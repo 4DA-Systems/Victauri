@@ -373,7 +373,7 @@ Linux CI requires a virtual display (`xvfb-run`) since Tauri/WebView needs a dis
 
 ```bash
 cargo build --workspace                               # Build all crates
-cargo test --workspace                                # Run all 750 tests
+cargo test --workspace                                # Run all 756 tests
 cargo bench -p victauri-core                          # Criterion benchmarks (16)
 cargo clippy --workspace --all-targets                # Lint (20 enforced lints)
 cargo fmt --all -- --check                            # Format

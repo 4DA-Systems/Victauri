@@ -41,19 +41,33 @@ victauri_plugin::VictauriBuilder::new()
 
 ## Tools
 
-55 MCP tools across 17 categories:
+23 MCP tools -- 9 compound tools (each with multiple actions) and 14 standalone:
 
-| Category | Tools | Examples |
-|---|---|---|
-| WebView | 11 | eval_js, dom_snapshot, click, fill, type_text, press_key |
-| Windows | 7 | get_window_state, list_windows, screenshot, manage_window |
-| Backend | 5 | invoke_command, get_ipc_log, get_registry, get_memory_stats |
-| Verification | 3 | verify_state, detect_ghost_commands, check_ipc_integrity |
-| Time-Travel | 7 | start_recording, checkpoint, get_replay_sequence |
-| CSS/Style | 4 | get_styles, get_bounding_boxes, inject_css |
-| Accessibility | 1 | audit_accessibility (WCAG checks) |
-| Performance | 1 | get_performance_metrics (timing, heap, resources) |
-| + 9 more | 16 | storage, navigation, dialogs, network, wait_for, ... |
+| Tool | What it does |
+|---|---|
+| **`interact`** | Click, double-click, hover, focus, scroll, select |
+| **`input`** | Fill inputs, type character-by-character, press keyboard keys |
+| **`window`** | Get state, list windows, manage, resize, move, set title |
+| **`storage`** | Read/write localStorage, sessionStorage, cookies |
+| **`navigate`** | Go to URL, go back, get history, configure dialog responses |
+| **`recording`** | Start/stop sessions, checkpoints, get events, export/import |
+| **`inspect`** | Computed CSS, bounding boxes, element highlighting, a11y audit, performance metrics |
+| **`css`** | Inject/remove debug CSS |
+| **`logs`** | Console, network, IPC, navigation, dialog logs |
+| `eval_js` | Execute JavaScript in the webview |
+| `dom_snapshot` | Full accessibility tree with ref handles |
+| `find_elements` | Search for elements by text, role, test ID, or CSS selector |
+| `invoke_command` | Call any registered Tauri command through real IPC |
+| `screenshot` | Platform-native window capture |
+| `verify_state` | Compare frontend DOM state against backend state |
+| `detect_ghost_commands` | Find frontend IPC calls with no backend handler |
+| `check_ipc_integrity` | Detect stuck, stale, or errored IPC calls |
+| `wait_for` | Poll for conditions: text appears, selector matches, IPC settles |
+| `assert_semantic` | Evaluate JS expression and assert against expected value |
+| `resolve_command` | Natural language to matching Tauri command |
+| `get_registry` | List all commands with schemas from `#[inspectable]` |
+| `get_memory_stats` | Real-time process memory statistics |
+| `get_plugin_info` | Victauri config: port, enabled tools, version |
 
 ## Security
 
