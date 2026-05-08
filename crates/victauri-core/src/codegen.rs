@@ -738,4 +738,128 @@ mod tests {
             "expected select_option_by_id, got:\n{code}"
         );
     }
+
+    /// Round-trip test: builds a realistic multi-event session and verifies
+    /// the generated Rust source contains valid structural elements for every
+    /// event kind — click, fill, key-press, IPC, and state-change.
+    #[test]
+    fn round_trip_realistic_session() {
+        let base = Utc::now();
+
+        let events = vec![
+            // 0: Click on #submit-btn  (should resolve to click_by_id)
+            interaction_event_at(base, 0, InteractionKind::Click, "#submit-btn", None, 0),
+            // 1: Fill on input[name=email]  (raw selector — should use client.fill)
+            interaction_event_at(
+                base,
+                1,
+                InteractionKind::Fill,
+                "input[name=email]",
+                Some("test@example.com"),
+                100,
+            ),
+            // 2: KeyPress "Enter"
+            interaction_event_at(
+                base,
+                2,
+                InteractionKind::KeyPress,
+                "body",
+                Some("Enter"),
+                200,
+            ),
+            // 3: IPC call — save_draft completed successfully
+            RecordedEvent {
+                index: 3,
+                timestamp: base + Duration::milliseconds(300),
+                event: AppEvent::Ipc(IpcCall {
+                    id: "ipc-1".to_string(),
+                    command: "save_draft".to_string(),
+                    timestamp: base + Duration::milliseconds(300),
+                    duration_ms: Some(15),
+                    result: IpcResult::Ok(serde_json::json!({"saved": true})),
+                    arg_size_bytes: 42,
+                    webview_label: "main".to_string(),
+                }),
+            },
+            // 4: StateChange caused by save_draft
+            RecordedEvent {
+                index: 4,
+                timestamp: base + Duration::milliseconds(350),
+                event: AppEvent::StateChange {
+                    key: "draft.status".to_string(),
+                    timestamp: base + Duration::milliseconds(350),
+                    caused_by: Some("save_draft".to_string()),
+                },
+            },
+        ];
+
+        let session = make_session_at(base, events);
+        let code = generate_test(&session, &CodegenOptions::default());
+
+        // --- Structural validity: the generated code is a well-formed async test ---
+        assert!(
+            code.contains("#[tokio::test]"),
+            "missing #[tokio::test] attribute:\n{code}"
+        );
+        assert!(
+            code.contains("async fn recorded_flow()"),
+            "missing async fn declaration:\n{code}"
+        );
+        assert!(
+            code.contains("VictauriClient::discover()"),
+            "missing VictauriClient::discover() call:\n{code}"
+        );
+        assert!(
+            code.ends_with("}\n"),
+            "missing closing brace at end of generated code:\n{code}"
+        );
+
+        // --- Event-specific assertions ---
+
+        // Click on #submit-btn should resolve to click_by_id (not raw click with "#submit-btn")
+        assert!(
+            code.contains("client.click_by_id(\"submit-btn\").await.unwrap();"),
+            "expected click_by_id for #submit-btn:\n{code}"
+        );
+        assert!(
+            !code.contains("client.click(\"#submit-btn\")"),
+            "#submit-btn should NOT appear as raw client.click:\n{code}"
+        );
+
+        // Fill on input[name=email] — raw selector, no # prefix
+        assert!(
+            code.contains("client.fill(\"input[name=email]\", \"test@example.com\").await.unwrap();"),
+            "expected raw client.fill for input[name=email]:\n{code}"
+        );
+        assert!(
+            !code.contains("client.fill_by_id(\"input[name=email]\""),
+            "input[name=email] should NOT resolve to fill_by_id:\n{code}"
+        );
+
+        // KeyPress "Enter"
+        assert!(
+            code.contains("client.press_key(\"Enter\").await.unwrap();"),
+            "expected press_key(\"Enter\"):\n{code}"
+        );
+
+        // IPC comment for save_draft
+        assert!(
+            code.contains("// IPC: save_draft completed successfully"),
+            "expected IPC comment for save_draft:\n{code}"
+        );
+
+        // State change comment for draft.status
+        assert!(
+            code.contains("// State changed: draft.status"),
+            "expected state change comment for draft.status:\n{code}"
+        );
+
+        // --- Brace matching: count opening and closing braces ---
+        let open_braces = code.matches('{').count();
+        let close_braces = code.matches('}').count();
+        assert_eq!(
+            open_braces, close_braces,
+            "unbalanced braces: {open_braces} open vs {close_braces} close in:\n{code}"
+        );
+    }
 }

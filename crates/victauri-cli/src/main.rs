@@ -49,6 +49,15 @@ enum Commands {
         #[arg(short, long)]
         filter: Option<String>,
     },
+    /// Report IPC command coverage from a running Tauri app
+    Coverage {
+        /// Minimum coverage percentage — exit with code 1 if below this value
+        #[arg(long)]
+        threshold: Option<f64>,
+        /// Write coverage as `JUnit` XML report to this path
+        #[arg(long)]
+        junit: Option<PathBuf>,
+    },
 }
 
 #[tokio::main]
@@ -68,6 +77,9 @@ async fn main() -> Result<()> {
         }
         Commands::Watch { dir, filter } => {
             cmd_watch(&dir, filter.as_deref()).await?;
+        }
+        Commands::Coverage { threshold, junit } => {
+            cmd_coverage(threshold, junit.as_deref()).await?;
         }
     }
 
@@ -256,6 +268,66 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
         victauri_test::reporting::write_junit_report(&junit, path)
             .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
         eprintln!("JUnit report written to {}", path.display());
+    }
+
+    Ok(())
+}
+
+async fn cmd_coverage(threshold: Option<f64>, junit_path: Option<&Path>) -> Result<()> {
+    eprintln!("Connecting to running Victauri server...\n");
+
+    let mut client = match victauri_test::VictauriClient::discover().await {
+        Ok(c) => c,
+        Err(e) => {
+            bail!(
+                "Could not connect to Victauri server: {e}\n\n\
+                 Is your Tauri app running? Try:  pnpm run tauri dev\n\
+                 The app must have victauri-plugin wired into its builder."
+            );
+        }
+    };
+
+    let report = victauri_test::coverage::coverage_report(&mut client)
+        .await
+        .context("failed to generate coverage report")?;
+
+    let summary = report.to_summary();
+    eprintln!("{summary}");
+
+    if let Some(path) = junit_path {
+        let verify_report = victauri_test::VerifyReport {
+            results: vec![victauri_test::CheckResult {
+                description: format!(
+                    "IPC coverage {:.1}% ({}/{})",
+                    report.coverage_percentage, report.tested_commands, report.total_commands
+                ),
+                passed: threshold.map_or(true, |t| report.meets_threshold(t)),
+                detail: if report.untested.is_empty() {
+                    String::new()
+                } else {
+                    format!("untested: {}", report.untested.join(", "))
+                },
+            }],
+        };
+        let junit = verify_report.to_junit("victauri-coverage", std::time::Duration::from_secs(0));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+        }
+        victauri_test::reporting::write_junit_report(&junit, path)
+            .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
+        eprintln!("JUnit report written to {}", path.display());
+    }
+
+    if let Some(t) = threshold {
+        if !report.meets_threshold(t) {
+            eprintln!(
+                "Coverage {:.1}% is below threshold {:.1}% — failing.",
+                report.coverage_percentage, t
+            );
+            std::process::exit(1);
+        }
+        eprintln!("Coverage {:.1}% meets threshold {:.1}%.", report.coverage_percentage, t);
     }
 
     Ok(())

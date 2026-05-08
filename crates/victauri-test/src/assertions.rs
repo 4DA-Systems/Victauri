@@ -49,6 +49,7 @@ enum Check {
     },
     IpcHealthy,
     NoGhostCommands,
+    CoverageAbove(f64),
 }
 
 /// A single check result — pass or fail with context.
@@ -208,6 +209,17 @@ impl<'a> VerifyBuilder<'a> {
     #[must_use]
     pub fn no_ghost_commands(mut self) -> Self {
         self.checks.push(Check::NoGhostCommands);
+        self
+    }
+
+    /// Assert that IPC command coverage meets the given threshold percentage.
+    ///
+    /// Queries the command registry and IPC log to compute how many registered
+    /// commands have been exercised, then checks whether the coverage percentage
+    /// is at or above `threshold`.
+    #[must_use]
+    pub fn coverage_above(mut self, threshold: f64) -> Self {
+        self.checks.push(Check::CoverageAbove(threshold));
         self
     }
 
@@ -398,6 +410,25 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                     String::new()
                 } else {
                     format!("{ghosts} ghost command(s) found")
+                },
+            })
+        }
+        Check::CoverageAbove(threshold) => {
+            let report = crate::coverage::coverage_report(client).await?;
+            let passed = report.meets_threshold(*threshold);
+            Ok(CheckResult {
+                description: format!(
+                    "IPC coverage >= {threshold:.1}% (actual: {:.1}%)",
+                    report.coverage_percentage
+                ),
+                passed,
+                detail: if passed {
+                    String::new()
+                } else {
+                    format!(
+                        "coverage {:.1}% is below threshold {threshold:.1}%",
+                        report.coverage_percentage
+                    )
                 },
             })
         }

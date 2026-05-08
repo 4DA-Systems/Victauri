@@ -2,6 +2,7 @@ use serde_json::{Value, json};
 
 use crate::assertions::VerifyBuilder;
 use crate::error::TestError;
+use crate::visual::{VisualDiff, VisualOptions};
 
 /// Typed HTTP client for the Victauri MCP server.
 ///
@@ -360,6 +361,27 @@ impl VictauriClient {
     /// Returns errors from [`VictauriClient::call_tool`].
     pub async fn screenshot(&mut self) -> Result<Value, TestError> {
         self.call_tool("screenshot", json!({})).await
+    }
+
+    /// Take a screenshot and compare it against a stored baseline.
+    ///
+    /// Captures the current window, extracts the base64 PNG data, and passes
+    /// it to [`visual::compare_screenshot`](crate::visual::compare_screenshot).
+    /// On first run the screenshot is saved as the new baseline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::VisualRegression`] if the diff exceeds the
+    /// threshold, or [`TestError::Other`] if the screenshot result does not
+    /// contain recognizable image data.
+    pub async fn screenshot_visual(
+        &mut self,
+        name: &str,
+        options: &VisualOptions,
+    ) -> Result<VisualDiff, TestError> {
+        let result = self.screenshot().await?;
+        let base64_data = extract_screenshot_base64(&result)?;
+        crate::visual::compare_screenshot(name, &base64_data, options)
     }
 
     /// Invoke a Tauri command by name with optional arguments.
@@ -896,6 +918,25 @@ impl VictauriClient {
         find_in_tree_by_attr_id(tree, id)
             .ok_or_else(|| TestError::ElementNotFound(format!("id=\"{id}\"")))
     }
+}
+
+fn extract_screenshot_base64(result: &Value) -> Result<String, TestError> {
+    // Try various response shapes the plugin may return
+    if let Some(data) = result.get("base64").and_then(Value::as_str) {
+        return Ok(data.to_string());
+    }
+    if let Some(data) = result.get("data").and_then(Value::as_str) {
+        return Ok(data.to_string());
+    }
+    if let Some(data) = result.get("image").and_then(Value::as_str) {
+        return Ok(data.to_string());
+    }
+    if let Some(data) = result.pointer("/result/content/0/data").and_then(Value::as_str) {
+        return Ok(data.to_string());
+    }
+    Err(TestError::Other(
+        "screenshot result does not contain recognizable base64 image data".to_string(),
+    ))
 }
 
 fn find_in_tree_by_text(node: &Value, text: &str) -> Option<String> {
