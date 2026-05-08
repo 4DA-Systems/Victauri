@@ -335,6 +335,27 @@ impl VictauriBuilder {
         self
     }
 
+    /// Auto-discover all `#[inspectable]` commands in the binary.
+    ///
+    /// Uses `inventory` to collect every command marked with `#[inspectable]`
+    /// at link time — no manual listing required. This replaces both
+    /// `.commands(&[...])` and `register_commands!()`.
+    ///
+    /// ```rust,ignore
+    /// tauri::Builder::default()
+    ///     .plugin(
+    ///         VictauriBuilder::new()
+    ///             .auto_discover()
+    ///             .build()
+    ///             .unwrap(),
+    ///     )
+    /// ```
+    #[must_use]
+    pub fn auto_discover(mut self) -> Self {
+        self.commands.extend(victauri_core::auto_discovered_commands());
+        self
+    }
+
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
     #[must_use]
@@ -578,6 +599,22 @@ impl VictauriBuilder {
 #[must_use]
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
     VictauriBuilder::new()
+        .build()
+        .expect("default Victauri configuration is always valid")
+}
+
+/// Initialize the Victauri plugin with auto-discovery of all `#[inspectable]` commands.
+///
+/// Equivalent to `VictauriBuilder::new().auto_discover().build()` — all commands
+/// marked with `#[inspectable]` are registered automatically without manual listing.
+///
+/// # Panics
+///
+/// Panics if the default builder configuration is invalid (this is a bug).
+#[must_use]
+pub fn init_auto_discover<R: Runtime>() -> TauriPlugin<R> {
+    VictauriBuilder::new()
+        .auto_discover()
         .build()
         .expect("default Victauri configuration is always valid")
 }

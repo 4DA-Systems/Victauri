@@ -43,6 +43,15 @@ pub struct CommandArg {
     pub schema: Option<serde_json::Value>,
 }
 
+/// Factory function submitted by `#[inspectable]` for auto-discovery.
+///
+/// Wraps a `fn() -> CommandInfo` so it can be registered via `inventory`
+/// (function pointers are const-constructible, unlike `CommandInfo` with its `String` fields).
+#[doc(hidden)]
+pub struct CommandInfoFactory(pub fn() -> CommandInfo);
+
+inventory::collect!(CommandInfoFactory);
+
 impl CommandInfo {
     /// Creates a new command with the given name and all optional fields set to `None`/empty.
     ///
@@ -241,6 +250,41 @@ impl CommandRegistry {
 
         scored.sort_by(|a, b| b.score.total_cmp(&a.score));
         scored
+    }
+}
+
+/// Returns all commands registered via `#[inspectable]` auto-discovery.
+///
+/// Collects every `CommandInfoFactory` submitted by the `#[inspectable]` macro
+/// and calls each factory to produce `CommandInfo` values.
+#[must_use]
+pub fn auto_discovered_commands() -> Vec<CommandInfo> {
+    inventory::iter::<CommandInfoFactory>
+        .into_iter()
+        .map(|factory| (factory.0)())
+        .collect()
+}
+
+impl CommandRegistry {
+    /// Creates a registry pre-populated with all `#[inspectable]` commands.
+    ///
+    /// Uses `inventory` to collect every `CommandInfo` that was submitted at
+    /// link time by the `#[inspectable]` macro. This replaces manual
+    /// `register_commands!` or `.commands(&[...])` calls.
+    ///
+    /// ```
+    /// use victauri_core::CommandRegistry;
+    ///
+    /// let registry = CommandRegistry::from_auto_discovery();
+    /// // Contains all #[inspectable] commands from the binary
+    /// ```
+    #[must_use]
+    pub fn from_auto_discovery() -> Self {
+        let registry = Self::new();
+        for info in auto_discovered_commands() {
+            registry.register(info);
+        }
+        registry
     }
 }
 

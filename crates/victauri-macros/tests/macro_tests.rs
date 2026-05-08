@@ -90,3 +90,64 @@ fn inspectable_with_intent_annotations() {
     assert_eq!(info.args.len(), 1);
     assert_eq!(info.args[0].name, "prefs");
 }
+
+#[test]
+fn auto_discovery_finds_inspectable_commands() {
+    let discovered = victauri_core::auto_discovered_commands();
+    let names: Vec<&str> = discovered.iter().map(|c| c.name.as_str()).collect();
+
+    assert!(
+        names.contains(&"save_api_key"),
+        "auto_discover should find save_api_key, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"simple_command"),
+        "auto_discover should find simple_command, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"save_user_preferences"),
+        "auto_discover should find save_user_preferences, got: {names:?}"
+    );
+    assert!(
+        names.contains(&"load_user"),
+        "auto_discover should find load_user, got: {names:?}"
+    );
+    assert!(
+        discovered.len() >= 4,
+        "should discover at least 4 commands, got {}",
+        discovered.len()
+    );
+}
+
+#[test]
+fn auto_discovery_preserves_metadata() {
+    let discovered = victauri_core::auto_discovered_commands();
+    let prefs_cmd = discovered
+        .iter()
+        .find(|c| c.name == "save_user_preferences")
+        .expect("save_user_preferences should be auto-discovered");
+
+    assert_eq!(prefs_cmd.description.as_deref(), Some("Persist user prefs"));
+    assert_eq!(prefs_cmd.category.as_deref(), Some("settings"));
+    assert_eq!(prefs_cmd.examples.len(), 2);
+    assert_eq!(prefs_cmd.args.len(), 1);
+    assert_eq!(prefs_cmd.args[0].name, "prefs");
+}
+
+#[test]
+fn registry_from_auto_discovery() {
+    let registry = victauri_core::CommandRegistry::from_auto_discovery();
+    assert!(
+        registry.count() >= 4,
+        "registry should have at least 4 auto-discovered commands, got {}",
+        registry.count()
+    );
+    assert!(
+        registry.get("save_api_key").is_some(),
+        "registry should contain save_api_key"
+    );
+    assert!(
+        registry.get("load_user").is_some(),
+        "registry should contain load_user"
+    );
+}

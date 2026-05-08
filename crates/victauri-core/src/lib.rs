@@ -4,6 +4,9 @@
 //! This crate provides the shared type system used by all Victauri crates.
 //! It has no Tauri dependency and can be used independently for testing.
 
+#[doc(hidden)]
+pub extern crate inventory;
+
 pub mod error;
 pub mod event;
 pub mod recording;
@@ -15,7 +18,10 @@ pub mod verification;
 pub use error::VictauriError;
 pub use event::{AppEvent, EventLog, IpcCall, IpcResult};
 pub use recording::{EventRecorder, RecordedEvent, RecordedSession, StateCheckpoint};
-pub use registry::{CommandArg, CommandInfo, CommandRegistry, ScoredCommand};
+pub use registry::{
+    CommandArg, CommandInfo, CommandInfoFactory, CommandRegistry, ScoredCommand,
+    auto_discovered_commands,
+};
 pub use snapshot::{DomElement, DomSnapshot, WindowState};
 pub use types::{Divergence, DivergenceSeverity, MemoryDelta, RefHandle, VerificationResult};
 pub use verification::{

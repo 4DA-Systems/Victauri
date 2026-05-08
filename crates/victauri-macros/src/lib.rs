@@ -94,6 +94,10 @@ pub fn inspectable(attr: TokenStream, item: TokenStream) -> TokenStream {
                 examples: vec![#(#example_tokens),*],
             }
         }
+
+        victauri_core::inventory::submit! {
+            victauri_core::registry::CommandInfoFactory(#schema_fn_name)
+        }
     };
 
     TokenStream::from(expanded)
