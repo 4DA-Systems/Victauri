@@ -30,6 +30,7 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 ctrlc = "3"
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 toml_edit = "0.22"
 
 [dev-dependencies]

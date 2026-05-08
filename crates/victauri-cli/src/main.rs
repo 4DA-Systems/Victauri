@@ -40,6 +40,15 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "recorded_flow")]
         test_name: String,
     },
+    /// Watch test files and re-run on changes
+    Watch {
+        /// Directory to watch (default: tests/)
+        #[arg(short, long, default_value = "tests")]
+        dir: PathBuf,
+        /// Only run tests matching this filter
+        #[arg(short, long)]
+        filter: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -56,6 +65,9 @@ async fn main() -> Result<()> {
         }
         Commands::Record { output, test_name } => {
             cmd_record(&output, &test_name).await?;
+        }
+        Commands::Watch { dir, filter } => {
+            cmd_watch(&dir, filter.as_deref()).await?;
         }
     }
 
@@ -323,6 +335,92 @@ async fn cmd_record(output: &Path, test_name: &str) -> Result<()> {
     eprintln!("\nRun your test:");
     eprintln!("  VICTAURI_E2E=1 cargo test --test {test_name}");
     Ok(())
+}
+
+async fn cmd_watch(dir: &Path, filter: Option<&str>) -> Result<()> {
+    use notify::{RecursiveMode, Watcher};
+
+    let watch_dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+
+    if !watch_dir.exists() {
+        bail!("watch directory does not exist: {}", watch_dir.display());
+    }
+
+    eprintln!("Watching {} for changes...", watch_dir.display());
+    if let Some(f) = filter {
+        eprintln!("  Filter: {f}");
+    }
+    eprintln!("  Press Ctrl+C to stop.\n");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res {
+            let dominated_by_rs = event.paths.iter().any(|p| {
+                p.extension()
+                    .is_some_and(|ext| ext == "rs")
+            });
+            if dominated_by_rs {
+                let _ = tx.blocking_send(());
+            }
+        }
+    })
+    .context("failed to create file watcher")?;
+
+    watcher
+        .watch(&watch_dir, RecursiveMode::Recursive)
+        .with_context(|| format!("failed to watch {}", watch_dir.display()))?;
+
+    run_tests(filter);
+
+    while rx.recv().await.is_some() {
+        // Debounce: drain any additional events that arrived during compilation
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        while rx.try_recv().is_ok() {}
+
+        eprintln!("\n--- File changed, re-running tests ---\n");
+        run_tests(filter);
+    }
+
+    Ok(())
+}
+
+fn run_tests(filter: Option<&str>) {
+    let start = std::time::Instant::now();
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.arg("test");
+    cmd.env("VICTAURI_E2E", "1");
+
+    if let Some(f) = filter {
+        cmd.arg("--test").arg(f);
+    }
+
+    let status = cmd.status();
+    let elapsed = start.elapsed();
+
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!("\nAll tests passed ({:.1}s)", elapsed.as_secs_f64());
+        }
+        Ok(s) => {
+            eprintln!(
+                "\nTests failed (exit code: {}, {:.1}s)",
+                s.code().unwrap_or(-1),
+                elapsed.as_secs_f64()
+            );
+        }
+        Err(e) => {
+            eprintln!("\nFailed to run cargo test: {e}");
+        }
+    }
+
+    if elapsed.as_secs() > 30 {
+        eprintln!("  Warning: test suite took >{:.0}s — consider splitting slow tests", elapsed.as_secs_f64());
+    }
 }
 
 fn detect_project(root: &Path) -> Result<(PathBuf, bool)> {
