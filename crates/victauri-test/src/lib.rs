@@ -39,6 +39,7 @@ mod assertions;
 mod client;
 pub mod coverage;
 mod error;
+pub mod prelude;
 pub mod reporting;
 pub mod visual;
 
