@@ -37,6 +37,7 @@
 mod app;
 mod assertions;
 mod client;
+pub mod coverage;
 mod error;
 pub mod reporting;
 pub mod visual;
