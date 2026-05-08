@@ -44,6 +44,9 @@ assert!(result["divergences"].as_array().unwrap().is_empty());
 | Cross-boundary verification | No | No | No | No | **Yes** |
 | `#[inspectable]` command schemas | No | No | No | No | **Yes** |
 | Time-travel recording | No | No | No | No | **Yes** |
+| Visual regression testing | Plugin | Plugin | No | No | **Yes** |
+| IPC coverage tracking | No | No | No | No | **Yes** |
+| Record → generate tests | Codegen | No | No | No | **Yes** |
 | Zero-config setup | No | No | Near | Near | **Yes** |
 | Works with `cargo test` | N/A | Limited | No | No | **Yes** |
 
@@ -198,6 +201,8 @@ The `victauri-test` crate provides Playwright-style convenience methods that han
 | `expect_text("Success!")` | Poll until text appears (5s timeout) |
 | `expect_no_text("Error")` | Poll until text disappears (3s timeout) |
 | `text_by_id("counter")` | Get text content of element by id |
+| `screenshot_visual("name", &opts)` | Visual regression — compare against stored baseline |
+| `verify().coverage_above(80.0)` | Assert IPC command coverage meets threshold |
 
 Plus lower-level methods for direct ref-handle interaction, IPC inspection, recording, accessibility audits, and performance profiling.
 
@@ -262,6 +267,59 @@ e2e_test!(greet_flow, |client| async move {
 ```
 
 The `e2e_test!` macro handles skip-when-no-server and auto-connect.
+
+### Visual Regression
+
+Compare screenshots against stored baselines — pixel-level diffing with configurable tolerance:
+
+```rust
+use victauri_test::visual::VisualOptions;
+
+let opts = VisualOptions {
+    snapshot_dir: "tests/snapshots".into(),
+    channel_tolerance: 2,   // per-channel tolerance (0-255)
+    threshold_percent: 0.5, // max % of pixels that may differ
+    ..Default::default()
+};
+
+let diff = client.screenshot_visual("dashboard", &opts).await?;
+assert!(diff.is_match, "visual regression: {:.2}% pixels differ", diff.diff_percentage);
+```
+
+On first run, the screenshot is saved as the baseline. Subsequent runs compare against it and generate a red-overlay diff image when mismatched.
+
+### IPC Coverage
+
+Track which registered commands your tests actually exercise:
+
+```rust
+use victauri_test::coverage::coverage_report;
+
+let report = coverage_report(&mut client).await?;
+assert!(report.meets_threshold(80.0), "{}", report.to_summary());
+```
+
+Or inline with the fluent builder:
+
+```rust
+client.verify()
+    .has_text("Welcome")
+    .coverage_above(80.0)
+    .run().await?.assert_all_passed();
+```
+
+## CLI
+
+The `victauri` CLI scaffolds, checks, records, and measures:
+
+```bash
+victauri init                          # Scaffold test directory with starter tests
+victauri check                         # Connect to running app, report health
+victauri check --junit report.xml      # Same, with JUnit XML output
+victauri record --output tests/flow.rs # Record interactions → generate Rust test
+victauri coverage --threshold 80       # Report IPC coverage, fail if below 80%
+victauri watch                         # Re-run tests on file changes
+```
 
 ## Instrument Your Commands
 
@@ -373,7 +431,7 @@ Linux CI requires a virtual display (`xvfb-run`) since Tauri/WebView needs a dis
 
 ```bash
 cargo build --workspace                               # Build all crates
-cargo test --workspace                                # Run all 756 tests
+cargo test --workspace                                # Run all 838 tests
 cargo bench -p victauri-core                          # Criterion benchmarks (16)
 cargo clippy --workspace --all-targets                # Lint (20 enforced lints)
 cargo fmt --all -- --check                            # Format

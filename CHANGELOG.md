@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **victauri-test**: Visual regression testing — `compare_screenshot()` with pixel-level PNG diffing, configurable channel tolerance, diff image generation, RGB/Grayscale auto-conversion
+- **victauri-test**: `VictauriClient::screenshot_visual()` convenience method — capture + compare in one call
+- **victauri-test**: IPC coverage tracking — `coverage_report()` compares registered commands against observed calls, `assert_coverage_above()` for threshold enforcement
+- **victauri-test**: `VerifyBuilder::coverage_above()` for fluent coverage assertions
+- **victauri-test**: `JunitReport` — generate JUnit XML reports from `VerifyReport` for CI integration
+- **victauri-core**: Test codegen engine — `generate_test()` converts `RecordedSession` into compilable Rust test code with idiomatic selector resolution (`click_by_id`, `click_by_text`, raw fallback)
+- **victauri-core**: `DomInteraction` event type with `InteractionKind` enum (Click, DoubleClick, Fill, KeyPress, Select, Navigate, Scroll)
+- **victauri-core**: `inventory`-based command auto-discovery via `CommandInfoFactory`
+- **victauri-plugin**: JS interaction observer — captures click, dblclick, change, keydown with `isTrusted` check and `bestSelector()` resolution
+- **victauri-plugin**: `parse_bridge_event()` public API for unit-testable event parsing
+- **victauri-cli**: `coverage` command — report IPC coverage with optional `--threshold` and `--junit` flags
+- **victauri-cli**: `record` command — connect to running app, capture interactions, generate test file
+- **victauri-cli**: `watch` command — re-run tests automatically on file changes via `notify` crate
+- **victauri-cli**: `init` command — scaffold test directory with starter smoke tests
+
 ## [0.1.2] - 2026-05-07
 
 ### Fixed

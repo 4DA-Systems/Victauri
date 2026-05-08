@@ -14,7 +14,7 @@ Requires Rust 1.88+ (edition 2024).
 ## Running Tests
 
 ```bash
-cargo test --workspace          # All tests (756)
+cargo test --workspace          # All tests (838)
 cargo test -p victauri-core     # Core crate only
 cargo test -p victauri-plugin   # Plugin crate only
 cargo bench -p victauri-core    # Criterion benchmarks (16)

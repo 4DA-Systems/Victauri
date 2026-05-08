@@ -301,7 +301,7 @@ async fn cmd_coverage(threshold: Option<f64>, junit_path: Option<&Path>) -> Resu
                     "IPC coverage {:.1}% ({}/{})",
                     report.coverage_percentage, report.tested_commands, report.total_commands
                 ),
-                passed: threshold.map_or(true, |t| report.meets_threshold(t)),
+                passed: threshold.is_none_or(|t| report.meets_threshold(t)),
                 detail: if report.untested.is_empty() {
                     String::new()
                 } else {
