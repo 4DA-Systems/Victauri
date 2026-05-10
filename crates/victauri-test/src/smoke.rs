@@ -414,30 +414,27 @@ impl VictauriClient {
     /// response shape is wrong.
     pub async fn assert_health_hardened(&mut self) -> Result<(), TestError> {
         let url = format!("{}/health", self.base_url());
-        let resp = self
-            .http_client()
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| TestError::Connection {
-                host: self.host().to_string(),
-                port: self.port(),
-                reason: e.to_string(),
-            })?;
+        let resp =
+            self.http_client()
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| TestError::Connection {
+                    host: self.host().to_string(),
+                    port: self.port(),
+                    reason: e.to_string(),
+                })?;
         if !resp.status().is_success() {
             return Err(TestError::Assertion(format!(
                 "/health returned status {}",
                 resp.status()
             )));
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| TestError::Connection {
-                host: self.host().to_string(),
-                port: self.port(),
-                reason: e.to_string(),
-            })?;
+        let text = resp.text().await.map_err(|e| TestError::Connection {
+            host: self.host().to_string(),
+            port: self.port(),
+            reason: e.to_string(),
+        })?;
         let json: Value = serde_json::from_str(&text).map_err(|_| {
             TestError::Assertion(format!(
                 "/health returned non-JSON: {}",

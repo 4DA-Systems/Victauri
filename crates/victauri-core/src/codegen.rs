@@ -539,7 +539,9 @@ mod tests {
         assert!(code.contains("client.double_click_by_selector(\"[data-testid=\\\"b\\\"]\")"));
         assert!(code.contains("client.fill_by_selector(\"[data-testid=\\\"c\\\"]\", \"val\")"));
         assert!(code.contains("client.press_key(\"Enter\")"));
-        assert!(code.contains("client.select_option_by_selector(\"[data-testid=\\\"e\\\"]\", &[\"opt1\"])"));
+        assert!(code.contains(
+            "client.select_option_by_selector(\"[data-testid=\\\"e\\\"]\", &[\"opt1\"])"
+        ));
         assert!(code.contains("client.navigate(\"/page\")"));
         assert!(code.contains("client.scroll_to_by_id(\"g\")"));
     }
@@ -726,7 +728,9 @@ mod tests {
         let code = generate_test_default(&session);
 
         assert!(
-            code.contains("client.click_by_selector(\"[data-testid=\\\"foo\\\"]\").await.unwrap();"),
+            code.contains(
+                "client.click_by_selector(\"[data-testid=\\\"foo\\\"]\").await.unwrap();"
+            ),
             "expected click_by_selector for data-testid selector, got:\n{code}"
         );
     }

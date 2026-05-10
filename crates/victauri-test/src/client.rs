@@ -173,14 +173,11 @@ impl VictauriClient {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
 
-            let resp = req
-                .send()
-                .await
-                .map_err(|e| TestError::Connection {
-                    host: host.to_string(),
-                    port,
-                    reason: e.to_string(),
-                })?;
+            let resp = req.send().await.map_err(|e| TestError::Connection {
+                host: host.to_string(),
+                port,
+                reason: e.to_string(),
+            })?;
 
             if resp.status() == 429 && attempt < 3 {
                 let delay = std::time::Duration::from_millis(100 * (1 << attempt));
@@ -357,8 +354,7 @@ impl VictauriClient {
                     || {
                         format!(
                             "unknown error (raw: {})",
-                            serde_json::to_string(error)
-                                .unwrap_or_else(|_| "<unparseable>".into())
+                            serde_json::to_string(error).unwrap_or_else(|_| "<unparseable>".into())
                         )
                     },
                     String::from,
@@ -1084,10 +1080,7 @@ impl VictauriClient {
     ///
     /// Returns [`TestError::ElementNotFound`] if no element matches the selector.
     /// Returns other errors from [`VictauriClient::call_tool`].
-    pub async fn double_click_by_selector(
-        &mut self,
-        selector: &str,
-    ) -> Result<Value, TestError> {
+    pub async fn double_click_by_selector(&mut self, selector: &str) -> Result<Value, TestError> {
         let ref_id = self.find_ref_by_selector(selector).await?;
         self.double_click(&ref_id).await
     }
@@ -1331,9 +1324,7 @@ impl VictauriClient {
     }
 
     async fn find_ref_by_selector(&mut self, selector: &str) -> Result<String, TestError> {
-        let result = self
-            .find_elements(json!({"selector": selector}))
-            .await?;
+        let result = self.find_elements(json!({"selector": selector})).await?;
         // find_elements returns an array of matched elements with ref_id fields
         let elements = result
             .as_array()

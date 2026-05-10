@@ -253,7 +253,10 @@ impl TestApp {
 
     /// Format the last N captured stderr lines for inclusion in error messages.
     fn recent_stderr(&self) -> String {
-        let lines = self.stderr_lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lines = self
+            .stderr_lines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if lines.is_empty() {
             return String::new();
         }
@@ -301,7 +304,9 @@ fn spawn_stderr_reader(
                 for line in reader.lines() {
                     match line {
                         Ok(text) => {
-                            let mut buf = lines.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut buf = lines
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             if buf.len() >= STDERR_MAX_LINES {
                                 buf.remove(0);
                             }

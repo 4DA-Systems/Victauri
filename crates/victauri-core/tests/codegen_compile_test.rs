@@ -138,13 +138,7 @@ fn codegen_emits_only_valid_client_methods() {
             None,
             10,
         ),
-        interaction(
-            2,
-            InteractionKind::Click,
-            "[data-testid=\"raw\"]",
-            None,
-            20,
-        ),
+        interaction(2, InteractionKind::Click, "[data-testid=\"raw\"]", None, 20),
         // DoubleClick variants
         interaction(3, InteractionKind::DoubleClick, "#dbl-id", None, 30),
         interaction(
@@ -154,21 +148,9 @@ fn codegen_emits_only_valid_client_methods() {
             None,
             40,
         ),
-        interaction(
-            5,
-            InteractionKind::DoubleClick,
-            ".raw-dbl",
-            None,
-            50,
-        ),
+        interaction(5, InteractionKind::DoubleClick, ".raw-dbl", None, 50),
         // Fill variants
-        interaction(
-            6,
-            InteractionKind::Fill,
-            "#input-id",
-            Some("hello"),
-            60,
-        ),
+        interaction(6, InteractionKind::Fill, "#input-id", Some("hello"), 60),
         interaction(
             7,
             InteractionKind::Fill,
@@ -186,13 +168,7 @@ fn codegen_emits_only_valid_client_methods() {
         // KeyPress (no selector variants)
         interaction(9, InteractionKind::KeyPress, "body", Some("Enter"), 90),
         // Select variants
-        interaction(
-            10,
-            InteractionKind::Select,
-            "#country",
-            Some("AU"),
-            100,
-        ),
+        interaction(10, InteractionKind::Select, "#country", Some("AU"), 100),
         interaction(
             11,
             InteractionKind::Select,
@@ -200,13 +176,7 @@ fn codegen_emits_only_valid_client_methods() {
             Some("opt1"),
             110,
         ),
-        interaction(
-            12,
-            InteractionKind::Select,
-            "select.raw",
-            Some("opt2"),
-            120,
-        ),
+        interaction(12, InteractionKind::Select, "select.raw", Some("opt2"), 120),
         // Navigate
         interaction(
             13,
@@ -255,13 +225,7 @@ fn codegen_selector_resolution_is_correct() {
             None,
             10,
         ),
-        interaction(
-            2,
-            InteractionKind::Click,
-            "[data-testid=\"raw\"]",
-            None,
-            20,
-        ),
+        interaction(2, InteractionKind::Click, "[data-testid=\"raw\"]", None, 20),
     ]);
 
     let opts = CodegenOptions {
@@ -287,13 +251,7 @@ fn codegen_selector_resolution_is_correct() {
 /// Verify `generate_test_default` works and produces a valid skeleton.
 #[test]
 fn codegen_default_options_produce_valid_output() {
-    let session = make_session(vec![interaction(
-        0,
-        InteractionKind::Click,
-        "#ok",
-        None,
-        0,
-    )]);
+    let session = make_session(vec![interaction(0, InteractionKind::Click, "#ok", None, 0)]);
     let code = generate_test_default(&session);
 
     assert!(code.contains("#[tokio::test]"));

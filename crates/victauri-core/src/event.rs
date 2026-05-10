@@ -289,20 +289,17 @@ impl EventLog {
     /// Returns the number of events currently in the log.
     #[must_use]
     pub fn len(&self) -> usize {
-        crate::acquire_lock(&self.events, "EventLog")
-            .len()
+        crate::acquire_lock(&self.events, "EventLog").len()
     }
 
     /// Returns true if the log contains no events.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        crate::acquire_lock(&self.events, "EventLog")
-            .is_empty()
+        crate::acquire_lock(&self.events, "EventLog").is_empty()
     }
 
     /// Removes all events from the log.
     pub fn clear(&self) {
-        crate::acquire_lock(&self.events, "EventLog")
-            .clear();
+        crate::acquire_lock(&self.events, "EventLog").clear();
     }
 }

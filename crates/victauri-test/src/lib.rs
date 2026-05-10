@@ -52,8 +52,7 @@ pub use assertions::{
 };
 pub use client::{
     MemoryStats, PluginInfo, VictauriClient, WaitForBuilder, assert_ipc_healthy, assert_json_eq,
-    assert_json_truthy, assert_no_a11y_violations, assert_performance_budget,
-    assert_state_matches,
+    assert_json_truthy, assert_no_a11y_violations, assert_performance_budget, assert_state_matches,
 };
 pub use error::TestError;
 pub use smoke::{SmokeCheckResult, SmokeConfig, SmokeReport};

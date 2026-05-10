@@ -147,8 +147,7 @@ impl EventRecorder {
     /// Returns true if a recording session is currently active.
     #[must_use]
     pub fn is_recording(&self) -> bool {
-        crate::acquire_lock(&self.recording, "EventRecorder")
-            .is_some()
+        crate::acquire_lock(&self.recording, "EventRecorder").is_some()
     }
 
     /// Appends an event to the active recording, evicting the oldest if at capacity.

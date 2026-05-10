@@ -111,8 +111,7 @@ impl Redactor {
                 // Fall back to an empty set so the process survives.
                 // An empty RegexSet always compiles successfully.
                 let empty: Vec<String> = Vec::new();
-                let empty_set =
-                    RegexSet::new(&empty).unwrap_or_else(|_| unreachable!());
+                let empty_set = RegexSet::new(&empty).unwrap_or_else(|_| unreachable!());
                 (empty_set, Vec::new())
             }
         };

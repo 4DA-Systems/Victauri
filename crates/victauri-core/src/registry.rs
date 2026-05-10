@@ -135,8 +135,7 @@ impl CommandRegistry {
     /// assert!(registry.get("greet").is_some());
     /// ```
     pub fn register(&self, info: CommandInfo) {
-        crate::acquire_write(&self.commands, "CommandRegistry")
-            .insert(info.name.clone(), info);
+        crate::acquire_write(&self.commands, "CommandRegistry").insert(info.name.clone(), info);
     }
 
     /// Looks up a command by exact name.
@@ -159,8 +158,7 @@ impl CommandRegistry {
     /// Returns the number of registered commands.
     #[must_use]
     pub fn count(&self) -> usize {
-        crate::acquire_read(&self.commands, "CommandRegistry")
-            .len()
+        crate::acquire_read(&self.commands, "CommandRegistry").len()
     }
 
     /// Searches commands by substring match on name or description (case-insensitive).

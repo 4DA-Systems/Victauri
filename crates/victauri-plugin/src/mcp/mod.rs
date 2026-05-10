@@ -1191,11 +1191,7 @@ impl VictauriMcpHandler {
                     );
                     let timeout = std::time::Duration::from_millis(5000);
                     match self
-                        .eval_with_return_timeout(
-                            &code,
-                            params.webview_label.as_deref(),
-                            timeout,
-                        )
+                        .eval_with_return_timeout(&code, params.webview_label.as_deref(), timeout)
                         .await
                     {
                         Ok(result) => CallToolResult::success(vec![Content::text(result)]),
@@ -1702,10 +1698,7 @@ mod tests {
     #[test]
     fn url_blocks_file_by_default() {
         let err = validate_url("file:///etc/passwd", false).unwrap_err();
-        assert!(
-            err.contains("file"),
-            "error should mention the file scheme"
-        );
+        assert!(err.contains("file"), "error should mention the file scheme");
     }
 
     #[test]

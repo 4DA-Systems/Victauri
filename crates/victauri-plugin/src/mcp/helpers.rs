@@ -73,11 +73,9 @@ pub fn validate_url(url: &str, allow_file: bool) -> Result<(), String> {
         Ok(parsed) => match parsed.scheme() {
             "http" | "https" => Ok(()),
             "file" if allow_file => Ok(()),
-            "file" => Err(
-                "scheme 'file' is not allowed by default; enable with \
+            "file" => Err("scheme 'file' is not allowed by default; enable with \
                  VictauriBuilder::allow_file_navigation()"
-                    .to_string(),
-            ),
+                .to_string()),
             scheme => Err(format!(
                 "scheme '{scheme}' is not allowed; use http or https"
             )),

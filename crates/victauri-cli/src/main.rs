@@ -452,8 +452,7 @@ async fn cmd_record(output: &Path, test_name: &str) -> Result<()> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let tx = std::sync::Mutex::new(Some(tx));
     ctrlc::set_handler(move || {
-        if let Some(tx) = victauri_core::acquire_lock(&tx, "ctrlc_handler").take()
-        {
+        if let Some(tx) = victauri_core::acquire_lock(&tx, "ctrlc_handler").take() {
             let _ = tx.send(());
         }
     })
