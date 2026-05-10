@@ -70,7 +70,11 @@ impl TestApp {
     ) -> Result<Self, TestError> {
         let parts: Vec<&str> = cmd.split_whitespace().collect();
         if parts.is_empty() {
-            return Err(TestError::Connection("empty command".into()));
+            return Err(TestError::Connection {
+                host: "127.0.0.1".into(),
+                port: port.unwrap_or(0),
+                reason: "empty command".into(),
+            });
         }
 
         let mut child = Command::new(parts[0])
@@ -78,7 +82,11 @@ impl TestApp {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| TestError::Connection(format!("failed to spawn `{cmd}`: {e}")))?;
+            .map_err(|e| TestError::Connection {
+                host: "127.0.0.1".into(),
+                port: port.unwrap_or(0),
+                reason: format!("failed to spawn `{cmd}`: {e}"),
+            })?;
 
         let (stderr_lines, stderr_thread) = spawn_stderr_reader(child.stderr.take());
 
@@ -111,7 +119,11 @@ impl TestApp {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| TestError::Connection(format!("failed to spawn demo-app: {e}")))?;
+            .map_err(|e| TestError::Connection {
+                host: "127.0.0.1".into(),
+                port,
+                reason: format!("failed to spawn demo-app: {e}"),
+            })?;
 
         let (stderr_lines, stderr_thread) = spawn_stderr_reader(child.stderr.take());
 
@@ -150,13 +162,18 @@ impl TestApp {
             .timeout(Duration::from_secs(5))
             .send()
             .await
-            .map_err(|e| TestError::Connection(format!("health check failed: {e}")))?;
+            .map_err(|e| TestError::Connection {
+                host: "127.0.0.1".into(),
+                port,
+                reason: format!("health check failed: {e}"),
+            })?;
 
         if !resp.status().is_success() {
-            return Err(TestError::Connection(format!(
-                "health returned {}",
-                resp.status()
-            )));
+            return Err(TestError::Connection {
+                host: "127.0.0.1".into(),
+                port,
+                reason: format!("health returned {}", resp.status()),
+            });
         }
 
         Ok(app)
@@ -183,7 +200,11 @@ impl TestApp {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
-            .map_err(|e| TestError::Connection(e.to_string()))?;
+            .map_err(|e| TestError::Connection {
+                host: "127.0.0.1".into(),
+                port: self.port,
+                reason: e.to_string(),
+            })?;
 
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(200);
@@ -191,20 +212,28 @@ impl TestApp {
         loop {
             if start.elapsed() > timeout {
                 let stderr_tail = self.recent_stderr();
-                return Err(TestError::Connection(format!(
-                    "app did not become ready within {}s — check that the Victauri plugin is \
-                     initialized and the MCP server is listening.{stderr_tail}",
-                    timeout.as_secs()
-                )));
+                return Err(TestError::Connection {
+                    host: "127.0.0.1".into(),
+                    port: self.port,
+                    reason: format!(
+                        "app did not become ready within {}s — check that the Victauri plugin is \
+                         initialized and the MCP server is listening.{stderr_tail}",
+                        timeout.as_secs()
+                    ),
+                });
             }
 
             if let Some(ref mut child) = self.child
                 && let Some(status) = child.try_wait().ok().flatten()
             {
                 let stderr_tail = self.recent_stderr();
-                return Err(TestError::Connection(format!(
-                    "app process exited with {status} before becoming ready{stderr_tail}"
-                )));
+                return Err(TestError::Connection {
+                    host: "127.0.0.1".into(),
+                    port: self.port,
+                    reason: format!(
+                        "app process exited with {status} before becoming ready{stderr_tail}"
+                    ),
+                });
             }
 
             let port = self.discover_actual_port();

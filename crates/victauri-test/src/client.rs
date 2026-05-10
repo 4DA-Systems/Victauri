@@ -1,9 +1,106 @@
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::assertions::VerifyBuilder;
 use crate::discovery::{scan_discovery_dirs_for_port, scan_discovery_dirs_for_token};
 use crate::error::TestError;
 use crate::visual::{VisualDiff, VisualOptions};
+
+// ── Typed Response Structs (Phase 4E) ───────────────────────────────────────
+
+/// Structured plugin information returned by [`VictauriClient::plugin_info`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct PluginInfo {
+    /// Plugin version string (e.g. `"0.2.0"`).
+    pub version: String,
+    /// Seconds since the plugin was initialized.
+    pub uptime_secs: f64,
+    /// Number of tools registered by the plugin.
+    pub tool_count: usize,
+    /// Total number of tool invocations served.
+    pub tool_invocations: u64,
+}
+
+/// Structured process memory statistics returned by [`VictauriClient::memory_stats`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct MemoryStats {
+    /// Current working set size in bytes.
+    pub working_set_bytes: u64,
+    /// Peak working set size in bytes, if available.
+    pub peak_working_set_bytes: Option<u64>,
+}
+
+// ── WaitForBuilder (Phase 4B) ───────────────────────────────────────────────
+
+/// Builder for configuring and executing a `wait_for` condition.
+///
+/// Created via [`VictauriClient::wait`]. Provides a fluent API as an
+/// alternative to the positional-argument [`VictauriClient::wait_for`] method.
+///
+/// # Examples
+///
+/// ```rust,ignore
+/// // Wait for text to appear with custom timeout
+/// client.wait("text")
+///     .value("Hello, World!")
+///     .timeout_ms(15_000)
+///     .run()
+///     .await
+///     .unwrap();
+///
+/// // Wait for network idle with fast polling
+/// client.wait("network_idle")
+///     .poll_ms(50)
+///     .run()
+///     .await
+///     .unwrap();
+/// ```
+pub struct WaitForBuilder<'a> {
+    client: &'a mut VictauriClient,
+    condition: String,
+    value: Option<String>,
+    timeout_ms: u64,
+    poll_ms: u64,
+}
+
+impl<'a> WaitForBuilder<'a> {
+    /// Set the value to match against (e.g. the text string for `"text"` condition).
+    #[must_use]
+    pub fn value(mut self, v: &str) -> Self {
+        self.value = Some(v.to_string());
+        self
+    }
+
+    /// Set the maximum time to wait in milliseconds (default: 10 000).
+    #[must_use]
+    pub fn timeout_ms(mut self, ms: u64) -> Self {
+        self.timeout_ms = ms;
+        self
+    }
+
+    /// Set the polling interval in milliseconds (default: 200).
+    #[must_use]
+    pub fn poll_ms(mut self, ms: u64) -> Self {
+        self.poll_ms = ms;
+        self
+    }
+
+    /// Execute the wait, polling until the condition is met or the timeout expires.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn run(self) -> Result<Value, TestError> {
+        self.client
+            .wait_for(
+                &self.condition,
+                self.value.as_deref(),
+                Some(self.timeout_ms),
+                Some(self.poll_ms),
+            )
+            .await
+    }
+}
 
 /// Typed HTTP client for the Victauri MCP server.
 ///
@@ -12,6 +109,8 @@ use crate::visual::{VisualDiff, VisualOptions};
 pub struct VictauriClient {
     http: reqwest::Client,
     base_url: String,
+    host: String,
+    port: u16,
     session_id: String,
     next_id: u64,
     auth_token: Option<String>,
@@ -40,12 +139,17 @@ impl VictauriClient {
     /// returns a non-success status. Returns [`TestError::Request`] on
     /// HTTP transport failures.
     pub async fn connect_with_token(port: u16, token: Option<&str>) -> Result<Self, TestError> {
-        let base_url = format!("http://127.0.0.1:{port}");
+        let host = "127.0.0.1";
+        let base_url = format!("http://{host}:{port}");
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
-            .map_err(|e| TestError::Connection(e.to_string()))?;
+            .map_err(|e| TestError::Connection {
+                host: host.to_string(),
+                port,
+                reason: e.to_string(),
+            })?;
 
         let init_body = json!({
             "jsonrpc": "2.0",
@@ -72,7 +176,11 @@ impl VictauriClient {
             let resp = req
                 .send()
                 .await
-                .map_err(|e| TestError::Connection(e.to_string()))?;
+                .map_err(|e| TestError::Connection {
+                    host: host.to_string(),
+                    port,
+                    reason: e.to_string(),
+                })?;
 
             if resp.status() == 429 && attempt < 3 {
                 let delay = std::time::Duration::from_millis(100 * (1 << attempt));
@@ -84,21 +192,29 @@ impl VictauriClient {
             break;
         }
 
-        let init_resp = init_resp
-            .ok_or_else(|| TestError::Connection("initialize failed after retries".into()))?;
+        let init_resp = init_resp.ok_or_else(|| TestError::Connection {
+            host: host.to_string(),
+            port,
+            reason: "initialize failed after retries".into(),
+        })?;
 
         if !init_resp.status().is_success() {
-            return Err(TestError::Connection(format!(
-                "initialize returned {}",
-                init_resp.status()
-            )));
+            return Err(TestError::Connection {
+                host: host.to_string(),
+                port,
+                reason: format!("initialize returned {}", init_resp.status()),
+            });
         }
 
         let session_id = init_resp
             .headers()
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| TestError::Connection("no mcp-session-id header".into()))?
+            .ok_or_else(|| TestError::Connection {
+                host: host.to_string(),
+                port,
+                reason: "no mcp-session-id header".into(),
+            })?
             .to_string();
 
         let mut notify_req = http
@@ -119,6 +235,8 @@ impl VictauriClient {
         Ok(Self {
             http,
             base_url,
+            host: host.to_string(),
+            port,
             session_id,
             next_id: 10,
             auth_token: token.map(String::from),
@@ -225,9 +343,12 @@ impl VictauriClient {
             break;
         }
 
-        let resp =
-            resp.ok_or_else(|| TestError::Connection("tool call failed after retries".into()))?;
-        let body = Self::parse_response(resp).await?;
+        let resp = resp.ok_or_else(|| TestError::Connection {
+            host: self.host.clone(),
+            port: self.port,
+            reason: "tool call failed after retries".into(),
+        })?;
+        let body = Self::parse_response(resp, &self.host, self.port).await?;
 
         if let Some(error) = body.get("error") {
             return Err(TestError::Mcp {
@@ -263,7 +384,11 @@ impl VictauriClient {
     ///
     /// rmcp's Streamable HTTP transport always returns SSE format with the
     /// JSON-RPC payload in a `data:` line. This method handles both formats.
-    async fn parse_response(resp: reqwest::Response) -> Result<Value, TestError> {
+    async fn parse_response(
+        resp: reqwest::Response,
+        host: &str,
+        port: u16,
+    ) -> Result<Value, TestError> {
         let content_type = resp
             .headers()
             .get("content-type")
@@ -287,15 +412,19 @@ impl VictauriClient {
                     return Ok(parsed);
                 }
             }
-            Err(TestError::Connection(
-                "SSE stream contained no JSON-RPC data".into(),
-            ))
+            Err(TestError::Connection {
+                host: host.to_string(),
+                port,
+                reason: "SSE stream contained no JSON-RPC data".into(),
+            })
         } else {
-            serde_json::from_str(&text).map_err(|e| {
-                TestError::Connection(format!(
+            serde_json::from_str(&text).map_err(|e| TestError::Connection {
+                host: host.to_string(),
+                port,
+                reason: format!(
                     "JSON parse error: {e}, body: {}",
                     &text[..200.min(text.len())]
-                ))
+                ),
             })
         }
     }
@@ -713,6 +842,18 @@ impl VictauriClient {
         &self.base_url
     }
 
+    /// Get the host the client is connected to.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    /// Get the port the client is connected to.
+    #[must_use]
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Get the MCP session ID.
     #[must_use]
     pub fn session_id(&self) -> &str {
@@ -751,23 +892,6 @@ impl VictauriClient {
             .collect())
     }
 
-    /// Snapshot the current IPC log length, for use with `ipc_calls_since`.
-    ///
-    /// # Errors
-    ///
-    /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn ipc_checkpoint(&mut self) -> Result<usize, TestError> {
-        let log = self.get_ipc_log(None).await?;
-        let len = if let Some(arr) = log.as_array() {
-            arr.len()
-        } else if let Some(entries) = log.get("entries").and_then(Value::as_array) {
-            entries.len()
-        } else {
-            0
-        };
-        Ok(len)
-    }
-
     /// Get IPC calls made since a previous checkpoint.
     ///
     /// # Errors
@@ -783,6 +907,101 @@ impl VictauriClient {
             return Ok(Vec::new());
         };
         Ok(entries.into_iter().skip(checkpoint).collect())
+    }
+
+    // ── Builder-Style Wait (Phase 4B) ──────────────────────────────────────────
+
+    /// Start a builder-style wait for a condition.
+    ///
+    /// This is a fluent alternative to [`VictauriClient::wait_for`] that avoids
+    /// positional `Option` arguments.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,ignore
+    /// client.wait("text")
+    ///     .value("Welcome")
+    ///     .timeout_ms(5000)
+    ///     .run()
+    ///     .await
+    ///     .unwrap();
+    /// ```
+    pub fn wait(&mut self, condition: &str) -> WaitForBuilder<'_> {
+        WaitForBuilder {
+            client: self,
+            condition: condition.to_string(),
+            value: None,
+            timeout_ms: 10_000,
+            poll_ms: 200,
+        }
+    }
+
+    // ── Deprecated Aliases (Phase 4C) ────────────────────────────────────────
+
+    /// Snapshot the current IPC log length, for use with `ipc_calls_since`.
+    ///
+    /// Prefer [`VictauriClient::create_ipc_checkpoint`] — this alias exists
+    /// for backwards compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    #[deprecated(since = "0.2.0", note = "renamed to create_ipc_checkpoint")]
+    pub async fn ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+        self.create_ipc_checkpoint().await
+    }
+
+    /// Snapshot the current IPC log length, for use with `ipc_calls_since`.
+    ///
+    /// Returns the number of IPC calls recorded so far. Pass this value to
+    /// [`VictauriClient::ipc_calls_since`] to get only the calls that occurred
+    /// after the checkpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn create_ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+        let log = self.get_ipc_log(None).await?;
+        let len = if let Some(arr) = log.as_array() {
+            arr.len()
+        } else if let Some(entries) = log.get("entries").and_then(Value::as_array) {
+            entries.len()
+        } else {
+            0
+        };
+        Ok(len)
+    }
+
+    // ── Typed Response Methods (Phase 4E) ────────────────────────────────────
+
+    /// Read plugin info as a typed [`PluginInfo`] struct.
+    ///
+    /// This is a typed alternative to [`VictauriClient::get_plugin_info`] which
+    /// returns raw JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Other`] if the response cannot be deserialized.
+    /// Returns other errors from [`VictauriClient::call_tool`].
+    pub async fn plugin_info(&mut self) -> Result<PluginInfo, TestError> {
+        let value = self.get_plugin_info().await?;
+        serde_json::from_value(value)
+            .map_err(|e| TestError::Other(format!("failed to deserialize PluginInfo: {e}")))
+    }
+
+    /// Read process memory statistics as a typed [`MemoryStats`] struct.
+    ///
+    /// This is a typed alternative to [`VictauriClient::get_memory_stats`] which
+    /// returns raw JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Other`] if the response cannot be deserialized.
+    /// Returns other errors from [`VictauriClient::call_tool`].
+    pub async fn memory_stats(&mut self) -> Result<MemoryStats, TestError> {
+        let value = self.get_memory_stats().await?;
+        serde_json::from_value(value)
+            .map_err(|e| TestError::Other(format!("failed to deserialize MemoryStats: {e}")))
     }
 
     // ── Fluent Verification Builder ───────────────────────────────────────────

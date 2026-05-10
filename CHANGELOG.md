@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **victauri-plugin**: Origin guard rewritten with URL parsing — `starts_with("http://localhost")` replaced with `url::Url::parse()` + host comparison, blocking `localhost.evil.com` and `localhost@evil.com` prefix smuggling attacks
+- **victauri-plugin**: Action-level privacy in strict mode — `invoke_command`, `window.manage`, `window.resize`, `window.move_to`, `window.set_title` now blocked alongside existing tool-level gates
+- **victauri-plugin**: `file:` URL navigation blocked by default — `VictauriBuilder::allow_file_navigation()` to opt in
+- **victauri-plugin**: `RegexSet::new().expect()` replaced with match + tracing fallback
+- **victauri-plugin**: `deflate_compress` returns `Result` instead of panicking
+
 ### Added
 
+- **victauri-core**: `acquire_lock`, `acquire_read`, `acquire_write` helpers for mutex/rwlock poisoning recovery with tracing diagnostics (replaces 28 raw `PoisonError::into_inner` calls)
+- **victauri-core**: `DomElement.attributes` and `DomSnapshot.ref_map` changed from `HashMap` to `BTreeMap` for deterministic serialization
+- **victauri-test**: Per-process server discovery directories (`<temp>/victauri/<pid>/`) for CI parallelism with TCP-based liveness filtering
+- **victauri-test**: `TestApp` stderr capture — connection timeout errors now include last 10 lines of app stderr
+- **victauri-test**: 12 new `VictauriClient` methods: `double_click`, `hover`, `click_by_selector`, `fill_by_text`, `fill_by_selector`, `select_option_by_id`, `select_option_by_text`, `select_option_by_selector`, `scroll_to_by_id`, `scroll_to_by_selector`, `double_click_by_id`, `double_click_by_text`
+- **victauri-test**: Codegen compile test harness validates all generated method names exist on `VictauriClient`
+- **victauri-plugin**: Centralized output redaction at `call_tool` boundary — applies to all text responses uniformly
+- **victauri-plugin**: Per-process metadata.json written alongside port/token files (PID, port, version, timestamp)
+- **victauri-cli**: `--allow-empty-registry` flag for `coverage` command; exits 1 on empty registry by default
+- CI coverage job with `cargo-llvm-cov` and Codecov upload
+- Release workflow: dry-run + test gate before publish, `victauri-cli` added to publish sequence
+- `MIGRATION.md` — upgrade guide for v0.1.x → v0.2.0
 - **victauri-test**: Visual regression testing — `compare_screenshot()` with pixel-level PNG diffing, configurable channel tolerance, diff image generation, RGB/Grayscale auto-conversion
 - **victauri-test**: `VictauriClient::screenshot_visual()` convenience method — capture + compare in one call
 - **victauri-test**: IPC coverage tracking — `coverage_report()` compares registered commands against observed calls, `assert_coverage_above()` for threshold enforcement
@@ -23,6 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **victauri-cli**: `record` command — connect to running app, capture interactions, generate test file
 - **victauri-cli**: `watch` command — re-run tests automatically on file changes via `notify` crate
 - **victauri-cli**: `init` command — scaffold test directory with starter smoke tests
+- **victauri-test**: `WaitForBuilder` fluent API — `client.wait("text").value("Hello").timeout_ms(15_000).run().await` as alternative to positional `wait_for()`
+- **victauri-test**: `PluginInfo` and `MemoryStats` typed response structs — `plugin_info()` and `memory_stats()` methods with deserialized returns alongside raw JSON `get_plugin_info()`/`get_memory_stats()`
+- **victauri-test**: `create_ipc_checkpoint()` verb-first canonical name — `ipc_checkpoint()` deprecated with forwarding alias
+- **victauri-test**: `TestError::Connection` now carries structured `host`, `port`, `reason` fields instead of a flat string
+- **victauri-test**: `VictauriClient` exposes `host()` and `port()` accessors
+- **victauri-plugin**: `logs` tool `wait_for_capture` parameter — polls up to 500ms for pending IPC responses before returning log, eliminating race conditions in test assertions
 
 ## [0.1.2] - 2026-05-07
 

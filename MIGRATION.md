@@ -35,6 +35,20 @@ The API is identical — `BTreeMap` implements the same traits. If you were cons
 
 If your strict-mode tests used these tools, either switch to default mode or selectively re-enable them via `disable_tools()`.
 
+#### `TestError::Connection` is now a struct variant
+
+`TestError::Connection(String)` changed to `TestError::Connection { host, port, reason }` for richer diagnostics. Update pattern matches:
+
+```rust
+// Before
+Err(TestError::Connection(msg)) => eprintln!("{msg}"),
+
+// After
+Err(TestError::Connection { host, port, reason }) => {
+    eprintln!("failed to reach {host}:{port}: {reason}");
+}
+```
+
 ### New Features
 
 - **`VictauriBuilder::allow_file_navigation()`** — opt in to `file://` URL navigation
@@ -47,4 +61,4 @@ If your strict-mode tests used these tools, either switch to default mode or sel
 
 ### Deprecations
 
-None in this release — all existing public APIs remain unchanged.
+- **`ipc_checkpoint()`** → renamed to **`create_ipc_checkpoint()`** (verb-first naming). The old name still works with a deprecation warning and forwards to the new method.

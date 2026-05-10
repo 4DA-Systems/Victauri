@@ -1123,7 +1123,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls).",
+        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to poll up to 500ms for pending responses), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1157,14 +1157,59 @@ impl VictauriMcpHandler {
                     .await
             }
             LogsAction::Ipc => {
+                let wait = params.wait_for_capture.unwrap_or(false);
                 let limit_arg = params.limit.map(|l| format!("{l}")).unwrap_or_default();
-                let code = if limit_arg.is_empty() {
-                    "return window.__VICTAURI__?.getIpcLog()".to_string()
+                if wait {
+                    // Poll until the latest IPC entry has duration_ms populated
+                    // (meaning its response was captured), up to 500ms.
+                    let limit_js = if limit_arg.is_empty() {
+                        "undefined".to_string()
+                    } else {
+                        limit_arg.clone()
+                    };
+                    let code = format!(
+                        r"return (async function() {{
+                            var maxWait = 500;
+                            var interval = 50;
+                            var elapsed = 0;
+                            while (elapsed < maxWait) {{
+                                var log = window.__VICTAURI__?.getIpcLog() || [];
+                                if (log.length > 0) {{
+                                    var last = log[log.length - 1];
+                                    if (last.duration_ms !== null && last.duration_ms !== undefined) {{
+                                        var lim = {limit_js};
+                                        return (lim !== undefined) ? log.slice(-lim) : log;
+                                    }}
+                                }}
+                                await new Promise(function(r) {{ setTimeout(r, interval); }});
+                                elapsed += interval;
+                            }}
+                            var log = window.__VICTAURI__?.getIpcLog() || [];
+                            var lim = {limit_js};
+                            return (lim !== undefined) ? log.slice(-lim) : log;
+                        }})()"
+                    );
+                    let timeout = std::time::Duration::from_millis(5000);
+                    match self
+                        .eval_with_return_timeout(
+                            &code,
+                            params.webview_label.as_deref(),
+                            timeout,
+                        )
+                        .await
+                    {
+                        Ok(result) => CallToolResult::success(vec![Content::text(result)]),
+                        Err(e) => tool_error(e),
+                    }
                 } else {
-                    format!("return window.__VICTAURI__?.getIpcLog({limit_arg})")
-                };
-                self.eval_bridge(&code, params.webview_label.as_deref())
-                    .await
+                    let code = if limit_arg.is_empty() {
+                        "return window.__VICTAURI__?.getIpcLog()".to_string()
+                    } else {
+                        format!("return window.__VICTAURI__?.getIpcLog({limit_arg})")
+                    };
+                    self.eval_bridge(&code, params.webview_label.as_deref())
+                        .await
+                }
             }
             LogsAction::Navigation => {
                 self.eval_bridge(

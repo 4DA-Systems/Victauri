@@ -3,8 +3,15 @@
 #[non_exhaustive]
 pub enum TestError {
     /// Failed to connect to the Victauri MCP server at the expected port.
-    #[error("connection failed: {0}")]
-    Connection(String),
+    #[error("connection failed ({host}:{port}): {reason}")]
+    Connection {
+        /// Host that was targeted (typically `"127.0.0.1"`).
+        host: String,
+        /// Port that was targeted.
+        port: u16,
+        /// Human-readable explanation of what went wrong.
+        reason: String,
+    },
 
     /// An HTTP-level error occurred during an MCP request.
     #[error("MCP request failed: {0}")]

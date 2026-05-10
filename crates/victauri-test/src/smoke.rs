@@ -419,7 +419,11 @@ impl VictauriClient {
             .get(&url)
             .send()
             .await
-            .map_err(|e| TestError::Connection(e.to_string()))?;
+            .map_err(|e| TestError::Connection {
+                host: self.host().to_string(),
+                port: self.port(),
+                reason: e.to_string(),
+            })?;
         if !resp.status().is_success() {
             return Err(TestError::Assertion(format!(
                 "/health returned status {}",
@@ -429,7 +433,11 @@ impl VictauriClient {
         let text = resp
             .text()
             .await
-            .map_err(|e| TestError::Connection(e.to_string()))?;
+            .map_err(|e| TestError::Connection {
+                host: self.host().to_string(),
+                port: self.port(),
+                reason: e.to_string(),
+            })?;
         let json: Value = serde_json::from_str(&text).map_err(|_| {
             TestError::Assertion(format!(
                 "/health returned non-JSON: {}",

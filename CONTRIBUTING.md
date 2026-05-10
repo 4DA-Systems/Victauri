@@ -14,7 +14,7 @@ Requires Rust 1.88+ (edition 2024).
 ## Running Tests
 
 ```bash
-cargo test --workspace          # All tests (838)
+cargo test --workspace          # All tests
 cargo test -p victauri-core     # Core crate only
 cargo test -p victauri-plugin   # Plugin crate only
 cargo bench -p victauri-core    # Criterion benchmarks (16)
@@ -46,6 +46,7 @@ All checks (test, clippy, fmt) must pass. CI runs them on Linux, Windows, and ma
 | `victauri-macros` | `#[inspectable]` proc macro |
 | `victauri-plugin` | Tauri plugin: MCP server, JS bridge, auth, privacy |
 | `victauri-test` | Typed MCP HTTP client + assertion helpers for CI testing |
+| `victauri-cli` | CLI: init, check, record, coverage, watch |
 | `victauri-watchdog` | Health-check sidecar |
 
 ## Adding MCP Tools
@@ -68,7 +69,7 @@ cargo build -p demo-app
 Maintainers only. Push a `v*` tag and the release workflow handles publication in dependency order:
 
 ```
-victauri-core -> victauri-macros -> victauri-plugin -> victauri-test -> victauri-watchdog
+victauri-core -> victauri-macros -> victauri-plugin -> victauri-test -> victauri-cli -> victauri-watchdog
 ```
 
 ## License
