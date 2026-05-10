@@ -169,7 +169,7 @@ fn build_report(registered: &[String], called: &[String]) -> Result<CoverageRepo
         }
     }
 
-    most_called.sort_by(|a, b| b.calls.cmp(&a.calls));
+    most_called.sort_by_key(|c| std::cmp::Reverse(c.calls));
     untested.sort();
 
     let coverage_percentage = if total_commands == 0 {
