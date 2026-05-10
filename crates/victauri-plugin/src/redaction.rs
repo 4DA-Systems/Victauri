@@ -92,16 +92,30 @@ impl Redactor {
 
     /// Build a redactor with custom patterns, logging a warning and skipping any invalid patterns.
     ///
-    /// # Panics
-    ///
-    /// Panics if the built-in redaction patterns fail to compile (this is a bug).
+    /// If the built-in redaction patterns fail to compile (a bug), falls back to
+    /// an empty set and logs an error rather than panicking.
     pub fn new(custom_patterns: &[String]) -> Self {
-        let builtin_set =
-            RegexSet::new(BUILTIN_PATTERNS).expect("builtin redaction patterns must compile");
-        let builtin_compiled: Vec<regex::Regex> = BUILTIN_PATTERNS
-            .iter()
-            .filter_map(|p| regex::Regex::new(p).ok())
-            .collect();
+        let (builtin_set, builtin_compiled) = match RegexSet::new(BUILTIN_PATTERNS) {
+            Ok(set) => {
+                let compiled: Vec<regex::Regex> = BUILTIN_PATTERNS
+                    .iter()
+                    .filter_map(|p| regex::Regex::new(p).ok())
+                    .collect();
+                (set, compiled)
+            }
+            Err(e) => {
+                tracing::error!(
+                    "BUG: built-in redaction patterns failed to compile: {e}. \
+                     Redaction will be disabled."
+                );
+                // Fall back to an empty set so the process survives.
+                // An empty RegexSet always compiles successfully.
+                let empty: Vec<String> = Vec::new();
+                let empty_set =
+                    RegexSet::new(&empty).unwrap_or_else(|_| unreachable!());
+                (empty_set, Vec::new())
+            }
+        };
 
         let (custom_set, custom_compiled) = if custom_patterns.is_empty() {
             (None, Vec::new())

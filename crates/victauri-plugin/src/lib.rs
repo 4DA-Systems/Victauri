@@ -129,6 +129,10 @@ pub struct VictauriState {
     pub started_at: std::time::Instant,
     /// Total number of MCP tool invocations since startup.
     pub tool_invocations: AtomicU64,
+    /// Whether `file:` URLs are allowed in the `navigate` tool's `go_to` action.
+    /// Defaults to `false` — only `http` and `https` are permitted unless opted in
+    /// via [`VictauriBuilder::allow_file_navigation`].
+    pub allow_file_navigation: bool,
 }
 
 /// Builder for configuring the Victauri plugin before adding it to a Tauri app.
@@ -157,6 +161,7 @@ pub struct VictauriBuilder {
     bridge_capacities: js_bridge::BridgeCapacities,
     on_ready: Option<Box<dyn FnOnce(u16) + Send + 'static>>,
     commands: Vec<victauri_core::CommandInfo>,
+    allow_file_navigation: bool,
 }
 
 impl Default for VictauriBuilder {
@@ -177,6 +182,7 @@ impl Default for VictauriBuilder {
             bridge_capacities: js_bridge::BridgeCapacities::default(),
             on_ready: None,
             commands: Vec::new(),
+            allow_file_navigation: false,
         }
     }
 }
@@ -357,6 +363,20 @@ impl VictauriBuilder {
         self
     }
 
+    /// Allow `file:` URLs in the `navigate` tool's `go_to` action.
+    ///
+    /// By default, only `http` and `https` schemes are permitted. Calling this
+    /// method opts in to `file:` navigation, which grants the MCP client access
+    /// to local filesystem paths via the webview.
+    ///
+    /// **Warning:** Enabling this in untrusted environments exposes local files
+    /// to any process that can reach the MCP server.
+    #[must_use]
+    pub fn allow_file_navigation(mut self) -> Self {
+        self.allow_file_navigation = true;
+        self
+    }
+
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
     #[must_use]
@@ -477,6 +497,7 @@ impl VictauriBuilder {
             let eval_timeout = self.resolve_eval_timeout();
             let auth_token = self.resolve_auth_token();
             let privacy_config = self.build_privacy_config();
+            let allow_file_navigation = self.allow_file_navigation;
             let on_ready = self.on_ready;
             let commands = self.commands;
             let js_init = js_bridge::init_script(&self.bridge_capacities);
@@ -498,6 +519,7 @@ impl VictauriBuilder {
                         shutdown_tx,
                         started_at: std::time::Instant::now(),
                         tool_invocations: AtomicU64::new(0),
+                        allow_file_navigation,
                     });
 
                     app.manage(state.clone());
@@ -781,6 +803,21 @@ mod tests {
     fn builder_on_ready_sets_callback() {
         let builder = VictauriBuilder::new().on_ready(|_port| {});
         assert!(builder.on_ready.is_some());
+    }
+
+    #[test]
+    fn builder_file_navigation_disabled_by_default() {
+        let builder = VictauriBuilder::new();
+        assert!(
+            !builder.allow_file_navigation,
+            "file navigation should be disabled by default"
+        );
+    }
+
+    #[test]
+    fn builder_allow_file_navigation() {
+        let builder = VictauriBuilder::new().allow_file_navigation();
+        assert!(builder.allow_file_navigation);
     }
 
     #[test]

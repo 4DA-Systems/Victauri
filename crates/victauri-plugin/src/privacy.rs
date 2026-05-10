@@ -57,6 +57,11 @@ const STRICT_DISABLED_TOOLS: &[&str] = &[
     "set_dialog_response",
     "fill",
     "type_text",
+    "invoke_command",
+    "window.manage",
+    "window.resize",
+    "window.move_to",
+    "window.set_title",
 ];
 
 /// Create a [`PrivacyConfig`] that disables dangerous tools (eval, screenshot, mutations) and enables redaction.
@@ -138,9 +143,30 @@ mod tests {
         assert!(!config.is_tool_enabled("screenshot"));
         assert!(!config.is_tool_enabled("inject_css"));
         assert!(!config.is_tool_enabled("navigate"));
+        assert!(!config.is_tool_enabled("invoke_command"));
         assert!(config.is_tool_enabled("dom_snapshot"));
         assert!(config.is_tool_enabled("get_window_state"));
         assert!(config.redaction_enabled);
+    }
+
+    #[test]
+    fn strict_mode_blocks_window_mutations() {
+        let config = strict_privacy_config();
+        assert!(!config.is_tool_enabled("window.manage"));
+        assert!(!config.is_tool_enabled("window.resize"));
+        assert!(!config.is_tool_enabled("window.move_to"));
+        assert!(!config.is_tool_enabled("window.set_title"));
+        assert!(config.is_tool_enabled("window"));
+    }
+
+    #[test]
+    fn default_allows_all_actions() {
+        let config = PrivacyConfig::default();
+        assert!(config.is_tool_enabled("invoke_command"));
+        assert!(config.is_tool_enabled("window.manage"));
+        assert!(config.is_tool_enabled("window.resize"));
+        assert!(config.is_tool_enabled("window.move_to"));
+        assert!(config.is_tool_enabled("window.set_title"));
     }
 
     #[test]

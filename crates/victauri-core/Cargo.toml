@@ -26,6 +26,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 schemars = { workspace = true, optional = true }
 inventory = "0.3"
+tracing = { workspace = true }
 
 [features]
 schema = ["dep:schemars"]

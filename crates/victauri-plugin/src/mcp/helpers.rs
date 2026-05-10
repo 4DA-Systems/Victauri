@@ -62,13 +62,24 @@ pub fn missing_param(param: &str, action: &str) -> CallToolResult {
     )
 }
 
-pub fn validate_url(url: &str) -> Result<(), String> {
+/// Validate a URL for navigation.
+///
+/// Only `http` and `https` schemes are allowed by default. The `file` scheme
+/// is blocked unless `allow_file` is `true` (opt-in via
+/// [`VictauriBuilder::allow_file_navigation`](crate::VictauriBuilder::allow_file_navigation)).
+pub fn validate_url(url: &str, allow_file: bool) -> Result<(), String> {
     let trimmed: String = url.chars().filter(|c| !c.is_control()).collect();
     match url::Url::parse(&trimmed) {
         Ok(parsed) => match parsed.scheme() {
-            "http" | "https" | "file" => Ok(()),
+            "http" | "https" => Ok(()),
+            "file" if allow_file => Ok(()),
+            "file" => Err(
+                "scheme 'file' is not allowed by default; enable with \
+                 VictauriBuilder::allow_file_navigation()"
+                    .to_string(),
+            ),
             scheme => Err(format!(
-                "scheme '{scheme}' is not allowed; use http, https, or file"
+                "scheme '{scheme}' is not allowed; use http or https"
             )),
         },
         Err(e) => Err(format!("invalid URL: {e}")),

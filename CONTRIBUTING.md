@@ -34,8 +34,7 @@ All checks (test, clippy, fmt) must pass. CI runs them on Linux, Windows, and ma
 - All value-returning public functions must have `#[must_use]`
 - Prefer `let...else` over match for single-pattern extraction with early return
 - Prefer `map_or` over `map().unwrap_or()`
-- Use method references (`PoisonError::into_inner`) over closures (`|e| e.into_inner()`)
-- No `unwrap()` on mutexes or RwLocks — use `unwrap_or_else(PoisonError::into_inner)` for poisoning recovery
+- No `unwrap()` on mutexes or RwLocks — use `victauri_core::acquire_lock`, `acquire_read`, or `acquire_write` helpers for poisoning recovery with diagnostic logging
 - No `unreachable!()` in match arms that could be reached by malformed input
 - `unsafe_code = "deny"` is enforced workspace-wide — use targeted `#[allow(unsafe_code)]` with `// SAFETY:` comments for FFI
 

@@ -69,6 +69,9 @@ enum Commands {
         /// Write coverage as `JUnit` XML report to this path
         #[arg(long)]
         junit: Option<PathBuf>,
+        /// Allow empty registry (zero commands) without failing
+        #[arg(long)]
+        allow_empty_registry: bool,
     },
 }
 
@@ -97,8 +100,12 @@ async fn main() -> Result<()> {
         Commands::Watch { dir, filter } => {
             cmd_watch(&dir, filter.as_deref()).await?;
         }
-        Commands::Coverage { threshold, junit } => {
-            cmd_coverage(threshold, junit.as_deref()).await?;
+        Commands::Coverage {
+            threshold,
+            junit,
+            allow_empty_registry,
+        } => {
+            cmd_coverage(threshold, junit.as_deref(), allow_empty_registry).await?;
         }
     }
 
@@ -341,7 +348,11 @@ async fn cmd_test(max_load_ms: u64, max_heap_mb: f64, junit_path: Option<&Path>)
     Ok(())
 }
 
-async fn cmd_coverage(threshold: Option<f64>, junit_path: Option<&Path>) -> Result<()> {
+async fn cmd_coverage(
+    threshold: Option<f64>,
+    junit_path: Option<&Path>,
+    allow_empty_registry: bool,
+) -> Result<()> {
     eprintln!("Connecting to running Victauri server...\n");
 
     let mut client = match victauri_test::VictauriClient::discover().await {
@@ -358,6 +369,16 @@ async fn cmd_coverage(threshold: Option<f64>, junit_path: Option<&Path>) -> Resu
     let report = victauri_test::coverage::coverage_report(&mut client)
         .await
         .context("failed to generate coverage report")?;
+
+    if report.total_commands == 0 && !allow_empty_registry {
+        eprintln!("WARNING: No commands registered. Coverage cannot be computed.");
+        eprintln!(
+            "Hint: Use #[inspectable] on your Tauri commands and call \
+             .auto_discover() on VictauriBuilder."
+        );
+        eprintln!("\nPass --allow-empty-registry to suppress this error.");
+        std::process::exit(1);
+    }
 
     let summary = report.to_summary();
     eprintln!("{summary}");
@@ -431,10 +452,7 @@ async fn cmd_record(output: &Path, test_name: &str) -> Result<()> {
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let tx = std::sync::Mutex::new(Some(tx));
     ctrlc::set_handler(move || {
-        if let Some(tx) = tx
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
+        if let Some(tx) = victauri_core::acquire_lock(&tx, "ctrlc_handler").take()
         {
             let _ = tx.send(());
         }

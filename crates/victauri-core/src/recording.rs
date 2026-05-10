@@ -104,10 +104,7 @@ impl EventRecorder {
     /// assert!(recorder.is_recording());
     /// ```
     pub fn start(&self, session_id: String) -> crate::error::Result<()> {
-        let mut rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
         if rec.is_some() {
             return Err(VictauriError::RecordingAlreadyActive);
         }
@@ -138,10 +135,7 @@ impl EventRecorder {
     /// ```
     #[must_use]
     pub fn stop(&self) -> Option<RecordedSession> {
-        let mut rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
         rec.take().map(|r| RecordedSession {
             id: r.session_id,
             started_at: r.started_at,
@@ -153,18 +147,13 @@ impl EventRecorder {
     /// Returns true if a recording session is currently active.
     #[must_use]
     pub fn is_recording(&self) -> bool {
-        self.recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.recording, "EventRecorder")
             .is_some()
     }
 
     /// Appends an event to the active recording, evicting the oldest if at capacity.
     pub fn record_event(&self, event: AppEvent) {
-        let mut rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
         if let Some(ref mut active) = *rec {
             let timestamp = event.timestamp();
             let index = active.event_counter;
@@ -193,10 +182,7 @@ impl EventRecorder {
         label: Option<String>,
         state: serde_json::Value,
     ) -> crate::error::Result<()> {
-        let mut rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
         if let Some(ref mut active) = *rec {
             let event_index = active.event_counter;
             if active.checkpoints.len() >= active.max_checkpoints {
@@ -218,9 +204,7 @@ impl EventRecorder {
     /// Returns the number of events recorded so far, or 0 if not recording.
     #[must_use]
     pub fn event_count(&self) -> usize {
-        self.recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.recording, "EventRecorder")
             .as_ref()
             .map_or(0, |r| r.events.len())
     }
@@ -228,9 +212,7 @@ impl EventRecorder {
     /// Returns the number of checkpoints created so far, or 0 if not recording.
     #[must_use]
     pub fn checkpoint_count(&self) -> usize {
-        self.recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.recording, "EventRecorder")
             .as_ref()
             .map_or(0, |r| r.checkpoints.len())
     }
@@ -238,10 +220,7 @@ impl EventRecorder {
     /// Returns all events with an index >= the given value.
     #[must_use]
     pub fn events_since(&self, index: usize) -> Vec<RecordedEvent> {
-        let rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rec = crate::acquire_lock(&self.recording, "EventRecorder");
         match rec.as_ref() {
             Some(active) => active
                 .events
@@ -256,10 +235,7 @@ impl EventRecorder {
     /// Returns events whose timestamps fall within the given inclusive range.
     #[must_use]
     pub fn events_between(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Vec<RecordedEvent> {
-        let rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rec = crate::acquire_lock(&self.recording, "EventRecorder");
         match rec.as_ref() {
             Some(active) => active
                 .events
@@ -274,10 +250,7 @@ impl EventRecorder {
     /// Returns all checkpoints from the active recording session.
     #[must_use]
     pub fn get_checkpoints(&self) -> Vec<StateCheckpoint> {
-        let rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rec = crate::acquire_lock(&self.recording, "EventRecorder");
         match rec.as_ref() {
             Some(active) => active.checkpoints.iter().cloned().collect(),
             None => Vec::new(),
@@ -295,10 +268,7 @@ impl EventRecorder {
         from_checkpoint_id: &str,
         to_checkpoint_id: &str,
     ) -> crate::error::Result<Vec<RecordedEvent>> {
-        let rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rec = crate::acquire_lock(&self.recording, "EventRecorder");
         let active = rec.as_ref().ok_or(VictauriError::NoActiveRecording)?;
 
         let from_idx = active
@@ -335,10 +305,7 @@ impl EventRecorder {
     /// Snapshot the current recording as a session WITHOUT stopping it.
     #[must_use]
     pub fn export(&self) -> Option<RecordedSession> {
-        let rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rec = crate::acquire_lock(&self.recording, "EventRecorder");
         rec.as_ref().map(|r| RecordedSession {
             id: r.session_id.clone(),
             started_at: r.started_at,
@@ -351,10 +318,7 @@ impl EventRecorder {
     pub fn import(&self, session: RecordedSession) {
         let event_counter = session.events.last().map_or(0, |e| e.index + 1);
         let max_events = self.max_events;
-        let mut rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
         *rec = Some(ActiveRecording {
             session_id: session.id,
             started_at: session.started_at,
@@ -369,10 +333,7 @@ impl EventRecorder {
     /// Extracts IPC calls in order from the recording for replay.
     #[must_use]
     pub fn ipc_replay_sequence(&self) -> Vec<IpcCall> {
-        let rec = self
-            .recording
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let rec = crate::acquire_lock(&self.recording, "EventRecorder");
         match rec.as_ref() {
             Some(active) => active
                 .events

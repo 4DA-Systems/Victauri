@@ -206,10 +206,7 @@ impl EventLog {
     /// assert_eq!(log.snapshot().len(), 1);
     /// ```
     pub fn push(&self, event: AppEvent) {
-        let mut events = self
-            .events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut events = crate::acquire_lock(&self.events, "EventLog");
         if events.len() >= self.max_capacity {
             events.pop_front();
         }
@@ -219,9 +216,7 @@ impl EventLog {
     /// Returns a clone of all events currently in the log.
     #[must_use]
     pub fn snapshot(&self) -> Vec<AppEvent> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .iter()
             .cloned()
             .collect()
@@ -230,9 +225,7 @@ impl EventLog {
     /// Returns a paginated slice of events starting at `offset`, up to `limit` items.
     #[must_use]
     pub fn snapshot_range(&self, offset: usize, limit: usize) -> Vec<AppEvent> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .iter()
             .skip(offset)
             .take(limit)
@@ -243,9 +236,7 @@ impl EventLog {
     /// Returns all events with a timestamp at or after the given time.
     #[must_use]
     pub fn since(&self, timestamp: DateTime<Utc>) -> Vec<AppEvent> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .iter()
             .filter(|e| e.timestamp() >= timestamp)
             .cloned()
@@ -274,9 +265,7 @@ impl EventLog {
     /// ```
     #[must_use]
     pub fn ipc_calls(&self) -> Vec<IpcCall> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .iter()
             .filter_map(|e| match e {
                 AppEvent::Ipc(call) => Some(call.clone()),
@@ -288,9 +277,7 @@ impl EventLog {
     /// Returns IPC calls with a timestamp at or after the given time.
     #[must_use]
     pub fn ipc_calls_since(&self, timestamp: DateTime<Utc>) -> Vec<IpcCall> {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .iter()
             .filter_map(|e| match e {
                 AppEvent::Ipc(call) if call.timestamp >= timestamp => Some(call.clone()),
@@ -302,26 +289,20 @@ impl EventLog {
     /// Returns the number of events currently in the log.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .len()
     }
 
     /// Returns true if the log contains no events.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .is_empty()
     }
 
     /// Removes all events from the log.
     pub fn clear(&self) {
-        self.events
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_lock(&self.events, "EventLog")
             .clear();
     }
 }

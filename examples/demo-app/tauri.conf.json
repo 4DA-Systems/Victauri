@@ -1,6 +1,6 @@
 {
   "productName": "victauri-demo",
-  "identifier": "ai.4da.victauri.demo",
+  "identifier": "com.example.victauri-demo",
   "build": {
     "frontendDist": "frontend"
   },

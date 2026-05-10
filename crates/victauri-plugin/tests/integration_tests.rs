@@ -1036,6 +1036,7 @@ async fn state_port_reflected_in_info() {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         started_at: std::time::Instant::now(),
         tool_invocations: std::sync::atomic::AtomicU64::new(0),
+        allow_file_navigation: false,
     });
 
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(&["main"]));
@@ -1098,6 +1099,7 @@ fn builder_custom_port_reflected_in_state() {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         started_at: std::time::Instant::now(),
         tool_invocations: std::sync::atomic::AtomicU64::new(0),
+        allow_file_navigation: false,
     });
 
     assert_eq!(state.port.load(std::sync::atomic::Ordering::Relaxed), 8888);
@@ -1355,6 +1357,7 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         started_at: std::time::Instant::now(),
         tool_invocations: std::sync::atomic::AtomicU64::new(0),
+        allow_file_navigation: false,
     })
 }
 

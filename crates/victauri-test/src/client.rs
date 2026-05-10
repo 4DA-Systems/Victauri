@@ -219,7 +219,16 @@ impl VictauriClient {
         if let Some(error) = body.get("error") {
             return Err(TestError::Mcp {
                 code: error["code"].as_i64().unwrap_or(-1),
-                message: error["message"].as_str().unwrap_or("unknown").to_string(),
+                message: error["message"].as_str().map_or_else(
+                    || {
+                        format!(
+                            "unknown error (raw: {})",
+                            serde_json::to_string(error)
+                                .unwrap_or_else(|_| "<unparseable>".into())
+                        )
+                    },
+                    String::from,
+                ),
             });
         }
 

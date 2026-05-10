@@ -128,6 +128,7 @@ fn test_state() -> Arc<VictauriState> {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         started_at: std::time::Instant::now(),
         tool_invocations: std::sync::atomic::AtomicU64::new(0),
+        allow_file_navigation: false,
     })
 }
 
@@ -143,6 +144,7 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
         shutdown_tx: tokio::sync::watch::channel(false).0,
         started_at: std::time::Instant::now(),
         tool_invocations: std::sync::atomic::AtomicU64::new(0),
+        allow_file_navigation: false,
     })
 }
 

@@ -135,18 +135,14 @@ impl CommandRegistry {
     /// assert!(registry.get("greet").is_some());
     /// ```
     pub fn register(&self, info: CommandInfo) {
-        self.commands
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_write(&self.commands, "CommandRegistry")
             .insert(info.name.clone(), info);
     }
 
     /// Looks up a command by exact name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<CommandInfo> {
-        self.commands
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_read(&self.commands, "CommandRegistry")
             .get(name)
             .cloned()
     }
@@ -154,9 +150,7 @@ impl CommandRegistry {
     /// Returns all registered commands in alphabetical order.
     #[must_use]
     pub fn list(&self) -> Vec<CommandInfo> {
-        self.commands
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_read(&self.commands, "CommandRegistry")
             .values()
             .cloned()
             .collect()
@@ -165,9 +159,7 @@ impl CommandRegistry {
     /// Returns the number of registered commands.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.commands
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_read(&self.commands, "CommandRegistry")
             .len()
     }
 
@@ -189,9 +181,7 @@ impl CommandRegistry {
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<CommandInfo> {
         let query_lower = query.to_lowercase();
-        self.commands
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::acquire_read(&self.commands, "CommandRegistry")
             .values()
             .filter(|cmd| {
                 cmd.name.to_lowercase().contains(&query_lower)
@@ -230,10 +220,7 @@ impl CommandRegistry {
             return Vec::new();
         }
 
-        let mut scored: Vec<ScoredCommand> = self
-            .commands
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        let mut scored: Vec<ScoredCommand> = crate::acquire_read(&self.commands, "CommandRegistry")
             .values()
             .filter_map(|cmd| {
                 let score = score_command(cmd, &query_lower, &query_words);

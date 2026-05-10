@@ -164,6 +164,9 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<InvokeCommandParams>,
     ) -> CallToolResult {
+        if !self.state.privacy.is_tool_enabled("invoke_command") {
+            return tool_disabled("invoke_command");
+        }
         if !self.state.privacy.is_command_allowed(&params.command) {
             return tool_error(format!(
                 "command '{}' is blocked by privacy configuration",
@@ -669,6 +672,9 @@ impl VictauriMcpHandler {
                 json_result(&labels)
             }
             WindowAction::Manage => {
+                if !self.state.privacy.is_tool_enabled("window.manage") {
+                    return tool_disabled("window.manage");
+                }
                 let Some(manage_action) = &params.manage_action else {
                     return missing_param("manage_action", "manage");
                 };
@@ -681,6 +687,9 @@ impl VictauriMcpHandler {
                 }
             }
             WindowAction::Resize => {
+                if !self.state.privacy.is_tool_enabled("window.resize") {
+                    return tool_disabled("window.resize");
+                }
                 let Some(width) = params.width else {
                     return missing_param("width", "resize");
                 };
@@ -700,6 +709,9 @@ impl VictauriMcpHandler {
                 }
             }
             WindowAction::MoveTo => {
+                if !self.state.privacy.is_tool_enabled("window.move_to") {
+                    return tool_disabled("window.move_to");
+                }
                 let Some(x) = params.x else {
                     return missing_param("x", "move_to");
                 };
@@ -715,6 +727,9 @@ impl VictauriMcpHandler {
                 }
             }
             WindowAction::SetTitle => {
+                if !self.state.privacy.is_tool_enabled("window.set_title") {
+                    return tool_disabled("window.set_title");
+                }
                 let Some(title) = &params.title else {
                     return missing_param("title", "set_title");
                 };
@@ -822,7 +837,7 @@ impl VictauriMcpHandler {
                 let Some(url) = &params.url else {
                     return missing_param("url", "go_to");
                 };
-                if let Err(e) = validate_url(url) {
+                if let Err(e) = validate_url(url, self.state.allow_file_navigation) {
                     return tool_error(e);
                 }
                 let code = format!("return window.__VICTAURI__?.navigate({})", js_string(url));
@@ -1628,49 +1643,63 @@ mod tests {
 
     #[test]
     fn url_allows_http() {
-        assert!(validate_url("http://example.com").is_ok());
+        assert!(validate_url("http://example.com", false).is_ok());
     }
 
     #[test]
     fn url_allows_https() {
-        assert!(validate_url("https://example.com/path?q=1").is_ok());
+        assert!(validate_url("https://example.com/path?q=1", false).is_ok());
     }
 
     #[test]
-    fn url_allows_file() {
-        assert!(validate_url("file:///tmp/test.html").is_ok());
+    fn url_allows_http_localhost() {
+        assert!(validate_url("http://localhost:3000", false).is_ok());
+    }
+
+    #[test]
+    fn url_blocks_file_by_default() {
+        let err = validate_url("file:///etc/passwd", false).unwrap_err();
+        assert!(
+            err.contains("file"),
+            "error should mention the file scheme"
+        );
+    }
+
+    #[test]
+    fn url_allows_file_when_opted_in() {
+        assert!(validate_url("file:///tmp/test.html", true).is_ok());
     }
 
     #[test]
     fn url_blocks_javascript() {
-        assert!(validate_url("javascript:alert(1)").is_err());
+        assert!(validate_url("javascript:alert(1)", false).is_err());
     }
 
     #[test]
     fn url_blocks_javascript_case_insensitive() {
-        assert!(validate_url("JAVASCRIPT:alert(1)").is_err());
+        assert!(validate_url("JAVASCRIPT:alert(1)", false).is_err());
     }
 
     #[test]
     fn url_blocks_data_scheme() {
-        assert!(validate_url("data:text/html,<script>alert(1)</script>").is_err());
+        assert!(validate_url("data:text/html,<script>alert(1)</script>", false).is_err());
     }
 
     #[test]
     fn url_blocks_vbscript() {
-        assert!(validate_url("vbscript:MsgBox(1)").is_err());
+        assert!(validate_url("vbscript:MsgBox(1)", false).is_err());
     }
 
     #[test]
     fn url_rejects_invalid() {
-        assert!(validate_url("not a url at all").is_err());
+        assert!(validate_url("not a url at all", false).is_err());
     }
 
     #[test]
     fn url_strips_control_chars() {
         // Control characters should be stripped, leaving a valid URL
         let input = format!("http://example{}com", '\0');
-        assert!(validate_url(&input).is_ok());
+        assert!(validate_url(&input, false).is_ok());
     }
 
     // ── CSS color sanitization tests ───────────────────────────────────────

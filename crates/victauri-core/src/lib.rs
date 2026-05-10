@@ -31,3 +31,39 @@ pub use verification::{
     IpcIntegrityReport, SemanticAssertion, check_ipc_integrity, detect_ghost_commands,
     evaluate_assertion, verify_state,
 };
+
+/// Acquire a mutex lock, recovering from poisoning with a warning.
+///
+/// Victauri's mutex-protected data is append-only logs and registries where
+/// stale data is preferable to crashing the testing framework.
+pub fn acquire_lock<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    context: &str,
+) -> std::sync::MutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::error!("{context}: mutex was poisoned, recovering");
+        poisoned.into_inner()
+    })
+}
+
+/// Acquire a read lock on an `RwLock`, recovering from poisoning.
+pub fn acquire_read<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    context: &str,
+) -> std::sync::RwLockReadGuard<'a, T> {
+    lock.read().unwrap_or_else(|poisoned| {
+        tracing::error!("{context}: RwLock was poisoned, recovering with read guard");
+        poisoned.into_inner()
+    })
+}
+
+/// Acquire a write lock on an `RwLock`, recovering from poisoning.
+pub fn acquire_write<'a, T>(
+    lock: &'a std::sync::RwLock<T>,
+    context: &str,
+) -> std::sync::RwLockWriteGuard<'a, T> {
+    lock.write().unwrap_or_else(|poisoned| {
+        tracing::error!("{context}: RwLock was poisoned, recovering with write guard");
+        poisoned.into_inner()
+    })
+}

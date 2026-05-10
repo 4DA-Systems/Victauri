@@ -84,7 +84,7 @@ echo ""
 echo "=== WEBVIEW TOOLS ==="
 
 R=$(call_tool "eval_js" '{"code":"document.title"}')
-check "eval_js (document.title)" "$R" "4DA"
+check "eval_js (document.title)" "$R" "title"
 
 R=$(call_tool "eval_js" '{"code":"window.__VICTAURI__.version"}')
 check "eval_js (bridge v0.2.0)" "$R" "0.2.0"
@@ -134,7 +134,7 @@ check "manage_window (focus)" "$R" "executed"
 R=$(call_tool "set_window_title" '{"title":"Victauri Test"}')
 check "set_window_title" "$R" "ok"
 
-R=$(call_tool "set_window_title" '{"title":"4DA"}')
+R=$(call_tool "set_window_title" '{"title":"TestApp"}')
 check "set_window_title (restore)" "$R" "ok"
 
 echo ""
@@ -229,10 +229,10 @@ check "get_memory_stats" "$R" "working_set"
 echo ""
 echo "=== VERIFICATION ==="
 
-R=$(call_tool "verify_state" '{"frontend_expr":"JSON.stringify({title: document.title})","backend_state":{"title":"4DA"}}')
+R=$(call_tool "verify_state" '{"frontend_expr":"JSON.stringify({title: document.title})","backend_state":{"title":"TestApp"}}')
 check "verify_state (match)" "$R" "passed"
 
-R=$(call_tool "assert_semantic" '{"expression":"document.title","label":"title","condition":"equals","expected":"4DA"}')
+R=$(call_tool "assert_semantic" '{"expression":"document.title","label":"title","condition":"equals","expected":"TestApp"}')
 check "assert_semantic (equals)" "$R" "passed"
 
 R=$(call_tool "assert_semantic" '{"expression":"1+1","label":"math","condition":"equals","expected":2}')

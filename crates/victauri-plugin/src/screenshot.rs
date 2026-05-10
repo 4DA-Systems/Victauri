@@ -456,7 +456,7 @@ fn encode_png(width: u32, height: u32, rgba: &[u8]) -> anyhow::Result<Vec<u8>> {
         raw.extend_from_slice(row);
     }
 
-    let compressed = deflate_compress(&raw);
+    let compressed = deflate_compress(&raw)?;
     write_png_chunk(&mut out, b"IDAT", &compressed)?;
 
     // IEND
@@ -499,14 +499,18 @@ fn png_crc32(data: &[u8]) -> u32 {
 }
 
 #[allow(dead_code)]
-fn deflate_compress(data: &[u8]) -> Vec<u8> {
+fn deflate_compress(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     use flate2::Compression;
     use flate2::write::ZlibEncoder;
     use std::io::Write;
 
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(data).expect("zlib write failed");
-    encoder.finish().expect("zlib finish failed")
+    encoder
+        .write_all(data)
+        .map_err(|e| anyhow::anyhow!("zlib write failed: {e}"))?;
+    encoder
+        .finish()
+        .map_err(|e| anyhow::anyhow!("zlib finish failed: {e}"))
 }
 
 #[allow(dead_code)]
@@ -587,7 +591,7 @@ mod tests {
         use std::io::Read;
 
         let data = b"hello world";
-        let compressed = deflate_compress(data);
+        let compressed = deflate_compress(data).unwrap();
         // zlib header: CMF=0x78 (deflate, 32K window)
         assert_eq!(compressed[0], 0x78);
         let mut decoder = ZlibDecoder::new(&compressed[..]);
@@ -599,7 +603,7 @@ mod tests {
     #[test]
     fn deflate_compress_large_data_compresses() {
         let data = vec![0u8; 100_000];
-        let compressed = deflate_compress(&data);
+        let compressed = deflate_compress(&data).unwrap();
         // Uniform data should compress significantly
         assert!(
             compressed.len() < data.len() / 2,

@@ -4,6 +4,7 @@ use axum::middleware::Next;
 use axum::response::Response;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use url::Url;
 
 const BEARER_PREFIX_LEN: usize = "Bearer ".len();
 
@@ -195,20 +196,26 @@ pub async fn origin_guard(request: Request, next: Next) -> Result<Response, Stat
         .headers()
         .get("origin")
         .and_then(|v| v.to_str().ok())
+        && !is_allowed_origin(origin)
     {
-        let allowed = origin.starts_with("http://localhost")
-            || origin.starts_with("https://localhost")
-            || origin.starts_with("http://127.0.0.1")
-            || origin.starts_with("https://127.0.0.1")
-            || origin.starts_with("http://[::1]")
-            || origin.starts_with("https://[::1]")
-            || origin.starts_with("tauri://");
-        if !allowed {
-            tracing::warn!("Cross-origin request blocked: Origin={origin}");
-            return Err(StatusCode::FORBIDDEN);
-        }
+        tracing::warn!("Cross-origin request blocked: Origin={origin}");
+        return Err(StatusCode::FORBIDDEN);
     }
     Ok(next.run(request).await)
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    if origin.starts_with("tauri://") {
+        return true;
+    }
+    let Ok(parsed) = Url::parse(origin) else {
+        return false;
+    };
+    matches!(parsed.scheme(), "http" | "https")
+        && matches!(
+            parsed.host_str(),
+            Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+        )
 }
 
 /// Axum middleware that sets security-hardening response headers on every response.
@@ -670,5 +677,43 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn origin_guard_allows_localhost_variants() {
+        assert!(is_allowed_origin("http://localhost"));
+        assert!(is_allowed_origin("http://localhost:7373"));
+        assert!(is_allowed_origin("https://localhost"));
+        assert!(is_allowed_origin("https://localhost:443"));
+        assert!(is_allowed_origin("http://127.0.0.1"));
+        assert!(is_allowed_origin("http://127.0.0.1:8080"));
+        assert!(is_allowed_origin("https://127.0.0.1"));
+        assert!(is_allowed_origin("http://[::1]"));
+        assert!(is_allowed_origin("http://[::1]:7373"));
+        assert!(is_allowed_origin("tauri://localhost"));
+        assert!(is_allowed_origin("tauri://some-app"));
+    }
+
+    #[test]
+    fn origin_guard_rejects_prefix_smuggling() {
+        assert!(!is_allowed_origin("http://localhost.evil.com"));
+        assert!(!is_allowed_origin("https://localhost.evil.com"));
+        assert!(!is_allowed_origin("https://127.0.0.1.evil.com"));
+        assert!(!is_allowed_origin("http://[::1].evil.com"));
+    }
+
+    #[test]
+    fn origin_guard_rejects_userinfo_trick() {
+        assert!(!is_allowed_origin("http://localhost@evil.com"));
+        assert!(!is_allowed_origin("http://127.0.0.1@evil.com"));
+    }
+
+    #[test]
+    fn origin_guard_rejects_foreign_and_malformed() {
+        assert!(!is_allowed_origin("http://evil.com"));
+        assert!(!is_allowed_origin("https://attacker.io"));
+        assert!(!is_allowed_origin("not-a-url"));
+        assert!(!is_allowed_origin(""));
+        assert!(!is_allowed_origin("ftp://localhost"));
     }
 }
