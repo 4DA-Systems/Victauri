@@ -769,7 +769,7 @@ dependencies = [
 
 [[package]]
 name = "demo-app"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -4996,7 +4996,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "victauri-cli"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -5013,7 +5013,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-core"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "chrono",
  "criterion",
@@ -5028,7 +5028,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-macros"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5039,7 +5039,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-plugin"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -5071,7 +5071,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-test"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5089,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-watchdog"
-version = "0.1.3"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",

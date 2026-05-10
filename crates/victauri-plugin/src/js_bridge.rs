@@ -110,6 +110,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     var dialogLog = [];
     var interactionLog = [];
     var CAP_INTERACTION = 500;
+    var ipcWaiters = [];
 
     function checkActionable(el) {
         if (!el || !el.isConnected) return { error: 'element is detached from DOM', hint: 'RETRY_LATER' };
@@ -423,6 +424,28 @@ const INIT_SCRIPT_BODY: &str = r#"
             for (var i = networkLog.length - 1; i >= 0; i--) {
                 if (networkLog[i].url.indexOf(ipcPrefix) === 0) networkLog.splice(i, 1);
             }
+        },
+
+        waitForIpcComplete: function(timeoutMs) {
+            var log = window.__VICTAURI__.getIpcLog();
+            if (log.length > 0) {
+                var last = log[log.length - 1];
+                if (last.duration_ms !== null && last.duration_ms !== undefined && last.result !== null) {
+                    return Promise.resolve(true);
+                }
+            }
+            return new Promise(function(resolve) {
+                var timer = setTimeout(function() {
+                    var idx = ipcWaiters.indexOf(waiterFn);
+                    if (idx !== -1) ipcWaiters.splice(idx, 1);
+                    resolve(false);
+                }, timeoutMs || 500);
+                function waiterFn() {
+                    clearTimeout(timer);
+                    resolve(true);
+                }
+                ipcWaiters.push(waiterFn);
+            });
         },
 
         // ── Console ──────────────────────────────────────────────────────────
@@ -1390,7 +1413,12 @@ const INIT_SCRIPT_BODY: &str = r#"
                         var cloned = response.clone();
                         cloned.text().then(function(text) {
                             try { entry.response_body = JSON.parse(text); } catch(e) { entry.response_body = text; }
-                        }).catch(function() {});
+                        }).catch(function() {}).then(function() {
+                            for (var w = ipcWaiters.length - 1; w >= 0; w--) {
+                                ipcWaiters[w]();
+                            }
+                            ipcWaiters.length = 0;
+                        });
                     }
 
                     return response;
@@ -1398,6 +1426,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                     entry.status = 'error';
                     entry.error = String(err);
                     entry.duration_ms = Date.now() - entry.timestamp;
+                    for (var w = ipcWaiters.length - 1; w >= 0; w--) {
+                        ipcWaiters[w]();
+                    }
+                    ipcWaiters.length = 0;
                     throw err;
                 });
             };

@@ -581,9 +581,9 @@ pub struct LogsParams {
     pub limit: Option<usize>,
     /// Threshold in milliseconds for slow IPC calls (for `slow_ipc`).
     pub threshold_ms: Option<u64>,
-    /// When true (for ipc action), poll up to 500ms until the latest IPC entry
-    /// has its response captured (`duration_ms` populated). Prevents reading
-    /// stale data when called immediately after `invoke_command`.
+    /// When true (for ipc action), await up to 500ms for the latest IPC entry's
+    /// response body to be fully captured. Uses event-driven signaling from the
+    /// fetch interceptor rather than polling.
     pub wait_for_capture: Option<bool>,
     /// Target webview label.
     pub webview_label: Option<String>,

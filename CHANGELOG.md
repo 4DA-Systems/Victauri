@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **victauri-plugin**: IPC `wait_for_capture` replaced polling loop (50ms×10) with event-driven signaling — fetch interceptor now notifies waiters after response body parsing completes, eliminating 500ms worst-case latency
+- **victauri-test**: `VisualOptions` defaults to `platform_baselines: true` — baselines stored in `tests/snapshots/{os}/` for cross-platform CI
+
+### Added
+
+- **victauri-test**: `MaskRegion` — exclude rectangular areas from visual comparison (timestamps, animations, user-specific content)
+- **victauri-test**: `ThresholdPreset` enum — `Strict` (pixel-perfect), `Standard` (default), `AntiAlias` (subpixel-tolerant), `Relaxed` (cross-platform lenient)
+- **victauri-test**: `VisualOptions::with_preset()` and `with_mask()` fluent builders
+- **victauri-test**: `VisualDiff.masked_pixels` field reports excluded pixel count
+
 ## [0.2.0] - 2026-05-10
 
 ### Security
