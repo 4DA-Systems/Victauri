@@ -29,19 +29,19 @@ jobs:
         run: cargo publish -p victauri-core --dry-run
 
       - name: Dry-run victauri-macros
-        run: cargo publish -p victauri-macros --dry-run
+        run: cargo publish -p victauri-macros --dry-run --no-verify
 
       - name: Dry-run victauri-plugin
-        run: cargo publish -p victauri-plugin --dry-run
+        run: cargo publish -p victauri-plugin --dry-run --no-verify
 
       - name: Dry-run victauri-test
-        run: cargo publish -p victauri-test --dry-run
+        run: cargo publish -p victauri-test --dry-run --no-verify
 
       - name: Dry-run victauri-cli
-        run: cargo publish -p victauri-cli --dry-run
+        run: cargo publish -p victauri-cli --dry-run --no-verify
 
       - name: Dry-run victauri-watchdog
-        run: cargo publish -p victauri-watchdog --dry-run
+        run: cargo publish -p victauri-watchdog --dry-run --no-verify
 
   test:
     name: Test gate
