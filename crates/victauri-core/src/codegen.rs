@@ -111,10 +111,10 @@ pub fn generate_test(session: &RecordedSession, options: &CodegenOptions) -> Str
                 }
             }
 
-            AppEvent::StateChange { key, caused_by, .. } if options.include_state_checks => {
-                if caused_by.is_some() {
-                    out.push_str(&format!("    // State changed: {key}\n"));
-                }
+            AppEvent::StateChange { key, caused_by, .. }
+                if options.include_state_checks && caused_by.is_some() =>
+            {
+                out.push_str(&format!("    // State changed: {key}\n"));
             }
 
             // DomMutation, WindowEvent, and disabled variants are skipped
