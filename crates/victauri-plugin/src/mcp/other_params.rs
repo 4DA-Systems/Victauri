@@ -106,6 +106,20 @@ pub struct FindElementsParams {
     pub name: Option<String>,
     /// Maximum number of results to return. Default: 10.
     pub max_results: Option<u32>,
+    /// HTML tag name to match (e.g. "button", "input").
+    pub tag: Option<String>,
+    /// Placeholder text to match (case-insensitive substring).
+    pub placeholder: Option<String>,
+    /// Alt text to match (case-insensitive substring).
+    pub alt: Option<String>,
+    /// Title attribute to match (case-insensitive substring).
+    pub title_attr: Option<String>,
+    /// Associated label text to match (finds inputs by their label).
+    pub label: Option<String>,
+    /// If true, text matching is exact instead of substring.
+    pub exact: Option<bool>,
+    /// Filter by enabled state.
+    pub enabled: Option<bool>,
     /// Target webview label.
     pub webview_label: Option<String>,
 }

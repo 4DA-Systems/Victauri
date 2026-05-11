@@ -22,6 +22,7 @@ pub use crate::app::TestApp;
 pub use crate::assertions::{CheckResult, VerifyBuilder, VerifyReport};
 pub use crate::client::VictauriClient;
 pub use crate::error::TestError;
+pub use crate::locator::{Bounds, Locator, LocatorExpect, LocatorMatch};
 pub use crate::smoke::{SmokeCheckResult, SmokeConfig, SmokeReport};
 pub use crate::visual::{MaskRegion, ThresholdPreset, VisualDiff, VisualOptions};
 pub use crate::{

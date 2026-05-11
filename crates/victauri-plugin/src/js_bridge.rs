@@ -226,7 +226,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             function matches(el) {
                 if (query.text) {
                     var txt = (el.textContent || '').trim();
-                    if (txt.toLowerCase().indexOf(query.text.toLowerCase()) === -1) return false;
+                    if (query.exact) {
+                        if (txt !== query.text) return false;
+                    } else {
+                        if (txt.toLowerCase().indexOf(query.text.toLowerCase()) === -1) return false;
+                    }
                 }
                 if (query.role) {
                     var role = el.getAttribute('role') || inferRole(el);
@@ -244,7 +248,67 @@ const INIT_SCRIPT_BODY: &str = r#"
                         || el.getAttribute('placeholder') || '';
                     if (name.toLowerCase().indexOf(query.name.toLowerCase()) === -1) return false;
                 }
+                if (query.tag) {
+                    if (el.tagName.toLowerCase() !== query.tag.toLowerCase()) return false;
+                }
+                if (query.placeholder) {
+                    if ((el.getAttribute('placeholder') || '').toLowerCase().indexOf(query.placeholder.toLowerCase()) === -1) return false;
+                }
+                if (query.alt) {
+                    if ((el.getAttribute('alt') || '').toLowerCase().indexOf(query.alt.toLowerCase()) === -1) return false;
+                }
+                if (query.title_attr) {
+                    if ((el.getAttribute('title') || '').toLowerCase().indexOf(query.title_attr.toLowerCase()) === -1) return false;
+                }
+                if (query.enabled === true && el.disabled) return false;
+                if (query.enabled === false && !el.disabled) return false;
                 return true;
+            }
+
+            function buildResult(node, style) {
+                var existingRef = null;
+                refMap.forEach(function(el, refId) {
+                    if (el === node) existingRef = refId;
+                });
+                var ref_id = existingRef || registerRef(node);
+                var role = node.getAttribute('role') || inferRole(node);
+                var rect = node.getBoundingClientRect();
+                var vis = true;
+                if (style) {
+                    vis = style.display !== 'none' && style.visibility !== 'hidden';
+                }
+                return {
+                    ref_id: ref_id,
+                    tag: node.tagName.toLowerCase(),
+                    role: role,
+                    name: node.getAttribute('aria-label') || node.getAttribute('title') || null,
+                    text: (node.textContent || '').trim().substring(0, 100),
+                    bounds: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
+                    visible: vis,
+                    enabled: !node.disabled,
+                    value: node.value || null
+                };
+            }
+
+            if (query.label) {
+                var labels = document.querySelectorAll('label');
+                for (var li = 0; li < labels.length && results.length < maxResults; li++) {
+                    var lbl = labels[li];
+                    if ((lbl.textContent || '').toLowerCase().indexOf(query.label.toLowerCase()) === -1) continue;
+                    var target = null;
+                    var forAttr = lbl.getAttribute('for');
+                    if (forAttr) {
+                        target = document.getElementById(forAttr);
+                    }
+                    if (!target) {
+                        target = lbl.querySelector('input, textarea, select');
+                    }
+                    if (target) {
+                        var ts = window.getComputedStyle(target);
+                        results.push(buildResult(target, ts));
+                    }
+                }
+                return results;
             }
 
             function search(node) {
@@ -254,21 +318,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (style.display === 'none' || style.visibility === 'hidden') return;
 
                 if (matches(node)) {
-                    var existingRef = null;
-                    refMap.forEach(function(el, refId) {
-                        if (el === node) existingRef = refId;
-                    });
-                    var ref_id = existingRef || registerRef(node);
-                    var role = node.getAttribute('role') || inferRole(node);
-                    var rect = node.getBoundingClientRect();
-                    results.push({
-                        ref_id: ref_id,
-                        tag: node.tagName.toLowerCase(),
-                        role: role,
-                        name: node.getAttribute('aria-label') || node.getAttribute('title') || null,
-                        text: (node.textContent || '').trim().substring(0, 100),
-                        bounds: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) }
-                    });
+                    results.push(buildResult(node, style));
                 }
 
                 for (var c = 0; c < node.children.length; c++) {
@@ -356,8 +406,35 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         pressKey: function(key) {
             var target = document.activeElement || document.body;
-            target.dispatchEvent(new KeyboardEvent('keydown', { key: key, bubbles: true }));
-            target.dispatchEvent(new KeyboardEvent('keyup', { key: key, bubbles: true }));
+            var parts = key.split('+');
+            if (parts.length === 1 || (parts.length === 2 && parts[0] === '' && parts[1] === '')) {
+                var k = parts.length === 1 ? key : '+';
+                target.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
+                target.dispatchEvent(new KeyboardEvent('keyup', { key: k, bubbles: true }));
+                return { ok: true };
+            }
+            var finalKey = parts.pop();
+            var mods = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
+            for (var m = 0; m < parts.length; m++) {
+                var mod = parts[m];
+                if (mod === 'Control' || mod === 'Ctrl') mods.ctrlKey = true;
+                else if (mod === 'Shift') mods.shiftKey = true;
+                else if (mod === 'Alt') mods.altKey = true;
+                else if (mod === 'Meta' || mod === 'Command' || mod === 'Cmd') mods.metaKey = true;
+            }
+            var modKeys = [];
+            if (mods.ctrlKey) modKeys.push('Control');
+            if (mods.shiftKey) modKeys.push('Shift');
+            if (mods.altKey) modKeys.push('Alt');
+            if (mods.metaKey) modKeys.push('Meta');
+            for (var i = 0; i < modKeys.length; i++) {
+                target.dispatchEvent(new KeyboardEvent('keydown', { key: modKeys[i], bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
+            }
+            target.dispatchEvent(new KeyboardEvent('keydown', { key: finalKey, bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
+            target.dispatchEvent(new KeyboardEvent('keyup', { key: finalKey, bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
+            for (var j = modKeys.length - 1; j >= 0; j--) {
+                target.dispatchEvent(new KeyboardEvent('keyup', { key: modKeys[j], bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
+            }
             return { ok: true };
         },
 

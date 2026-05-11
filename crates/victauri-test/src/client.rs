@@ -1411,6 +1411,127 @@ impl VictauriClient {
             "selector=\"{selector}\""
         )))
     }
+
+    // ── Locator Factories ──────────────────────────────────────────────────
+
+    /// Create a [`Locator`](crate::Locator) matching elements by ARIA role.
+    ///
+    /// Equivalent to Playwright's `page.getByRole()`.
+    #[must_use]
+    pub fn get_by_role(&self, role: &str) -> crate::locator::Locator {
+        crate::locator::Locator::role(role)
+    }
+
+    /// Create a [`Locator`](crate::Locator) matching elements by visible text content.
+    ///
+    /// Equivalent to Playwright's `page.getByText()`.
+    #[must_use]
+    pub fn get_by_text(&self, text: &str) -> crate::locator::Locator {
+        crate::locator::Locator::text(text)
+    }
+
+    /// Create a [`Locator`](crate::Locator) matching elements by `data-testid` attribute.
+    ///
+    /// Equivalent to Playwright's `page.getByTestId()`.
+    #[must_use]
+    pub fn get_by_test_id(&self, id: &str) -> crate::locator::Locator {
+        crate::locator::Locator::test_id(id)
+    }
+
+    /// Create a [`Locator`](crate::Locator) matching form controls by associated label text.
+    ///
+    /// Equivalent to Playwright's `page.getByLabel()`.
+    #[must_use]
+    pub fn get_by_label(&self, text: &str) -> crate::locator::Locator {
+        crate::locator::Locator::label(text)
+    }
+
+    /// Create a [`Locator`](crate::Locator) matching elements by placeholder text.
+    ///
+    /// Equivalent to Playwright's `page.getByPlaceholder()`.
+    #[must_use]
+    pub fn get_by_placeholder(&self, text: &str) -> crate::locator::Locator {
+        crate::locator::Locator::placeholder(text)
+    }
+
+    /// Create a [`Locator`](crate::Locator) matching elements by CSS selector.
+    ///
+    /// Equivalent to Playwright's `page.locator()`.
+    #[must_use]
+    pub fn locator(&self, css: &str) -> crate::locator::Locator {
+        crate::locator::Locator::css(css)
+    }
+
+    /// Create a [`Locator`](crate::Locator) matching elements by alt text (images).
+    ///
+    /// Equivalent to Playwright's `page.getByAltText()`.
+    #[must_use]
+    pub fn get_by_alt_text(&self, alt: &str) -> crate::locator::Locator {
+        crate::locator::Locator::alt_text(alt)
+    }
+
+    /// Create a [`Locator`](crate::Locator) matching elements by title attribute.
+    ///
+    /// Equivalent to Playwright's `page.getByTitle()`.
+    #[must_use]
+    pub fn get_by_title(&self, title: &str) -> crate::locator::Locator {
+        crate::locator::Locator::title(title)
+    }
+
+    // ── Screenshot to File ─────────────────────────────────────────────────
+
+    /// Take a screenshot and save it to a file on disk.
+    ///
+    /// Captures the default window, decodes the base64 PNG, and writes it
+    /// to the given path. Returns the canonical path of the saved file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Other`] if the screenshot cannot be captured,
+    /// decoded, or written to disk.
+    pub async fn screenshot_to_file(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf, TestError> {
+        let result = self.screenshot().await?;
+        let base64_data = extract_screenshot_base64(&result)?;
+        save_screenshot_to_file(&base64_data, path.as_ref())
+    }
+
+    /// Take a screenshot of a specific window and save it to a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Other`] if the screenshot cannot be captured,
+    /// decoded, or written to disk.
+    pub async fn screenshot_to_file_for(
+        &mut self,
+        label: &str,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<std::path::PathBuf, TestError> {
+        let result = self.screenshot_for(label).await?;
+        let base64_data = extract_screenshot_base64(&result)?;
+        save_screenshot_to_file(&base64_data, path.as_ref())
+    }
+}
+
+fn save_screenshot_to_file(
+    base64_data: &str,
+    path: &std::path::Path,
+) -> Result<std::path::PathBuf, TestError> {
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(base64_data)
+        .map_err(|e| TestError::Other(format!("failed to decode screenshot base64: {e}")))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| TestError::Other(format!("failed to create directory: {e}")))?;
+    }
+    std::fs::write(path, &bytes)
+        .map_err(|e| TestError::Other(format!("failed to write screenshot: {e}")))?;
+    path.canonicalize()
+        .or_else(|_| Ok(path.to_path_buf()))
+        .map_err(|e: std::io::Error| TestError::Other(format!("path error: {e}")))
 }
 
 fn extract_screenshot_base64(result: &Value) -> Result<String, TestError> {

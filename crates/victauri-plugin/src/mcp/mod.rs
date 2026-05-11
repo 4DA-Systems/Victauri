@@ -149,6 +149,27 @@ impl VictauriMcpHandler {
         if let Some(max) = params.max_results {
             parts.push(format!("max_results: {max}"));
         }
+        if let Some(t) = &params.tag {
+            parts.push(format!("tag: {}", js_string(t)));
+        }
+        if let Some(p) = &params.placeholder {
+            parts.push(format!("placeholder: {}", js_string(p)));
+        }
+        if let Some(a) = &params.alt {
+            parts.push(format!("alt: {}", js_string(a)));
+        }
+        if let Some(ta) = &params.title_attr {
+            parts.push(format!("title_attr: {}", js_string(ta)));
+        }
+        if let Some(l) = &params.label {
+            parts.push(format!("label: {}", js_string(l)));
+        }
+        if let Some(true) = params.exact {
+            parts.push("exact: true".to_string());
+        }
+        if let Some(e) = params.enabled {
+            parts.push(format!("enabled: {e}"));
+        }
         let code = format!(
             "return window.__VICTAURI__?.findElements({{ {} }})",
             parts.join(", ")

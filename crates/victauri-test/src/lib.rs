@@ -41,6 +41,7 @@ mod client;
 pub mod coverage;
 mod discovery;
 mod error;
+pub mod locator;
 pub mod prelude;
 pub mod reporting;
 pub mod smoke;
@@ -56,6 +57,7 @@ pub use client::{
     assert_json_truthy, assert_no_a11y_violations, assert_performance_budget, assert_state_matches,
 };
 pub use error::TestError;
+pub use locator::{Bounds, Locator, LocatorExpect, LocatorMatch};
 pub use smoke::{SmokeCheckResult, SmokeConfig, SmokeReport};
 
 /// Returns `true` if E2E tests should run (i.e., `VICTAURI_E2E` env var is set).
