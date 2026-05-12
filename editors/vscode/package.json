@@ -1,0 +1,163 @@
+{
+  "name": "victauri",
+  "displayName": "Victauri",
+  "description": "Full-stack testing and inspection for Tauri apps",
+  "version": "0.1.0",
+  "publisher": "4da-systems",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/runyourempire/victauri"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Testing",
+    "Debuggers",
+    "Other"
+  ],
+  "keywords": [
+    "tauri",
+    "testing",
+    "mcp",
+    "rust",
+    "webview"
+  ],
+  "activationEvents": [
+    "workspaceContains:**/tauri.conf.json"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "victauri",
+          "title": "Victauri",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "victauri": [
+        {
+          "id": "victauri.appState",
+          "name": "App State"
+        },
+        {
+          "id": "victauri.domExplorer",
+          "name": "DOM Explorer"
+        },
+        {
+          "id": "victauri.ipcLog",
+          "name": "IPC Log"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "victauri.connect",
+        "title": "Connect to Tauri App",
+        "category": "Victauri"
+      },
+      {
+        "command": "victauri.disconnect",
+        "title": "Disconnect",
+        "category": "Victauri"
+      },
+      {
+        "command": "victauri.screenshot",
+        "title": "Take Screenshot",
+        "category": "Victauri"
+      },
+      {
+        "command": "victauri.evalJs",
+        "title": "Evaluate JavaScript",
+        "category": "Victauri"
+      },
+      {
+        "command": "victauri.smokeTest",
+        "title": "Run Smoke Test",
+        "category": "Victauri"
+      },
+      {
+        "command": "victauri.refreshAll",
+        "title": "Refresh All Views",
+        "category": "Victauri",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "victauri.copyRefId",
+        "title": "Copy Ref ID",
+        "category": "Victauri"
+      },
+      {
+        "command": "victauri.generateTest",
+        "title": "Generate Test for Element",
+        "category": "Victauri"
+      },
+      {
+        "command": "victauri.generateTestForCommand",
+        "title": "Generate Test for Command",
+        "category": "Victauri"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "victauri.refreshAll",
+          "when": "view =~ /^victauri\\./",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "victauri.copyRefId",
+          "when": "viewItem == domElement"
+        },
+        {
+          "command": "victauri.generateTest",
+          "when": "viewItem == domElement"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Victauri",
+      "properties": {
+        "victauri.port": {
+          "type": "number",
+          "default": 7373,
+          "description": "Port of the Victauri server"
+        },
+        "victauri.autoConnect": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically connect when a Tauri project is detected"
+        },
+        "victauri.pollInterval": {
+          "type": "number",
+          "default": 2000,
+          "description": "Polling interval in milliseconds for live updates"
+        },
+        "victauri.authToken": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token for authenticated connections"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --watch",
+    "package": "npx @vscode/vsce package",
+    "lint": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
+  }
+}
