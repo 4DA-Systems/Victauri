@@ -17,7 +17,7 @@ pub mod snapshot;
 pub mod types;
 pub mod verification;
 
-pub use codegen::{CodegenOptions, generate_test, generate_test_default};
+pub use codegen::{CodegenOptions, CodegenStyle, generate_test, generate_test_default};
 pub use error::VictauriError;
 pub use event::{AppEvent, EventLog, InteractionKind, IpcCall, IpcResult};
 pub use recording::{EventRecorder, RecordedEvent, RecordedSession, StateCheckpoint};

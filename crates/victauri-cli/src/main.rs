@@ -52,6 +52,12 @@ enum Commands {
         /// Name of the generated test function
         #[arg(short = 'n', long, default_value = "recorded_flow")]
         test_name: String,
+        /// Generate Locator API style code instead of direct client methods
+        #[arg(long)]
+        locator: bool,
+        /// Emit `assert_ipc_called` assertions for each IPC command
+        #[arg(long)]
+        assert_ipc: bool,
     },
     /// Diagnose your Victauri setup — check every step from plugin wiring to tool operation
     Doctor,
@@ -100,8 +106,13 @@ async fn main() -> Result<()> {
         Commands::Doctor => {
             cmd_doctor().await?;
         }
-        Commands::Record { output, test_name } => {
-            cmd_record(&output, &test_name).await?;
+        Commands::Record {
+            output,
+            test_name,
+            locator,
+            assert_ipc,
+        } => {
+            cmd_record(&output, &test_name, locator, assert_ipc).await?;
         }
         Commands::Watch { dir, filter } => {
             cmd_watch(&dir, filter.as_deref()).await?;
@@ -731,7 +742,7 @@ async fn cmd_coverage(
     Ok(())
 }
 
-async fn cmd_record(output: &Path, test_name: &str) -> Result<()> {
+async fn cmd_record(output: &Path, test_name: &str, locator: bool, assert_ipc: bool) -> Result<()> {
     eprintln!("Connecting to running Tauri app...\n");
 
     let mut client = match victauri_test::VictauriClient::discover().await {
@@ -787,8 +798,15 @@ async fn cmd_record(output: &Path, test_name: &str) -> Result<()> {
         .filter(|e| matches!(e.event, victauri_core::AppEvent::Ipc(_)))
         .count();
 
+    let style = if locator {
+        victauri_core::CodegenStyle::Locator
+    } else {
+        victauri_core::CodegenStyle::Direct
+    };
     let options = victauri_core::CodegenOptions {
         test_name: test_name.to_string(),
+        emit_ipc_assert_calls: assert_ipc,
+        style,
         ..victauri_core::CodegenOptions::default()
     };
     let code = victauri_core::generate_test(&session, &options);
