@@ -3730,3 +3730,240 @@ async fn mcp_interact_unknown_action_returns_structured_error() {
         "error should list valid actions including 'click', got: {body}"
     );
 }
+
+// ── REST API tests ──────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn rest_list_tools_returns_all_tools() {
+    let state = test_state();
+    let base = start_test_server(state, &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/tools"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let tools: Vec<serde_json::Value> = resp.json().await.unwrap();
+    assert!(
+        tools.len() >= 20,
+        "should list at least 20 tools, got {}",
+        tools.len()
+    );
+
+    let names: Vec<&str> = tools
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"eval_js"), "should contain eval_js");
+    assert!(names.contains(&"dom_snapshot"), "should contain dom_snapshot");
+    assert!(names.contains(&"screenshot"), "should contain screenshot");
+    assert!(names.contains(&"interact"), "should contain interact");
+    assert!(names.contains(&"window"), "should contain window");
+
+    for tool in &tools {
+        assert!(tool["name"].is_string(), "each tool should have a name");
+    }
+}
+
+#[tokio::test]
+async fn rest_call_unknown_tool_returns_404() {
+    let state = test_state();
+    let base = start_test_server(state, &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/tools/nonexistent_tool"))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("unknown tool"),
+        "should report unknown tool, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rest_call_tool_with_invalid_params_returns_400() {
+    let state = test_state();
+    let base = start_test_server(state, &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/tools/eval_js"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"wrong_field": "value"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("invalid parameters"),
+        "should report invalid parameters, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rest_call_tool_with_invalid_json_returns_400() {
+    let state = test_state();
+    let base = start_test_server(state, &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/tools/eval_js"))
+        .header("Content-Type", "application/json")
+        .body("not valid json {{{")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("invalid JSON"),
+        "should report invalid JSON, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rest_get_memory_stats_works_without_body() {
+    let state = test_state();
+    let base = start_test_server(state, &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/tools/get_memory_stats"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body.get("result").is_some(),
+        "should have result field, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rest_get_plugin_info_returns_version() {
+    let state = test_state();
+    let base = start_test_server(state, &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/tools/get_plugin_info"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let result = &body["result"];
+    assert!(
+        result["version"].is_string(),
+        "should have version in result, got: {body}"
+    );
+    assert!(
+        result["tools"]["total"].as_u64().unwrap() >= 20,
+        "should report tool count, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn rest_get_registry_returns_json_result() {
+    let state = test_state();
+    state.registry.register(CommandInfo {
+        name: "test_cmd".to_string(),
+        plugin: None,
+        description: Some("A test command".to_string()),
+        args: vec![],
+        return_type: None,
+        is_async: false,
+        intent: None,
+        category: None,
+        examples: vec![],
+    });
+    let base = start_test_server(state, &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/tools/get_registry"))
+        .header("Content-Type", "application/json")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let result = &body["result"];
+    assert!(result.is_array(), "registry should return array, got: {body}");
+    assert_eq!(result.as_array().unwrap().len(), 1);
+    assert_eq!(result[0]["name"], "test_cmd");
+}
+
+#[tokio::test]
+async fn rest_respects_auth_middleware() {
+    let state = test_state();
+    let token = "test-rest-token-123";
+    let base = start_auth_test_server(state, &["main"], token).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/api/tools"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "unauthenticated request should be rejected"
+    );
+
+    let resp = client
+        .get(format!("{base}/api/tools"))
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "authenticated request should succeed"
+    );
+}
+
+#[tokio::test]
+async fn rest_call_tool_with_callback_bridge() {
+    let state = test_state();
+    let base = start_callback_server(state, &["main"], |_js| {
+        r#""hello from eval""#.to_string()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/api/tools/eval_js"))
+        .header("Content-Type", "application/json")
+        .body(r#"{"code": "document.title"}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["result"], "hello from eval",
+        "should return eval result, got: {body}"
+    );
+}

@@ -69,7 +69,8 @@ Proc macro crate. Single attribute macro: `#[inspectable]`.
 The main crate. Tauri plugin + embedded MCP server.
 - `init<R: Runtime>()` — plugin entry point, gated behind `#[cfg(debug_assertions)]`
 - JS bridge injection (`js_bridge.rs`) — DOM walking, ref map, console hooks
-- MCP server (`mcp/`) — axum on :7373, rmcp tools/resources/prompts (split into mod.rs + server.rs + helpers.rs + 8 param sub-modules)
+- MCP server (`mcp/`) — axum on :7373, rmcp tools/resources/prompts (split into mod.rs + server.rs + rest.rs + helpers.rs + 8 param sub-modules)
+- REST API (`mcp/rest.rs`) — `GET /api/tools` lists tools, `POST /api/tools/{name}` executes any tool via plain JSON (no MCP handshake)
 - Tools (`tools.rs`) — Tauri commands for eval, window state, IPC log, registry, memory
 - Screenshot (`screenshot.rs`) — platform-native window capture
 - Memory (`memory.rs`) — atomic allocation tracking
@@ -156,9 +157,9 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-05-10)
+## Current State (2026-05-13)
 
-**All 8 phases complete + production hardening + adversarial audit. v0.1.3 published.** All 6 crates compile cleanly (`RUSTFLAGS="-Dwarnings" cargo clippy` passes). 858 tests pass. Zero clippy warnings (`-D warnings`, 20 enforced lints). 26 runnable doc-test examples. 16 Criterion benchmarks. CI green on Linux/Windows/macOS. Tauri 2.10.3 + rmcp 1.5.0. All 6 crates published to crates.io. `cargo install victauri-cli` provides standalone `victauri` binary.
+**All 8 phases complete + production hardening + adversarial audit + REST API. v0.1.3 published.** All 6 crates compile cleanly (`RUSTFLAGS="-Dwarnings" cargo clippy` passes). 870+ tests pass (including 9 REST API integration tests + 5 REST unit tests). Zero clippy warnings (`-D warnings`, 20 enforced lints). 26 runnable doc-test examples. 16 Criterion benchmarks. CI green on Linux/Windows/macOS. Tauri 2.10.3 + rmcp 1.5.0. All 6 crates published to crates.io. `cargo install victauri-cli` provides standalone `victauri` binary. Dual-protocol: MCP on `/mcp` + REST on `/api/tools`.
 
 ### Live test results (4DA, 2026-04-26):
 Tested against 4DA (3 windows: main 1200×800, notification 440×160, briefing 560×780; 135 DOM elements; 11 buttons; React/Vite frontend on :4444). **99/99 tests pass — all 23 tools + 3 resources + tool registration checks.**
@@ -239,7 +240,8 @@ Tested against 4DA (3 windows: main 1200×800, notification 440×160, briefing 5
 
 ### Architecture notes:
 - **bridge.rs** — `WebviewBridge` trait (public) erases the Tauri `Runtime` generic, allowing the MCP handler (which can't be generic) to access webview windows via `Arc<dyn WebviewBridge>`. 8 methods: eval_webview, get_window_states, list_window_labels, get_native_handle, manage_window, resize_window, move_window, set_window_title. Impl provided for `AppHandle<R: Runtime>`. Cross-platform `get_native_handle`: Windows HWND, macOS CGWindowID (via ObjC runtime `windowNumber`), Linux Xlib/Xcb window ID. Testable via mock implementations.
-- **mcp/** — Split into `mod.rs` (handler + server startup + tests), `helpers.rs` (js_string, tool_error, validate_url, sanitize_css_color), and 7 param modules (webview, window, backend, verification, recording, introspection, other). rmcp `#[tool_router]` + `#[tool_handler]` macros require all tool methods in a single `impl` block, so the handler stays monolithic. `build_app()` constructs the axum `Router` independently of Tauri (testable). `StreamableHttpService` serves on `/mcp`. Health/info endpoints on `/health` and `/info`.
+- **mcp/** — Split into `mod.rs` (handler + server startup + tests), `server.rs` (Router + server lifecycle), `rest.rs` (REST API routes), `helpers.rs` (js_string, tool_error, validate_url, sanitize_css_color), and 7 param modules (webview, window, backend, verification, recording, introspection, other). rmcp `#[tool_router]` + `#[tool_handler]` macros require all tool methods in a single `impl` block, so the handler stays monolithic. `build_app()` constructs the axum `Router` independently of Tauri (testable). `StreamableHttpService` serves on `/mcp`. REST API on `/api/tools`. Health/info endpoints on `/health` and `/info`.
+- **REST API** (`mcp/rest.rs`) — Dual-protocol: all 23 tools accessible via `POST /api/tools/{name}` with plain JSON body, no MCP session needed. `GET /api/tools` lists available tools. Uses the same `VictauriMcpHandler.execute_tool()` dispatch that applies privacy checks, rate limiting, auth, and output redaction. Response format: `{"result": ...}` for success, `{"error": "..."}` for errors. Text results parsed as JSON when valid. Goes through the same auth/rate-limit middleware as MCP.
 - **tools.rs** — Tauri commands still work independently for in-app IPC. Both the MCP tools and Tauri commands use the same `pending_evals` mechanism for JS eval with return.
 - **screenshot.rs** — Windows: `PrintWindow` → `GetDIBits` (BGRA) → RGBA → PNG. macOS: `CGWindowListCreateImage` → `CGBitmapContext` (RGBA) → PNG. Linux: X11 `GetImage` (BGRA ZPixmap) → RGBA via `x11rb`, with Wayland fallback via `grim` subprocess (full-screen capture). All platforms use the same custom PNG encoder with flate2 zlib compression (CRC32 + Adler32).
 - **auth.rs** — Bearer token authentication, **enabled by default**. Auto-generates UUID token on startup if none provided (token logged for user). `auth_disabled()` builder method to explicitly opt out. `require_auth` axum middleware skips `/health` but protects `/mcp` and `/info`. Token from `VictauriBuilder::auth_token()`, `generate_auth_token()`, or `VICTAURI_AUTH_TOKEN` env var.
@@ -263,6 +265,7 @@ Tested against 4DA (3 windows: main 1200×800, notification 440×160, briefing 5
 - Eval timeout is 30s (not 10s) to support `wait_for` tool's configurable polling timeout
 - **Auto-event recording** — background `event_drain_loop` polls `getEventStream()` every 1s while recording is active, converting JS events (console, mutation, IPC, network, navigation) into `AppEvent` variants and feeding them into `EventRecorder`. Time-travel now works automatically without manual tool calls.
 - **Port fallback** — `try_bind()` tries preferred port, then +1 through +10. Writes `<temp>/victauri.port` file for client discovery, removes on shutdown. `VictauriState.port` is `AtomicU16` updated to actual bound port.
+- **Dual-protocol (MCP + REST)** — REST routes (`/api/tools`) are nested in the axum Router alongside `/mcp`, sharing the same auth/rate-limit/security middleware. `VictauriMcpHandler::execute_tool()` dispatches by tool name, deserializes JSON args into the appropriate param struct, and calls the rmcp `#[tool]` method directly. No MCP session or handshake needed for REST calls.
 
 ### Relationship to 4DA:
 Victauri is a standalone open-source project. 4DA has `victauri-plugin` as a path dependency (`path = "../../runyourempire/victauri/crates/victauri-plugin"` in `src-tauri/Cargo.toml`), with `victauri:default` in capabilities and `.mcp.json` configured. They share no code. The 4DA repo is at `D:\4DA`, this repo is at `D:\runyourempire\victauri`.

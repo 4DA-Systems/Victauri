@@ -2,6 +2,7 @@ mod backend_params;
 mod compound_params;
 mod helpers;
 mod other_params;
+mod rest;
 mod server;
 mod verification_params;
 mod webview_params;
@@ -1315,6 +1316,145 @@ impl VictauriMcpHandler {
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             bridge_checked: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub(crate) fn is_tool_enabled(&self, name: &str) -> bool {
+        self.state.privacy.is_tool_enabled(name)
+    }
+
+    pub(crate) async fn execute_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<CallToolResult, rest::ToolCallError> {
+        if !self.state.privacy.is_tool_enabled(name) {
+            return Ok(tool_disabled(name));
+        }
+        self.state.tool_invocations.fetch_add(1, Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        tracing::debug!(tool = %name, "REST tool invocation started");
+
+        let result = match name {
+            "eval_js" => {
+                let p: EvalJsParams = Self::parse_args(args)?;
+                self.eval_js(Parameters(p)).await
+            }
+            "dom_snapshot" => {
+                let p: SnapshotParams = Self::parse_args(args)?;
+                self.dom_snapshot(Parameters(p)).await
+            }
+            "find_elements" => {
+                let p: FindElementsParams = Self::parse_args(args)?;
+                self.find_elements(Parameters(p)).await
+            }
+            "invoke_command" => {
+                let p: InvokeCommandParams = Self::parse_args(args)?;
+                self.invoke_command(Parameters(p)).await
+            }
+            "screenshot" => {
+                let p: ScreenshotParams = Self::parse_args(args)?;
+                self.screenshot(Parameters(p)).await
+            }
+            "verify_state" => {
+                let p: VerifyStateParams = Self::parse_args(args)?;
+                self.verify_state(Parameters(p)).await
+            }
+            "detect_ghost_commands" => {
+                let p: GhostCommandParams = Self::parse_args(args)?;
+                self.detect_ghost_commands(Parameters(p)).await
+            }
+            "check_ipc_integrity" => {
+                let p: IpcIntegrityParams = Self::parse_args(args)?;
+                self.check_ipc_integrity(Parameters(p)).await
+            }
+            "wait_for" => {
+                let p: WaitForParams = Self::parse_args(args)?;
+                self.wait_for(Parameters(p)).await
+            }
+            "assert_semantic" => {
+                let p: SemanticAssertParams = Self::parse_args(args)?;
+                self.assert_semantic(Parameters(p)).await
+            }
+            "resolve_command" => {
+                let p: ResolveCommandParams = Self::parse_args(args)?;
+                self.resolve_command(Parameters(p)).await
+            }
+            "get_registry" => {
+                let p: RegistryParams = Self::parse_args(args)?;
+                self.get_registry(Parameters(p)).await
+            }
+            "get_memory_stats" => self.get_memory_stats().await,
+            "get_plugin_info" => self.get_plugin_info().await,
+            "interact" => {
+                let p: InteractParams = Self::parse_args(args)?;
+                self.interact(Parameters(p)).await
+            }
+            "input" => {
+                let p: InputParams = Self::parse_args(args)?;
+                self.input(Parameters(p)).await
+            }
+            "window" => {
+                let p: WindowParams = Self::parse_args(args)?;
+                self.window(Parameters(p)).await
+            }
+            "storage" => {
+                let p: StorageParams = Self::parse_args(args)?;
+                self.storage(Parameters(p)).await
+            }
+            "navigate" => {
+                let p: NavigateParams = Self::parse_args(args)?;
+                self.navigate(Parameters(p)).await
+            }
+            "recording" => {
+                let p: RecordingParams = Self::parse_args(args)?;
+                self.recording(Parameters(p)).await
+            }
+            "inspect" => {
+                let p: InspectParams = Self::parse_args(args)?;
+                self.inspect(Parameters(p)).await
+            }
+            "css" => {
+                let p: CssParams = Self::parse_args(args)?;
+                self.css(Parameters(p)).await
+            }
+            "logs" => {
+                let p: LogsParams = Self::parse_args(args)?;
+                self.logs(Parameters(p)).await
+            }
+            _ => return Err(rest::ToolCallError::UnknownTool(name.to_string())),
+        };
+
+        let elapsed = start.elapsed();
+        tracing::debug!(
+            tool = %name,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "REST tool invocation completed"
+        );
+
+        if self.state.privacy.redaction_enabled {
+            Ok(Self::redact_result(result, &self.state.privacy))
+        } else {
+            Ok(result)
+        }
+    }
+
+    fn parse_args<T: serde::de::DeserializeOwned>(
+        args: serde_json::Value,
+    ) -> Result<T, rest::ToolCallError> {
+        serde_json::from_value(args)
+            .map_err(|e| rest::ToolCallError::InvalidParams(e.to_string()))
+    }
+
+    fn redact_result(
+        mut result: CallToolResult,
+        privacy: &crate::privacy::PrivacyConfig,
+    ) -> CallToolResult {
+        for item in &mut result.content {
+            if let RawContent::Text(ref mut tc) = item.raw {
+                tc.text = privacy.redact_output(&tc.text);
+            }
+        }
+        result
     }
 
     fn track_tool_call(&self) {

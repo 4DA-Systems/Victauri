@@ -38,6 +38,7 @@ pub fn build_app_full(
     rate_limiter: Option<Arc<crate::auth::RateLimiterState>>,
 ) -> axum::Router {
     let handler = VictauriMcpHandler::new(state.clone(), bridge);
+    let rest = super::rest::router(handler.clone());
 
     let mcp_service = StreamableHttpService::new(
         move || Ok(handler.clone()),
@@ -58,6 +59,7 @@ pub fn build_app_full(
 
     let mut router = axum::Router::new()
         .route_service("/mcp", mcp_service)
+        .nest("/api/tools", rest)
         .route(
             "/info",
             axum::routing::get(move || {
