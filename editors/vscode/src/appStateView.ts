@@ -6,6 +6,7 @@ type NodeKind =
   | "window"
   | "memory"
   | "plugin"
+  | "performance"
   | "diagnosticWarning";
 
 interface StateNode {
@@ -114,6 +115,45 @@ export class AppStateProvider implements vscode.TreeDataProvider<StateNode> {
           },
         ],
       });
+    }
+
+    // Performance
+    const perf = this.client.perfMetrics;
+    if (perf) {
+      const children: StateNode[] = [];
+      const heap = perf.js_heap as { used_mb?: number; total_mb?: number } | undefined;
+      if (heap?.used_mb != null) {
+        children.push({
+          kind: "performance",
+          label: "JS Heap",
+          description: `${heap.used_mb.toFixed(1)} / ${(heap.total_mb ?? 0).toFixed(1)} MB`,
+        });
+      }
+      const dom = perf.dom_stats as { element_count?: number; max_depth?: number } | undefined;
+      if (dom?.element_count != null) {
+        children.push({
+          kind: "performance",
+          label: "DOM Elements",
+          description: `${dom.element_count} (depth ${dom.max_depth ?? "?"})`,
+        });
+      }
+      const longTasks = perf.long_task_count as number | undefined;
+      if (longTasks != null) {
+        children.push({
+          kind: "performance",
+          label: "Long Tasks",
+          description: `${longTasks}`,
+          icon: longTasks > 0 ? new vscode.ThemeIcon("warning") : undefined,
+        });
+      }
+      if (children.length > 0) {
+        nodes.push({
+          kind: "header",
+          label: "Performance",
+          icon: new vscode.ThemeIcon("graph"),
+          children,
+        });
+      }
     }
 
     // Diagnostics warnings

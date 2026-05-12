@@ -65,6 +65,7 @@ export class VictauriClient {
   memoryStats: Record<string, unknown> = {};
   pluginInfo: Record<string, unknown> = {};
   diagnostics: DiagnosticsResult | null = null;
+  perfMetrics: Record<string, unknown> | null = null;
   toolCount = 0;
 
   get connectionState(): ConnectionState {
@@ -99,6 +100,7 @@ export class VictauriClient {
     this.memoryStats = {};
     this.pluginInfo = {};
     this.diagnostics = null;
+    this.perfMetrics = null;
     this.toolCount = 0;
   }
 
@@ -111,6 +113,7 @@ export class VictauriClient {
       this.refreshPluginInfo(),
       this.refreshDom(),
       this.refreshDiagnostics(),
+      this.refreshPerformance(),
     ]);
     this.onDataUpdate.fire();
   }
@@ -147,6 +150,30 @@ export class VictauriClient {
 
   async evalJs(code: string): Promise<unknown> {
     return this.callTool("eval_js", { code });
+  }
+
+  async clickElement(refId: string): Promise<unknown> {
+    return this.callTool("interact", { action: "click", ref_id: refId });
+  }
+
+  async highlightElement(refId: string): Promise<unknown> {
+    return this.callTool("inspect", { action: "highlight", ref_id: refId, color: "#e94560" });
+  }
+
+  async clearHighlights(): Promise<unknown> {
+    return this.callTool("inspect", { action: "highlight_clear" });
+  }
+
+  async getElementStyles(refId: string): Promise<unknown> {
+    return this.callTool("inspect", { action: "styles", ref_id: refId });
+  }
+
+  async auditAccessibility(): Promise<unknown> {
+    return this.callTool("inspect", { action: "accessibility" });
+  }
+
+  async getPerformanceMetrics(): Promise<unknown> {
+    return this.callTool("inspect", { action: "performance" });
   }
 
   dispose(): void {
@@ -229,6 +256,17 @@ export class VictauriClient {
       )) as DiagnosticsResult;
       if (result && typeof result === "object" && "warnings" in result) {
         this.diagnostics = result;
+      }
+    } catch {
+      // keep stale
+    }
+  }
+
+  private async refreshPerformance(): Promise<void> {
+    try {
+      const result = (await this.getPerformanceMetrics()) as Record<string, unknown>;
+      if (result && typeof result === "object") {
+        this.perfMetrics = result;
       }
     } catch {
       // keep stale

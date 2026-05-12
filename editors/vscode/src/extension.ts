@@ -13,9 +13,11 @@ import { ScreenshotPanel } from "./screenshotPanel";
 
 let client: VictauriClient;
 let statusBarItem: vscode.StatusBarItem;
+let outputChannel: vscode.OutputChannel;
 
 export function activate(context: vscode.ExtensionContext): void {
   client = new VictauriClient();
+  outputChannel = vscode.window.createOutputChannel("Victauri");
 
   // Status bar
   statusBarItem = vscode.window.createStatusBarItem(
@@ -102,10 +104,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
       try {
         const result = await client.evalJs(code);
-        const output = vscode.window.createOutputChannel("Victauri");
-        output.appendLine(`> ${code}`);
-        output.appendLine(JSON.stringify(result, null, 2));
-        output.show();
+        outputChannel.appendLine(`> ${code}`);
+        outputChannel.appendLine(JSON.stringify(result, null, 2));
+        outputChannel.show();
       } catch (e) {
         vscode.window.showErrorMessage(`Victauri: Eval failed — ${e}`);
       }
@@ -121,10 +122,9 @@ export function activate(context: vscode.ExtensionContext): void {
           warnings?: Array<{ message: string }>;
           info?: Record<string, unknown>;
         };
-        const output = vscode.window.createOutputChannel("Victauri");
-        output.appendLine("=== Victauri Diagnostics ===");
-        output.appendLine(JSON.stringify(result, null, 2));
-        output.show();
+        outputChannel.appendLine("=== Victauri Diagnostics ===");
+        outputChannel.appendLine(JSON.stringify(result, null, 2));
+        outputChannel.show();
 
         const warnings = result?.warnings ?? [];
         if (warnings.length === 0) {
@@ -180,7 +180,108 @@ export function activate(context: vscode.ExtensionContext): void {
         });
         await vscode.window.showTextDocument(doc);
       }
-    )
+    ),
+
+    vscode.commands.registerCommand(
+      "victauri.clickElement",
+      async (node: unknown) => {
+        const domNode = node as { ref_id?: string };
+        if (!domNode?.ref_id) return;
+        try {
+          await client.clickElement(domNode.ref_id);
+          vscode.window.showInformationMessage(
+            `Clicked element ${domNode.ref_id}`
+          );
+        } catch (e) {
+          vscode.window.showErrorMessage(`Click failed: ${e}`);
+        }
+      }
+    ),
+
+    vscode.commands.registerCommand(
+      "victauri.highlightElement",
+      async (node: unknown) => {
+        const domNode = node as { ref_id?: string };
+        if (!domNode?.ref_id) return;
+        try {
+          await client.highlightElement(domNode.ref_id);
+        } catch (e) {
+          vscode.window.showErrorMessage(`Highlight failed: ${e}`);
+        }
+      }
+    ),
+
+    vscode.commands.registerCommand("victauri.clearHighlights", async () => {
+      try {
+        await client.clearHighlights();
+      } catch (e) {
+        vscode.window.showErrorMessage(`Clear highlights failed: ${e}`);
+      }
+    }),
+
+    vscode.commands.registerCommand(
+      "victauri.inspectStyles",
+      async (node: unknown) => {
+        const domNode = node as { ref_id?: string; tag?: string };
+        if (!domNode?.ref_id) return;
+        try {
+          const styles = await client.getElementStyles(domNode.ref_id);
+          outputChannel.appendLine(
+            `=== Styles for ${domNode.tag ?? "element"} [${domNode.ref_id}] ===`
+          );
+          outputChannel.appendLine(JSON.stringify(styles, null, 2));
+          outputChannel.show();
+        } catch (e) {
+          vscode.window.showErrorMessage(`Inspect styles failed: ${e}`);
+        }
+      }
+    ),
+
+    vscode.commands.registerCommand("victauri.auditA11y", async () => {
+      if (client.connectionState !== "connected") {
+        vscode.window.showWarningMessage("Victauri: Not connected");
+        return;
+      }
+      try {
+        const result = (await client.auditAccessibility()) as {
+          violations?: unknown[];
+          warnings?: unknown[];
+          summary?: Record<string, number>;
+        };
+        outputChannel.appendLine("=== Accessibility Audit ===");
+        outputChannel.appendLine(JSON.stringify(result, null, 2));
+        outputChannel.show();
+
+        const violations = result?.violations ?? [];
+        const warnings = result?.warnings ?? [];
+        if (violations.length === 0 && warnings.length === 0) {
+          vscode.window.showInformationMessage(
+            "Victauri: No accessibility issues found"
+          );
+        } else {
+          vscode.window.showWarningMessage(
+            `Victauri: ${violations.length} violation(s), ${warnings.length} warning(s) — see Output panel`
+          );
+        }
+      } catch (e) {
+        vscode.window.showErrorMessage(`A11y audit failed: ${e}`);
+      }
+    }),
+
+    vscode.commands.registerCommand("victauri.perfMetrics", async () => {
+      if (client.connectionState !== "connected") {
+        vscode.window.showWarningMessage("Victauri: Not connected");
+        return;
+      }
+      try {
+        const result = await client.getPerformanceMetrics();
+        outputChannel.appendLine("=== Performance Metrics ===");
+        outputChannel.appendLine(JSON.stringify(result, null, 2));
+        outputChannel.show();
+      } catch (e) {
+        vscode.window.showErrorMessage(`Performance metrics failed: ${e}`);
+      }
+    })
   );
 
   context.subscriptions.push(client, statusBarItem);

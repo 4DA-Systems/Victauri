@@ -790,12 +790,12 @@ cd editors/vscode && npm install && npm run build
 ### Features
 
 - **Activity bar** with three tree views:
-  - **App State** — windows, memory usage, plugin info, diagnostic warnings
-  - **DOM Explorer** — navigable accessible tree with ref IDs, roles, bounds
+  - **App State** — windows, memory, performance (JS heap, DOM stats, long tasks), plugin info, diagnostics
+  - **DOM Explorer** — accessible tree with ref IDs, roles, bounds. Right-click to click, highlight, inspect styles, copy refs, generate tests
   - **IPC Log** — live command log with status, duration, timestamps
-- **Status bar** — connection state indicator (click to connect/disconnect)
-- **CodeLens** — "Generate Victauri test" appears on every `#[tauri::command]` in Rust files
-- **Commands** — Connect, Disconnect, Screenshot, Evaluate JS, Run Smoke Test
+- **Screenshot panel** — inline webview with refresh and save-to-disk
+- **CodeLens** — "Generate Victauri test" on every `#[tauri::command]` in Rust files
+- **Commands** — Connect, Disconnect, Screenshot, Evaluate JS, Diagnostics, A11y Audit, Performance Metrics
 - **Auto-connect** — detects `tauri.conf.json` in workspace, connects on activation
 - **Port discovery** — reads `victauri.port` temp file for auto-fallback detection
 - **Auth support** — configurable Bearer token via `victauri.authToken` setting

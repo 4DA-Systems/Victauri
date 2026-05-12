@@ -113,6 +113,42 @@
         "title": "Generate Test for Command",
         "category": "Victauri",
         "icon": "$(beaker)"
+      },
+      {
+        "command": "victauri.clickElement",
+        "title": "Click Element",
+        "category": "Victauri",
+        "icon": "$(debug-start)"
+      },
+      {
+        "command": "victauri.highlightElement",
+        "title": "Highlight Element",
+        "category": "Victauri",
+        "icon": "$(lightbulb)"
+      },
+      {
+        "command": "victauri.clearHighlights",
+        "title": "Clear Highlights",
+        "category": "Victauri",
+        "icon": "$(close-all)"
+      },
+      {
+        "command": "victauri.inspectStyles",
+        "title": "Inspect Styles",
+        "category": "Victauri",
+        "icon": "$(symbol-color)"
+      },
+      {
+        "command": "victauri.auditA11y",
+        "title": "Audit Accessibility",
+        "category": "Victauri",
+        "icon": "$(accessibility)"
+      },
+      {
+        "command": "victauri.perfMetrics",
+        "title": "Performance Metrics",
+        "category": "Victauri",
+        "icon": "$(graph)"
       }
     ],
     "viewsWelcome": [
@@ -142,12 +178,29 @@
       ],
       "view/item/context": [
         {
+          "command": "victauri.clickElement",
+          "when": "viewItem == domElement",
+          "group": "1_interact"
+        },
+        {
+          "command": "victauri.highlightElement",
+          "when": "viewItem == domElement",
+          "group": "1_interact"
+        },
+        {
+          "command": "victauri.inspectStyles",
+          "when": "viewItem == domElement",
+          "group": "2_inspect"
+        },
+        {
           "command": "victauri.copyRefId",
-          "when": "viewItem == domElement"
+          "when": "viewItem == domElement",
+          "group": "3_copy"
         },
         {
           "command": "victauri.generateTest",
-          "when": "viewItem == domElement"
+          "when": "viewItem == domElement",
+          "group": "4_generate"
         }
       ]
     },
