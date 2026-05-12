@@ -53,6 +53,8 @@ enum Commands {
         #[arg(short = 'n', long, default_value = "recorded_flow")]
         test_name: String,
     },
+    /// Diagnose your Victauri setup — check every step from plugin wiring to tool operation
+    Doctor,
     /// Watch test files and re-run on changes
     Watch {
         /// Directory to watch (default: tests/)
@@ -95,6 +97,9 @@ async fn main() -> Result<()> {
         } => {
             cmd_test(max_load_ms, max_heap_mb, junit.as_deref()).await?;
         }
+        Commands::Doctor => {
+            cmd_doctor().await?;
+        }
         Commands::Record { output, test_name } => {
             cmd_record(&output, &test_name).await?;
         }
@@ -127,31 +132,101 @@ fn cmd_init(root: &Path) -> Result<()> {
         eprintln!("         Victauri is designed for Tauri apps — tests may not connect.\n");
     }
 
+    eprintln!("Initializing Victauri...\n");
+
+    // Step 1: Add dependencies to Cargo.toml
     let added = add_dependencies(&cargo_toml_path)?;
     if added {
-        eprintln!("  Added victauri-plugin and victauri-test to Cargo.toml");
+        eprintln!("  [+] Added victauri-plugin and victauri-test to Cargo.toml");
     } else {
-        eprintln!("  Dependencies already present in Cargo.toml");
+        eprintln!("  [=] Dependencies already present in Cargo.toml");
     }
 
+    // Step 2: Auto-patch main.rs/lib.rs with plugin wiring
+    let src_dir = cargo_toml_path
+        .parent()
+        .map(|p| p.join("src"))
+        .unwrap_or_default();
+    let mut patched = false;
+    if src_dir.exists() {
+        patched = try_patch_tauri_builder(&src_dir)?;
+    }
+    if !patched {
+        eprintln!("  [!] Could not auto-patch your Tauri builder.");
+        eprintln!("      Add this line manually:\n");
+        eprintln!("        .plugin(victauri_plugin::init())\n");
+    }
+
+    // Step 3: Create .mcp.json for AI agent connection
+    let mcp_json_path = root.join(".mcp.json");
+    if mcp_json_path.exists() {
+        let content = std::fs::read_to_string(&mcp_json_path).unwrap_or_default();
+        if content.contains("victauri") {
+            eprintln!("  [=] .mcp.json already configured for Victauri");
+        } else {
+            eprintln!("  [!] .mcp.json exists but doesn't reference Victauri.");
+            eprintln!("      Add this to your mcpServers:\n");
+            eprintln!("        \"victauri\": {{ \"url\": \"http://127.0.0.1:7373/mcp\" }}\n");
+        }
+    } else {
+        std::fs::write(&mcp_json_path, generate_mcp_json())
+            .with_context(|| format!("failed to write {}", mcp_json_path.display()))?;
+        eprintln!("  [+] Created .mcp.json (AI agent configuration)");
+    }
+
+    // Step 4: Create Tauri capability for Victauri
+    let capabilities_dir = find_capabilities_dir(&cargo_toml_path);
+    if let Some(caps_dir) = capabilities_dir {
+        let cap_path = caps_dir.join("victauri.json");
+        if cap_path.exists() {
+            eprintln!("  [=] capabilities/victauri.json already exists");
+        } else {
+            std::fs::create_dir_all(&caps_dir)
+                .with_context(|| format!("failed to create {}", caps_dir.display()))?;
+            std::fs::write(&cap_path, generate_capability_json())
+                .with_context(|| format!("failed to write {}", cap_path.display()))?;
+            eprintln!("  [+] Created capabilities/victauri.json");
+        }
+    }
+
+    // Step 5: Create test files
     let tests_dir = find_src_tauri(&root).map_or_else(|| root.join("tests"), |p| p.join("tests"));
     std::fs::create_dir_all(&tests_dir)
         .with_context(|| format!("failed to create {}", tests_dir.display()))?;
 
     let smoke_path = tests_dir.join("smoke.rs");
     if smoke_path.exists() {
-        eprintln!("  tests/smoke.rs already exists — skipping");
+        eprintln!("  [=] tests/smoke.rs already exists");
     } else {
         std::fs::write(&smoke_path, generate_smoke_test())
             .with_context(|| format!("failed to write {}", smoke_path.display()))?;
-        eprintln!("  Created {}", smoke_path.display());
+        eprintln!("  [+] Created tests/smoke.rs (smoke tests)");
     }
 
+    let integration_path = tests_dir.join("integration.rs");
+    if integration_path.exists() {
+        eprintln!("  [=] tests/integration.rs already exists");
+    } else {
+        std::fs::write(&integration_path, generate_integration_test())
+            .with_context(|| format!("failed to write {}", integration_path.display()))?;
+        eprintln!("  [+] Created tests/integration.rs (integration test template)");
+    }
+
+    // Step 6: Print summary
+    let mut remaining_steps = Vec::new();
+    if !patched {
+        remaining_steps
+            .push("Add .plugin(victauri_plugin::init()) to your Tauri builder".to_string());
+    }
+    remaining_steps.push("Start your app:  pnpm tauri dev".to_string());
+    remaining_steps.push("Run the tests:   VICTAURI_E2E=1 cargo test --test smoke".to_string());
+    remaining_steps.push("Try the CLI:     victauri check".to_string());
+
     eprintln!("\nVictauri initialized. Next steps:");
-    eprintln!("  1. Add .plugin(victauri_plugin::init()) to your Tauri builder");
-    eprintln!("     (or .plugin(victauri_plugin::init_auto_discover()) for auto-discovery)");
-    eprintln!("  2. Start your app:  pnpm run tauri dev");
-    eprintln!("  3. Run the tests:   VICTAURI_E2E=1 cargo test --test smoke");
+    for (i, step) in remaining_steps.iter().enumerate() {
+        eprintln!("  {}. {step}", i + 1);
+    }
+
     Ok(())
 }
 
@@ -297,6 +372,236 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn cmd_doctor() -> Result<()> {
+    eprintln!("Victauri Doctor — checking your setup...\n");
+
+    let mut pass_count = 0u32;
+    let mut fail_count = 0u32;
+    let mut warn_count = 0u32;
+
+    // Check 1: Project structure
+    let cwd = std::env::current_dir()?;
+    let (cargo_path, is_tauri) = if let Ok(result) = detect_project(&cwd) {
+        eprintln!("  [PASS] Cargo.toml found: {}", result.0.display());
+        pass_count += 1;
+        result
+    } else {
+        eprintln!("  [FAIL] No Cargo.toml found in current directory");
+        eprintln!("         Run this command from your Tauri project root.\n");
+        fail_count += 1;
+        print_doctor_summary(pass_count, fail_count, warn_count);
+        return Ok(());
+    };
+
+    // Check 2: Tauri dependency
+    if is_tauri {
+        eprintln!("  [PASS] Tauri dependency detected");
+        pass_count += 1;
+    } else {
+        eprintln!("  [FAIL] No Tauri dependency in Cargo.toml");
+        eprintln!("         Add `tauri` to [dependencies] in {}", cargo_path.display());
+        fail_count += 1;
+    }
+
+    // Check 3: Victauri plugin dependency
+    let cargo_content = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+    if cargo_content.contains("victauri-plugin") {
+        eprintln!("  [PASS] victauri-plugin dependency present");
+        pass_count += 1;
+    } else {
+        eprintln!("  [FAIL] victauri-plugin not in Cargo.toml");
+        eprintln!("         Run: victauri init");
+        fail_count += 1;
+    }
+
+    // Check 4: Victauri test dependency
+    if cargo_content.contains("victauri-test") {
+        eprintln!("  [PASS] victauri-test dependency present");
+        pass_count += 1;
+    } else {
+        eprintln!("  [WARN] victauri-test not in Cargo.toml");
+        eprintln!("         Run: victauri init");
+        warn_count += 1;
+    }
+
+    // Check 5: Plugin wiring in source code
+    let src_dir = cargo_path.parent().map(|p| p.join("src")).unwrap_or_default();
+    let mut plugin_wired = false;
+    for filename in ["lib.rs", "main.rs"] {
+        let path = src_dir.join(filename);
+        if path.exists() {
+            let content = std::fs::read_to_string(&path).unwrap_or_default();
+            if content.contains("victauri_plugin") {
+                eprintln!("  [PASS] Plugin wired in {filename}");
+                plugin_wired = true;
+                pass_count += 1;
+                break;
+            }
+        }
+    }
+    if !plugin_wired {
+        eprintln!("  [FAIL] victauri_plugin not referenced in src/main.rs or src/lib.rs");
+        eprintln!("         Add .plugin(victauri_plugin::init()) to your Tauri builder");
+        fail_count += 1;
+    }
+
+    // Check 6: .mcp.json
+    let mcp_path = cwd.join(".mcp.json");
+    if mcp_path.exists() {
+        let content = std::fs::read_to_string(&mcp_path).unwrap_or_default();
+        if content.contains("7373") || content.contains("victauri") {
+            eprintln!("  [PASS] .mcp.json configured for Victauri");
+            pass_count += 1;
+        } else {
+            eprintln!("  [WARN] .mcp.json exists but may not reference Victauri");
+            warn_count += 1;
+        }
+    } else {
+        eprintln!("  [WARN] No .mcp.json found (needed for AI agent connection)");
+        eprintln!("         Run: victauri init");
+        warn_count += 1;
+    }
+
+    // Check 7: Capabilities
+    let caps_dir = find_capabilities_dir(&cargo_path);
+    if let Some(ref caps) = caps_dir {
+        let victauri_cap = caps.join("victauri.json");
+        if victauri_cap.exists() {
+            eprintln!("  [PASS] capabilities/victauri.json exists");
+            pass_count += 1;
+        } else {
+            // Check if any capability file references victauri
+            let has_victauri_perm = std::fs::read_dir(caps)
+                .map(|entries| {
+                    entries.filter_map(Result::ok).any(|e| {
+                        std::fs::read_to_string(e.path())
+                            .unwrap_or_default()
+                            .contains("victauri")
+                    })
+                })
+                .unwrap_or(false);
+            if has_victauri_perm {
+                eprintln!("  [PASS] Victauri permissions found in capabilities");
+                pass_count += 1;
+            } else {
+                eprintln!("  [WARN] No Victauri capability configured");
+                eprintln!("         Run: victauri init");
+                warn_count += 1;
+            }
+        }
+    }
+
+    // Check 8: Test files
+    let tests_dir = find_src_tauri(&cwd).map_or_else(|| cwd.join("tests"), |p| p.join("tests"));
+    if tests_dir.join("smoke.rs").exists() || tests_dir.join("integration.rs").exists() {
+        eprintln!("  [PASS] Test files found in {}", tests_dir.display());
+        pass_count += 1;
+    } else {
+        eprintln!("  [WARN] No Victauri test files found");
+        eprintln!("         Run: victauri init");
+        warn_count += 1;
+    }
+
+    // Check 9: Server connectivity
+    eprintln!();
+    eprintln!("  Checking server connectivity...");
+    if let Ok(mut client) = victauri_test::VictauriClient::discover().await {
+        eprintln!("  [PASS] Connected to Victauri server");
+        pass_count += 1;
+
+        // Check 10: Plugin info
+        if let Ok(info) = client.get_plugin_info().await {
+            let version = info
+                .get("version")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            eprintln!("  [PASS] Plugin responding (v{version})");
+            pass_count += 1;
+        } else {
+            eprintln!("  [FAIL] Plugin info unavailable");
+            fail_count += 1;
+        }
+
+        // Check 11: JS bridge
+        if let Ok(val) = client.eval_js("typeof window.__VICTAURI__").await {
+            let bridge_type = val.as_str().unwrap_or("undefined");
+            if bridge_type == "object" {
+                eprintln!("  [PASS] JS bridge loaded and responding");
+                pass_count += 1;
+
+                if let Ok(ver) = client.eval_js("window.__VICTAURI__.version").await {
+                    let ver_str = ver.as_str().unwrap_or("unknown");
+                    eprintln!("         Bridge version: {ver_str}");
+                }
+            } else {
+                eprintln!("  [FAIL] JS bridge not loaded (typeof = {bridge_type})");
+                eprintln!("         Check that your webview is rendering and CSP allows scripts");
+                fail_count += 1;
+            }
+        } else {
+            eprintln!("  [FAIL] JS eval failed");
+            eprintln!("         The webview may not be ready or CSP may block eval");
+            fail_count += 1;
+        }
+
+        // Check 12: DOM snapshot
+        if let Ok(snap) = client.dom_snapshot().await {
+            let element_count = snap
+                .get("element_count")
+                .and_then(serde_json::Value::as_u64)
+                .or_else(|| {
+                    snap.get("tree")
+                        .and_then(|t| t.get("children"))
+                        .and_then(|c| c.as_array())
+                        .map(|a| a.len() as u64)
+                })
+                .unwrap_or(0);
+            eprintln!("  [PASS] DOM snapshot works ({element_count} elements)");
+            pass_count += 1;
+        } else {
+            eprintln!("  [FAIL] DOM snapshot failed");
+            fail_count += 1;
+        }
+
+        // Check 13: IPC integrity
+        if let Ok(report) = client.check_ipc_integrity().await {
+            let healthy = report
+                .get("healthy")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if healthy {
+                eprintln!("  [PASS] IPC integrity healthy");
+                pass_count += 1;
+            } else {
+                eprintln!("  [WARN] IPC integrity degraded");
+                warn_count += 1;
+            }
+        } else {
+            eprintln!("  [FAIL] IPC integrity check failed");
+            fail_count += 1;
+        }
+    } else {
+        eprintln!("  [SKIP] Server not running — skipping runtime checks");
+        eprintln!("         Start your app to test the full chain: pnpm tauri dev");
+    }
+
+    eprintln!();
+    print_doctor_summary(pass_count, fail_count, warn_count);
+    Ok(())
+}
+
+fn print_doctor_summary(pass: u32, fail: u32, warn: u32) {
+    let total = pass + fail + warn;
+    eprintln!("Summary: {pass}/{total} passed, {fail} failed, {warn} warnings");
+    if fail == 0 && warn == 0 {
+        eprintln!("Your Victauri setup looks good!");
+    } else if fail == 0 {
+        eprintln!("Setup is functional but has minor issues. Run `victauri init` to fix.");
+    } else {
+        eprintln!("Setup needs attention. Fix the [FAIL] items above to get started.");
+    }
 }
 
 async fn cmd_test(max_load_ms: u64, max_heap_mb: f64, junit_path: Option<&Path>) -> Result<()> {
@@ -593,6 +898,178 @@ fn run_tests(filter: Option<&str>) {
     }
 }
 
+fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
+    for filename in ["lib.rs", "main.rs"] {
+        let path = src_dir.join(filename);
+        if !path.exists() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        if content.contains("victauri_plugin") {
+            eprintln!("  [=] {} already references victauri_plugin", path.display());
+            return Ok(true);
+        }
+
+        if !content.contains("tauri::Builder") {
+            continue;
+        }
+
+        // Try to find a safe insertion point:
+        // Look for `.run(tauri::generate_context` or `.build(tauri::generate_context`
+        // and insert `.plugin(victauri_plugin::init())` before that line.
+        let lines: Vec<&str> = content.lines().collect();
+        let mut insert_idx = None;
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.contains(".run(tauri::generate_context")
+                || trimmed.contains(".build(tauri::generate_context")
+            {
+                insert_idx = Some(i);
+                break;
+            }
+        }
+
+        if let Some(idx) = insert_idx {
+            let indent = lines[idx]
+                .chars()
+                .take_while(|c| c.is_whitespace())
+                .collect::<String>();
+            let plugin_line = format!("{indent}.plugin(victauri_plugin::init())");
+
+            let mut new_lines = lines[..idx].to_vec();
+            new_lines.push(&plugin_line);
+            new_lines.extend_from_slice(&lines[idx..]);
+
+            let new_content = new_lines.join("\n");
+            // Preserve trailing newline if original had one
+            let new_content = if content.ends_with('\n') {
+                format!("{new_content}\n")
+            } else {
+                new_content
+            };
+
+            std::fs::write(&path, new_content)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            eprintln!("  [+] Patched {} with .plugin(victauri_plugin::init())", path.display());
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn generate_mcp_json() -> &'static str {
+    r#"{
+  "mcpServers": {
+    "victauri": {
+      "url": "http://127.0.0.1:7373/mcp"
+    }
+  }
+}
+"#
+}
+
+fn generate_capability_json() -> &'static str {
+    r#"{
+  "identifier": "victauri",
+  "description": "Victauri testing plugin — debug builds only",
+  "context": "local",
+  "windows": ["*"],
+  "permissions": [
+    "victauri:default"
+  ]
+}
+"#
+}
+
+fn find_capabilities_dir(cargo_toml_path: &Path) -> Option<PathBuf> {
+    let project_dir = cargo_toml_path.parent()?;
+    // Tauri 2 standard: capabilities/ next to Cargo.toml
+    let caps = project_dir.join("capabilities");
+    if caps.exists() || project_dir.join("tauri.conf.json").exists() {
+        return Some(caps);
+    }
+    None
+}
+
+fn generate_integration_test() -> &'static str {
+    r#"//! Integration test template — demonstrates Victauri's full-stack testing capabilities.
+//!
+//! Run with: VICTAURI_E2E=1 cargo test --test integration
+
+use victauri_test::prelude::*;
+
+fn skip_unless_e2e() -> bool {
+    if !is_e2e() {
+        eprintln!("Skipping: set VICTAURI_E2E=1 with your Tauri dev server running");
+        return true;
+    }
+    false
+}
+
+#[tokio::test]
+async fn full_stack_health_check() {
+    if skip_unless_e2e() { return; }
+    let mut client = VictauriClient::discover().await
+        .expect("Failed to connect — is your Tauri dev server running?");
+
+    let report = client.verify()
+        .ipc_healthy()
+        .no_console_errors()
+        .no_ghost_commands()
+        .run()
+        .await
+        .unwrap();
+
+    for result in &report.results {
+        eprintln!("  [{}] {}", if result.passed { "PASS" } else { "FAIL" }, result.description);
+    }
+    report.assert_all_passed();
+}
+
+// Uncomment and adapt these patterns for your app:
+//
+// #[tokio::test]
+// async fn form_submission() {
+//     if skip_unless_e2e() { return; }
+//     let mut client = VictauriClient::discover().await.unwrap();
+//
+//     // Find elements by label or test ID
+//     let input = Locator::label("Name");
+//     let submit = Locator::role("button").and_text("Submit");
+//
+//     // Interact
+//     input.fill(&mut client, "World").await.unwrap();
+//     submit.click(&mut client).await.unwrap();
+//
+//     // Wait for result and verify
+//     Locator::text("Hello, World!")
+//         .expect(&mut client)
+//         .to_be_visible()
+//         .await
+//         .unwrap();
+//
+//     // Verify IPC call happened with correct args
+//     let log = client.get_ipc_log(Some(1)).await.unwrap();
+//     assert_ipc_called(&log, "greet");
+// }
+//
+// #[tokio::test]
+// async fn visual_regression() {
+//     if skip_unless_e2e() { return; }
+//     let mut client = VictauriClient::discover().await.unwrap();
+//
+//     let opts = VisualOptions {
+//         snapshot_dir: "tests/snapshots".into(),
+//         ..VisualOptions::from_preset(ThresholdPreset::Standard)
+//     };
+//     let diff = client.screenshot_visual("main-view", &opts).await.unwrap();
+//     assert!(diff.is_match, "visual regression: {:.2}% differ", diff.diff_percentage);
+// }
+"#
+}
+
 fn detect_project(root: &Path) -> Result<(PathBuf, bool)> {
     let src_tauri = root.join("src-tauri");
     let cargo_toml = if src_tauri.join("Cargo.toml").exists() {
@@ -830,5 +1307,111 @@ mod tests {
         add_dependencies(&cargo).unwrap();
         let second = add_dependencies(&cargo).unwrap();
         assert!(!second, "second call should report no changes");
+    }
+
+    #[test]
+    fn patch_tauri_builder_inserts_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "fn main() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n",
+        )
+        .unwrap();
+
+        let patched = try_patch_tauri_builder(&src).unwrap();
+        assert!(patched, "should have patched the file");
+
+        let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        assert!(content.contains("victauri_plugin::init()"));
+        assert!(
+            content.find("victauri_plugin").unwrap()
+                < content.find(".run(tauri::generate_context").unwrap(),
+            "plugin line should appear before .run()"
+        );
+    }
+
+    #[test]
+    fn patch_tauri_builder_skips_if_already_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "fn main() {\n    tauri::Builder::default()\n        .plugin(victauri_plugin::init())\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n",
+        )
+        .unwrap();
+
+        let patched = try_patch_tauri_builder(&src).unwrap();
+        assert!(patched, "should report true (already present)");
+
+        let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        assert_eq!(
+            content.matches("victauri_plugin").count(),
+            1,
+            "should not duplicate the plugin line"
+        );
+    }
+
+    #[test]
+    fn patch_tauri_builder_handles_lib_rs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub fn run() {\n    tauri::Builder::default()\n        .build(tauri::generate_context!())\n        .unwrap();\n}\n",
+        )
+        .unwrap();
+
+        let patched = try_patch_tauri_builder(&src).unwrap();
+        assert!(patched);
+
+        let content = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+        assert!(content.contains("victauri_plugin::init()"));
+    }
+
+    #[test]
+    fn patch_tauri_builder_no_builder_returns_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("main.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
+
+        let patched = try_patch_tauri_builder(&src).unwrap();
+        assert!(!patched, "should return false when no tauri::Builder found");
+    }
+
+    #[test]
+    fn mcp_json_has_correct_structure() {
+        let content = generate_mcp_json();
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert!(parsed["mcpServers"]["victauri"]["url"].as_str().is_some());
+        assert!(parsed["mcpServers"]["victauri"]["url"]
+            .as_str()
+            .unwrap()
+            .contains("7373"));
+    }
+
+    #[test]
+    fn capability_json_has_correct_structure() {
+        let content = generate_capability_json();
+        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        assert_eq!(parsed["identifier"].as_str().unwrap(), "victauri");
+        assert!(parsed["permissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.contains("victauri"))));
+    }
+
+    #[test]
+    fn integration_test_content_is_valid() {
+        let content = generate_integration_test();
+        assert!(content.contains("VictauriClient"));
+        assert!(content.contains("Locator"));
+        assert!(content.contains("VisualOptions"));
+        assert!(content.contains("verify()"));
     }
 }
