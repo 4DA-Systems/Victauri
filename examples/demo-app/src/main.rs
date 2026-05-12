@@ -1,17 +1,24 @@
 //! Demo Tauri application showcasing Victauri introspection and MCP tools.
+//!
+//! Features: multi-window, CRUD, form validation, navigation, state sync —
+//! everything needed to demonstrate Victauri's full-stack testing.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
-use tauri::Manager;
+use tauri::{Emitter, Manager, WebviewWindow};
 use victauri_plugin::inspectable;
+
+// ── State ──────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
 struct AppState {
     counter: Mutex<i32>,
     todos: Mutex<Vec<Todo>>,
     settings: Mutex<Settings>,
+    contacts: Mutex<Vec<Contact>>,
+    notifications: Mutex<Vec<Notification>>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -37,6 +44,30 @@ impl Default for Settings {
         }
     }
 }
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Contact {
+    id: u32,
+    name: String,
+    email: String,
+    message: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Notification {
+    id: u32,
+    title: String,
+    body: String,
+    read: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ValidationError {
+    field: String,
+    message: String,
+}
+
+// ── Counter commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
 #[inspectable(
@@ -97,6 +128,8 @@ fn reset_counter(state: tauri::State<'_, AppState>) -> i32 {
     *count = 0;
     *count
 }
+
+// ── Todo commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
 #[inspectable(
@@ -162,6 +195,8 @@ fn delete_todo(state: tauri::State<'_, AppState>, id: u32) -> Result<(), String>
     Ok(())
 }
 
+// ── Settings commands ──────────────────────────────────────────────────────
+
 #[tauri::command]
 #[inspectable(
     description = "Get current application settings",
@@ -199,6 +234,169 @@ fn update_settings(
     settings.clone()
 }
 
+// ── Contact form commands (validation pattern) ─────────────────────────────
+
+#[tauri::command]
+#[inspectable(
+    description = "Submit a contact form with server-side validation",
+    intent = "submit contact form",
+    category = "contacts",
+    example = "submit a contact form"
+)]
+fn submit_contact(
+    state: tauri::State<'_, AppState>,
+    name: String,
+    email: String,
+    message: String,
+) -> Result<Contact, Vec<ValidationError>> {
+    let mut errors = Vec::new();
+
+    if name.trim().is_empty() {
+        errors.push(ValidationError {
+            field: "name".to_string(),
+            message: "Name is required".to_string(),
+        });
+    }
+    if !email.contains('@') || !email.contains('.') {
+        errors.push(ValidationError {
+            field: "email".to_string(),
+            message: "Valid email address is required".to_string(),
+        });
+    }
+    if message.trim().len() < 10 {
+        errors.push(ValidationError {
+            field: "message".to_string(),
+            message: "Message must be at least 10 characters".to_string(),
+        });
+    }
+
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+
+    let mut contacts = state.contacts.lock().unwrap();
+    let id = contacts.len() as u32 + 1;
+    let contact = Contact {
+        id,
+        name: name.trim().to_string(),
+        email: email.trim().to_string(),
+        message: message.trim().to_string(),
+    };
+    contacts.push(contact.clone());
+    Ok(contact)
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "List all submitted contacts",
+    intent = "read contacts",
+    category = "contacts",
+    example = "show contacts"
+)]
+fn list_contacts(state: tauri::State<'_, AppState>) -> Vec<Contact> {
+    state.contacts.lock().unwrap().clone()
+}
+
+// ── Notification commands (multi-window pattern) ───────────────────────────
+
+#[tauri::command]
+#[inspectable(
+    description = "Send a notification (appears in notification window)",
+    intent = "create notification",
+    category = "notifications",
+    example = "send a notification"
+)]
+fn send_notification(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    title: String,
+    body: String,
+) -> Notification {
+    let mut notifs = state.notifications.lock().unwrap();
+    let id = notifs.len() as u32 + 1;
+    let notif = Notification {
+        id,
+        title,
+        body,
+        read: false,
+    };
+    notifs.push(notif.clone());
+
+    let _ = app.emit("notification-added", &notif);
+    notif
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "List all notifications",
+    intent = "read notifications",
+    category = "notifications"
+)]
+fn list_notifications(state: tauri::State<'_, AppState>) -> Vec<Notification> {
+    state.notifications.lock().unwrap().clone()
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "Mark a notification as read",
+    intent = "update notification",
+    category = "notifications"
+)]
+fn mark_notification_read(
+    state: tauri::State<'_, AppState>,
+    id: u32,
+) -> Result<Notification, String> {
+    let mut notifs = state.notifications.lock().unwrap();
+    let notif = notifs
+        .iter_mut()
+        .find(|n| n.id == id)
+        .ok_or_else(|| format!("notification {id} not found"))?;
+    notif.read = true;
+    Ok(notif.clone())
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "Get count of unread notifications",
+    intent = "count unread",
+    category = "notifications"
+)]
+fn unread_count(state: tauri::State<'_, AppState>) -> u32 {
+    state
+        .notifications
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|n| !n.read)
+        .count() as u32
+}
+
+// ── Window management ──────────────────────────────────────────────────────
+
+#[tauri::command]
+#[inspectable(
+    description = "Show or create the notification panel window",
+    intent = "open notification window",
+    category = "windows",
+    example = "show notifications"
+)]
+fn show_notification_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("notifications") {
+        window.show().map_err(|e| e.to_string())?;
+        window.set_focus().map_err(|e| e.to_string())?;
+    } else {
+        WebviewWindow::builder(&app, "notifications", tauri::WebviewUrl::App("notification.html".into()))
+            .title("Notifications")
+            .inner_size(400.0, 500.0)
+            .resizable(true)
+            .build()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// ── Debug ──────────────────────────────────────────────────────────────────
+
 #[tauri::command]
 #[inspectable(
     description = "Get a summary of all application state for verification",
@@ -211,6 +409,8 @@ fn get_app_state(state: tauri::State<'_, AppState>) -> serde_json::Value {
         "counter": *state.counter.lock().unwrap(),
         "todos": *state.todos.lock().unwrap(),
         "settings": *state.settings.lock().unwrap(),
+        "contacts": *state.contacts.lock().unwrap(),
+        "notifications": *state.notifications.lock().unwrap(),
     })
 }
 
@@ -231,6 +431,13 @@ fn main() {
                     delete_todo__schema(),
                     get_settings__schema(),
                     update_settings__schema(),
+                    submit_contact__schema(),
+                    list_contacts__schema(),
+                    send_notification__schema(),
+                    list_notifications__schema(),
+                    mark_notification_read__schema(),
+                    unread_count__schema(),
+                    show_notification_window__schema(),
                     get_app_state__schema(),
                 ])
                 .build()
@@ -249,6 +456,13 @@ fn main() {
             delete_todo,
             get_settings,
             update_settings,
+            submit_contact,
+            list_contacts,
+            send_notification,
+            list_notifications,
+            mark_notification_read,
+            unread_count,
+            show_notification_window,
             get_app_state,
         ])
         .setup(|app| {

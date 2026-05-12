@@ -31,7 +31,7 @@ victauri/
 │   ├── victauri-test/       # Test client + assertion helpers + smoke suite
 │   └── victauri-watchdog/   # Crash-recovery sidecar (monitors plugin health)
 └── examples/
-    └── demo-app/            # Minimal Tauri app with Victauri wired up
+    └── demo-app/            # Multi-window Tauri app with comprehensive test suite
 ```
 
 ### How It Works
@@ -234,7 +234,7 @@ Tested against 4DA (3 windows: main 1200×800, notification 440×160, briefing 5
 - **victauri-test**: Typed MCP HTTP client (`VictauriClient`) with auto-session management (initialize + notifications/initialized). 23 convenience methods for tool calls (eval_js, dom_snapshot, click, fill, etc). 6 standalone assertion helpers: `assert_json_eq`, `assert_json_truthy`, `assert_no_a11y_violations`, `assert_performance_budget`, `assert_ipc_healthy`, `assert_state_matches`. 11 client assertion methods: `assert_eval_works`, `assert_dom_snapshot_valid`, `assert_screenshot_ok`, `assert_windows_exist`, `assert_ipc_integrity_ok`, `assert_accessible`, `assert_dom_complete_under`, `assert_heap_under_mb`, `assert_no_uncaught_errors`, `assert_recording_lifecycle`, `assert_health_hardened`. Built-in `smoke_test()` suite (11 checks, returns `SmokeReport` with timing + JUnit XML). `SmokeConfig` for custom thresholds. Supports Bearer token auth via `connect_with_token`. Published to crates.io as standalone crate.
 - **victauri-cli**: CLI binary (`victauri`) with 6 commands: `init` (scaffold test directory), `check` (server diagnostics), `test` (built-in smoke suite — 11 checks with pass/fail + JUnit XML), `record` (capture interactions → test file), `watch` (file watcher → re-run tests), `coverage` (IPC command coverage report). `victauri test` auto-discovers the running app, runs all smoke checks, prints a summary, exits 0/1 for CI. Configurable `--max-load-ms` and `--max-heap-mb` thresholds.
 - **victauri-watchdog**: Configurable via env vars (`VICTAURI_PORT`, `VICTAURI_INTERVAL`, `VICTAURI_MAX_FAILURES`, `VICTAURI_ON_FAILURE`). Proper `tracing-subscriber` log output. Executes configurable recovery commands on failure. Fires recovery action once per failure cycle, resets on recovery.
-- **demo-app**: Tauri 2 app in `examples/demo-app/` with Victauri wired up. 12 commands (greet, counter CRUD, todo CRUD, settings, app state dump) all decorated with `#[inspectable]` including intent, category, examples. Frontend exercises all 12 commands: greet form, counter with +/−/reset, todo list with add/toggle/delete, settings panel (theme/notifications/language), debug state inspector. Includes `.mcp.json` for immediate Claude Code connection.
+- **demo-app**: Multi-window Tauri 2 app in `examples/demo-app/` with Victauri wired up. 19 commands (greet, counter CRUD, todo CRUD, settings, contact form with validation, notifications with cross-window events, window management, app state dump) all decorated with `#[inspectable]`. Tab-based navigation with ARIA attributes, `data-testid` on all interactive elements. Notification panel window with event sync. 20 integration tests in `tests/integration.rs` demonstrating every Victauri testing pattern (direct client API, Locator API, IPC verification, cross-boundary state, a11y audit, perf monitoring, time-travel recording, verify builder). Includes `.mcp.json` for immediate Claude Code connection.
 - **CI**: GitHub Actions workflow (`ci.yml`) — clippy + tests + docs on Linux/Windows/macOS, format check on Linux. All crate code passes `cargo fmt --check`.
 
 ### Architecture notes:

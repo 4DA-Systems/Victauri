@@ -15,8 +15,8 @@
       padding: 40px 20px;
     }
     .container { max-width: 640px; width: 100%; }
-    h1 { color: #8b5cf6; margin-bottom: 8px; font-size: 1.8em; }
-    .subtitle { color: #888; margin-bottom: 32px; font-size: 0.95em; }
+    h1 { color: #8b5cf6; margin-bottom: 4px; font-size: 1.8em; }
+    .subtitle { color: #888; margin-bottom: 24px; font-size: 0.95em; }
     .card {
       background: #1a1a24;
       border: 1px solid #2a2a3a;
@@ -26,7 +26,7 @@
     }
     .card h2 { color: #a78bfa; font-size: 1.1em; margin-bottom: 16px; }
     label { display: block; color: #aaa; font-size: 0.85em; margin-bottom: 6px; }
-    input, select {
+    input, select, textarea {
       width: 100%;
       padding: 10px 14px;
       background: #0f0f13;
@@ -35,8 +35,12 @@
       color: #e0e0e0;
       font-size: 0.95em;
       margin-bottom: 12px;
+      font-family: inherit;
     }
-    input:focus, select:focus { outline: none; border-color: #8b5cf6; }
+    textarea { resize: vertical; min-height: 80px; }
+    input:focus, select:focus, textarea:focus { outline: none; border-color: #8b5cf6; }
+    input.field-error, textarea.field-error { border-color: #ef4444; }
+    .field-error-msg { color: #ef4444; font-size: 0.8em; margin-top: -8px; margin-bottom: 8px; }
     button {
       padding: 10px 20px;
       background: #8b5cf6;
@@ -49,199 +53,221 @@
     }
     button:hover { background: #7c3aed; }
     button:active { background: #6d28d9; }
-    button.secondary {
-      background: #2a2a3a;
-      color: #a78bfa;
-    }
+    button.secondary { background: #2a2a3a; color: #a78bfa; }
     button.secondary:hover { background: #333348; }
-    button.danger {
-      background: #7f1d1d;
-      color: #fca5a5;
-      padding: 6px 12px;
-      font-size: 0.8em;
-    }
+    button.danger { background: #7f1d1d; color: #fca5a5; padding: 6px 12px; font-size: 0.8em; }
     button.danger:hover { background: #991b1b; }
     .result {
-      margin-top: 12px;
-      padding: 12px;
-      background: #0f0f13;
-      border-radius: 8px;
-      font-family: monospace;
-      font-size: 0.9em;
-      color: #a78bfa;
-      min-height: 20px;
+      margin-top: 12px; padding: 12px; background: #0f0f13;
+      border-radius: 8px; font-family: monospace; font-size: 0.9em;
+      color: #a78bfa; min-height: 20px;
     }
+
+    /* Tabs */
+    .tabs {
+      display: flex; gap: 4px; margin-bottom: 20px;
+      border-bottom: 1px solid #2a2a3a; padding-bottom: 0;
+    }
+    .tab {
+      padding: 10px 18px; cursor: pointer; color: #888;
+      border: none; background: none; font-size: 0.9em;
+      border-bottom: 2px solid transparent; transition: all 0.2s;
+    }
+    .tab:hover { color: #a78bfa; }
+    .tab.active { color: #8b5cf6; border-bottom-color: #8b5cf6; }
+    .tab-badge {
+      background: #8b5cf6; color: white; font-size: 0.7em;
+      padding: 1px 6px; border-radius: 10px; margin-left: 6px;
+    }
+    .tab-panel { display: none; }
+    .tab-panel.active { display: block; }
+
+    /* Counter */
     .counter-display {
-      font-size: 3em;
-      text-align: center;
-      color: #8b5cf6;
-      font-weight: bold;
-      margin: 16px 0;
+      font-size: 3em; text-align: center; color: #8b5cf6;
+      font-weight: bold; margin: 16px 0;
     }
     .counter-buttons { display: flex; gap: 12px; justify-content: center; }
+
+    /* Todo */
     .todo-list { list-style: none; }
     .todo-item {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 10px 12px;
-      background: #0f0f13;
-      border-radius: 8px;
-      margin-bottom: 8px;
+      display: flex; align-items: center; gap: 12px;
+      padding: 10px 12px; background: #0f0f13;
+      border-radius: 8px; margin-bottom: 8px;
     }
-    .todo-item.completed .todo-title {
-      text-decoration: line-through;
-      color: #666;
-    }
+    .todo-item.completed .todo-title { text-decoration: line-through; color: #666; }
     .todo-title { flex: 1; cursor: pointer; }
     .todo-check {
-      width: 20px; height: 20px;
-      border-radius: 50%;
-      border: 2px solid #444;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
+      width: 20px; height: 20px; border-radius: 50%;
+      border: 2px solid #444; cursor: pointer;
+      display: flex; align-items: center; justify-content: center; flex-shrink: 0;
     }
-    .todo-check.done {
-      background: #8b5cf6;
-      border-color: #8b5cf6;
-    }
-    .todo-check.done::after { content: "✓"; color: white; font-size: 12px; }
+    .todo-check.done { background: #8b5cf6; border-color: #8b5cf6; }
+    .todo-check.done::after { content: "\2713"; color: white; font-size: 12px; }
     .todo-input-row { display: flex; gap: 8px; }
     .todo-input-row input { flex: 1; margin-bottom: 0; }
-    .settings-row {
-      display: flex; align-items: center; gap: 12px;
-      margin-bottom: 16px;
-    }
+    .empty-state { color: #666; text-align: center; padding: 20px; font-size: 0.9em; }
+
+    /* Settings */
+    .settings-row { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
     .settings-row label { margin-bottom: 0; flex-shrink: 0; width: 120px; }
     .settings-row select, .settings-row input { flex: 1; margin-bottom: 0; }
     .toggle {
-      width: 44px; height: 24px;
-      background: #333;
-      border-radius: 12px;
-      cursor: pointer;
-      position: relative;
-      transition: background 0.2s;
-      flex-shrink: 0;
+      width: 44px; height: 24px; background: #333; border-radius: 12px;
+      cursor: pointer; position: relative; transition: background 0.2s; flex-shrink: 0;
     }
     .toggle.on { background: #8b5cf6; }
     .toggle::after {
-      content: "";
-      position: absolute;
-      width: 18px; height: 18px;
-      background: white;
-      border-radius: 50%;
-      top: 3px; left: 3px;
-      transition: transform 0.2s;
+      content: ""; position: absolute; width: 18px; height: 18px;
+      background: white; border-radius: 50%; top: 3px; left: 3px; transition: transform 0.2s;
     }
     .toggle.on::after { transform: translateX(20px); }
-    .empty-state { color: #666; text-align: center; padding: 20px; font-size: 0.9em; }
+
+    /* Success/error messages */
+    .alert { padding: 12px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 0.9em; }
+    .alert-success { background: #0d1f0d; border: 1px solid #1a3a1a; color: #4ade80; }
+    .alert-error { background: #1f0d0d; border: 1px solid #3a1a1a; color: #f87171; }
+
+    /* Status bar */
     .status {
-      margin-top: 32px;
-      padding: 16px;
-      background: #0d1f0d;
-      border: 1px solid #1a3a1a;
-      border-radius: 12px;
-      font-size: 0.85em;
-      color: #4ade80;
+      margin-top: 32px; padding: 16px; background: #0d1f0d;
+      border: 1px solid #1a3a1a; border-radius: 12px;
+      font-size: 0.85em; color: #4ade80;
     }
     .status .dot {
-      display: inline-block;
-      width: 8px; height: 8px;
-      background: #4ade80;
-      border-radius: 50%;
-      margin-right: 8px;
+      display: inline-block; width: 8px; height: 8px;
+      background: #4ade80; border-radius: 50%; margin-right: 8px;
     }
     .debug-btn {
-      margin-top: 12px;
-      padding: 8px 16px;
-      background: #1a2a1a;
-      color: #4ade80;
-      border: 1px solid #2a3a2a;
-      border-radius: 8px;
-      font-size: 0.8em;
-      cursor: pointer;
-      font-family: monospace;
+      margin-top: 12px; padding: 8px 16px; background: #1a2a1a;
+      color: #4ade80; border: 1px solid #2a3a2a; border-radius: 8px;
+      font-size: 0.8em; cursor: pointer; font-family: monospace;
     }
     .debug-btn:hover { background: #1a3a1a; }
     .debug-output {
-      margin-top: 8px;
-      padding: 12px;
-      background: #0a0a0f;
-      border: 1px solid #1a3a1a;
-      border-radius: 8px;
-      font-family: monospace;
-      font-size: 0.8em;
-      color: #4ade80;
-      white-space: pre-wrap;
-      max-height: 200px;
-      overflow-y: auto;
-      display: none;
+      margin-top: 8px; padding: 12px; background: #0a0a0f;
+      border: 1px solid #1a3a1a; border-radius: 8px;
+      font-family: monospace; font-size: 0.8em; color: #4ade80;
+      white-space: pre-wrap; max-height: 200px; overflow-y: auto; display: none;
     }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>Victauri Demo</h1>
-    <p class="subtitle">12 instrumented commands — connect an MCP client to introspect everything</p>
+    <p class="subtitle">19 instrumented commands — connect an MCP client to introspect everything</p>
 
-    <!-- Greet Card -->
-    <div class="card">
-      <h2>Greet</h2>
-      <label for="name-input">Your name</label>
-      <input id="name-input" type="text" placeholder="Enter your name..." />
-      <button id="greet-btn">Greet</button>
-      <div id="greet-result" class="result"></div>
-    </div>
+    <!-- Tab Navigation -->
+    <nav class="tabs" role="tablist" aria-label="Main navigation">
+      <button class="tab active" role="tab" data-tab="home" aria-selected="true">Home</button>
+      <button class="tab" role="tab" data-tab="todos" aria-selected="false">Todos</button>
+      <button class="tab" role="tab" data-tab="contact" aria-selected="false">Contact</button>
+      <button class="tab" role="tab" data-tab="settings" aria-selected="false">Settings</button>
+      <button class="tab" role="tab" data-tab="notifications" aria-selected="false">
+        Notifications <span id="notif-badge" class="tab-badge" style="display:none;">0</span>
+      </button>
+    </nav>
 
-    <!-- Counter Card -->
-    <div class="card">
-      <h2>Counter</h2>
-      <div id="counter-value" class="counter-display">0</div>
-      <div class="counter-buttons">
-        <button id="decrement-btn" class="secondary">−</button>
-        <button id="increment-btn">+</button>
-        <button id="reset-btn" class="secondary">Reset</button>
+    <!-- Home Tab -->
+    <div id="panel-home" class="tab-panel active" role="tabpanel">
+      <!-- Greet Card -->
+      <div class="card">
+        <h2>Greet</h2>
+        <label for="name-input">Your name</label>
+        <input id="name-input" data-testid="name-input" type="text" placeholder="Enter your name..." />
+        <button id="greet-btn" data-testid="greet-btn">Greet</button>
+        <div id="greet-result" data-testid="greet-result" class="result"></div>
+      </div>
+
+      <!-- Counter Card -->
+      <div class="card">
+        <h2>Counter</h2>
+        <div id="counter-value" data-testid="counter-value" class="counter-display" role="status" aria-live="polite">0</div>
+        <div class="counter-buttons">
+          <button id="decrement-btn" data-testid="decrement-btn" class="secondary" aria-label="Decrement counter">−</button>
+          <button id="increment-btn" data-testid="increment-btn" aria-label="Increment counter">+</button>
+          <button id="reset-btn" data-testid="reset-btn" class="secondary" aria-label="Reset counter">Reset</button>
+        </div>
       </div>
     </div>
 
-    <!-- Todo Card -->
-    <div class="card">
-      <h2>Todos</h2>
-      <div class="todo-input-row">
-        <input id="todo-input" type="text" placeholder="What needs to be done?" />
-        <button id="add-todo-btn">Add</button>
+    <!-- Todos Tab -->
+    <div id="panel-todos" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <h2>Todos</h2>
+        <div class="todo-input-row">
+          <input id="todo-input" data-testid="todo-input" type="text" placeholder="What needs to be done?" aria-label="New todo" />
+          <button id="add-todo-btn" data-testid="add-todo-btn">Add</button>
+        </div>
+        <ul id="todo-list" class="todo-list" style="margin-top: 16px;" role="list" aria-label="Todo items"></ul>
+        <div id="todo-empty" class="empty-state">No todos yet — add one above</div>
       </div>
-      <ul id="todo-list" class="todo-list" style="margin-top: 16px;"></ul>
-      <div id="todo-empty" class="empty-state">No todos yet — add one above</div>
     </div>
 
-    <!-- Settings Card -->
-    <div class="card">
-      <h2>Settings</h2>
-      <div class="settings-row">
-        <label>Theme</label>
-        <select id="theme-select">
-          <option value="dark">Dark</option>
-          <option value="light">Light</option>
-          <option value="system">System</option>
-        </select>
+    <!-- Contact Tab -->
+    <div id="panel-contact" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <h2>Contact Form</h2>
+        <div id="contact-alert" style="display:none;"></div>
+        <form id="contact-form" novalidate>
+          <label for="contact-name">Name</label>
+          <input id="contact-name" data-testid="contact-name" type="text" placeholder="Your name" required />
+          <div id="contact-name-error" class="field-error-msg" style="display:none;"></div>
+
+          <label for="contact-email">Email</label>
+          <input id="contact-email" data-testid="contact-email" type="email" placeholder="you@example.com" required />
+          <div id="contact-email-error" class="field-error-msg" style="display:none;"></div>
+
+          <label for="contact-message">Message</label>
+          <textarea id="contact-message" data-testid="contact-message" placeholder="How can we help?" required></textarea>
+          <div id="contact-message-error" class="field-error-msg" style="display:none;"></div>
+
+          <button type="submit" id="contact-submit" data-testid="contact-submit">Send Message</button>
+        </form>
       </div>
-      <div class="settings-row">
-        <label>Notifications</label>
-        <div id="notif-toggle" class="toggle on"></div>
+    </div>
+
+    <!-- Settings Tab -->
+    <div id="panel-settings" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <h2>Settings</h2>
+        <div class="settings-row">
+          <label for="theme-select">Theme</label>
+          <select id="theme-select" data-testid="theme-select">
+            <option value="dark">Dark</option>
+            <option value="light">Light</option>
+            <option value="system">System</option>
+          </select>
+        </div>
+        <div class="settings-row">
+          <label>Notifications</label>
+          <div id="notif-toggle" data-testid="notif-toggle" class="toggle on" role="switch" aria-checked="true" aria-label="Enable notifications" tabindex="0"></div>
+        </div>
+        <div class="settings-row">
+          <label for="lang-select">Language</label>
+          <select id="lang-select" data-testid="lang-select">
+            <option value="en">English</option>
+            <option value="es">Espanol</option>
+            <option value="fr">Francais</option>
+            <option value="de">Deutsch</option>
+            <option value="ja">Japanese</option>
+          </select>
+        </div>
       </div>
-      <div class="settings-row">
-        <label>Language</label>
-        <select id="lang-select">
-          <option value="en">English</option>
-          <option value="es">Español</option>
-          <option value="fr">Français</option>
-          <option value="de">Deutsch</option>
-          <option value="ja">日本語</option>
-        </select>
+    </div>
+
+    <!-- Notifications Tab -->
+    <div id="panel-notifications" class="tab-panel" role="tabpanel">
+      <div class="card">
+        <h2>Notifications</h2>
+        <div class="todo-input-row" style="margin-bottom: 16px;">
+          <input id="notif-title" data-testid="notif-title" type="text" placeholder="Title" style="margin-bottom:0;" />
+          <button id="send-notif-btn" data-testid="send-notif-btn">Send</button>
+        </div>
+        <input id="notif-body" data-testid="notif-body" type="text" placeholder="Notification body..." />
+        <ul id="notif-list" role="list" aria-label="Notifications" style="list-style:none;"></ul>
+        <div id="notif-empty" class="empty-state">No notifications yet</div>
       </div>
     </div>
 
@@ -250,13 +276,28 @@
       <span class="dot"></span>
       Victauri MCP server running on <strong>127.0.0.1:7373</strong>
       <br/>
-      <button class="debug-btn" id="debug-btn">get_app_state()</button>
-      <div id="debug-output" class="debug-output"></div>
+      <button class="debug-btn" id="debug-btn" data-testid="debug-btn">get_app_state()</button>
+      <div id="debug-output" data-testid="debug-output" class="debug-output"></div>
     </div>
   </div>
 
   <script>
     const { invoke } = window.__TAURI__.core;
+
+    // === Tab Navigation ===
+    const tabs = document.querySelectorAll(".tab");
+    const panels = document.querySelectorAll(".tab-panel");
+
+    tabs.forEach(tab => {
+      tab.addEventListener("click", () => {
+        const target = tab.dataset.tab;
+        tabs.forEach(t => { t.classList.remove("active"); t.setAttribute("aria-selected", "false"); });
+        panels.forEach(p => p.classList.remove("active"));
+        tab.classList.add("active");
+        tab.setAttribute("aria-selected", "true");
+        document.getElementById("panel-" + target).classList.add("active");
+      });
+    });
 
     // === Greet ===
     document.getElementById("greet-btn").addEventListener("click", async () => {
@@ -304,9 +345,13 @@
       for (const todo of todos) {
         const li = document.createElement("li");
         li.className = "todo-item" + (todo.completed ? " completed" : "");
+        li.setAttribute("data-testid", "todo-" + todo.id);
 
         const check = document.createElement("div");
         check.className = "todo-check" + (todo.completed ? " done" : "");
+        check.setAttribute("role", "checkbox");
+        check.setAttribute("aria-checked", todo.completed);
+        check.setAttribute("aria-label", "Toggle " + todo.title);
         check.addEventListener("click", async () => {
           await invoke("toggle_todo", { id: todo.id });
           renderTodos();
@@ -323,6 +368,7 @@
         const del = document.createElement("button");
         del.className = "danger";
         del.textContent = "Delete";
+        del.setAttribute("aria-label", "Delete " + todo.title);
         del.addEventListener("click", async () => {
           await invoke("delete_todo", { id: todo.id });
           renderTodos();
@@ -357,6 +403,7 @@
       document.getElementById("lang-select").value = s.language;
       const toggle = document.getElementById("notif-toggle");
       toggle.className = "toggle" + (s.notifications_enabled ? " on" : "");
+      toggle.setAttribute("aria-checked", s.notifications_enabled);
     }
 
     document.getElementById("theme-select").addEventListener("change", async (e) => {
@@ -372,9 +419,102 @@
       const isOn = toggle.classList.contains("on");
       await invoke("update_settings", { notificationsEnabled: !isOn });
       toggle.className = "toggle" + (!isOn ? " on" : "");
+      toggle.setAttribute("aria-checked", !isOn);
     });
 
     loadSettings();
+
+    // === Contact Form ===
+    function clearContactErrors() {
+      ["name", "email", "message"].forEach(f => {
+        document.getElementById("contact-" + f).classList.remove("field-error");
+        document.getElementById("contact-" + f + "-error").style.display = "none";
+      });
+      document.getElementById("contact-alert").style.display = "none";
+    }
+
+    document.getElementById("contact-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      clearContactErrors();
+
+      const name = document.getElementById("contact-name").value;
+      const email = document.getElementById("contact-email").value;
+      const message = document.getElementById("contact-message").value;
+
+      try {
+        await invoke("submit_contact", { name, email, message });
+        const alert = document.getElementById("contact-alert");
+        alert.className = "alert alert-success";
+        alert.textContent = "Message sent successfully!";
+        alert.style.display = "block";
+        document.getElementById("contact-form").reset();
+      } catch (err) {
+        if (Array.isArray(err)) {
+          err.forEach(ve => {
+            const input = document.getElementById("contact-" + ve.field);
+            const errEl = document.getElementById("contact-" + ve.field + "-error");
+            if (input) input.classList.add("field-error");
+            if (errEl) { errEl.textContent = ve.message; errEl.style.display = "block"; }
+          });
+        } else {
+          const alert = document.getElementById("contact-alert");
+          alert.className = "alert alert-error";
+          alert.textContent = typeof err === "string" ? err : "An error occurred";
+          alert.style.display = "block";
+        }
+      }
+    });
+
+    // === Notifications ===
+    async function refreshNotifications() {
+      const notifs = await invoke("list_notifications");
+      const list = document.getElementById("notif-list");
+      const empty = document.getElementById("notif-empty");
+      const badge = document.getElementById("notif-badge");
+      const unread = notifs.filter(n => !n.read).length;
+
+      badge.textContent = unread;
+      badge.style.display = unread > 0 ? "inline" : "none";
+
+      list.innerHTML = "";
+      empty.style.display = notifs.length === 0 ? "block" : "none";
+
+      for (const n of notifs) {
+        const li = document.createElement("li");
+        li.className = "todo-item" + (n.read ? " completed" : "");
+        li.setAttribute("data-testid", "notif-" + n.id);
+
+        const check = document.createElement("div");
+        check.className = "todo-check" + (n.read ? " done" : "");
+        check.setAttribute("role", "checkbox");
+        check.setAttribute("aria-checked", n.read);
+        check.setAttribute("aria-label", "Mark as read");
+        check.addEventListener("click", async () => {
+          await invoke("mark_notification_read", { id: n.id });
+          refreshNotifications();
+        });
+
+        const content = document.createElement("span");
+        content.className = "todo-title";
+        content.innerHTML = "<strong>" + n.title + "</strong><br/><span style='color:#888;font-size:0.85em;'>" + n.body + "</span>";
+
+        li.appendChild(check);
+        li.appendChild(content);
+        list.appendChild(li);
+      }
+    }
+
+    document.getElementById("send-notif-btn").addEventListener("click", async () => {
+      const title = document.getElementById("notif-title").value.trim();
+      const body = document.getElementById("notif-body").value.trim();
+      if (!title) return;
+      await invoke("send_notification", { title, body: body || "No details" });
+      document.getElementById("notif-title").value = "";
+      document.getElementById("notif-body").value = "";
+      refreshNotifications();
+    });
+
+    refreshNotifications();
 
     // === Debug: Full State ===
     document.getElementById("debug-btn").addEventListener("click", async () => {

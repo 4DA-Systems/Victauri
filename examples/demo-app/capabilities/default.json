@@ -1,9 +1,10 @@
 {
   "identifier": "default",
   "description": "Default capabilities for the demo app",
-  "windows": ["main"],
+  "windows": ["main", "notifications"],
   "permissions": [
     "core:default",
+    "core:event:default",
     "victauri:default"
   ]
 }

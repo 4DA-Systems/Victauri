@@ -775,8 +775,10 @@ dependencies = [
  "serde_json",
  "tauri",
  "tauri-build",
+ "tokio",
  "victauri-core",
  "victauri-plugin",
+ "victauri-test",
 ]
 
 [[package]]
