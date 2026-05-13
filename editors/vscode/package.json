@@ -27,7 +27,7 @@
   "activationEvents": [
     "workspaceContains:**/tauri.conf.json"
   ],
-  "icon": "media/icon.svg",
+  "icon": "media/icon.png",
   "galleryBanner": {
     "color": "#1a1a2e",
     "theme": "dark"
@@ -39,7 +39,7 @@
         {
           "id": "victauri",
           "title": "Victauri",
-          "icon": "media/icon.svg"
+          "icon": "media/icon.png"
         }
       ]
     },

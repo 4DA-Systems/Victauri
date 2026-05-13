@@ -14,4 +14,7 @@ Initial release.
 - Bearer token auth support
 - Evaluate JS in the webview via input box
 - Run diagnostics for compatibility checks
-- Right-click DOM elements to copy ref IDs or generate test code
+- Right-click DOM elements to click, highlight, inspect styles, copy ref IDs, or generate test code
+- Accessibility audit command (WCAG checks)
+- Performance metrics command (navigation timing, JS heap, DOM stats)
+- Clear highlights command
