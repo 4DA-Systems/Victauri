@@ -1257,7 +1257,9 @@
         console[level] = function() {
             var args = Array.prototype.slice.call(arguments);
             var msg = args.map(String).join(' ').replace(CTRL_RE, '');
-            consoleLogs.push({ level: level, message: msg, timestamp: Date.now() });
+            var logEntry = { level: level, message: msg, timestamp: Date.now() };
+            consoleLogs.push(logEntry);
+            pushRecordingEvent('console', logEntry);
             if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
             originalConsole[level].apply(console, args);
         };
@@ -1415,6 +1417,7 @@
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
 
                 networkLog.push(entry);
+                pushRecordingEvent('network', { method: entry.method, url: entry.url });
                 if (networkLog.length > CAP_NETWORK) networkLog.shift();
 
                 return origFetch.call(this, input, init).then(function(response) {
@@ -1474,21 +1477,29 @@
         var origReplaceState = history.replaceState;
         history.pushState = function() {
             var result = origPushState.apply(this, arguments);
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'pushState' });
+            var navEntry = { url: window.location.href, timestamp: Date.now(), type: 'pushState' };
+            navigationLog.push(navEntry);
+            pushRecordingEvent('navigation', navEntry);
             if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
             return result;
         };
         history.replaceState = function() {
             var result = origReplaceState.apply(this, arguments);
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'replaceState' });
+            var navEntry = { url: window.location.href, timestamp: Date.now(), type: 'replaceState' };
+            navigationLog.push(navEntry);
+            pushRecordingEvent('navigation', navEntry);
             if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
             return result;
         };
         window.addEventListener('popstate', function() {
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'popstate' });
+            var navEntry = { url: window.location.href, timestamp: Date.now(), type: 'popstate' };
+            navigationLog.push(navEntry);
+            pushRecordingEvent('navigation', navEntry);
         });
         window.addEventListener('hashchange', function(e) {
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'hashchange', old_url: e.oldURL });
+            var navEntry = { url: window.location.href, timestamp: Date.now(), type: 'hashchange', old_url: e.oldURL };
+            navigationLog.push(navEntry);
+            pushRecordingEvent('navigation', navEntry);
         });
     })();
 
@@ -1537,6 +1548,70 @@
         weakRefMap.clear();
         refCounter = 0;
     });
+
+    // ── Recording ─────────────────────────────────────────────────────────────
+
+    var recordingSession = null;
+    var recordingEvents = [];
+    var recordingCheckpoints = [];
+
+    function startRecording() {
+        var sessionId = 'rec-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+        recordingSession = { id: sessionId, started: Date.now() };
+        recordingEvents = [];
+        recordingCheckpoints = [];
+        return { session_id: sessionId, started: true };
+    }
+
+    function stopRecording() {
+        if (!recordingSession) return { error: 'no active recording' };
+        var session = {
+            session_id: recordingSession.id,
+            duration_ms: Date.now() - recordingSession.started,
+            events: recordingEvents,
+            checkpoints: recordingCheckpoints,
+        };
+        recordingSession = null;
+        recordingEvents = [];
+        recordingCheckpoints = [];
+        return session;
+    }
+
+    function recordCheckpoint(args) {
+        if (!recordingSession) return { error: 'no active recording' };
+        var cp = {
+            checkpoint_id: 'cp-' + Date.now() + '-' + Math.random().toString(36).slice(2, 6),
+            label: (args && args.label) || null,
+            timestamp: Date.now(),
+            event_index: recordingEvents.length,
+        };
+        recordingCheckpoints.push(cp);
+        return { checkpoint_id: cp.checkpoint_id, created: true, event_index: cp.event_index };
+    }
+
+    function getRecordingEvents(args) {
+        var since = (args && args.since) || 0;
+        return recordingEvents.filter(function(e) { return e.timestamp >= since; });
+    }
+
+    function listRecordingCheckpoints() {
+        return recordingCheckpoints;
+    }
+
+    function exportRecording() {
+        if (!recordingSession) return { error: 'no active recording' };
+        return {
+            session_id: recordingSession.id,
+            started: recordingSession.started,
+            events: recordingEvents,
+            checkpoints: recordingCheckpoints,
+        };
+    }
+
+    function pushRecordingEvent(type, data) {
+        if (!recordingSession) return;
+        recordingEvents.push({ type: type, data: data, timestamp: Date.now() });
+    }
 
     // ── Command Dispatch (browser extension bridge) ──────────────────────────
 
@@ -1612,6 +1687,12 @@
             case 'getPerformanceMetrics': return bridge.getPerformanceMetrics();
             case 'getDiagnostics': return bridge.getDiagnostics();
             case 'eval': return evalInPage(args.code);
+            case 'recording_start': return startRecording();
+            case 'recording_stop': return stopRecording();
+            case 'recording_checkpoint': return recordCheckpoint(args);
+            case 'recording_get_events': return getRecordingEvents(args);
+            case 'recording_list_checkpoints': return listRecordingCheckpoints();
+            case 'recording_export': return exportRecording();
             default: throw new Error('Unknown bridge method: ' + method);
         }
     }

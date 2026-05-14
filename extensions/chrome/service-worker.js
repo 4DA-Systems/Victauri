@@ -66,22 +66,25 @@ async function handleHostCommand(command) {
 
         if (cmdType === 'cdp') {
             const result = await executeCdp(tabId, domain_method, params);
-            sendToHost({ id, type: 'result', data: result });
+            sendToHost({ id, type: 'response', data: result });
         } else if (method === 'screenshot') {
             const data = await captureScreenshot(tabId, args || {});
-            sendToHost({ id, type: 'result', data });
+            sendToHost({ id, type: 'response', data });
         } else {
             const result = await sendToContentScript(tabId, id, method, args);
-            sendToHost({ id, type: 'result', data: result });
+            sendToHost({ id, type: 'response', data: result });
         }
     } catch (e) {
-        sendToHost({ id, type: 'error', error: e.message });
+        sendToHost({ id, type: 'response', error: e.message });
     }
 }
 
 function sendToHost(message) {
-    if (nativePort) {
+    if (!nativePort) return;
+    try {
         nativePort.postMessage(message);
+    } catch (e) {
+        console.error('[victauri] sendToHost failed:', e);
     }
 }
 
@@ -196,6 +199,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
         if (changeInfo.url) state.url = changeInfo.url;
         if (changeInfo.title) state.title = changeInfo.title;
         tabStates.set(tabId, state);
+        sendToHost({
+            type: 'tab_updated',
+            tab_id: tabId,
+            url: changeInfo.url,
+            title: changeInfo.title,
+        });
     }
 });
 
@@ -210,5 +219,34 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     }
 });
 
+// Sync existing tabs on startup (service worker may restart)
+async function syncExistingTabs() {
+    try {
+        const tabs = await chrome.tabs.query({});
+        for (const tab of tabs) {
+            if (!tabStates.has(tab.id)) {
+                tabStates.set(tab.id, {
+                    url: tab.url || '',
+                    title: tab.title || '',
+                    bridgeReady: false,
+                });
+                sendToHost({
+                    type: 'tab_created',
+                    tab_id: tab.id,
+                    url: tab.url || '',
+                    title: tab.title || '',
+                });
+            }
+        }
+        const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        if (activeTab) {
+            sendToHost({ type: 'tab_activated', tab_id: activeTab.id });
+        }
+    } catch (e) {
+        console.error('[victauri] Tab sync failed:', e);
+    }
+}
+
 // Connect on startup
 connectNative();
+syncExistingTabs();

@@ -96,20 +96,23 @@ async fn execute_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bridge_dispatch::BridgeDispatch;
     use crate::tab_state::TabManager;
     use std::sync::Arc;
 
     #[test]
     fn router_builds_without_auth() {
         let tab_mgr = Arc::new(TabManager::new());
-        let handler = VictauriBrowserHandler::new(tab_mgr);
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = VictauriBrowserHandler::new(tab_mgr, dispatch);
         let _router = build_app(handler, None);
     }
 
     #[test]
     fn router_builds_with_auth() {
         let tab_mgr = Arc::new(TabManager::new());
-        let handler = VictauriBrowserHandler::new(tab_mgr);
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = VictauriBrowserHandler::new(tab_mgr, dispatch);
         let _router = build_app(handler, Some("test-token".to_string()));
     }
 }

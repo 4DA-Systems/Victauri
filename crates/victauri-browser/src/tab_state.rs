@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
 
 use serde_json::Value;
 use tokio::sync::{RwLock, oneshot};
