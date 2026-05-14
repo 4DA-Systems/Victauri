@@ -193,7 +193,7 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<InvokeCommandParams>,
     ) -> CallToolResult {
-        if !self.state.privacy.is_tool_enabled("invoke_command") {
+        if !self.state.privacy.is_invoke_allowed(&params.command) {
             return tool_disabled("invoke_command");
         }
         if !self.state.privacy.is_command_allowed(&params.command) {

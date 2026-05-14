@@ -161,19 +161,19 @@ export class VictauriClient {
   }
 
   async clearHighlights(): Promise<unknown> {
-    return this.callTool("inspect", { action: "highlight_clear" });
+    return this.callTool("inspect", { action: "clear_highlights" });
   }
 
   async getElementStyles(refId: string): Promise<unknown> {
-    return this.callTool("inspect", { action: "styles", ref_id: refId });
+    return this.callTool("inspect", { action: "get_styles", ref_id: refId });
   }
 
   async auditAccessibility(): Promise<unknown> {
-    return this.callTool("inspect", { action: "accessibility" });
+    return this.callTool("inspect", { action: "audit_accessibility" });
   }
 
   async getPerformanceMetrics(): Promise<unknown> {
-    return this.callTool("inspect", { action: "performance" });
+    return this.callTool("inspect", { action: "get_performance" });
   }
 
   dispose(): void {
@@ -210,7 +210,7 @@ export class VictauriClient {
   private async refreshIpcLog(): Promise<void> {
     try {
       const result = (await this.callTool("logs", {
-        source: "ipc",
+        action: "ipc",
         limit: 50,
       })) as IpcEntry[];
       if (Array.isArray(result)) {

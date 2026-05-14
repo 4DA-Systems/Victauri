@@ -121,22 +121,85 @@ impl PrivacyConfig {
 fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool {
     match profile {
         PrivacyProfile::FullControl => true,
-        PrivacyProfile::Test => !matches!(
+        PrivacyProfile::Test => matches!(
             tool_or_action,
-            "eval_js"
-                | "screenshot"
-                | "invoke_command"
-                | "navigate"
-                | "navigate.go_to"
-                | "set_dialog_response"
-                | "navigate.set_dialog_response"
-                | "inject_css"
-                | "css.inject"
-                | "css.remove"
-                | "window.manage"
-                | "window.resize"
-                | "window.move_to"
-                | "window.set_title"
+            // Read-only observation (superset of Observe)
+            "dom_snapshot"
+                | "find_elements"
+                | "get_registry"
+                | "get_memory_stats"
+                | "get_plugin_info"
+                | "get_diagnostics"
+                | "detect_ghost_commands"
+                | "check_ipc_integrity"
+                | "resolve_command"
+                | "wait_for"
+                // Assertions (use eval internally but are test-oriented)
+                | "verify_state"
+                | "assert_semantic"
+                // Interactions
+                | "interact"
+                | "interact.click"
+                | "interact.double_click"
+                | "interact.hover"
+                | "interact.focus"
+                | "interact.scroll_into_view"
+                | "interact.select_option"
+                // Input
+                | "fill"
+                | "input"
+                | "input.fill"
+                | "type_text"
+                | "input.type_text"
+                | "input.press_key"
+                // Storage (read + write)
+                | "storage"
+                | "set_storage"
+                | "storage.set"
+                | "delete_storage"
+                | "storage.delete"
+                | "storage.get"
+                | "storage.get_cookies"
+                | "get_storage"
+                | "get_cookies"
+                // Recording
+                | "recording"
+                | "recording.start"
+                | "recording.stop"
+                | "recording.checkpoint"
+                | "recording.list_checkpoints"
+                | "recording.get_events"
+                | "recording.events_between"
+                | "recording.get_replay"
+                | "recording.export"
+                | "recording.import"
+                // Logs (all read-only)
+                | "logs"
+                | "logs.console"
+                | "logs.network"
+                | "logs.ipc"
+                | "logs.navigation"
+                | "logs.dialogs"
+                | "logs.events"
+                | "logs.slow_ipc"
+                // Inspect (read-only + visual debug)
+                | "inspect"
+                | "inspect.styles"
+                | "inspect.bounds"
+                | "inspect.highlight"
+                | "inspect.clear_highlights"
+                | "inspect.audit_a11y"
+                | "inspect.performance"
+                // Window (read-only)
+                | "list_windows"
+                | "window"
+                | "window.get_state"
+                | "window.list"
+                | "get_window_state"
+                // Navigate (read-only actions)
+                | "navigate.go_back"
+                | "navigate.get_history"
+                | "navigate.get_dialog_log"
         ),
         PrivacyProfile::Observe => matches!(
             tool_or_action,

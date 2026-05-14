@@ -41,7 +41,7 @@ victauri_plugin::VictauriBuilder::new()
 
 ## Tools
 
-23 MCP tools -- 9 compound tools (each with multiple actions) and 14 standalone:
+24 MCP tools -- 9 compound tools (each with multiple actions) and 15 standalone:
 
 | Tool | What it does |
 |---|---|
@@ -68,6 +68,7 @@ victauri_plugin::VictauriBuilder::new()
 | `get_registry` | List all commands with schemas from `#[inspectable]` |
 | `get_memory_stats` | Real-time process memory statistics |
 | `get_plugin_info` | Victauri config: port, enabled tools, version |
+| `get_diagnostics` | Server health, compatibility warnings, tool status |
 
 ## Security
 

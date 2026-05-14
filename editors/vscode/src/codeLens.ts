@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 
 const COMMAND_PATTERN =
-  /^\s*#\[tauri::command\]\s*$/;
+  /^\s*#\[tauri::command(?:\(.*\))?\]\s*$/;
 const FN_PATTERN =
   /^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)/;
 

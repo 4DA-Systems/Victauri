@@ -57,13 +57,14 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("victauri.connect", async () => {
       const config = vscode.workspace.getConfiguration("victauri");
       const port = config.get<number>("port", 7373);
-      const token = config.get<string>("authToken", "");
+      const configToken = config.get<string>("authToken", "");
 
-      // Try to auto-discover port from victauri.port file
-      const actualPort = await discoverPort(port);
+      const discovered = await discoverServer(port);
+      const actualPort = discovered.port;
+      const token = configToken || discovered.token || undefined;
 
       try {
-        await client.connect(actualPort, token || undefined);
+        await client.connect(actualPort, token);
         vscode.window.showInformationMessage(
           `Victauri: Connected on port ${actualPort}`
         );
@@ -338,16 +339,48 @@ function updateStatusBar(): void {
   }
 }
 
-async function discoverPort(defaultPort: number): Promise<number> {
+interface DiscoveredServer {
+  port: number;
+  token: string | undefined;
+}
+
+async function discoverServer(
+  defaultPort: number
+): Promise<DiscoveredServer> {
   const tmpDir =
     process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp";
-  const portFile = path.join(tmpDir, "victauri.port");
+  const baseDir = path.join(tmpDir, "victauri");
+
   try {
-    const content = (await fs.readFile(portFile, "utf-8")).trim();
-    const port = parseInt(content, 10);
-    if (port > 0 && port < 65536) return port;
+    const entries = await fs.readdir(baseDir, { withFileTypes: true });
+    const servers: DiscoveredServer[] = [];
+
+    for (const entry of entries) {
+      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
+      const dir = path.join(baseDir, entry.name);
+      try {
+        const portStr = (await fs.readFile(path.join(dir, "port"), "utf-8")).trim();
+        const port = parseInt(portStr, 10);
+        if (port <= 0 || port >= 65536) continue;
+
+        let token: string | undefined;
+        try {
+          const t = (await fs.readFile(path.join(dir, "token"), "utf-8")).trim();
+          if (t) token = t;
+        } catch {
+          // no token file
+        }
+
+        servers.push({ port, token });
+      } catch {
+        // no port file in this dir
+      }
+    }
+
+    if (servers.length === 1) return servers[0];
   } catch {
-    // File doesn't exist or unreadable
+    // base dir doesn't exist
   }
-  return defaultPort;
+
+  return { port: defaultPort, token: undefined };
 }

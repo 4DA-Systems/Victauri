@@ -50,11 +50,11 @@ export class DomExplorerProvider
     if (node.ref_id) {
       if (node.tag === "input" || node.tag === "textarea") {
         lines.push(
-          `    client.fill_by_id("${node.ref_id}", "test value").await.unwrap();`
+          `    client.fill("${node.ref_id}", "test value").await.unwrap();`
         );
       } else if (node.tag === "button" || node.tag === "a") {
         lines.push(
-          `    client.click_by_id("${node.ref_id}").await.unwrap();`
+          `    client.click("${node.ref_id}").await.unwrap();`
         );
       } else if (node.name) {
         lines.push(
