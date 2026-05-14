@@ -6,7 +6,7 @@
 
 X-ray vision and hands for AI agents inside Tauri apps. Unlike Playwright (which sees only the browser glass), Victauri gives agents simultaneous access to the webview DOM, the Rust backend, the IPC layer, the database, and native window state — all through a single MCP interface.
 
-**Stack:** Pure Rust workspace (6 crates) | **Target:** Tauri 2.0 applications
+**Stack:** Pure Rust workspace (7 crates) | **Target:** Tauri 2.0 applications + any website via Chrome extension
 
 ## Commands
 
@@ -24,12 +24,15 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps  # Generate docs (zer
 ```
 victauri/
 ├── crates/
+│   ├── victauri-browser/    # Chrome extension native host: MCP for any website
 │   ├── victauri-cli/        # CLI: init, check, test, record, watch, coverage
 │   ├── victauri-core/       # Shared types: events, registry, snapshots, verification
 │   ├── victauri-macros/     # Proc macros: #[inspectable] for command instrumentation
 │   ├── victauri-plugin/     # Tauri plugin: embedded MCP server + JS bridge + tools
 │   ├── victauri-test/       # Test client + assertion helpers + smoke suite
 │   └── victauri-watchdog/   # Crash-recovery sidecar (monitors plugin health)
+├── extensions/
+│   └── chrome/              # Chrome/Edge/Brave extension (MV3)
 └── examples/
     └── demo-app/            # Multi-window Tauri app with comprehensive test suite
 ```
@@ -50,6 +53,20 @@ victauri/
 | **Backend** | State reading, DB queries, memory tracking | Direct `AppHandle` access (same process) |
 
 ## Crate Responsibilities
+
+### victauri-browser
+Native messaging host binary + Chrome extension for browser MCP inspection.
+- `main.rs` — CLI (install/uninstall/serve/version), native message reader loop, port fallback :7474-7484
+- `native_messaging.rs` — Chrome native messaging wire protocol (32-bit LE length prefix + UTF-8 JSON)
+- `bridge_dispatch.rs` — UUID command dispatch via oneshot channels, 30s timeout, cancel-all on disconnect
+- `mcp_handler.rs` — 20-tool router: dispatches through bridge to Chrome extension content script
+- `mcp_server.rs` — rmcp `ServerHandler` impl with JSON Schema tool definitions for MCP Streamable HTTP
+- `server.rs` — axum router: `/mcp` (MCP protocol), `/api/tools` (REST), `/health`, `/info`
+- `auth.rs` — Bearer token auth (constant-time eq), token-bucket rate limiter, security headers, origin guard
+- `tab_state.rs` — Per-tab state tracking (URL, title, bridge ready), active tab resolution
+- `installer.rs` — Cross-platform native host manifest registration (Chrome/Edge/Brave/Arc on Win/Mac/Linux)
+- Chrome extension: MV3 service worker (native messaging + tab lifecycle + CDP + screenshot), ISOLATED world relay, MAIN world JS bridge (1700+ lines — DOM, interactions, a11y, perf, CSS, recording), dark popup UI
+- 47 tests (5 native_messaging + 4 bridge_dispatch + 6 mcp_handler + 6 mcp_server + 12 server integration + 5 tab_state + 4 installer + 3 auth + 2 router)
 
 ### victauri-core
 Shared types used by all other crates. No Tauri dependency.
@@ -157,9 +174,9 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-05-14)
+## Current State (2026-05-15)
 
-**All 8 phases complete + production hardening + adversarial audit + REST API + VS Code extension + ultimate compatibility testing (5 third-party apps, 867/895 pass across 179 tests each = 96.9%). v0.2.1 published.** All 6 crates compile cleanly (`RUSTFLAGS="-Dwarnings" cargo clippy` passes). 1004 tests pass (including 9 REST API integration tests + 5 REST unit tests + 85 tool contract tests + 38 adversarial tests + 30 bridge tests + 22 stress tests). Zero clippy warnings (`-D warnings`, 20 enforced lints). 26 runnable doc-test examples. 16 Criterion benchmarks. CI green on Linux/Windows/macOS. Tauri 2.10.3 + rmcp 1.5.0. All 6 crates published to crates.io. `cargo install victauri-cli` provides standalone `victauri` binary. Dual-protocol: MCP on `/mcp` + REST on `/api/tools`. VS Code extension in `editors/vscode/` with live app state inspection, DOM interaction, screenshots, a11y audits, and perf metrics.
+**All 8 phases complete + production hardening + adversarial audit + REST API + VS Code extension + ultimate compatibility testing (5 third-party apps, 867/895 pass across 179 tests each = 96.9%). v0.2.1 published. victauri-browser crate + Chrome extension scaffold complete.** All 7 crates compile cleanly (`RUSTFLAGS="-Dwarnings" cargo clippy` passes). 1051 tests pass (1004 existing + 47 victauri-browser). Zero clippy warnings (`-D warnings`, 20 enforced lints). 26 runnable doc-test examples. 16 Criterion benchmarks. CI green on Linux/Windows/macOS. Tauri 2.10.3 + rmcp 1.5.0. All 6 original crates published to crates.io. `cargo install victauri-cli` provides standalone `victauri` binary. Dual-protocol: MCP on `/mcp` + REST on `/api/tools`. VS Code extension in `editors/vscode/`. Chrome extension in `extensions/chrome/` with MV3, 20 MCP tools, native messaging host on :7474.
 
 ### Live test results (4DA, 2026-04-26):
 Tested against 4DA (3 windows: main 1200×800, notification 440×160, briefing 560×780; 135 DOM elements; 11 buttons; React/Vite frontend on :4444). **99/99 tests pass — all 23 tools + 3 resources + tool registration checks.**
@@ -336,6 +353,7 @@ Tested against 4 third-party open-source Tauri 2 apps with fully built frontends
 - **CI**: GitHub Actions workflow (`ci.yml`) — clippy + tests + docs on Linux/Windows/macOS, format check on Linux. All crate code passes `cargo fmt --check`.
 
 ### Architecture notes:
+- **victauri-browser architecture** — `MCP Client → axum HTTP :7474 → Native Messaging (stdio) → Chrome Extension Service Worker → Content Script (MAIN world)`. The Rust binary serves dual roles: HTTP server for MCP clients AND native messaging host for Chrome. Both run concurrently via tokio tasks. The `BridgeDispatch` sends UUID-tagged commands to stdout (Chrome native messaging), and a spawned reader task receives responses on stdin and resolves oneshot channels. The `mcp_handler.rs` routes all 20 tools: `get_plugin_info` and `tabs.list` are handled locally in the Rust host; everything else is dispatched to the Chrome extension via native messaging → service worker → content script relay → MAIN world bridge. The content script uses CustomEvents (`__victauri_command`/`__victauri_response`) to bridge ISOLATED ↔ MAIN worlds. Navigation uses `chrome.tabs.update()` instead of content script `window.location`, and cookies use `chrome.cookies.getAll()` for httpOnly access.
 - **bridge.rs** — `WebviewBridge` trait (public) erases the Tauri `Runtime` generic, allowing the MCP handler (which can't be generic) to access webview windows via `Arc<dyn WebviewBridge>`. 8 methods: eval_webview, get_window_states, list_window_labels, get_native_handle, manage_window, resize_window, move_window, set_window_title. Impl provided for `AppHandle<R: Runtime>`. Cross-platform `get_native_handle`: Windows HWND, macOS CGWindowID (via ObjC runtime `windowNumber`), Linux Xlib/Xcb window ID. Testable via mock implementations.
 - **mcp/** — Split into `mod.rs` (handler + server startup + tests), `server.rs` (Router + server lifecycle), `rest.rs` (REST API routes), `helpers.rs` (js_string, tool_error, validate_url, sanitize_css_color), and 7 param modules (webview, window, backend, verification, recording, introspection, other). rmcp `#[tool_router]` + `#[tool_handler]` macros require all tool methods in a single `impl` block, so the handler stays monolithic. `build_app()` constructs the axum `Router` independently of Tauri (testable). `StreamableHttpService` serves on `/mcp`. REST API on `/api/tools`. Health/info endpoints on `/health` and `/info`.
 - **REST API** (`mcp/rest.rs`) — Dual-protocol: all 24 tools accessible via `POST /api/tools/{name}` with plain JSON body, no MCP session needed. `GET /api/tools` lists available tools. Uses the same `VictauriMcpHandler.execute_tool()` dispatch that applies privacy checks, rate limiting, auth, and output redaction. Response format: `{"result": ...}` for success, `{"error": "..."}` for errors. Text results parsed as JSON when valid. Goes through the same auth/rate-limit middleware as MCP.
