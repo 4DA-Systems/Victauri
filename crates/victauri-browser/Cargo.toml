@@ -30,5 +30,8 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 
+[dev-dependencies]
+http-body-util = "0.1"
+
 [lints]
 workspace = true
