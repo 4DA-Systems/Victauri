@@ -2,6 +2,7 @@ mod auth;
 mod bridge_dispatch;
 mod installer;
 mod mcp_handler;
+mod mcp_server;
 mod native_messaging;
 mod server;
 mod tab_state;
