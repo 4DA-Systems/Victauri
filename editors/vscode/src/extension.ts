@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import * as fs from "fs";
+import * as fs from "fs/promises";
 import { VictauriClient } from "./client";
 import { AppStateProvider } from "./appStateView";
 import { DomExplorerProvider } from "./domExplorerView";
@@ -185,6 +185,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "victauri.clickElement",
       async (node: unknown) => {
+        if (client.connectionState !== "connected") {
+          vscode.window.showWarningMessage("Victauri: Not connected");
+          return;
+        }
         const domNode = node as { ref_id?: string };
         if (!domNode?.ref_id) return;
         try {
@@ -201,6 +205,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "victauri.highlightElement",
       async (node: unknown) => {
+        if (client.connectionState !== "connected") {
+          vscode.window.showWarningMessage("Victauri: Not connected");
+          return;
+        }
         const domNode = node as { ref_id?: string };
         if (!domNode?.ref_id) return;
         try {
@@ -212,6 +220,10 @@ export function activate(context: vscode.ExtensionContext): void {
     ),
 
     vscode.commands.registerCommand("victauri.clearHighlights", async () => {
+      if (client.connectionState !== "connected") {
+        vscode.window.showWarningMessage("Victauri: Not connected");
+        return;
+      }
       try {
         await client.clearHighlights();
       } catch (e) {
@@ -222,6 +234,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "victauri.inspectStyles",
       async (node: unknown) => {
+        if (client.connectionState !== "connected") {
+          vscode.window.showWarningMessage("Victauri: Not connected");
+          return;
+        }
         const domNode = node as { ref_id?: string; tag?: string };
         if (!domNode?.ref_id) return;
         try {
@@ -323,12 +339,11 @@ function updateStatusBar(): void {
 }
 
 async function discoverPort(defaultPort: number): Promise<number> {
-  // Check temp dir for victauri.port file
   const tmpDir =
     process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp";
   const portFile = path.join(tmpDir, "victauri.port");
   try {
-    const content = fs.readFileSync(portFile, "utf-8").trim();
+    const content = (await fs.readFile(portFile, "utf-8")).trim();
     const port = parseInt(content, 10);
     if (port > 0 && port < 65536) return port;
   } catch {

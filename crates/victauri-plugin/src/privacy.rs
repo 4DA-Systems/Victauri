@@ -145,6 +145,7 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "get_registry"
                 | "get_memory_stats"
                 | "get_plugin_info"
+                | "get_diagnostics"
                 | "detect_ghost_commands"
                 | "check_ipc_integrity"
                 | "resolve_command"
@@ -441,6 +442,7 @@ mod tests {
         assert!(config.is_tool_enabled("get_registry"));
         assert!(config.is_tool_enabled("get_memory_stats"));
         assert!(config.is_tool_enabled("get_plugin_info"));
+        assert!(config.is_tool_enabled("get_diagnostics"));
         assert!(config.is_tool_enabled("resolve_command"));
         assert!(config.is_tool_enabled("wait_for"));
         assert!(config.is_tool_enabled("window")); // the compound tool itself (get_state, list)

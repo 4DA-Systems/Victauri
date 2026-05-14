@@ -66,10 +66,12 @@ export class ScreenshotPanel {
   }
 
   private getHtml(base64Data: string): string {
+    const nonce = this.getNonce();
     return `<!DOCTYPE html>
 <html>
 <head>
-<style>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src data:; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+<style nonce="${nonce}">
   body { margin: 0; padding: 16px; background: var(--vscode-editor-background); display: flex; flex-direction: column; align-items: center; }
   img { max-width: 100%; border: 1px solid var(--vscode-panel-border); border-radius: 4px; }
   .toolbar { margin-bottom: 12px; display: flex; gap: 8px; }
@@ -80,22 +82,54 @@ export class ScreenshotPanel {
 </head>
 <body>
   <div class="toolbar">
-    <button onclick="vscode.postMessage({command:'refresh'})">Refresh</button>
-    <button onclick="vscode.postMessage({command:'save',data:'${base64Data}'})">Save As...</button>
+    <button id="refreshBtn">Refresh</button>
+    <button id="saveBtn">Save As...</button>
   </div>
   <img src="data:image/png;base64,${base64Data}" />
   <div class="meta">Captured at ${new Date().toLocaleTimeString()}</div>
-  <script>const vscode = acquireVsCodeApi();</script>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    const imgData = document.querySelector('img').src.split(',')[1];
+    document.getElementById('refreshBtn').addEventListener('click', () => {
+      vscode.postMessage({command:'refresh'});
+    });
+    document.getElementById('saveBtn').addEventListener('click', () => {
+      vscode.postMessage({command:'save', data: imgData});
+    });
+  </script>
 </body>
 </html>`;
   }
 
   private getErrorHtml(error: string): string {
+    const nonce = this.getNonce();
+    const escaped = error
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
     return `<!DOCTYPE html>
-<html><body style="padding:16px;color:var(--vscode-errorForeground);font-family:var(--vscode-font-family);">
-  <p>Screenshot failed: ${error}</p>
-  <button onclick="vscode.postMessage({command:'refresh'})" style="background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;padding:6px 14px;cursor:pointer;">Retry</button>
-  <script>const vscode = acquireVsCodeApi();</script>
+<html>
+<head>
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+</head>
+<body style="padding:16px;color:var(--vscode-errorForeground);font-family:var(--vscode-font-family);">
+  <p>Screenshot failed: ${escaped}</p>
+  <button id="retryBtn" style="background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;padding:6px 14px;cursor:pointer;">Retry</button>
+  <script nonce="${nonce}">
+    const vscode = acquireVsCodeApi();
+    document.getElementById('retryBtn').addEventListener('click', () => {
+      vscode.postMessage({command:'refresh'});
+    });
+  </script>
 </body></html>`;
+  }
+
+  private getNonce(): string {
+    const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let nonce = "";
+    for (let i = 0; i < 32; i++) {
+      nonce += chars.charAt(Math.floor(Math.random() * chars.length));
+    }
+    return nonce;
   }
 }

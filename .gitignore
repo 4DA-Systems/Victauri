@@ -28,3 +28,8 @@ data/
 # Bridge test dependencies (npm)
 **/node_modules/
 # Keep package-lock.json committed for reproducible CI builds
+
+# VS Code extension build output
+editors/vscode/dist/
+editors/vscode/media/screenshots/
+editors/vscode/*.vsix

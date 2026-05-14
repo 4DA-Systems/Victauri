@@ -324,6 +324,16 @@ export class VictauriClient {
     if (this.token) {
       headers["Authorization"] = `Bearer ${this.token}`;
     }
-    return fetch(`${this.baseUrl}${path}`, { ...init, headers });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 30_000);
+    try {
+      return await fetch(`${this.baseUrl}${path}`, {
+        ...init,
+        headers,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
   }
 }

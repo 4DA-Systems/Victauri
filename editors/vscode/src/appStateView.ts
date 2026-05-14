@@ -92,28 +92,35 @@ export class AppStateProvider implements vscode.TreeDataProvider<StateNode> {
     // Plugin info
     const info = this.client.pluginInfo;
     if (info.version) {
+      const children: StateNode[] = [
+        {
+          kind: "plugin",
+          label: "Tools",
+          description: `${this.client.toolCount} available`,
+        },
+      ];
+      const uptime = info.uptime_secs;
+      if (typeof uptime === "number") {
+        children.push({
+          kind: "plugin",
+          label: "Uptime",
+          description: `${Math.round(uptime)}s`,
+        });
+      }
+      const invocations = info.tool_invocations;
+      if (invocations != null) {
+        children.push({
+          kind: "plugin",
+          label: "Invocations",
+          description: `${invocations}`,
+        });
+      }
       nodes.push({
         kind: "plugin",
         label: "Plugin",
         description: `v${info.version}`,
         icon: new vscode.ThemeIcon("extensions"),
-        children: [
-          {
-            kind: "plugin",
-            label: "Tools",
-            description: `${this.client.toolCount} available`,
-          },
-          {
-            kind: "plugin",
-            label: "Uptime",
-            description: `${Math.round(info.uptime_secs as number)}s`,
-          },
-          {
-            kind: "plugin",
-            label: "Invocations",
-            description: `${info.tool_invocations}`,
-          },
-        ],
+        children,
       });
     }
 
