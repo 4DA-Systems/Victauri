@@ -7,3 +7,5 @@ tsconfig.json
 .gitignore
 **/*.map
 **/*.ts
+media/logo-concepts/**
+media/screenshots/**
