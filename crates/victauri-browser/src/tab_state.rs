@@ -577,5 +577,124 @@ mod tests {
         assert!(matches!(result, Err(TabError::NoActiveTab)));
     }
 
+    // --- Deep challenger: resolve_tab + pending command lifecycle ---
+
+    #[tokio::test]
+    async fn resolve_tab_with_explicit_id_works() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(42, "https://x.com", "X").await;
+        let result = mgr.resolve_tab(Some(42)).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn resolve_tab_with_explicit_nonexistent_errors() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(1, "https://x.com", "X").await;
+        let result = mgr.resolve_tab(Some(999)).await;
+        assert!(matches!(result, Err(TabError::TabNotFound(999))));
+    }
+
+    #[tokio::test]
+    async fn resolve_tab_with_none_uses_active() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(5, "https://x.com", "X").await;
+        mgr.on_tab_activated(5).await;
+        let result = mgr.resolve_tab(None).await;
+        assert_eq!(result.unwrap(), 5);
+    }
+
+    #[tokio::test]
+    async fn resolve_tab_active_but_closed_errors() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(5, "https://x.com", "X").await;
+        mgr.on_tab_activated(5).await;
+        mgr.on_tab_closed(5).await;
+        // active_tab still points to 5, but it's gone
+        let result = mgr.resolve_tab(None).await;
+        assert!(matches!(result, Err(TabError::TabNotFound(5))));
+    }
+
+    #[tokio::test]
+    async fn pending_command_lost_on_tab_close() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(1, "https://x.com", "X").await;
+        let rx = mgr.register_pending(1, "cmd-1").await.unwrap();
+
+        // Close the tab — pending commands are dropped
+        mgr.on_tab_closed(1).await;
+
+        // The sender was dropped, so rx should get RecvError
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_pending_on_nonexistent_tab_returns_none() {
+        let mgr = TabManager::new();
+        let result = mgr.register_pending(999, "cmd-1").await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_on_nonexistent_tab_returns_false() {
+        let mgr = TabManager::new();
+        let result = mgr.resolve_pending(999, "cmd-1", serde_json::json!({})).await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn resolve_pending_with_wrong_command_id_returns_false() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(1, "https://x.com", "X").await;
+        let _rx = mgr.register_pending(1, "cmd-1").await.unwrap();
+        let result = mgr.resolve_pending(1, "cmd-2", serde_json::json!({})).await;
+        assert!(!result);
+    }
+
+    #[tokio::test]
+    async fn tab_create_overwrites_existing() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(1, "https://first.com", "First").await;
+        mgr.on_bridge_ready(1).await;
+
+        // Re-create same tab ID (e.g., service worker restart)
+        mgr.on_tab_created(1, "https://second.com", "Second").await;
+
+        let tabs = mgr.list_tabs().await;
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs[0].url, "https://second.com");
+        assert!(!tabs[0].bridge_ready); // Reset by re-creation
+    }
+
+    #[tokio::test]
+    async fn list_tabs_shows_correct_active_flag() {
+        let mgr = TabManager::new();
+        mgr.on_tab_created(1, "https://a.com", "A").await;
+        mgr.on_tab_created(2, "https://b.com", "B").await;
+        mgr.on_tab_created(3, "https://c.com", "C").await;
+        mgr.on_tab_activated(2).await;
+
+        let tabs = mgr.list_tabs().await;
+        let active_count = tabs.iter().filter(|t| t.active).count();
+        assert_eq!(active_count, 1);
+        let active_tab = tabs.iter().find(|t| t.active).unwrap();
+        assert_eq!(active_tab.tab_id, 2);
+    }
+
+    #[tokio::test]
+    async fn on_tab_updated_unknown_tab_is_silent() {
+        let mgr = TabManager::new();
+        // Should not panic on unknown tab
+        mgr.on_tab_updated(999, Some("https://new.com"), Some("New")).await;
+        assert_eq!(mgr.tab_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn on_bridge_ready_unknown_tab_is_silent() {
+        let mgr = TabManager::new();
+        mgr.on_bridge_ready(999).await;
+        assert_eq!(mgr.tab_count().await, 0);
+    }
+
     use std::sync::Arc;
 }

@@ -1536,4 +1536,239 @@ mod tests {
         // Contains is case-sensitive
         assert_eq!(result["passed"], false);
     }
+
+    // --- Type confusion & adversarial argument tests ---
+
+    #[tokio::test]
+    async fn tool_with_action_as_number_errors() {
+        let handler = make_handler();
+        // action field is a number instead of string
+        let result = handler
+            .execute_tool("interact", serde_json::json!({"action": 42, "ref_id": "e0"}))
+            .await;
+        // as_str on number returns None → "missing action"
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("action"));
+    }
+
+    #[tokio::test]
+    async fn tool_with_action_as_array_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("input", serde_json::json!({"action": ["fill"], "ref_id": "e0"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("action"));
+    }
+
+    #[tokio::test]
+    async fn tool_with_action_as_null_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("css", serde_json::json!({"action": null}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("action"));
+    }
+
+    #[tokio::test]
+    async fn eval_js_code_as_number_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("eval_js", serde_json::json!({"code": 42}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("code"));
+    }
+
+    #[tokio::test]
+    async fn eval_js_code_as_object_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("eval_js", serde_json::json!({"code": {"expr": "1+1"}}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("code"));
+    }
+
+    #[tokio::test]
+    async fn navigate_go_to_url_as_object_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("navigate", serde_json::json!({"action": "go_to", "url": {"href": "https://x.com"}}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("url"));
+    }
+
+    #[tokio::test]
+    async fn input_fill_value_as_number_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("input", serde_json::json!({"action": "fill", "ref_id": "e0", "value": 42}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("value"));
+    }
+
+    #[tokio::test]
+    async fn css_inject_css_as_array_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("css", serde_json::json!({"action": "inject", "css": ["body{}", "div{}"]}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("css"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_name_errors() {
+        let handler = make_handler();
+        let result = handler
+            .execute_tool("drop_table", serde_json::json!({}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn empty_tool_name_errors() {
+        let handler = make_handler();
+        let result = handler.execute_tool("", serde_json::json!({})).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn tool_name_case_sensitive() {
+        let handler = make_handler();
+        // Tools are case-sensitive — "Eval_Js" is not "eval_js"
+        let result = handler
+            .execute_tool("Eval_Js", serde_json::json!({"code": "1"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn tool_invocations_count_includes_failures() {
+        let handler = make_handler();
+        // Even failed calls should increment the counter
+        let _ = handler.execute_tool("nonexistent", serde_json::json!({})).await;
+        let _ = handler.execute_tool("eval_js", serde_json::json!({})).await;
+        let info = handler.execute_tool("get_plugin_info", serde_json::json!({})).await.unwrap();
+        assert_eq!(info["invocations"], 3);
+    }
+
+    #[tokio::test]
+    async fn tabs_with_populated_manager_shows_count() {
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+
+        tab_mgr.on_tab_created(1, "https://a.com", "A").await;
+        tab_mgr.on_tab_created(2, "https://b.com", "B").await;
+
+        let handler = VictauriBrowserHandler::new(tab_mgr, dispatch);
+        let info = handler.execute_tool("get_plugin_info", serde_json::json!({})).await.unwrap();
+        assert_eq!(info["tab_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn tabs_list_with_active_tab_marked() {
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+
+        tab_mgr.on_tab_created(10, "https://a.com", "A").await;
+        tab_mgr.on_tab_created(20, "https://b.com", "B").await;
+        tab_mgr.on_tab_activated(20).await;
+
+        let handler = VictauriBrowserHandler::new(tab_mgr, dispatch);
+        let result = handler.execute_tool("tabs", serde_json::json!({"action": "list"})).await.unwrap();
+        let tabs = result.as_array().unwrap();
+        let active: Vec<_> = tabs.iter().filter(|t| t["active"] == true).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["tab_id"], 20);
+    }
+
+    #[tokio::test]
+    async fn all_action_tools_reject_empty_string_action() {
+        let handler = make_handler();
+        let tools_with_actions = ["interact", "input", "inspect", "css", "logs", "storage", "navigate", "recording"];
+        for tool in tools_with_actions {
+            let result = handler
+                .execute_tool(tool, serde_json::json!({"action": ""}))
+                .await;
+            assert!(
+                result.is_err(),
+                "{tool} should reject empty string action"
+            );
+            let err = result.unwrap_err();
+            assert!(
+                err.contains("unknown") || err.contains("action"),
+                "{tool} error should mention action: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_tool_invocation_counter() {
+        let handler = Arc::new(make_handler());
+        let mut handles = vec![];
+        for _ in 0..100 {
+            let h = Arc::clone(&handler);
+            handles.push(tokio::spawn(async move {
+                h.execute_tool("get_plugin_info", serde_json::json!({})).await.unwrap()
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let info = handler.execute_tool("get_plugin_info", serde_json::json!({})).await.unwrap();
+        assert_eq!(info["invocations"], 101);
+    }
+
+    #[tokio::test]
+    async fn all_bridge_tools_dispatch_recognized() {
+        // Verify every tool that dispatches to the bridge is recognized (not "unknown tool").
+        // Uses a spawned task to resolve the pending command immediately with mock data.
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = VictauriBrowserHandler::new(Arc::clone(&tab_mgr), Arc::clone(&dispatch));
+
+        let bridge_tools: Vec<(&str, serde_json::Value)> = vec![
+            ("get_diagnostics", serde_json::json!({})),
+            ("get_memory_stats", serde_json::json!({})),
+            ("screenshot", serde_json::json!({})),
+            ("page_info", serde_json::json!({})),
+            ("cookies", serde_json::json!({})),
+            ("dom_snapshot", serde_json::json!({})),
+            ("find_elements", serde_json::json!({"text": "x"})),
+            ("wait_for", serde_json::json!({"condition": "selector", "value": "body"})),
+        ];
+
+        for (tool_name, args) in bridge_tools {
+            let d = Arc::clone(&dispatch);
+            // Spawn a task that resolves whatever pending command appears
+            let resolver = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let ids = d.pending_ids().await;
+                for id in ids {
+                    d.on_response(&id, Some(serde_json::json!({"mock": true, "js_heap": {}})), None).await;
+                }
+            });
+
+            let result = handler.execute_tool(tool_name, args).await;
+            resolver.await.unwrap();
+
+            match result {
+                Ok(_) => {} // Tool recognized and got mock response
+                Err(e) => {
+                    assert!(
+                        !e.contains("unknown tool"),
+                        "{tool_name} should be recognized: {e}"
+                    );
+                }
+            }
+        }
+    }
 }

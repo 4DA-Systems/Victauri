@@ -405,4 +405,118 @@ mod tests {
         let decoded = read_message(&mut reader).await.unwrap();
         assert_eq!(decoded["emoji_sequence"], "👨‍👩‍👧‍👦");
     }
+
+    // --- Deep challenger: protocol edge cases ---
+
+    #[tokio::test]
+    async fn truncated_body_causes_io_error() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend(vec![b'x'; 50]);
+
+        let mut reader = BufReader::new(buf.as_slice());
+        let result = read_message(&mut reader).await;
+        assert!(matches!(result, Err(NativeMessageError::Io(_))));
+    }
+
+    #[tokio::test]
+    async fn zero_length_message_is_invalid_json() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut reader = BufReader::new(buf.as_slice());
+        let result = read_message(&mut reader).await;
+        assert!(matches!(result, Err(NativeMessageError::Json(_))));
+    }
+
+    #[tokio::test]
+    async fn partial_length_prefix_causes_disconnect() {
+        let buf = [0x10, 0x00];
+        let mut reader = BufReader::new(buf.as_slice());
+        let result = read_message(&mut reader).await;
+        assert!(matches!(result, Err(NativeMessageError::Disconnected)));
+    }
+
+    #[tokio::test]
+    async fn write_then_read_back_large_near_limit() {
+        let big_string = "a".repeat(900_000);
+        let msg = serde_json::json!({"data": big_string});
+
+        let mut buf = Vec::new();
+        write_message(&mut buf, &msg).await.unwrap();
+
+        let mut reader = BufReader::new(buf.as_slice());
+        let decoded = read_message(&mut reader).await.unwrap();
+        assert_eq!(decoded["data"].as_str().unwrap().len(), 900_000);
+    }
+
+    #[tokio::test]
+    async fn multiple_messages_then_disconnect() {
+        let mut buf = Vec::new();
+        write_message(&mut buf, &serde_json::json!({"n": 1})).await.unwrap();
+        write_message(&mut buf, &serde_json::json!({"n": 2})).await.unwrap();
+
+        let mut reader = BufReader::new(buf.as_slice());
+        assert_eq!(read_message(&mut reader).await.unwrap()["n"], 1);
+        assert_eq!(read_message(&mut reader).await.unwrap()["n"], 2);
+        assert!(matches!(read_message(&mut reader).await, Err(NativeMessageError::Disconnected)));
+    }
+
+    #[tokio::test]
+    async fn invalid_utf8_in_body_is_json_error() {
+        let invalid = [0xFF, 0xFE, 0xFD, 0xFC, 0xFB];
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(invalid.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&invalid);
+
+        let mut reader = BufReader::new(buf.as_slice());
+        let result = read_message(&mut reader).await;
+        assert!(matches!(result, Err(NativeMessageError::Json(_))));
+    }
+
+    #[tokio::test]
+    async fn valid_json_non_object_types() {
+        let values: Vec<serde_json::Value> = vec![
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("just a string"),
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::json!(null),
+        ];
+
+        for val in values {
+            let mut buf = Vec::new();
+            write_message(&mut buf, &val).await.unwrap();
+
+            let mut reader = BufReader::new(buf.as_slice());
+            let decoded = read_message(&mut reader).await.unwrap();
+            assert_eq!(decoded, val);
+        }
+    }
+
+    #[tokio::test]
+    async fn length_prefix_exactly_at_boundary() {
+        let json_body = format!("{{\"x\":\"{}\"}}", "a".repeat(MAX_INPUT_SIZE - 8));
+        assert!(json_body.len() <= MAX_INPUT_SIZE);
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(json_body.len() as u32).to_le_bytes());
+        buf.extend_from_slice(json_body.as_bytes());
+
+        let mut reader = BufReader::new(buf.as_slice());
+        let result = read_message(&mut reader).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn write_verifies_length_prefix_correctness() {
+        let big_val = "x".repeat(10_000_000);
+        let msg = serde_json::json!({"data": big_val});
+
+        let mut buf = Vec::new();
+        let result = write_message(&mut buf, &msg).await;
+        assert!(result.is_ok());
+        let written_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        assert_eq!(written_len + 4, buf.len());
+    }
 }
