@@ -832,4 +832,219 @@ mod integration_tests {
         // as_str on number returns None, defaults to ""
         assert_eq!(tab_mgr.tab_count().await, 0);
     }
+
+    // --- Full-pipeline integration: HTTP → handler → bridge → resolve ---
+
+    #[tokio::test]
+    async fn full_pipeline_http_to_bridge_resolution() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = VictauriBrowserHandler::new(Arc::clone(&tab_mgr), Arc::clone(&dispatch));
+        let app = crate::server::build_app(handler, None);
+
+        // Set up a tab
+        tab_mgr.on_tab_created(1, "https://app.com", "App").await;
+        tab_mgr.on_tab_activated(1).await;
+        tab_mgr.on_bridge_ready(1).await;
+
+        // Spawn a background task that simulates the extension responding
+        let d = Arc::clone(&dispatch);
+        let responder = tokio::spawn(async move {
+            // Wait for a pending command to appear
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let ids = d.pending_ids().await;
+                if !ids.is_empty() {
+                    for id in ids {
+                        d.on_response(
+                            &id,
+                            Some(json!({"tag": "body", "children": [{"tag": "div", "ref": "e0"}]})),
+                            None,
+                        ).await;
+                    }
+                    break;
+                }
+            }
+        });
+
+        // Make HTTP request to the REST API
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/tools/dom_snapshot")
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["result"]["tag"], "body");
+        assert_eq!(json["result"]["children"][0]["ref"], "e0");
+
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_pipeline_concurrent_tool_calls_with_responses() {
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = Arc::new(VictauriBrowserHandler::new(
+            Arc::clone(&tab_mgr),
+            Arc::clone(&dispatch),
+        ));
+
+        tab_mgr.on_tab_created(1, "https://app.com", "App").await;
+        tab_mgr.on_tab_activated(1).await;
+
+        // Spawn a responder that handles multiple concurrent commands
+        let d = Arc::clone(&dispatch);
+        let responder = tokio::spawn(async move {
+            let mut resolved = 0;
+            while resolved < 10 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let ids = d.pending_ids().await;
+                for id in ids {
+                    d.on_response(
+                        &id,
+                        Some(json!({"resolved": resolved})),
+                        None,
+                    ).await;
+                    resolved += 1;
+                }
+            }
+        });
+
+        // Launch 10 concurrent tool calls
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let h = Arc::clone(&handler);
+            handles.push(tokio::spawn(async move {
+                h.execute_tool("dom_snapshot", json!({})).await
+            }));
+        }
+
+        let mut successes = 0;
+        for handle in handles {
+            if handle.await.unwrap().is_ok() {
+                successes += 1;
+            }
+        }
+        assert_eq!(successes, 10);
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_pipeline_error_propagation() {
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = VictauriBrowserHandler::new(Arc::clone(&tab_mgr), Arc::clone(&dispatch));
+
+        tab_mgr.on_tab_created(1, "https://app.com", "App").await;
+        tab_mgr.on_tab_activated(1).await;
+
+        // Spawn responder that returns an error
+        let d = Arc::clone(&dispatch);
+        let responder = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let ids = d.pending_ids().await;
+                if !ids.is_empty() {
+                    for id in ids {
+                        d.on_response(&id, None, Some("element not found: e99".to_string())).await;
+                    }
+                    break;
+                }
+            }
+        });
+
+        let result = handler
+            .execute_tool("interact", json!({"action": "click", "ref_id": "e99"}))
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("element not found"));
+
+        responder.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stress_mixed_messages_and_tool_calls() {
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = Arc::new(VictauriBrowserHandler::new(
+            Arc::clone(&tab_mgr),
+            Arc::clone(&dispatch),
+        ));
+
+        // Simulate rapid tab lifecycle events while tool calls are in flight
+        let d = Arc::clone(&dispatch);
+        let tm = Arc::clone(&tab_mgr);
+
+        // Create initial tabs
+        for i in 1..=20u32 {
+            process_message(
+                &json!({"type": "tab_created", "tab_id": i, "url": format!("https://t{i}.com"), "title": format!("T{i}")}),
+                &d,
+                &tm,
+            ).await;
+        }
+        process_message(&json!({"type": "tab_activated", "tab_id": 10}), &d, &tm).await;
+
+        // Spawn background: resolve any pending commands
+        let d2 = Arc::clone(&dispatch);
+        let resolver = tokio::spawn(async move {
+            for _ in 0..100 {
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let ids = d2.pending_ids().await;
+                for id in ids {
+                    d2.on_response(&id, Some(json!({"ok": true})), None).await;
+                }
+            }
+        });
+
+        // Spawn background: rapid tab events
+        let d3 = Arc::clone(&dispatch);
+        let tm2 = Arc::clone(&tab_mgr);
+        let tab_events = tokio::spawn(async move {
+            for i in 21..=50u32 {
+                process_message(
+                    &json!({"type": "tab_created", "tab_id": i, "url": format!("https://t{i}.com"), "title": format!("T{i}")}),
+                    &d3,
+                    &tm2,
+                ).await;
+            }
+            for i in (1..=20u32).step_by(3) {
+                process_message(
+                    &json!({"type": "tab_closed", "tab_id": i}),
+                    &d3,
+                    &tm2,
+                ).await;
+            }
+        });
+
+        // Concurrently call tools
+        let mut handles = vec![];
+        for _ in 0..20 {
+            let h = Arc::clone(&handler);
+            handles.push(tokio::spawn(async move {
+                h.execute_tool("get_plugin_info", json!({})).await.unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let info = handle.await.unwrap();
+            assert_eq!(info["name"], "victauri-browser");
+        }
+
+        tab_events.await.unwrap();
+        resolver.await.unwrap();
+
+        // After all events: 20 created initially + 30 new - 7 closed = 43
+        let count = tab_mgr.tab_count().await;
+        assert_eq!(count, 43);
+    }
 }

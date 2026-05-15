@@ -297,4 +297,98 @@ mod tests {
             assert!(p.to_string_lossy().ends_with(".json"));
         }
     }
+
+    // --- Deep challenger: Chrome manifest spec compliance ---
+
+    #[test]
+    fn manifest_is_valid_json_object() {
+        let manifest = host_manifest("/bin/host", "ext");
+        assert!(manifest.is_object());
+        let obj = manifest.as_object().unwrap();
+        // Chrome requires exactly these fields
+        assert!(obj.contains_key("name"));
+        assert!(obj.contains_key("description"));
+        assert!(obj.contains_key("path"));
+        assert!(obj.contains_key("type"));
+        assert!(obj.contains_key("allowed_origins"));
+    }
+
+    #[test]
+    fn manifest_name_follows_chrome_spec() {
+        // Chrome: name must match regex [a-z][a-z0-9._]*
+        let manifest = host_manifest("/bin/host", "ext");
+        let name = manifest["name"].as_str().unwrap();
+        assert!(name.chars().next().unwrap().is_ascii_lowercase());
+        assert!(name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_'));
+        assert!(name.len() <= 255);
+    }
+
+    #[test]
+    fn manifest_origin_format_correct() {
+        // Chrome requires "chrome-extension://<id>/" format with trailing slash
+        let manifest = host_manifest("/bin/host", "abcdefghijklmnopqrstuvwxyz012345");
+        let origin = manifest["allowed_origins"][0].as_str().unwrap();
+        assert!(origin.starts_with("chrome-extension://"));
+        assert!(origin.ends_with('/'));
+    }
+
+    #[test]
+    fn manifest_handles_windows_path() {
+        let manifest = host_manifest(r"C:\Program Files\Victauri\victauri-browser-host.exe", "ext");
+        let path = manifest["path"].as_str().unwrap();
+        assert!(path.contains("victauri-browser-host"));
+        assert!(path.contains(r"C:\Program Files"));
+    }
+
+    #[test]
+    fn manifest_handles_path_with_spaces() {
+        let manifest = host_manifest("/Users/My User/apps/victauri", "ext");
+        assert_eq!(manifest["path"], "/Users/My User/apps/victauri");
+    }
+
+    #[test]
+    fn manifest_handles_unicode_path() {
+        let manifest = host_manifest("/Users/用户/victauri", "ext");
+        assert_eq!(manifest["path"], "/Users/用户/victauri");
+    }
+
+    #[test]
+    fn manifest_serializes_to_valid_json() {
+        let manifest = host_manifest("/bin/host", "ext123");
+        let json_str = serde_json::to_string_pretty(&manifest).unwrap();
+        // Should be parseable back
+        let reparsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(reparsed, manifest);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn all_manifest_paths_in_victauri_dir() {
+        let paths = all_manifest_paths().unwrap();
+        for p in &paths {
+            assert!(p.to_string_lossy().contains(".victauri"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn all_manifest_paths_cover_browsers() {
+        let paths = all_manifest_paths().unwrap();
+        let path_strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert!(path_strs.iter().any(|p| p.contains("Chrome")));
+        assert!(path_strs.iter().any(|p| p.contains("Edge")));
+        assert!(path_strs.iter().any(|p| p.contains("Brave")));
+        assert!(path_strs.iter().any(|p| p.contains("Arc")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn all_manifest_paths_cover_browsers() {
+        let paths = all_manifest_paths().unwrap();
+        let path_strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().to_string()).collect();
+        assert!(path_strs.iter().any(|p| p.contains("google-chrome")));
+        assert!(path_strs.iter().any(|p| p.contains("microsoft-edge")));
+        assert!(path_strs.iter().any(|p| p.contains("Brave")));
+        assert!(path_strs.iter().any(|p| p.contains("chromium")));
+    }
 }

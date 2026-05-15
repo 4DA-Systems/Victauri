@@ -539,4 +539,132 @@ mod tests {
             );
         }
     }
+
+    // --- Deep challenger: cross-module consistency ---
+
+    #[tokio::test]
+    async fn schema_tool_names_match_handler_tool_list() {
+        use crate::mcp_handler::VictauriBrowserHandler;
+        use crate::bridge_dispatch::BridgeDispatch;
+        use crate::tab_state::TabManager;
+        use std::sync::Arc;
+
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = VictauriBrowserHandler::new(tab_mgr, dispatch);
+
+        let schema_tools = build_tool_definitions();
+        let handler_tools = handler.list_tools();
+
+        let schema_names: std::collections::HashSet<&str> =
+            schema_tools.iter().map(|t| t.name.as_ref()).collect();
+        let handler_names: std::collections::HashSet<&str> =
+            handler_tools.iter().map(|t| t.name.as_str()).collect();
+
+        // Every schema tool must be in the handler list
+        for name in &schema_names {
+            assert!(
+                handler_names.contains(name),
+                "schema defines '{name}' but handler.list_tools() doesn't"
+            );
+        }
+
+        // Every handler tool must be in the schema
+        for name in &handler_names {
+            assert!(
+                schema_names.contains(name),
+                "handler lists '{name}' but schema doesn't define it"
+            );
+        }
+
+        assert_eq!(schema_names.len(), handler_names.len());
+    }
+
+    #[tokio::test]
+    async fn all_schema_tools_recognized_by_handler() {
+        use crate::mcp_handler::VictauriBrowserHandler;
+        use crate::bridge_dispatch::BridgeDispatch;
+        use crate::tab_state::TabManager;
+        use std::sync::Arc;
+
+        let tab_mgr = Arc::new(TabManager::new());
+        let dispatch = Arc::new(BridgeDispatch::new(tokio::io::stdout()));
+        let handler = VictauriBrowserHandler::new(Arc::clone(&tab_mgr), Arc::clone(&dispatch));
+
+        // Spawn a responder to resolve any bridge commands immediately
+        let d = Arc::clone(&dispatch);
+        let responder = tokio::spawn(async move {
+            for _ in 0..200 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let ids = d.pending_ids().await;
+                for id in ids {
+                    d.on_response(&id, Some(json!({"mock": true, "js_heap": {}})), None).await;
+                }
+            }
+        });
+
+        let tools = build_tool_definitions();
+        for tool in &tools {
+            let name = tool.name.as_ref();
+            let result = handler.execute_tool(name, json!({})).await;
+            match result {
+                Ok(_) => {}
+                Err(e) => {
+                    assert!(
+                        !e.contains("unknown tool"),
+                        "schema tool '{name}' not recognized by handler: {e}"
+                    );
+                }
+            }
+        }
+
+        responder.abort();
+    }
+
+    #[test]
+    fn server_instructions_list_all_tool_names() {
+        let tools = build_tool_definitions();
+        for tool in &tools {
+            let name = tool.name.as_ref();
+            assert!(
+                SERVER_INSTRUCTIONS.contains(name),
+                "tool '{name}' missing from SERVER_INSTRUCTIONS string"
+            );
+        }
+    }
+
+    #[test]
+    fn no_duplicate_tool_names_in_schema() {
+        let tools = build_tool_definitions();
+        let mut seen = std::collections::HashSet::new();
+        for tool in &tools {
+            assert!(
+                seen.insert(tool.name.as_ref()),
+                "duplicate tool name in schema: {}",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn schema_required_fields_are_in_properties() {
+        let tools = build_tool_definitions();
+        for tool in &tools {
+            let schema = serde_json::Value::Object((*tool.input_schema).clone());
+            if let Some(required) = schema["required"].as_array() {
+                let properties = schema["properties"].as_object().unwrap_or_else(
+                    || panic!("{} has required but no properties", tool.name),
+                );
+                for req in required {
+                    let field = req.as_str().unwrap();
+                    assert!(
+                        properties.contains_key(field),
+                        "{}: required field '{}' not in properties",
+                        tool.name,
+                        field
+                    );
+                }
+            }
+        }
+    }
 }
