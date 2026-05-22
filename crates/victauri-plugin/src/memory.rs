@@ -53,21 +53,18 @@ fn process_memory_fallback() -> serde_json::Value {
             for line in status.lines() {
                 if let Some(v) = line.strip_prefix("VmRSS:") {
                     vm_rss_kb = v
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|n| n.parse().ok())
                         .unwrap_or(0);
                 } else if let Some(v) = line.strip_prefix("VmHWM:") {
                     vm_hwm_kb = v
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|n| n.parse().ok())
                         .unwrap_or(0);
                 } else if let Some(v) = line.strip_prefix("VmSize:") {
                     vm_size_kb = v
-                        .trim()
                         .split_whitespace()
                         .next()
                         .and_then(|n| n.parse().ok())
