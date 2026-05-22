@@ -490,15 +490,13 @@ async fn cmd_doctor() -> Result<()> {
             pass_count += 1;
         } else {
             // Check if any capability file references victauri
-            let has_victauri_perm = std::fs::read_dir(caps)
-                .map(|entries| {
-                    entries.filter_map(Result::ok).any(|e| {
-                        std::fs::read_to_string(e.path())
-                            .unwrap_or_default()
-                            .contains("victauri")
-                    })
+            let has_victauri_perm = std::fs::read_dir(caps).is_ok_and(|entries| {
+                entries.filter_map(Result::ok).any(|e| {
+                    std::fs::read_to_string(e.path())
+                        .unwrap_or_default()
+                        .contains("victauri")
                 })
-                .unwrap_or(false);
+            });
             if has_victauri_perm {
                 eprintln!("  [PASS] Victauri permissions found in capabilities");
                 pass_count += 1;
