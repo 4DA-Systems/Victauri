@@ -1,0 +1,9 @@
+[book]
+title = "Victauri Documentation"
+authors = ["4DA Systems"]
+language = "en"
+src = "src"
+
+[output.html]
+default-theme = "navy"
+git-repository-url = "https://github.com/4DA-Systems/victauri"

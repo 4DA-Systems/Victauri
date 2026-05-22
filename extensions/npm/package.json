@@ -1,0 +1,39 @@
+{
+  "name": "victauri-browser",
+  "version": "0.3.0",
+  "description": "Native messaging host for the Victauri Chrome/Firefox extension — MCP bridge for any website",
+  "bin": {
+    "victauri-browser": "./bin/victauri-browser.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "preuninstall": "node scripts/preuninstall.js"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ],
+  "keywords": [
+    "victauri",
+    "mcp",
+    "chrome-extension",
+    "browser-automation",
+    "ai-agent",
+    "tauri"
+  ],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/runyourempire/victauri.git"
+  },
+  "homepage": "https://github.com/runyourempire/victauri",
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

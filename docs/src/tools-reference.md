@@ -1,0 +1,415 @@
+# Tools Reference
+
+Victauri exposes 24 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
+
+All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
+
+## Standalone Tools
+
+### eval_js
+
+Evaluate JavaScript in the webview and return the result.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `expression` | string | yes | JavaScript expression or statements to evaluate |
+| `webview_label` | string | no | Target webview (defaults to "main" or first visible) |
+
+**Examples:**
+```json
+{"expression": "document.title"}
+{"expression": "document.querySelectorAll('button').length"}
+{"expression": "await fetch('/api/data').then(r => r.json())"}
+```
+
+Bare expressions are auto-wrapped with `return`. Multi-statement code and async/await are supported.
+
+---
+
+### dom_snapshot
+
+Capture a full accessible DOM tree with ref handles for every element.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `webview_label` | string | no | Target webview |
+
+**Returns:** Tree of elements with `ref`, `role`, `name`, `children`, and bounding box data.
+
+---
+
+### find_elements
+
+Search for elements by CSS selector or text content.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `selector` | string | no | CSS selector (alias: `css`) |
+| `text` | string | no | Text content to search for |
+| `role` | string | no | ARIA role to filter by |
+| `webview_label` | string | no | Target webview |
+
+**Examples:**
+```json
+{"selector": "button.primary"}
+{"text": "Submit"}
+{"role": "heading"}
+```
+
+---
+
+### invoke_command
+
+Invoke a Tauri command from the backend.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `command` | string | yes | Command name |
+| `args` | object | no | Arguments to pass |
+
+**Example:**
+```json
+{"command": "get_settings", "args": {}}
+{"command": "search_context", "args": {"query": "hello"}}
+```
+
+---
+
+### screenshot
+
+Capture a PNG screenshot of the application window.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `window_label` | string | no | Target window (defaults to main) |
+
+**Returns:** Base64-encoded PNG image data.
+
+---
+
+### verify_state
+
+Compare frontend and backend state to detect drift.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `frontend_expr` | string | no | JS expression for frontend state |
+| `backend_state` | object | no | Expected backend state to compare |
+
+**Example:**
+```json
+{
+  "frontend_expr": "document.title",
+  "backend_state": {"title": "My App"}
+}
+```
+
+---
+
+### detect_ghost_commands
+
+Find commands invoked by the frontend that are not registered in the backend registry.
+
+**Parameters:** None required.
+
+**Returns:** List of ghost commands with invocation counts.
+
+---
+
+### check_ipc_integrity
+
+Verify the health of IPC communication.
+
+**Parameters:** None required.
+
+**Returns:** `{healthy, total_calls, pending, stale, errored}`
+
+---
+
+### wait_for
+
+Wait for a condition to become true, polling until timeout.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url` |
+| `value` | string | yes | The selector, text, or URL pattern to match |
+| `timeout_ms` | number | no | Max wait time in ms (default: 5000) |
+
+**Example:**
+```json
+{"condition": "selector", "value": ".modal.open", "timeout_ms": 3000}
+{"condition": "url", "value": "/dashboard"}
+```
+
+---
+
+### assert_semantic
+
+Assert a condition about the application state using JS expressions.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `expression` | string | yes | JS expression to evaluate |
+| `condition` | string | yes | One of: `equals`, `not_equals`, `contains`, `greater_than`, `less_than`, `truthy`, `falsy` |
+| `expected` | any | no | Expected value (not needed for truthy/falsy) |
+
+**Example:**
+```json
+{
+  "expression": "document.title",
+  "condition": "equals",
+  "expected": "My App"
+}
+```
+
+---
+
+### resolve_command
+
+Resolve a natural language description to registered commands.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query` | string | yes | Natural language description |
+
+**Example:**
+```json
+{"query": "show settings"}
+```
+
+---
+
+### get_registry
+
+List all registered commands with their metadata.
+
+**Parameters:** None.
+
+---
+
+### get_memory_stats
+
+Get real OS process memory usage.
+
+**Parameters:** None.
+
+**Returns:** `{working_set_bytes, peak_working_set_bytes, page_fault_count, page_file_bytes}`
+
+---
+
+### get_plugin_info
+
+Get plugin version, uptime, configuration, and capabilities.
+
+**Parameters:** None.
+
+---
+
+### get_diagnostics
+
+Get detailed diagnostic information about the plugin state.
+
+**Parameters:** None.
+
+---
+
+## Compound Tools
+
+Compound tools use an `action` parameter to select the specific operation.
+
+### interact
+
+Element interactions with actionability checks.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `click` | `ref_id` | Click an element |
+| `hover` | `ref_id` | Hover over an element |
+| `focus` | `ref_id` | Focus an element |
+| `scroll_into_view` | `ref_id` | Scroll element into viewport |
+| `select` | `ref_id`, `value` | Select an option |
+
+**Example:**
+```json
+{"action": "click", "ref_id": "e3"}
+{"action": "hover", "ref_id": "e12"}
+```
+
+---
+
+### input
+
+Text input and keyboard operations.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `fill` | `ref_id`, `value` | Set input value directly |
+| `type` | `ref_id`, `text` | Type character-by-character |
+| `press_key` | `key` | Press a keyboard key |
+
+**Example:**
+```json
+{"action": "fill", "ref_id": "e5", "value": "hello@example.com"}
+{"action": "type", "ref_id": "e5", "text": "Hello"}
+{"action": "press_key", "key": "Enter"}
+```
+
+Supported keys: `Tab`, `Escape`, `Enter`, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `F1`-`F12`, and any single character.
+
+---
+
+### window
+
+Window management operations.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `get_state` | `label` | Get window state (position, size, visibility) |
+| `list` | — | List all window labels |
+| `manage` | `label`, `operation` | minimize/unminimize/maximize/unmaximize/close |
+| `resize` | `label`, `width`, `height` | Resize a window |
+| `move_to` | `label`, `x`, `y` | Move a window |
+| `set_title` | `label`, `title` | Change window title |
+
+**Example:**
+```json
+{"action": "list"}
+{"action": "get_state", "label": "main"}
+{"action": "resize", "label": "main", "width": 1200, "height": 800}
+```
+
+---
+
+### storage
+
+Browser storage operations.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `get` | `key` | Get localStorage value |
+| `set` | `key`, `value` | Set localStorage value |
+| `delete` | `key` | Delete localStorage key |
+| `cookies` | — | Get all cookies |
+
+**Example:**
+```json
+{"action": "set", "key": "theme", "value": "dark"}
+{"action": "get", "key": "theme"}
+```
+
+---
+
+### navigate
+
+Navigation and history operations.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `go_to` | `url` | Navigate to a URL (http/https only) |
+| `back` | — | Go back in history |
+| `history` | — | Get navigation history log |
+| `dialogs` | — | Get dialog log (alerts, confirms, prompts) |
+
+**Example:**
+```json
+{"action": "go_to", "url": "https://example.com"}
+{"action": "history"}
+```
+
+---
+
+### recording
+
+Time-travel recording for session capture and replay.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `start` | — | Start recording events |
+| `stop` | — | Stop recording and return session |
+| `checkpoint` | `label` | Create a named checkpoint |
+| `events` | `since`, `limit` | Get recorded events |
+| `export` | — | Export full session data |
+| `import` | `session` | Import a session for replay |
+
+**Example:**
+```json
+{"action": "start"}
+{"action": "checkpoint", "label": "after-login"}
+{"action": "stop"}
+```
+
+---
+
+### inspect
+
+CSS inspection, accessibility, and performance profiling.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `styles` | `ref_id`, `properties` | Get computed CSS styles |
+| `bounds` | `ref_ids` | Get bounding boxes with box model |
+| `highlight` | `ref_id`, `color`, `label` | Draw debug overlay on element |
+| `accessibility` | — | Run WCAG accessibility audit |
+| `performance` | — | Get performance metrics |
+
+**Example:**
+```json
+{"action": "styles", "ref_id": "e3", "properties": ["color", "font-size"]}
+{"action": "bounds", "ref_ids": ["e1", "e2", "e3"]}
+{"action": "accessibility"}
+{"action": "performance"}
+```
+
+The accessibility audit checks: missing alt text, unlabeled form inputs, empty buttons/links, heading hierarchy, color contrast (WCAG AA), ARIA role validity, positive tabindex, and missing document language/title.
+
+Performance metrics include: navigation timing, resource summary, paint timing (FP/FCP), JS heap usage, long task count, and DOM statistics.
+
+---
+
+### css
+
+CSS injection for debugging and prototyping.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `inject` | `css` | Inject custom CSS (replaces previous) |
+| `remove` | — | Remove injected CSS |
+
+**Example:**
+```json
+{"action": "inject", "css": "* { outline: 1px solid red; }"}
+{"action": "remove"}
+```
+
+---
+
+### logs
+
+Access all captured logs from the application.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `console` | `since`, `level` | Console log entries |
+| `network` | `since` | Network request log |
+| `ipc` | `since`, `limit` | IPC command log |
+| `navigation` | — | Navigation history |
+| `dialogs` | — | Dialog interactions |
+| `events` | `since` | Event stream |
+| `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
+
+**Example:**
+```json
+{"action": "console", "level": "error"}
+{"action": "network"}
+{"action": "slow_ipc", "threshold_ms": 100}
+```

@@ -5006,6 +5006,7 @@ dependencies = [
  "axum",
  "chrono",
  "http-body-util",
+ "reqwest 0.12.28",
  "rmcp",
  "serde",
  "serde_json",

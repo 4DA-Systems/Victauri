@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="popup.css">
+    <title>Victauri Browser</title>
+</head>
+<body>
+    <div class="header">
+        <div class="logo">V</div>
+        <div class="title">Victauri Browser</div>
+    </div>
+
+    <div class="status-section">
+        <div class="status-row">
+            <span class="label">Host</span>
+            <span id="host-status" class="status disconnected">Disconnected</span>
+        </div>
+        <div class="status-row">
+            <span class="label">Bridge</span>
+            <span id="bridge-status" class="status disconnected">Not Injected</span>
+        </div>
+    </div>
+
+    <div class="tab-info" id="tab-info">
+        <div class="tab-url" id="tab-url">—</div>
+        <div class="tab-title" id="tab-title">No active tab</div>
+    </div>
+
+    <div class="actions">
+        <button id="btn-screenshot" class="action-btn" disabled>Screenshot</button>
+        <button id="btn-a11y" class="action-btn" disabled>A11y Audit</button>
+        <button id="btn-snapshot" class="action-btn" disabled>DOM Snapshot</button>
+    </div>
+
+    <div class="mcp-url">
+        <span class="label">MCP Server</span>
+        <code id="mcp-url">http://127.0.0.1:7474/mcp</code>
+    </div>
+
+    <div class="version">v0.1.0</div>
+
+    <script src="popup.js"></script>
+</body>
+</html>
