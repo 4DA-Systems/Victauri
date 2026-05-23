@@ -67,8 +67,10 @@ pub fn build_app_full(
                 async move {
                     axum::Json(serde_json::json!({
                         "name": "victauri",
+                        "description": "Full-stack Tauri app inspection: webview + IPC + Rust backend + SQLite",
                         "version": env!("CARGO_PKG_VERSION"),
                         "protocol": "mcp",
+                        "capabilities": ["webview", "ipc", "backend", "database", "filesystem"],
                         "commands_registered": s.registry.count(),
                         "events_captured": s.event_log.len(),
                         "port": s.port.load(Ordering::Relaxed),

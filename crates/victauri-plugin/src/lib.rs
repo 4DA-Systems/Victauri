@@ -36,6 +36,9 @@
 
 /// Runtime-erased webview bridge trait and its Tauri implementation.
 pub mod bridge;
+/// Backend database access (`SQLite` read-only queries).
+#[cfg(feature = "sqlite")]
+pub mod database;
 pub mod error;
 /// JS bridge script generation for webview injection.
 pub mod js_bridge;

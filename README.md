@@ -24,7 +24,8 @@ Testing Tauri apps today means choosing between frontend mocks that lie about yo
 
 Victauri gives you capabilities that no other Tauri testing tool provides:
 
-- **Full-stack verification** — click a button, confirm the IPC call went through, verify the Rust handler ran with correct arguments, check the UI updated
+- **Full-stack verification** — click a button, confirm the IPC call went through, verify the Rust handler ran with correct arguments, query the database to confirm the write, check the UI updated
+- **Direct backend access** — read app config, browse data directories, query SQLite databases, inspect process memory — all from the Rust backend, no webview proxy
 - **Ghost command detection** — find frontend calls with no backend handler, and backend commands no frontend ever calls
 - **Cross-boundary state checking** — compare what the DOM says against what the Rust backend knows, catch state drift automatically
 - **IPC coverage tracking** — know exactly which Tauri commands your tests exercise and which have zero coverage
@@ -385,6 +386,70 @@ assert!(health["healthy"].as_bool().unwrap());
 
 ---
 
+## Backend Access
+
+Victauri provides direct access to the Rust backend — no webview proxy needed. Query databases, read files, and inspect app state from the same process:
+
+### Query SQLite databases
+
+```rust
+// Auto-discovers databases in the app data directory
+let result = client.query_db(
+    "SELECT * FROM users WHERE active = ?",
+    None,                           // auto-discover database
+    Some(vec![json!(true)]),        // bind parameters
+).await?;
+println!("{} rows", result["row_count"]);
+for row in result["rows"].as_array().unwrap() {
+    println!("  {} ({})", row["name"], row["email"]);
+}
+```
+
+### Inspect app configuration
+
+```rust
+let info = client.app_info().await?;
+println!("App: {}", info["config"]["product_name"]);
+println!("Data dir: {}", info["paths"]["data"]);
+println!("Databases found: {:?}", info["databases"]);
+```
+
+### Browse and read backend files
+
+```rust
+// List files in the app data directory
+let files = client.list_app_dir(Some("data"), None).await?;
+for entry in files["entries"].as_array().unwrap() {
+    println!("  {} ({} bytes)", entry["name"], entry["size"]);
+}
+
+// Read a config file
+let content = client.read_app_file("settings.json", Some("config")).await?;
+println!("{}", content["content"]);
+```
+
+### End-to-end: UI action to database verification
+
+```rust
+// Click "Save" in the UI
+client.click_by_id("save-btn").await?;
+
+// Verify the IPC command was called
+let log = client.get_ipc_log(None).await?;
+assert_ipc_called(&log, "save_settings");
+
+// Verify the database was actually written
+let result = client.query_db(
+    "SELECT value FROM settings WHERE key = 'theme'",
+    None, None,
+).await?;
+assert_eq!(result["rows"][0]["value"], "dark");
+```
+
+This is the full-stack verification loop: **UI action -> IPC verification -> database confirmation** — all from one test, one tool, one process.
+
+---
+
 ## Fluent Verification
 
 Check multiple conditions at once — DOM, IPC, accessibility, errors — with a single report:
@@ -725,9 +790,41 @@ Exit code 0 if all pass, 1 if any fail. Ideal for CI gates.
 
 ## MCP Tools
 
-Victauri exposes 24 MCP tools — 9 compound tools (grouped actions) and 15 standalone:
+Victauri exposes 28 MCP tools across three layers — giving agents and tests simultaneous access to the webview, IPC, and Rust backend:
 
-### Compound tools
+### Backend tools (direct Rust access, no webview needed)
+
+| Tool | What it does |
+|---|---|
+| `app_info` | App config, directory paths, env vars, discovered databases, process info |
+| `list_app_dir` | Browse files in app data/config/log/local_data directories |
+| `read_app_file` | Read files from app backend directories (UTF-8 or base64) |
+| `query_db` | Read-only SQLite queries with auto-discovery |
+| `invoke_command` | Call any Tauri command directly through IPC |
+| `get_memory_stats` | Real-time OS process memory (working set, page faults) |
+
+### IPC tools
+
+| Tool | What it does |
+|---|---|
+| `get_registry` | List all `#[inspectable]` command schemas |
+| `detect_ghost_commands` | Find orphaned frontend IPC calls with no backend handler |
+| `check_ipc_integrity` | Detect stuck/stale/errored IPC calls |
+| `verify_state` | Compare frontend DOM against backend state (with auto-fetch via command) |
+| `resolve_command` | Natural language to matching Tauri command |
+
+### Webview tools
+
+| Tool | What it does |
+|---|---|
+| `eval_js` | Execute JavaScript in the webview |
+| `dom_snapshot` | Full accessibility tree with ref handles |
+| `find_elements` | Search by text, role, test ID, CSS, label, placeholder, alt, title |
+| `screenshot` | Platform-native window capture (no Chromium) |
+| `wait_for` | Poll for conditions: text, selector, IPC settle |
+| `assert_semantic` | Evaluate JS + assert against expected value |
+
+### Compound tools (multiple actions per tool)
 
 | Tool | Actions |
 |---|---|
@@ -740,24 +837,6 @@ Victauri exposes 24 MCP tools — 9 compound tools (grouped actions) and 15 stan
 | **`inspect`** | `styles`, `bounds`, `highlight`, `audit_accessibility`, `get_performance` |
 | **`logs`** | `console`, `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc` |
 | **`css`** | `inject`, `remove` — debug CSS injection |
-
-### Standalone tools
-
-| Tool | What it does |
-|---|---|
-| `eval_js` | Execute JavaScript in the webview |
-| `dom_snapshot` | Full accessibility tree with ref handles |
-| `find_elements` | Search by text, role, test ID, CSS, label, placeholder, alt, title |
-| `invoke_command` | Call any Tauri command through real IPC |
-| `screenshot` | Platform-native window capture (no Chromium) |
-| `verify_state` | Compare frontend DOM against backend state |
-| `detect_ghost_commands` | Find orphaned IPC calls |
-| `check_ipc_integrity` | Detect stuck/stale/errored IPC calls |
-| `wait_for` | Poll for conditions: text, selector, IPC settle |
-| `assert_semantic` | Evaluate JS + assert against expected value |
-| `resolve_command` | Natural language to matching Tauri command |
-| `get_registry` | List all `#[inspectable]` command schemas |
-| `get_memory_stats` | Real-time OS process memory statistics |
 | `get_plugin_info` | Plugin config: port, tools, privacy, version |
 | `get_diagnostics` | Detect edge cases: shadow DOM, service workers, iframes, large DOM |
 
@@ -931,9 +1010,11 @@ AI Agent / cargo test / curl
      |       |       |
      v       v       v
   WebView  IPC    Backend
-  - DOM    - log   - state
-  - click  - args  - memory
-  - eval   - result - registry
+  - DOM    - log   - app config
+  - click  - args  - file system
+  - eval   - cmds  - SQLite DBs
+  - a11y   - ghost - memory
+  - perf   - verify- env vars
 ```
 
 ### Why embedded matters

@@ -58,6 +58,41 @@ const RESOURCE_URI_STATE: &str = "victauri://state";
 
 const BRIDGE_VERSION: &str = "0.3.0";
 
+const SAFE_ENV_PREFIXES: &[&str] = &[
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "LC_",
+    "TERM",
+    "SHELL",
+    "DISPLAY",
+    "XDG_",
+    "TAURI_",
+    "VICTAURI_",
+    "RUST",
+    "CARGO",
+    "NODE_ENV",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "USERPROFILE",
+    "TEMP",
+    "TMP",
+    "PROGRAMFILES",
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "OS",
+    "PROCESSOR_",
+    "NUMBER_OF_PROCESSORS",
+    "COMPUTERNAME",
+    "HOSTNAME",
+    "PWD",
+    "OLDPWD",
+    "SHLVL",
+    "LOGNAME",
+];
+
 /// MCP tool handler that dispatches tool calls to the webview bridge and state.
 #[derive(Clone)]
 pub struct VictauriMcpHandler {
@@ -291,7 +326,41 @@ impl VictauriMcpHandler {
             }
         };
 
-        let result = victauri_core::verify_state(frontend_state, params.backend_state);
+        let backend_state = if let Some(state) = params.backend_state {
+            state
+        } else if let Some(ref cmd) = params.backend_command {
+            if !self.state.privacy.is_command_allowed(cmd) {
+                return tool_error(format!(
+                    "command '{cmd}' is blocked by privacy configuration"
+                ));
+            }
+            let args = params.backend_args.unwrap_or(serde_json::json!({}));
+            let args_str = serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string());
+            let invoke_code = format!(
+                "return window.__TAURI_INTERNALS__.invoke({}, {args_str})",
+                js_string(cmd)
+            );
+            match self
+                .eval_with_return(&invoke_code, params.webview_label.as_deref())
+                .await
+            {
+                Ok(result) => match serde_json::from_str(&result) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return tool_error(format!(
+                            "backend command '{cmd}' did not return valid JSON: {e}"
+                        ));
+                    }
+                },
+                Err(e) => {
+                    return tool_error(format!("failed to invoke backend command '{cmd}': {e}"));
+                }
+            }
+        } else {
+            return tool_error("either backend_state or backend_command must be provided");
+        };
+
+        let result = victauri_core::verify_state(frontend_state, backend_state);
         json_result(&result)
     }
 
@@ -577,6 +646,266 @@ impl VictauriMcpHandler {
             params.webview_label.as_deref(),
         )
         .await
+    }
+
+    // ── Backend Access Tools ───────────────────────────────────────────────
+
+    #[tool(
+        description = "Get comprehensive app info: Tauri config (identifier, product name, version), app directory paths (data, config, log, local_data), process environment variables, and database files found in app directories. Provides direct backend context without going through the webview.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn app_info(&self) -> CallToolResult {
+        self.track_tool_call();
+        let config = self.bridge.tauri_config();
+
+        let data_dir = self.bridge.app_data_dir().ok();
+        let config_dir = self.bridge.app_config_dir().ok();
+        let log_dir = self.bridge.app_log_dir().ok();
+        let local_data_dir = self.bridge.app_local_data_dir().ok();
+
+        let env_vars: std::collections::BTreeMap<String, String> = std::env::vars()
+            .filter(|(k, _)| {
+                let upper = k.to_uppercase();
+                SAFE_ENV_PREFIXES
+                    .iter()
+                    .any(|prefix| upper.starts_with(prefix))
+            })
+            .collect();
+
+        #[cfg(feature = "sqlite")]
+        let databases: Vec<String> = data_dir
+            .as_ref()
+            .map(|d| {
+                crate::database::discover_databases(d)
+                    .into_iter()
+                    .filter_map(|p| {
+                        p.strip_prefix(d)
+                            .ok()
+                            .map(|rel| rel.to_string_lossy().into_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        #[cfg(not(feature = "sqlite"))]
+        let databases: Vec<String> = Vec::new();
+
+        let result = serde_json::json!({
+            "config": config,
+            "paths": {
+                "data": data_dir.as_ref().map(|p| p.to_string_lossy()),
+                "config": config_dir.as_ref().map(|p| p.to_string_lossy()),
+                "log": log_dir.as_ref().map(|p| p.to_string_lossy()),
+                "local_data": local_data_dir.as_ref().map(|p| p.to_string_lossy()),
+            },
+            "databases": databases,
+            "env": env_vars,
+            "process": {
+                "pid": std::process::id(),
+                "arch": std::env::consts::ARCH,
+                "os": std::env::consts::OS,
+                "family": std::env::consts::FAMILY,
+            },
+        });
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "List files in the app's data, config, log, or local_data directories. Useful for discovering databases, config files, logs, and cached data on the backend — without going through the webview.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn list_app_dir(
+        &self,
+        Parameters(params): Parameters<ListAppDirParams>,
+    ) -> CallToolResult {
+        self.track_tool_call();
+        let base = match self.resolve_app_dir(params.directory) {
+            Ok(d) => d,
+            Err(e) => return tool_error(e),
+        };
+
+        let target = if let Some(ref sub) = params.path {
+            let resolved = base.join(sub);
+            if !resolved.exists() {
+                return tool_error(format!("directory does not exist: {}", resolved.display()));
+            }
+            if let Err(e) = Self::safe_within(&base, &resolved) {
+                return tool_error(e);
+            }
+            resolved
+        } else {
+            base.clone()
+        };
+
+        if !target.exists() {
+            return tool_error(format!("directory does not exist: {}", target.display()));
+        }
+
+        let max_depth = params.max_depth.unwrap_or(1).min(5);
+        let pattern = params.pattern.as_deref();
+        let mut entries = Vec::new();
+
+        Self::list_dir_recursive(&target, &base, 0, max_depth, pattern, &mut entries);
+
+        json_result(&serde_json::json!({
+            "base": base.to_string_lossy(),
+            "path": params.path.unwrap_or_default(),
+            "entries": entries,
+            "count": entries.len(),
+        }))
+    }
+
+    #[tool(
+        description = "Read a file from the app's data, config, log, or local_data directory. Returns UTF-8 text by default, or base64 for binary files. Directly reads backend files without going through the webview.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn read_app_file(
+        &self,
+        Parameters(params): Parameters<ReadAppFileParams>,
+    ) -> CallToolResult {
+        self.track_tool_call();
+        let base = match self.resolve_app_dir(params.directory) {
+            Ok(d) => d,
+            Err(e) => return tool_error(e),
+        };
+
+        let target = base.join(&params.path);
+        if !target.exists() {
+            return tool_error(format!("file not found: {}", params.path));
+        }
+        if let Err(e) = Self::safe_within(&base, &target) {
+            return tool_error(e);
+        }
+        if !target.is_file() {
+            return tool_error(format!("not a file: {}", params.path));
+        }
+
+        let max_bytes = params.max_bytes.unwrap_or(1_048_576).min(10_485_760);
+        let metadata = std::fs::metadata(&target).map_err(|e| e.to_string());
+
+        match std::fs::read(&target) {
+            Ok(mut bytes) => {
+                let original_size = bytes.len();
+                let truncated = bytes.len() > max_bytes;
+                if truncated {
+                    bytes.truncate(max_bytes);
+                }
+
+                let file_info = serde_json::json!({
+                    "path": params.path,
+                    "size": original_size,
+                    "truncated": truncated,
+                    "modified": metadata.as_ref().ok()
+                        .and_then(|m| m.modified().ok())
+                        .map(|t| {
+                            let duration = t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default();
+                            duration.as_secs()
+                        }),
+                });
+
+                if params.binary == Some(true) {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                    json_result(&serde_json::json!({
+                        "file": file_info,
+                        "encoding": "base64",
+                        "content": b64,
+                    }))
+                } else {
+                    match String::from_utf8(bytes) {
+                        Ok(text) => json_result(&serde_json::json!({
+                            "file": file_info,
+                            "encoding": "utf-8",
+                            "content": text,
+                        })),
+                        Err(e) => {
+                            use base64::Engine;
+                            let bytes = e.into_bytes();
+                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            json_result(&serde_json::json!({
+                                "file": file_info,
+                                "encoding": "base64",
+                                "note": "file is not valid UTF-8, returning base64",
+                                "content": b64,
+                            }))
+                        }
+                    }
+                }
+            }
+            Err(e) => tool_error(format!("failed to read file: {e}")),
+        }
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tool(
+        description = "Execute a read-only SQL query against a SQLite database in the app's data directory. Auto-discovers database files if no path is specified. Only SELECT/PRAGMA/EXPLAIN/WITH queries are allowed. Returns rows as JSON objects with column names as keys. This provides direct backend database access without going through the webview or IPC.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn query_db(&self, Parameters(params): Parameters<QueryDbParams>) -> CallToolResult {
+        self.track_tool_call();
+        let data_dir = match self.bridge.app_data_dir() {
+            Ok(d) => d,
+            Err(e) => return tool_error(format!("cannot access app data directory: {e}")),
+        };
+
+        let db_path = if let Some(ref rel_path) = params.path {
+            let resolved = data_dir.join(rel_path);
+            if !resolved.exists() {
+                return tool_error(format!("database not found: {rel_path}"));
+            }
+            if let Err(e) = Self::safe_within(&data_dir, &resolved) {
+                return tool_error(e);
+            }
+            resolved
+        } else {
+            let databases = crate::database::discover_databases(&data_dir);
+            match databases.first() {
+                Some(p) => p.clone(),
+                None => {
+                    return tool_error(format!(
+                        "no SQLite databases found in {}",
+                        data_dir.display()
+                    ));
+                }
+            }
+        };
+
+        let db_display = db_path
+            .strip_prefix(&data_dir)
+            .unwrap_or(&db_path)
+            .to_string_lossy()
+            .into_owned();
+        let bind_params = params.params.unwrap_or_default();
+
+        match crate::database::query(&db_path, &params.query, &bind_params, params.max_rows) {
+            Ok(mut result) => {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("database".to_string(), serde_json::json!(db_display));
+                }
+                json_result(&result)
+            }
+            Err(e) => tool_error(e),
+        }
     }
 
     // ── Compound Tools ──────────────────────────────────────────────────────
@@ -1420,6 +1749,20 @@ impl VictauriMcpHandler {
                 let p: DiagnosticsParams = Self::parse_args(args)?;
                 self.get_diagnostics(Parameters(p)).await
             }
+            "app_info" => self.app_info().await,
+            "list_app_dir" => {
+                let p: ListAppDirParams = Self::parse_args(args)?;
+                self.list_app_dir(Parameters(p)).await
+            }
+            "read_app_file" => {
+                let p: ReadAppFileParams = Self::parse_args(args)?;
+                self.read_app_file(Parameters(p)).await
+            }
+            #[cfg(feature = "sqlite")]
+            "query_db" => {
+                let p: QueryDbParams = Self::parse_args(args)?;
+                self.query_db(Parameters(p)).await
+            }
             "interact" => {
                 let p: InteractParams = Self::parse_args(args)?;
                 self.interact(Parameters(p)).await
@@ -1493,6 +1836,89 @@ impl VictauriMcpHandler {
 
     fn track_tool_call(&self) {
         self.state.tool_invocations.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn resolve_app_dir(&self, dir: Option<AppDir>) -> Result<std::path::PathBuf, String> {
+        match dir.unwrap_or(AppDir::Data) {
+            AppDir::Data => self.bridge.app_data_dir(),
+            AppDir::Config => self.bridge.app_config_dir(),
+            AppDir::Log => self.bridge.app_log_dir(),
+            AppDir::LocalData => self.bridge.app_local_data_dir(),
+        }
+    }
+
+    fn safe_within(base: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
+        let canon_base = std::fs::canonicalize(base)
+            .map_err(|e| format!("cannot resolve base directory: {e}"))?;
+        let canon_target = std::fs::canonicalize(target)
+            .map_err(|e| format!("cannot resolve target path: {e}"))?;
+        if !canon_target.starts_with(&canon_base) {
+            return Err("path traversal not allowed".to_string());
+        }
+        Ok(())
+    }
+
+    fn list_dir_recursive(
+        dir: &std::path::Path,
+        base: &std::path::Path,
+        depth: u32,
+        max_depth: u32,
+        pattern: Option<&str>,
+        entries: &mut Vec<serde_json::Value>,
+    ) {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read_dir.flatten() {
+            let path = entry.path();
+            if path.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+
+            if let Some(pat) = pattern
+                && !Self::matches_glob(&name, pat)
+                && !path.is_dir()
+            {
+                continue;
+            }
+
+            let is_dir = path.is_dir();
+            let meta = std::fs::metadata(&path).ok();
+
+            entries.push(serde_json::json!({
+                "name": name,
+                "path": relative,
+                "is_dir": is_dir,
+                "size": meta.as_ref().map(std::fs::Metadata::len),
+                "modified": meta.as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs()),
+            }));
+
+            if is_dir && depth < max_depth {
+                Self::list_dir_recursive(&path, base, depth + 1, max_depth, pattern, entries);
+            }
+        }
+    }
+
+    fn matches_glob(name: &str, pattern: &str) -> bool {
+        if pattern == "*" {
+            return true;
+        }
+        if let Some(suffix) = pattern.strip_prefix("*.") {
+            return name.ends_with(&format!(".{suffix}"));
+        }
+        if let Some(prefix) = pattern.strip_suffix("*") {
+            return name.starts_with(prefix);
+        }
+        name == pattern
     }
 
     async fn eval_bridge(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
@@ -1626,18 +2052,28 @@ impl VictauriMcpHandler {
     }
 }
 
-const SERVER_INSTRUCTIONS: &str = "Victauri gives you X-ray vision and hands inside a running Tauri application. \
-Use compound tools with an 'action' parameter to interact with the app: \
+const SERVER_INSTRUCTIONS: &str = "Victauri is a FULL-STACK inspection tool for Tauri applications. \
+It provides simultaneous access to three layers: (1) the WEBVIEW (DOM, interactions, JS eval), \
+(2) the IPC LAYER (command registry, invoke commands, intercept traffic), and \
+(3) the RUST BACKEND (app config, file system, SQLite databases, process memory). \
+\n\nBACKEND tools (direct Rust access, no webview needed): \
+'app_info' (app config, directory paths, discovered databases, process info), \
+'list_app_dir' (browse app data/config/log directories), \
+'read_app_file' (read files from app directories), \
+'query_db' (read-only SQLite queries with auto-discovery). \
+\n\nWEBVIEW tools: \
 'interact' (click, hover, focus, scroll, select), 'input' (fill, type_text, press_key), \
+'inspect' (get_styles, get_bounding_boxes, highlight, audit_accessibility, get_performance), \
+'css' (inject, remove), eval_js, dom_snapshot, find_elements, screenshot. \
+\n\nIPC tools: invoke_command, get_registry, detect_ghost_commands, check_ipc_integrity. \
+\n\nCOMPOUND tools with an 'action' parameter: \
 'window' (get_state, list, manage, resize, move_to, set_title), \
 'storage' (get, set, delete, get_cookies), 'navigate' (go_to, go_back, get_history, \
 set_dialog_response, get_dialog_log), 'recording' (start, stop, checkpoint, list_checkpoints, \
-get_events, events_between, get_replay, export, import), 'inspect' (get_styles, \
-get_bounding_boxes, highlight, clear_highlights, audit_accessibility, get_performance), \
-'css' (inject, remove), 'logs' (console, network, ipc, navigation, dialogs, events, slow_ipc). \
-Standalone tools: eval_js, dom_snapshot, invoke_command, screenshot, verify_state, \
-detect_ghost_commands, check_ipc_integrity, wait_for, assert_semantic, resolve_command, \
-get_registry, get_memory_stats, get_plugin_info.";
+get_events, events_between, get_replay, export, import), \
+'logs' (console, network, ipc, navigation, dialogs, events, slow_ipc). \
+\n\nOTHER: verify_state, wait_for, assert_semantic, resolve_command, \
+get_memory_stats, get_plugin_info, get_diagnostics.";
 
 impl ServerHandler for VictauriMcpHandler {
     fn get_info(&self) -> ServerInfo {

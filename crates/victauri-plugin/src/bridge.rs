@@ -1,7 +1,9 @@
 use tauri::{Manager, Runtime};
 use victauri_core::WindowState;
 
-/// Runtime-erased interface for webview access, allowing the MCP server to interact with Tauri windows without generic parameters.
+/// Runtime-erased interface for webview and backend access, allowing the MCP
+/// server to interact with Tauri windows and the application backend without
+/// generic parameters.
 pub trait WebviewBridge: Send + Sync {
     /// Execute JavaScript in the target webview (defaults to "main" or first visible window).
     ///
@@ -44,6 +46,50 @@ pub trait WebviewBridge: Send + Sync {
     ///
     /// Returns an error string if no matching window is found or the title change fails.
     fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String>;
+
+    // ── Backend Access ─────────────────────────────────────────────────────
+
+    /// Return the app's per-user data directory (e.g. `~/.local/share/<app>/`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be resolved.
+    fn app_data_dir(&self) -> Result<std::path::PathBuf, String> {
+        Err("backend access not available".to_string())
+    }
+
+    /// Return the app's per-user config directory (e.g. `~/.config/<app>/`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be resolved.
+    fn app_config_dir(&self) -> Result<std::path::PathBuf, String> {
+        Err("backend access not available".to_string())
+    }
+
+    /// Return the app's log directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be resolved.
+    fn app_log_dir(&self) -> Result<std::path::PathBuf, String> {
+        Err("backend access not available".to_string())
+    }
+
+    /// Return the app's local data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the path cannot be resolved.
+    fn app_local_data_dir(&self) -> Result<std::path::PathBuf, String> {
+        Err("backend access not available".to_string())
+    }
+
+    /// Return the Tauri app configuration as JSON.
+    #[must_use]
+    fn tauri_config(&self) -> serde_json::Value {
+        serde_json::Value::Null
+    }
 }
 
 fn find_window<'a, R: Runtime>(
@@ -173,6 +219,31 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
         let window = find_window(&windows, label)?;
 
         window.set_title(title).map_err(|e| e.to_string())
+    }
+
+    fn app_data_dir(&self) -> Result<std::path::PathBuf, String> {
+        self.path().app_data_dir().map_err(|e| e.to_string())
+    }
+
+    fn app_config_dir(&self) -> Result<std::path::PathBuf, String> {
+        self.path().app_config_dir().map_err(|e| e.to_string())
+    }
+
+    fn app_log_dir(&self) -> Result<std::path::PathBuf, String> {
+        self.path().app_log_dir().map_err(|e| e.to_string())
+    }
+
+    fn app_local_data_dir(&self) -> Result<std::path::PathBuf, String> {
+        self.path().app_local_data_dir().map_err(|e| e.to_string())
+    }
+
+    fn tauri_config(&self) -> serde_json::Value {
+        let config = self.config();
+        serde_json::json!({
+            "identifier": config.identifier,
+            "product_name": config.product_name,
+            "version": config.version,
+        })
     }
 }
 

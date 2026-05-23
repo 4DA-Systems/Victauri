@@ -40,6 +40,11 @@ regex = "1"
 url = { workspace = true }
 flate2 = "1"
 tower = { version = "0.5", features = ["limit"] }
+rusqlite = { workspace = true, optional = true }
+
+[features]
+default = ["sqlite"]
+sqlite = ["dep:rusqlite"]
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }

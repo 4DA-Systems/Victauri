@@ -775,6 +775,75 @@ impl VictauriClient {
         self.call_tool("get_diagnostics", json!({})).await
     }
 
+    // ── Backend Access ─────────────────────────────────────────────────────
+
+    /// Get app info: Tauri config, directory paths, env vars, discovered databases.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn app_info(&mut self) -> Result<Value, TestError> {
+        self.call_tool("app_info", json!({})).await
+    }
+
+    /// List files in an app directory (data, config, log, or `local_data`).
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn list_app_dir(
+        &mut self,
+        directory: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Value, TestError> {
+        let mut args = json!({});
+        if let Some(d) = directory {
+            args["directory"] = json!(d);
+        }
+        if let Some(p) = path {
+            args["path"] = json!(p);
+        }
+        self.call_tool("list_app_dir", args).await
+    }
+
+    /// Read a file from an app directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn read_app_file(
+        &mut self,
+        path: &str,
+        directory: Option<&str>,
+    ) -> Result<Value, TestError> {
+        let mut args = json!({"path": path});
+        if let Some(d) = directory {
+            args["directory"] = json!(d);
+        }
+        self.call_tool("read_app_file", args).await
+    }
+
+    /// Execute a read-only SQL query against a `SQLite` database in the app data directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn query_db(
+        &mut self,
+        query: &str,
+        db_path: Option<&str>,
+        params: Option<Vec<Value>>,
+    ) -> Result<Value, TestError> {
+        let mut args = json!({"query": query});
+        if let Some(p) = db_path {
+            args["path"] = json!(p);
+        }
+        if let Some(params) = params {
+            args["params"] = json!(params);
+        }
+        self.call_tool("query_db", args).await
+    }
+
     /// Wait for a condition to be met, polling at an interval.
     ///
     /// Conditions: `text`, `text_gone`, `selector`, `selector_gone`, `url`,

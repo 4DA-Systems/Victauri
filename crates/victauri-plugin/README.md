@@ -41,32 +41,53 @@ victauri_plugin::VictauriBuilder::new()
 
 ## Tools
 
-24 MCP tools -- 9 compound tools (each with multiple actions) and 15 standalone:
+28 MCP tools across three layers -- webview, IPC, and Rust backend:
+
+### Backend (direct Rust access, no webview needed)
+
+| Tool | What it does |
+|---|---|
+| `app_info` | App config, directory paths, env vars, discovered databases, process info |
+| `list_app_dir` | List files in app data/config/log/local_data directories |
+| `read_app_file` | Read files from app backend directories (UTF-8 or base64) |
+| `query_db` | Read-only SQLite queries with auto-discovery |
+| `get_memory_stats` | Real-time OS process memory (working set, page faults) |
+| `invoke_command` | Call any Tauri command directly through IPC |
+
+### IPC Layer
+
+| Tool | What it does |
+|---|---|
+| `get_registry` | List all commands with schemas from `#[inspectable]` |
+| `detect_ghost_commands` | Find frontend IPC calls with no backend handler |
+| `check_ipc_integrity` | Detect stuck, stale, or errored IPC calls |
+| `verify_state` | Compare frontend DOM against backend state |
+| `resolve_command` | Natural language to matching Tauri command |
+
+### Webview (DOM, interactions, JS)
 
 | Tool | What it does |
 |---|---|
 | **`interact`** | Click, double-click, hover, focus, scroll, select |
 | **`input`** | Fill inputs, type character-by-character, press keyboard keys |
+| **`inspect`** | Computed CSS, bounding boxes, element highlighting, a11y audit, performance metrics |
+| **`css`** | Inject/remove debug CSS |
+| `eval_js` | Execute JavaScript in the webview |
+| `dom_snapshot` | Full accessibility tree with ref handles |
+| `find_elements` | Search for elements by text, role, test ID, or CSS selector |
+| `screenshot` | Platform-native window capture |
+| `assert_semantic` | Evaluate JS expression and assert against expected value |
+| `wait_for` | Poll for conditions: text appears, selector matches, IPC settles |
+
+### App-wide
+
+| Tool | What it does |
+|---|---|
 | **`window`** | Get state, list windows, manage, resize, move, set title |
 | **`storage`** | Read/write localStorage, sessionStorage, cookies |
 | **`navigate`** | Go to URL, go back, get history, configure dialog responses |
 | **`recording`** | Start/stop sessions, checkpoints, get events, export/import |
-| **`inspect`** | Computed CSS, bounding boxes, element highlighting, a11y audit, performance metrics |
-| **`css`** | Inject/remove debug CSS |
 | **`logs`** | Console, network, IPC, navigation, dialog logs |
-| `eval_js` | Execute JavaScript in the webview |
-| `dom_snapshot` | Full accessibility tree with ref handles |
-| `find_elements` | Search for elements by text, role, test ID, or CSS selector |
-| `invoke_command` | Call any registered Tauri command through real IPC |
-| `screenshot` | Platform-native window capture |
-| `verify_state` | Compare frontend DOM state against backend state |
-| `detect_ghost_commands` | Find frontend IPC calls with no backend handler |
-| `check_ipc_integrity` | Detect stuck, stale, or errored IPC calls |
-| `wait_for` | Poll for conditions: text appears, selector matches, IPC settles |
-| `assert_semantic` | Evaluate JS expression and assert against expected value |
-| `resolve_command` | Natural language to matching Tauri command |
-| `get_registry` | List all commands with schemas from `#[inspectable]` |
-| `get_memory_stats` | Real-time process memory statistics |
 | `get_plugin_info` | Victauri config: port, enabled tools, version |
 | `get_diagnostics` | Server health, compatibility warnings, tool status |
 
