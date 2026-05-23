@@ -156,7 +156,7 @@ Result: 2 violations
 | **Natural language** | `resolve_command("save the key")` → finds `save_api_key` |
 | **Window inspection** | `window(list)` → `window(get_state, label: "main")` |
 
-## Tool Reference (24 tools)
+## Tool Reference (28 tools)
 
 **15 standalone:** `eval_js`, `dom_snapshot`, `find_elements`, `invoke_command`, `screenshot`, `verify_state`, `detect_ghost_commands`, `check_ipc_integrity`, `wait_for`, `assert_semantic`, `resolve_command`, `get_registry`, `get_memory_stats`, `get_plugin_info`, `get_diagnostics`
 

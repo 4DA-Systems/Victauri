@@ -10,19 +10,14 @@ Get Victauri running in your Tauri app in under 5 minutes.
 
 ## Step 1: Add the Dependency
 
-Add `victauri-plugin` as a **dev dependency** in your app's `src-tauri/Cargo.toml`:
-
-```toml
-[dev-dependencies]
-victauri-plugin = "0.2"
-```
-
-Since Victauri is gated behind `#[cfg(debug_assertions)]`, it compiles to nothing in release builds. If you prefer it always available during development:
+Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.2"
+victauri-plugin = "0.3"
 ```
+
+The plugin must be a regular dependency (not `[dev-dependencies]`) because it runs inside your app process. In release builds, `init()` returns a no-op plugin with zero overhead — no feature flags needed.
 
 ## Step 2: Initialize the Plugin
 
@@ -130,7 +125,7 @@ curl http://127.0.0.1:7373/health
 # Returns: ok
 
 curl http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.2.1",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.3.0",...}
 ```
 
 Or use the Victauri CLI:
@@ -168,7 +163,7 @@ fn main() {
 
 ## Optional: REST API
 
-All 24 tools are also available via a REST API without MCP session overhead:
+All 28 tools are also available via a REST API without MCP session overhead:
 
 ```bash
 # List available tools
@@ -183,6 +178,6 @@ curl -X POST http://127.0.0.1:7373/api/tools/eval_js \
 ## Next Steps
 
 - [Architecture](./architecture.md) — Understand how Victauri works under the hood
-- [Tools Reference](./tools-reference.md) — Complete list of all 24 tools
+- [Tools Reference](./tools-reference.md) — Complete list of all 28 tools
 - [Configuration](./configuration.md) — Customize port, auth, privacy, and more
 - [Testing](./testing.md) — Write automated tests with the victauri-test crate

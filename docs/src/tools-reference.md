@@ -1,10 +1,73 @@
 # Tools Reference
 
-Victauri exposes 24 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
+Victauri exposes 28 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
 
 All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
 
-## Standalone Tools
+## Backend Tools
+
+These tools access the Rust backend directly — no webview proxy, no JavaScript evaluation.
+
+### app_info
+
+Get application configuration, directory paths, environment, discovered databases, and process info.
+
+**Parameters:** None required.
+
+**Returns:** `{config, paths, databases, process, environment}`
+
+---
+
+### list_app_dir
+
+Browse files in app backend directories (data, config, log, local_data).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `dir_type` | string | no | One of: `data`, `config`, `log`, `local_data` (default: `data`) |
+| `subpath` | string | no | Subdirectory to list within the chosen directory |
+
+**Returns:** `{path, entries: [{name, size, is_dir, modified}]}`
+
+---
+
+### read_app_file
+
+Read a file from one of the app's backend directories.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `path` | string | yes | File path relative to the directory root |
+| `dir_type` | string | no | One of: `data`, `config`, `log`, `local_data` (default: `data`) |
+
+**Returns:** `{content, encoding, size}` — UTF-8 text or base64-encoded binary.
+
+---
+
+### query_db
+
+Execute a read-only SQL query against a SQLite database in the app's data directory.
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `sql` | string | yes | SQL query (SELECT only) |
+| `db_path` | string | no | Path to database file (auto-discovers if omitted) |
+| `params` | array | no | Bind parameters for the query |
+
+**Examples:**
+```json
+{"sql": "SELECT * FROM users WHERE active = ?", "params": [true]}
+{"sql": "SELECT count(*) FROM items", "db_path": "app.db"}
+```
+
+**Returns:** `{columns, rows, row_count}`
+
+---
+
+## Webview & IPC Tools
 
 ### eval_js
 

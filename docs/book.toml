@@ -6,4 +6,4 @@ src = "src"
 
 [output.html]
 default-theme = "navy"
-git-repository-url = "https://github.com/4DA-Systems/victauri"
+git-repository-url = "https://github.com/runyourempire/victauri"
