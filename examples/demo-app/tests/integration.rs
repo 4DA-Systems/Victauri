@@ -83,9 +83,12 @@ e2e_test!(locator_counter_buttons, |client| async move {
     let before: i64 =
         serde_json::from_value(client.invoke_command("get_counter", None).await.unwrap()).unwrap();
 
-    Locator::text("+").click(&mut client).await.unwrap();
+    Locator::test_id("increment-btn")
+        .click(&mut client)
+        .await
+        .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let after: i64 =
         serde_json::from_value(client.invoke_command("get_counter", None).await.unwrap()).unwrap();
@@ -373,12 +376,19 @@ e2e_test!(notification_lifecycle, |client| async move {
 
 e2e_test!(smoke_test_suite, |client| async move {
     let report = client.smoke_test().await.unwrap();
-    assert!(
-        report.all_passed(),
-        "smoke test failed: {}/{} passed",
-        report.passed_count(),
-        report.total_count(),
-    );
+    if !report.all_passed() {
+        let failures: Vec<String> = report
+            .failures()
+            .iter()
+            .map(|f| format!("  {} — {}", f.name, f.detail))
+            .collect();
+        panic!(
+            "smoke test failed: {}/{} passed\n{}",
+            report.passed_count(),
+            report.total_count(),
+            failures.join("\n"),
+        );
+    }
 });
 
 // ────────────────────────────────────────────────────────────────────────────
