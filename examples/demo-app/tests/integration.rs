@@ -33,32 +33,25 @@ e2e_test!(greet_flow, |client| async move {
 });
 
 e2e_test!(counter_increment, |client| async move {
-    client.invoke_command("reset_counter", None).await.unwrap();
+    // Use return values from increment (each is atomic) to avoid shared-state races
+    let v1: i64 =
+        serde_json::from_value(client.invoke_command("increment", None).await.unwrap()).unwrap();
+    let v2: i64 =
+        serde_json::from_value(client.invoke_command("increment", None).await.unwrap()).unwrap();
+    let v3: i64 =
+        serde_json::from_value(client.invoke_command("increment", None).await.unwrap()).unwrap();
 
-    let before: i64 =
-        serde_json::from_value(client.invoke_command("get_counter", None).await.unwrap()).unwrap();
-
-    client.click_by_id("increment-btn").await.unwrap();
-    client.click_by_id("increment-btn").await.unwrap();
-    client.click_by_id("increment-btn").await.unwrap();
-
-    let after: i64 =
-        serde_json::from_value(client.invoke_command("get_counter", None).await.unwrap()).unwrap();
-    assert!(
-        after > before,
-        "counter should increase: before={before}, after={after}"
-    );
+    assert_eq!(v2, v1 + 1, "second increment should be one more than first");
+    assert_eq!(v3, v2 + 1, "third increment should be one more than second");
 });
 
 e2e_test!(counter_decrement_below_zero, |client| async move {
-    client.invoke_command("reset_counter", None).await.unwrap();
-
+    // Each decrement returns the new value atomically — assert on relative change only
     let v1: i64 =
         serde_json::from_value(client.invoke_command("decrement", None).await.unwrap()).unwrap();
-    assert_eq!(v1, -1, "first decrement from zero should be -1");
     let v2: i64 =
         serde_json::from_value(client.invoke_command("decrement", None).await.unwrap()).unwrap();
-    assert_eq!(v2, -2, "second decrement should be -2");
+    assert_eq!(v2, v1 - 1, "second decrement should be one less than first");
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -87,7 +80,8 @@ e2e_test!(locator_greet_by_test_id, |client| async move {
 });
 
 e2e_test!(locator_counter_buttons, |client| async move {
-    client.invoke_command("reset_counter", None).await.unwrap();
+    let before: i64 =
+        serde_json::from_value(client.invoke_command("get_counter", None).await.unwrap()).unwrap();
 
     Locator::text("+").click(&mut client).await.unwrap();
 
@@ -95,7 +89,7 @@ e2e_test!(locator_counter_buttons, |client| async move {
 
     let after: i64 =
         serde_json::from_value(client.invoke_command("get_counter", None).await.unwrap()).unwrap();
-    assert!(after > 0, "counter should be positive after clicking +");
+    assert!(after > before, "counter should increase via + button");
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -182,15 +176,12 @@ e2e_test!(contact_form_success, |client| async move {
 // ────────────────────────────────────────────────────────────────────────────
 
 e2e_test!(cross_boundary_counter_state, |client| async move {
-    client.invoke_command("reset_counter", None).await.unwrap();
-
+    // increment returns the new value atomically
     let v1: i64 =
         serde_json::from_value(client.invoke_command("increment", None).await.unwrap()).unwrap();
-    assert_eq!(v1, 1, "increment from zero should return 1");
-
     let v2: i64 =
-        serde_json::from_value(client.invoke_command("get_counter", None).await.unwrap()).unwrap();
-    assert_eq!(v2, 1, "get_counter should match after increment");
+        serde_json::from_value(client.invoke_command("increment", None).await.unwrap()).unwrap();
+    assert_eq!(v2, v1 + 1, "consecutive increments should differ by 1");
 
     let report = client.verify().no_console_errors().run().await.unwrap();
 

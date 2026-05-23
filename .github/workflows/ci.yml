@@ -255,7 +255,7 @@ jobs:
           echo "MCP server ready after ${elapsed}s"
 
       - name: Run E2E tests
-        run: cargo test -p demo-app --test integration
+        run: cargo test -p demo-app --test integration -- --test-threads=1
         env:
           VICTAURI_E2E: "1"
 
