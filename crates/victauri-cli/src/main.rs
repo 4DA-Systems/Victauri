@@ -272,7 +272,28 @@ fn cmd_init(root: &Path) -> Result<()> {
         eprintln!("  [+] Created .github/workflows/victauri.yml (CI pipeline)");
     }
 
-    // Step 7: Print summary
+    // Step 7: Add Victauri section to CLAUDE.md for AI agent guidance
+    let claude_md_path = root.join("CLAUDE.md");
+    if claude_md_path.exists() {
+        let content = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
+        if content.contains("Victauri") || content.contains("victauri") {
+            eprintln!("  [=] CLAUDE.md already references Victauri");
+        } else {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&claude_md_path)
+                .with_context(|| format!("failed to append to {}", claude_md_path.display()))?;
+            std::io::Write::write_all(&mut file, generate_claude_md_section().as_bytes())
+                .with_context(|| format!("failed to write to {}", claude_md_path.display()))?;
+            eprintln!("  [+] Added Victauri section to CLAUDE.md");
+        }
+    } else {
+        std::fs::write(&claude_md_path, generate_claude_md_section())
+            .with_context(|| format!("failed to write {}", claude_md_path.display()))?;
+        eprintln!("  [+] Created CLAUDE.md with Victauri agent instructions");
+    }
+
+    // Step 8: Print summary
     let mut remaining_steps = Vec::new();
     if !patched {
         remaining_steps
@@ -1103,6 +1124,34 @@ fn generate_mcp_json() -> &'static str {
 "#
 }
 
+fn generate_claude_md_section() -> &'static str {
+    r#"
+## Victauri (App Inspection & Testing)
+
+This app has **Victauri** integrated — an MCP server embedded inside the Tauri process
+that gives full-stack access to the webview DOM, IPC layer, Rust backend, and native
+windows. Available when the app is running in debug mode.
+
+**Use Victauri MCP tools for all app inspection and testing tasks.** Victauri runs inside
+the app process with sub-ms response times and direct AppHandle access — it sees
+everything, not just the webview.
+
+Key tools that only Victauri can provide (not available via CDP/Playwright):
+- `invoke_command` — call any registered Tauri command directly
+- `verify_state` — cross-boundary frontend/backend state verification
+- `detect_ghost_commands` — find commands with no backend handler
+- `check_ipc_integrity` — verify IPC pipeline health
+- `get_memory_stats` — real OS process memory stats
+- `audit_accessibility` — WCAG accessibility checks
+- `get_performance` — navigation timing, JS heap, resource loading
+
+Connection: `http://127.0.0.1:7373/mcp` (configured in `.mcp.json`)
+
+Do NOT use Playwright or CDP for tasks that Victauri handles. Only fall back to
+Playwright for browser-only work unrelated to the Tauri app.
+"#
+}
+
 fn generate_capability_json() -> &'static str {
     r#"{
   "identifier": "victauri",
@@ -1788,6 +1837,18 @@ mod tests {
         assert!(content.contains("victauri test"));
         assert!(content.contains("xvfb"));
         assert!(content.contains("VICTAURI_E2E"));
+    }
+
+    #[test]
+    fn claude_md_section_has_key_instructions() {
+        let content = generate_claude_md_section();
+        assert!(content.contains("Victauri"));
+        assert!(content.contains("invoke_command"));
+        assert!(content.contains("7373"));
+        assert!(
+            content.contains("Do NOT use Playwright"),
+            "should instruct agents to prefer Victauri"
+        );
     }
 
     #[test]
