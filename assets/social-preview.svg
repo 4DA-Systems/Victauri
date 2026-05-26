@@ -48,7 +48,7 @@
 
   <!-- Bottom bar -->
   <g transform="translate(640, 560)" text-anchor="middle" font-family="ui-monospace, monospace" font-size="15" fill="#52525b">
-    <text x="-200" y="0">28 MCP tools</text>
+    <text x="-200" y="0">31 MCP tools</text>
     <text x="-60" y="0" fill="#3f3f46">|</text>
     <text x="30" y="0">Rust + TypeScript</text>
     <text x="140" y="0" fill="#3f3f46">|</text>

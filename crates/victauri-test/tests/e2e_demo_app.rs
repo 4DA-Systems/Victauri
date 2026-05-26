@@ -598,8 +598,8 @@ e2e_test!(plugin_info_tool_count, {
     let mut client = VictauriClient::discover().await.unwrap();
     let result = client.get_plugin_info().await.unwrap();
     let text = serde_json::to_string(&result).unwrap();
-    // Should report 28 tools (24 original + 4 backend access)
-    assert!(text.contains("28") || text.contains("tools") || text.contains("tool_count"));
+    // Should report 31 tools (19 standalone + 12 compound)
+    assert!(text.contains("31") || text.contains("tools") || text.contains("tool_count"));
 });
 
 // ── Logs ────────────────────────────────────────────────────────────────────
