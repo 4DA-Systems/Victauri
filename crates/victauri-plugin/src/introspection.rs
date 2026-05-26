@@ -778,6 +778,290 @@ impl Default for TaskTracker {
     }
 }
 
+// ── Child Process Enumeration ──────────────────────────────────────────
+
+/// Information about a child process of the Tauri application.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChildProcessInfo {
+    /// Process ID.
+    pub pid: u32,
+    /// Parent process ID.
+    pub ppid: u32,
+    /// Executable name (not full path).
+    pub name: String,
+    /// Memory usage in bytes (working set / RSS), if available.
+    pub memory_bytes: Option<u64>,
+}
+
+/// Enumerate child processes of the current process.
+///
+/// Uses platform-native APIs:
+/// - Windows: `CreateToolhelp32Snapshot` + `Process32First/Next`
+/// - Linux: `/proc/` filesystem
+/// - macOS: `proc_listpids` + `proc_pidinfo`
+#[must_use]
+pub fn enumerate_child_processes() -> Vec<ChildProcessInfo> {
+    let my_pid = std::process::id();
+
+    #[cfg(windows)]
+    {
+        enumerate_children_windows(my_pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        enumerate_children_linux(my_pid)
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        enumerate_children_macos(my_pid)
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = my_pid;
+        Vec::new()
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn enumerate_children_windows(parent_pid: u32) -> Vec<ChildProcessInfo> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32, Process32First, Process32Next, TH32CS_SNAPPROCESS,
+    };
+
+    let mut children = Vec::new();
+
+    // SAFETY: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)` creates a
+    // read-only snapshot of all running processes. The returned handle is
+    // closed via `CloseHandle` when we're done. `Process32First/Next` iterate
+    // the snapshot entries.
+    unsafe {
+        let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return children;
+        };
+
+        let mut entry: PROCESSENTRY32 = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32>() as u32;
+
+        if Process32First(snapshot, &mut entry).is_ok() {
+            loop {
+                if entry.th32ParentProcessID == parent_pid && entry.th32ProcessID != parent_pid {
+                    let name_bytes: Vec<u8> = entry
+                        .szExeFile
+                        .iter()
+                        .take_while(|&&b| b != 0)
+                        .map(|&b| b as u8)
+                        .collect();
+                    let name = String::from_utf8_lossy(&name_bytes).to_string();
+
+                    let memory_bytes = get_process_memory_windows(entry.th32ProcessID);
+
+                    children.push(ChildProcessInfo {
+                        pid: entry.th32ProcessID,
+                        ppid: entry.th32ParentProcessID,
+                        name,
+                        memory_bytes,
+                    });
+                }
+
+                if Process32Next(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+
+        let _ = CloseHandle(snapshot);
+    }
+
+    children
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn get_process_memory_windows(pid: u32) -> Option<u64> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`
+    // opens a limited handle for reading memory stats. The process handle is closed
+    // automatically when dropped (windows crate handles this).
+    unsafe {
+        let process = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            false,
+            pid,
+        )
+        .ok()?;
+
+        let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+
+        if GetProcessMemoryInfo(process, &mut counters, counters.cb).is_ok() {
+            Some(counters.WorkingSetSize as u64)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn enumerate_children_linux(parent_pid: u32) -> Vec<ChildProcessInfo> {
+    let mut children = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return children;
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(pid_str) = file_name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+
+        let status_path = format!("/proc/{pid}/status");
+        let Ok(status) = std::fs::read_to_string(&status_path) else {
+            continue;
+        };
+
+        let mut ppid: Option<u32> = None;
+        let mut name = String::new();
+        let mut vm_rss_kb: u64 = 0;
+
+        for line in status.lines() {
+            if let Some(v) = line.strip_prefix("PPid:\t") {
+                ppid = v.trim().parse().ok();
+            } else if let Some(v) = line.strip_prefix("Name:\t") {
+                name = v.trim().to_string();
+            } else if let Some(v) = line.strip_prefix("VmRSS:") {
+                vm_rss_kb = v
+                    .split_whitespace()
+                    .next()
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+
+        if ppid == Some(parent_pid) {
+            children.push(ChildProcessInfo {
+                pid,
+                ppid: parent_pid,
+                name,
+                memory_bytes: if vm_rss_kb > 0 {
+                    Some(vm_rss_kb * 1024)
+                } else {
+                    None
+                },
+            });
+        }
+    }
+
+    children
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
+    use std::mem;
+
+    unsafe extern "C" {
+        fn proc_listchildpids(ppid: i32, buffer: *mut i32, buffersize: i32) -> i32;
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut u8, buffersize: i32) -> i32;
+        fn proc_name(pid: i32, buffer: *mut u8, buffersize: u32) -> i32;
+    }
+
+    const PROC_PIDTASKINFO: i32 = 4;
+
+    #[repr(C)]
+    struct ProcTaskInfo {
+        pti_virtual_size: u64,
+        pti_resident_size: u64,
+        pti_total_user: u64,
+        pti_total_system: u64,
+        pti_threads_user: u64,
+        pti_threads_system: u64,
+        pti_policy: i32,
+        pti_faults: i32,
+        pti_pageins: i32,
+        pti_cow_faults: i32,
+        pti_messages_sent: i32,
+        pti_messages_received: i32,
+        pti_syscalls_mach: i32,
+        pti_syscalls_unix: i32,
+        pti_csw: i32,
+        pti_threadnum: i32,
+        pti_numrunning: i32,
+        pti_priority: i32,
+    }
+
+    let mut children = Vec::new();
+
+    // SAFETY: `proc_listchildpids` populates a buffer of child PIDs for the given
+    // parent PID. We first call with a zero buffer to get the count, then allocate
+    // and call again. `proc_name` and `proc_pidinfo` read metadata for a given PID.
+    unsafe {
+        let ppid = parent_pid as i32;
+        let count = proc_listchildpids(ppid, std::ptr::null_mut(), 0);
+        if count <= 0 {
+            return children;
+        }
+
+        let mut pids = vec![0i32; count as usize];
+        let buf_size = (count as usize * mem::size_of::<i32>()) as i32;
+        let actual = proc_listchildpids(ppid, pids.as_mut_ptr(), buf_size);
+        if actual <= 0 {
+            return children;
+        }
+
+        let n = actual as usize / mem::size_of::<i32>();
+        for &pid in &pids[..n] {
+            if pid <= 0 {
+                continue;
+            }
+
+            let mut name_buf = [0u8; 256];
+            let name_len = proc_name(pid, name_buf.as_mut_ptr(), 256);
+            let name = if name_len > 0 {
+                String::from_utf8_lossy(&name_buf[..name_len as usize]).to_string()
+            } else {
+                String::from("<unknown>")
+            };
+
+            let mut task_info: ProcTaskInfo = mem::zeroed();
+            let info_size = mem::size_of::<ProcTaskInfo>() as i32;
+            let ret = proc_pidinfo(
+                pid,
+                PROC_PIDTASKINFO,
+                0,
+                &mut task_info as *mut _ as *mut u8,
+                info_size,
+            );
+
+            let memory_bytes = if ret == info_size {
+                Some(task_info.pti_resident_size)
+            } else {
+                None
+            };
+
+            children.push(ChildProcessInfo {
+                pid: pid as u32,
+                ppid: parent_pid,
+                name,
+                memory_bytes,
+            });
+        }
+    }
+
+    children
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

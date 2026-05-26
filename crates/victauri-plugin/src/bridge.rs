@@ -239,10 +239,59 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
 
     fn tauri_config(&self) -> serde_json::Value {
         let config = self.config();
+
+        let windows: Vec<serde_json::Value> = config
+            .app
+            .windows
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "label": w.label,
+                    "title": w.title,
+                    "url": format!("{}", w.url),
+                    "width": w.width,
+                    "height": w.height,
+                    "visible": w.visible,
+                    "resizable": w.resizable,
+                    "fullscreen": w.fullscreen,
+                    "decorations": w.decorations,
+                    "transparent": w.transparent,
+                    "always_on_top": w.always_on_top,
+                })
+            })
+            .collect();
+
+        let plugins: Vec<String> = config.plugins.0.keys().cloned().collect();
+
+        let security = serde_json::json!({
+            "csp": config.app.security.csp.as_ref().map(|c| format!("{c}")),
+            "freeze_prototype": config.app.security.freeze_prototype,
+            "capabilities": config.app.security.capabilities.iter().map(|c| {
+                match c {
+                    tauri::utils::config::CapabilityEntry::Inlined(cap) => {
+                        serde_json::json!({
+                            "identifier": cap.identifier,
+                            "description": cap.description,
+                            "windows": cap.windows,
+                            "webviews": cap.webviews,
+                            "permissions": cap.permissions.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>(),
+                            "platforms": cap.platforms,
+                        })
+                    }
+                    tauri::utils::config::CapabilityEntry::Reference(path) => {
+                        serde_json::json!({ "reference": path })
+                    }
+                }
+            }).collect::<Vec<_>>(),
+        });
+
         serde_json::json!({
             "identifier": config.identifier,
             "product_name": config.product_name,
             "version": config.version,
+            "windows": windows,
+            "plugins": plugins,
+            "security": security,
         })
     }
 }

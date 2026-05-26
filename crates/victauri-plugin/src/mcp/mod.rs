@@ -1788,8 +1788,8 @@ impl VictauriMcpHandler {
 
     #[tool(
         description = "Deep backend introspection — command profiling, IPC contract testing, \
-            coverage, startup timing, capability auditing, database diagnostics, managed state, \
-            process info, task tracking, file system scope, and event bus monitoring. \
+            coverage, startup timing, capability auditing, database diagnostics, process \
+            enumeration, and event bus monitoring. \
             These features exploit Victauri's position inside the Rust process.\n\n\
             Actions:\n\
             - `command_timings`: Per-command execution timing stats (min/max/avg/p95). Set `slow_threshold_ms` to filter.\n\
@@ -1798,14 +1798,13 @@ impl VictauriMcpHandler {
             - `contract_check`: Check all recorded contracts for schema drift.\n\
             - `contract_list`: List all recorded contract baselines.\n\
             - `contract_clear`: Clear all recorded contract baselines.\n\
-            - `startup_timing`: Plugin initialization phase-by-phase timing breakdown.\n\
-            - `capabilities`: Audit Tauri v2 permissions and capabilities.\n\
+            - `startup_timing`: Victauri plugin initialization phase-by-phase timing breakdown.\n\
+            - `capabilities`: Enumerate Tauri v2 capabilities, security config (CSP, freeze_prototype), configured plugins, and window definitions.\n\
             - `db_health`: SQLite database diagnostics (journal mode, WAL, page stats).\n\
-            - `managed_state`: Snapshot of Victauri's internal state (event log, registry, faults, recording, etc.).\n\
-            - `processes`: Current process PID, uptime, platform, and Tauri config.\n\
-            - `tasks`: List Victauri's spawned async tasks (MCP server, event drain) with status.\n\
-            - `fs_scope`: App directory paths and file system scope configuration.\n\
-            - `event_bus`: List captured Tauri event bus events (from listen_any).\n\
+            - `plugin_state`: Snapshot of the Victauri plugin's internal state (event log, registry, faults, recording, timings, etc.).\n\
+            - `processes`: Enumerate the host process and all child processes (sidecars, background workers) with PID, name, and memory usage.\n\
+            - `plugin_tasks`: List Victauri's own spawned async tasks (MCP server, event drain) with status.\n\
+            - `event_bus`: List all captured Tauri events (automatically intercepted via listen_any — no app opt-in needed).\n\
             - `event_bus_clear`: Clear the event bus capture buffer.",
         annotations(
             read_only_hint = true,
@@ -2015,12 +2014,24 @@ impl VictauriMcpHandler {
             }
             IntrospectAction::Capabilities => {
                 let config = self.bridge.tauri_config();
+                let live_windows = self.bridge.list_window_labels();
+
                 let result = serde_json::json!({
-                    "tauri_config": config,
-                    "windows": self.bridge.list_window_labels(),
-                    "registered_commands": self.state.registry.list().len(),
-                    "auth_enabled": self.state.privacy.is_tool_enabled("introspect"),
-                    "tools_enabled": self.state.privacy.is_tool_enabled("eval_js"),
+                    "app": {
+                        "identifier": config.get("identifier"),
+                        "product_name": config.get("product_name"),
+                        "version": config.get("version"),
+                    },
+                    "security": config.get("security"),
+                    "configured_windows": config.get("windows"),
+                    "live_windows": live_windows,
+                    "configured_plugins": config.get("plugins"),
+                    "victauri": {
+                        "registered_commands": self.state.registry.list().len(),
+                        "auth_enabled": self.state.privacy.redaction_enabled,
+                        "privacy_profile": format!("{:?}", self.state.privacy.profile),
+                        "disabled_tools": &self.state.privacy.disabled_tools,
+                    },
                 });
                 json_result(&result)
             }
@@ -2039,7 +2050,7 @@ impl VictauriMcpHandler {
                     tool_error("SQLite support not compiled in — enable the `sqlite` feature")
                 }
             }
-            IntrospectAction::ManagedState => {
+            IntrospectAction::PluginState => {
                 let recording_active = self.state.recorder.is_recording();
                 let recording_events = self.state.recorder.event_count();
                 let result = serde_json::json!({
@@ -2079,18 +2090,28 @@ impl VictauriMcpHandler {
             IntrospectAction::Processes => {
                 let pid = std::process::id();
                 let uptime = self.state.started_at.elapsed();
-                let config = self.bridge.tauri_config();
+                let children = crate::introspection::enumerate_child_processes();
+                let host_memory = crate::memory::current_stats();
+
                 let result = serde_json::json!({
-                    "pid": pid,
-                    "uptime_secs": uptime.as_secs(),
-                    "platform": std::env::consts::OS,
-                    "arch": std::env::consts::ARCH,
-                    "tauri_config": config,
-                    "debug_build": cfg!(debug_assertions),
+                    "host": {
+                        "pid": pid,
+                        "uptime_secs": uptime.as_secs(),
+                        "platform": std::env::consts::OS,
+                        "arch": std::env::consts::ARCH,
+                        "memory": host_memory,
+                    },
+                    "children": children.iter().map(|c| serde_json::json!({
+                        "pid": c.pid,
+                        "name": c.name,
+                        "memory_bytes": c.memory_bytes,
+                    })).collect::<Vec<_>>(),
+                    "child_count": children.len(),
+                    "total_child_memory_bytes": children.iter().filter_map(|c| c.memory_bytes).sum::<u64>(),
                 });
                 json_result(&result)
             }
-            IntrospectAction::Tasks => {
+            IntrospectAction::PluginTasks => {
                 let tasks = self.state.task_tracker.list();
                 let active = self.state.task_tracker.active_count();
                 let result = serde_json::json!({
@@ -2101,38 +2122,6 @@ impl VictauriMcpHandler {
                 });
                 json_result(&result)
             }
-            IntrospectAction::FsScope => {
-                let config = self.bridge.tauri_config();
-
-                let data_dir = self
-                    .bridge
-                    .app_data_dir()
-                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
-                let config_dir = self
-                    .bridge
-                    .app_config_dir()
-                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
-                let log_dir = self
-                    .bridge
-                    .app_log_dir()
-                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
-                let local_data_dir = self
-                    .bridge
-                    .app_local_data_dir()
-                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
-
-                let result = serde_json::json!({
-                    "tauri_config": config,
-                    "app_directories": {
-                        "data": data_dir,
-                        "config": config_dir,
-                        "log": log_dir,
-                        "local_data": local_data_dir,
-                    },
-                    "note": "File system scope is enforced by Tauri capabilities. Check the app's capabilities JSON for fs:scope permissions."
-                });
-                json_result(&result)
-            }
             IntrospectAction::EventBus => {
                 let tauri_events = self.state.event_bus.events();
                 let app_events = self.state.event_log.snapshot();
@@ -2140,7 +2129,6 @@ impl VictauriMcpHandler {
                     "tauri_events": {
                         "count": tauri_events.len(),
                         "events": tauri_events,
-                        "note": "Captured via app.listen_any() — apps must opt in by calling state.event_bus.push()"
                     },
                     "app_events": {
                         "count": app_events.len(),
@@ -3035,10 +3023,10 @@ It provides simultaneous access to three layers: (1) the WEBVIEW (DOM, interacti
 'query_db' (read-only SQLite queries with auto-discovery). \
 \n\nBACKEND INTROSPECTION (CDP cannot do this — Victauri-exclusive): \
 'introspect' (command_timings, coverage, contract_record/check/list/clear, startup_timing, \
-capabilities, db_health, managed_state, processes, tasks, fs_scope, event_bus, event_bus_clear) — \
+capabilities, db_health, plugin_state, processes, plugin_tasks, event_bus, event_bus_clear) — \
 Rust-side performance profiling, IPC contract testing, command coverage analysis, startup timing, \
-permission auditing, database diagnostics, internal state snapshot, process info, task tracking, \
-file system scope, and Tauri event bus monitoring. \
+capability/security auditing, database diagnostics, plugin state, child process enumeration, \
+task tracking, and automatic Tauri event bus monitoring. \
 'fault' (inject, list, clear, clear_all) — chaos engineering: inject delays, errors, \
 drops, and response corruption into Tauri commands at the Rust layer. \
 'explain' (summary, last_action, diff) — cross-layer activity correlation: summarizes recent \

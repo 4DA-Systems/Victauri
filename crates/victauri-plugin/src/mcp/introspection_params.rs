@@ -17,21 +17,19 @@ pub enum IntrospectAction {
     ContractList,
     /// Clear all recorded contract baselines.
     ContractClear,
-    /// Report plugin startup phase timing breakdown.
+    /// Report Victauri plugin startup phase timing breakdown.
     StartupTiming,
-    /// Audit Tauri v2 capabilities and permissions.
+    /// Enumerate Tauri v2 capabilities, security config, plugin config, and window definitions.
     Capabilities,
     /// `SQLite` database health diagnostics (journal mode, WAL, page stats).
     DbHealth,
-    /// Snapshot of Victauri's own managed state (event log, registry, recording, faults, etc.).
-    ManagedState,
-    /// Current process info (PID, uptime, thread count).
+    /// Snapshot of the Victauri plugin's internal state (event log, registry, recording, faults).
+    PluginState,
+    /// Enumerate the host process and its child processes (sidecars, background workers).
     Processes,
-    /// Report Victauri's spawned async tasks and their status.
-    Tasks,
-    /// Report the app's file system scope configuration from Tauri config.
-    FsScope,
-    /// List captured Tauri event bus events.
+    /// Report Victauri's own spawned async tasks (MCP server, event drain) and their status.
+    PluginTasks,
+    /// List captured Tauri event bus events (automatically intercepted).
     EventBus,
     /// Clear the event bus capture buffer.
     EventBusClear,

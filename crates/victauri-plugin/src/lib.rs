@@ -62,7 +62,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, AtomicU64};
 use tauri::plugin::{Builder, TauriPlugin};
-use tauri::{Manager, RunEvent, Runtime};
+use tauri::{Listener, Manager, RunEvent, Runtime};
 use tokio::sync::{Mutex, oneshot, watch};
 use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 
@@ -183,6 +183,7 @@ pub struct VictauriBuilder {
     on_ready: Option<Box<dyn FnOnce(u16) + Send + 'static>>,
     commands: Vec<victauri_core::CommandInfo>,
     allow_file_navigation: bool,
+    listen_events: Vec<String>,
 }
 
 impl Default for VictauriBuilder {
@@ -205,6 +206,7 @@ impl Default for VictauriBuilder {
             on_ready: None,
             commands: Vec::new(),
             allow_file_navigation: false,
+            listen_events: Vec::new(),
         }
     }
 }
@@ -447,6 +449,25 @@ impl VictauriBuilder {
         self
     }
 
+    /// Register custom Tauri event names to capture in the event bus.
+    ///
+    /// Window lifecycle events (focus, blur, close, resize, move, theme change) are
+    /// captured automatically. Use this for app-specific events emitted via `app.emit()`.
+    ///
+    /// ```rust,ignore
+    /// VictauriBuilder::new()
+    ///     .listen_events(&["notification-added", "settings-changed", "sync-complete"])
+    ///     .build()
+    /// ```
+    #[must_use]
+    pub fn listen_events(mut self, events: &[&str]) -> Self {
+        self.listen_events = events
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        self
+    }
+
     /// Allow `file:` URLs in the `navigate` tool's `go_to` action.
     ///
     /// By default, only `http` and `https` schemes are permitted. Calling this
@@ -582,6 +603,7 @@ impl VictauriBuilder {
             let allow_file_navigation = self.allow_file_navigation;
             let on_ready = self.on_ready;
             let commands = self.commands;
+            let listen_events = self.listen_events;
             let js_init = js_bridge::init_script(&self.bridge_capacities);
 
             Ok(Builder::new("victauri")
@@ -620,6 +642,29 @@ impl VictauriBuilder {
                         state.registry.register(cmd);
                     }
                     state.startup_timeline.mark("commands_registered");
+
+                    // Register listeners for custom event names specified via builder.
+                    for event_name in &listen_events {
+                        let bus = state.event_bus.clone();
+                        let name = event_name.clone();
+                        app.listen_any(event_name.clone(), move |event| {
+                            let payload =
+                                serde_json::from_str::<serde_json::Value>(event.payload())
+                                    .map_or_else(
+                                        |_| event.payload().to_string(),
+                                        |v| v.to_string(),
+                                    );
+                            bus.push(introspection::CapturedTauriEvent {
+                                name: name.clone(),
+                                payload,
+                                timestamp: chrono::Utc::now()
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            });
+                        });
+                    }
+                    state
+                        .startup_timeline
+                        .mark("event_bus_listeners_registered");
 
                     if let Some(ref token) = auth_token {
                         tracing::info!(
@@ -690,11 +735,36 @@ impl VictauriBuilder {
                     Ok(())
                 })
                 .on_event(|app, event| {
-                    if let RunEvent::Exit = event
-                        && let Some(state) = app.try_state::<Arc<VictauriState>>()
-                    {
-                        let _ = state.shutdown_tx.send(true);
-                        tracing::info!("Victauri shutdown signal sent");
+                    let Some(state) = app.try_state::<Arc<VictauriState>>() else {
+                        return;
+                    };
+                    match event {
+                        RunEvent::Exit => {
+                            let _ = state.shutdown_tx.send(true);
+                            tracing::info!("Victauri shutdown signal sent");
+                        }
+                        RunEvent::ExitRequested { .. } => {
+                            state.event_bus.push(introspection::CapturedTauriEvent {
+                                name: "tauri://exit-requested".to_string(),
+                                payload: String::new(),
+                                timestamp: chrono::Utc::now()
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            });
+                        }
+                        RunEvent::WindowEvent {
+                            label,
+                            event: win_event,
+                            ..
+                        } => {
+                            let (name, payload) = format_window_event(label, win_event);
+                            state.event_bus.push(introspection::CapturedTauriEvent {
+                                name,
+                                payload,
+                                timestamp: chrono::Utc::now()
+                                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            });
+                        }
+                        _ => {}
                     }
                 })
                 .js_init_script(js_init)
@@ -713,6 +783,41 @@ impl VictauriBuilder {
                 ])
                 .build())
         }
+    }
+}
+
+#[cfg(debug_assertions)]
+fn format_window_event(label: &str, event: &tauri::WindowEvent) -> (String, String) {
+    match event {
+        tauri::WindowEvent::Resized(size) => (
+            format!("window:{label}:resized"),
+            serde_json::json!({"width": size.width, "height": size.height}).to_string(),
+        ),
+        tauri::WindowEvent::Moved(pos) => (
+            format!("window:{label}:moved"),
+            serde_json::json!({"x": pos.x, "y": pos.y}).to_string(),
+        ),
+        tauri::WindowEvent::CloseRequested { .. } => {
+            (format!("window:{label}:close-requested"), String::new())
+        }
+        tauri::WindowEvent::Destroyed => (format!("window:{label}:destroyed"), String::new()),
+        tauri::WindowEvent::Focused(focused) => (
+            format!("window:{label}:focused"),
+            serde_json::json!({"focused": focused}).to_string(),
+        ),
+        tauri::WindowEvent::ScaleFactorChanged { scale_factor, .. } => (
+            format!("window:{label}:scale-factor-changed"),
+            serde_json::json!({"scale_factor": scale_factor}).to_string(),
+        ),
+        tauri::WindowEvent::ThemeChanged(theme) => (
+            format!("window:{label}:theme-changed"),
+            serde_json::json!({"theme": format!("{theme:?}")}).to_string(),
+        ),
+        tauri::WindowEvent::DragDrop(drag_event) => (
+            format!("window:{label}:drag-drop"),
+            format!("{drag_event:?}"),
+        ),
+        _ => (format!("window:{label}:other"), format!("{event:?}")),
     }
 }
 
