@@ -15,6 +15,7 @@ Victauri is configured via the `VictauriBuilder` API in Rust code and/or environ
 | Console log cap | `.console_log_capacity(1000)` | — | 1,000 |
 | Network log cap | `.network_log_capacity(1000)` | — | 1,000 |
 | Navigation log cap | `.navigation_log_capacity(200)` | — | 200 |
+| Event bus capture | `.listen_events(&[...])` | — | Window events only |
 
 ## VictauriBuilder API
 
@@ -168,6 +169,18 @@ VictauriBuilder::new()
     .build()
 ```
 
+### Event Bus Capture
+
+Window lifecycle events (resize, move, focus, close, theme change, drag-drop) are captured automatically. To also capture app-specific events emitted via `app.emit()`:
+
+```rust
+VictauriBuilder::new()
+    .listen_events(&["notification-added", "settings-changed", "sync-complete"])
+    .build()
+```
+
+All captured events appear in `introspect.event_bus`.
+
 ### File Navigation
 
 By default, the `navigate` tool only allows `http://` and `https://` URLs. To allow `file://` URLs:
@@ -254,6 +267,8 @@ tauri::Builder::default()
             // Commands
             .register_command(greet__schema())
             .register_command(increment__schema())
+            // Event bus
+            .listen_events(&["app-event", "sync-complete"])
             // Callback
             .on_ready(|port| println!("MCP server on :{}", port))
             .build(),

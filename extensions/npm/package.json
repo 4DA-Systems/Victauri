@@ -1,6 +1,6 @@
 {
   "name": "victauri-browser",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Native messaging host for the Victauri Chrome/Firefox extension — MCP bridge for any website",
   "bin": {
     "victauri-browser": "./bin/victauri-browser.js"

@@ -170,6 +170,6 @@ Result: 2 violations
 - `inspect` — get_styles, get_bounding_boxes, highlight, clear_highlights, audit_accessibility, get_performance
 - `css` — inject, remove
 - `logs` — console, network, ipc, navigation, dialogs, events, slow_ipc
-- `introspect` — command_timings, coverage, contract_record, contract_check, contract_list, contract_clear, startup_timing, capabilities, db_health, managed_state, processes, tasks, fs_scope, event_bus, event_bus_clear
+- `introspect` — command_timings, coverage, contract_record, contract_check, contract_list, contract_clear, startup_timing, capabilities, db_health, plugin_state, processes, plugin_tasks, event_bus, event_bus_clear
 - `fault` — inject, list, clear, clear_all
 - `explain` — summary, last_action, diff

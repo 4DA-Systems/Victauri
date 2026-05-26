@@ -487,7 +487,7 @@ These tools exploit Victauri's position inside the Rust process to provide insig
 
 ### introspect
 
-Deep backend introspection — command performance profiling, IPC contract testing, coverage analysis, startup timing, capability auditing, and database diagnostics.
+Deep backend introspection — command performance profiling, IPC contract testing, coverage analysis, startup timing, capability auditing, process enumeration, and event bus monitoring.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
@@ -497,14 +497,13 @@ Deep backend introspection — command performance profiling, IPC contract testi
 | `contract_check` | — | Check all recorded contracts for schema drift |
 | `contract_list` | — | List all recorded contract baselines |
 | `contract_clear` | — | Clear all recorded contract baselines |
-| `startup_timing` | — | Plugin initialization phase-by-phase timing breakdown |
-| `capabilities` | — | Audit Tauri v2 permissions and capabilities |
+| `startup_timing` | — | Victauri plugin initialization phase-by-phase timing breakdown |
+| `capabilities` | — | Tauri v2 capabilities, security config (CSP, freeze_prototype), plugins, and window definitions |
 | `db_health` | `db_path` | `SQLite` database diagnostics (journal mode, WAL, page stats) |
-| `managed_state` | — | Full internal plugin state: event counts, registry, recording, faults, tasks, uptime |
-| `processes` | — | Process info: PID, uptime, platform, arch, debug build status |
-| `tasks` | — | Tracked async tasks with active/finished counts |
-| `fs_scope` | — | App directory paths (data, config, log, local_data) with Tauri config |
-| `event_bus` | — | Combined Tauri event bus + app events from EventLog |
+| `plugin_state` | — | Victauri plugin internal state: event counts, registry, recording, faults, timings, uptime |
+| `processes` | — | Host process + child processes (sidecars, background workers) with PID, name, and memory |
+| `plugin_tasks` | — | Victauri's spawned async tasks (MCP server, event drain) with active/finished counts |
+| `event_bus` | — | All captured Tauri events (automatically intercepted) + app events from EventLog |
 | `event_bus_clear` | — | Clear both event bus and event log |
 
 **Examples:**
@@ -516,10 +515,9 @@ Deep backend introspection — command performance profiling, IPC contract testi
 {"action": "startup_timing"}
 {"action": "capabilities"}
 {"action": "db_health"}
-{"action": "managed_state"}
+{"action": "plugin_state"}
 {"action": "processes"}
-{"action": "tasks"}
-{"action": "fs_scope"}
+{"action": "plugin_tasks"}
 {"action": "event_bus"}
 ```
 

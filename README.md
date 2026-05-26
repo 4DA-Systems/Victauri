@@ -264,7 +264,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | **`inspect`** | `styles`, `bounds`, `highlight`, `audit_accessibility`, `get_performance` |
 | **`logs`** | `console`, `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc` |
 | **`css`** | `inject`, `remove` |
-| **`introspect`** | `command_timings`, `coverage`, `contract_record`, `contract_check`, `startup_timing`, `capabilities`, `db_health`, `managed_state`, `processes`, `tasks`, `fs_scope`, `event_bus` |
+| **`introspect`** | `command_timings`, `coverage`, `contract_record`, `contract_check`, `startup_timing`, `capabilities`, `db_health`, `plugin_state`, `processes`, `plugin_tasks`, `event_bus` |
 | **`fault`** | `inject` (delay/error/drop/corrupt), `list`, `clear`, `clear_all` |
 | **`explain`** | `summary`, `last_action`, `diff` |
 | `get_plugin_info` | Plugin config: port, tools, privacy, version |

@@ -1,12 +1,42 @@
 # Migration Guide
 
+## v0.5.0 → v0.5.1
+
+### Introspect Action Renames
+
+Three actions renamed for clarity:
+
+| Old Name | New Name | Reason |
+|----------|----------|--------|
+| `managed_state` | `plugin_state` | Distinguishes Victauri's own state from app state |
+| `tasks` | `plugin_tasks` | Distinguishes Victauri's async tasks from app tasks |
+| `fs_scope` | *(removed)* | Redundant with `app_info` tool |
+
+### Enhanced Actions
+
+- **`capabilities`** now returns structured security config (CSP, `freeze_prototype`), configured plugins, window definitions, and privacy profile
+- **`processes`** now enumerates child processes (sidecars, background workers) with PID, name, and memory usage
+- **`event_bus`** events are now captured automatically — apps no longer need to manually push events
+
+### New Builder Method
+
+```rust
+VictauriBuilder::new()
+    .listen_events(&["notification-added", "settings-changed"])
+    .build()
+```
+
+Window lifecycle events (resize, move, focus, close, theme, drag-drop) are captured automatically without `listen_events`.
+
+---
+
 ## v0.4.x → v0.5.0
 
 ### New Tools
 
 Three new compound tools added — no breaking changes, purely additive.
 
-**`introspect`** — 15 actions for deep backend introspection:
+**`introspect`** — 13 actions for deep backend introspection:
 
 ```json
 {"action": "command_timings", "slow_threshold_ms": 100}
@@ -16,10 +46,9 @@ Three new compound tools added — no breaking changes, purely additive.
 {"action": "startup_timing"}
 {"action": "capabilities"}
 {"action": "db_health"}
-{"action": "managed_state"}
+{"action": "plugin_state"}
 {"action": "processes"}
-{"action": "tasks"}
-{"action": "fs_scope"}
+{"action": "plugin_tasks"}
 {"action": "event_bus"}
 ```
 

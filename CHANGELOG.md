@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-26
+
+### Changed
+
+- **BREAKING (introspect tool):** `managed_state` action renamed to `plugin_state` for clarity
+- **BREAKING (introspect tool):** `tasks` action renamed to `plugin_tasks` to distinguish from app tasks
+- **victauri-plugin**: `introspect.capabilities` now returns structured security config (CSP, `freeze_prototype`), configured plugins, window definitions, and privacy profile — previously returned only basic config
+- **victauri-plugin**: `introspect.processes` now enumerates child processes (sidecars, background workers) with PID, name, and memory usage — previously returned only the host process info
+- **victauri-plugin**: `introspect.event_bus` events are now captured automatically via `listen_any` — apps no longer need to manually push events
+
+### Added
+
+- **victauri-plugin**: `VictauriBuilder::listen_events(&["event-name", ...])` — register custom Tauri event names to capture in the event bus (window lifecycle events are captured automatically)
+- **victauri-plugin**: Automatic window lifecycle event capture — resize, move, focus, close, theme change, drag-drop events are pushed to `EventBusMonitor` without app opt-in
+- **victauri-plugin**: `enumerate_child_processes()` with platform-native APIs: Windows `CreateToolhelp32Snapshot`, Linux `/proc`, macOS `proc_listchildpids`
+- **victauri-plugin**: `tauri_config()` now exposes window definitions, plugin list, and security configuration (capabilities, CSP)
+
+### Removed
+
+- **victauri-plugin**: `introspect.fs_scope` action removed (redundant with `app_info` tool which already provides directory paths)
+
+### Fixed
+
+- Chrome/Firefox extension popup version display updated from v0.1.0 to v0.5.0
+- VS Code extension `package-lock.json` version synced to 0.5.0
+- Social preview SVG tool count updated from 28 to 31
+- VS Code `esbuild` bumped to ^0.25.0 (resolves moderate security advisory GHSA-67mh-4wv8-2f99)
+- npm audit now reports 0 vulnerabilities across all JS packages
+
 ## [0.5.0] - 2026-05-26
 
 ### Added
@@ -257,7 +286,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/runyourempire/victauri/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/runyourempire/victauri/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/runyourempire/victauri/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/runyourempire/victauri/compare/v0.2.0...v0.3.0
