@@ -167,7 +167,11 @@ pub async fn start_server_with_options<R: Runtime>(
     let drain_state = state.clone();
     let drain_bridge = bridge;
     let drain_shutdown = state.shutdown_tx.subscribe();
-    tokio::spawn(event_drain_loop(drain_state, drain_bridge, drain_shutdown));
+    let drain_finished = state.task_tracker.track("event_drain_loop");
+    tokio::spawn(async move {
+        event_drain_loop(drain_state, drain_bridge, drain_shutdown).await;
+        drain_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
 
     let mut shutdown_rx2 = shutdown_rx.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {

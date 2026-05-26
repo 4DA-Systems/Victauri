@@ -406,6 +406,8 @@ pub enum RecordingAction {
     Export,
     /// Import a previously exported session.
     Import,
+    /// Replay recorded IPC commands and compare responses to baseline.
+    Replay,
 }
 
 impl fmt::Display for RecordingAction {
@@ -420,6 +422,7 @@ impl fmt::Display for RecordingAction {
             Self::GetReplay => f.write_str("get_replay"),
             Self::Export => f.write_str("export"),
             Self::Import => f.write_str("import"),
+            Self::Replay => f.write_str("replay"),
         }
     }
 }
@@ -445,6 +448,8 @@ pub struct RecordingParams {
     pub since_index: Option<usize>,
     /// JSON string of a previously exported `RecordedSession` (for import).
     pub session_json: Option<String>,
+    /// Target webview label (for replay).
+    pub webview_label: Option<String>,
 }
 
 // ── inspect ─────────────────────────────────────────────────────────────────

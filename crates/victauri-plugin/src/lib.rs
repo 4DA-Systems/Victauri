@@ -148,6 +148,10 @@ pub struct VictauriState {
     pub contract_store: introspection::ContractStore,
     /// Plugin startup phase timestamps for performance analysis.
     pub startup_timeline: introspection::StartupTimeline,
+    /// Captured Tauri event bus events (from `listen_any`).
+    pub event_bus: introspection::EventBusMonitor,
+    /// Tracker for Victauri's own spawned async tasks.
+    pub task_tracker: introspection::TaskTracker,
 }
 
 /// Builder for configuring the Victauri plugin before adding it to a Tauri app.
@@ -605,6 +609,8 @@ impl VictauriBuilder {
                         fault_registry: introspection::FaultRegistry::new(),
                         contract_store: introspection::ContractStore::new(),
                         startup_timeline,
+                        event_bus: introspection::EventBusMonitor::default(),
+                        task_tracker: introspection::TaskTracker::new(),
                     });
                     state.startup_timeline.mark("state_created");
 
@@ -630,6 +636,7 @@ impl VictauriBuilder {
                     state.startup_timeline.mark("server_spawning");
                     let app_handle = app.clone();
                     let ready_state = state.clone();
+                    let server_finished = state.task_tracker.track("mcp_server");
                     tauri::async_runtime::spawn(async move {
                         match mcp::start_server_with_options(
                             app_handle,
@@ -647,9 +654,11 @@ impl VictauriBuilder {
                                 tracing::error!("Victauri MCP server failed: {e}");
                             }
                         }
+                        server_finished.store(true, std::sync::atomic::Ordering::Relaxed);
                     });
 
                     if let Some(cb) = on_ready {
+                        let ready_finished = ready_state.task_tracker.track("on_ready_probe");
                         tauri::async_runtime::spawn(async move {
                             for _ in 0..50 {
                                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -662,6 +671,8 @@ impl VictauriBuilder {
                                 .is_ok()
                                 {
                                     cb(actual_port);
+                                    ready_finished
+                                        .store(true, std::sync::atomic::Ordering::Relaxed);
                                     return;
                                 }
                             }
@@ -671,6 +682,7 @@ impl VictauriBuilder {
                                 "Victauri on_ready: server did not become ready within 5s"
                             );
                             cb(actual_port);
+                            ready_finished.store(true, std::sync::atomic::Ordering::Relaxed);
                         });
                     }
 

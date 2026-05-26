@@ -137,6 +137,8 @@ fn make_state_with_privacy(privacy: PrivacyConfig) -> Arc<VictauriState> {
         fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
         contract_store: victauri_plugin::introspection::ContractStore::new(),
         startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
+        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
+        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
     })
 }
 
@@ -351,6 +353,7 @@ async fn rest_list_tools_returns_all_24() {
         "logs",
         "introspect",
         "fault",
+        "explain",
     ];
     for tool in &expected_tools {
         assert!(

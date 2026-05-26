@@ -4,8 +4,9 @@
 //! the plugin's position inside the Rust process to provide insights and control
 //! that browser-external tools like CDP cannot access.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -599,9 +600,243 @@ impl Default for StartupTimeline {
     }
 }
 
+// ── Tauri Event Bus Monitor ─────────────────────────────────────────────
+
+/// A Tauri event captured from the application's native event bus.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapturedTauriEvent {
+    /// Event name (e.g. "notification-added", `tauri://focus`).
+    pub name: String,
+    /// Serialized event payload.
+    pub payload: String,
+    /// ISO 8601 timestamp.
+    pub timestamp: String,
+}
+
+const DEFAULT_EVENT_BUS_CAPACITY: usize = 1000;
+
+/// Thread-safe ring buffer for captured Tauri events.
+#[derive(Clone)]
+pub struct EventBusMonitor {
+    inner: std::sync::Arc<RwLock<VecDeque<CapturedTauriEvent>>>,
+    capacity: usize,
+}
+
+impl EventBusMonitor {
+    /// Create a new monitor with the given capacity.
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Arc::new(RwLock::new(VecDeque::with_capacity(capacity))),
+            capacity,
+        }
+    }
+
+    /// Record a captured event.
+    pub fn push(&self, event: CapturedTauriEvent) {
+        let mut buf = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if buf.len() >= self.capacity {
+            buf.pop_front();
+        }
+        buf.push_back(event);
+    }
+
+    /// Get all captured events.
+    #[must_use]
+    pub fn events(&self) -> Vec<CapturedTauriEvent> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Get the number of captured events.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Returns true if no events have been captured.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clear all captured events, returning how many were removed.
+    pub fn clear(&self) -> usize {
+        let mut buf = self
+            .inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = buf.len();
+        buf.clear();
+        count
+    }
+}
+
+impl Default for EventBusMonitor {
+    fn default() -> Self {
+        Self::new(DEFAULT_EVENT_BUS_CAPACITY)
+    }
+}
+
+// ── Internal Task Tracker ──────────────────────────────────────────────
+
+/// Info about a tracked async task spawned by Victauri.
+#[derive(Debug, Clone, Serialize)]
+pub struct TrackedTaskInfo {
+    /// Human-readable task name.
+    pub name: String,
+    /// ISO 8601 timestamp when the task was spawned.
+    pub spawned_at: String,
+    /// Whether the task has finished (completed or errored).
+    pub is_finished: bool,
+    /// How long the task has been running in seconds.
+    pub uptime_secs: u64,
+}
+
+struct TrackedTaskEntry {
+    name: String,
+    spawned_at: Instant,
+    spawned_at_wall: String,
+    finished: std::sync::Arc<AtomicBool>,
+}
+
+/// Tracks Victauri's own spawned async tasks for observability.
+pub struct TaskTracker {
+    tasks: RwLock<Vec<TrackedTaskEntry>>,
+}
+
+impl TaskTracker {
+    /// Create a new empty tracker.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            tasks: RwLock::new(Vec::new()),
+        }
+    }
+
+    /// Register a new task. Returns a flag that the task should set to `true` when it finishes.
+    pub fn track(&self, name: &str) -> std::sync::Arc<AtomicBool> {
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let entry = TrackedTaskEntry {
+            name: name.to_string(),
+            spawned_at: Instant::now(),
+            spawned_at_wall: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            finished: finished.clone(),
+        };
+        self.tasks
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(entry);
+        finished
+    }
+
+    /// List all tracked tasks with their current status.
+    #[must_use]
+    pub fn list(&self) -> Vec<TrackedTaskInfo> {
+        let tasks = self
+            .tasks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks
+            .iter()
+            .map(|t| TrackedTaskInfo {
+                name: t.name.clone(),
+                spawned_at: t.spawned_at_wall.clone(),
+                is_finished: t.finished.load(std::sync::atomic::Ordering::Relaxed),
+                uptime_secs: t.spawned_at.elapsed().as_secs(),
+            })
+            .collect()
+    }
+
+    /// Count of active (non-finished) tasks.
+    #[must_use]
+    pub fn active_count(&self) -> usize {
+        let tasks = self
+            .tasks
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks
+            .iter()
+            .filter(|t| !t.finished.load(std::sync::atomic::Ordering::Relaxed))
+            .count()
+    }
+}
+
+impl Default for TaskTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_bus_push_and_read() {
+        let bus = EventBusMonitor::new(3);
+        assert!(bus.is_empty());
+        bus.push(CapturedTauriEvent {
+            name: "test".to_string(),
+            payload: "{}".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+        });
+        assert_eq!(bus.len(), 1);
+        assert_eq!(bus.events()[0].name, "test");
+    }
+
+    #[test]
+    fn event_bus_ring_buffer_eviction() {
+        let bus = EventBusMonitor::new(2);
+        for i in 0..5 {
+            bus.push(CapturedTauriEvent {
+                name: format!("event_{i}"),
+                payload: String::new(),
+                timestamp: String::new(),
+            });
+        }
+        assert_eq!(bus.len(), 2);
+        assert_eq!(bus.events()[0].name, "event_3");
+        assert_eq!(bus.events()[1].name, "event_4");
+    }
+
+    #[test]
+    fn event_bus_clear() {
+        let bus = EventBusMonitor::new(10);
+        bus.push(CapturedTauriEvent {
+            name: "a".to_string(),
+            payload: String::new(),
+            timestamp: String::new(),
+        });
+        assert_eq!(bus.clear(), 1);
+        assert!(bus.is_empty());
+    }
+
+    #[test]
+    fn task_tracker_lifecycle() {
+        let tracker = TaskTracker::new();
+        let flag = tracker.track("mcp_server");
+        let tasks = tracker.list();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].name, "mcp_server");
+        assert!(!tasks[0].is_finished);
+        assert_eq!(tracker.active_count(), 1);
+
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let tasks = tracker.list();
+        assert!(tasks[0].is_finished);
+        assert_eq!(tracker.active_count(), 0);
+    }
 
     #[test]
     fn timing_samples_basic() {

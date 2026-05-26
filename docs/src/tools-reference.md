@@ -1,6 +1,6 @@
 # Tools Reference
 
-Victauri exposes 30 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
+Victauri exposes 31 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
 
 All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
 
@@ -403,12 +403,14 @@ Time-travel recording for session capture and replay.
 | `events` | `since`, `limit` | Get recorded events |
 | `export` | — | Export full session data |
 | `import` | `session` | Import a session for replay |
+| `replay` | `webview_label` | Re-execute recorded IPC commands and report pass/fail per command |
 
 **Example:**
 ```json
 {"action": "start"}
 {"action": "checkpoint", "label": "after-login"}
 {"action": "stop"}
+{"action": "replay"}
 ```
 
 ---
@@ -498,6 +500,12 @@ Deep backend introspection — command performance profiling, IPC contract testi
 | `startup_timing` | — | Plugin initialization phase-by-phase timing breakdown |
 | `capabilities` | — | Audit Tauri v2 permissions and capabilities |
 | `db_health` | `db_path` | `SQLite` database diagnostics (journal mode, WAL, page stats) |
+| `managed_state` | — | Full internal plugin state: event counts, registry, recording, faults, tasks, uptime |
+| `processes` | — | Process info: PID, uptime, platform, arch, debug build status |
+| `tasks` | — | Tracked async tasks with active/finished counts |
+| `fs_scope` | — | App directory paths (data, config, log, local_data) with Tauri config |
+| `event_bus` | — | Combined Tauri event bus + app events from EventLog |
+| `event_bus_clear` | — | Clear both event bus and event log |
 
 **Examples:**
 ```json
@@ -508,6 +516,11 @@ Deep backend introspection — command performance profiling, IPC contract testi
 {"action": "startup_timing"}
 {"action": "capabilities"}
 {"action": "db_health"}
+{"action": "managed_state"}
+{"action": "processes"}
+{"action": "tasks"}
+{"action": "fs_scope"}
+{"action": "event_bus"}
 ```
 
 ---
@@ -532,4 +545,31 @@ Inject faults into Tauri IPC commands at the Rust layer for chaos engineering. C
 {"action": "inject", "command": "fetch_feed", "fault_type": "drop", "max_triggers": 3}
 {"action": "list"}
 {"action": "clear_all"}
+```
+
+---
+
+### explain
+
+Natural-language narration of what happened in the app. Aggregates events from the EventLog over a time window and produces human-readable summaries, causal chains, or diffs.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `summary` | `seconds` | Aggregate events over N seconds (default: 30) into a narrative with type counts |
+| `last_action` | `seconds` | Map recent events to a causal chain with " → " separators (default: 5s) |
+| `diff` | `seconds` | Count IPC calls, DOM changes, errors, and interactions over N seconds (default: 10) |
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `action` | string | yes | One of: `summary`, `last_action`, `diff` |
+| `seconds` | integer | no | How many seconds to look back |
+| `webview_label` | string | no | Target webview window |
+
+**Examples:**
+```json
+{"action": "summary"}
+{"action": "summary", "seconds": 60}
+{"action": "last_action"}
+{"action": "diff", "seconds": 15}
 ```

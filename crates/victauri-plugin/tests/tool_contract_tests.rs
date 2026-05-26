@@ -133,6 +133,8 @@ fn test_state() -> Arc<VictauriState> {
         fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
         contract_store: victauri_plugin::introspection::ContractStore::new(),
         startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
+        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
+        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
     })
 }
 
@@ -153,6 +155,8 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
         fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
         contract_store: victauri_plugin::introspection::ContractStore::new(),
         startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
+        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
+        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
     })
 }
 

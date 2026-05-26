@@ -9,7 +9,7 @@ mod verification_params;
 mod webview_params;
 mod window_params;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1385,7 +1385,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load session from JSON).",
+        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load session from JSON), replay (re-execute recorded IPC commands and compare responses).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1497,6 +1497,53 @@ impl VictauriMcpHandler {
                 });
                 self.state.recorder.import(session);
                 CallToolResult::success(vec![Content::text(result.to_string())])
+            }
+            RecordingAction::Replay => {
+                let calls = self.state.recorder.ipc_replay_sequence();
+                if calls.is_empty() {
+                    return tool_error("no IPC calls recorded — record a session first");
+                }
+                let mut replay_results = Vec::new();
+                for call in &calls {
+                    let code = format!(
+                        "return window.__TAURI_INTERNALS__.invoke({})",
+                        js_string(&call.command)
+                    );
+                    let outcome = match self
+                        .eval_with_return(&code, params.webview_label.as_deref())
+                        .await
+                    {
+                        Ok(result_str) => {
+                            let value: serde_json::Value = serde_json::from_str(&result_str)
+                                .unwrap_or(serde_json::Value::String(result_str));
+                            let shape = crate::introspection::JsonShape::from_value(&value);
+                            serde_json::json!({
+                                "command": call.command,
+                                "status": "ok",
+                                "response_type": shape.type_name(),
+                            })
+                        }
+                        Err(e) => {
+                            serde_json::json!({
+                                "command": call.command,
+                                "status": "error",
+                                "error": e,
+                            })
+                        }
+                    };
+                    replay_results.push(outcome);
+                }
+                let passed = replay_results
+                    .iter()
+                    .filter(|r| r.get("status").and_then(|s| s.as_str()) == Some("ok"))
+                    .count();
+                let result = serde_json::json!({
+                    "replayed": replay_results.len(),
+                    "passed": passed,
+                    "failed": replay_results.len() - passed,
+                    "results": replay_results,
+                });
+                json_result(&result)
             }
         }
     }
@@ -1740,10 +1787,10 @@ impl VictauriMcpHandler {
     // ── Backend Introspection ────────────────────────────────────────────────
 
     #[tool(
-        description = "Deep backend introspection — command performance profiling, IPC contract testing, \
-            coverage analysis, startup timing, capability auditing, and database diagnostics. \
-            These features exploit Victauri's position inside the Rust process to provide insights \
-            that browser-external tools like CDP cannot access.\n\n\
+        description = "Deep backend introspection — command profiling, IPC contract testing, \
+            coverage, startup timing, capability auditing, database diagnostics, managed state, \
+            process info, task tracking, file system scope, and event bus monitoring. \
+            These features exploit Victauri's position inside the Rust process.\n\n\
             Actions:\n\
             - `command_timings`: Per-command execution timing stats (min/max/avg/p95). Set `slow_threshold_ms` to filter.\n\
             - `coverage`: Which registered commands have been called during this session.\n\
@@ -1752,8 +1799,14 @@ impl VictauriMcpHandler {
             - `contract_list`: List all recorded contract baselines.\n\
             - `contract_clear`: Clear all recorded contract baselines.\n\
             - `startup_timing`: Plugin initialization phase-by-phase timing breakdown.\n\
-            - `capabilities`: Audit Tauri v2 permissions and capabilities granted to this app.\n\
-            - `db_health`: SQLite database diagnostics (journal mode, WAL status, page stats).",
+            - `capabilities`: Audit Tauri v2 permissions and capabilities.\n\
+            - `db_health`: SQLite database diagnostics (journal mode, WAL, page stats).\n\
+            - `managed_state`: Snapshot of Victauri's internal state (event log, registry, faults, recording, etc.).\n\
+            - `processes`: Current process PID, uptime, platform, and Tauri config.\n\
+            - `tasks`: List Victauri's spawned async tasks (MCP server, event drain) with status.\n\
+            - `fs_scope`: App directory paths and file system scope configuration.\n\
+            - `event_bus`: List captured Tauri event bus events (from listen_any).\n\
+            - `event_bus_clear`: Clear the event bus capture buffer.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1986,6 +2039,125 @@ impl VictauriMcpHandler {
                     tool_error("SQLite support not compiled in — enable the `sqlite` feature")
                 }
             }
+            IntrospectAction::ManagedState => {
+                let recording_active = self.state.recorder.is_recording();
+                let recording_events = self.state.recorder.event_count();
+                let result = serde_json::json!({
+                    "event_log": {
+                        "size": self.state.event_log.len(),
+                        "capacity": self.state.event_log.capacity(),
+                    },
+                    "registry": {
+                        "commands_registered": self.state.registry.list().len(),
+                    },
+                    "recording": {
+                        "active": recording_active,
+                        "events_captured": recording_events,
+                    },
+                    "faults": {
+                        "active_rules": self.state.fault_registry.list().len(),
+                    },
+                    "contracts": {
+                        "baselines_recorded": self.state.contract_store.all().len(),
+                    },
+                    "timings": {
+                        "commands_profiled": self.state.command_timings.all_stats().len(),
+                    },
+                    "event_bus": {
+                        "captured_events": self.state.event_bus.len(),
+                    },
+                    "tasks": {
+                        "total": self.state.task_tracker.list().len(),
+                        "active": self.state.task_tracker.active_count(),
+                    },
+                    "tool_invocations": self.state.tool_invocations.load(Ordering::Relaxed),
+                    "uptime_secs": self.state.started_at.elapsed().as_secs(),
+                    "port": self.state.port.load(std::sync::atomic::Ordering::Relaxed),
+                });
+                json_result(&result)
+            }
+            IntrospectAction::Processes => {
+                let pid = std::process::id();
+                let uptime = self.state.started_at.elapsed();
+                let config = self.bridge.tauri_config();
+                let result = serde_json::json!({
+                    "pid": pid,
+                    "uptime_secs": uptime.as_secs(),
+                    "platform": std::env::consts::OS,
+                    "arch": std::env::consts::ARCH,
+                    "tauri_config": config,
+                    "debug_build": cfg!(debug_assertions),
+                });
+                json_result(&result)
+            }
+            IntrospectAction::Tasks => {
+                let tasks = self.state.task_tracker.list();
+                let active = self.state.task_tracker.active_count();
+                let result = serde_json::json!({
+                    "total": tasks.len(),
+                    "active": active,
+                    "finished": tasks.len() - active,
+                    "tasks": tasks,
+                });
+                json_result(&result)
+            }
+            IntrospectAction::FsScope => {
+                let config = self.bridge.tauri_config();
+
+                let data_dir = self
+                    .bridge
+                    .app_data_dir()
+                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
+                let config_dir = self
+                    .bridge
+                    .app_config_dir()
+                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
+                let log_dir = self
+                    .bridge
+                    .app_log_dir()
+                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
+                let local_data_dir = self
+                    .bridge
+                    .app_local_data_dir()
+                    .map_or_else(|_| "unavailable".to_string(), |p| p.display().to_string());
+
+                let result = serde_json::json!({
+                    "tauri_config": config,
+                    "app_directories": {
+                        "data": data_dir,
+                        "config": config_dir,
+                        "log": log_dir,
+                        "local_data": local_data_dir,
+                    },
+                    "note": "File system scope is enforced by Tauri capabilities. Check the app's capabilities JSON for fs:scope permissions."
+                });
+                json_result(&result)
+            }
+            IntrospectAction::EventBus => {
+                let tauri_events = self.state.event_bus.events();
+                let app_events = self.state.event_log.snapshot();
+                let result = serde_json::json!({
+                    "tauri_events": {
+                        "count": tauri_events.len(),
+                        "events": tauri_events,
+                        "note": "Captured via app.listen_any() — apps must opt in by calling state.event_bus.push()"
+                    },
+                    "app_events": {
+                        "count": app_events.len(),
+                        "capacity": self.state.event_log.capacity(),
+                        "events": app_events,
+                    },
+                });
+                json_result(&result)
+            }
+            IntrospectAction::EventBusClear => {
+                let tauri_cleared = self.state.event_bus.clear();
+                self.state.event_log.clear();
+                json_result(&serde_json::json!({
+                    "tauri_events_cleared": tauri_cleared,
+                    "app_events_cleared": true,
+                }))
+            }
         }
     }
 
@@ -2079,6 +2251,274 @@ impl VictauriMcpHandler {
                 json_result(&serde_json::json!({
                     "removed": removed,
                 }))
+            }
+        }
+    }
+
+    // ── Cross-Layer Explanation ────────────────────────────────────────────
+
+    #[tool(
+        description = "Correlate recent activity across all layers into a coherent narrative. \
+            CDP shows raw events per layer; Victauri correlates IPC + DOM + console + network \
+            + window events across the Rust backend and webview simultaneously.\n\n\
+            Actions:\n\
+            - `summary`: High-level activity summary for the last N seconds (default 30). \
+              Counts IPC calls, DOM mutations, console entries, network requests, errors.\n\
+            - `last_action`: Correlate the most recent burst of events into a causal timeline \
+              (e.g. 'IPC call → DOM update → console.log').\n\
+            - `diff`: What changed in the last N seconds — event counts, errors, new IPC commands.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn explain(&self, Parameters(params): Parameters<ExplainParams>) -> CallToolResult {
+        self.track_tool_call();
+        if !self.state.privacy.is_tool_enabled("explain") {
+            return tool_disabled("explain");
+        }
+
+        match params.action {
+            ExplainAction::Summary => {
+                let secs = params.seconds.unwrap_or(30);
+                let since = chrono::Utc::now()
+                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let events = self.state.event_log.since(since);
+
+                let mut ipc_count = 0u64;
+                let mut dom_mutations = 0u64;
+                let mut state_changes = 0u64;
+                let mut window_events = 0u64;
+                let mut interactions = 0u64;
+                let mut top_commands: HashMap<String, u64> = HashMap::new();
+                let mut errors: Vec<String> = Vec::new();
+
+                for event in &events {
+                    match event {
+                        victauri_core::AppEvent::Ipc(call) => {
+                            ipc_count += 1;
+                            *top_commands.entry(call.command.clone()).or_insert(0) += 1;
+                            if let victauri_core::IpcResult::Err(e) = &call.result {
+                                errors.push(format!("IPC {}: {e}", call.command));
+                            }
+                        }
+                        victauri_core::AppEvent::DomMutation { mutation_count, .. } => {
+                            dom_mutations += u64::from(*mutation_count)
+                        }
+                        victauri_core::AppEvent::StateChange { .. } => state_changes += 1,
+                        victauri_core::AppEvent::WindowEvent { .. } => window_events += 1,
+                        victauri_core::AppEvent::DomInteraction { .. } => interactions += 1,
+                        _ => {}
+                    }
+                }
+
+                let mut sorted_cmds: Vec<_> = top_commands.into_iter().collect();
+                sorted_cmds.sort_by_key(|b| std::cmp::Reverse(b.1));
+                let top: Vec<_> = sorted_cmds.iter().take(5).collect();
+
+                let narrative = format!(
+                    "{ipc_count} IPC call{} in the last {secs}s{}. \
+                     {dom_mutations} DOM mutation{}, {interactions} interaction{}, \
+                     {window_events} window event{}. {}.",
+                    if ipc_count == 1 { "" } else { "s" },
+                    if top.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            ", dominated by {}",
+                            top.iter()
+                                .map(|(cmd, n)| format!("{cmd} ({n}x)"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                    if dom_mutations == 1 { "" } else { "s" },
+                    if interactions == 1 { "" } else { "s" },
+                    if window_events == 1 { "" } else { "s" },
+                    if errors.is_empty() {
+                        "No errors".to_string()
+                    } else {
+                        format!(
+                            "{} error{}",
+                            errors.len(),
+                            if errors.len() == 1 { "" } else { "s" }
+                        )
+                    },
+                );
+
+                let result = serde_json::json!({
+                    "time_window_secs": secs,
+                    "total_events": events.len(),
+                    "ipc_calls": ipc_count,
+                    "dom_mutations": dom_mutations,
+                    "state_changes": state_changes,
+                    "window_events": window_events,
+                    "interactions": interactions,
+                    "top_commands": sorted_cmds.iter().take(5).map(|(cmd, n)| {
+                        serde_json::json!({"command": cmd, "count": n})
+                    }).collect::<Vec<_>>(),
+                    "errors": errors,
+                    "narrative": narrative,
+                });
+                json_result(&result)
+            }
+            ExplainAction::LastAction => {
+                let secs = params.seconds.unwrap_or(5);
+                let since = chrono::Utc::now()
+                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let events = self.state.event_log.since(since);
+
+                let timeline: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|event| match event {
+                        victauri_core::AppEvent::Ipc(call) => {
+                            serde_json::json!({
+                                "time": call.timestamp.to_rfc3339_opts(
+                                    chrono::SecondsFormat::Millis, true
+                                ),
+                                "type": "ipc",
+                                "detail": format!(
+                                    "{} {} ({}ms)",
+                                    call.command,
+                                    call.result,
+                                    call.duration_ms.unwrap_or(0)
+                                ),
+                            })
+                        }
+                        victauri_core::AppEvent::DomMutation {
+                            timestamp,
+                            mutation_count,
+                            webview_label,
+                        } => {
+                            serde_json::json!({
+                                "time": timestamp.to_rfc3339_opts(
+                                    chrono::SecondsFormat::Millis, true
+                                ),
+                                "type": "dom_mutation",
+                                "detail": format!(
+                                    "{mutation_count} element{} updated in {webview_label}",
+                                    if *mutation_count == 1 { "" } else { "s" }
+                                ),
+                            })
+                        }
+                        victauri_core::AppEvent::DomInteraction {
+                            timestamp,
+                            action,
+                            selector,
+                            ..
+                        } => {
+                            serde_json::json!({
+                                "time": timestamp.to_rfc3339_opts(
+                                    chrono::SecondsFormat::Millis, true
+                                ),
+                                "type": "interaction",
+                                "detail": format!("{action} on {selector}"),
+                            })
+                        }
+                        victauri_core::AppEvent::StateChange {
+                            timestamp,
+                            key,
+                            caused_by,
+                        } => {
+                            serde_json::json!({
+                                "time": timestamp.to_rfc3339_opts(
+                                    chrono::SecondsFormat::Millis, true
+                                ),
+                                "type": "state_change",
+                                "detail": format!(
+                                    "{key} changed{}",
+                                    caused_by.as_ref().map_or(String::new(), |c| format!(" (by {c})"))
+                                ),
+                            })
+                        }
+                        victauri_core::AppEvent::WindowEvent {
+                            timestamp,
+                            label,
+                            event,
+                        } => {
+                            serde_json::json!({
+                                "time": timestamp.to_rfc3339_opts(
+                                    chrono::SecondsFormat::Millis, true
+                                ),
+                                "type": "window_event",
+                                "detail": format!("{event} on window '{label}'"),
+                            })
+                        }
+                        _ => {
+                            serde_json::json!({
+                                "time": event.timestamp().to_rfc3339_opts(
+                                    chrono::SecondsFormat::Millis, true
+                                ),
+                                "type": "other",
+                                "detail": "unknown event type",
+                            })
+                        }
+                    })
+                    .collect();
+
+                let narrative = if timeline.is_empty() {
+                    format!("No activity in the last {secs}s.")
+                } else {
+                    let parts: Vec<String> = timeline
+                        .iter()
+                        .filter_map(|e| e.get("detail").and_then(|d| d.as_str()))
+                        .map(String::from)
+                        .collect();
+                    parts.join(" → ")
+                };
+
+                let result = serde_json::json!({
+                    "time_window_secs": secs,
+                    "event_count": timeline.len(),
+                    "timeline": timeline,
+                    "narrative": narrative,
+                });
+                json_result(&result)
+            }
+            ExplainAction::Diff => {
+                let secs = params.seconds.unwrap_or(10);
+                let since = chrono::Utc::now()
+                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let events = self.state.event_log.since(since);
+
+                let mut ipc_commands: Vec<String> = Vec::new();
+                let mut dom_changes = 0u64;
+                let mut error_count = 0u64;
+                let mut interaction_count = 0u64;
+
+                for event in &events {
+                    match event {
+                        victauri_core::AppEvent::Ipc(call) => {
+                            ipc_commands.push(call.command.clone());
+                            if matches!(call.result, victauri_core::IpcResult::Err(_)) {
+                                error_count += 1;
+                            }
+                        }
+                        victauri_core::AppEvent::DomMutation { mutation_count, .. } => {
+                            dom_changes += u64::from(*mutation_count)
+                        }
+                        victauri_core::AppEvent::DomInteraction { .. } => {
+                            interaction_count += 1;
+                        }
+                        _ => {}
+                    }
+                }
+
+                ipc_commands.dedup();
+
+                let result = serde_json::json!({
+                    "since": since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    "time_window_secs": secs,
+                    "total_events": events.len(),
+                    "ipc_calls_made": ipc_commands.len(),
+                    "unique_commands": ipc_commands,
+                    "dom_elements_changed": dom_changes,
+                    "interactions": interaction_count,
+                    "errors": error_count,
+                });
+                json_result(&result)
             }
         }
     }
@@ -2223,6 +2663,10 @@ impl VictauriMcpHandler {
             "fault" => {
                 let p: FaultParams = Self::parse_args(args)?;
                 self.fault(Parameters(p)).await
+            }
+            "explain" => {
+                let p: ExplainParams = Self::parse_args(args)?;
+                self.explain(Parameters(p)).await
             }
             _ => return Err(rest::ToolCallError::UnknownTool(name.to_string())),
         };
@@ -2590,11 +3034,15 @@ It provides simultaneous access to three layers: (1) the WEBVIEW (DOM, interacti
 'read_app_file' (read files from app directories), \
 'query_db' (read-only SQLite queries with auto-discovery). \
 \n\nBACKEND INTROSPECTION (CDP cannot do this — Victauri-exclusive): \
-'introspect' (command_timings, coverage, contract_record, contract_check, startup_timing, \
-capabilities, db_health) — Rust-side performance profiling, IPC contract testing, \
-command coverage analysis, startup timing, permission auditing, database diagnostics. \
+'introspect' (command_timings, coverage, contract_record/check/list/clear, startup_timing, \
+capabilities, db_health, managed_state, processes, tasks, fs_scope, event_bus, event_bus_clear) — \
+Rust-side performance profiling, IPC contract testing, command coverage analysis, startup timing, \
+permission auditing, database diagnostics, internal state snapshot, process info, task tracking, \
+file system scope, and Tauri event bus monitoring. \
 'fault' (inject, list, clear, clear_all) — chaos engineering: inject delays, errors, \
 drops, and response corruption into Tauri commands at the Rust layer. \
+'explain' (summary, last_action, diff) — cross-layer activity correlation: summarizes recent \
+activity across IPC + DOM + console + network + window events into a coherent narrative. \
 \n\nWEBVIEW tools: \
 'interact' (click, hover, focus, scroll, select), 'input' (fill, type_text, press_key), \
 'inspect' (get_styles, get_bounding_boxes, highlight, audit_accessibility, get_performance), \
@@ -2604,7 +3052,7 @@ drops, and response corruption into Tauri commands at the Rust layer. \
 'window' (get_state, list, manage, resize, move_to, set_title), \
 'storage' (get, set, delete, get_cookies), 'navigate' (go_to, go_back, get_history, \
 set_dialog_response, get_dialog_log), 'recording' (start, stop, checkpoint, list_checkpoints, \
-get_events, events_between, get_replay, export, import), \
+get_events, events_between, get_replay, export, import, replay), \
 'logs' (console, network, ipc, navigation, dialogs, events, slow_ipc). \
 \n\nOTHER: verify_state, wait_for, assert_semantic, resolve_command, \
 get_memory_stats, get_plugin_info, get_diagnostics.";

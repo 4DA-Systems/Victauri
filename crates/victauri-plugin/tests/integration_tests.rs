@@ -1041,6 +1041,8 @@ async fn state_port_reflected_in_info() {
         fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
         contract_store: victauri_plugin::introspection::ContractStore::new(),
         startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
+        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
+        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
     });
 
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(&["main"]));
@@ -1108,6 +1110,8 @@ fn builder_custom_port_reflected_in_state() {
         fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
         contract_store: victauri_plugin::introspection::ContractStore::new(),
         startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
+        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
+        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
     });
 
     assert_eq!(state.port.load(std::sync::atomic::Ordering::Relaxed), 8888);
@@ -1370,6 +1374,8 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
         fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
         contract_store: victauri_plugin::introspection::ContractStore::new(),
         startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
+        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
+        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
     })
 }
 

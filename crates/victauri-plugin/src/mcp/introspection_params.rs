@@ -23,6 +23,18 @@ pub enum IntrospectAction {
     Capabilities,
     /// `SQLite` database health diagnostics (journal mode, WAL, page stats).
     DbHealth,
+    /// Snapshot of Victauri's own managed state (event log, registry, recording, faults, etc.).
+    ManagedState,
+    /// Current process info (PID, uptime, thread count).
+    Processes,
+    /// Report Victauri's spawned async tasks and their status.
+    Tasks,
+    /// Report the app's file system scope configuration from Tauri config.
+    FsScope,
+    /// List captured Tauri event bus events.
+    EventBus,
+    /// Clear the event bus capture buffer.
+    EventBusClear,
 }
 
 /// Parameters for the `introspect` compound tool.
@@ -105,4 +117,31 @@ pub struct FaultParams {
     /// Maximum number of times to trigger (0 or omit for unlimited).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_triggers: Option<u64>,
+}
+
+/// Actions available in the `explain` compound tool.
+#[derive(Debug, Copy, Clone, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplainAction {
+    /// Summarize recent activity across all layers (IPC, DOM, console, network, window events).
+    Summary,
+    /// Correlate the most recent burst of activity into a causal timeline.
+    LastAction,
+    /// Report what changed in the last N seconds (events, IPC calls, console entries).
+    Diff,
+}
+
+/// Parameters for the `explain` compound tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ExplainParams {
+    /// Which explain action to perform.
+    pub action: ExplainAction,
+
+    /// How many seconds to look back (default: 30 for summary, 5 for `last_action`, 10 for diff).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<u64>,
+
+    /// Target webview for JS eval (console/network log retrieval).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webview_label: Option<String>,
 }
