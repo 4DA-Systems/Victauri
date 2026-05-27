@@ -3,11 +3,17 @@
 //! Reads JSON-RPC messages from stdin, forwards them to Victauri's Streamable HTTP
 //! endpoint, parses SSE responses, and writes them back to stdout. This bridges
 //! the gap between MCP hosts that expect stdio transport and Victauri's HTTP server.
+//!
+//! The bridge automatically recovers from server restarts: when it detects a stale
+//! session (404) or connection failure, it re-discovers the server and retries.
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
+
+const MAX_RETRIES: usize = 3;
+const RETRY_DELAY_MS: u64 = 500;
 
 /// Run the stdio bridge against a discovered Victauri server.
 ///
@@ -16,17 +22,14 @@ use anyhow::{Context, Result, bail};
 /// Returns an error if the server cannot be reached or the bridge encounters
 /// a fatal protocol error.
 pub async fn run(wait: bool) -> Result<()> {
-    let (port, token) = discover_server(wait).await?;
-    let base_url = format!("http://127.0.0.1:{port}");
-    let mcp_url = format!("{base_url}/mcp");
+    let connection = Arc::new(Mutex::new(discover_server(wait).await?));
+    let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .context("failed to create HTTP client")?;
-
-    let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -48,103 +51,154 @@ pub async fn run(wait: bool) -> Result<()> {
 
         let is_notification = msg.get("id").is_none();
 
-        let mut req = http
-            .post(&mcp_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json, text/event-stream");
+        let mut last_err = None;
 
-        if let Some(t) = &token {
-            req = req.header("Authorization", format!("Bearer {t}"));
-        }
-        if let Some(sid) = session_id.lock().expect("session_id lock").as_deref() {
-            req = req.header("Mcp-Session-Id", sid);
-        }
+        for attempt in 0..MAX_RETRIES {
+            let (port, token) = {
+                let guard = connection.lock().expect("connection lock");
+                (guard.0, guard.1.clone())
+            };
+            let mcp_url = format!("http://127.0.0.1:{port}/mcp");
 
-        let resp = match req.json(&msg).send().await {
-            Ok(r) => r,
-            Err(e) => {
+            let mut req = http
+                .post(&mcp_url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "application/json, text/event-stream");
+
+            if let Some(ref t) = token {
+                req = req.header("Authorization", format!("Bearer {t}"));
+            }
+            {
+                let sid_guard = session_id.lock().expect("session_id lock");
+                if let Some(ref sid) = *sid_guard {
+                    req = req.header("Mcp-Session-Id", sid.clone());
+                }
+            }
+
+            let resp = match req.json(&msg).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!(
+                        "victauri-bridge: connection failed (attempt {}/{}): {e}",
+                        attempt + 1,
+                        MAX_RETRIES
+                    );
+                    *session_id.lock().expect("session_id lock") = None;
+                    if attempt + 1 < MAX_RETRIES {
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            RETRY_DELAY_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        if let Ok(new_conn) = discover_server(true).await {
+                            *connection.lock().expect("connection lock") = new_conn;
+                            eprintln!("victauri-bridge: reconnected to server");
+                        }
+                    }
+                    last_err = Some(format!("Victauri server unreachable: {e}"));
+                    continue;
+                }
+            };
+
+            if let Some(sid) = resp.headers().get("mcp-session-id")
+                && let Ok(s) = sid.to_str()
+            {
+                *session_id.lock().expect("session_id lock") = Some(s.to_string());
+            }
+
+            let status = resp.status();
+
+            if is_notification && status.as_u16() == 202 {
+                last_err = None;
+                break;
+            }
+
+            if status.as_u16() == 404 || status.as_u16() == 409 {
+                eprintln!(
+                    "victauri-bridge: stale session ({}), reconnecting (attempt {}/{})",
+                    status,
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                *session_id.lock().expect("session_id lock") = None;
+                if attempt + 1 < MAX_RETRIES {
+                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
+                    if let Ok(new_conn) = discover_server(false).await {
+                        *connection.lock().expect("connection lock") = new_conn;
+                    }
+                }
+                last_err = Some(format!("Victauri returned {status}"));
+                continue;
+            }
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
                 if !is_notification {
                     let err_resp = serde_json::json!({
                         "jsonrpc": "2.0",
                         "id": msg.get("id"),
                         "error": {
                             "code": -32000,
-                            "message": format!("Victauri server unreachable: {e}")
+                            "message": format!("Victauri returned {status}: {body}")
                         }
                     });
                     let mut out = stdout.lock();
                     let _ = writeln!(out, "{err_resp}");
                     let _ = out.flush();
                 }
-                continue;
+                last_err = None;
+                break;
             }
-        };
 
-        // Capture session ID from response headers
-        if let Some(sid) = resp.headers().get("mcp-session-id")
-            && let Ok(s) = sid.to_str()
-        {
-            *session_id.lock().expect("session_id lock") = Some(s.to_string());
-        }
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
 
-        let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
 
-        // Notifications get 202 with no body
-        if is_notification && status.as_u16() == 202 {
-            continue;
-        }
-
-        if !status.is_success() {
-            if !is_notification {
-                let body = resp.text().await.unwrap_or_default();
-                let err_resp = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": msg.get("id"),
-                    "error": {
-                        "code": -32000,
-                        "message": format!("Victauri returned {status}: {body}")
-                    }
-                });
-                let mut out = stdout.lock();
-                let _ = writeln!(out, "{err_resp}");
-                let _ = out.flush();
-            }
-            continue;
-        }
-
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        let body = resp.text().await.unwrap_or_default();
-
-        if content_type.contains("text/event-stream") {
-            // Parse SSE: extract `data:` lines that contain JSON-RPC messages
-            for sse_line in body.lines() {
-                if let Some(data) = sse_line.strip_prefix("data: ") {
-                    let data = data.trim();
-                    if data.is_empty() {
-                        continue;
-                    }
-                    // Validate it's JSON before forwarding
-                    if serde_json::from_str::<serde_json::Value>(data).is_ok() {
-                        let mut out = stdout.lock();
-                        let _ = writeln!(out, "{data}");
-                        let _ = out.flush();
+            if content_type.contains("text/event-stream") {
+                for sse_line in body.lines() {
+                    if let Some(data) = sse_line.strip_prefix("data: ") {
+                        let data = data.trim();
+                        if data.is_empty() {
+                            continue;
+                        }
+                        if serde_json::from_str::<serde_json::Value>(data).is_ok() {
+                            let mut out = stdout.lock();
+                            let _ = writeln!(out, "{data}");
+                            let _ = out.flush();
+                        }
                     }
                 }
+            } else {
+                let body = body.trim();
+                if !body.is_empty() {
+                    let mut out = stdout.lock();
+                    let _ = writeln!(out, "{body}");
+                    let _ = out.flush();
+                }
             }
-        } else {
-            // application/json — forward directly
-            let body = body.trim();
-            if !body.is_empty() {
-                let mut out = stdout.lock();
-                let _ = writeln!(out, "{body}");
-                let _ = out.flush();
-            }
+
+            last_err = None;
+            break;
+        }
+
+        if let Some(err_msg) = last_err
+            && !is_notification
+        {
+            let err_resp = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": msg.get("id"),
+                "error": {
+                    "code": -32000,
+                    "message": err_msg
+                }
+            });
+            let mut out = stdout.lock();
+            let _ = writeln!(out, "{err_resp}");
+            let _ = out.flush();
         }
     }
 
