@@ -29,6 +29,7 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 ctrlc = "3"
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 toml_edit = "0.22"

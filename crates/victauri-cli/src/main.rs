@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 //! CLI for Victauri — scaffold tests, diagnose running apps, and record sessions.
 
+mod bridge;
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -81,6 +83,12 @@ enum Commands {
         #[arg(long)]
         raw: bool,
     },
+    /// Run as a stdio-to-HTTP MCP bridge for Claude Code and other MCP hosts
+    Bridge {
+        /// Wait up to 30 seconds for the Victauri server to become available
+        #[arg(long)]
+        wait: bool,
+    },
     /// Report IPC command coverage from a running Tauri app
     Coverage {
         /// Minimum coverage percentage — exit with code 1 if below this value
@@ -116,6 +124,9 @@ async fn main() -> Result<()> {
         }
         Commands::Doctor => {
             cmd_doctor().await?;
+        }
+        Commands::Bridge { wait } => {
+            bridge::run(wait).await?;
         }
         Commands::Record {
             output,
@@ -1117,7 +1128,8 @@ fn generate_mcp_json() -> &'static str {
     r#"{
   "mcpServers": {
     "victauri": {
-      "url": "http://127.0.0.1:7373/mcp"
+      "command": "victauri",
+      "args": ["bridge", "--wait"]
     }
   }
 }
@@ -1148,7 +1160,7 @@ Key tools that only Victauri can provide (not available via CDP/Playwright):
 - `audit_accessibility` — WCAG accessibility checks
 - `get_performance` — navigation timing, JS heap, resource loading
 
-Connection: `http://127.0.0.1:7373/mcp` (configured in `.mcp.json`)
+Connection: `victauri bridge` (stdio-to-HTTP proxy, configured in `.mcp.json`)
 
 Do NOT use Playwright or CDP for tasks that Victauri handles. Only fall back to
 Playwright for browser-only work unrelated to the Tauri app.
@@ -1756,13 +1768,14 @@ mod tests {
     fn mcp_json_has_correct_structure() {
         let content = generate_mcp_json();
         let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
-        assert!(parsed["mcpServers"]["victauri"]["url"].as_str().is_some());
-        assert!(
-            parsed["mcpServers"]["victauri"]["url"]
+        assert_eq!(
+            parsed["mcpServers"]["victauri"]["command"]
                 .as_str()
-                .unwrap()
-                .contains("7373")
+                .unwrap(),
+            "victauri"
         );
+        let args = parsed["mcpServers"]["victauri"]["args"].as_array().unwrap();
+        assert!(args.iter().any(|a| a.as_str() == Some("bridge")));
     }
 
     #[test]
@@ -1832,7 +1845,7 @@ mod tests {
         let content = generate_claude_md_section();
         assert!(content.contains("Victauri"));
         assert!(content.contains("invoke_command"));
-        assert!(content.contains("7373"));
+        assert!(content.contains("victauri bridge"));
         assert!(
             content.contains("Do NOT use Playwright"),
             "should instruct agents to prefer Victauri"
