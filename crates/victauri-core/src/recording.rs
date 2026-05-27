@@ -56,6 +56,7 @@ pub struct RecordedEvent {
 #[derive(Debug, Clone)]
 pub struct EventRecorder {
     recording: Arc<Mutex<Option<ActiveRecording>>>,
+    last_session: Arc<Mutex<Option<RecordedSession>>>,
     max_events: usize,
 }
 
@@ -84,6 +85,7 @@ impl EventRecorder {
     pub fn new(max_events: usize) -> Self {
         Self {
             recording: Arc::new(Mutex::new(None)),
+            last_session: Arc::new(Mutex::new(None)),
             max_events,
         }
     }
@@ -136,11 +138,16 @@ impl EventRecorder {
     #[must_use]
     pub fn stop(&self) -> Option<RecordedSession> {
         let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
-        rec.take().map(|r| RecordedSession {
-            id: r.session_id,
-            started_at: r.started_at,
-            events: r.events.into_iter().collect(),
-            checkpoints: r.checkpoints.into_iter().collect(),
+        rec.take().map(|r| {
+            let session = RecordedSession {
+                id: r.session_id,
+                started_at: r.started_at,
+                events: r.events.into_iter().collect(),
+                checkpoints: r.checkpoints.into_iter().collect(),
+            };
+            *crate::acquire_lock(&self.last_session, "EventRecorder::last_session") =
+                Some(session.clone());
+            session
         })
     }
 
@@ -302,15 +309,20 @@ impl EventRecorder {
     }
 
     /// Snapshot the current recording as a session WITHOUT stopping it.
+    /// Falls back to the last stopped session if no active recording.
     #[must_use]
     pub fn export(&self) -> Option<RecordedSession> {
         let rec = crate::acquire_lock(&self.recording, "EventRecorder");
-        rec.as_ref().map(|r| RecordedSession {
-            id: r.session_id.clone(),
-            started_at: r.started_at,
-            events: r.events.iter().cloned().collect(),
-            checkpoints: r.checkpoints.iter().cloned().collect(),
-        })
+        if let Some(r) = rec.as_ref() {
+            return Some(RecordedSession {
+                id: r.session_id.clone(),
+                started_at: r.started_at,
+                events: r.events.iter().cloned().collect(),
+                checkpoints: r.checkpoints.iter().cloned().collect(),
+            });
+        }
+        drop(rec);
+        crate::acquire_lock(&self.last_session, "EventRecorder::last_session").clone()
     }
 
     /// Import a previously exported session, replacing any active recording.
@@ -329,21 +341,32 @@ impl EventRecorder {
         });
     }
 
-    /// Extracts IPC calls in order from the recording for replay.
+    /// Extracts IPC calls in order from the active recording or last stopped session for replay.
     #[must_use]
     pub fn ipc_replay_sequence(&self) -> Vec<IpcCall> {
         let rec = crate::acquire_lock(&self.recording, "EventRecorder");
-        match rec.as_ref() {
-            Some(active) => active
+        if let Some(active) = rec.as_ref() {
+            return active
                 .events
                 .iter()
                 .filter_map(|re| match &re.event {
                     AppEvent::Ipc(call) => Some(call.clone()),
                     _ => None,
                 })
-                .collect(),
-            None => Vec::new(),
+                .collect();
         }
+        drop(rec);
+        let last = crate::acquire_lock(&self.last_session, "EventRecorder::last_session");
+        last.as_ref().map_or_else(Vec::new, |session| {
+            session
+                .events
+                .iter()
+                .filter_map(|re| match &re.event {
+                    AppEvent::Ipc(call) => Some(call.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
     }
 }
 

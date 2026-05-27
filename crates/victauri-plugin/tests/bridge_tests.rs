@@ -4521,10 +4521,10 @@ fn find_elements_no_results() {
                 setup_js: None,
             },
             TestCase {
-                name: "findElements returns empty for invalid css".into(),
+                name: "findElements returns error for invalid css".into(),
                 code: r"
                     var results = window.__VICTAURI__.findElements({ css: '###invalid' });
-                    return { count: results.length };
+                    return { has_error: !!results.error, error_contains_selector: results.error && results.error.indexOf('###invalid') !== -1 };
                 "
                 .into(),
                 setup_html: None,
@@ -4538,7 +4538,11 @@ fn find_elements_no_results() {
     assert_all_pass(&results);
     assert_eq!(results[0].result.as_ref().unwrap()["count"], 0);
     assert_eq!(results[1].result.as_ref().unwrap()["count"], 0);
-    assert_eq!(results[2].result.as_ref().unwrap()["count"], 0);
+    assert_eq!(results[2].result.as_ref().unwrap()["has_error"], true);
+    assert_eq!(
+        results[2].result.as_ref().unwrap()["error_contains_selector"],
+        true
+    );
 }
 
 #[test]

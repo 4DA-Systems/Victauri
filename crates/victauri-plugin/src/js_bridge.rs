@@ -223,6 +223,12 @@ const INIT_SCRIPT_BODY: &str = r#"
             var results = [];
             var maxResults = query.max_results || 10;
 
+            if (query.css) {
+                try { document.body.matches(query.css); } catch(e) {
+                    return { error: 'invalid CSS selector: ' + query.css + ' — ' + e.message };
+                }
+            }
+
             function matches(el) {
                 if (query.text) {
                     var txt = (el.textContent || '').trim();
@@ -240,7 +246,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (el.getAttribute('data-testid') !== query.test_id) return false;
                 }
                 if (query.css) {
-                    try { if (!el.matches(query.css)) return false; } catch(e) { return false; }
+                    if (!el.matches(query.css)) return false;
                 }
                 if (query.name) {
                     var name = el.getAttribute('aria-label')
@@ -1560,9 +1566,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
                 var method = (init && init.method) || (input && input.method) || 'GET';
                 var isIpc = url.indexOf('http://ipc.localhost/') === 0;
+                var isVictauriInternal = isIpc && url.indexOf('plugin%3Avictauri%7C') !== -1;
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
 
-                if (isIpc && init && init.body && window.__VICTAURI__._captureIpcBodies !== false) {
+                if (isIpc && !isVictauriInternal && init && init.body && window.__VICTAURI__._captureIpcBodies !== false) {
                     try {
                         var bodyStr = typeof init.body === 'string' ? init.body : null;
                         if (bodyStr) {
@@ -1572,8 +1579,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                     } catch(e) {}
                 }
 
-                networkLog.push(entry);
-                if (networkLog.length > CAP_NETWORK) networkLog.shift();
+                if (!isVictauriInternal) {
+                    networkLog.push(entry);
+                    if (networkLog.length > CAP_NETWORK) networkLog.shift();
+                }
 
                 return origFetch.call(this, input, init).then(function(response) {
                     entry.status = response.status;

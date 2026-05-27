@@ -132,7 +132,15 @@ impl VictauriMcpHandler {
             .eval_with_return(&params.code, params.webview_label.as_deref())
             .await
         {
-            Ok(result) => CallToolResult::success(vec![Content::text(result)]),
+            Ok(result) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result)
+                    && let Some(err_val) = parsed.get("__error")
+                {
+                    let msg = err_val.as_str().unwrap_or("unknown error");
+                    return tool_error(format!("JavaScript error: {msg}"));
+                }
+                CallToolResult::success(vec![Content::text(result)])
+            }
             Err(e) => tool_error(e),
         }
     }
@@ -217,8 +225,20 @@ impl VictauriMcpHandler {
             "return window.__VICTAURI__?.findElements({{ {} }})",
             parts.join(", ")
         );
-        self.eval_bridge(&code, params.webview_label.as_deref())
+        match self
+            .eval_with_return(&code, params.webview_label.as_deref())
             .await
+        {
+            Ok(result) => {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result)
+                    && let Some(err) = parsed.get("error").and_then(|e| e.as_str())
+                {
+                    return tool_error(err);
+                }
+                CallToolResult::success(vec![Content::text(result)])
+            }
+            Err(e) => tool_error(e),
+        }
     }
 
     #[tool(
@@ -2295,7 +2315,13 @@ impl VictauriMcpHandler {
                         victauri_core::AppEvent::DomMutation { mutation_count, .. } => {
                             dom_mutations += u64::from(*mutation_count)
                         }
-                        victauri_core::AppEvent::StateChange { .. } => state_changes += 1,
+                        victauri_core::AppEvent::StateChange { caused_by, .. } => {
+                            let is_victauri =
+                                caused_by.as_ref().is_some_and(|c| c.contains("victauri"));
+                            if !is_victauri {
+                                state_changes += 1;
+                            }
+                        }
                         victauri_core::AppEvent::WindowEvent { .. } => window_events += 1,
                         victauri_core::AppEvent::DomInteraction { .. } => interactions += 1,
                         _ => {}
@@ -2360,9 +2386,12 @@ impl VictauriMcpHandler {
 
                 let timeline: Vec<serde_json::Value> = events
                     .iter()
-                    .map(|event| match event {
+                    .filter_map(|event| match event {
                         victauri_core::AppEvent::Ipc(call) => {
-                            serde_json::json!({
+                            if call.command.starts_with("plugin:victauri|") {
+                                return None;
+                            }
+                            Some(serde_json::json!({
                                 "time": call.timestamp.to_rfc3339_opts(
                                     chrono::SecondsFormat::Millis, true
                                 ),
@@ -2373,14 +2402,14 @@ impl VictauriMcpHandler {
                                     call.result,
                                     call.duration_ms.unwrap_or(0)
                                 ),
-                            })
+                            }))
                         }
                         victauri_core::AppEvent::DomMutation {
                             timestamp,
                             mutation_count,
                             webview_label,
                         } => {
-                            serde_json::json!({
+                            Some(serde_json::json!({
                                 "time": timestamp.to_rfc3339_opts(
                                     chrono::SecondsFormat::Millis, true
                                 ),
@@ -2389,7 +2418,7 @@ impl VictauriMcpHandler {
                                     "{mutation_count} element{} updated in {webview_label}",
                                     if *mutation_count == 1 { "" } else { "s" }
                                 ),
-                            })
+                            }))
                         }
                         victauri_core::AppEvent::DomInteraction {
                             timestamp,
@@ -2397,20 +2426,23 @@ impl VictauriMcpHandler {
                             selector,
                             ..
                         } => {
-                            serde_json::json!({
+                            Some(serde_json::json!({
                                 "time": timestamp.to_rfc3339_opts(
                                     chrono::SecondsFormat::Millis, true
                                 ),
                                 "type": "interaction",
                                 "detail": format!("{action} on {selector}"),
-                            })
+                            }))
                         }
                         victauri_core::AppEvent::StateChange {
                             timestamp,
                             key,
                             caused_by,
                         } => {
-                            serde_json::json!({
+                            if caused_by.as_ref().is_some_and(|c| c.contains("victauri")) {
+                                return None;
+                            }
+                            Some(serde_json::json!({
                                 "time": timestamp.to_rfc3339_opts(
                                     chrono::SecondsFormat::Millis, true
                                 ),
@@ -2419,29 +2451,29 @@ impl VictauriMcpHandler {
                                     "{key} changed{}",
                                     caused_by.as_ref().map_or(String::new(), |c| format!(" (by {c})"))
                                 ),
-                            })
+                            }))
                         }
                         victauri_core::AppEvent::WindowEvent {
                             timestamp,
                             label,
                             event,
                         } => {
-                            serde_json::json!({
+                            Some(serde_json::json!({
                                 "time": timestamp.to_rfc3339_opts(
                                     chrono::SecondsFormat::Millis, true
                                 ),
                                 "type": "window_event",
                                 "detail": format!("{event} on window '{label}'"),
-                            })
+                            }))
                         }
                         _ => {
-                            serde_json::json!({
+                            Some(serde_json::json!({
                                 "time": event.timestamp().to_rfc3339_opts(
                                     chrono::SecondsFormat::Millis, true
                                 ),
                                 "type": "other",
                                 "detail": "unknown event type",
-                            })
+                            }))
                         }
                     })
                     .collect();
@@ -2478,7 +2510,9 @@ impl VictauriMcpHandler {
 
                 for event in &events {
                     match event {
-                        victauri_core::AppEvent::Ipc(call) => {
+                        victauri_core::AppEvent::Ipc(call)
+                            if !call.command.starts_with("plugin:victauri|") =>
+                        {
                             ipc_commands.push(call.command.clone());
                             if matches!(call.result, victauri_core::IpcResult::Err(_)) {
                                 error_count += 1;
@@ -2794,6 +2828,33 @@ impl VictauriMcpHandler {
             .await
     }
 
+    async fn probe_bridge(&self, webview_label: Option<&str>) -> Result<(), String> {
+        let id = uuid::Uuid::new_v4().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = self.state.pending_evals.lock().await;
+            pending.insert(id.clone(), tx);
+        }
+        let id_js = js_string(&id);
+        let probe = format!(
+            r#"(async()=>{{await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback',{{id:{id_js},result:'"probe_ok"'}});}})();"#
+        );
+        if let Err(e) = self.bridge.eval_webview(webview_label, &probe) {
+            self.state.pending_evals.lock().await.remove(&id);
+            return Err(format!("eval injection failed: {e}"));
+        }
+        if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+            Ok(())
+        } else {
+            self.state.pending_evals.lock().await.remove(&id);
+            let label = webview_label.unwrap_or("default");
+            Err(format!(
+                "bridge not responding on window '{label}' — the window may be hidden, \
+                 missing the victauri capability, or the JS bridge is not loaded"
+            ))
+        }
+    }
+
     async fn eval_with_return_timeout(
         &self,
         code: &str,
@@ -2801,6 +2862,11 @@ impl VictauriMcpHandler {
         timeout: std::time::Duration,
     ) -> Result<String, String> {
         self.track_tool_call();
+
+        if webview_label.is_some() {
+            self.probe_bridge(webview_label).await?;
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -2843,22 +2909,25 @@ impl VictauriMcpHandler {
 
         let id_js = js_string(&id);
         let inject = format!(
-            r"
+            r#"
             (async () => {{
                 try {{
                     const __result = await (async () => {{ {code} }})();
+                    const __serialized = __result === undefined ? '"undefined"'
+                        : __result === null ? 'null'
+                        : JSON.stringify(__result) ?? 'null';
                     await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
                         id: {id_js},
-                        result: JSON.stringify(__result)
+                        result: __serialized
                     }});
                 }} catch (e) {{
                     await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
                         id: {id_js},
-                        result: JSON.stringify({{ __error: e.message }})
+                        result: JSON.stringify({{ __error: String(e && e.message || e) }})
                     }});
                 }}
             }})();
-            "
+            "#
         );
 
         if let Err(e) = self.bridge.eval_webview(webview_label, &inject) {

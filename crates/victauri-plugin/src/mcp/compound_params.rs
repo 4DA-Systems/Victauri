@@ -436,7 +436,8 @@ pub struct RecordingParams {
     pub session_id: Option<String>,
     /// Checkpoint ID (for checkpoint, required).
     pub checkpoint_id: Option<String>,
-    /// Checkpoint label (for checkpoint, optional).
+    /// Checkpoint label (for checkpoint, optional). Also accepts `label` as an alias.
+    #[serde(alias = "label")]
     pub checkpoint_label: Option<String>,
     /// State snapshot as JSON (for checkpoint).
     pub state: Option<serde_json::Value>,

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-05-27
+
+### Fixed
+
+- **Release Blocker:** Victauri's own IPC traffic (`plugin:victauri|*`) no longer fills the 1000-entry `networkLog` — real app IPC evidence is preserved
+- **Release Blocker:** Multi-window eval (hidden windows) now fails fast with diagnostic in 2s instead of timing out after 30s — bridge probe detects unresponsive windows
+- **Release Blocker:** `eval_js` errors surface as MCP `isError` — `throw new Error()` returns structured error, `undefined` returns `"undefined"`, `null` returns `"null"`
+- **Recording:** `replay` and `export` now work after `stop()` — session data persisted in `last_session` field
+- **Recording:** `checkpoint_label` parameter now accepts `label` as alias via `#[serde(alias)]`
+- **find_elements:** Invalid CSS selectors now return descriptive error instead of silently returning `[]`
+- **explain:** Narrative (summary/last_action/diff) no longer dominated by Victauri's own drain loop callbacks — internal IPC and state changes filtered out
+
 ## [0.5.2] - 2026-05-26
 
 ### Changed
@@ -286,7 +298,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/runyourempire/victauri/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/runyourempire/victauri/compare/v0.5.0...v0.5.2
 [0.5.0]: https://github.com/runyourempire/victauri/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/runyourempire/victauri/compare/v0.3.0...v0.4.0
