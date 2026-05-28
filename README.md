@@ -5,6 +5,10 @@
 <h1 align="center">Victauri</h1>
 
 <p align="center">
+  <em>Verified Introspection &amp; Control for Tauri Applications</em>
+</p>
+
+<p align="center">
   <strong>Full-stack testing for Tauri apps. Click a button in the frontend, verify the Rust handler ran, confirm the database row was written — from one test.</strong>
 </p>
 
