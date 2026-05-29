@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Victauri Browser",
-    "version": "0.6.0",
+    "version": "0.7.0",
     "description": "MCP-native inspection for any website. X-ray vision for AI agents.",
     "browser_specific_settings": {
         "gecko": {

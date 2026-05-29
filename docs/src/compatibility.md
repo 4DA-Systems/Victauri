@@ -126,7 +126,7 @@ Returns:
       }
     ],
     "info": {
-      "bridge_version": "0.6.0",
+      "bridge_version": "0.7.0",
       "dom_elements": 847,
       "open_shadow_roots": 12,
       "event_listeners": 234,

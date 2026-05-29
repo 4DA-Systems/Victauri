@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-30
+
 ### Added — Webview parity (Playwright-grade, no CDP)
 
 - **Trusted (OS-level) input (Phase 2).** `input` (`type_text`/`press_key`) and `interact` (`click`) accept `trusted: true` to deliver real OS input events (`isTrusted: true`) instead of synthetic DOM events — for app handlers that gate on `event.isTrusted` and browser features needing user activation. Implemented on Windows via Win32 `SendInput` (Unicode keystrokes, named keys, and DPI-aware absolute mouse clicks); macOS/Linux return a clear "not implemented on this platform" error and callers fall back to synthetic input. New `WebviewBridge` methods `native_type_text`/`native_key`/`native_click`. Verified live on Windows: keyboard `keydown.isTrusted === true`, click `isTrusted === true` at the correct coordinates. (Cookie *set* for non-httpOnly cookies is available today via `eval_js` `document.cookie=...`; httpOnly cookie-set via the platform cookie store is deferred.)

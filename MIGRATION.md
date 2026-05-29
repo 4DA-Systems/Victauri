@@ -1,5 +1,23 @@
 # Migration Guide
 
+## v0.6.0 → v0.7.0
+
+Additive release — webview Playwright-parity (no CDP). No breaking API changes
+for normal plugin usage.
+
+- **Two new MCP tools:** `route` (network interception — block/fulfill/delay on
+  fetch+XHR) and `trace` (screencast ring buffer + event bundle). 33 tools total.
+- **Trusted OS input:** `input` (`type_text`/`press_key`) and `interact` (`click`)
+  accept `trusted: true` for real OS events (`isTrusted: true`). Windows-implemented;
+  macOS/Linux return a clear error and you keep using synthetic input (the default).
+- **Same-origin iframe traversal:** `dom_snapshot`/`find_elements` now reach into
+  frame content automatically — no API change, just broader coverage.
+- **New `WebviewBridge` trait methods** (`native_type_text`/`native_key`/`native_click`)
+  have default implementations, so existing `WebviewBridge` impls keep compiling.
+- **`VictauriState` gained a public `screencast` field.** Only relevant if you
+  construct `VictauriState` directly (tests/mocks) rather than via `VictauriBuilder`;
+  add `screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default())`.
+
 ## v0.5.6 → v0.6.0
 
 ### Behavior change: `eval_js` multi-statement code
