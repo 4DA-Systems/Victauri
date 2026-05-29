@@ -164,15 +164,21 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (!el || !el.isConnected) return { error: 'element is detached from DOM', hint: 'RETRY_LATER' };
         if (el.disabled) return { error: 'element is disabled (disabled attribute)', hint: 'RETRY_LATER' };
         if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return { error: 'element is disabled (aria-disabled)', hint: 'RETRY_LATER' };
-        var cs = window.getComputedStyle(el);
+        // Use the element's OWN document/window so the viewport and occlusion
+        // (elementFromPoint) checks are correct for elements inside same-origin
+        // iframes — getBoundingClientRect() is relative to the element's own
+        // frame viewport, not the top document.
+        var doc = el.ownerDocument || document;
+        var win = doc.defaultView || window;
+        var cs = win.getComputedStyle(el);
         if (cs.display === 'none') return { error: 'element is not visible (display: none)', hint: 'RETRY_LATER' };
         if (cs.visibility === 'hidden') return { error: 'element is not visible (visibility: hidden)', hint: 'RETRY_LATER' };
         if (parseFloat(cs.opacity) < 0.01) return { error: 'element is not visible (opacity: ' + cs.opacity + ')', hint: 'RETRY_LATER' };
         var rect = el.getBoundingClientRect();
         if (rect.width === 0 && rect.height === 0) return { error: 'element has zero size', hint: 'RETRY_LATER' };
         if (cs.pointerEvents === 'none') return { error: 'element has pointer-events: none', hint: 'RETRY_LATER' };
-        var vw = window.innerWidth || document.documentElement.clientWidth;
-        var vh = window.innerHeight || document.documentElement.clientHeight;
+        var vw = win.innerWidth || doc.documentElement.clientWidth;
+        var vh = win.innerHeight || doc.documentElement.clientHeight;
         if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
             el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
             rect = el.getBoundingClientRect();
@@ -182,7 +188,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         var cx = rect.left + rect.width / 2;
         var cy = rect.top + rect.height / 2;
-        var topEl = document.elementFromPoint(cx, cy);
+        var topEl = doc.elementFromPoint(cx, cy);
         if (topEl && topEl !== el && !el.contains(topEl) && !topEl.contains(el)) {
             var tag = topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
             var info = tag;
@@ -386,6 +392,13 @@ const INIT_SCRIPT_BODY: &str = r#"
                     for (var s = 0; s < node.shadowRoot.children.length; s++) {
                         search(node.shadowRoot.children[s]);
                     }
+                }
+                // Same-origin iframe traversal.
+                if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+                    try {
+                        var idoc = node.contentDocument;
+                        if (idoc && idoc.body) search(idoc.body);
+                    } catch (e) { /* cross-origin: skip */ }
                 }
             }
 
@@ -1412,6 +1425,25 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
         }
 
+        // Same-origin iframe traversal: descend into accessible frame documents.
+        // Cross-origin frames throw on contentDocument access — mark and skip.
+        if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+            try {
+                var idoc = node.contentDocument;
+                if (idoc && idoc.body) {
+                    var frameChild = walkDom(idoc.body);
+                    if (frameChild) {
+                        frameChild.frame = true;
+                        element.children.push(frameChild);
+                    }
+                } else {
+                    element.attributes['cross_origin_frame'] = 'true';
+                }
+            } catch (e) {
+                element.attributes['cross_origin_frame'] = 'true';
+            }
+        }
+
         return element;
     }
 
@@ -1477,6 +1509,21 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (node.shadowRoot) {
             for (var s = 0; s < node.shadowRoot.children.length; s++) {
                 result += walkDomCompact(node.shadowRoot.children[s], depth + 1);
+            }
+        }
+
+        // Same-origin iframe traversal (see walkDom for rationale).
+        if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+            try {
+                var idoc = node.contentDocument;
+                if (idoc && idoc.body) {
+                    result += indent + '  ⤷ iframe content:\n';
+                    result += walkDomCompact(idoc.body, depth + 2);
+                } else {
+                    result += indent + '  ⤷ [cross-origin iframe]\n';
+                }
+            } catch (e) {
+                result += indent + '  ⤷ [cross-origin iframe]\n';
             }
         }
 

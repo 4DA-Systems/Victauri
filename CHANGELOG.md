@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added — Webview parity (Playwright-grade, no CDP)
 
+- **Same-origin iframe traversal (Phase 3).** `dom_snapshot` (compact + JSON) and `find_elements` now descend into same-origin `<iframe>`/`<frame>` content; cross-origin frames are marked and skipped. Elements inside frames get ref handles and are fully interactable (`interact`, `input`). Actionability checks are now frame-aware — the occlusion/viewport checks run against the element's own document/window, fixing false "covered by …" rejections for frame elements (`getBoundingClientRect` is relative to the element's own frame viewport).
 - **`route` tool — network interception (Phase 1).** Match webview `fetch`/XHR by URL (`substring`/`glob`/`regex`/`exact`, optional method) and **block** (abort), **fulfill** (return a synthetic `status`/`headers`/`body`/`content_type` mock — fetch only), or **delay** (latency injection). `times` limits firings; `route matches` logs intercepts; rules are page-scoped. The Playwright `route()` equivalent, implemented purely in the JS bridge — works identically on WebView2/WKWebView/WebKitGTK. (XHR supports block/delay; fulfill is fetch-only. Top-level navigation, sub-resources, and WebSocket frames are not intercepted; for Tauri IPC-layer faults use `fault`.)
 
 ## [0.6.0] - 2026-05-30
