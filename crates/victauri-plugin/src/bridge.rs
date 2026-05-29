@@ -47,6 +47,53 @@ pub trait WebviewBridge: Send + Sync {
     /// Returns an error string if no matching window is found or the title change fails.
     fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String>;
 
+    // ── Native (OS-level, trusted) input ───────────────────────────────────
+    //
+    // These deliver real OS input events (`isTrusted: true`), unlike the JS
+    // bridge's synthetic events. They are needed for app handlers that gate on
+    // `event.isTrusted` and for user-activation-gated browser APIs. Default
+    // implementations return an error so platforms without support degrade
+    // gracefully (callers fall back to synthetic input).
+
+    /// Type Unicode text as trusted OS keyboard input into the focused element
+    /// of the target window. The element must already hold focus.
+    ///
+    /// # Errors
+    /// Returns an error if not supported on this platform or the window is missing.
+    fn native_type_text(&self, _label: Option<&str>, _text: &str) -> Result<(), String> {
+        Err(
+            "native (trusted) keyboard input is not implemented on this platform; \
+             use synthetic input via the `input` tool without `trusted`"
+                .to_string(),
+        )
+    }
+
+    /// Press a single named key (e.g. `Enter`, `Tab`, `Escape`, `ArrowDown`) as
+    /// trusted OS keyboard input to the focused element of the target window.
+    ///
+    /// # Errors
+    /// Returns an error if not supported on this platform or the key is unknown.
+    fn native_key(&self, _label: Option<&str>, _key: &str) -> Result<(), String> {
+        Err(
+            "native (trusted) key input is not implemented on this platform; \
+             use synthetic input via the `input` tool without `trusted`"
+                .to_string(),
+        )
+    }
+
+    /// Click at logical (CSS-pixel) coordinates within the target window's
+    /// content area, as a trusted OS mouse event.
+    ///
+    /// # Errors
+    /// Returns an error if not supported on this platform or the window is missing.
+    fn native_click(&self, _label: Option<&str>, _x: f64, _y: f64) -> Result<(), String> {
+        Err(
+            "native (trusted) mouse input is not implemented on this platform; \
+             use synthetic input via the `interact` tool"
+                .to_string(),
+        )
+    }
+
     // ── Backend Access ─────────────────────────────────────────────────────
 
     /// Return the app's per-user data directory (e.g. `~/.local/share/<app>/`).
@@ -171,6 +218,27 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
             RawWindowHandle::Xcb(h) => Ok(h.window.get() as isize),
             _ => Err("unsupported window handle type on this platform".to_string()),
         }
+    }
+
+    #[cfg(windows)]
+    fn native_type_text(&self, label: Option<&str>, text: &str) -> Result<(), String> {
+        let hwnd = self.get_native_handle(label)?;
+        win_focus(hwnd);
+        win_send_text(text)
+    }
+
+    #[cfg(windows)]
+    fn native_key(&self, label: Option<&str>, key: &str) -> Result<(), String> {
+        let hwnd = self.get_native_handle(label)?;
+        win_focus(hwnd);
+        win_send_key(key)
+    }
+
+    #[cfg(windows)]
+    fn native_click(&self, label: Option<&str>, x: f64, y: f64) -> Result<(), String> {
+        let hwnd = self.get_native_handle(label)?;
+        win_focus(hwnd);
+        win_click(hwnd, x, y)
     }
 
     fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
@@ -324,5 +392,232 @@ fn macos_window_number(ns_view: *mut std::ffi::c_void) -> Result<isize, String> 
             return Err(format!("invalid CGWindowID: {window_number}"));
         }
         Ok(window_number)
+    }
+}
+
+// ── Windows native (trusted) input helpers ─────────────────────────────────
+//
+// These deliver real OS input via SendInput, producing events with
+// `isTrusted: true` (unlike the JS bridge's synthetic events).
+
+#[cfg(windows)]
+fn win_hwnd(hwnd: isize) -> windows::Win32::Foundation::HWND {
+    windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void)
+}
+
+/// Bring the target window to the foreground so input is routed to it, then
+/// give the OS a brief moment to apply focus.
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn win_focus(hwnd: isize) {
+    use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+    // SAFETY: hwnd comes from Tauri's window handle; SetForegroundWindow is safe
+    // to call with any HWND (returns false if it fails).
+    unsafe {
+        let _ = SetForegroundWindow(win_hwnd(hwnd));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(40));
+}
+
+#[cfg(windows)]
+fn win_keyboard_input(
+    vk: u16,
+    scan: u16,
+    key_up: bool,
+    unicode: bool,
+) -> windows::Win32::UI::Input::KeyboardAndMouse::INPUT {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
+        KEYEVENTF_UNICODE, VIRTUAL_KEY,
+    };
+    let mut flags = KEYBD_EVENT_FLAGS(0);
+    if unicode {
+        flags |= KEYEVENTF_UNICODE;
+    }
+    if key_up {
+        flags |= KEYEVENTF_KEYUP;
+    }
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 {
+            ki: KEYBDINPUT {
+                wVk: VIRTUAL_KEY(vk),
+                wScan: scan,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    }
+}
+
+/// Type Unicode text via `SendInput` (`KEYEVENTF_UNICODE` per UTF-16 code unit).
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn win_send_text(text: &str) -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    let mut inputs: Vec<INPUT> = Vec::new();
+    for unit in text.encode_utf16() {
+        inputs.push(win_keyboard_input(0, unit, false, true));
+        inputs.push(win_keyboard_input(0, unit, true, true));
+    }
+    if inputs.is_empty() {
+        return Ok(());
+    }
+    let cb = i32::try_from(std::mem::size_of::<INPUT>()).unwrap_or(0);
+    // SAFETY: `inputs` is a valid slice of properly-initialized INPUT structs.
+    let sent = unsafe { SendInput(&inputs, cb) } as usize;
+    if sent == inputs.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "SendInput delivered {sent}/{} key events",
+            inputs.len()
+        ))
+    }
+}
+
+/// Map a named key (Playwright-style) to a Win32 virtual-key code.
+#[cfg(windows)]
+fn win_vk_for_key(key: &str) -> Option<u16> {
+    use windows::Win32::UI::Input::KeyboardAndMouse as k;
+    let vk = match key {
+        "Enter" | "Return" => k::VK_RETURN,
+        "Tab" => k::VK_TAB,
+        "Escape" | "Esc" => k::VK_ESCAPE,
+        "Backspace" => k::VK_BACK,
+        "Delete" | "Del" => k::VK_DELETE,
+        "ArrowUp" | "Up" => k::VK_UP,
+        "ArrowDown" | "Down" => k::VK_DOWN,
+        "ArrowLeft" | "Left" => k::VK_LEFT,
+        "ArrowRight" | "Right" => k::VK_RIGHT,
+        "Home" => k::VK_HOME,
+        "End" => k::VK_END,
+        "PageUp" => k::VK_PRIOR,
+        "PageDown" => k::VK_NEXT,
+        "Space" | " " => k::VK_SPACE,
+        "F1" => k::VK_F1,
+        "F2" => k::VK_F2,
+        "F3" => k::VK_F3,
+        "F4" => k::VK_F4,
+        "F5" => k::VK_F5,
+        "F6" => k::VK_F6,
+        "F7" => k::VK_F7,
+        "F8" => k::VK_F8,
+        "F9" => k::VK_F9,
+        "F10" => k::VK_F10,
+        "F11" => k::VK_F11,
+        "F12" => k::VK_F12,
+        _ => return None,
+    };
+    Some(vk.0)
+}
+
+/// Press and release a named key, or a single printable character, via `SendInput`.
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn win_send_key(key: &str) -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{INPUT, SendInput};
+    let inputs: Vec<INPUT> = if let Some(vk) = win_vk_for_key(key) {
+        vec![
+            win_keyboard_input(vk, 0, false, false),
+            win_keyboard_input(vk, 0, true, false),
+        ]
+    } else {
+        // Single printable character → send as Unicode.
+        let mut chars = key.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            return Err(format!(
+                "unknown key '{key}' (use a named key or a single character)"
+            ));
+        };
+        let mut buf = [0u16; 2];
+        let mut v = Vec::new();
+        for unit in c.encode_utf16(&mut buf) {
+            v.push(win_keyboard_input(0, *unit, false, true));
+            v.push(win_keyboard_input(0, *unit, true, true));
+        }
+        v
+    };
+    let cb = i32::try_from(std::mem::size_of::<INPUT>()).unwrap_or(0);
+    // SAFETY: valid slice of initialized INPUT structs.
+    let sent = unsafe { SendInput(&inputs, cb) } as usize;
+    if sent == inputs.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "SendInput delivered {sent}/{} key events",
+            inputs.len()
+        ))
+    }
+}
+
+/// Click at logical (CSS-pixel) coordinates within the window's content area
+/// via an absolute-positioned `SendInput` mouse sequence (move + down + up).
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        INPUT, INPUT_0, INPUT_MOUSE, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+        MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN,
+    };
+    let h = win_hwnd(hwnd);
+    // SAFETY: GetDpiForWindow/GetSystemMetrics/ClientToScreen are safe to call
+    // with a valid HWND; ClientToScreen writes into our stack POINT.
+    let (nx, ny) = unsafe {
+        let dpi = GetDpiForWindow(h);
+        let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
+        let mut pt = POINT {
+            x: (x * scale) as i32,
+            y: (y * scale) as i32,
+        };
+        let _ = ClientToScreen(h, &mut pt);
+        let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        let vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        if vw <= 1 || vh <= 1 {
+            return Err("virtual screen metrics unavailable".to_string());
+        }
+        let nx = ((f64::from(pt.x - vx)) * 65535.0 / f64::from(vw - 1)) as i32;
+        let ny = ((f64::from(pt.y - vy)) * 65535.0 / f64::from(vh - 1)) as i32;
+        (nx, ny)
+    };
+    let make = |flags: MOUSE_EVENT_FLAGS| INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: nx,
+                dy: ny,
+                mouseData: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let base = MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    let inputs = [
+        make(base | MOUSEEVENTF_MOVE),
+        make(base | MOUSEEVENTF_LEFTDOWN),
+        make(base | MOUSEEVENTF_LEFTUP),
+    ];
+    let cb = i32::try_from(std::mem::size_of::<INPUT>()).unwrap_or(0);
+    // SAFETY: valid slice of initialized INPUT structs.
+    let sent = unsafe { SendInput(&inputs, cb) } as usize;
+    if sent == inputs.len() {
+        Ok(())
+    } else {
+        Err(format!(
+            "SendInput delivered {sent}/{} mouse events",
+            inputs.len()
+        ))
     }
 }

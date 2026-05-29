@@ -1083,6 +1083,48 @@ impl VictauriMcpHandler {
                 let Some(ref_id) = &params.ref_id else {
                     return missing_param("ref_id", "click");
                 };
+                if params.trusted.unwrap_or(false) {
+                    // Resolve the element's viewport-center coords, run the
+                    // actionability check, then deliver a real OS click.
+                    let probe = format!(
+                        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
+                         if(!__e) return null; __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
+                         var __b=__e.getBoundingClientRect(); \
+                         return {{x:__b.left+__b.width/2, y:__b.top+__b.height/2}}",
+                        js_string(ref_id)
+                    );
+                    let raw = match self
+                        .eval_with_return(&probe, params.webview_label.as_deref())
+                        .await
+                    {
+                        Ok(r) => r,
+                        Err(e) => return tool_error(e),
+                    };
+                    let Ok(point) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                        return tool_error_with_hint(
+                            format!("ref not found: {ref_id}"),
+                            RecoveryHint::CheckInput,
+                        );
+                    };
+                    let (Some(x), Some(y)) = (
+                        point.get("x").and_then(serde_json::Value::as_f64),
+                        point.get("y").and_then(serde_json::Value::as_f64),
+                    ) else {
+                        return tool_error_with_hint(
+                            format!("ref not found: {ref_id}"),
+                            RecoveryHint::CheckInput,
+                        );
+                    };
+                    return match self
+                        .bridge
+                        .native_click(params.webview_label.as_deref(), x, y)
+                    {
+                        Ok(()) => json_result(
+                            &serde_json::json!({"ok": true, "trusted": true, "x": x, "y": y}),
+                        ),
+                        Err(e) => tool_error(e),
+                    };
+                }
                 let code = format!("return window.__VICTAURI__?.click({})", js_string(ref_id));
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
@@ -1212,6 +1254,31 @@ impl VictauriMcpHandler {
                 let Some(text) = &params.text else {
                     return missing_param("text", "type_text");
                 };
+                if params.trusted.unwrap_or(false) {
+                    // Focus the element via JS, then deliver real OS keystrokes
+                    // (isTrusted: true) for handlers that reject synthetic events.
+                    let focus = format!(
+                        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); if(__e){{__e.focus();}} return !!__e",
+                        js_string(ref_id)
+                    );
+                    let focused = self
+                        .eval_with_return(&focus, params.webview_label.as_deref())
+                        .await
+                        .unwrap_or_default();
+                    if focused != "true" {
+                        return tool_error_with_hint(
+                            format!("ref not found or not focusable: {ref_id}"),
+                            RecoveryHint::CheckInput,
+                        );
+                    }
+                    return match self
+                        .bridge
+                        .native_type_text(params.webview_label.as_deref(), text)
+                    {
+                        Ok(()) => json_result(&serde_json::json!({"ok": true, "trusted": true})),
+                        Err(e) => tool_error(e),
+                    };
+                }
                 let code = format!(
                     "return window.__VICTAURI__?.type({}, {})",
                     js_string(ref_id),
@@ -1227,6 +1294,22 @@ impl VictauriMcpHandler {
                 let Some(key) = &params.key else {
                     return missing_param("key", "press_key");
                 };
+                if params.trusted.unwrap_or(false) {
+                    // Optionally focus a target element, then send a real OS key.
+                    if let Some(ref_id) = &params.ref_id {
+                        let focus = format!(
+                            "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); if(__e){{__e.focus();}} return !!__e",
+                            js_string(ref_id)
+                        );
+                        let _ = self
+                            .eval_with_return(&focus, params.webview_label.as_deref())
+                            .await;
+                    }
+                    return match self.bridge.native_key(params.webview_label.as_deref(), key) {
+                        Ok(()) => json_result(&serde_json::json!({"ok": true, "trusted": true})),
+                        Err(e) => tool_error(e),
+                    };
+                }
                 let code = format!("return window.__VICTAURI__?.pressKey({})", js_string(key));
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await

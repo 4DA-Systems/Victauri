@@ -139,6 +139,11 @@ pub struct InteractParams {
     pub x: Option<f64>,
     /// Vertical scroll position (pixels). Used with `scroll_into_view` when `ref_id` is null.
     pub y: Option<f64>,
+    /// If true, deliver a real OS mouse click (`isTrusted: true`) at the
+    /// element's center instead of a synthetic DOM click (for `click`). Falls
+    /// back with an error on platforms without native-input support. Currently
+    /// implemented on Windows.
+    pub trusted: Option<bool>,
     /// Target webview label.
     pub webview_label: Option<String>,
 }
@@ -180,6 +185,11 @@ pub struct InputParams {
     pub text: Option<String>,
     /// Key to press (for `press_key` action, e.g. "Enter", "Escape", "Tab", "`ArrowDown`").
     pub key: Option<String>,
+    /// If true, deliver real OS keyboard input (`isTrusted: true`) instead of
+    /// synthetic DOM events — for `type_text`/`press_key`. The target element is
+    /// focused first (via `ref_id`). Falls back with an error on platforms
+    /// without native-input support. Currently implemented on Windows.
+    pub trusted: Option<bool>,
     /// Target webview label.
     pub webview_label: Option<String>,
 }
