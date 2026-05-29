@@ -1045,6 +1045,7 @@ async fn state_port_reflected_in_info() {
         task_tracker: victauri_plugin::introspection::TaskTracker::new(),
         bridge_ready: std::sync::atomic::AtomicBool::new(true),
         bridge_notify: tokio::sync::Notify::new(),
+        db_search_paths: Vec::new(),
     });
 
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(&["main"]));
@@ -1116,6 +1117,7 @@ fn builder_custom_port_reflected_in_state() {
         task_tracker: victauri_plugin::introspection::TaskTracker::new(),
         bridge_ready: std::sync::atomic::AtomicBool::new(true),
         bridge_notify: tokio::sync::Notify::new(),
+        db_search_paths: Vec::new(),
     });
 
     assert_eq!(state.port.load(std::sync::atomic::Ordering::Relaxed), 8888);
@@ -1382,6 +1384,7 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
         task_tracker: victauri_plugin::introspection::TaskTracker::new(),
         bridge_ready: std::sync::atomic::AtomicBool::new(true),
         bridge_notify: tokio::sync::Notify::new(),
+        db_search_paths: Vec::new(),
     })
 }
 
@@ -2378,9 +2381,11 @@ async fn callback_mock_ghost_commands_detected() {
     state.registry.register(cmd);
 
     let base = start_callback_server(state, &["main"], |code| {
+        // detect_ghost_commands now projects command names in JS
+        // (`getIpcLog().map(c => c.command)`), so the bridge returns a string
+        // array rather than full IPC entries.
         if code.contains("getIpcLog") {
-            r#"[{"command":"greet","status":200},{"command":"secret_cmd","status":200}]"#
-                .to_string()
+            r#"["greet","secret_cmd"]"#.to_string()
         } else {
             "null".to_string()
         }

@@ -137,6 +137,7 @@ fn test_state() -> Arc<VictauriState> {
         task_tracker: victauri_plugin::introspection::TaskTracker::new(),
         bridge_ready: std::sync::atomic::AtomicBool::new(true),
         bridge_notify: tokio::sync::Notify::new(),
+        db_search_paths: Vec::new(),
     })
 }
 
@@ -161,6 +162,7 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
         task_tracker: victauri_plugin::introspection::TaskTracker::new(),
         bridge_ready: std::sync::atomic::AtomicBool::new(true),
         bridge_notify: tokio::sync::Notify::new(),
+        db_search_paths: Vec::new(),
     })
 }
 
@@ -418,8 +420,10 @@ async fn verify_state_happy_path() {
 async fn detect_ghost_commands_happy_path() {
     let state = test_state();
     let base = start_callback_server(state, &["main"], |script| {
+        // detect_ghost_commands projects command names in JS, so the bridge
+        // returns a string array rather than full IPC entries.
         if script.contains("getIpcLog") {
-            r#"[{"command":"greet","status":200}]"#.to_string()
+            r#"["greet"]"#.to_string()
         } else {
             "null".to_string()
         }

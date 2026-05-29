@@ -867,10 +867,11 @@ async fn adversarial_get_window_state_nonexistent_label() {
         json!({"action": "get_state", "label": "fake"}),
     )
     .await;
-    // Should return an empty array since no window matches
+    // A specific label matching no window is an error (not a silent empty
+    // array, which reads as "success, no state").
     assert!(
-        body.contains("[]"),
-        "get_window_state with nonexistent label should return empty array: {body}"
+        body.contains("window not found") && body.contains("fake"),
+        "get_window_state with nonexistent label should return an error: {body}"
     );
 }
 

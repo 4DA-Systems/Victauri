@@ -157,6 +157,13 @@ pub struct VictauriState {
     pub bridge_ready: AtomicBool,
     /// Notifies waiters when the JS bridge ready signal arrives.
     pub bridge_notify: tokio::sync::Notify,
+    /// Extra absolute directories searched by `query_db` / `introspect db_health`
+    /// in addition to the OS app directories. Lets Victauri reach databases an
+    /// app stores outside the Tauri app-data dir (e.g. a project or working
+    /// directory). Opt in via [`VictauriBuilder::db_search_paths`]. Absolute
+    /// `query_db` paths are permitted only when they resolve within one of these
+    /// roots (or an app directory).
+    pub db_search_paths: Vec<std::path::PathBuf>,
 }
 
 /// Builder for configuring the Victauri plugin before adding it to a Tauri app.
@@ -190,6 +197,7 @@ pub struct VictauriBuilder {
     commands: Vec<victauri_core::CommandInfo>,
     allow_file_navigation: bool,
     listen_events: Vec<String>,
+    db_search_paths: Vec<std::path::PathBuf>,
 }
 
 impl Default for VictauriBuilder {
@@ -214,6 +222,7 @@ impl Default for VictauriBuilder {
             commands: Vec::new(),
             allow_file_navigation: false,
             listen_events: Vec::new(),
+            db_search_paths: Vec::new(),
         }
     }
 }
@@ -493,6 +502,29 @@ impl VictauriBuilder {
         self
     }
 
+    /// Add extra directories for `query_db` and `introspect db_health` to search
+    /// for `SQLite` databases, beyond the OS app directories.
+    ///
+    /// Many apps store their database outside the Tauri app-data directory (in a
+    /// project/working directory, a user-chosen location, or a configured path).
+    /// By default Victauri only searches the OS app directories, so those
+    /// databases are unreachable. Registering their containing directory here
+    /// makes them discoverable by relative name and permits absolute `query_db`
+    /// paths that resolve within these roots.
+    ///
+    /// Access remains read-only and path-traversal-guarded. Paths are added
+    /// as-is; relative paths are resolved against the process working directory.
+    #[must_use]
+    pub fn db_search_paths<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<std::path::PathBuf>,
+    {
+        self.db_search_paths
+            .extend(paths.into_iter().map(Into::into));
+        self
+    }
+
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
     #[must_use]
@@ -612,6 +644,7 @@ impl VictauriBuilder {
             let auth_token = self.resolve_auth_token();
             let privacy_config = self.build_privacy_config();
             let allow_file_navigation = self.allow_file_navigation;
+            let db_search_paths = self.db_search_paths;
             let on_ready = self.on_ready;
             let commands = self.commands;
             let listen_events = self.listen_events;
@@ -646,6 +679,7 @@ impl VictauriBuilder {
                         task_tracker: introspection::TaskTracker::new(),
                         bridge_ready: AtomicBool::new(false),
                         bridge_notify: tokio::sync::Notify::new(),
+                        db_search_paths,
                     });
                     state.startup_timeline.mark("state_created");
 

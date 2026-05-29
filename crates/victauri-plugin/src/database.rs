@@ -49,6 +49,31 @@ fn is_read_only(sql: &str) -> bool {
         .any(|prefix| trimmed.starts_with(prefix))
 }
 
+/// Returns true if `sql` is the write form of a PRAGMA (`PRAGMA name = value`).
+///
+/// The read forms (`PRAGMA name`, `PRAGMA name(arg)`) are not flagged. An `=`
+/// is only significant when it appears outside of any quoted string.
+#[cfg(feature = "sqlite")]
+fn is_pragma_write(sql: &str) -> bool {
+    let cleaned = strip_sql_comments(sql);
+    let trimmed = cleaned.trim_start();
+    if !trimmed.to_lowercase().starts_with("pragma") {
+        return false;
+    }
+    let bytes = trimmed.as_bytes();
+    let mut in_single = false;
+    let mut in_double = false;
+    for &b in bytes {
+        match b {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'=' if !in_single && !in_double => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Discover `SQLite` database files in a directory (non-recursive, max depth 2).
 #[cfg(feature = "sqlite")]
 #[must_use]
@@ -97,6 +122,17 @@ pub fn query(
         return Err(
             "only SELECT, PRAGMA, EXPLAIN, and WITH queries are allowed (read-only access)"
                 .to_string(),
+        );
+    }
+
+    // Defence in depth: the connection is opened READ_ONLY (SQLite rejects
+    // actual writes), but explicitly reject the write form of PRAGMA
+    // (`PRAGMA name = value`) so the read-only contract is self-evident and
+    // not solely reliant on the open flags. The read forms `PRAGMA name` and
+    // `PRAGMA name(arg)` remain allowed.
+    if is_pragma_write(sql) {
+        return Err(
+            "PRAGMA writes (PRAGMA name = value) are not allowed (read-only access)".to_string(),
         );
     }
 
@@ -306,6 +342,35 @@ mod tests {
         let (_f, path) = create_test_db();
         let result = query(&path, "PRAGMA table_info(users)", &[], None).unwrap();
         assert!(result["row_count"].as_u64().unwrap() >= 3);
+    }
+
+    #[test]
+    fn pragma_read_allowed() {
+        let (_f, path) = create_test_db();
+        assert!(query(&path, "PRAGMA journal_mode", &[], None).is_ok());
+        assert!(query(&path, "PRAGMA user_version", &[], None).is_ok());
+    }
+
+    #[test]
+    fn rejects_pragma_write_form() {
+        let (_f, path) = create_test_db();
+        for sql in [
+            "PRAGMA journal_mode=DELETE",
+            "PRAGMA journal_mode = WAL",
+            "PRAGMA user_version=12345",
+            "  pragma  synchronous = 0 ",
+        ] {
+            let err = query(&path, sql, &[], None).unwrap_err();
+            assert!(err.contains("PRAGMA writes"), "expected block for: {sql}");
+        }
+    }
+
+    #[test]
+    fn is_pragma_write_ignores_equals_in_strings() {
+        // A read-form PRAGMA whose argument contains '=' inside quotes is not a write.
+        assert!(!is_pragma_write("PRAGMA table_info('a=b')"));
+        assert!(is_pragma_write("PRAGMA foo = 'a=b'"));
+        assert!(!is_pragma_write("SELECT 1 = 1"));
     }
 
     #[test]

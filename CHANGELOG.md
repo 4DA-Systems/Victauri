@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **CRITICAL: `eval_js` silently returned wrong values for multi-statement code.** The auto-return heuristic prepended `return` to any code not starting with a statement keyword, so a statement block like `foo(); return bar()` was rewritten to `return foo(); return bar()` — executing only the first statement and silently discarding the rest (typically returning `undefined`). This affected the extremely common "do X, then return Y" pattern (`localStorage.setItem(...); return localStorage.getItem(...)`, `window.scrollTo(...); return window.scrollY`, etc.). The heuristic is now string/comment/template-aware and only prepends `return` to a single bare expression; multi-statement code and code with an explicit `return` are used as-is.
+- **Deeply-nested `eval_js` results leaked the internal envelope.** serde_json's default recursion limit (128) caused results nested deeper than ~127 levels to fail parsing and silently fall through to returning the raw `{"__victauri_ok":...}` envelope as a string. When the recursion-limited parse fails, the envelope is now stripped by string slicing (no recursion) so the actual value is returned. (The recursion limit is intentionally *not* disabled — an unbounded recursive parse/serialize of a pathologically deep result overflows the worker thread stack and crashes the host.)
+- **`logs ipc`/`logs network`/`logs slow_ipc` and `detect_ghost_commands` failed on real apps.** These tools fetched the entire IPC/network log — including full request/response bodies — and exceeded the 5 MB eval cap on apps with substantial traffic (e.g. responses containing large arrays). They now apply a default entry limit (100) and truncate per-entry fields larger than 4 KB; `detect_ghost_commands` projects only command names; `slow_ipc` truncates each returned entry.
+- **`window get_state` on a nonexistent label** now returns an error instead of an empty array (which read as "success, no state").
+- **`window resize` with zero width/height** is now rejected with a clear error.
+- **`eval_js` timeout message** now explains that JavaScript syntax errors surface only as a timeout (the webview cannot report parse errors back to the host), alongside unresolved promises and infinite loops.
+
+### Added
+
+- **`VictauriBuilder::db_search_paths(paths)`**: register extra directories for `query_db` and `introspect db_health` to search for SQLite databases, beyond the OS app directories. Many apps store their database in a project/working directory or a custom location that the default app-data search cannot reach. Configured roots take precedence in auto-discovery, and absolute `query_db` paths are permitted when they resolve within an allowed root (read-only and path-traversal-guarded as before).
+
+### Security
+
+- **`query_db` blocks the write form of PRAGMA** (`PRAGMA name = value`) explicitly. The connection was already opened `SQLITE_OPEN_READ_ONLY` (so writes could not persist), but the write form is now rejected up front so the read-only contract does not rely solely on the open flags. Read forms (`PRAGMA name`, `PRAGMA name(arg)`) remain allowed.
+
 ## [0.5.6] - 2026-05-28
 
 ### Changed

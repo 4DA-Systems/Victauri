@@ -35,8 +35,8 @@ use crate::VictauriState;
 use crate::bridge::WebviewBridge;
 
 use helpers::{
-    js_string, json_result, missing_param, sanitize_css_color, tool_disabled, tool_error,
-    validate_url,
+    RecoveryHint, js_string, json_result, missing_param, sanitize_css_color, tool_disabled,
+    tool_error, tool_error_with_hint, validate_url,
 };
 
 pub use backend_params::*;
@@ -67,6 +67,15 @@ const MAX_EVAL_CODE_LEN: usize = 1_000_000;
 /// Maximum length of a JavaScript eval return value (5 MB).
 /// Results exceeding this are truncated to prevent memory exhaustion.
 const MAX_EVAL_RESULT_LEN: usize = 5_000_000;
+
+/// Default number of entries returned by IPC/network log tools when no explicit
+/// `limit` is given. Prevents busy apps (large logs) from exceeding the eval cap.
+const DEFAULT_LOG_LIMIT: usize = 100;
+
+/// Per-field byte cap applied to each IPC/network log entry before serialization.
+/// Large request/response bodies are truncated with a marker so the aggregate
+/// log stays well under [`MAX_EVAL_RESULT_LEN`] even on heavy-traffic apps.
+const MAX_LOG_FIELD_BYTES: usize = 4096;
 
 const RESOURCE_URI_IPC_LOG: &str = "victauri://ipc-log";
 const RESOURCE_URI_WINDOWS: &str = "victauri://windows";
@@ -455,7 +464,10 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<GhostCommandParams>,
     ) -> CallToolResult {
-        let code = "return window.__VICTAURI__?.getIpcLog()";
+        // Project only command names in JS — ghost detection never needs request
+        // or response bodies, so this stays tiny even when the full IPC log is
+        // huge (avoids the eval size cap on busy apps).
+        let code = "return (window.__VICTAURI__?.getIpcLog() || []).map(function(c){ return (c && c.command) || null; }).filter(function(x){ return x; })";
         let ipc_json = match self
             .eval_with_return(code, params.webview_label.as_deref())
             .await
@@ -464,13 +476,12 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to read IPC log: {e}")),
         };
 
-        let ipc_calls: Vec<serde_json::Value> = match serde_json::from_str(&ipc_json) {
+        let command_names: Vec<String> = match serde_json::from_str(&ipc_json) {
             Ok(v) => v,
             Err(e) => return tool_error(format!("failed to parse IPC log JSON: {e}")),
         };
-        let frontend_commands: Vec<String> = ipc_calls
-            .iter()
-            .filter_map(|c| c.get("command").and_then(|v| v.as_str()).map(String::from))
+        let frontend_commands: Vec<String> = command_names
+            .into_iter()
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
@@ -952,7 +963,7 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("cannot access app data directory: {e}")),
         };
 
-        let search_dirs: Vec<std::path::PathBuf> = [
+        let app_dirs: Vec<std::path::PathBuf> = [
             self.bridge.app_data_dir(),
             self.bridge.app_config_dir(),
             self.bridge.app_local_data_dir(),
@@ -963,17 +974,43 @@ impl VictauriMcpHandler {
         .collect::<std::collections::HashSet<_>>()
         .into_iter()
         .collect();
+        // Explicitly-configured roots (VictauriBuilder::db_search_paths) take
+        // precedence over OS app directories for auto-discovery, so a configured
+        // application DB wins over incidental ones (e.g. WebView internals).
+        let mut search_dirs: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
+        search_dirs.extend(app_dirs);
 
         let db_path = if let Some(ref rel_path) = params.path {
+            let candidate = std::path::Path::new(rel_path);
+            // Absolute paths are permitted only when they resolve within one of
+            // the allowed roots (app directories or configured db_search_paths).
+            if candidate.is_absolute() {
+                if !candidate.exists() {
+                    return tool_error(format!("database not found: {rel_path}"));
+                }
+                if !search_dirs
+                    .iter()
+                    .any(|d| Self::safe_within(d, candidate).is_ok())
+                {
+                    return tool_error(format!(
+                        "absolute path '{rel_path}' is not within an allowed directory; \
+                         register its parent via VictauriBuilder::db_search_paths"
+                    ));
+                }
+            }
             let mut found = None;
-            for dir in &search_dirs {
-                let resolved = dir.join(rel_path);
-                if resolved.exists() {
-                    if let Err(e) = Self::safe_within(dir, &resolved) {
-                        return tool_error(e);
+            if candidate.is_absolute() {
+                found = Some(candidate.to_path_buf());
+            } else {
+                for dir in &search_dirs {
+                    let resolved = dir.join(rel_path);
+                    if resolved.exists() {
+                        if let Err(e) = Self::safe_within(dir, &resolved) {
+                            return tool_error(e);
+                        }
+                        found = Some(resolved);
+                        break;
                     }
-                    found = Some(resolved);
-                    break;
                 }
             }
             if let Some(p) = found {
@@ -1211,6 +1248,15 @@ impl VictauriMcpHandler {
         match params.action {
             WindowAction::GetState => {
                 let states = self.bridge.get_window_states(params.label.as_deref());
+                // A specific label that matches no window is an error, not an
+                // empty array (which reads as "success, no state").
+                if states.is_empty()
+                    && let Some(label) = params.label.as_deref()
+                {
+                    return tool_error(format!(
+                        "window not found: '{label}' (use window.list to see available labels)"
+                    ));
+                }
                 json_result(&states)
             }
             WindowAction::List => {
@@ -1242,6 +1288,14 @@ impl VictauriMcpHandler {
                 let Some(height) = params.height else {
                     return missing_param("height", "resize");
                 };
+                if width == 0 || height == 0 {
+                    return tool_error_with_hint(
+                        format!(
+                            "invalid window size {width}x{height}: width and height must be > 0"
+                        ),
+                        RecoveryHint::CheckInput,
+                    );
+                }
                 match self
                     .bridge
                     .resize_window(params.label.as_deref(), width, height)
@@ -1784,29 +1838,21 @@ impl VictauriMcpHandler {
                     .filter
                     .as_ref()
                     .map_or_else(|| "null".to_string(), |f| js_string(f));
-                let limit_arg = params
-                    .limit
-                    .map_or_else(|| "null".to_string(), |l| l.to_string());
-                let code =
-                    format!("return window.__VICTAURI__?.getNetworkLog({filter_arg}, {limit_arg})");
+                let limit = params.limit.unwrap_or(DEFAULT_LOG_LIMIT);
+                let source = format!("window.__VICTAURI__?.getNetworkLog({filter_arg}, {limit})");
+                let code = trimmed_log_js(&source, limit);
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
             LogsAction::Ipc => {
                 let wait = params.wait_for_capture.unwrap_or(false);
-                let limit_arg = params.limit.map(|l| format!("{l}")).unwrap_or_default();
+                let limit = params.limit.unwrap_or(DEFAULT_LOG_LIMIT);
                 if wait {
-                    let limit_js = if limit_arg.is_empty() {
-                        "undefined".to_string()
-                    } else {
-                        limit_arg.clone()
-                    };
+                    let inner = trimmed_log_js("window.__VICTAURI__.getIpcLog()", limit);
                     let code = format!(
                         r"return (async function() {{
                             await window.__VICTAURI__.waitForIpcComplete(500);
-                            var log = window.__VICTAURI__.getIpcLog() || [];
-                            var lim = {limit_js};
-                            return (lim !== undefined) ? log.slice(-lim) : log;
+                            return (function() {{ {inner} }})();
                         }})()"
                     );
                     let timeout = std::time::Duration::from_millis(5000);
@@ -1818,11 +1864,7 @@ impl VictauriMcpHandler {
                         Err(e) => tool_error(e),
                     }
                 } else {
-                    let code = if limit_arg.is_empty() {
-                        "return window.__VICTAURI__?.getIpcLog()".to_string()
-                    } else {
-                        format!("return window.__VICTAURI__?.getIpcLog({limit_arg})")
-                    };
+                    let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", limit);
                     self.eval_bridge(&code, params.webview_label.as_deref())
                         .await
                 }
@@ -1867,12 +1909,20 @@ impl VictauriMcpHandler {
                     return missing_param("threshold_ms", "slow_ipc");
                 };
                 let limit = params.limit.unwrap_or(20);
+                let mb = MAX_LOG_FIELD_BYTES;
                 let code = format!(
                     r"return (function() {{
+                        var MB = {mb};
+                        function trimField(v) {{
+                            if (typeof v === 'string') return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
+                            if (v && typeof v === 'object') {{ var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }} if (s.length > MB) return '[truncated ' + s.length + ' bytes]'; }}
+                            return v;
+                        }}
+                        function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
                         var log = window.__VICTAURI__?.getIpcLog() || [];
                         var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold}; }});
                         slow.sort(function(a, b) {{ return (b.duration_ms || 0) - (a.duration_ms || 0); }});
-                        return {{ threshold_ms: {threshold}, count: Math.min(slow.length, {limit}), calls: slow.slice(0, {limit}) }};
+                        return {{ threshold_ms: {threshold}, count: Math.min(slow.length, {limit}), calls: slow.slice(0, {limit}).map(trimEntry) }};
                     }})()",
                 );
                 self.eval_bridge(&code, None).await
@@ -2987,31 +3037,16 @@ impl VictauriMcpHandler {
             pending.insert(id.clone(), tx);
         }
 
-        // Auto-prepend `return` so bare expressions produce a value.
-        // Only skip for code that starts with a statement keyword where
-        // prepending `return` would be a syntax error.
-        let code = code.trim();
-        let needs_return = !code.starts_with("return ")
-            && !code.starts_with("return;")
-            && !code.starts_with('{')
-            && !code.starts_with("if ")
-            && !code.starts_with("if(")
-            && !code.starts_with("for ")
-            && !code.starts_with("for(")
-            && !code.starts_with("while ")
-            && !code.starts_with("while(")
-            && !code.starts_with("switch ")
-            && !code.starts_with("try ")
-            && !code.starts_with("const ")
-            && !code.starts_with("let ")
-            && !code.starts_with("var ")
-            && !code.starts_with("function ")
-            && !code.starts_with("class ")
-            && !code.starts_with("throw ");
-        let code = if needs_return {
-            format!("return {code}")
+        // Auto-prepend `return` so bare expressions produce a value — but ONLY
+        // for single expressions. Multi-statement blocks (or code containing an
+        // explicit `return`) are used as-is. Prepending `return` to a statement
+        // block like `foo(); return bar()` would parse as `return foo();` and
+        // silently discard everything after the first statement (issue: core
+        // primitive returned wrong/undefined values for "do X, then return Y").
+        let code = if should_prepend_return(code) {
+            format!("return {}", code.trim())
         } else {
-            code.to_string()
+            code.trim().to_string()
         };
 
         let id_js = js_string(&id);
@@ -3052,61 +3087,71 @@ impl VictauriMcpHandler {
                         raw.len()
                     ));
                 }
-                if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&raw) {
-                    if let Some(err) = envelope.get("__victauri_err") {
-                        return Err(format!(
-                            "JavaScript error: {}",
-                            err.as_str().unwrap_or("unknown error")
-                        ));
-                    }
-                    if envelope.get("__victauri_ok").is_some() {
-                        let js_type = envelope
-                            .get("__victauri_type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("value");
-                        return match js_type {
-                            "undefined" => Ok("undefined".to_string()),
-                            "null" => Ok("null".to_string()),
-                            _ => {
-                                let val = &envelope["__victauri_ok"];
-                                Ok(serde_json::to_string(val)
-                                    .unwrap_or_else(|_| "null".to_string()))
-                            }
-                        };
-                    }
-                }
-                Ok(raw)
+                unwrap_eval_envelope(raw)
             }
             Ok(Err(_)) => Err("eval callback channel closed".to_string()),
             Err(_) => {
                 self.state.pending_evals.lock().await.remove(&id);
-                Err(format!("eval timed out after {}s", timeout.as_secs()))
+                Err(format!(
+                    "eval timed out after {}s — the code never resolved. Common causes: a \
+                     JavaScript syntax error in the injected code (parse errors cannot be \
+                     reported by the webview and surface only as this timeout), an unresolved \
+                     promise, or an infinite loop. Verify the code parses and resolves.",
+                    timeout.as_secs()
+                ))
             }
         }
     }
 
     #[cfg(feature = "sqlite")]
     async fn run_db_health(&self, db_path: Option<&str>) -> Result<serde_json::Value, String> {
-        let data_dir = self.bridge.app_data_dir()?;
-        let path = if let Some(p) = db_path {
-            data_dir.join(p)
-        } else {
-            let mut found = None;
-            if let Ok(entries) = std::fs::read_dir(&data_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension()
-                        .is_some_and(|ext| ext == "db" || ext == "sqlite" || ext == "sqlite3")
-                    {
-                        found = Some(p);
-                        break;
-                    }
-                }
-            }
-            found.ok_or_else(|| "no database found in app data directory".to_string())?
-        };
-        Self::safe_within(&data_dir, &path)?;
+        // Roots: configured db_search_paths first, then app directories.
+        let mut roots: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
+        for d in [
+            self.bridge.app_data_dir(),
+            self.bridge.app_local_data_dir(),
+            self.bridge.app_config_dir(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            roots.push(d);
+        }
 
+        let path = if let Some(p) = db_path {
+            let candidate = std::path::Path::new(p);
+            if candidate.is_absolute() {
+                if !roots
+                    .iter()
+                    .any(|r| Self::safe_within(r, candidate).is_ok())
+                {
+                    return Err(format!(
+                        "absolute path '{p}' is not within an allowed directory; \
+                         register its parent via VictauriBuilder::db_search_paths"
+                    ));
+                }
+                candidate.to_path_buf()
+            } else {
+                roots
+                    .iter()
+                    .map(|r| r.join(p))
+                    .find(|c| c.exists())
+                    .ok_or_else(|| format!("database not found: {p}"))?
+            }
+        } else {
+            roots
+                .iter()
+                .flat_map(|r| crate::database::discover_databases(r))
+                .next()
+                .ok_or_else(|| {
+                    "no database found in app directories or configured db_search_paths".to_string()
+                })?
+        };
+        // No further containment check needed: the path is either discovered
+        // within an allowed root, an existing relative file joined onto an
+        // allowed root, or an absolute path already verified above. (A
+        // safe_within check against app_data_dir would fail when that directory
+        // does not exist — common for apps that store data elsewhere.)
         let path_str = path
             .to_str()
             .ok_or_else(|| "invalid path encoding".to_string())?
@@ -3440,9 +3485,325 @@ impl ServerHandler for VictauriMcpHandler {
     }
 }
 
+/// Build a JS expression that takes an array of log entries (`source_expr`),
+/// keeps at most `limit` of the most recent, and truncates any per-entry field
+/// larger than [`MAX_LOG_FIELD_BYTES`]. This keeps IPC/network log results under
+/// the eval size cap on busy apps where individual entries carry large bodies.
+///
+/// The returned code is a complete `return (...)` statement.
+fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
+    let mb = MAX_LOG_FIELD_BYTES;
+    format!(
+        r"return (function() {{
+            var MB = {mb};
+            function trimField(v) {{
+                if (typeof v === 'string') {{
+                    return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
+                }}
+                if (v && typeof v === 'object') {{
+                    var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }}
+                    if (s.length > MB) {{ return '[truncated ' + s.length + ' bytes]'; }}
+                }}
+                return v;
+            }}
+            function trimEntry(e) {{
+                if (e == null || typeof e !== 'object') return e;
+                var out = Array.isArray(e) ? [] : {{}};
+                for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) out[k] = trimField(e[k]); }}
+                return out;
+            }}
+            var arr = {source_expr} || [];
+            if (arr.length > {limit}) arr = arr.slice(-{limit});
+            return arr.map(trimEntry);
+        }})()"
+    )
+}
+
+/// Unwrap the `{"__victauri_ok": <val>, "__victauri_type": <t>}` (or
+/// `{"__victauri_err": <msg>}`) envelope produced by the eval bridge into the
+/// value/error string returned to callers.
+///
+/// Parsing uses `serde_json`'s default recursion limit (it is intentionally NOT
+/// disabled — an unbounded recursive parse of a pathologically deep result
+/// overflows the worker thread stack and crashes the host). When the parse
+/// fails because the value is too deeply nested, the envelope is stripped by
+/// string slicing (no recursion) so the actual value is still returned rather
+/// than leaking the raw envelope string.
+fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
+    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&raw) {
+        if let Some(err) = envelope.get("__victauri_err") {
+            return Err(format!(
+                "JavaScript error: {}",
+                err.as_str().unwrap_or("unknown error")
+            ));
+        }
+        if envelope.get("__victauri_ok").is_some() {
+            let js_type = envelope
+                .get("__victauri_type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("value");
+            return match js_type {
+                "undefined" => Ok("undefined".to_string()),
+                "null" => Ok("null".to_string()),
+                _ => Ok(serde_json::to_string(&envelope["__victauri_ok"])
+                    .unwrap_or_else(|_| "null".to_string())),
+            };
+        }
+    }
+    // Fallback for results too deeply nested for the recursion-limited parser.
+    if let Some(after) = raw.strip_prefix(r#"{"__victauri_ok":"#)
+        && let Some(idx) = after.rfind(r#","__victauri_type":"#)
+    {
+        return Ok(after[..idx].to_string());
+    }
+    if let Some(after) = raw.strip_prefix(r#"{"__victauri_err":"#) {
+        let msg = after.trim_end_matches('}').trim_matches('"');
+        return Err(format!("JavaScript error: {msg}"));
+    }
+    Ok(raw)
+}
+
+/// Statement keywords where a leading `return` would be a syntax error.
+const STMT_STARTS: &[&str] = &[
+    "return ",
+    "return;",
+    "return\n",
+    "return\t",
+    "if ",
+    "if(",
+    "for ",
+    "for(",
+    "while ",
+    "while(",
+    "switch ",
+    "switch(",
+    "try ",
+    "try{",
+    "const ",
+    "let ",
+    "var ",
+    "function ",
+    "function(",
+    "function*",
+    "class ",
+    "throw ",
+    "do ",
+    "do{",
+    "{",
+    "async function",
+    "debugger",
+];
+
+/// String/template/comment scan state for [`should_prepend_return`].
+#[derive(PartialEq, Clone, Copy)]
+enum ScanState {
+    Code,
+    SingleQuote,
+    DoubleQuote,
+    Template,
+}
+
+/// Decide whether to wrap `code` with a leading `return`.
+///
+/// Only a single bare expression should get `return` prepended. Code that is a
+/// multi-statement block, contains an explicit top-level `return`, or starts
+/// with a statement keyword is used as-is — prepending `return` to such code
+/// would execute only the first statement and silently discard the rest.
+///
+/// The scan is string/template/comment-aware and only treats a `;` or an
+/// explicit `return` token as significant when it occurs at bracket depth 0
+/// outside of any string, template literal, or comment.
+fn should_prepend_return(code: &str) -> bool {
+    use ScanState::{Code, DoubleQuote, SingleQuote, Template};
+
+    let code = code.trim();
+    if code.is_empty() {
+        return false;
+    }
+
+    if STMT_STARTS.iter().any(|k| code.starts_with(k)) {
+        return false;
+    }
+
+    let bytes = code.as_bytes();
+    let mut i = 0;
+    let mut depth: i32 = 0;
+    let mut state = ScanState::Code;
+
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
+    // Is there a top-level `return` token starting at byte `i` (word-bounded)?
+    let is_return_token = |i: usize| -> bool {
+        let prev_ok = i == 0 || !is_ident(bytes[i - 1]);
+        prev_ok
+            && code[i..].starts_with("return")
+            && bytes.get(i + 6).copied().is_none_or(|b| !is_ident(b))
+    };
+
+    while i < bytes.len() {
+        let c = bytes[i];
+        match state {
+            Code => match c {
+                b'\'' => state = SingleQuote,
+                b'"' => state = DoubleQuote,
+                b'`' => state = Template,
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
+                    i += 2;
+                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                        i += 1;
+                    }
+                    i += 2;
+                    continue;
+                }
+                b'(' | b'[' | b'{' => depth += 1,
+                b')' | b']' | b'}' => depth -= 1,
+                // A top-level `;` with more code after it == multi-statement.
+                b';' if depth <= 0 && !code[i + 1..].trim().is_empty() => return false,
+                // An explicit top-level `return` token means the code already returns.
+                b'r' if depth <= 0 && is_return_token(i) => return false,
+                _ => {}
+            },
+            SingleQuote => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == b'\'' {
+                    state = Code;
+                }
+            }
+            DoubleQuote => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == b'"' {
+                    state = Code;
+                }
+            }
+            Template => {
+                if c == b'\\' {
+                    i += 1;
+                } else if c == b'`' {
+                    state = Code;
+                }
+            }
+        }
+        i += 1;
+    }
+
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepend_return_bare_expressions() {
+        assert!(should_prepend_return("document.title"));
+        assert!(should_prepend_return("5 + 5"));
+        assert!(should_prepend_return("\"justexpr\""));
+        assert!(should_prepend_return("await fetch('/x')"));
+        assert!(should_prepend_return(
+            "document.querySelectorAll('a').length"
+        ));
+        assert!(should_prepend_return("x ? a : b"));
+        // Single trailing semicolon on a bare expression is still an expression.
+        assert!(should_prepend_return("document.title;"));
+        // Semicolons inside strings must not be treated as boundaries.
+        assert!(should_prepend_return("'a;b;c'"));
+        assert!(should_prepend_return("\"x;y\".length"));
+        // IIFE workaround: the `;` lives inside the arrow body (depth > 0).
+        assert!(should_prepend_return("(()=>{window.x=5; return 'ok'})()"));
+    }
+
+    #[test]
+    fn no_prepend_for_statement_blocks() {
+        // The original silent-corruption cases.
+        assert!(!should_prepend_return(
+            "localStorage.setItem('k','v'); return localStorage.getItem('k')"
+        ));
+        assert!(!should_prepend_return(
+            "window.scrollTo(0,50); return window.scrollY"
+        ));
+        assert!(!should_prepend_return("console.log('x'); return 123"));
+        assert!(!should_prepend_return("window.__z=7; return 'ok'"));
+        // Explicit return without a preceding semicolon (newline-separated).
+        assert!(!should_prepend_return("window.x = 5\nreturn window.x"));
+    }
+
+    #[test]
+    fn no_prepend_for_statement_keywords() {
+        assert!(!should_prepend_return("return 42"));
+        assert!(!should_prepend_return("const x = 1; return x"));
+        assert!(!should_prepend_return("let y = 2"));
+        assert!(!should_prepend_return("var z = 3"));
+        assert!(!should_prepend_return("if (x) { return 1 }"));
+        assert!(!should_prepend_return("for (const x of y) doThing(x)"));
+        assert!(!should_prepend_return("throw new Error('x')"));
+        assert!(!should_prepend_return("function f(){}"));
+        assert!(!should_prepend_return("{ a: 1 }")); // object-literal-as-block ambiguity → as-is
+    }
+
+    #[test]
+    fn empty_code_no_prepend() {
+        assert!(!should_prepend_return(""));
+        assert!(!should_prepend_return("   "));
+    }
+
+    #[test]
+    fn envelope_unwrap_value() {
+        assert_eq!(
+            unwrap_eval_envelope(r#"{"__victauri_ok":"4DA","__victauri_type":"value"}"#.into()),
+            Ok("\"4DA\"".to_string())
+        );
+        assert_eq!(
+            unwrap_eval_envelope(r#"{"__victauri_ok":42,"__victauri_type":"value"}"#.into()),
+            Ok("42".to_string())
+        );
+    }
+
+    #[test]
+    fn envelope_unwrap_undefined_null() {
+        assert_eq!(
+            unwrap_eval_envelope(r#"{"__victauri_ok":null,"__victauri_type":"undefined"}"#.into()),
+            Ok("undefined".to_string())
+        );
+        assert_eq!(
+            unwrap_eval_envelope(r#"{"__victauri_ok":null,"__victauri_type":"null"}"#.into()),
+            Ok("null".to_string())
+        );
+    }
+
+    #[test]
+    fn envelope_unwrap_error() {
+        let r = unwrap_eval_envelope(r#"{"__victauri_err":"boom"}"#.into());
+        assert!(r.unwrap_err().contains("boom"));
+    }
+
+    #[test]
+    fn envelope_unwrap_deeply_nested_does_not_leak() {
+        // Build an envelope whose value is nested far deeper than serde_json's
+        // default recursion limit (128). The full parse fails, so the slice
+        // fallback must return the value — NOT the raw `__victauri_ok` envelope.
+        let mut value = String::from("0");
+        for _ in 0..300 {
+            value = format!("{{\"n\":{value}}}");
+        }
+        let raw = format!(r#"{{"__victauri_ok":{value},"__victauri_type":"value"}}"#);
+        let out = unwrap_eval_envelope(raw).unwrap();
+        assert!(
+            out.starts_with(r#"{"n":"#),
+            "deep value should be unwrapped, got: {}",
+            &out[..out.len().min(40)]
+        );
+        assert!(
+            !out.contains("__victauri_ok"),
+            "envelope must not leak into the result"
+        );
+    }
 
     #[test]
     fn js_string_simple() {

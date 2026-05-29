@@ -1,5 +1,40 @@
 # Migration Guide
 
+## Unreleased (post-0.5.6)
+
+### Behavior change: `eval_js` multi-statement code
+
+`eval_js` previously prepended `return` to any code that did not start with a
+statement keyword. This silently broke multi-statement snippets — e.g.
+`localStorage.setItem('k','v'); return localStorage.getItem('k')` was rewritten
+to `return localStorage.setItem(...); ...` and returned `undefined`.
+
+It now correctly only prepends `return` to a single bare expression. Multi-statement
+code with an explicit `return` (or wrapped in an IIFE) works as written. **No action
+needed** — code that previously got the wrong value now gets the right one. If you
+adopted an IIFE workaround (`(()=>{ ...; return x })()`), it continues to work.
+
+### New: reach databases outside the app-data directory
+
+If your app stores its SQLite database outside the OS app-data directory (a common
+case — project/working dir, a user-chosen path), `query_db` and `introspect db_health`
+could not find it. Register the containing directory:
+
+```rust
+VictauriBuilder::new()
+    .db_search_paths(["../data", "/abs/path/to/data"])
+    .build()
+```
+
+Configured roots take precedence in auto-discovery, and absolute `query_db` paths are
+permitted when they resolve within an allowed root (read-only and traversal-guarded).
+
+### Log tools now apply a default limit
+
+`logs ipc`/`network`/`slow_ipc` now return at most 100 entries by default and truncate
+per-entry fields larger than 4 KB. Pass an explicit `limit` for more entries. This
+prevents the tools from exceeding the eval size cap on apps with heavy IPC traffic.
+
 ## v0.5.5 → v0.5.6
 
 ### Breaking Change: Auth Enabled by Default
