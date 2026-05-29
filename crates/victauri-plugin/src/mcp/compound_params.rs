@@ -543,6 +543,122 @@ pub struct CssParams {
     pub webview_label: Option<String>,
 }
 
+// ── route (network interception) ──────────────────────────────────────────
+
+/// Action for the compound `route` tool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteAction {
+    /// Add a network route rule.
+    Add,
+    /// List active route rules.
+    List,
+    /// Remove a route rule by id.
+    Clear,
+    /// Remove all route rules.
+    ClearAll,
+    /// Return the log of intercepted requests.
+    Matches,
+}
+
+impl fmt::Display for RouteAction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Add => f.write_str("add"),
+            Self::List => f.write_str("list"),
+            Self::Clear => f.write_str("clear"),
+            Self::ClearAll => f.write_str("clear_all"),
+            Self::Matches => f.write_str("matches"),
+        }
+    }
+}
+
+/// How a route rule's pattern is matched against the request URL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteMatchType {
+    /// URL contains the pattern (default).
+    Substring,
+    /// Glob with `*` wildcards.
+    Glob,
+    /// JavaScript regular expression.
+    Regex,
+    /// Exact URL match.
+    Exact,
+}
+
+impl RouteMatchType {
+    /// Bridge string for this match type.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Substring => "substring",
+            Self::Glob => "glob",
+            Self::Regex => "regex",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+/// What a matched route rule does to the request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteBehavior {
+    /// Abort the request (the app sees a network failure).
+    Block,
+    /// Return a synthetic mock response (fetch only; XHR falls back to delay).
+    Fulfill,
+    /// Let the request proceed, but after `delay_ms` (latency injection).
+    Delay,
+}
+
+impl RouteBehavior {
+    /// Bridge string for this behavior.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Fulfill => "fulfill",
+            Self::Delay => "delay",
+        }
+    }
+}
+
+/// Parameters for the compound `route` tool (network interception / mock / block / delay).
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct RouteParams {
+    /// Action: add, list, clear, `clear_all`, matches.
+    pub action: RouteAction,
+    /// URL pattern to match (for add). Interpreted per `match_type`.
+    pub pattern: Option<String>,
+    /// How `pattern` is matched: substring (default), glob, regex, exact.
+    pub match_type: Option<RouteMatchType>,
+    /// Restrict to a single HTTP method (for add, optional).
+    pub method: Option<String>,
+    /// What the rule does: block, fulfill, delay (for add). Defaults to fulfill.
+    pub behavior: Option<RouteBehavior>,
+    /// Mock response status code (for fulfill). Default 200.
+    pub status: Option<u16>,
+    /// Mock response status text (for fulfill).
+    pub status_text: Option<String>,
+    /// Mock response headers as a JSON object (for fulfill).
+    pub headers: Option<serde_json::Value>,
+    /// Mock response body (for fulfill). Strings sent as-is; other JSON is serialized.
+    pub body: Option<serde_json::Value>,
+    /// Mock response content-type (for fulfill). Default "application/json".
+    pub content_type: Option<String>,
+    /// Delay in milliseconds (for delay, or to delay a fulfill).
+    pub delay_ms: Option<u64>,
+    /// Maximum times this rule fires (for add). 0 or omitted = unlimited.
+    pub times: Option<u64>,
+    /// Route rule id (for clear).
+    pub id: Option<u64>,
+    /// Maximum match-log entries to return (for matches).
+    pub limit: Option<usize>,
+    /// Target webview label.
+    pub webview_label: Option<String>,
+}
+
 // ── logs ────────────────────────────────────────────────────────────────────
 
 /// Action for the compound `logs` tool.

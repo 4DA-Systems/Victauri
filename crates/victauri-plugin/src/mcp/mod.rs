@@ -1808,6 +1808,111 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
+        description = "Network request interception (Playwright route() equivalent, no CDP). \
+            Matches webview fetch/XHR by URL and blocks, mocks, or delays them. \
+            Actions:\n\
+            - `add`: add a rule. `pattern` (+ optional `match_type`: substring/glob/regex/exact, \
+              and `method`) selects requests; `behavior` is `block` (abort), `fulfill` (return a \
+              mock `status`/`headers`/`body`/`content_type`), or `delay` (proceed after `delay_ms`). \
+              `times` limits how often it fires. Rules are page-scoped (cleared on reload).\n\
+            - `list`: list active rules.\n\
+            - `clear` (by `id`) / `clear_all`: remove rules.\n\
+            - `matches`: log of intercepted requests.\n\
+            Note: fetch supports all behaviors; XHR supports block/delay (fulfill is fetch-only). \
+            Top-level navigation, sub-resource (img/css), and WebSocket traffic are not intercepted. \
+            For Tauri IPC-layer faults, prefer the `fault` tool.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn route(&self, Parameters(params): Parameters<RouteParams>) -> CallToolResult {
+        self.track_tool_call();
+        match params.action {
+            RouteAction::Add => {
+                if !self.state.privacy.is_tool_enabled("route.add") {
+                    return tool_disabled("route.add");
+                }
+                let Some(pattern) = &params.pattern else {
+                    return missing_param("pattern", "add");
+                };
+                let behavior = params.behavior.unwrap_or(RouteBehavior::Fulfill);
+                let match_type = params.match_type.unwrap_or(RouteMatchType::Substring);
+                let mut rule = serde_json::json!({
+                    "pattern": pattern,
+                    "match_type": match_type.as_str(),
+                    "action": behavior.as_str(),
+                });
+                if let Some(m) = &params.method {
+                    rule["method"] = serde_json::json!(m);
+                }
+                if let Some(s) = params.status {
+                    rule["status"] = serde_json::json!(s);
+                }
+                if let Some(st) = &params.status_text {
+                    rule["status_text"] = serde_json::json!(st);
+                }
+                if let Some(h) = &params.headers {
+                    rule["headers"] = h.clone();
+                }
+                if let Some(b) = &params.body {
+                    // A JSON string body is passed through as-is; structured JSON
+                    // is stringified so the bridge sends valid JSON text.
+                    rule["body"] = match b {
+                        serde_json::Value::String(s) => serde_json::json!(s),
+                        other => serde_json::json!(other.to_string()),
+                    };
+                }
+                if let Some(ct) = &params.content_type {
+                    rule["content_type"] = serde_json::json!(ct);
+                }
+                if let Some(d) = params.delay_ms {
+                    rule["delay_ms"] = serde_json::json!(d);
+                }
+                if let Some(t) = params.times {
+                    rule["times"] = serde_json::json!(t);
+                }
+                let code = format!(
+                    "return window.__VICTAURI__?.addRoute({})",
+                    js_string(&rule.to_string())
+                );
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
+            }
+            RouteAction::List => {
+                self.eval_bridge(
+                    "return window.__VICTAURI__?.getRouteRules()",
+                    params.webview_label.as_deref(),
+                )
+                .await
+            }
+            RouteAction::Clear => {
+                let Some(id) = params.id else {
+                    return missing_param("id", "clear");
+                };
+                let code = format!("return window.__VICTAURI__?.clearRoute({id})");
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
+            }
+            RouteAction::ClearAll => {
+                self.eval_bridge(
+                    "return window.__VICTAURI__?.clearRoutes()",
+                    params.webview_label.as_deref(),
+                )
+                .await
+            }
+            RouteAction::Matches => {
+                let limit = params.limit.unwrap_or(100);
+                let code = format!("return window.__VICTAURI__?.getRouteMatches({limit})");
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
+            }
+        }
+    }
+
+    #[tool(
         description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls).",
         annotations(
             read_only_hint = true,
@@ -2806,6 +2911,10 @@ impl VictauriMcpHandler {
             "css" => {
                 let p: CssParams = Self::parse_args(args)?;
                 self.css(Parameters(p)).await
+            }
+            "route" => {
+                let p: RouteParams = Self::parse_args(args)?;
+                self.route(Parameters(p)).await
             }
             "logs" => {
                 let p: LogsParams = Self::parse_args(args)?;

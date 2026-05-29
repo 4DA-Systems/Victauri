@@ -737,6 +737,7 @@ async fn mcp_tool_count_is_correct() {
         "recording",
         "inspect",
         "css",
+        "route",
         "logs",
     ];
 
@@ -2433,6 +2434,58 @@ async fn callback_mock_get_network_log() {
     assert!(
         body.contains("api.example.com"),
         "logs network should return mocked entries, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn callback_mock_route_add_dispatch() {
+    let state = test_state();
+    let base = start_callback_server(state, &["main"], |code| {
+        if code.contains("addRoute") {
+            r#"{"ok":true,"id":1,"echo":"ROUTE_OK"}"#.to_string()
+        } else {
+            "null".to_string()
+        }
+    })
+    .await;
+
+    let (client, session_id) = mcp_session(&base).await;
+    let body = mcp_call_tool(
+        &client,
+        &base,
+        &session_id,
+        "route",
+        serde_json::json!({
+            "action": "add",
+            "pattern": "*api.example.com*",
+            "match_type": "glob",
+            "behavior": "block"
+        }),
+    )
+    .await;
+
+    assert!(
+        body.contains("ROUTE_OK"),
+        "route add should dispatch addRoute to the bridge and return its result, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn callback_mock_route_missing_pattern() {
+    let state = test_state();
+    let base = start_callback_server(state, &["main"], |_| "null".to_string()).await;
+    let (client, session_id) = mcp_session(&base).await;
+    let body = mcp_call_tool(
+        &client,
+        &base,
+        &session_id,
+        "route",
+        serde_json::json!({"action": "add", "behavior": "fulfill"}),
+    )
+    .await;
+    assert!(
+        body.contains("pattern"),
+        "route add without pattern should error about the missing pattern, got: {body}"
     );
 }
 

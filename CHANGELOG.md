@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Webview parity (Playwright-grade, no CDP)
+
+- **`route` tool — network interception (Phase 1).** Match webview `fetch`/XHR by URL (`substring`/`glob`/`regex`/`exact`, optional method) and **block** (abort), **fulfill** (return a synthetic `status`/`headers`/`body`/`content_type` mock — fetch only), or **delay** (latency injection). `times` limits firings; `route matches` logs intercepts; rules are page-scoped. The Playwright `route()` equivalent, implemented purely in the JS bridge — works identically on WebView2/WKWebView/WebKitGTK. (XHR supports block/delay; fulfill is fetch-only. Top-level navigation, sub-resources, and WebSocket frames are not intercepted; for Tauri IPC-layer faults use `fault`.)
+
 ## [0.6.0] - 2026-05-30
 
 ### Fixed
