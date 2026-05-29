@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Victauri Browser",
-    "version": "0.5.6",
+    "version": "0.6.0",
     "description": "MCP-native inspection for any website. X-ray vision for AI agents.",
     "permissions": [
         "activeTab",

@@ -92,6 +92,9 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
     if result.content.len() == 1 {
         return match &result.content[0].raw {
             RawContent::Text(tc) => {
+                // Parse with the default (stack-safe) recursion limit. Extremely
+                // deep results fall back to a JSON-encoded string rather than
+                // risking a stack overflow from an unbounded recursive parse.
                 let parsed = serde_json::from_str::<serde_json::Value>(&tc.text)
                     .unwrap_or_else(|_| serde_json::Value::String(tc.text.clone()));
                 serde_json::json!({ "result": parsed })

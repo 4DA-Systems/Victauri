@@ -2,7 +2,7 @@
   "name": "victauri",
   "displayName": "Victauri",
   "description": "Full-stack testing and inspection for Tauri apps",
-  "version": "0.5.6",
+  "version": "0.6.0",
   "publisher": "4da-systems",
   "license": "Apache-2.0",
   "repository": {
