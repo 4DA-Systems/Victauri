@@ -19,10 +19,16 @@ serde_json = { workspace = true }
 [dev-dependencies]
 victauri-test = { workspace = true }
 tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+harness = true
+
+[[test]]
+name = "adversarial"
+path = "tests/adversarial.rs"
 harness = true
 
 [lints]

@@ -72,6 +72,76 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  e2e-real-app:
+    name: Real-App E2E (demo-app, adversarial)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev xvfb
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+
+      # Build the app and the test up front so the run step doesn't rebuild a
+      # running binary. Debug build → the Victauri plugin is active.
+      - name: Build demo-app + adversarial test
+        run: |
+          cargo build -p demo-app --bin demo-app
+          cargo test -p demo-app --test adversarial --no-run
+
+      - name: Run adversarial E2E against the live app
+        run: |
+          set -euo pipefail
+          # Software rendering for headless WebKitGTK in CI.
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          export LIBGL_ALWAYS_SOFTWARE=1
+
+          # Launch the GUI app under a virtual display, in the background.
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            ./target/debug/demo-app > /tmp/demo-app.log 2>&1 &
+          APP_PID=$!
+
+          # Wait for the embedded MCP server, failing fast if the app exits.
+          up=false
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:7373/health >/dev/null 2>&1; then
+              echo "demo-app MCP server up after ${i}s"; up=true; break
+            fi
+            if ! kill -0 "$APP_PID" 2>/dev/null; then
+              echo "::error::demo-app exited before the server came up"; cat /tmp/demo-app.log; exit 1
+            fi
+            sleep 1
+          done
+          if [ "$up" != true ]; then
+            echo "::error::demo-app MCP server never became reachable"; cat /tmp/demo-app.log; kill "$APP_PID" || true; exit 1
+          fi
+
+          # Shared-app E2E tests must run sequentially (they mutate app state).
+          set +e
+          VICTAURI_E2E=1 cargo test -p demo-app --test adversarial -- --test-threads=1 --nocapture
+          status=$?
+          set -e
+
+          kill "$APP_PID" 2>/dev/null || true
+          if [ $status -ne 0 ]; then
+            echo "=== demo-app log (last 100 lines) ==="; tail -100 /tmp/demo-app.log || true
+          fi
+          exit $status
+
+      - name: Upload demo-app log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: demo-app-e2e-log
+          path: /tmp/demo-app.log
+          if-no-files-found: ignore
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
