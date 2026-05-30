@@ -642,7 +642,9 @@ Deep backend introspection — command performance profiling, IPC contract testi
 
 ### fault
 
-Inject faults into Tauri IPC commands at the Rust layer for chaos engineering. CDP cannot inject failures at the backend.
+Probe a backend command handler under failure for chaos engineering.
+
+> **Scope:** faults apply **only** to commands you run via the `invoke_command` tool — they do **not** intercept the app's real user-driven IPC (`window.__TAURI_INTERNALS__.invoke`), which Tauri serves below the JS layer Victauri can reach. Use `fault` to test a handler's error path when *you* drive it (e.g. "does my error branch return the right shape on a DB failure?"). It does not reproduce a failure a user clicking the UI would experience — that path is not interceptable cross-platform without CDP.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|

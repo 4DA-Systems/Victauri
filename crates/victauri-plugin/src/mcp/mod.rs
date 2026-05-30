@@ -1907,7 +1907,10 @@ impl VictauriMcpHandler {
             - `matches`: log of intercepted requests.\n\
             Note: fetch supports all behaviors; XHR supports block/delay (fulfill is fetch-only). \
             Top-level navigation, sub-resource (img/css), and WebSocket traffic are not intercepted. \
-            For Tauri IPC-layer faults, prefer the `fault` tool.",
+            Tauri IPC (ipc.localhost) is OBSERVE-ONLY: such calls appear in `matches`, but block/\
+            fulfill/delay do NOT take effect on them — Tauri serves IPC below the JS fetch layer, so \
+            it cannot be controlled cross-platform without CDP. There is no IPC-control tool; the \
+            `fault` tool only affects commands you drive via `invoke_command`, not real user IPC.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2594,9 +2597,12 @@ impl VictauriMcpHandler {
     // ── Fault Injection / Chaos Engineering ──────────────────────────────────
 
     #[tool(
-        description = "Inject faults into Tauri IPC commands at the Rust layer for chaos engineering. \
+        description = "Probe a backend command handler under failure by faulting it for chaos engineering. \
             Simulate slow commands, backend errors, dropped responses, and corrupted data. \
-            CDP cannot inject failures at the backend — it can only observe the frontend.\n\n\
+            SCOPE: faults apply ONLY to commands you run via this server's `invoke_command` tool — \
+            they do NOT intercept the app's real user-driven IPC (window.__TAURI_INTERNALS__.invoke), \
+            which runs below the layer Victauri can reach. Use this to test a handler's error path when \
+            YOU drive it; it does not reproduce a failure a user clicking the UI would see.\n\n\
             Actions:\n\
             - `inject`: Add a fault rule (requires `command`, `fault_type`). Optional: `delay_ms`, `error_message`, `max_triggers`.\n\
             - `list`: List all active fault injection rules.\n\
