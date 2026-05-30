@@ -7,9 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-05-31
+
 ### Changed
 
 - **Resilience: `eval_js` fails fast when the webview reloads or the app stops responding.** Previously, if the bridge went away mid-session (e.g. an SPA navigation, a Tauri app's startup-recovery re-navigation, or an app crash), every subsequent eval blocked the full timeout (up to 30s) and returned an unclear result. Now, when an eval times out, the next eval on that window does a fast liveness probe (~2s) and fails immediately with a clear "the webview may have reloaded or the app stopped responding" message if the bridge is gone. Harmless when the bridge is alive — the re-probe succeeds in milliseconds (verified: a normal eval 70ms after a 30s timeout). The timeout message also now names the reload/crash case as a possible cause.
+
+### Internal / docs
+
+- Property tests for the `eval_js` auto-return heuristic (fuzz + multi-statement-corruption invariants) — the code that caused the worst bug, now locked down.
+- New adversarial multi-step real-app E2E suite run against the demo-app in CI (`e2e-real-app` job) — the guard the original happy-path tests lacked.
+- `bump-version` scripts now update the `[workspace.dependencies]` inter-crate pins automatically.
+- Tools reference docs: added `route`/`trace`/trusted-input/iframe; corrected stale `query_db`/`wait_for`/`list_app_dir`/`read_app_file` params.
 
 ## [0.7.0] - 2026-05-30
 
