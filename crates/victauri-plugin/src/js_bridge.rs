@@ -2129,7 +2129,10 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // ── Dialog Capture ───────────────────────────────────────────────────────
 
-    var dialogAutoResponses = { alert: { action: 'accept' }, confirm: { action: 'accept' }, prompt: { action: 'accept', text: '' } };
+    // Default fail-CLOSED (audit #32): merely loading the bridge must not silently
+    // auto-approve "are you sure?" gates. confirm() -> false, prompt() -> null until
+    // an explicit set_dialog_response opts into accepting.
+    var dialogAutoResponses = { alert: { action: 'accept' }, confirm: { action: 'dismiss' }, prompt: { action: 'dismiss', text: '' } };
 
     // ── Resource Cleanup ────────────────────────────────────────────────────
 

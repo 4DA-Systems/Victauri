@@ -1095,7 +1095,7 @@ fn dialog_capture() {
                 setup_js: None,
             },
             TestCase {
-                name: "confirm returns true by default".into(),
+                name: "confirm returns false by default (fail-closed)".into(),
                 code: r"
                     var result = window.confirm('Are you sure?');
                     var log = window.__VICTAURI__.getDialogLog();
@@ -1107,7 +1107,7 @@ fn dialog_capture() {
                 setup_js: None,
             },
             TestCase {
-                name: "prompt returns empty string by default".into(),
+                name: "prompt returns null by default (fail-closed)".into(),
                 code: r"
                     var result = window.prompt('Enter name:');
                     var log = window.__VICTAURI__.getDialogLog();
@@ -1149,8 +1149,13 @@ fn dialog_capture() {
     assert_all_pass(&results);
     assert_eq!(results[0].result.as_ref().unwrap()["type"], "alert");
     assert_eq!(results[0].result.as_ref().unwrap()["message"], "Hello!");
-    assert_eq!(results[1].result.as_ref().unwrap()["result"], true);
+    // Fail-closed default (audit #32): confirm() -> false, prompt() -> null.
+    assert_eq!(results[1].result.as_ref().unwrap()["result"], false);
     assert_eq!(results[1].result.as_ref().unwrap()["type"], "confirm");
+    assert_eq!(
+        results[2].result.as_ref().unwrap()["result"],
+        serde_json::Value::Null
+    );
     assert_eq!(results[2].result.as_ref().unwrap()["type"], "prompt");
     assert_eq!(results[3].result.as_ref().unwrap()["result"], false);
     assert_eq!(results[4].result.as_ref().unwrap()["count"], 0);

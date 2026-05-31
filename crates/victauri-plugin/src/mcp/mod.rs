@@ -102,6 +102,32 @@ const SAFE_ENV_PREFIXES: &[&str] = &[
     "LOGNAME",
 ];
 
+/// Substrings that mark an env var as a secret. Even when a name matches a
+/// `SAFE_ENV_PREFIXES` entry it is dropped if it contains one of these — a prefix
+/// like `TAURI_`/`VICTAURI_` otherwise leaks `TAURI_SIGNING_PRIVATE_KEY`,
+/// `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, or `VICTAURI_AUTH_TOKEN` (audit #5).
+const SECRET_ENV_SUBSTRINGS: &[&str] = &[
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PRIVATE",
+    "CREDENTIAL",
+    "APIKEY",
+    "AUTH",
+    "_KEY",
+];
+
+/// Whether an env var name is safe to surface via `app_info`: it must match a
+/// known-safe prefix AND not look like a secret (audit #5).
+fn is_safe_env_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    SAFE_ENV_PREFIXES
+        .iter()
+        .any(|prefix| upper.starts_with(prefix))
+        && !SECRET_ENV_SUBSTRINGS.iter().any(|s| upper.contains(s))
+}
+
 /// MCP tool handler that dispatches tool calls to the webview bridge and state.
 #[derive(Clone)]
 pub struct VictauriMcpHandler {
@@ -768,12 +794,7 @@ impl VictauriMcpHandler {
         let local_data_dir = self.bridge.app_local_data_dir().ok();
 
         let env_vars: std::collections::BTreeMap<String, String> = std::env::vars()
-            .filter(|(k, _)| {
-                let upper = k.to_uppercase();
-                SAFE_ENV_PREFIXES
-                    .iter()
-                    .any(|prefix| upper.starts_with(prefix))
-            })
+            .filter(|(k, _)| is_safe_env_key(k))
             .collect();
 
         #[cfg(feature = "sqlite")]
@@ -1727,6 +1748,19 @@ impl VictauriMcpHandler {
                 }
                 let mut replay_results = Vec::new();
                 for call in &calls {
+                    // Enforce the same command allow/blocklist as invoke_command
+                    // (audit #30/#31): a recorded/imported session must not be able to
+                    // invoke a command an operator blocked.
+                    if !self.state.privacy.is_invoke_allowed(&call.command)
+                        || !self.state.privacy.is_command_allowed(&call.command)
+                    {
+                        replay_results.push(serde_json::json!({
+                            "command": call.command,
+                            "status": "blocked",
+                            "error": "blocked by privacy configuration",
+                        }));
+                        continue;
+                    }
                     let code = format!(
                         "return window.__TAURI_INTERNALS__.invoke({})",
                         js_string(&call.command)
@@ -2523,6 +2557,15 @@ impl VictauriMcpHandler {
                 let Some(command) = params.command else {
                     return missing_param("command", "contract_record");
                 };
+                // contract_record invokes the command with caller-supplied args, so
+                // it must honour the same allow/blocklist as invoke_command (audit #30).
+                if !self.state.privacy.is_invoke_allowed(&command)
+                    || !self.state.privacy.is_command_allowed(&command)
+                {
+                    return tool_error(format!(
+                        "command '{command}' is blocked by privacy configuration"
+                    ));
+                }
                 let args_json = params.args.unwrap_or(serde_json::json!({}));
                 let args_str =
                     serde_json::to_string(&args_json).unwrap_or_else(|_| "{}".to_string());
@@ -2573,6 +2616,13 @@ impl VictauriMcpHandler {
                 }
                 let mut results = Vec::new();
                 for baseline in &baselines {
+                    // Re-checking a baseline re-invokes the command; honour the
+                    // allow/blocklist in case it changed since recording (audit #30).
+                    if !self.state.privacy.is_invoke_allowed(&baseline.command)
+                        || !self.state.privacy.is_command_allowed(&baseline.command)
+                    {
+                        continue;
+                    }
                     let args_str =
                         serde_json::to_string(&baseline.args).unwrap_or_else(|_| "{}".to_string());
                     let code = format!(
@@ -2662,7 +2712,7 @@ impl VictauriMcpHandler {
                     "configured_plugins": config.get("plugins"),
                     "victauri": {
                         "registered_commands": self.state.registry.list().len(),
-                        "auth_enabled": self.state.privacy.redaction_enabled,
+                        "redaction_enabled": self.state.privacy.redaction_enabled,
                         "privacy_profile": format!("{:?}", self.state.privacy.profile),
                         "disabled_tools": &self.state.privacy.disabled_tools,
                     },
@@ -4359,6 +4409,23 @@ mod prop_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_filter_drops_secrets_keeps_safe() {
+        // Safe, non-secret vars pass.
+        assert!(is_safe_env_key("HOME"));
+        assert!(is_safe_env_key("LANG"));
+        assert!(is_safe_env_key("TAURI_ENV_PLATFORM"));
+        assert!(is_safe_env_key("VICTAURI_PORT"));
+        // Secret-looking vars are dropped even under a safe prefix (audit #5).
+        assert!(!is_safe_env_key("TAURI_SIGNING_PRIVATE_KEY"));
+        assert!(!is_safe_env_key("TAURI_SIGNING_PRIVATE_KEY_PASSWORD"));
+        assert!(!is_safe_env_key("VICTAURI_AUTH_TOKEN"));
+        assert!(!is_safe_env_key("VICTAURI_API_KEY"));
+        // Unknown prefixes are dropped regardless.
+        assert!(!is_safe_env_key("AWS_SECRET_ACCESS_KEY"));
+        assert!(!is_safe_env_key("RANDOM_VAR"));
+    }
 
     #[test]
     fn prepend_return_bare_expressions() {
