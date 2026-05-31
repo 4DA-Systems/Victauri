@@ -1,0 +1,78 @@
+name: Release VS Code Extension
+
+# Decoupled from the core workspace release. Ships ONLY when you tag it:
+#   git tag vscode-v0.7.1 && git push origin vscode-v0.7.1
+# Or run manually (workflow_dispatch) with dry_run=true to just build + package.
+#
+# Required secrets (Settings → Secrets → Actions):
+#   VSCE_PAT  — Azure DevOps PAT, Marketplace → Manage scope (publisher 4da-systems)
+#   OVSX_TOKEN — (optional) open-vsx.org token, for Cursor / VSCodium / agent IDEs
+on:
+  push:
+    tags: ["vscode-v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build + package only (do not publish)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Build & publish VS Code extension
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#vscode-v}"
+          echo "package.json=$PKG_VERSION  tag=$TAG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag ($TAG_VERSION) does not match editors/vscode/package.json ($PKG_VERSION) — bump the package.json version first"
+            exit 1
+          fi
+
+      - name: Package .vsix
+        run: npx --yes @vscode/vsce package --no-dependencies -o victauri.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false'
+        run: npx --yes @vscode/vsce publish --packagePath victauri.vsix -p "$VSCE_PAT"
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      - name: Publish to Open VSX (Cursor / VSCodium / agent IDEs)
+        if: ${{ (startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false') && env.OVSX_TOKEN != '' }}
+        run: npx --yes ovsx publish victauri.vsix -p "$OVSX_TOKEN"
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+
+      - name: Attach .vsix to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        with:
+          name: ${{ github.ref_name }}
+          files: editors/vscode/victauri.vsix
+          fail_on_unmatched_files: true

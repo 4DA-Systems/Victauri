@@ -1,0 +1,54 @@
+name: Release npm Package
+
+# Decoupled from the core workspace release. Ships ONLY when you tag it:
+#   git tag npm-v0.7.1 && git push origin npm-v0.7.1
+# Or run manually with dry_run=true to pack + validate without publishing.
+#
+# Required secret:
+#   NPM_TOKEN — npmjs.com automation token with publish rights for `victauri-browser`
+on:
+  push:
+    tags: ["npm-v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Pack + validate only (do not publish)"
+        type: boolean
+        default: true
+
+jobs:
+  publish:
+    name: Publish npm package
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: extensions/npm
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Verify tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          TAG_VERSION="${GITHUB_REF_NAME#npm-v}"
+          echo "package.json=$PKG_VERSION  tag=$TAG_VERSION"
+          if [ "$PKG_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::tag ($TAG_VERSION) does not match extensions/npm/package.json ($PKG_VERSION)"
+            exit 1
+          fi
+
+      - name: Install + validate (pack)
+        run: |
+          npm install --no-audit --no-fund || true
+          npm pack --dry-run
+
+      - name: Publish to npm
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false'
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

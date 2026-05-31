@@ -1,0 +1,81 @@
+name: Surface Audit (rot detector)
+
+# Proactively catches the failure mode that bit us: a published surface silently
+# drifting out of sync with the repo (VS Code Marketplace stuck at 0.2.0 while the
+# repo was 0.7.1). Runs weekly + on demand. FAILS (emails you) if anything has
+# drifted or stopped building — so rot can't hide.
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch:
+
+jobs:
+  audit:
+    name: Audit published surfaces vs repo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Compare repo versions vs published registries
+        id: versions
+        run: |
+          set +e
+          DRIFT=0
+          {
+            echo "## Surface audit"
+            echo ""
+            echo "| Surface | Repo | Published | Status |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          newer() { dpkg --compare-versions "$1" gt "$2"; }   # repo > published ?
+
+          # --- crates.io (core; workspace version) ---
+          REPO_CRATE=$(grep -m1 -E '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          PUB_CRATE=$(curl -fsSL "https://crates.io/api/v1/crates/victauri-plugin" 2>/dev/null | jq -r '.crate.max_stable_version // .crate.max_version // "unknown"')
+          if [ "$PUB_CRATE" = "unknown" ]; then ST="⚠️ query failed";
+          elif newer "$REPO_CRATE" "$PUB_CRATE"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
+          else ST="✅ in sync"; fi
+          echo "| crates.io (victauri-plugin) | $REPO_CRATE | $PUB_CRATE | $ST |" >> "$GITHUB_STEP_SUMMARY"
+
+          # --- npm (browser host installer) ---
+          REPO_NPM=$(node -p "require('./extensions/npm/package.json').version")
+          NPM_NAME=$(node -p "require('./extensions/npm/package.json').name")
+          PUB_NPM=$(npm view "$NPM_NAME" version 2>/dev/null || echo "unknown")
+          if [ "$PUB_NPM" = "unknown" ]; then ST="⚠️ not published / query failed";
+          elif newer "$REPO_NPM" "$PUB_NPM"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
+          else ST="✅ in sync"; fi
+          echo "| npm ($NPM_NAME) | $REPO_NPM | $PUB_NPM | $ST |" >> "$GITHUB_STEP_SUMMARY"
+
+          # --- VS Code Marketplace ---
+          REPO_VSC=$(node -p "require('./editors/vscode/package.json').version")
+          PUB_VSC=$(curl -fsSL -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \
+            -H "Accept: application/json;api-version=3.0-preview.1" -H "Content-Type: application/json" \
+            -d '{"filters":[{"criteria":[{"filterType":7,"value":"4da-systems.victauri"}]}],"flags":914}' 2>/dev/null \
+            | jq -r '.results[0].extensions[0].versions[0].version // "unknown"')
+          if [ "$PUB_VSC" = "unknown" ]; then ST="⚠️ not found / query failed";
+          elif newer "$REPO_VSC" "$PUB_VSC"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
+          else ST="✅ in sync"; fi
+          echo "| VS Code Marketplace (4da-systems.victauri) | $REPO_VSC | $PUB_VSC | $ST |" >> "$GITHUB_STEP_SUMMARY"
+
+          echo "drift=$DRIFT" >> "$GITHUB_OUTPUT"
+
+      - name: VS Code extension build health
+        id: vscodehealth
+        working-directory: editors/vscode
+        run: |
+          set -e
+          npm install --no-audit --no-fund
+          npm run lint
+          npm run build
+          echo "✅ VS Code extension still typechecks + builds" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if anything drifted
+        if: steps.versions.outputs.drift != '0'
+        run: |
+          echo "::error::A published surface is behind the repo — see the job summary. Publish it (tag vscode-v* / npm-v* / v*) or bump the repo."
+          exit 1
