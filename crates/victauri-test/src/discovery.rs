@@ -18,6 +18,7 @@ fn victauri_base_dir() -> PathBuf {
 /// effective user, and not group/other-writable. On Windows the temp dir is already
 /// per-user, and the writer restricts ACLs via `icacls`, so no extra check is needed.
 #[cfg(unix)]
+#[allow(unsafe_code)] // single FFI call to geteuid(); see SAFETY note below
 fn dir_is_trusted(path: &std::path::Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -26,9 +27,9 @@ fn dir_is_trusted(path: &std::path::Path) -> bool {
     if !meta.file_type().is_dir() {
         return false; // reject symlinks / non-dirs
     }
-    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    // SAFETY: `geteuid` has no preconditions, takes no arguments, and cannot fail.
     let euid = unsafe { libc::geteuid() };
-    meta.uid() == euid && meta.permissions().mode() & 0o022 == 0
+    meta.uid() == euid && (meta.permissions().mode() & 0o022) == 0
 }
 
 #[cfg(not(unix))]
