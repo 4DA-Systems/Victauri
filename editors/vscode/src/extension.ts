@@ -344,6 +344,24 @@ interface DiscoveredServer {
   token: string | undefined;
 }
 
+// Whether a discovery dir is safe to trust (audit #9): on Unix the temp root is
+// world-writable, so it must be a real directory (not a symlink), owned by the
+// current user, and not group/other-writable. Windows temp is per-user and the
+// writer restricts ACLs via icacls, so no extra check is needed there.
+async function dirIsTrusted(dir: string): Promise<boolean> {
+  if (process.platform === "win32") return true;
+  try {
+    const st = await fs.lstat(dir);
+    if (!st.isDirectory()) return false;
+    const myUid = typeof process.getuid === "function" ? process.getuid() : -1;
+    if (myUid >= 0 && st.uid !== myUid) return false;
+    if ((st.mode & 0o022) !== 0) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function discoverServer(
   defaultPort: number
 ): Promise<DiscoveredServer> {
@@ -358,6 +376,9 @@ async function discoverServer(
     for (const entry of entries) {
       if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
       const dir = path.join(baseDir, entry.name);
+      // Only trust a discovery dir we own — never read a token from a dir a local
+      // attacker could have planted in the world-writable temp root (audit #9).
+      if (!(await dirIsTrusted(dir))) continue;
       try {
         const portStr = (await fs.readFile(path.join(dir, "port"), "utf-8")).trim();
         const port = parseInt(portStr, 10);

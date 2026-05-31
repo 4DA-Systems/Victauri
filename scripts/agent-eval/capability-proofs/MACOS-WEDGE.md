@@ -87,6 +87,34 @@ claim. (Windows initially failed because the axum server binds before WebView2
 finishes its cold init — fixed with a webview-readiness poll before asserting; it
 was a CI cold-start race, not a capability gap. `eval` works on real Windows.)
 
+## Live cloud-Mac verification (2026-06-01, Scaleway M2 / macOS Tahoe 26.3)
+
+Re-validated current `main` on a real Apple-silicon box (not CI), incl. all code
+added since the last Mac run (animation suite, `window introspectability`,
+`blank_frame_reason`, agent-eval era):
+
+- **Build + clippy clean; full `cargo test --workspace` green** on arm64 macOS 26.3.
+  (Caveat: `deep_adversarial_tests` false-fails on a fresh Mac due to macOS's
+  default `ulimit -n` = 256 — the concurrent-server battery exhausts FDs with
+  "Too many open files"; `ulimit -n 8192` → **107/0 passed**. Not a code bug;
+  worth adding `ulimit -n 8192` to `macos-deep-test.sh`.)
+- **Backend introspection works HEADLESS (no GUI/Aqua session):** launched the
+  demo-app over plain SSH with no window server; the WKWebView never rendered
+  (so `eval_js` returns empty — no bridge), **but the embedded MCP server came up
+  and `get_memory_stats` returned real macOS process RSS (73,170,944 B) and
+  `get_registry` returned 19 commands.** The "full-stack ≠ webview-dependent"
+  property, live on macOS: with the webview entirely absent, Victauri still
+  answers from direct `AppHandle` access — while a browser-only / CDP tool on
+  macOS has *nothing* (can't attach to WKWebView, and here there's no rendered
+  webview either). Mirrors the live-4DA finding (query_db worked while the webview
+  bridge was down).
+- **The rendered-webview 4-layer proof is already CI-green** on macOS (above); the
+  one thing not yet exercised on a *real* macOS WKWebView is the **`animation`
+  tool (scrub/filmstrip)** — needs a GUI session (Scaleway VNC login, or an
+  auto-login AWS EC2 Mac). Note macOS `CGWindowListCreateImage` captures
+  *composited* windows (unlike Windows GDI), so the filmstrip may even work on
+  transparent windows there — untested.
+
 ## The honest one-liner
 
 > On macOS, the blessed Tauri E2E tooling doesn't run, and the new embedded drivers
