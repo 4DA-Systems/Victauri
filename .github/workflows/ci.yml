@@ -418,7 +418,12 @@ jobs:
         run: npm install
 
       - name: Build demo app
-        run: cargo build -p demo-app
+        run: |
+          cargo build -p demo-app
+          # Pre-compile the E2E test BEFORE the app starts so the later test step
+          # never relinks the running demo-app binary (on Windows a running .exe
+          # can't be removed → "Access is denied"). See the E2E test step below.
+          cargo test -p demo-app --test integration --no-run
 
       - name: Start demo app (Linux)
         if: runner.os == 'Linux'
