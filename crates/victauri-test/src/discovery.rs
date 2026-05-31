@@ -11,6 +11,31 @@ fn victauri_base_dir() -> PathBuf {
     std::env::temp_dir().join("victauri")
 }
 
+/// Whether a discovery directory is safe to trust (audit #15). On Unix the temp
+/// root (e.g. `/tmp`) is world-writable, so an attacker can plant a fake `<pid>`
+/// dir pointing at a server they control to steal the token / forge results. We
+/// trust a dir only if it is a real directory (not a symlink), owned by the current
+/// effective user, and not group/other-writable. On Windows the temp dir is already
+/// per-user, and the writer restricts ACLs via `icacls`, so no extra check is needed.
+#[cfg(unix)]
+fn dir_is_trusted(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_dir() {
+        return false; // reject symlinks / non-dirs
+    }
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    meta.uid() == euid && meta.permissions().mode() & 0o022 == 0
+}
+
+#[cfg(not(unix))]
+fn dir_is_trusted(_path: &std::path::Path) -> bool {
+    true
+}
+
 /// Scan per-process discovery directories and return the port of a live server.
 ///
 /// Returns `None` if no live server is found, or if multiple are found (ambiguous).
@@ -52,6 +77,11 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
             continue;
         };
         if pid_str.parse::<u32>().is_err() {
+            continue;
+        }
+        // Only trust dirs we own — never read a token from, or delete, a dir a
+        // local attacker could have planted (audit #15).
+        if !dir_is_trusted(&path) {
             continue;
         }
         let port_path = path.join("port");

@@ -26,6 +26,10 @@ tokio = { workspace = true }
 png = "0.17"
 base64 = "0.22"
 
+# Unix-only: verify discovery-dir ownership before trusting a token (audit #15).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 axum = { workspace = true }
 uuid = { workspace = true }
