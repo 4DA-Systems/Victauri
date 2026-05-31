@@ -18,7 +18,6 @@ fn victauri_base_dir() -> PathBuf {
 /// effective user, and not group/other-writable. On Windows the temp dir is already
 /// per-user, and the writer restricts ACLs via `icacls`, so no extra check is needed.
 #[cfg(unix)]
-#[allow(unsafe_code)] // single FFI call to geteuid(); see SAFETY note below
 fn dir_is_trusted(path: &std::path::Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let Ok(meta) = std::fs::symlink_metadata(path) else {
@@ -27,9 +26,25 @@ fn dir_is_trusted(path: &std::path::Path) -> bool {
     if !meta.file_type().is_dir() {
         return false; // reject symlinks / non-dirs
     }
-    // SAFETY: `geteuid` has no preconditions, takes no arguments, and cannot fail.
-    let euid = unsafe { libc::geteuid() };
+    let Some(euid) = current_euid() else {
+        return false; // can't establish our uid -> don't trust
+    };
     meta.uid() == euid && (meta.permissions().mode() & 0o022) == 0
+}
+
+/// Determine the current effective uid without `unsafe` code (this crate
+/// `#![forbid(unsafe_code)]`): create a file we own and read back its owner uid.
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let probe = std::env::temp_dir().join(format!(".victauri_uidprobe_{}", std::process::id()));
+    std::fs::write(&probe, b"").ok()?;
+    let uid = match std::fs::metadata(&probe) {
+        Ok(m) => Some(m.uid()),
+        Err(_) => None,
+    };
+    let _ = std::fs::remove_file(&probe);
+    uid
 }
 
 #[cfg(not(unix))]

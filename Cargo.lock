@@ -5233,7 +5233,6 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "http-body-util",
- "libc",
  "png",
  "reqwest 0.12.28",
  "serde",
