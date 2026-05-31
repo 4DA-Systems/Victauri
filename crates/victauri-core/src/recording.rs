@@ -359,18 +359,38 @@ impl EventRecorder {
     }
 
     /// Import a previously exported session, replacing any active recording.
+    ///
+    /// The imported session is fully caller-controlled, so its collections are
+    /// clamped to the configured caps (keeping the most recent entries) before
+    /// becoming active — an oversized session cannot inflate resident memory past
+    /// `max_events`/`max_checkpoints` (audit #19), and a crafted event index of
+    /// `usize::MAX` cannot overflow the counter (audit #18).
     pub fn import(&self, session: RecordedSession) {
-        let event_counter = session.events.last().map_or(0, |e| e.index + 1);
         let max_events = self.max_events;
+        let max_checkpoints = DEFAULT_MAX_CHECKPOINTS;
+
+        let mut events: std::collections::VecDeque<RecordedEvent> =
+            session.events.into_iter().collect();
+        while events.len() > max_events {
+            events.pop_front();
+        }
+        let mut checkpoints: std::collections::VecDeque<StateCheckpoint> =
+            session.checkpoints.into_iter().collect();
+        while checkpoints.len() > max_checkpoints {
+            checkpoints.pop_front();
+        }
+
+        let event_counter = events.back().map_or(0, |e| e.index.saturating_add(1));
+
         let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
         *rec = Some(ActiveRecording {
             session_id: session.id,
             started_at: session.started_at,
-            events: session.events.into_iter().collect(),
-            checkpoints: session.checkpoints.into_iter().collect(),
+            events,
+            checkpoints,
             event_counter,
             max_events,
-            max_checkpoints: DEFAULT_MAX_CHECKPOINTS,
+            max_checkpoints,
         });
     }
 

@@ -212,7 +212,15 @@ impl CommandRegistry {
     /// ```
     #[must_use]
     pub fn resolve(&self, query: &str) -> Vec<ScoredCommand> {
-        let query_lower = query.to_lowercase();
+        // Scoring is O(commands × query_words × field_len), so an unbounded query
+        // is a CPU/allocation DoS. Cap the query length (audit #20); a few hundred
+        // chars is far more than any real natural-language command query.
+        const MAX_QUERY_LEN: usize = 512;
+        let query_lower: String = query
+            .chars()
+            .take(MAX_QUERY_LEN)
+            .collect::<String>()
+            .to_lowercase();
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
         if query_words.is_empty() {
             return Vec::new();

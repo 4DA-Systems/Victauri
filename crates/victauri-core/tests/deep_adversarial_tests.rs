@@ -792,7 +792,10 @@ fn recorder_default_has_50000_capacity() {
 // ── Group 4: DomSnapshot / DomElement ────────────────────────────────────
 
 #[test]
-fn dom_deep_nesting_1000_levels() {
+fn dom_deep_nesting_is_depth_bounded() {
+    // A snapshot can come from a hostile page (browser-extension target); rendering
+    // its accessible text must be depth-bounded, not an unbounded recursion that
+    // stack-overflows the host (audit #21).
     fn build_nested(depth: usize) -> DomElement {
         let mut el = element(&format!("e{depth}"), "div");
         el.visible = true;
@@ -801,13 +804,22 @@ fn dom_deep_nesting_1000_levels() {
         }
         el
     }
+    // 1000 levels > the 256 DOM cap (so the guard fires) but is safe to drop.
     let snap = DomSnapshot {
         webview_label: "main".to_string(),
         elements: vec![build_nested(1000)],
         ref_map: BTreeMap::new(),
     };
-    let text = snap.to_accessible_text(0);
-    assert!(text.lines().count() >= 1000);
+    let text = snap.to_accessible_text(0); // guard prevents recursing past the cap
+    assert!(
+        text.contains("max DOM depth"),
+        "expected the depth guard to fire"
+    );
+    assert!(
+        text.lines().count() < 300,
+        "expected bounded output, got {} lines",
+        text.lines().count()
+    );
 }
 
 #[test]
@@ -2018,4 +2030,63 @@ fn app_event_timestamp_all_variants() {
     for event in &events {
         assert_eq!(event.timestamp(), ts);
     }
+}
+
+#[test]
+fn verify_state_deep_nesting_is_depth_bounded() {
+    // verify_state takes a fully caller-controlled backend_state; deep nesting must
+    // be depth-bounded, not an unbounded recursion that stack-overflows the host
+    // (audit #14).
+    fn nest(leaf: serde_json::Value, n: usize) -> serde_json::Value {
+        let mut v = leaf;
+        for _ in 0..n {
+            v = serde_json::json!({ "a": v });
+        }
+        v
+    }
+    // 600 levels > the 128 compare cap (so the guard fires) but is safe to drop.
+    let f = nest(serde_json::json!(1), 600);
+    let b = nest(serde_json::json!(2), 600);
+    let result = verify_state(f, b); // guard prevents recursing past the cap
+    assert!(!result.passed);
+    assert!(
+        result.divergences.iter().any(|d| d
+            .frontend_value
+            .as_str()
+            .is_some_and(|s| s.contains("max compare depth"))),
+        "expected a depth-bound divergence"
+    );
+}
+
+#[test]
+fn recorder_import_clamps_oversized_session() {
+    // An imported session is fully attacker-controlled: it must be clamped to the
+    // configured caps rather than loaded verbatim (audit #19).
+    let small = EventRecorder::new(10);
+    let big = EventRecorder::new(10_000);
+    big.start("src".to_string()).unwrap();
+    for i in 0..500 {
+        big.record_event(ipc(&format!("e{i}"), "cmd"));
+    }
+    let session = big.export().expect("active session");
+    assert_eq!(session.events.len(), 500);
+
+    small.import(session); // clamp to small.max_events
+    let clamped = small.export().expect("active after import");
+    assert!(
+        clamped.events.len() <= 10,
+        "import must clamp to max_events, got {}",
+        clamped.events.len()
+    );
+}
+
+#[test]
+fn resolve_caps_pathological_query() {
+    // A multi-MB query must not be a CPU DoS — resolve() bounds the query length
+    // before scoring (audit #20).
+    let reg = CommandRegistry::new();
+    reg.register(CommandInfo::new("get_settings").with_description("get the settings"));
+    let huge = "get settings ".repeat(500_000); // ~6.5 MB
+    let results = reg.resolve(&huge); // returns promptly thanks to the length cap
+    assert!(!results.is_empty());
 }

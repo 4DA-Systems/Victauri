@@ -116,13 +116,27 @@ impl DomSnapshot {
     pub fn to_accessible_text(&self, indent: usize) -> String {
         let mut output = String::new();
         for element in &self.elements {
-            Self::format_element(&mut output, element, indent);
+            Self::format_element(&mut output, element, indent, 0);
         }
         output
     }
 
-    fn format_element(output: &mut String, element: &DomElement, indent: usize) {
+    /// Maximum DOM nesting `format_element` will recurse through. A snapshot can
+    /// come from an arbitrary (browser-extension: hostile) page, so an unbounded
+    /// recursion here is a stack-overflow (denial of service) when rendering the text.
+    const MAX_DOM_DEPTH: usize = 256;
+
+    fn format_element(output: &mut String, element: &DomElement, indent: usize, depth: usize) {
         if !element.visible {
+            return;
+        }
+
+        if depth >= Self::MAX_DOM_DEPTH {
+            output.push_str(&format!(
+                "{}- <max DOM depth {} exceeded>\n",
+                "  ".repeat(indent),
+                Self::MAX_DOM_DEPTH
+            ));
             return;
         }
 
@@ -144,7 +158,7 @@ impl DomSnapshot {
         output.push_str(&line);
 
         for child in &element.children {
-            Self::format_element(output, child, indent + 1);
+            Self::format_element(output, child, indent + 1, depth + 1);
         }
     }
 }

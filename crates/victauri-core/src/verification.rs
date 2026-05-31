@@ -30,7 +30,7 @@ pub fn verify_state(
     backend_state: serde_json::Value,
 ) -> VerificationResult {
     let mut divergences = Vec::new();
-    compare_values("", &frontend_state, &backend_state, &mut divergences);
+    compare_values("", &frontend_state, &backend_state, &mut divergences, 0);
     let passed = divergences.is_empty();
     VerificationResult {
         passed,
@@ -40,13 +40,37 @@ pub fn verify_state(
     }
 }
 
+/// Maximum nesting depth `compare_values` will recurse through. `verify_state`
+/// takes a fully caller-controlled `backend_state`, so an unbounded recursion
+/// here is a stack-overflow (denial of service) on the in-process app. A depth this large is far
+/// beyond any legitimate UI/backend state shape; deeper structures are reported
+/// as a single bounded divergence instead of being walked.
+const MAX_COMPARE_DEPTH: usize = 128;
+
 fn compare_values(
     path: &str,
     frontend: &serde_json::Value,
     backend: &serde_json::Value,
     divergences: &mut Vec<Divergence>,
+    depth: usize,
 ) {
     if frontend == backend {
+        return;
+    }
+
+    if depth >= MAX_COMPARE_DEPTH {
+        divergences.push(Divergence {
+            path: if path.is_empty() {
+                "$".to_string()
+            } else {
+                path.to_string()
+            },
+            frontend_value: serde_json::Value::String(format!(
+                "<max compare depth {MAX_COMPARE_DEPTH} exceeded>"
+            )),
+            backend_value: serde_json::Value::Null,
+            severity: DivergenceSeverity::Warning,
+        });
         return;
     }
 
@@ -59,7 +83,9 @@ fn compare_values(
                     format!("{path}.{key}")
                 };
                 match b_map.get(key) {
-                    Some(b_val) => compare_values(&child_path, f_val, b_val, divergences),
+                    Some(b_val) => {
+                        compare_values(&child_path, f_val, b_val, divergences, depth + 1);
+                    }
                     None => divergences.push(Divergence {
                         path: child_path,
                         frontend_value: f_val.clone(),
@@ -94,7 +120,7 @@ fn compare_values(
                 };
                 match (f_arr.get(i), b_arr.get(i)) {
                     (Some(f_val), Some(b_val)) => {
-                        compare_values(&child_path, f_val, b_val, divergences);
+                        compare_values(&child_path, f_val, b_val, divergences, depth + 1);
                     }
                     (Some(f_val), None) => divergences.push(Divergence {
                         path: child_path,
