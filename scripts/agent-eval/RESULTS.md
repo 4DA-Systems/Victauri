@@ -88,6 +88,49 @@ WKWebView / Linux WebKitGTK, CDP can't attach *at all*, so Victauri's `eval_js`
 competitor has *nothing*. That cross-platform case — not the Windows animation
 demo — is the decisive proof, and it's still unrun.
 
+## Harder corpus — moat-targeted tasks (H1–H3 + control) (2026-05-31)
+
+The T1–T7 ties happened because those tasks were reachable via `eval_js` +
+`__TAURI_INTERNALS__.invoke` + WAAPI. So we built a **harder corpus that
+deliberately targets the axes with NO `eval_js` equivalent** — and ran the A/B
+on two isolated demo-app instances (A→:7374, B→:7375), fresh per task.
+**This is where Victauri wins decisively, and the wins are honest.**
+
+| Task | Discriminator (no eval_js equivalent) | Agent-B (full Victauri) | Agent-A (browser-only) | Verdict |
+|---|---|---|---|---|
+| **H1** ghost/registry — a runtime-injected `legacy_migrate_v1_prefs` invoke | registry enumeration + actual runtime IPC history | ✅ named it, **4 calls, read-only** (`detect_ghost_commands`+`get_registry`+`logs`+`resolve_command`) | ❌ **WRONG** — concluded "no ghost"; could only read *static source* (16 invokes), couldn't see the runtime call; **mutated unrevertable state** (sent a notification) to probe | **B decisive** |
+| **H2** historical IPC error — past `toggle_todo(424242)` `Err` | IPC history **with response bodies** | ✅ named `toggle_todo` + "todo 424242 not found", **4 calls, read-only** (`logs ipc/network` retain bodies) | ❌ **honestly blind** — Perf API exposes no response bodies and HTTP 200 even on `Err`; refused to guess | **B decisive** |
+| **H3** native process/memory | OS process RSS + child-process table | ✅ real RSS **34,975,744 B** + child `conhost.exe`, **2 calls, read-only** | ❌ **honestly blind** — `performance.memory` is JS heap (~3.24 MB) ≠ process RSS; no JS API for the OS process table | **B decisive — NO caveat** |
+| **C** control (pure DOM) | none (CSS) | ✅ `pointer-events:none`, **8 calls, mutated** (+ found `get_styles` omits `pointer-events`) | ✅ `pointer-events:none`, **2 calls, read-only** | **A cleaner** — control holds, fair |
+
+**What the hard corpus proves (honestly):** when the task's truth lives in the
+**command registry, the IPC history (with bodies), or the native process** —
+the three things with no `eval_js` equivalent — **browser-only is genuinely
+blind and Victauri wins read-only and in fewer calls.** Two of three browser-only
+arms *correctly refused to guess* (good epistemics), and the one that didn't (H1)
+got it **wrong** *and* mutated unrevertable state. The control confirms the
+corpus isn't rigged: on a pure-DOM bug, browser-only is cheaper.
+
+**Honest caveats (do not omit):**
+- **H1** depends partly on a *runtime-injected* ghost — a *source-level* ghost
+  would let A find it by reading source (the capability gap narrows), but the
+  **read-only-safety** gap (A mutated to probe) and the runtime/dynamic-ghost
+  gap remain.
+- **H2** beats `eval_js`-only; a **full CDP** tool with the Network domain
+  enabled *from page load* could capture the body and might tie — **but only on
+  Windows, where CDP can attach.**
+- **H3** is the cleanest: **no CDP escape hatch** — CDP also lives in the
+  renderer and cannot read the host process RSS or enumerate OS children. But
+  process introspection is a narrower debugging need than DOM/IPC.
+- **The durable, caveat-free moat across all three remains cross-platform:** on
+  macOS WKWebView / Linux WebKitGTK, the browser-only competitor can't attach at
+  all, so *every* one of these (and the easy tasks too) is Victauri-only there.
+
+**Bug surfaced by the eval (worth fixing):** `inspect get_styles` omits
+`pointer-events` from its default key-property set, so it masked the H1-control
+cause until the agent fell back to raw `eval_js getComputedStyle`. Add
+`pointer-events` (and likely `visibility`/`cursor`) to the key set.
+
 ## Where Victauri falls short (verified — the point of the exercise)
 
 1. **`fault` injection does NOT affect the app's real IPC** — verified in code at
