@@ -143,7 +143,7 @@ fn bridge_init_version_and_idempotent() {
         setup_js: None,
         tests: vec![
             TestCase {
-                name: "version is 0.7.1".into(),
+                name: "version is 0.8.0".into(),
                 code: "return window.__VICTAURI__.version;".into(),
                 setup_html: None,
                 setup_js: None,
@@ -192,7 +192,7 @@ fn bridge_init_version_and_idempotent() {
         return;
     };
     assert_all_pass(&results);
-    assert_eq!(results[0].result.as_ref().unwrap(), "0.7.1");
+    assert_eq!(results[0].result.as_ref().unwrap(), "0.8.0");
     assert_eq!(results[1].result.as_ref().unwrap(), "object");
     assert_eq!(results[2].result.as_ref().unwrap(), "same");
     let missing: Vec<String> =
@@ -3972,7 +3972,7 @@ fn diagnostics_basic() {
                     return {
                         has_warnings: Array.isArray(diag.warnings),
                         has_info: typeof diag.info === 'object',
-                        has_version: diag.info.bridge_version === '0.7.1',
+                        has_version: diag.info.bridge_version === '0.8.0',
                         has_url: typeof diag.info.url === 'string',
                         has_dom_elements: typeof diag.info.dom_elements === 'number',
                         has_protocol: typeof diag.info.protocol === 'string',

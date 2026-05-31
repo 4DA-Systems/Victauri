@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-05-31
+
 ### Added — Animation-debugging suite (motion introspection, no CDP)
 
 - **New `animation` compound tool (34th MCP tool)** — gives an agent quantitative, deterministic, cross-platform access to the webview's animation engine via the Web Animations API. Works identically on WebView2/WKWebView/WebKitGTK with no CDP. Motion was the last blind spot in agent perception (screenshots are frozen instants); this closes it.

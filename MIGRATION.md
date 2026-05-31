@@ -1,5 +1,24 @@
 # Migration Guide
 
+## v0.7.x → v0.8.0
+
+Additive release — no breaking API changes. Existing code keeps working unchanged.
+
+- **New `animation` MCP tool (34 tools total):** motion introspection via the Web
+  Animations API (no CDP) — `list` (running animations + timing/easing/keyframes),
+  `scrub` (deterministic pause-seek geometry curve + optional filmstrip PNG), and
+  `sample` (real-time rAF motion + jank recorder). CSS-driven animations are
+  seekable; JS/rAF-driven ones are observable via `sample` but not `scrub`.
+- **New `window introspectability` action:** probes every window and reports which
+  Victauri can actually see. If a multi-window app's secondary windows return
+  `introspectable:false`, add `victauri:default` to that window's capability file
+  (`src-tauri/capabilities/*.json`) — the bridge requires the capability **per
+  window**, not just for `main`, and a rebuild is needed (capabilities are baked at
+  compile time). This was always required; the diagnostic just makes it visible.
+- **`screenshot::capture_window_raw`** is now public (raw RGBA + dims) alongside
+  `capture_window` (PNG). Only relevant if you call the screenshot module directly.
+- **New `filmstrip` module** (`compose`, `Frame`, `default_cols`) — public, additive.
+
 ## v0.6.0 → v0.7.0
 
 Additive release — webview Playwright-parity (no CDP). No breaking API changes
