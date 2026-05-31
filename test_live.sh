@@ -6,14 +6,19 @@ PASS=0
 FAIL=0
 ERRORS=""
 
+# Per-run private temp file for response headers (audit #29: avoid a predictable,
+# world-readable /tmp path that could leak the session id to other local users).
+HEADERS_FILE=$(mktemp "${TMPDIR:-/tmp}/victauri_mcp_headers.XXXXXX")
+trap 'rm -f "$HEADERS_FILE"' EXIT
+
 # Initialize MCP session
 SESSION_RESP=$(curl -s -X POST "$BASE/mcp" \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0.1.0"}}}' \
-  -D /tmp/mcp_headers.txt 2>/dev/null)
+  -D "$HEADERS_FILE" 2>/dev/null)
 
-MCP_SESSION=$(grep -i 'mcp-session-id' /tmp/mcp_headers.txt | tr -d '\r' | awk '{print $2}')
+MCP_SESSION=$(grep -i 'mcp-session-id' "$HEADERS_FILE" | tr -d '\r' | awk '{print $2}')
 echo "Session: $MCP_SESSION"
 
 # Send initialized notification

@@ -145,14 +145,23 @@ pub fn generate_test(session: &RecordedSession, options: &CodegenOptions) -> Str
                     if options.emit_ipc_assert_calls {
                         ipc_commands_seen.push(cmd.clone());
                     }
-                    out.push_str(&format!("    // IPC: {cmd} completed successfully\n"));
+                    // Strip newlines defensively (audit #16): these values come from
+                    // the recorded app and are written into a `//` comment, so a
+                    // newline could otherwise break out of the comment line.
+                    out.push_str(&format!(
+                        "    // IPC: {} completed successfully\n",
+                        sanitize_comment(cmd)
+                    ));
                 }
             }
 
             AppEvent::StateChange { key, caused_by, .. }
                 if options.include_state_checks && caused_by.is_some() =>
             {
-                out.push_str(&format!("    // State changed: {key}\n"));
+                out.push_str(&format!(
+                    "    // State changed: {}\n",
+                    sanitize_comment(key)
+                ));
             }
 
             // DomMutation, WindowEvent, and disabled variants are skipped
@@ -172,6 +181,12 @@ pub fn generate_test(session: &RecordedSession, options: &CodegenOptions) -> Str
 
     out.push_str("}\n");
     out
+}
+
+/// Flattens newlines/carriage returns so a value interpolated into a `//` line
+/// comment cannot break out of the comment (defense-in-depth, audit #16).
+fn sanitize_comment(s: &str) -> String {
+    s.replace(['\n', '\r'], " ")
 }
 
 /// Escapes a string for embedding in a Rust string literal.

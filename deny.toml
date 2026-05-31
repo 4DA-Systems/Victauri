@@ -1,6 +1,7 @@
 [advisories]
+# Vulnerabilities are denied by default in cargo-deny; these tighten the rest (audit #10).
 unmaintained = "workspace"
-yanked = "warn"
+yanked = "deny"
 ignore = []
 
 [licenses]
