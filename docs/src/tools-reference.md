@@ -1,6 +1,6 @@
 # Tools Reference
 
-Victauri exposes 33 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
+Victauri exposes 34 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
 
 All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
 
@@ -385,12 +385,16 @@ Window management operations.
 | `resize` | `label`, `width`, `height` | Resize a window |
 | `move_to` | `label`, `x`, `y` | Move a window |
 | `set_title` | `label`, `title` | Change window title |
+| `introspectability` | — | Probe every window's JS bridge and report which are introspectable vs. blind |
+
+**`introspectability`** answers "which windows can Victauri actually see?" A window that returns `introspectable: false` while `visible: true` is almost always missing the `victauri:default` capability — Tauri's per-window permission ACL silently blocks the bridge's callback IPC, so `eval_js`/`dom_snapshot`/`animation`/`find_elements` see nothing with no error. The diagnostic names the exact capability file to edit. Required per window (not just `main`).
 
 **Example:**
 ```json
 {"action": "list"}
 {"action": "get_state", "label": "main"}
 {"action": "resize", "label": "main", "width": 1200, "height": 800}
+{"action": "introspectability"}
 ```
 
 ---
@@ -689,4 +693,36 @@ Natural-language narration of what happened in the app. Aggregates events from t
 {"action": "summary", "seconds": 60}
 {"action": "last_action"}
 {"action": "diff", "seconds": 15}
+```
+
+---
+
+### animation
+
+Quantitative, deterministic, cross-platform access to the webview's animation engine via the Web Animations API. Works identically on WebView2 / WKWebView / WebKitGTK with **no CDP**. Closes the last blind spot in agent perception — screenshots are frozen instants; this lets an agent perceive time-based behaviour.
+
+| Action | Parameters | Description |
+|--------|-----------|-------------|
+| `list` | `webview_label` | `getAnimations()` introspection: declared timing (duration/delay/easing/iterations), computed progress, keyframes, play state, and the animating target. An animation only appears while running/pending — trigger it first. |
+| `scrub` | `selector`, `points`, `capture`, `webview_label` | Pauses the target's animation and seeks it to N evenly-spaced points (`await animation.ready` + double-rAF freezes each frame), returning the exact geometry curve (rect + transform + opacity per point). With `capture: true`, also returns a single contact-sheet **filmstrip PNG** of the whole arc plus a manifest. **CSS-driven animations only** (JS/rAF animations are not seekable — errors clearly and suggests `sample`). |
+| `sample` | `record`, `selector`, `webview_label` | Real-time `requestAnimationFrame` recorder, decoupled from the blocking eval so event-triggered sweeps are catchable: `record: true` arms a watcher, trigger the animation, then `record: false` reads the measured per-frame curve, jank stats (dropped frames, max frame gap), and declared-vs-measured duration. Works for **any** animation including JS/rAF-driven ones. |
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `action` | string | yes | One of: `list`, `scrub`, `sample` |
+| `selector` | string | for `scrub`/`sample` | CSS selector of the animating element |
+| `points` | integer | no | Number of evenly-spaced seek points for `scrub` (default: 6) |
+| `capture` | boolean | no | For `scrub`: also return a filmstrip PNG of the arc |
+| `record` | boolean | for `sample` | `true` to arm the recorder, `false` to read results |
+| `webview_label` | string | no | Target webview window |
+
+> **Filmstrip + transparent windows:** `scrub`'s filmstrip uses native window capture, which cannot see transparent / GPU-composited windows (no DWM redirection surface). On such a window the capture now **fails with an actionable error** rather than returning a blank frame — use an opaque window, or `list` / `sample` / `scrub` without `capture`.
+
+**Examples:**
+```json
+{"action": "list"}
+{"action": "scrub", "selector": "#sweep-toast", "points": 6, "capture": true}
+{"action": "sample", "selector": "#sweep-toast", "record": true}
+{"action": "sample", "record": false}
 ```

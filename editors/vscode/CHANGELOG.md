@@ -2,6 +2,11 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.7.2 (2026-05-31)
+
+- Version-synced with the Victauri workspace 0.7.2 release (animation-debugging suite, per-window introspectability diagnostic, loud-fail on blank window capture).
+- Connects to the embedded Victauri MCP/REST server exposing all 34 tools.
+
 ## 0.2.0 (2026-05-14)
 
 - New logo — minimalist glowing V with electric blue glow on dark background

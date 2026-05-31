@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`window introspectability`** action — probes every window's JS bridge and reports which ones Victauri can actually see vs. which are **blind**. A window that returns `introspectable:false` while `visible:true` is almost always missing the `victauri:default` capability: Tauri's per-window permission ACL silently blocks the bridge's callback IPC, so `eval_js`/`dom_snapshot`/`animation`/`find_elements` see nothing with no error. The diagnostic turns that silent dead-end into an actionable, up-front message naming the exact capability file to edit. Required per window (not just `main`) — the common multi-window gotcha. Verified live: flags a capability-stripped window correctly and passes a fully-capable one.
 
+### Changed — Loud failure on blank window capture
+
+- **Native window capture no longer returns a silent blank frame on transparent/composited windows.** GDI capture (`PrintWindow`/`BitBlt`) cannot see a transparent or GPU-composited window (no DWM redirection surface) — it previously returned an all-white/empty image that looked like a successful capture, so `animation scrub`'s filmstrip would silently produce a blank. `capture_window_raw` now detects the uniform blank frame (and reports whether `WS_EX_LAYERED`/`WS_EX_NOREDIRECTIONBITMAP` is set) and **fails with an actionable error naming the OS desktop-composite workaround** instead. Opaque-window capture is unchanged. (5 new unit tests.)
+
 ## [0.7.1] - 2026-05-31
 
 ### Changed

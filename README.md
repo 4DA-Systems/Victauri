@@ -217,7 +217,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 
 ## MCP Tools
 
-31 tools across three layers — backend, IPC, and webview:
+34 tools across the full stack — backend, IPC, webview, and introspection:
 
 ### Backend tools (direct Rust access, no webview needed)
 
@@ -419,7 +419,7 @@ victauri init    # generates .github/workflows/victauri.yml
 
 - [**Getting Started**](docs/src/getting-started.md) — Setup, capabilities, first connection
 - [**Testing Guide**](docs/src/testing.md) — Locator API, IPC verification, visual regression, CI integration
-- [**Tools Reference**](docs/src/tools-reference.md) — All 31 tools with parameters and examples
+- [**Tools Reference**](docs/src/tools-reference.md) — All 34 tools with parameters and examples
 - [**Architecture**](docs/src/architecture.md) — Embedded design, JS bridge, dual protocol
 - [**Configuration**](docs/src/configuration.md) — Port, auth, privacy, capacity tuning
 - [**Security**](docs/src/security.md) — Threat model, privacy profiles, redaction
