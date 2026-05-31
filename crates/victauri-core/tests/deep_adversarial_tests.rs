@@ -2090,3 +2090,25 @@ fn resolve_caps_pathological_query() {
     let results = reg.resolve(&huge); // returns promptly thanks to the length cap
     assert!(!results.is_empty());
 }
+
+#[test]
+fn record_event_after_max_index_import_does_not_panic() {
+    // Adversarial: import a session whose last event index is usize::MAX, then let
+    // a new event be recorded. The counter increment must saturate, not panic in
+    // debug / wrap in release (audit #18 — the saturating_add belongs in
+    // record_event, not only in import).
+    let rec = EventRecorder::new(100);
+    let session = RecordedSession {
+        id: "evil".to_string(),
+        started_at: Utc::now(),
+        events: vec![RecordedEvent {
+            index: usize::MAX,
+            timestamp: Utc::now(),
+            event: ipc("m", "cmd"),
+        }],
+        checkpoints: vec![],
+    };
+    rec.import(session);
+    rec.record_event(ipc("after", "cmd")); // must not panic
+    assert!(rec.event_count() >= 1);
+}

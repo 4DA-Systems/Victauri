@@ -92,7 +92,9 @@ const SAFE_ENV_PREFIXES: &[&str] = &[
     "SHELL",
     "DISPLAY",
     "XDG_",
-    "TAURI_",
+    // Only Tauri's build-env namespace, NOT all of TAURI_ — the latter is an
+    // app-custom namespace that can hold secrets (audit #5).
+    "TAURI_ENV_",
     "VICTAURI_",
     "NODE_ENV",
     "OS",
@@ -109,13 +111,22 @@ const SAFE_ENV_PREFIXES: &[&str] = &[
 const SECRET_ENV_SUBSTRINGS: &[&str] = &[
     "TOKEN",
     "SECRET",
-    "PASSWORD",
-    "PASSWD",
+    "PASS", // PASSWORD, PASSWD, PASSPHRASE
     "PRIVATE",
     "CREDENTIAL",
     "APIKEY",
     "AUTH",
     "_KEY",
+    "DSN", // connection strings with embedded creds
+    "PAT", // personal access token
+    "JWT",
+    "BEARER",
+    "SESSION",
+    "COOKIE",
+    "SALT",
+    "CERT",
+    "SIGN", // signing keys/material
+    "LICENSE",
 ];
 
 /// Whether an env var name is safe to surface via `app_info`: it must match a
@@ -446,7 +457,12 @@ impl VictauriMcpHandler {
         let backend_state = if let Some(state) = params.backend_state {
             state
         } else if let Some(ref cmd) = params.backend_command {
-            if !self.state.privacy.is_command_allowed(cmd) {
+            // Gate on BOTH is_invoke_allowed and is_command_allowed, matching
+            // invoke_command and the contract/replay paths — backend_command
+            // previously checked only the blocklist (audit #30 follow-up).
+            if !self.state.privacy.is_invoke_allowed(cmd)
+                || !self.state.privacy.is_command_allowed(cmd)
+            {
                 return tool_error(format!(
                     "command '{cmd}' is blocked by privacy configuration"
                 ));
@@ -4432,6 +4448,16 @@ mod tests {
         // Unknown prefixes are dropped regardless.
         assert!(!is_safe_env_key("AWS_SECRET_ACCESS_KEY"));
         assert!(!is_safe_env_key("RANDOM_VAR"));
+        // The broad TAURI_ namespace is no longer allowed — only TAURI_ENV_ — so
+        // app-custom TAURI_ secrets are dropped even without a denylist hit.
+        assert!(!is_safe_env_key("TAURI_CUSTOM_THING"));
+        // Adversarial leaks closed (audit #5 follow-up): connection strings,
+        // passphrases, PATs, JWTs, etc. under an allowed prefix.
+        assert!(!is_safe_env_key("VICTAURI_DB_DSN"));
+        assert!(!is_safe_env_key("VICTAURI_SIGNING_PASSPHRASE"));
+        assert!(!is_safe_env_key("VICTAURI_GH_PAT"));
+        assert!(!is_safe_env_key("VICTAURI_JWT"));
+        assert!(!is_safe_env_key("VICTAURI_SESSION_ID"));
     }
 
     #[test]

@@ -3,61 +3,30 @@
 const https = require("https");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
 const { execFileSync } = require("child_process");
+// Shared integrity pin — single source of truth for the version, asset map, and
+// SHA-256 hashes, used by both this installer and the bin launcher (audit #1).
+const pin = require("./pin.js");
 
-// Version is derived from package.json so the download tag can never drift from
-// the published package version (audit finding #11).
-const VERSION = require("../package.json").version;
+const VERSION = pin.VERSION;
 const REPO = "runyourempire/victauri";
-const BINARY_NAME = "victauri-browser-host";
+const BINARY_NAME = pin.BINARY_NAME;
+const sha256 = pin.sha256;
 
-// Pinned SHA-256 of every release artifact (audit finding #1). A downloaded binary
-// is verified against this map BEFORE it is made executable or run; anything that
-// does not match a pinned hash is rejected (fail closed). These MUST be regenerated
-// for each release — generate with:
-//   gh release download v<VERSION> --pattern 'victauri-browser-host-*'
-//   sha256sum victauri-browser-host-*
-const SHA256 = {
-  "0.7.2": {
-    "victauri-browser-host-linux-x86_64":
-      "63ceb84bb056e45a88aa89800c94fed69b5cf6666749b69fcb0292a8fdf84904",
-    "victauri-browser-host-macos-x86_64":
-      "b44f1ac417fb4b708e40e27f7ce14f6049be934a30a982ab6f089a8248d57e6c",
-    "victauri-browser-host-macos-aarch64":
-      "26d8850e314b181357af4cf6c6041c076ce4ee9722f5295bbd1ab9e6109552f7",
-    "victauri-browser-host-windows-x86_64.exe":
-      "f91154a026473e59aa0081ddc10ff9f5c81c5fbdce4675f034c435d98be0302e",
-  },
-};
-
-// Map Node platform/arch -> the actual published release asset name. (The previous
-// map produced darwin-*/win32-* names that did not match the published macos-*/
-// windows-* assets, so non-Linux installs silently 404'd.)
+// Wraps the shared asset map with a user-facing warning on unsupported platforms.
 function getAssetName() {
-  const key = `${process.platform}-${process.arch}`;
-  const map = {
-    "linux-x64": "victauri-browser-host-linux-x86_64",
-    "darwin-x64": "victauri-browser-host-macos-x86_64",
-    "darwin-arm64": "victauri-browser-host-macos-aarch64",
-    "win32-x64": "victauri-browser-host-windows-x86_64.exe",
-  };
-  const asset = map[key];
+  const asset = pin.getAssetName();
   if (!asset) {
-    console.warn(`victauri-browser: no prebuilt binary for ${key}.`);
+    console.warn(
+      `victauri-browser: no prebuilt binary for ${process.platform}-${process.arch}.`
+    );
     console.warn("Build from source: cargo install victauri-browser");
-    return null; // non-fatal: don't break `npm install`
   }
-  return asset;
+  return asset; // null on unsupported platform — non-fatal
 }
 
 function expectedHash(asset) {
-  const perVersion = SHA256[VERSION];
-  return perVersion ? perVersion[asset] : undefined;
-}
-
-function sha256(buf) {
-  return crypto.createHash("sha256").update(buf).digest("hex");
+  return pin.expectedHashFor(asset);
 }
 
 // HTTPS-only download into memory. Redirects are followed ONLY to https:// URLs —

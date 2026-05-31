@@ -5,6 +5,7 @@
 const path = require("path");
 const { spawn } = require("child_process");
 const fs = require("fs");
+const pin = require("../scripts/pin.js");
 
 const VERSION = require("../package.json").version;
 const BINARY_NAME = process.platform === "win32" ? "victauri-browser-host.exe" : "victauri-browser-host";
@@ -12,9 +13,21 @@ const BINARY_PATH = path.join(__dirname, BINARY_NAME);
 
 function getBinaryPath() {
   if (fs.existsSync(BINARY_PATH)) {
+    // Re-verify the npm-managed binary against the pinned hash on EVERY run, not
+    // just at install time — a binary tampered after install must not execute
+    // (audit #1). Fail closed.
+    const v = pin.verifyFile(BINARY_PATH);
+    if (!v.ok) {
+      console.error(`Refusing to run victauri-browser-host: ${v.reason}.`);
+      console.error(`The binary at ${BINARY_PATH} failed integrity verification.`);
+      console.error("Reinstall the package, or build from source: cargo install victauri-browser");
+      process.exit(1);
+    }
     return BINARY_PATH;
   }
-  // Fallback: check if installed globally via cargo
+  // Fallback: a user-installed (cargo) binary on PATH. It is built from source, so
+  // there is no release pin to verify against — it is the user's own explicit
+  // install, not the npm-distributed artifact.
   const globalName = process.platform === "win32" ? "victauri-browser-host.exe" : "victauri-browser-host";
   const envPath = process.env.PATH || "";
   const dirs = envPath.split(path.delimiter);

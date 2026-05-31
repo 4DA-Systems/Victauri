@@ -163,7 +163,10 @@ impl EventRecorder {
         if let Some(ref mut active) = *rec {
             let timestamp = event.timestamp();
             let index = active.event_counter;
-            active.event_counter += 1;
+            // Saturating: an imported session can seed event_counter at usize::MAX
+            // (its index is attacker-controlled); a bare `+= 1` would then panic in
+            // debug / wrap in release on the next auto-captured event (audit #18).
+            active.event_counter = active.event_counter.saturating_add(1);
 
             if active.events.len() >= active.max_events {
                 active.events.pop_front();
