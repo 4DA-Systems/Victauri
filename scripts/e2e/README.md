@@ -1,6 +1,6 @@
 # Victauri End-to-End Test Harness
 
-REST-driven E2E suites that exercise all 31 MCP tools against a **running Tauri
+REST-driven E2E suites that exercise all 34 MCP tools against a **running Tauri
 app** with the `victauri-plugin` embedded. They hit the dual-protocol REST API
 (`POST /api/tools/{name}`) on `http://127.0.0.1:7373`, so no MCP handshake is
 needed and the scripts stay dependency-light (`curl` + `jq`).

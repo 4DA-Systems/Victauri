@@ -27,23 +27,27 @@ You cannot accidentally ship Victauri to users.
 
 ## Bearer Token Authentication
 
-Authentication is **disabled by default**. The MCP server binds to `127.0.0.1` only
-and the plugin is `#[cfg(debug_assertions)]`-gated, so localhost-only access in debug
-builds is the baseline security model.
+Authentication is **enabled by default**. On startup Victauri auto-generates a UUID
+Bearer token and writes it to the per-process discovery directory; first-party clients read
+it automatically. Localhost-only binding (`127.0.0.1`) and the `#[cfg(debug_assertions)]`
+release gate are *additional* layers on top of — not a substitute for — auth, because any
+other process running as the same user can also reach `127.0.0.1`.
 
-When enabled, every request (except `/health`) must include a valid Bearer token.
+Every request except `/health` must include a valid Bearer token.
 
 ### How It Works
 
-1. Call `.auth_enabled()` or `.auth_token("...")` on the builder
-2. The token is printed to the application log and written to the discovery directory
+1. By default the token is auto-generated — no builder call needed. Use `.auth_token("...")`
+   to set a fixed value, or `.auth_disabled()` to turn auth off.
+2. The token is written to the per-process discovery directory (user-only permissions) and
+   auto-discovered by `VictauriClient::discover()`, the CLI, and the VS Code extension
 3. Clients must include `Authorization: Bearer <token>` in every request
 4. Token comparison uses constant-time equality to prevent timing attacks
 
 ### Configuration
 
 ```rust
-// No auth (default — localhost-only, debug build)
+// Auth ON by default (auto-generated UUID token, auto-discovered by clients)
 VictauriBuilder::new().build()
 
 // Fixed token
@@ -51,12 +55,12 @@ VictauriBuilder::new()
     .auth_token("my-secret-token")
     .build()
 
-// Auto-generated UUID token
+// Opt OUT of auth (you accept that any local process can connect)
 VictauriBuilder::new()
-    .auth_enabled()
+    .auth_disabled()
     .build()
 
-// Environment variable (enables auth with the given token)
+// Environment variable (overrides the auto-generated token with a fixed value)
 // VICTAURI_AUTH_TOKEN=my-token
 ```
 
@@ -199,7 +203,7 @@ All HTTP responses include security headers:
 | Threat | Mitigation |
 |--------|-----------|
 | Production exposure | `#[cfg(debug_assertions)]` gate |
-| Unauthorized local access | Bearer token auth (opt-in) + localhost-only binding |
+| Unauthorized local access | Bearer token auth (**on by default**) + localhost-only binding |
 | Timing attacks on auth | Constant-time comparison |
 | Request flooding | Token-bucket rate limiter |
 | Remote network access | Localhost-only binding |
@@ -214,7 +218,7 @@ All HTTP responses include security headers:
 
 ## Recommendations
 
-For typical development (default — no auth needed):
+For typical development (auth on by default — token auto-generated and auto-discovered):
 ```rust
 VictauriBuilder::new().build()
 ```

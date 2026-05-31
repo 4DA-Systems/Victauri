@@ -78,7 +78,8 @@ Claude Code will automatically discover and connect to your running app.
 
 ### With Authentication
 
-Auth is disabled by default for zero-friction setup. For shared machines or CI, enable it:
+Auth is **enabled by default** (the token is auto-generated and auto-discovered by clients).
+To pin a fixed token instead — e.g. for CI — set it explicitly:
 
 ```rust
 tauri::Builder::default()

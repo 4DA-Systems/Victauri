@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — red-team / audit hardening (release blockers)
+
+- **Browser-extension bridge provenance (audit #2) — re-announce leak closed.** The previous
+  nonce gate generated the secret in the MAIN world and re-broadcast it on a perpetual,
+  page-triggerable `__victauri_handshake_req` listener. Because the MAIN world shares the page's
+  `window`, a hostile page could fire that request, capture the re-announced nonce, and then drive
+  the privileged bridge (`eval`, `getCookies`, `getLocalStorage`, …). The nonce is now **generated
+  in the ISOLATED relay** (page JS cannot read that scope) and handed to MAIN via a **single-shot
+  responder** that is spent by the legitimate `document_start` pull — so a page can never re-elicit
+  it. Applies to both Chrome and Firefox extensions. New regression tests reproduce the exfiltration
+  attack and assert it fails (Chrome vitest: 169 pass, +6 provenance tests).
+- **`query_db` / `introspect db_health` no longer select the wrong database (red-team blocker).**
+  Selection previously took the first `.db` a directory walk happened to enumerate, with no ranking
+  and no exclusion of WebView/browser-engine internal stores — so an agent could confidently inspect
+  a WebView profile DB instead of the app's real DB. Now: (a) WebView/engine internals (Cookies,
+  QuotaManager, IndexedDB, Local Storage, WebKit/EBWebView dirs, …) are excluded; (b) the largest
+  remaining candidate wins; (c) configured `db_search_paths` are **exclusive** when set (no silent
+  fallback to OS app dirs); (d) a clear, actionable error is returned when only internals are present
+  instead of querying the wrong DB. (4 new tests, incl. the exact red-team layout.)
+- **`css inject` blocks remote `@import` / `url(...)` by default (audit / red-team).** Injected CSS
+  was added to the page verbatim, so `@import url(https://attacker/…)` or `url(//host)` turned a
+  debugging tool into a data-exfiltration / SSRF channel (acute when chained with page-sourced prompt
+  injection). A comment-stripping sanitizer now rejects `@import` and remote `url(...)` targets;
+  relative, `data:`, and `#fragment` refs are allowed. New `allow_remote: true` param opts back in.
+  (4 new tests.)
+- **`app_info` env-var secret denylist, dialog fail-closed, command-filter enforcement, core DoS
+  bounds** — verified intact at this HEAD (audit #5, #32, #30/#31, #14/#18-21).
+
+### Changed
+
+- **`eval_js` fails fast on malformed syntax instead of hanging for the full timeout.** A syntax
+  error in the submitted code previously broke the parse of the whole injected wrapper, so the
+  callback never fired and the call blocked for the entire (30s) eval timeout. A CSP-safe parse
+  watchdog now reports a likely syntax error in ~0.75s. (We intentionally do **not** use
+  `new Function`/`AsyncFunction` to surface the `SyntaxError`, because dynamic code generation is
+  gated by the same `unsafe-eval` CSP that blocks `eval()` — which is exactly why the bridge uses an
+  inline async-IIFE. The watchdog distinguishes a parse failure, which never marks the script
+  "started", from valid-but-slow code, which is left to run to the real timeout.)
+- **`app_info.databases` now returns objects, not bare strings.** Each entry is
+  `{ path, size_bytes, webview_internal, selected }` across **all** roots (configured
+  `db_search_paths` + every OS app dir), so an agent can see and disambiguate the real app DB and
+  which one `query_db` would auto-select. (Previously: relative path strings from `data_dir` only.)
+- **Auth documentation reconciled with auth-on-by-default.** 12 locations across the mdbook docs,
+  READMEs, `SECURITY.md`, and a stale crate doc-comment/test that still said auth was "off/optional
+  by default" now correctly describe auth as enabled by default (auto-generated, auto-discovered
+  token) with `.auth_disabled()` to opt out.
+
+### Fixed
+
+- **Dev-dependency advisories** — `ws` (bridge-test harness, GHSA-58qx-3vcg-4xpx, moderate) bumped to
+  8.21.0; `tmp` (VS Code `@vscode/vsce` packaging tooling, GHSA-ph9p-34f9-6g65, high) bumped to 0.2.7.
+  Both dev/build-only (neither ships to end users); non-breaking lockfile updates.
+- **E2E regression harnesses** — `scripts/e2e/01,02` updated from the stale `0.5.6` / 31-tool
+  assertions to `0.7.2` / 34 tools, and the tool-registration loop now includes `route`/`trace`/
+  `animation`.
+
 ## [0.7.2] - 2026-05-31
 
 ### Added — Animation-debugging suite (motion introspection, no CDP)

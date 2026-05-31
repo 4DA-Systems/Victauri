@@ -1,6 +1,6 @@
 #!/bin/bash
 # Exhaustive Victauri test against running 4DA app
-# Tests ALL 31 tools + 3 resources + server endpoints
+# Tests ALL 34 tools + 3 resources + server endpoints
 set -euo pipefail
 
 BASE="http://127.0.0.1:7373"
@@ -48,7 +48,7 @@ aj() {
 }
 
 echo "========================================="
-echo "  VICTAURI EXHAUSTIVE TEST v0.5.6 - 4DA"
+echo "  VICTAURI EXHAUSTIVE TEST v0.7.2 - 4DA"
 echo "========================================="
 echo ""
 
@@ -63,16 +63,16 @@ aj "info.port" "$R" '.port == 7373'
 aj "info.protocol" "$R" '.protocol == "mcp"'
 aj "info.commands" "$R" '.commands_registered > 0'
 aj "info.capabilities" "$R" '.capabilities | length > 0'
-aj "info.version" "$R" '.version == "0.5.6"'
+aj "info.version" "$R" '.version == "0.7.2"'
 aj "info.auth_required" "$R" '.auth_required == false'
 CMDS=$(echo "$R" | jq '.commands_registered')
 echo "  (commands: $CMDS)"
 
 TOOLS=$(curl -s "$BASE/api/tools")
 TOOL_COUNT=$(echo "$TOOLS" | jq 'length')
-aj "31 tools listed" "$TOOLS" 'length == 31'
+aj "34 tools listed" "$TOOLS" 'length == 34'
 
-for t in eval_js dom_snapshot find_elements invoke_command screenshot verify_state detect_ghost_commands check_ipc_integrity wait_for assert_semantic resolve_command get_registry get_memory_stats get_plugin_info get_diagnostics app_info list_app_dir read_app_file query_db interact input window storage navigate recording inspect css logs introspect fault explain; do
+for t in eval_js dom_snapshot find_elements invoke_command screenshot verify_state detect_ghost_commands check_ipc_integrity wait_for assert_semantic resolve_command get_registry get_memory_stats get_plugin_info get_diagnostics app_info list_app_dir read_app_file query_db interact input window storage navigate recording inspect css logs introspect fault explain route trace animation; do
   TOTAL=$((TOTAL + 1))
   if echo "$TOOLS" | jq -e ".[] | select(.name == \"$t\")" >/dev/null 2>&1; then
     PASS=$((PASS + 1))
@@ -80,7 +80,7 @@ for t in eval_js dom_snapshot find_elements invoke_command screenshot verify_sta
     FAIL=$((FAIL + 1)); FAILURES="$FAILURES\n  FAIL: tool '$t' missing"; echo "  FAIL: tool '$t' missing"
   fi
 done
-echo "  PASS: all 31 tools registered"
+echo "  PASS: all 34 tools registered"
 echo ""
 
 # ===== 2. EVAL_JS =====
@@ -483,7 +483,7 @@ echo ""
 # ===== 22. GET_PLUGIN_INFO =====
 echo "--- 22. GET_PLUGIN_INFO (1 test) ---"
 R=$(tool get_plugin_info)
-aj "plugin info v0.5.6" "$R" '.result.version == "0.5.6"'
+aj "plugin info v0.7.2" "$R" '.result.version == "0.7.2"'
 echo "  (tools: $(echo "$R" | jq '.result.tool_count'), invocations: $(echo "$R" | jq '.result.total_invocations'))"
 echo ""
 
