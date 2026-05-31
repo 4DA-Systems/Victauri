@@ -208,6 +208,17 @@ jobs:
           fail() { echo "::error::$1"; echo '--- app.log ---'; cat app.log; kill "$APP_PID" 2>/dev/null || true; exit 1; }
           call() { curl -sf -X POST "$B/$1" -H 'content-type: application/json' --data-binary "$2"; }
 
+          # The axum server binds before the webview finishes initializing — WebView2's
+          # cold init in particular can lag the server by several seconds. Wait for the
+          # webview to become eval-able before asserting (no-op once it's ready).
+          wv=false
+          for i in $(seq 1 45); do
+            r=$(call eval_js '{"code":"return 6*7"}' 2>/dev/null || true)
+            if echo "$r" | grep -q '42'; then echo "webview eval-able after ${i} tries"; wv=true; break; fi
+            sleep 2
+          done
+          [ "$wv" = true ] || fail "webview never became eval-able (last: ${r:-none})"
+
           echo "================ FULL-STACK PROOF on $RUNNER_OS ================"
 
           # 1. WEBVIEW — eval JS inside the live webview
