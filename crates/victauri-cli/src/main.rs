@@ -287,8 +287,11 @@ fn cmd_init(root: &Path) -> Result<()> {
     let claude_md_path = root.join("CLAUDE.md");
     if claude_md_path.exists() {
         let content = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
-        if content.contains("Victauri") || content.contains("victauri") {
-            eprintln!("  [=] CLAUDE.md already references Victauri");
+        // Detect a prior insertion by our sentinel marker, not a loose substring —
+        // the old `contains("victauri")` check skipped any file that merely mentioned
+        // Victauri, and couldn't tell its own block apart from the user's text (audit #24).
+        if content.contains("VICTAURI:BEGIN") {
+            eprintln!("  [=] CLAUDE.md already has the Victauri block (VICTAURI markers present)");
         } else {
             let mut file = std::fs::OpenOptions::new()
                 .append(true)
@@ -296,7 +299,10 @@ fn cmd_init(root: &Path) -> Result<()> {
                 .with_context(|| format!("failed to append to {}", claude_md_path.display()))?;
             std::io::Write::write_all(&mut file, generate_claude_md_section().as_bytes())
                 .with_context(|| format!("failed to write to {}", claude_md_path.display()))?;
-            eprintln!("  [+] Added Victauri section to CLAUDE.md");
+            eprintln!(
+                "  [+] Appended a Victauri block to CLAUDE.md (between <!-- VICTAURI:BEGIN --> and"
+            );
+            eprintln!("      <!-- VICTAURI:END --> markers — delete that block to opt out)");
         }
     } else {
         std::fs::write(&claude_md_path, generate_claude_md_section())
@@ -1138,6 +1144,7 @@ fn generate_mcp_json() -> &'static str {
 
 fn generate_claude_md_section() -> &'static str {
     r"
+<!-- VICTAURI:BEGIN (added by `victauri init` — delete this block to opt out) -->
 ## Victauri (App Inspection & Testing)
 
 This app has **Victauri** integrated — an MCP server embedded inside the Tauri process
@@ -1162,8 +1169,9 @@ Key tools that only Victauri can provide (not available via CDP/Playwright):
 
 Connection: `victauri bridge` (stdio-to-HTTP proxy, configured in `.mcp.json`)
 
-Do NOT use Playwright or CDP for tasks that Victauri handles. Only fall back to
+Prefer Victauri over Playwright or CDP for tasks it handles; fall back to
 Playwright for browser-only work unrelated to the Tauri app.
+<!-- VICTAURI:END -->
 "
 }
 
@@ -1847,9 +1855,12 @@ mod tests {
         assert!(content.contains("invoke_command"));
         assert!(content.contains("victauri bridge"));
         assert!(
-            content.contains("Do NOT use Playwright"),
+            content.contains("Prefer Victauri"),
             "should instruct agents to prefer Victauri"
         );
+        // Sentinel markers make insertion idempotent + removable (audit #24).
+        assert!(content.contains("VICTAURI:BEGIN"));
+        assert!(content.contains("VICTAURI:END"));
     }
 
     #[test]
