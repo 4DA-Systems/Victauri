@@ -6,7 +6,7 @@ const path = require("path");
 const { spawn } = require("child_process");
 const fs = require("fs");
 
-const VERSION = "0.5.0";
+const VERSION = require("../package.json").version;
 const BINARY_NAME = process.platform === "win32" ? "victauri-browser-host.exe" : "victauri-browser-host";
 const BINARY_PATH = path.join(__dirname, BINARY_NAME);
 
