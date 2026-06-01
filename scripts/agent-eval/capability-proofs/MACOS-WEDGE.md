@@ -108,12 +108,22 @@ added since the last Mac run (animation suite, `window introspectability`,
   macOS has *nothing* (can't attach to WKWebView, and here there's no rendered
   webview either). Mirrors the live-4DA finding (query_db worked while the webview
   bridge was down).
-- **The rendered-webview 4-layer proof is already CI-green** on macOS (above); the
-  one thing not yet exercised on a *real* macOS WKWebView is the **`animation`
-  tool (scrub/filmstrip)** — needs a GUI session (Scaleway VNC login, or an
-  auto-login AWS EC2 Mac). Note macOS `CGWindowListCreateImage` captures
-  *composited* windows (unlike Windows GDI), so the filmstrip may even work on
-  transparent windows there — untested.
+- **The rendered-webview 4-layer proof is already CI-green** on macOS (above).
+- **`animation` tool verified live on a real macOS WKWebView (2026-06-02).** A
+  GUI/Aqua session was established **over SSH, no VNC client**: FileVault is off,
+  so set `autoLoginUser=m1` + write `/etc/kcpassword`, then `sudo killall
+  loginwindow` → m1 auto-logs into Aqua (no reboot); launch the app with
+  `sudo launchctl asuser 501 sudo -u m1 <binary>` to enter the GUI bootstrap
+  context. Result on the live WKWebView: `eval_js 6*7→42`, and **all three
+  `animation` actions** — `list` (WAAPI exact config on WebKit), `scrub`
+  (geometry curve identical shape to Windows: tx 420→469→…→-48), `sample`
+  (74 frames, 1211 ms, 0 jank) — **plus a REAL filmstrip** (2716×1816, 8 frames,
+  ~400 KB PNG; a blank would be <20 KB). `CGWindowListCreateImage` captured the
+  WKWebView content with **no Screen-Recording/TCC grant needed for own-window
+  capture** on Tahoe 26.3, and it captures composited content — so the filmstrip
+  works on macOS where Windows GDI fails on transparent windows. **Net: on the
+  one platform where CDP/Playwright cannot attach at all, Victauri's *entire*
+  suite — webview + IPC + backend + DB + native + animation/filmstrip — works.**
 
 ## The honest one-liner
 
