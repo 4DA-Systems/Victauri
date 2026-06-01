@@ -198,12 +198,52 @@ jobs:
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────
+  # Require the FULL CI (all platforms + real-app E2E) to have passed for this
+  # exact commit before publishing. The `test` gate above only runs on ubuntu, so
+  # a bug that fails only on macOS or in the real-app E2E (both happened in 0.7.4)
+  # would otherwise publish anyway. CI is the single source of truth; a tag must
+  # point at a CI-green commit, and publish is blocked until it is proven green.
+  # ─────────────────────────────────────────────────────────────────────
+  require-ci-green:
+    name: Require CI green for this commit
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for and require CI success for ${{ github.sha }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha="${{ github.sha }}"
+          repo="${{ github.repository }}"
+          echo "Requiring the CI workflow (ci.yml) to be green for $sha before publishing."
+          for i in $(seq 1 80); do
+            run=$(gh api "repos/$repo/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=1" \
+                    --jq '.workflow_runs[0] | "\(.status)|\(.conclusion)"' 2>/dev/null || echo "none|")
+            status="${run%%|*}"
+            concl="${run##*|}"
+            echo "  attempt $i/80: ci status=$status conclusion=$concl"
+            if [ "$status" = "completed" ]; then
+              if [ "$concl" = "success" ]; then
+                echo "✅ CI is green for $sha — publish may proceed."
+                exit 0
+              fi
+              echo "::error::CI concluded '$concl' for $sha. Refusing to publish a commit that is not CI-green."
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "::error::Timed out waiting for CI to complete on $sha. Refusing to publish (no proven-green CI run)."
+          exit 1
+
+  # ─────────────────────────────────────────────────────────────────────
   # Publish crates to crates.io
   # ─────────────────────────────────────────────────────────────────────
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, require-ci-green]
     # Least privilege for the job that holds the crates.io token (audit #8).
     permissions:
       contents: read

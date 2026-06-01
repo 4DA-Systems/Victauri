@@ -14,6 +14,24 @@ fails loudly if any published version falls behind the repo.
 | `OVSX_TOKEN` *(optional)* | VS Code release → Open VSX | open-vsx.org token (Cursor / VSCodium / agent IDEs) |
 | `NPM_TOKEN` | npm release | npmjs automation token, publish rights on `victauri-browser` |
 
+## Before you tag — the pre-publish gate
+
+0.7.4 shipped with two bugs (a macOS-only discovery bug and a real-app E2E failure) because
+the release's own test step runs **only on ubuntu** and publish wasn't gated on the full CI.
+Two layers now prevent that:
+
+1. **Local preflight** — run `./scripts/preflight.ps1` (Windows) or `./scripts/preflight.sh`
+   before pushing. It runs fmt + clippy + the full workspace tests + the Chrome bridge tests,
+   so fast failures are caught locally in seconds instead of a 16-minute CI round trip. It
+   **cannot** catch macOS/Linux-only bugs (you're on one OS) or the real-app E2E — that's CI.
+2. **`require-ci-green` (the hard gate)** — `release.yml` will **not** publish unless the
+   **full CI** (all platforms + real-app E2E) concluded **success** for the exact release
+   commit. A tag on a non-CI-green commit is refused, loudly, before the publish step.
+
+**Recommended flow:** `preflight` → push to `main` → **wait for CI green on all platforms** →
+bump + tag. (Pushing commit + tag together still works — the gate waits for CI to finish, up
+to ~40 min, then requires success.)
+
 ## Core (crates + binaries) — `v*`
 
 ```bash
