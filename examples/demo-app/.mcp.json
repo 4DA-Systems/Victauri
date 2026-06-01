@@ -1,7 +1,8 @@
 {
   "mcpServers": {
     "victauri-demo": {
-      "url": "http://127.0.0.1:7373/mcp"
+      "command": "victauri",
+      "args": ["bridge", "--wait", "--app", "com.example.victauri-demo"]
     }
   }
 }

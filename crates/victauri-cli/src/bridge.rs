@@ -4,32 +4,64 @@
 //! endpoint, parses SSE responses, and writes them back to stdout. This bridges
 //! the gap between MCP hosts that expect stdio transport and Victauri's HTTP server.
 //!
-//! The bridge automatically recovers from server restarts: when it detects a stale
-//! session (404) or connection failure, it re-discovers the server and retries.
+//! Why this exists (and why agents should connect through it, not a fixed `url:`):
+//!
+//! * **Always reaches the RIGHT app.** A static `.mcp.json` URL hardcodes a port; when
+//!   several Victauri apps run (or one falls back off a busy 7373), that port can point at
+//!   the WRONG process. The bridge resolves the live backend **by app identity** at connect
+//!   time and re-resolves on failure — so the agent can never get stuck talking to the
+//!   wrong app. Select with `--app <identifier>` (or `VICTAURI_APP`); with no selector it
+//!   uses the single running app, or errors clearly if several are running.
+//! * **Survives server restarts.** Every dev rebuild/relaunch invalidates the MCP session.
+//!   The bridge caches the `initialize` handshake and transparently re-establishes a fresh
+//!   session (re-discovering the port) on a stale session (404/409/422) or connection drop,
+//!   so the agent's tool calls keep working without a reconnect.
 
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 
-const MAX_RETRIES: usize = 3;
-const RETRY_DELAY_MS: u64 = 500;
+const MAX_RETRIES: usize = 4;
+const RETRY_DELAY_MS: u64 = 400;
+
+/// A discovered, live Victauri backend.
+#[derive(Clone, Debug)]
+struct ServerInfo {
+    port: u16,
+    token: Option<String>,
+    identifier: Option<String>,
+    product_name: Option<String>,
+}
+
+impl ServerInfo {
+    fn label(&self) -> String {
+        let name = self
+            .identifier
+            .as_deref()
+            .or(self.product_name.as_deref())
+            .unwrap_or("<unknown app>");
+        format!("{name} (port {})", self.port)
+    }
+}
 
 /// Run the stdio bridge against a discovered Victauri server.
 ///
+/// `app` selects which app to bind when several are running (matches the Tauri bundle
+/// identifier or product name; falls back to the `VICTAURI_APP` env var).
+///
 /// # Errors
 ///
-/// Returns an error if the server cannot be reached or the bridge encounters
-/// a fatal protocol error.
-pub async fn run(wait: bool) -> Result<()> {
-    let connection = Arc::new(Mutex::new(discover_server(wait).await?));
+/// Returns an error if no matching server can be reached.
+pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
+    let app = app.or_else(|| std::env::var("VICTAURI_APP").ok());
+    let connection = Arc::new(Mutex::new(discover_and_select(wait, app.as_deref()).await?));
     let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache the MCP handshake so a session can be re-established transparently after the
+    // backend restarts — the host (e.g. Claude Code) only sends `initialize` once.
+    let cached_init: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .context("failed to create HTTP client")?;
+    let http = build_client()?;
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -49,140 +81,105 @@ pub async fn run(wait: bool) -> Result<()> {
             }
         };
 
+        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        let is_initialize = method == "initialize";
+        if is_initialize {
+            *cached_init.lock().expect("cached_init lock") = Some(msg.clone());
+        }
         let is_notification = msg.get("id").is_none();
 
         let mut last_err = None;
 
         for attempt in 0..MAX_RETRIES {
-            let (port, token) = {
-                let guard = connection.lock().expect("connection lock");
-                (guard.0, guard.1.clone())
-            };
-            let mcp_url = format!("http://127.0.0.1:{port}/mcp");
-
-            let mut req = http
-                .post(&mcp_url)
-                .header("Content-Type", "application/json")
-                .header("Accept", "application/json, text/event-stream");
-
-            if let Some(ref t) = token {
-                req = req.header("Authorization", format!("Bearer {t}"));
-            }
-            {
-                let sid_guard = session_id.lock().expect("session_id lock");
-                if let Some(ref sid) = *sid_guard {
-                    req = req.header("Mcp-Session-Id", sid.clone());
+            // If the session was invalidated and we have a cached handshake, re-establish a
+            // fresh session BEFORE replaying the real request (skip when the message itself
+            // is the initialize). This is what makes restart-recovery actually work — the
+            // old code cleared the session then re-sent the tool call with no session, which
+            // the server rejects with 422 "expect initialize".
+            if !is_initialize {
+                let need_reinit = session_id.lock().expect("session lock").is_none();
+                if need_reinit {
+                    let init = cached_init.lock().expect("cached_init lock").clone();
+                    if let Some(init) = init {
+                        let (port, token) = conn_parts(&connection);
+                        // We don't relay the re-init response to the host; it already believes
+                        // it is initialized. On failure we fall through to the request attempt,
+                        // which triggers re-discovery below.
+                        if let Ok(out) =
+                            post_message(&http, port, token.as_deref(), None, &init).await
+                            && let Some(sid) = out.session_id
+                        {
+                            *session_id.lock().expect("session lock") = Some(sid);
+                        }
+                    }
                 }
             }
 
-            let resp = match req.json(&msg).send().await {
-                Ok(r) => r,
+            let (port, token) = conn_parts(&connection);
+            let sid = session_id.lock().expect("session lock").clone();
+
+            match post_message(&http, port, token.as_deref(), sid.as_deref(), &msg).await {
+                Ok(out) => {
+                    if let Some(new_sid) = out.session_id {
+                        *session_id.lock().expect("session lock") = Some(new_sid);
+                    }
+
+                    if out.stale_session {
+                        eprintln!(
+                            "victauri-bridge: stale session (HTTP {}), re-establishing (attempt {}/{})",
+                            out.status,
+                            attempt + 1,
+                            MAX_RETRIES
+                        );
+                        *session_id.lock().expect("session lock") = None;
+                        if attempt + 1 < MAX_RETRIES {
+                            tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS))
+                                .await;
+                            if let Ok(new_conn) = discover_and_select(false, app.as_deref()).await {
+                                *connection.lock().expect("conn lock") = new_conn;
+                            }
+                        }
+                        last_err = Some(format!("Victauri returned {}", out.status));
+                        continue;
+                    }
+
+                    if is_notification && out.accepted {
+                        last_err = None;
+                        break;
+                    }
+
+                    for payload in out.payloads {
+                        let mut o = stdout.lock();
+                        let _ = writeln!(o, "{payload}");
+                        let _ = o.flush();
+                    }
+                    last_err = None;
+                    break;
+                }
                 Err(e) => {
                     eprintln!(
                         "victauri-bridge: connection failed (attempt {}/{}): {e}",
                         attempt + 1,
                         MAX_RETRIES
                     );
-                    *session_id.lock().expect("session_id lock") = None;
+                    *session_id.lock().expect("session lock") = None;
                     if attempt + 1 < MAX_RETRIES {
                         tokio::time::sleep(std::time::Duration::from_millis(
                             RETRY_DELAY_MS * (attempt as u64 + 1),
                         ))
                         .await;
-                        if let Ok(new_conn) = discover_server(true).await {
-                            *connection.lock().expect("connection lock") = new_conn;
-                            eprintln!("victauri-bridge: reconnected to server");
+                        if let Ok(new_conn) = discover_and_select(true, app.as_deref()).await {
+                            *connection.lock().expect("conn lock") = new_conn;
+                            eprintln!("victauri-bridge: reconnected to {}", {
+                                let g = connection.lock().expect("conn lock");
+                                g.label()
+                            });
                         }
                     }
                     last_err = Some(format!("Victauri server unreachable: {e}"));
                     continue;
                 }
-            };
-
-            if let Some(sid) = resp.headers().get("mcp-session-id")
-                && let Ok(s) = sid.to_str()
-            {
-                *session_id.lock().expect("session_id lock") = Some(s.to_string());
             }
-
-            let status = resp.status();
-
-            if is_notification && status.as_u16() == 202 {
-                last_err = None;
-                break;
-            }
-
-            if status.as_u16() == 404 || status.as_u16() == 409 {
-                eprintln!(
-                    "victauri-bridge: stale session ({}), reconnecting (attempt {}/{})",
-                    status,
-                    attempt + 1,
-                    MAX_RETRIES
-                );
-                *session_id.lock().expect("session_id lock") = None;
-                if attempt + 1 < MAX_RETRIES {
-                    tokio::time::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS)).await;
-                    if let Ok(new_conn) = discover_server(false).await {
-                        *connection.lock().expect("connection lock") = new_conn;
-                    }
-                }
-                last_err = Some(format!("Victauri returned {status}"));
-                continue;
-            }
-
-            if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                if !is_notification {
-                    let err_resp = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": msg.get("id"),
-                        "error": {
-                            "code": -32000,
-                            "message": format!("Victauri returned {status}: {body}")
-                        }
-                    });
-                    let mut out = stdout.lock();
-                    let _ = writeln!(out, "{err_resp}");
-                    let _ = out.flush();
-                }
-                last_err = None;
-                break;
-            }
-
-            let content_type = resp
-                .headers()
-                .get("content-type")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-                .to_string();
-
-            let body = resp.text().await.unwrap_or_default();
-
-            if content_type.contains("text/event-stream") {
-                for sse_line in body.lines() {
-                    if let Some(data) = sse_line.strip_prefix("data: ") {
-                        let data = data.trim();
-                        if data.is_empty() {
-                            continue;
-                        }
-                        if serde_json::from_str::<serde_json::Value>(data).is_ok() {
-                            let mut out = stdout.lock();
-                            let _ = writeln!(out, "{data}");
-                            let _ = out.flush();
-                        }
-                    }
-                }
-            } else {
-                let body = body.trim();
-                if !body.is_empty() {
-                    let mut out = stdout.lock();
-                    let _ = writeln!(out, "{body}");
-                    let _ = out.flush();
-                }
-            }
-
-            last_err = None;
-            break;
         }
 
         if let Some(err_msg) = last_err
@@ -191,110 +188,291 @@ pub async fn run(wait: bool) -> Result<()> {
             let err_resp = serde_json::json!({
                 "jsonrpc": "2.0",
                 "id": msg.get("id"),
-                "error": {
-                    "code": -32000,
-                    "message": err_msg
-                }
+                "error": { "code": -32000, "message": err_msg }
             });
-            let mut out = stdout.lock();
-            let _ = writeln!(out, "{err_resp}");
-            let _ = out.flush();
+            let mut o = stdout.lock();
+            let _ = writeln!(o, "{err_resp}");
+            let _ = o.flush();
         }
     }
 
     Ok(())
 }
 
-/// Discover a running Victauri server's port and auth token.
-///
-/// # Errors
-///
-/// Returns an error if no running server can be found within the timeout.
-async fn discover_server(wait: bool) -> Result<(u16, Option<String>)> {
+fn build_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(Into::into)
+}
+
+fn conn_parts(connection: &Arc<Mutex<ServerInfo>>) -> (u16, Option<String>) {
+    let g = connection.lock().expect("conn lock");
+    (g.port, g.token.clone())
+}
+
+/// Outcome of forwarding one JSON-RPC message to the backend.
+struct PostOutcome {
+    status: u16,
+    session_id: Option<String>,
+    stale_session: bool,
+    accepted: bool,
+    payloads: Vec<String>,
+}
+
+/// Forward a single JSON-RPC message to `127.0.0.1:<port>/mcp` and parse the response.
+async fn post_message(
+    http: &reqwest::Client,
+    port: u16,
+    token: Option<&str>,
+    session_id: Option<&str>,
+    msg: &serde_json::Value,
+) -> Result<PostOutcome> {
+    let url = format!("http://127.0.0.1:{port}/mcp");
+    let mut req = http
+        .post(&url)
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    if let Some(sid) = session_id {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+
+    let resp = req.json(msg).send().await?;
+    let status = resp.status().as_u16();
+    let new_sid = resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+
+    // 404/409 = unknown/terminated session; 422 = "expect initialize" (no/!init session).
+    // All three mean "the session is gone — re-establish it".
+    let stale_session = matches!(status, 404 | 409 | 422);
+    let accepted = status == 202;
+
+    let mut payloads = Vec::new();
+    if !stale_session && status != 202 {
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let body = resp.text().await.unwrap_or_default();
+
+        if !(200..300).contains(&status) {
+            // Surface a JSON-RPC error for the original request id.
+            payloads.push(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id"),
+                    "error": { "code": -32000, "message": format!("Victauri returned {status}: {body}") }
+                })
+                .to_string(),
+            );
+        } else if content_type.contains("text/event-stream") {
+            for sse_line in body.lines() {
+                if let Some(data) = sse_line.strip_prefix("data: ") {
+                    let data = data.trim();
+                    if !data.is_empty() && serde_json::from_str::<serde_json::Value>(data).is_ok() {
+                        payloads.push(data.to_string());
+                    }
+                }
+            }
+        } else {
+            let body = body.trim();
+            if !body.is_empty() {
+                payloads.push(body.to_string());
+            }
+        }
+    }
+
+    Ok(PostOutcome {
+        status,
+        session_id: new_sid,
+        stale_session,
+        accepted,
+        payloads,
+    })
+}
+
+/// Discover live Victauri backends and select the one matching `app` (or the only one).
+async fn discover_and_select(wait: bool, app: Option<&str>) -> Result<ServerInfo> {
     let max_attempts = if wait { 30 } else { 3 };
     let delay = std::time::Duration::from_secs(1);
 
     for attempt in 0..max_attempts {
-        let port = discover_port();
-        let token = discover_token();
-
-        let url = format!("http://127.0.0.1:{port}/health");
-        let ok = reqwest::Client::new()
-            .get(&url)
-            .timeout(std::time::Duration::from_secs(3))
-            .send()
-            .await
-            .is_ok_and(|r| r.status().is_success());
-
-        if ok {
-            eprintln!("victauri-bridge: connected to Victauri on port {port}");
-            return Ok((port, token));
+        // Explicit env override wins (a developer pinning a specific port).
+        if let Ok(p) = std::env::var("VICTAURI_PORT")
+            && let Ok(port) = p.parse::<u16>()
+            && health_ok(port).await
+        {
+            return Ok(ServerInfo {
+                port,
+                token: std::env::var("VICTAURI_AUTH_TOKEN")
+                    .ok()
+                    .or_else(discover_any_token),
+                identifier: None,
+                product_name: None,
+            });
         }
 
-        if attempt < max_attempts - 1 {
-            if attempt == 0 {
-                eprintln!("victauri-bridge: waiting for Victauri server...");
+        let mut servers = discover_servers();
+        // Keep only live ones (health-checked).
+        let mut live = Vec::new();
+        for s in servers.drain(..) {
+            if health_ok(s.port).await {
+                live.push(s);
             }
-            tokio::time::sleep(delay).await;
+        }
+
+        match select(&live, app) {
+            Selection::One(s) => {
+                eprintln!("victauri-bridge: connected to {}", s.label());
+                return Ok(s);
+            }
+            Selection::None if attempt + 1 < max_attempts => {
+                if attempt == 0 {
+                    eprintln!("victauri-bridge: waiting for Victauri server...");
+                }
+                tokio::time::sleep(delay).await;
+            }
+            Selection::None => {
+                bail!(
+                    "Could not connect to Victauri server.\n\
+                     Is your Tauri app running (debug build)? Start it with: pnpm run tauri dev"
+                );
+            }
+            Selection::Ambiguous(labels) => {
+                bail!(
+                    "Multiple Victauri apps are running:\n  {}\n\
+                     Specify which one with `victauri bridge --app <identifier>` (or set \
+                     VICTAURI_APP). The identifier is your Tauri bundle identifier.",
+                    labels.join("\n  ")
+                );
+            }
         }
     }
 
-    bail!(
-        "Could not connect to Victauri server.\n\
-         Is your Tauri app running? Start it with: pnpm run tauri dev"
-    )
+    bail!("Could not connect to a matching Victauri server")
 }
 
-/// Scan discovery directories for a running server's port.
-fn discover_port() -> u16 {
-    if let Ok(p) = std::env::var("VICTAURI_PORT")
-        && let Ok(port) = p.parse::<u16>()
-    {
-        return port;
-    }
-    // Scan temp/victauri/<PID>/port files for live servers
-    let discovery_root = std::env::temp_dir().join("victauri");
-    if let Ok(entries) = std::fs::read_dir(&discovery_root) {
-        for entry in entries.filter_map(Result::ok) {
-            let port_file = entry.path().join("port");
-            if let Ok(content) = std::fs::read_to_string(&port_file)
-                && let Ok(port) = content.trim().parse::<u16>()
-            {
-                let pid_str = entry.file_name().to_string_lossy().to_string();
-                if let Ok(pid) = pid_str.parse::<u32>()
-                    && is_process_alive(pid)
-                {
-                    return port;
-                }
-            }
-        }
-    }
-    7373
+enum Selection {
+    One(ServerInfo),
+    None,
+    Ambiguous(Vec<String>),
 }
 
-/// Scan discovery directories for a running server's auth token.
-fn discover_token() -> Option<String> {
-    if let Ok(token) = std::env::var("VICTAURI_AUTH_TOKEN") {
-        return Some(token);
+/// Pick the server matching `app`, or the sole running server.
+fn select(live: &[ServerInfo], app: Option<&str>) -> Selection {
+    if live.is_empty() {
+        return Selection::None;
     }
-    let discovery_root = std::env::temp_dir().join("victauri");
-    if let Ok(entries) = std::fs::read_dir(&discovery_root) {
-        for entry in entries.filter_map(Result::ok) {
-            let token_file = entry.path().join("token");
-            if let Ok(content) = std::fs::read_to_string(&token_file) {
-                let token = content.trim().to_string();
-                if !token.is_empty() {
-                    let pid_str = entry.file_name().to_string_lossy().to_string();
-                    if let Ok(pid) = pid_str.parse::<u32>()
-                        && is_process_alive(pid)
-                    {
-                        return Some(token);
-                    }
-                }
-            }
+    if let Some(app) = app {
+        let needle = app.to_ascii_lowercase();
+        // Prefer an exact identifier/product_name match, then a substring match.
+        let exact = live.iter().find(|s| {
+            s.identifier
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+                == Some(&needle)
+                || s.product_name
+                    .as_deref()
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                    == Some(&needle)
+        });
+        if let Some(s) = exact {
+            return Selection::One(s.clone());
         }
+        let partial = live.iter().find(|s| {
+            s.identifier
+                .as_deref()
+                .is_some_and(|i| i.to_ascii_lowercase().contains(&needle))
+                || s.product_name
+                    .as_deref()
+                    .is_some_and(|p| p.to_ascii_lowercase().contains(&needle))
+        });
+        return match partial {
+            Some(s) => Selection::One(s.clone()),
+            None => Selection::None,
+        };
     }
-    None
+    // No app specified: fine if exactly one is running; ambiguous otherwise.
+    if live.len() == 1 {
+        Selection::One(live[0].clone())
+    } else {
+        Selection::Ambiguous(live.iter().map(ServerInfo::label).collect())
+    }
+}
+
+/// Scan `<temp>/victauri/<pid>/` for live-process discovery entries (port + token + identity).
+fn discover_servers() -> Vec<ServerInfo> {
+    let root = std::env::temp_dir().join("victauri");
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return out;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let pid_str = entry.file_name().to_string_lossy().to_string();
+        let Ok(pid) = pid_str.parse::<u32>() else {
+            continue;
+        };
+        if !is_process_alive(pid) {
+            continue;
+        }
+        let dir = entry.path();
+        let Ok(port_s) = std::fs::read_to_string(dir.join("port")) else {
+            continue;
+        };
+        let Ok(port) = port_s.trim().parse::<u16>() else {
+            continue;
+        };
+        let token = std::fs::read_to_string(dir.join("token"))
+            .ok()
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
+        let (identifier, product_name) = std::fs::read_to_string(dir.join("metadata.json"))
+            .ok()
+            .and_then(|m| serde_json::from_str::<serde_json::Value>(&m).ok())
+            .map_or((None, None), |m| {
+                (
+                    m.get("identifier")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    m.get("product_name")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                )
+            });
+        out.push(ServerInfo {
+            port,
+            token,
+            identifier,
+            product_name,
+        });
+    }
+    out
+}
+
+/// First token found among live discovery entries (used only for the `VICTAURI_PORT` override).
+fn discover_any_token() -> Option<String> {
+    discover_servers().into_iter().find_map(|s| s.token)
+}
+
+async fn health_ok(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/health");
+    reqwest::Client::new()
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success())
 }
 
 #[cfg(windows)]
@@ -312,4 +490,69 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(not(windows))]
 fn is_process_alive(pid: u32) -> bool {
     std::path::Path::new(&format!("/proc/{pid}")).exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn srv(id: &str, name: &str, port: u16) -> ServerInfo {
+        ServerInfo {
+            port,
+            token: None,
+            identifier: Some(id.to_string()),
+            product_name: Some(name.to_string()),
+        }
+    }
+
+    #[test]
+    fn selects_sole_server_without_app() {
+        let live = vec![srv("com.a.app", "A", 7373)];
+        assert!(matches!(select(&live, None), Selection::One(s) if s.port == 7373));
+    }
+
+    #[test]
+    fn ambiguous_when_multiple_and_no_app() {
+        let live = vec![srv("com.a.app", "A", 7373), srv("com.b.app", "B", 7374)];
+        assert!(matches!(select(&live, None), Selection::Ambiguous(v) if v.len() == 2));
+    }
+
+    #[test]
+    fn selects_by_identifier_among_many() {
+        let live = vec![srv("com.a.app", "A", 7373), srv("com.4da.app", "4DA", 7374)];
+        match select(&live, Some("com.4da.app")) {
+            Selection::One(s) => assert_eq!(s.port, 7374),
+            _ => panic!("should pick 4DA by identifier"),
+        }
+    }
+
+    #[test]
+    fn selects_by_product_name_case_insensitive() {
+        let live = vec![
+            srv("com.a.app", "Demo", 7373),
+            srv("com.4da.app", "4DA", 7374),
+        ];
+        match select(&live, Some("4da")) {
+            Selection::One(s) => assert_eq!(s.port, 7374),
+            _ => panic!("should pick by product name"),
+        }
+    }
+
+    #[test]
+    fn no_match_returns_none() {
+        let live = vec![srv("com.a.app", "A", 7373)];
+        assert!(matches!(
+            select(&live, Some("com.nope.app")),
+            Selection::None
+        ));
+    }
+
+    #[test]
+    fn substring_identifier_match() {
+        let live = vec![srv("com.victauri.demo", "Demo", 7373)];
+        match select(&live, Some("demo")) {
+            Selection::One(s) => assert_eq!(s.port, 7373),
+            _ => panic!("substring of product/identifier should match"),
+        }
+    }
 }

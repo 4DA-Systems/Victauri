@@ -746,10 +746,17 @@ impl VictauriMcpHandler {
             .map(|t| t.name.as_ref())
             .collect();
 
+        // Host-app identity: lets an agent verify on its FIRST call that it reached the
+        // intended app (not another Victauri instance sharing the discovery port).
+        let app_cfg = self.bridge.tauri_config();
         let result = serde_json::json!({
             "version": env!("CARGO_PKG_VERSION"),
             "bridge_version": BRIDGE_VERSION,
             "port": self.state.port.load(Ordering::Relaxed),
+            "app": {
+                "identifier": app_cfg.get("identifier"),
+                "product_name": app_cfg.get("product_name"),
+            },
             "tools": {
                 "total": all_tools.len(),
                 "enabled": enabled_tools.len(),

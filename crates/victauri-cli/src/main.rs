@@ -88,6 +88,11 @@ enum Commands {
         /// Wait up to 30 seconds for the Victauri server to become available
         #[arg(long)]
         wait: bool,
+        /// Select which app to bind when several Victauri apps are running — matches the
+        /// Tauri bundle identifier or product name (env: `VICTAURI_APP`). Without it, the
+        /// bridge uses the single running app, or errors clearly if several are running.
+        #[arg(long)]
+        app: Option<String>,
     },
     /// Report IPC command coverage from a running Tauri app
     Coverage {
@@ -125,8 +130,8 @@ async fn main() -> Result<()> {
         Commands::Doctor => {
             cmd_doctor().await?;
         }
-        Commands::Bridge { wait } => {
-            bridge::run(wait).await?;
+        Commands::Bridge { wait, app } => {
+            bridge::run(wait, app).await?;
         }
         Commands::Record {
             output,
@@ -201,13 +206,20 @@ fn cmd_init(root: &Path) -> Result<()> {
             eprintln!("  [=] .mcp.json already configured for Victauri");
         } else {
             eprintln!("  [!] .mcp.json exists but doesn't reference Victauri.");
-            eprintln!("      Add this to your mcpServers:\n");
-            eprintln!("        \"victauri\": {{ \"url\": \"http://127.0.0.1:7373/mcp\" }}\n");
+            eprintln!("      Add this to your mcpServers (the bridge auto-discovers the port —");
+            eprintln!("      prefer it over a fixed url so agents never bind the wrong app):\n");
+            eprintln!(
+                "        \"victauri\": {{ \"command\": \"victauri\", \"args\": [\"bridge\", \"--wait\"] }}\n"
+            );
         }
     } else {
-        std::fs::write(&mcp_json_path, generate_mcp_json())
+        let app_id = read_app_identifier(root.as_path());
+        std::fs::write(&mcp_json_path, generate_mcp_json(app_id.as_deref()))
             .with_context(|| format!("failed to write {}", mcp_json_path.display()))?;
-        eprintln!("  [+] Created .mcp.json (AI agent configuration)");
+        match app_id {
+            Some(id) => eprintln!("  [+] Created .mcp.json (bridge pinned to app '{id}')"),
+            None => eprintln!("  [+] Created .mcp.json (AI agent configuration)"),
+        }
     }
 
     // Step 4: Create Tauri capability for Victauri
@@ -1130,20 +1142,45 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn generate_mcp_json() -> &'static str {
-    r#"{
-  "mcpServers": {
-    "victauri": {
+/// Generate the `.mcp.json` for AI-agent connection. Uses the `victauri bridge` stdio
+/// proxy (NOT a fixed `url:`) so the agent is connected by *discovery* — the bridge resolves
+/// the live backend port at connect time and re-resolves on restart, and `--app <identifier>`
+/// guarantees it binds the RIGHT app even when several Victauri apps are running.
+fn generate_mcp_json(app: Option<&str>) -> String {
+    let args = match app {
+        Some(id) => format!("[\"bridge\", \"--wait\", \"--app\", \"{id}\"]"),
+        None => "[\"bridge\", \"--wait\"]".to_string(),
+    };
+    format!(
+        r#"{{
+  "mcpServers": {{
+    "victauri": {{
       "command": "victauri",
-      "args": ["bridge", "--wait"]
-    }
-  }
-}
+      "args": {args}
+    }}
+  }}
+}}
 "#
+    )
+}
+
+/// Read the Tauri bundle identifier from the project's `tauri.conf.json` so the generated
+/// `.mcp.json` can pin the bridge to this specific app (multi-app zero-config).
+fn read_app_identifier(root: &Path) -> Option<String> {
+    for rel in ["src-tauri/tauri.conf.json", "tauri.conf.json"] {
+        let path = root.join(rel);
+        if let Ok(content) = std::fs::read_to_string(&path)
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
+            && let Some(id) = v.get("identifier").and_then(|i| i.as_str())
+        {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 fn generate_claude_md_section() -> &'static str {
-    r"
+    r#"
 <!-- VICTAURI:BEGIN (added by `victauri init` — delete this block to opt out) -->
 ## Victauri (App Inspection & Testing)
 
@@ -1167,12 +1204,28 @@ Key tools that only Victauri can provide (not available via CDP/Playwright):
 - `audit_accessibility` — WCAG accessibility checks
 - `get_performance` — navigation timing, JS heap, resource loading
 
-Connection: `victauri bridge` (stdio-to-HTTP proxy, configured in `.mcp.json`)
+### Connecting reliably (read this before reaching for CDP)
 
-Prefer Victauri over Playwright or CDP for tasks it handles; fall back to
-Playwright for browser-only work unrelated to the Tauri app.
+`.mcp.json` connects through `victauri bridge` — a stdio proxy that **discovers the running
+app's port at connect time and re-discovers on restart**, so you are never pinned to a stale
+or wrong port. Do **not** replace it with a fixed `"url": "http://127.0.0.1:7373/mcp"`: a
+hardcoded port can point at a *different* Victauri app (e.g. a leftover demo) and every call
+then fails with `422`/`404`. The bridge avoids that by design.
+
+- **First contact:** call `get_plugin_info` once and check `app.identifier` — confirm you
+  reached the intended app, not another Victauri instance.
+- **Multiple apps running?** Pin the bridge with `--app <bundle-identifier>` in `.mcp.json`
+  (`"args": ["bridge", "--wait", "--app", "com.your.app"]`), or set `VICTAURI_APP`. `init`
+  bakes this in automatically when it can read your identifier.
+- **If a tool call fails after an app rebuild/restart:** the bridge re-establishes the
+  session automatically — just retry. If the MCP path is genuinely wedged, the **sessionless
+  REST API is the fallback, NOT CDP**: `POST http://127.0.0.1:<port>/api/tools/<tool>` with
+  the Bearer token from `<temp>/victauri/<pid>/token` (same capabilities, no session).
+
+Prefer Victauri over Playwright or CDP for any Tauri-app task it handles; fall back to
+Playwright only for browser-only work unrelated to this app.
 <!-- VICTAURI:END -->
-"
+"#
 }
 
 fn generate_capability_json() -> &'static str {
@@ -1774,8 +1827,8 @@ mod tests {
 
     #[test]
     fn mcp_json_has_correct_structure() {
-        let content = generate_mcp_json();
-        let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+        let content = generate_mcp_json(None);
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             parsed["mcpServers"]["victauri"]["command"]
                 .as_str()
@@ -1784,6 +1837,15 @@ mod tests {
         );
         let args = parsed["mcpServers"]["victauri"]["args"].as_array().unwrap();
         assert!(args.iter().any(|a| a.as_str() == Some("bridge")));
+    }
+
+    #[test]
+    fn mcp_json_pins_app_identifier() {
+        let content = generate_mcp_json(Some("com.4da.app"));
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let args = parsed["mcpServers"]["victauri"]["args"].as_array().unwrap();
+        assert!(args.iter().any(|a| a.as_str() == Some("--app")));
+        assert!(args.iter().any(|a| a.as_str() == Some("com.4da.app")));
     }
 
     #[test]

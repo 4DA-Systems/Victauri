@@ -37,6 +37,18 @@ pub fn build_app_full(
     auth_token: Option<String>,
     rate_limiter: Option<Arc<crate::auth::RateLimiterState>>,
 ) -> axum::Router {
+    // Capture the host app's identity for `/info` (first-contact verification: an agent
+    // can confirm it reached the RIGHT app, not another Victauri instance on a shared port).
+    let tauri_cfg = bridge.tauri_config();
+    let app_identifier = tauri_cfg
+        .get("identifier")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let app_product_name = tauri_cfg
+        .get("product_name")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
     let handler = VictauriMcpHandler::new(state.clone(), bridge);
     let rest = super::rest::router(handler.clone());
 
@@ -64,12 +76,17 @@ pub fn build_app_full(
             "/info",
             axum::routing::get(move || {
                 let s = info_state.clone();
+                let app_id = app_identifier.clone();
+                let app_name = app_product_name.clone();
                 async move {
                     axum::Json(serde_json::json!({
                         "name": "victauri",
                         "description": "Full-stack Tauri app inspection: webview + IPC + Rust backend + SQLite",
                         "version": env!("CARGO_PKG_VERSION"),
                         "protocol": "mcp",
+                        // Host-app identity — lets an agent verify it reached the intended app.
+                        "app_identifier": app_id,
+                        "app_product_name": app_name,
                         "capabilities": ["webview", "ipc", "backend", "database", "filesystem"],
                         "commands_registered": s.registry.count(),
                         "events_captured": s.event_log.len(),
@@ -157,7 +174,10 @@ pub async fn start_server_with_options<R: Runtime>(
     }
 
     state.port.store(actual_port, Ordering::Relaxed);
-    write_port_file(actual_port);
+    let cfg = bridge.tauri_config();
+    let app_identifier = cfg.get("identifier").and_then(|v| v.as_str());
+    let app_product_name = cfg.get("product_name").and_then(|v| v.as_str());
+    write_port_file(actual_port, app_identifier, app_product_name);
     // Always write a session token to the discovery directory so clients can
     // authenticate automatically.  When auth is explicitly configured the
     // configured token is used; otherwise a fresh UUID is generated.  The auth
@@ -248,7 +268,7 @@ fn restrict_to_current_user(path: &std::path::Path) {
         .status();
 }
 
-fn write_port_file(port: u16) {
+fn write_port_file(port: u16, identifier: Option<&str>, product_name: Option<&str>) {
     let dir = discovery_dir();
     let _ = std::fs::create_dir_all(&dir);
     #[cfg(unix)]
@@ -268,10 +288,15 @@ fn write_port_file(port: u16) {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&port_path, std::fs::Permissions::from_mode(0o600));
     }
-    // Write metadata for multi-server discovery
+    // Write metadata for multi-server discovery. The app `identifier` lets a discovery
+    // client (e.g. `victauri bridge --app <id>`) select the RIGHT app when several Victauri
+    // instances are running, instead of guessing — the root cause of agents binding to the
+    // wrong process on a shared port.
     let metadata = serde_json::json!({
         "pid": std::process::id(),
         "port": port,
+        "identifier": identifier,
+        "product_name": product_name,
         "started_at": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
     });
@@ -527,7 +552,7 @@ mod tests {
 
     #[test]
     fn port_file_roundtrip() {
-        write_port_file(7777);
+        write_port_file(7777, Some("com.example.app"), Some("Example"));
         let dir = discovery_dir();
         let content = std::fs::read_to_string(dir.join("port")).unwrap();
         assert_eq!(content, "7777");
