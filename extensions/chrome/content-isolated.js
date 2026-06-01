@@ -2,17 +2,35 @@
 // Relays commands between the service worker and the MAIN world content script.
 // Has access to chrome.runtime but NOT to page JS globals.
 
-// Secret nonce shared with the MAIN-world bridge (audit #2). Established at
-// document_start, before page scripts run, so a page cannot forge a command. Latched
-// to the first announcement to resist a page racing the handshake.
-let bridgeNonce = null;
-window.addEventListener('__victauri_handshake', (event) => {
-    if (bridgeNonce === null && event.detail && event.detail.nonce) {
-        bridgeNonce = event.detail.nonce;
+// Secret nonce shared with the MAIN-world bridge (audit #2). The nonce is GENERATED
+// here in the ISOLATED world (page JS cannot read this scope) and handed to MAIN
+// exactly once, during document_start — before any page script can run. The responder
+// is single-shot: once the nonce has been delivered it is never offered again, so a page
+// script (which only runs after document_start) can never elicit it. The handshake
+// signalling events that a page *could* forge (`__victauri_nonce_offer`/`_req`) carry no
+// secret, so forging them is harmless.
+//
+// Earlier revisions generated the nonce in MAIN and re-broadcast it on a perpetual
+// `__victauri_handshake_req` listener; because MAIN shares the page's window, a page
+// could fire that request and capture the nonce. This design removes that leak.
+const bridgeNonce = (() => {
+    try {
+        const a = new Uint8Array(16);
+        crypto.getRandomValues(a);
+        return Array.prototype.map.call(a, (b) => ('0' + b.toString(16)).slice(-2)).join('');
+    } catch (e) {
+        return String(Date.now()) + Math.random().toString(36).slice(2);
     }
+})();
+let nonceDelivered = false;
+window.addEventListener('__victauri_nonce_req', () => {
+    if (nonceDelivered) return; // single-shot: never re-deliver to a late (page) requester
+    nonceDelivered = true;
+    window.dispatchEvent(new CustomEvent('__victauri_nonce', { detail: { nonce: bridgeNonce } }));
 });
-// Ask the MAIN bridge to (re)announce — covers the case where it loaded first.
-window.dispatchEvent(new CustomEvent('__victauri_handshake_req'));
+// Announce readiness so MAIN re-requests if it loaded before this relay was armed.
+// Carries no secret — safe even if a page observes or forges it.
+window.dispatchEvent(new CustomEvent('__victauri_nonce_offer'));
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type !== 'victauri_command') return false;

@@ -86,6 +86,13 @@ fn extract_inner_code(script: &str) -> String {
 
 impl WebviewBridge for CallbackMockBridge {
     fn eval_webview(&self, _label: Option<&str>, script: &str) -> Result<(), String> {
+        // The eval wrapper carries the result envelope marker `__victauri_ok`; the
+        // parse-watchdog companion script injected alongside it does not. Skip the
+        // watchdog here, exactly as a real webview only fires the watchdog's callback via
+        // its delayed timer (and only when the real wrapper failed to run).
+        if !script.contains("__victauri_ok") {
+            return Ok(());
+        }
         if let Some(id) = extract_eval_id(script) {
             let inner_code = extract_inner_code(script);
             let response = (self.response_fn)(&inner_code);

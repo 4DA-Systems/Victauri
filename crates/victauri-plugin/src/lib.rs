@@ -279,15 +279,13 @@ impl VictauriBuilder {
         self
     }
 
-    /// Enable authentication with an auto-generated `UUID` v4 token.
+    /// Explicitly enable authentication with an auto-generated `UUID` v4 token.
     ///
-    /// The token is printed to the log on startup and written to the discovery
-    /// directory (`<temp>/victauri/<pid>/token`) for client auto-discovery.
-    ///
-    /// Authentication is disabled by default because the MCP server binds to
-    /// `127.0.0.1` only and the plugin is `#[cfg(debug_assertions)]`-gated.
-    /// Enable auth for shared machines or CI environments where multiple
-    /// users may access the same host.
+    /// **Authentication is already enabled by default** (see [`Self::auth_disabled`]),
+    /// so this call is redundant in normal use and is kept for explicitness and
+    /// backward compatibility. The token is printed to the log on startup and written
+    /// to the discovery directory (`<temp>/victauri/<pid>/token`) for client
+    /// auto-discovery.
     #[must_use]
     pub fn auth_enabled(mut self) -> Self {
         self.auth_explicitly_enabled = true;
@@ -995,11 +993,11 @@ mod tests {
     }
 
     #[test]
-    fn builder_auth_disabled_is_noop() {
+    fn builder_auth_disabled_suppresses_default_token() {
         let builder = VictauriBuilder::new().auth_disabled();
         assert!(
             builder.resolve_auth_token().is_none(),
-            "auth_disabled is a no-op, auth stays off by default"
+            "auth_disabled must suppress the default auto-generated token (auth is ON by default)"
         );
     }
 

@@ -53,7 +53,7 @@ mcp_session() {
 }
 
 echo "============================================="
-echo "  VICTAURI EXHAUSTIVE TEST P2 v0.5.6 - 4DA"
+echo "  VICTAURI EXHAUSTIVE TEST P2 v0.7.2 - 4DA"
 echo "  (All gaps from part 1)"
 echo "============================================="
 echo ""
@@ -505,7 +505,7 @@ aj "mcp: list resources" "$RES_DATA" '.result.resources | length >= 3'
 # List tools via MCP protocol
 R=$(mcp_rpc "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/list\"}" "$SESSION_ID")
 TOOLS_DATA=$(mcp_data "$R")
-aj "mcp: list tools" "$TOOLS_DATA" '.result.tools | length == 31'
+aj "mcp: list tools" "$TOOLS_DATA" '.result.tools | length == 34'
 echo ""
 
 # ===== 48. INTROSPECT: DEEP DIVE =====
@@ -811,7 +811,7 @@ aj "diagnostics fields" "$R" '.result | type == "object"'
 echo "  (diag: $(echo "$R" | jq -c '.result' | head -c 200))"
 
 R=$(tool get_plugin_info)
-aj "plugin_info deep" "$R" '.result.version == "0.5.6"'
+aj "plugin_info deep" "$R" '.result.version == "0.7.2"'
 echo "  (plugin: $(echo "$R" | jq -c '.result' | head -c 200))"
 
 R=$(tool get_memory_stats)

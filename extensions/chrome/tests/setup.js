@@ -64,35 +64,57 @@ export function createBridgeEnv(html = '<html><head><title>Test</title></head><b
     });
   };
 
-  // Capture the MAIN-bridge provenance nonce (audit #2) the way the ISOLATED relay
-  // does. The listener is added BEFORE injection so it catches the handshake the
-  // bridge fires on load.
-  let bridgeNonce = null;
-  window.addEventListener('__victauri_handshake', (e) => {
-    if (bridgeNonce === null && e.detail && e.detail.nonce) bridgeNonce = e.detail.nonce;
+  // Simulate the ISOLATED relay's half of the audit-#2 handshake. The relay OWNS the
+  // nonce and hands it to the MAIN bridge via a SINGLE-SHOT responder: once the bridge
+  // has pulled it, the relay never re-delivers it. This mirrors the real
+  // content-isolated.js and lets the provenance tests prove a page cannot re-elicit the
+  // nonce after load. The responder is registered BEFORE injection so the bridge's
+  // on-load pull is answered synchronously (as it is at document_start in a real browser).
+  const relayNonce = (() => {
+    try {
+      const a = new Uint8Array(16);
+      (window.crypto || globalThis.crypto).getRandomValues(a);
+      return Array.prototype.map.call(a, (b) => ('0' + b.toString(16)).slice(-2)).join('');
+    } catch (e) {
+      return 'testnonce' + Math.random().toString(36).slice(2);
+    }
+  })();
+  let relayNonceDelivered = false;
+  window.addEventListener('__victauri_nonce_req', () => {
+    if (relayNonceDelivered) return; // single-shot — never re-deliver to a late requester
+    relayNonceDelivered = true;
+    window.dispatchEvent(new window.CustomEvent('__victauri_nonce', { detail: { nonce: relayNonce } }));
   });
 
-  // Inject the bridge script
+  // Inject the bridge script. On load it dispatches __victauri_nonce_req synchronously,
+  // which our already-registered single-shot responder answers — exactly as the real
+  // relay does at document_start, before any page script runs.
   const script = window.document.createElement('script');
   script.textContent = bridgeSource;
   window.document.head.appendChild(script);
 
-  // Fallback in case the load order missed the initial announcement.
-  if (bridgeNonce === null) {
-    window.dispatchEvent(new window.CustomEvent('__victauri_handshake_req'));
-  }
+  // Mirror the relay's readiness offer (covers bridge-loaded-first ordering).
+  window.dispatchEvent(new window.CustomEvent('__victauri_nonce_offer'));
 
   // Simulate the ISOLATED relay: stamp the nonce onto nonce-less command events so
   // existing tests (which dispatch __victauri_command directly) keep working.
   const origDispatch = window.dispatchEvent.bind(window);
   window.dispatchEvent = function (ev) {
-    if (ev && ev.type === '__victauri_command' && ev.detail && ev.detail.nonce == null && bridgeNonce) {
+    if (ev && ev.type === '__victauri_command' && ev.detail && ev.detail.nonce == null && relayNonce) {
       ev = new window.CustomEvent('__victauri_command', {
-        detail: Object.assign({}, ev.detail, { nonce: bridgeNonce }),
+        detail: Object.assign({}, ev.detail, { nonce: relayNonce }),
       });
     }
     return origDispatch(ev);
   };
 
-  return { dom, window, bridge: window.__VICTAURI__, nonce: bridgeNonce };
+  return {
+    dom,
+    window,
+    bridge: window.__VICTAURI__,
+    nonce: relayNonce,
+    // True once the relay's single-shot nonce responder has fired — a page that tries to
+    // re-elicit the nonce after the legitimate pull must find it spent.
+    relayNonceSpent: () => relayNonceDelivered,
+  };
 }

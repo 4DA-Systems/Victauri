@@ -1617,32 +1617,33 @@
 
     var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
 
-    // Provenance gate (audit #2): only honour commands carrying the secret nonce
-    // shared with the ISOLATED relay during a handshake that runs at document_start,
-    // before any page script executes. A page can dispatch __victauri_command but
-    // cannot learn the nonce, so it cannot drive the privileged bridge.
-    var __victauriNonce = (function () {
-        try {
-            var a = new Uint8Array(16);
-            window.crypto.getRandomValues(a);
-            return Array.prototype.map
-                .call(a, function (b) { return ('0' + b.toString(16)).slice(-2); })
-                .join('');
-        } catch (e) {
-            return String(Date.now()) + Math.random().toString(36).slice(2);
-        }
-    })();
-    function __victauriAnnounceNonce() {
-        window.dispatchEvent(new CustomEvent('__victauri_handshake', {
-            detail: { nonce: __victauriNonce }
-        }));
+    // Provenance gate (audit #2): only honour commands carrying the secret nonce that the
+    // ISOLATED relay hands us during a one-shot handshake at document_start, before any
+    // page script runs. The nonce is generated in (and owned by) the ISOLATED world; we
+    // pull it exactly once and keep it in this IIFE closure (page JS cannot read it). The
+    // nonce is NEVER broadcast in response to a page-triggerable event, so a page can
+    // dispatch __victauri_command but cannot learn the nonce and cannot drive the bridge.
+    var __victauriNonce = null;
+    function __victauriRequestNonce() {
+        window.dispatchEvent(new CustomEvent('__victauri_nonce_req'));
     }
-    window.addEventListener('__victauri_handshake_req', __victauriAnnounceNonce);
-    __victauriAnnounceNonce();
+    window.addEventListener('__victauri_nonce', function (event) {
+        if (__victauriNonce === null && event.detail && event.detail.nonce) {
+            __victauriNonce = event.detail.nonce;
+        }
+    });
+    // If ISOLATED loaded first, our initial request reaches its still-armed responder; if
+    // we loaded first, its offer prompts us to re-request once it is ready. Either way the
+    // pull completes synchronously during document_start, before page scripts run.
+    window.addEventListener('__victauri_nonce_offer', __victauriRequestNonce);
+    __victauriRequestNonce();
 
     window.addEventListener('__victauri_command', function(event) {
         var detail = event.detail;
-        if (!detail || detail.nonce !== __victauriNonce || !detail.id || !detail.method) return;
+        // Fail closed if the handshake never completed (__victauriNonce === null): reject
+        // every command rather than letting a forged `nonce: null` slip through.
+        if (!detail || __victauriNonce === null || detail.nonce !== __victauriNonce
+            || !detail.id || !detail.method) return;
 
         var id = detail.id;
         var method = detail.method;

@@ -53,7 +53,7 @@ Victauri is a **debug-only development tool**. Key security properties:
 
 - All plugin code is compiled out in release builds (`#[cfg(debug_assertions)]`)
 - The MCP server binds exclusively to `127.0.0.1` (not `0.0.0.0`)
-- Optional Bearer token authentication protects the MCP endpoint
+- Bearer token authentication is **enabled by default** (auto-generated token) and protects every endpoint except `/health`
 - The `/health` endpoint is unauthenticated by design (for watchdog polling)
 
 ## Contact

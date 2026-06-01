@@ -193,6 +193,29 @@ impl VictauriClient {
                 reason: e.to_string(),
             })?;
 
+        let session_id = Self::perform_handshake(&http, &base_url, host, port, token).await?;
+
+        Ok(Self {
+            http,
+            base_url,
+            host: host.to_string(),
+            port,
+            session_id,
+            next_id: 10,
+            auth_token: token.map(String::from),
+        })
+    }
+
+    /// Run the MCP `initialize` + `notifications/initialized` handshake and return the
+    /// minted session id. Shared by [`Self::connect_with_token`] and [`Self::reinitialize`]
+    /// so a fresh session can be established without rebuilding the whole client.
+    async fn perform_handshake(
+        http: &reqwest::Client,
+        base_url: &str,
+        host: &str,
+        port: u16,
+        token: Option<&str>,
+    ) -> Result<String, TestError> {
         let init_body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -271,15 +294,26 @@ impl VictauriClient {
 
         notify_req.send().await?;
 
-        Ok(Self {
-            http,
-            base_url,
-            host: host.to_string(),
-            port,
-            session_id,
-            next_id: 10,
-            auth_token: token.map(String::from),
-        })
+        Ok(session_id)
+    }
+
+    /// Re-run the MCP handshake to mint a fresh session, replacing the stale one.
+    ///
+    /// Called automatically by [`Self::call_tool`] when a tool call returns HTTP 422
+    /// "expected initialized request" — the session went stale because the in-app server
+    /// restarted, the client reconnected, or the `notifications/initialized` was missed.
+    async fn reinitialize(&mut self) -> Result<(), TestError> {
+        let token = self.auth_token.clone();
+        let session_id = Self::perform_handshake(
+            &self.http,
+            &self.base_url,
+            &self.host,
+            self.port,
+            token.as_deref(),
+        )
+        .await?;
+        self.session_id = session_id;
+        Ok(())
     }
 
     /// Auto-discover a running Victauri server via temp files.
@@ -365,13 +399,16 @@ impl VictauriClient {
 
     /// Call an MCP tool by name and return the result content as JSON.
     ///
-    /// Retries up to 3 times with exponential backoff on 429 (rate limited).
+    /// Retries up to 3 times with exponential backoff on 429 (rate limited). On a 422
+    /// "expected initialized request" (the MCP session went stale after an app/server
+    /// restart) it re-runs the handshake once and retries transparently; if the session is
+    /// still stale, the error names the cause and the sessionless REST fallback.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Connection`] if the request fails after retries.
-    /// Returns [`TestError::Request`] on HTTP transport errors.
-    /// Returns [`TestError::Mcp`] if the server returns a JSON-RPC error.
+    /// Returns [`TestError::Connection`] if the request fails after retries (including an
+    /// unrecoverable stale session). Returns [`TestError::Request`] on HTTP transport
+    /// errors. Returns [`TestError::Mcp`] if the server returns a JSON-RPC error.
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, TestError> {
         let id = self.next_id;
         self.next_id += 1;
@@ -387,6 +424,7 @@ impl VictauriClient {
         });
 
         let mut resp = None;
+        let mut reinitialized = false;
         for attempt in 0..4 {
             let mut req = self
                 .http
@@ -399,10 +437,21 @@ impl VictauriClient {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
             let r = req.send().await?;
+            let status = r.status();
 
-            if r.status() == 429 && attempt < 3 {
+            if status == 429 && attempt < 3 {
                 let delay = std::time::Duration::from_millis(100 * (1 << attempt));
                 tokio::time::sleep(delay).await;
+                continue;
+            }
+            // HTTP 422 "expected initialized request": the MCP session went stale (the
+            // in-app server restarted, the client reconnected, or notifications/initialized
+            // was missed). Re-handshake ONCE to mint a fresh session and retry transparently.
+            // Bounded by `reinitialized` so a persistently-stale server cannot loop.
+            if status == 422 && !reinitialized && attempt < 3 {
+                drop(r);
+                reinitialized = true;
+                self.reinitialize().await?;
                 continue;
             }
             resp = Some(r);
@@ -414,6 +463,23 @@ impl VictauriClient {
             port: self.port,
             reason: "tool call failed after retries".into(),
         })?;
+
+        // Still stale after a re-handshake: surface a clear, actionable error pointing at
+        // the sessionless REST endpoint, which never hits this failure class.
+        if resp.status() == 422 {
+            return Err(TestError::Connection {
+                host: self.host.clone(),
+                port: self.port,
+                reason: format!(
+                    "MCP session is stale (HTTP 422 'expected initialized request') and \
+                     re-initialization did not recover — the server likely restarted \
+                     mid-session. Use the sessionless REST API instead: \
+                     POST http://{}:{}/api/tools/{name} (same Bearer auth, no session \
+                     handshake).",
+                    self.host, self.port
+                ),
+            });
+        }
         let body = Self::parse_response(resp, &self.host, self.port).await?;
 
         if let Some(error) = body.get("error") {

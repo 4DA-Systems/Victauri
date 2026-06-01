@@ -7,8 +7,8 @@ Victauri is configured via the `VictauriBuilder` API in Rust code and/or environ
 | Setting | Builder Method | Environment Variable | Default |
 |---------|---------------|---------------------|---------|
 | Port | `.port(7373)` | `VICTAURI_PORT` | 7373 |
-| Auth token | `.auth_token("...")` | `VICTAURI_AUTH_TOKEN` | None (auth off) |
-| Enable auth | `.auth_enabled()` | — | Auth disabled |
+| Auth token | `.auth_token("...")` | `VICTAURI_AUTH_TOKEN` | Auto-generated UUID (auth **on**) |
+| Disable auth | `.auth_disabled()` | — | Auth enabled |
 | Eval timeout | `.eval_timeout(Duration)` | `VICTAURI_EVAL_TIMEOUT` | 30s |
 | Event capacity | `.event_capacity(10000)` | — | 10,000 |
 | Recorder capacity | `.recorder_capacity(50000)` | — | 50,000 |
@@ -51,25 +51,30 @@ If the preferred port is busy, Victauri tries the next 10 ports (9001-9010). The
 
 ### Authentication
 
-Authentication is **disabled by default** for zero-friction local development. The
-MCP server binds to `127.0.0.1` only and the plugin is `#[cfg(debug_assertions)]`-gated.
+Authentication is **enabled by default**. On startup Victauri auto-generates a UUID
+Bearer token and writes it to the per-process discovery directory, where first-party
+clients (`VictauriClient::discover()`, the CLI, the VS Code extension) read it
+automatically — so zero-config local development still "just works", but no unauthenticated
+local process can reach the god-mode tools. The server also binds to `127.0.0.1` only and
+the plugin is `#[cfg(debug_assertions)]`-gated.
 
 ```rust
-// 1. No auth (default — zero-friction local dev)
+// 1. Auth on by default (auto-generated UUID token, auto-discovered by clients)
 VictauriBuilder::new().build()
 
-// 2. Fixed token
+// 2. Fixed token (e.g. for CI where you want a known value)
 VictauriBuilder::new()
     .auth_token("my-secret-token")
     .build()
 
-// 3. Auto-generated UUID token (printed to console + written to discovery dir)
+// 3. Opt OUT of auth (local-only, you accept that any local process can connect)
 VictauriBuilder::new()
-    .auth_enabled()
+    .auth_disabled()
     .build()
 ```
 
-The `VICTAURI_AUTH_TOKEN` environment variable enables auth with the given token.
+The `VICTAURI_AUTH_TOKEN` environment variable overrides the auto-generated token with a
+fixed value.
 
 ### Privacy Controls
 

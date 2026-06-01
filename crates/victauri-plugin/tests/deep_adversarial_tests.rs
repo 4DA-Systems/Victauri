@@ -66,6 +66,11 @@ fn extract_eval_id(script: &str) -> Option<String> {
 
 impl WebviewBridge for CallbackMockBridge {
     fn eval_webview(&self, _label: Option<&str>, script: &str) -> Result<(), String> {
+        // Skip the parse-watchdog companion script (no `__victauri_ok` marker); only the
+        // real eval wrapper produces a result, mirroring a real webview.
+        if !script.contains("__victauri_ok") {
+            return Ok(());
+        }
         if let Some(id) = extract_eval_id(script) {
             let response = (self.response_fn)(script);
             let pending = self.pending_evals.clone();

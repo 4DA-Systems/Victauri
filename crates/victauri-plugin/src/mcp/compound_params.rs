@@ -554,6 +554,12 @@ pub struct CssParams {
     pub action: CssAction,
     /// CSS text to inject (for inject action).
     pub css: Option<String>,
+    /// Allow remote references (`@import`, remote `url(...)`) in injected CSS. Default
+    /// false: remote refs are blocked because they turn `css inject` into a data-exfil /
+    /// SSRF vector (especially when chained with page-sourced prompt injection). Set true
+    /// only when intentionally loading a remote stylesheet/asset for debugging.
+    #[serde(default)]
+    pub allow_remote: bool,
     /// Target webview label.
     pub webview_label: Option<String>,
 }

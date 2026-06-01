@@ -1,5 +1,28 @@
 # Migration Guide
 
+## Unreleased (security / red-team hardening)
+
+Mostly transparent. Two behaviour changes to be aware of:
+
+- **`app_info.databases` shape changed.** It now returns an **array of objects**
+  `{ path, size_bytes, webview_internal, selected }` (across configured `db_search_paths`
+  and every OS app dir) instead of an array of `data_dir`-relative path strings. If you
+  parsed the old string array, read `entry.path` instead. The new fields let an agent
+  disambiguate the real application DB from WebView/engine internal stores.
+- **`query_db` / `introspect db_health` selection is stricter.** WebView/browser-engine
+  internal databases are now excluded from auto-selection, the largest real candidate
+  wins, and configured `db_search_paths` are **exclusive** when set (no silent fallback to
+  the OS app dirs). If you relied on the old "first file found" behaviour, pass an explicit
+  `path`, or register the right directory via `VictauriBuilder::db_search_paths`. When only
+  WebView internals are present, `query_db` now returns a clear error instead of querying
+  the wrong DB.
+- **`css inject` rejects remote `@import` / `url(...)` by default.** If you intentionally
+  inject CSS that references a remote stylesheet/asset, pass `allow_remote: true`.
+- **`eval_js` reports a likely syntax error in ~0.75s** instead of blocking for the full
+  eval timeout. Valid-but-slow code (e.g. a `wait_for` poll) is unaffected.
+- **Auth was already on by default** (since v0.5.6) — docs that still implied otherwise are
+  corrected. No code change required.
+
 ## v0.7.1 → v0.7.2
 
 Additive release — no breaking API changes, and it stays within the `^0.7`

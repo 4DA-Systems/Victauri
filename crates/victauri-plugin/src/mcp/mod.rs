@@ -35,8 +35,8 @@ use crate::VictauriState;
 use crate::bridge::WebviewBridge;
 
 use helpers::{
-    RecoveryHint, js_string, json_result, missing_param, sanitize_css_color, tool_disabled,
-    tool_error, tool_error_with_hint, validate_url,
+    RecoveryHint, js_string, json_result, missing_param, sanitize_css_color, sanitize_injected_css,
+    tool_disabled, tool_error, tool_error_with_hint, validate_url,
 };
 
 pub use backend_params::*;
@@ -67,6 +67,12 @@ const MAX_EVAL_CODE_LEN: usize = 1_000_000;
 /// Maximum length of a JavaScript eval return value (5 MB).
 /// Results exceeding this are truncated to prevent memory exhaustion.
 const MAX_EVAL_RESULT_LEN: usize = 5_000_000;
+
+/// How long the eval parse-watchdog waits for the user-code script to begin executing
+/// before reporting a likely syntax error. A parse error means the script never runs (so
+/// it never marks itself "started"); this caps that failure at ~0.75s instead of the full
+/// eval timeout, while still leaving valid-but-slow code to run to the real timeout.
+const PARSE_WATCHDOG_MS: u64 = 750;
 
 /// Default number of entries returned by IPC/network log tools when no explicit
 /// `limit` is given. Prevents busy apps (large logs) from exceeding the eval cap.
@@ -813,23 +819,47 @@ impl VictauriMcpHandler {
             .filter(|(k, _)| is_safe_env_key(k))
             .collect();
 
+        // Enumerate every database candidate across ALL roots (configured db_search_paths
+        // + every OS app dir), each tagged with size, whether it is a WebView/engine
+        // internal store, and whether it is the one `query_db` would auto-select. This lets
+        // an agent see and disambiguate the real app DB instead of guessing (audit /
+        // red-team "wrong DB" finding — `app_info.databases` previously only walked
+        // data_dir and returned bare relative names).
         #[cfg(feature = "sqlite")]
-        let databases: Vec<String> = data_dir
-            .as_ref()
-            .map(|d| {
-                crate::database::discover_databases(d)
-                    .into_iter()
-                    .filter_map(|p| {
-                        p.strip_prefix(d)
-                            .ok()
-                            .map(|rel| rel.to_string_lossy().into_owned())
+        let databases: Vec<serde_json::Value> = {
+            let mut all_dirs: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
+            for d in [
+                data_dir.as_ref(),
+                config_dir.as_ref(),
+                log_dir.as_ref(),
+                local_data_dir.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                all_dirs.push(d.clone());
+            }
+            let select_dirs: Vec<std::path::PathBuf> = if self.state.db_search_paths.is_empty() {
+                all_dirs.clone()
+            } else {
+                self.state.db_search_paths.clone()
+            };
+            let selected = crate::database::select_app_database(&select_dirs).ok();
+            crate::database::classify_databases(&all_dirs)
+                .into_iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "path": c.path.to_string_lossy(),
+                        "size_bytes": c.size_bytes,
+                        "webview_internal": c.webview_internal,
+                        "selected": selected.as_ref() == Some(&c.path),
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
+                })
+                .collect()
+        };
 
         #[cfg(not(feature = "sqlite"))]
-        let databases: Vec<String> = Vec::new();
+        let databases: Vec<serde_json::Value> = Vec::new();
 
         let result = serde_json::json!({
             "config": config,
@@ -1067,19 +1097,20 @@ impl VictauriMcpHandler {
                 ));
             }
         } else {
-            let mut databases = Vec::new();
-            for dir in &search_dirs {
-                databases.extend(crate::database::discover_databases(dir));
-            }
-            if let Some(p) = databases.first() {
-                p.clone()
+            // Auto-select the application DB. When db_search_paths is configured it is
+            // EXCLUSIVE — never fall back to OS app dirs (which hold WebView internals),
+            // so a configured-but-empty root yields a clear error instead of silently
+            // querying the wrong database. WebView/browser-engine internal stores are
+            // excluded and the largest remaining candidate wins (audit / red-team "wrong
+            // DB" finding).
+            let select_dirs: Vec<std::path::PathBuf> = if self.state.db_search_paths.is_empty() {
+                search_dirs.clone()
             } else {
-                let dirs_str = search_dirs
-                    .iter()
-                    .map(|d| d.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return tool_error(format!("no SQLite databases found in: {dirs_str}"));
+                self.state.db_search_paths.clone()
+            };
+            match crate::database::select_app_database(&select_dirs) {
+                Ok(p) => p,
+                Err(e) => return tool_error(e),
             }
         };
 
@@ -1935,6 +1966,10 @@ impl VictauriMcpHandler {
                 let Some(css) = &params.css else {
                     return missing_param("css", "inject");
                 };
+                // Block remote @import / url(...) exfil vectors unless explicitly opted in.
+                if let Err(e) = sanitize_injected_css(css, params.allow_remote) {
+                    return tool_error(e);
+                }
                 let code = format!("return window.__VICTAURI__?.injectCss({})", js_string(css));
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
@@ -3699,11 +3734,48 @@ impl VictauriMcpHandler {
         };
 
         let id_js = js_string(&id);
+
+        // Fail fast on a SYNTAX error instead of hanging for the full timeout (audit /
+        // red-team "malformed eval consumes the full 30s"). The user code is inlined into
+        // the script below; if it has a parse error the WHOLE script fails to parse and the
+        // try/catch never runs, so the callback never fires. We cannot wrap the code in
+        // `new Function`/`AsyncFunction` to surface the SyntaxError, because dynamic code
+        // generation is gated by the same `unsafe-eval` CSP that blocks `eval()` — which is
+        // exactly why the bridge uses an inline async-IIFE in the first place. Instead an
+        // independent watchdog (which always parses) reports a parse error quickly: the
+        // user-code script sets a `started` flag at its very top, so a script that fails to
+        // parse never sets it. A valid-but-slow eval (e.g. a `wait_for` poll) sets `started`
+        // immediately and is left to run to the real timeout — the watchdog only fires when
+        // the code never began executing.
+        let watchdog = format!(
+            r"
+            (function () {{
+                window.__VIC_EVAL__ = window.__VIC_EVAL__ || {{}};
+                var s = (window.__VIC_EVAL__[{id_js}] =
+                    window.__VIC_EVAL__[{id_js}] || {{ started: false, done: false }});
+                setTimeout(function () {{
+                    if (s.started || s.done) return;
+                    s.done = true;
+                    try {{
+                        window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
+                            id: {id_js},
+                            result: JSON.stringify({{ __victauri_err: 'code did not begin executing within {PARSE_WATCHDOG_MS}ms — this almost always means a syntax/parse error in the submitted code (or the page main thread was blocked)' }})
+                        }});
+                    }} catch (e) {{}}
+                    delete window.__VIC_EVAL__[{id_js}];
+                }}, {PARSE_WATCHDOG_MS});
+            }})();
+            "
+        );
+
         let inject = format!(
             r"
             (async () => {{
+                var __s = (window.__VIC_EVAL__ && window.__VIC_EVAL__[{id_js}]) || null;
+                if (__s) __s.started = true;
                 try {{
                     const __result = await (async () => {{ {code} }})();
+                    if (__s) {{ if (__s.done) return; __s.done = true; delete window.__VIC_EVAL__[{id_js}]; }}
                     const __type = __result === undefined ? 'undefined'
                         : __result === null ? 'null' : 'value';
                     const __val = __type === 'undefined' ? null
@@ -3713,6 +3785,7 @@ impl VictauriMcpHandler {
                         result: JSON.stringify({{ __victauri_ok: __val, __victauri_type: __type }})
                     }});
                 }} catch (e) {{
+                    if (__s) {{ if (__s.done) return; __s.done = true; delete window.__VIC_EVAL__[{id_js}]; }}
                     await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
                         id: {id_js},
                         result: JSON.stringify({{ __victauri_err: String(e && e.message || e) }})
@@ -3722,6 +3795,13 @@ impl VictauriMcpHandler {
             "
         );
 
+        // Inject the watchdog first so it is armed before the user code runs. Order is not
+        // critical (the user-code script no-ops the watchdog state if it ran first), but
+        // arming first minimises the window.
+        if let Err(e) = self.bridge.eval_webview(webview_label, &watchdog) {
+            self.state.pending_evals.lock().await.remove(&id);
+            return Err(format!("eval injection failed: {e}"));
+        }
         if let Err(e) = self.bridge.eval_webview(webview_label, &inject) {
             self.state.pending_evals.lock().await.remove(&id);
             return Err(format!("eval injection failed: {e}"));
@@ -3746,13 +3826,13 @@ impl VictauriMcpHandler {
                 // ~2s instead of blocking the full timeout again.
                 self.timed_out_labels.lock().await.insert(label_key.clone());
                 Err(format!(
-                    "eval timed out after {}s — the code never resolved. Common causes: a \
-                     JavaScript syntax error in the injected code (parse errors cannot be \
-                     reported by the webview and surface only as this timeout), an unresolved \
-                     promise, an infinite loop, or the webview reloaded / the app stopped \
-                     responding mid-eval. Verify the code parses and resolves; if the app may \
-                     have navigated or crashed, retry (the next call fails fast if the bridge \
-                     is gone).",
+                    "eval timed out after {}s — the code began executing but never resolved. \
+                     (A syntax/parse error would have failed fast via the parse watchdog, so \
+                     this is NOT a parse error.) Common causes: an unresolved promise, an \
+                     infinite loop, an `await` on something that never settles, or the webview \
+                     reloaded / the app stopped responding mid-eval. If the app may have \
+                     navigated or crashed, retry (the next call fails fast if the bridge is \
+                     gone).",
                     timeout.as_secs()
                 ))
             }
@@ -3795,13 +3875,15 @@ impl VictauriMcpHandler {
                     .ok_or_else(|| format!("database not found: {p}"))?
             }
         } else {
-            roots
-                .iter()
-                .flat_map(|r| crate::database::discover_databases(r))
-                .next()
-                .ok_or_else(|| {
-                    "no database found in app directories or configured db_search_paths".to_string()
-                })?
+            // Configured db_search_paths are EXCLUSIVE when set (don't fall back to the
+            // OS app dirs that hold WebView internals); WebView/engine internal stores are
+            // excluded and the largest real candidate wins (audit / red-team "wrong DB").
+            let select_dirs: Vec<std::path::PathBuf> = if self.state.db_search_paths.is_empty() {
+                roots.clone()
+            } else {
+                self.state.db_search_paths.clone()
+            };
+            crate::database::select_app_database(&select_dirs)?
         };
         // No further containment check needed: the path is either discovered
         // within an allowed root, an existing relative file joined onto an

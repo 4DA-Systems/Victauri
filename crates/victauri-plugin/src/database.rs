@@ -105,6 +105,146 @@ fn discover_recursive(dir: &Path, depth: u32, max_depth: u32, results: &mut Vec<
     }
 }
 
+/// File basenames (matched case-insensitively, with or without a `SQLite` extension)
+/// that are browser-engine internal databases, never the application's own DB
+/// (Chromium/WebKit profile stores). Selecting one of these is the audit/red-team
+/// "wrong database" bug: an agent would confidently inspect `WebView` state instead of
+/// the app's data.
+#[cfg(feature = "sqlite")]
+const WEBVIEW_DB_BASENAMES: &[&str] = &[
+    "cookies",
+    "quotamanager",
+    "web data",
+    "history",
+    "favicons",
+    "top sites",
+    "login data",
+    "network action predictor",
+    "transportsecurity",
+    "trust tokens",
+    "sharedstorage",
+    "reporting and ntp",
+    "media history",
+    "affiliation database",
+    "site characteristics database",
+    "webdata",
+];
+
+/// Directory names (matched case-insensitively, anywhere in the path) that belong to a
+/// `WebView`/browser engine's private storage area. Any `.db`/`.sqlite` under one of these
+/// is an engine internal, not the app DB.
+#[cfg(feature = "sqlite")]
+const WEBVIEW_DIR_NAMES: &[&str] = &[
+    "ebwebview",
+    "wkwebview",
+    "webkit",
+    "local storage",
+    "indexeddb",
+    "session storage",
+    "service worker",
+    "gpucache",
+    "code cache",
+    "blob_storage",
+    "shared proto db",
+    "websql",
+];
+
+/// Whether a discovered database path is a `WebView`/browser-engine internal store rather
+/// than the application's own database (audit / red-team "wrong DB" finding).
+#[cfg(feature = "sqlite")]
+#[must_use]
+pub fn is_webview_internal(path: &Path) -> bool {
+    if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
+        let name = name.to_ascii_lowercase();
+        if WEBVIEW_DB_BASENAMES.iter().any(|n| name == *n) {
+            return true;
+        }
+    }
+    path.components().any(|c| {
+        let seg = c.as_os_str().to_string_lossy().to_ascii_lowercase();
+        WEBVIEW_DIR_NAMES.iter().any(|d| seg == *d)
+    })
+}
+
+/// A discovered database candidate with the metadata needed to disambiguate which DB the
+/// application actually uses.
+#[cfg(feature = "sqlite")]
+#[derive(Debug, Clone)]
+pub struct DbCandidate {
+    /// Absolute path to the discovered database file.
+    pub path: PathBuf,
+    /// File size in bytes (0 if it could not be stat'd).
+    pub size_bytes: u64,
+    /// Whether this is a `WebView`/browser-engine internal store rather than an app DB.
+    pub webview_internal: bool,
+}
+
+/// Classify every database discovered under `dirs`, returning application candidates first
+/// (non-`WebView`, largest by size — the substantial app DB outranks incidental ones) and
+/// `WebView` internals last. De-duplicates paths discovered via overlapping roots.
+#[cfg(feature = "sqlite")]
+#[must_use]
+pub fn classify_databases(dirs: &[PathBuf]) -> Vec<DbCandidate> {
+    let mut seen = std::collections::HashSet::new();
+    let mut candidates: Vec<DbCandidate> = Vec::new();
+    for dir in dirs {
+        for path in discover_databases(dir) {
+            let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !seen.insert(key) {
+                continue;
+            }
+            let size_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+            let webview_internal = is_webview_internal(&path);
+            candidates.push(DbCandidate {
+                path,
+                size_bytes,
+                webview_internal,
+            });
+        }
+    }
+    // Application DBs first, then by size descending (larger ⇒ more likely the real DB).
+    candidates.sort_by(|a, b| {
+        a.webview_internal
+            .cmp(&b.webview_internal)
+            .then(b.size_bytes.cmp(&a.size_bytes))
+    });
+    candidates
+}
+
+/// Select the single most likely application database from `dirs`, excluding `WebView`
+/// internals.
+///
+/// # Errors
+/// Returns `Err` with a diagnostic when no application database is found — either no
+/// databases at all, or only `WebView`/browser-engine internal stores (the error lists
+/// the skipped internals so the caller can tell an agent to register the real DB
+/// directory via `db_search_paths` or pass an explicit `path`).
+#[cfg(feature = "sqlite")]
+pub fn select_app_database(dirs: &[PathBuf]) -> Result<PathBuf, String> {
+    let candidates = classify_databases(dirs);
+    if let Some(app) = candidates.iter().find(|c| !c.webview_internal) {
+        return Ok(app.path.clone());
+    }
+    if candidates.is_empty() {
+        let dirs_str = dirs
+            .iter()
+            .map(|d| d.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!("no SQLite databases found in: {dirs_str}"));
+    }
+    let internals = candidates
+        .iter()
+        .map(|c| c.path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "only WebView/browser-engine internal databases were found ({internals}); none looks \
+         like an application database. Register the app's DB directory via \
+         VictauriBuilder::db_search_paths, or pass an explicit `path`."
+    ))
+}
+
 /// Execute a read-only SQL query against a `SQLite` database.
 ///
 /// # Errors
@@ -502,5 +642,93 @@ mod tests {
         let result = query(&path, "SELECT * FROM blobs", &[], None).unwrap();
         assert!(result["rows"][0]["data"]["__blob"].as_bool().unwrap());
         assert_eq!(result["rows"][0]["data"]["size"], 4);
+    }
+
+    // ── WebView-internal exclusion + app-DB selection (audit / red-team "wrong DB") ──
+
+    fn write_sqlite(path: &Path, rows: usize) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, blob TEXT)")
+            .unwrap();
+        for i in 0..rows {
+            conn.execute("INSERT INTO t (blob) VALUES (?)", [format!("row-{i}")])
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn flags_webview_internal_stores() {
+        assert!(is_webview_internal(Path::new(
+            "/app/EBWebView/Default/Cookies"
+        )));
+        assert!(is_webview_internal(Path::new(
+            "/app/EBWebView/Default/QuotaManager"
+        )));
+        assert!(is_webview_internal(Path::new(
+            "/Users/x/Library/WebKit/IndexedDB/file__0.indexeddb.sqlite3"
+        )));
+        assert!(is_webview_internal(Path::new(
+            "/app/Local Storage/leveldb.db"
+        )));
+        assert!(is_webview_internal(Path::new("/app/data/web data")));
+        // Real application DBs are NOT flagged.
+        assert!(!is_webview_internal(Path::new("/app/data/4da.db")));
+        assert!(!is_webview_internal(Path::new("/app/data/app.sqlite")));
+        assert!(!is_webview_internal(Path::new("/app/notes.db")));
+    }
+
+    #[test]
+    fn selects_app_db_over_webview_internals() {
+        // Reproduces the red-team layout: a WebView profile dir full of engine SQLite
+        // files sitting next to the real (larger) application DB. The selector must pick
+        // the app DB, never Cookies/QuotaManager.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Engine internals: flagged either by basename (Cookies/QuotaManager) or by living
+        // under a WebView profile dir (EBWebView). Real Chromium files are extensionless
+        // (and thus skipped by the extension filter entirely); we give them a recognized
+        // extension here precisely to prove the denylist also catches the extensioned forms
+        // (e.g. WebKit `*.indexeddb.sqlite3`).
+        write_sqlite(&root.join("EBWebView/Default/Cookies.db"), 1);
+        write_sqlite(&root.join("EBWebView/Default/QuotaManager.sqlite"), 1);
+        write_sqlite(&root.join("app.sqlite"), 200); // the real app DB (largest)
+
+        let selected = select_app_database(&[root.to_path_buf()]).unwrap();
+        assert_eq!(selected.file_name().unwrap(), "app.sqlite");
+
+        let classified = classify_databases(&[root.to_path_buf()]);
+        assert!(!classified[0].webview_internal, "app DB must rank first");
+        assert_eq!(classified[0].path.file_name().unwrap(), "app.sqlite");
+        assert!(
+            classified.iter().filter(|c| c.webview_internal).count() >= 2,
+            "Cookies + QuotaManager must be tagged as internal"
+        );
+    }
+
+    #[test]
+    fn errors_clearly_when_only_webview_internals_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_sqlite(&root.join("EBWebView/Default/Cookies.db"), 1);
+        write_sqlite(&root.join("EBWebView/Default/QuotaManager.sqlite"), 1);
+
+        let err = select_app_database(&[root.to_path_buf()]).unwrap_err();
+        assert!(
+            err.contains("WebView") && err.contains("db_search_paths"),
+            "error should name the cause and the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn larger_app_db_outranks_smaller_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_sqlite(&root.join("small.db"), 1);
+        write_sqlite(&root.join("big.db"), 500);
+        let selected = select_app_database(&[root.to_path_buf()]).unwrap();
+        assert_eq!(selected.file_name().unwrap(), "big.db");
     }
 }

@@ -979,3 +979,134 @@ async fn connect_with_token_sends_auth_header() {
         "auth header should contain token"
     );
 }
+
+// ── Stale-session (HTTP 422) auto-recovery — issue #2 ─────────────────────
+//
+// rmcp's StreamableHttpService rejects a tool call with HTTP 422 "expected initialized
+// request" whenever the session is stale (the in-app server restarted, the client
+// reconnected, or notifications/initialized was missed). The client must re-handshake once
+// and retry transparently; if it is still stale, it must surface a clear error pointing at
+// the sessionless REST endpoint.
+
+#[derive(Clone)]
+struct StaleState {
+    /// One-shot: the next `tools/call` returns 422, then clears — a re-initialized retry
+    /// succeeds. Simulates a session invalidated by an app/server restart.
+    pending_stale: Arc<std::sync::atomic::AtomicBool>,
+    /// Persistent: every `tools/call` returns 422 (re-init never recovers).
+    always_stale: Arc<std::sync::atomic::AtomicBool>,
+    initialize_count: Arc<AtomicU64>,
+    toolcall_attempts: Arc<AtomicU64>,
+}
+
+impl StaleState {
+    fn new() -> Self {
+        Self {
+            pending_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            always_stale: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            initialize_count: Arc::new(AtomicU64::new(0)),
+            toolcall_attempts: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+async fn stale_session_handler(State(state): State<StaleState>, body: String) -> Response {
+    let parsed: Value = serde_json::from_str(&body).unwrap_or_else(|_| json!({}));
+    let method = parsed["method"].as_str().unwrap_or("");
+    let id = parsed.get("id").cloned();
+    match method {
+        "initialize" => {
+            state.initialize_count.fetch_add(1, Ordering::Relaxed);
+            let resp = json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "serverInfo": {"name": "mock", "version": "0"}
+                }
+            });
+            let mut response = axum::Json(resp).into_response();
+            // Mint a fresh session id on every handshake.
+            response.headers_mut().insert(
+                "mcp-session-id",
+                uuid::Uuid::new_v4().to_string().parse().unwrap(),
+            );
+            response
+        }
+        "notifications/initialized" => StatusCode::OK.into_response(),
+        "tools/call" => {
+            state.toolcall_attempts.fetch_add(1, Ordering::Relaxed);
+            if state.always_stale.load(Ordering::Relaxed)
+                || state.pending_stale.swap(false, Ordering::Relaxed)
+            {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "expected initialized request",
+                )
+                    .into_response();
+            }
+            let resp = json!({
+                "jsonrpc": "2.0", "id": id,
+                "result": {"content": [{"type": "text", "text": "{\"ok\":true}"}]}
+            });
+            axum::Json(resp).into_response()
+        }
+        _ => StatusCode::OK.into_response(),
+    }
+}
+
+async fn start_stale_session_server(state: StaleState) -> u16 {
+    let app = Router::new()
+        .route("/mcp", post(stale_session_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    port
+}
+
+#[tokio::test]
+async fn call_tool_auto_recovers_from_stale_422_session() {
+    let state = StaleState::new();
+    let port = start_stale_session_server(state.clone()).await;
+    let mut client = VictauriClient::connect(port).await.unwrap();
+    assert_eq!(state.initialize_count.load(Ordering::Relaxed), 1);
+
+    // Simulate the server going stale (e.g. the app was rebuilt + relaunched) right before
+    // the next tool call.
+    state.pending_stale.store(true, Ordering::Relaxed);
+
+    let result = client.call_tool("eval_js", json!({"code": "1+1"})).await;
+    assert!(
+        result.is_ok(),
+        "expected transparent recovery, got: {result:?}"
+    );
+
+    // Re-initialized exactly once more (2 handshakes total) and the tool call was retried.
+    assert_eq!(state.initialize_count.load(Ordering::Relaxed), 2);
+    assert_eq!(state.toolcall_attempts.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn call_tool_recovery_is_bounded_and_reports_rest_fallback() {
+    let state = StaleState::new();
+    state.always_stale.store(true, Ordering::Relaxed);
+    let port = start_stale_session_server(state.clone()).await;
+    let mut client = VictauriClient::connect(port).await.unwrap();
+
+    let err = client
+        .call_tool("eval_js", json!({"code": "1+1"}))
+        .await
+        .expect_err("a persistently-stale session must surface an error");
+    let msg = err.to_string();
+    assert!(msg.contains("stale") || msg.contains("422"), "msg: {msg}");
+    assert!(
+        msg.contains("api/tools"),
+        "error should point to the REST fallback: {msg}"
+    );
+
+    // Bounded: exactly one re-initialization (2 handshakes), no infinite loop.
+    assert_eq!(state.initialize_count.load(Ordering::Relaxed), 2);
+}
