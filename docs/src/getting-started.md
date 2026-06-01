@@ -54,58 +54,50 @@ Without this capability, the Tauri permission system silently blocks IPC callbac
 
 ## Step 4: Connect via MCP
 
-Once your app is running in debug mode, the MCP server is available at:
-
-```
-http://127.0.0.1:7373/mcp
-```
-
-### Claude Code Connection
-
-Create a `.mcp.json` file in your project root:
+Create a `.mcp.json` file in your project root (`victauri init` writes this for you):
 
 ```json
 {
   "mcpServers": {
     "victauri": {
-      "url": "http://127.0.0.1:7373/mcp"
+      "command": "victauri",
+      "args": ["bridge", "--wait"]
     }
   }
 }
 ```
 
-Claude Code will automatically discover and connect to your running app.
+This connects through the **`victauri bridge`** — a stdio proxy that discovers the running
+app's port at connect time, re-discovers it across restarts, and reads the auth token
+automatically from the discovery directory. Because the port is resolved dynamically, the
+agent always reaches the right app — even after a rebuild, or when several Victauri apps are
+running. (Requires the CLI on your `PATH`: `cargo install victauri-cli`.)
 
-### With Authentication
+### Multiple apps running at once
 
-Auth is **enabled by default** (the token is auto-generated and auto-discovered by clients).
-To pin a fixed token instead — e.g. for CI — set it explicitly:
-
-```rust
-tauri::Builder::default()
-    .plugin(
-        victauri_plugin::VictauriBuilder::new()
-            .auth_token("my-secret-token")
-            .build(),
-    )
-    .run(tauri::generate_context!())
-    .unwrap();
-```
-
-Then include it in your `.mcp.json`:
+Pin the bridge to a specific app by its Tauri bundle identifier — `victauri init` bakes this
+in automatically when it can read your `tauri.conf.json`:
 
 ```json
 {
   "mcpServers": {
     "victauri": {
-      "url": "http://127.0.0.1:7373/mcp",
-      "headers": {
-        "Authorization": "Bearer my-secret-token"
-      }
+      "command": "victauri",
+      "args": ["bridge", "--wait", "--app", "com.your.app"]
     }
   }
 }
 ```
+
+### Authentication
+
+Auth is **enabled by default** (the token is auto-generated and auto-discovered — the bridge
+reads it for you, so no manual header is needed). To pin a fixed token for CI, set it on the
+builder with `.auth_token("…")` (or the `VICTAURI_AUTH_TOKEN` env var).
+
+> Connecting with a raw `"url": "http://127.0.0.1:7373/mcp"` also works, but it hardcodes a
+> port — if that port is taken (another app, a leftover instance) your agent can silently bind
+> the *wrong* app. Prefer the bridge.
 
 ## Step 5: Verify It Works
 

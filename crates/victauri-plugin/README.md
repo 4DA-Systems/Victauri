@@ -22,7 +22,15 @@ fn main() {
 }
 ```
 
-Connect Claude Code (or any MCP client) to `http://127.0.0.1:7373/mcp`.
+Connect Claude Code (or any MCP client) via the `victauri bridge` stdio proxy — it discovers
+the running app's port automatically and survives restarts:
+
+```json
+{ "mcpServers": { "victauri": { "command": "victauri", "args": ["bridge", "--wait"] } } }
+```
+
+(The raw endpoint is `http://127.0.0.1:7373/mcp`, but a fixed `url:` hardcodes a port and can
+bind the wrong app — prefer the bridge.)
 
 ## Configuration
 

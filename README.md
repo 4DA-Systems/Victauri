@@ -96,11 +96,18 @@ Add `.mcp.json` to your project root (created automatically by `victauri init`):
 {
   "mcpServers": {
     "my-app": {
-      "url": "http://127.0.0.1:7373/mcp"
+      "command": "victauri",
+      "args": ["bridge", "--wait"]
     }
   }
 }
 ```
+
+The `victauri bridge` stdio proxy discovers the running app's port at connect time and
+re-discovers on restart, so the agent always reaches the right app — even across rebuilds, or
+when several Victauri apps are running (add `"--app", "<your.bundle.identifier>"` to pin one).
+Prefer it over a fixed `"url": "http://127.0.0.1:7373/mcp"`, which hardcodes a port and can
+bind the wrong app.
 
 Works with **Claude Code**, **Cursor**, **Windsurf**, and any MCP client. Your agent gets full-stack access: DOM snapshots, IPC monitoring, command invocation, screenshot capture, accessibility auditing, and more.
 
