@@ -888,9 +888,18 @@ const INIT_SCRIPT_BODY: &str = r#"
                     'box-shadow','transform','transition','cursor','pointer-events','text-align',
                     'line-height','letter-spacing','white-space','text-overflow','max-width',
                     'max-height','min-width','min-height','top','right','bottom','left'];
+                // Interactivity-critical props are always shown (when non-empty),
+                // even at 'none'/'hidden'/'auto' — `display:none`,
+                // `visibility:hidden`, and `pointer-events:none` are exactly the
+                // "why can't I interact with this?" answers, and the compactness
+                // filter below would otherwise drop them as if they were defaults.
+                var alwaysShow = ['display', 'visibility', 'pointer-events'];
                 for (var i = 0; i < important.length; i++) {
                     var v = computed.getPropertyValue(important[i]);
-                    if (v && v !== '' && v !== 'none' && v !== 'normal' && v !== 'auto' && v !== '0px' && v !== 'rgba(0, 0, 0, 0)') {
+                    var critical = alwaysShow.indexOf(important[i]) !== -1;
+                    if (v && v !== '' && (critical
+                        || (v !== 'none' && v !== 'normal' && v !== 'auto'
+                            && v !== '0px' && v !== 'rgba(0, 0, 0, 0)'))) {
                         result[important[i]] = v;
                     }
                 }

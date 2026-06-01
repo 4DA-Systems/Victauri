@@ -13,6 +13,10 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
+# macOS defaults to ulimit -n 256, which the concurrent-server adversarial
+# battery exhausts ("Too many open files" — false test failures, not bugs).
+# Raise it; harmless where already higher (Linux). Verified: 256 -> 8192 fixed it.
+ulimit -n 8192 2>/dev/null || true
 PORT="${VICTAURI_PORT:-7373}"
 B="http://127.0.0.1:${PORT}/api/tools"
 LOG="/tmp/victauri-deep-test"
