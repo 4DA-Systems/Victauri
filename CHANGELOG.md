@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-06-02
+
 ### Fixed — agents could bind the WRONG app / wedge on restart (CDP-fallback root cause)
 
 - **`victauri bridge` now guarantees the agent reaches the RIGHT app, dynamically.** A static

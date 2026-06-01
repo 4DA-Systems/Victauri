@@ -229,7 +229,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     // ── Public API ───────────────────────────────────────────────────────────
 
     window.__VICTAURI__ = {
-        version: '0.7.3',
+        version: '0.7.4',
         _captureIpcBodies: true,
 
         // ── DOM ──────────────────────────────────────────────────────────────

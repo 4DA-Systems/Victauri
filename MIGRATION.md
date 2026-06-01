@@ -1,6 +1,6 @@
 # Migration Guide
 
-## Unreleased (agent connection reliability)
+## v0.7.3 → v0.7.4 (agent connection reliability)
 
 Recommended (not required): **connect agents through `victauri bridge`, not a fixed `url:`.**
 A hardcoded `"url": "http://127.0.0.1:7373/mcp"` can point at the wrong app when several
@@ -19,7 +19,7 @@ identifier from `tauri.conf.json`). Existing `url:` configs keep working — thi
 opt-in reliability upgrade. The `victauri bridge` command also gained a `--app` flag and now
 re-discovers the port + re-initializes the session across app restarts.
 
-## Unreleased (security / red-team hardening)
+## v0.7.2 → v0.7.3 (security / red-team hardening)
 
 Mostly transparent. Two behaviour changes to be aware of:
 

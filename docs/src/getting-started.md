@@ -108,7 +108,7 @@ curl http://127.0.0.1:7373/health
 # Returns: ok
 
 curl http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.7.3",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.7.4",...}
 ```
 
 Or use the Victauri CLI:
