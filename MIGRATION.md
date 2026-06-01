@@ -1,5 +1,24 @@
 # Migration Guide
 
+## Unreleased (agent connection reliability)
+
+Recommended (not required): **connect agents through `victauri bridge`, not a fixed `url:`.**
+A hardcoded `"url": "http://127.0.0.1:7373/mcp"` can point at the wrong app when several
+Victauri apps run (or one falls back off a busy 7373), and it can't recover when the app
+restarts. The bridge resolves the live backend by app identity and re-establishes the session
+automatically. Update `.mcp.json` to:
+
+```json
+{ "mcpServers": { "victauri": { "command": "victauri",
+  "args": ["bridge", "--wait", "--app", "<your.bundle.identifier>"] } } }
+```
+
+`--app` is only needed when several Victauri apps run at once (it pins the right one); with a
+single app you can omit it. `victauri init` now writes this automatically (reading your
+identifier from `tauri.conf.json`). Existing `url:` configs keep working — this is an
+opt-in reliability upgrade. The `victauri bridge` command also gained a `--app` flag and now
+re-discovers the port + re-initializes the session across app restarts.
+
 ## Unreleased (security / red-team hardening)
 
 Mostly transparent. Two behaviour changes to be aware of:
