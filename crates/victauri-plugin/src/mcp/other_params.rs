@@ -136,3 +136,35 @@ pub struct DiagnosticsParams {
     /// Target a specific webview window by label.
     pub webview_label: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_assert_params_label_is_optional() {
+        // Regression: `label` was a required `String`, so a minimal
+        // `{expression, condition}` call failed deserialization with an opaque
+        // 400. It is now `#[serde(default)]` and must default to empty.
+        let params: SemanticAssertParams = serde_json::from_value(serde_json::json!({
+            "expression": "1 + 1",
+            "condition": "equals",
+            "expected": 2
+        }))
+        .expect("minimal assert_semantic call (no label) must deserialize");
+        assert_eq!(params.label, "");
+        assert_eq!(params.expression, "1 + 1");
+        assert!(params.webview_label.is_none());
+    }
+
+    #[test]
+    fn semantic_assert_params_label_still_accepted() {
+        let params: SemanticAssertParams = serde_json::from_value(serde_json::json!({
+            "expression": "x",
+            "label": "user is logged in",
+            "condition": "truthy"
+        }))
+        .expect("explicit label must still deserialize");
+        assert_eq!(params.label, "user is logged in");
+    }
+}

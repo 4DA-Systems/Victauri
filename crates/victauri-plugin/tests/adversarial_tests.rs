@@ -339,6 +339,42 @@ async fn adversarial_checkpoint_without_recording() {
 }
 
 #[tokio::test]
+async fn adversarial_checkpoint_auto_generates_id() {
+    // Regression: checkpoint_id is optional — when omitted, the handler must
+    // auto-generate a `cp-<uuid>` and echo it back (it previously hard-errored
+    // with "missing checkpoint_id").
+    let state = test_state();
+    let base = start_server(state, &["main"]).await;
+    let (client, sid) = mcp_session(&base).await;
+
+    let _ = call_tool(
+        &client,
+        &base,
+        &sid,
+        "recording",
+        json!({"action": "start", "session_id": "auto-id-test"}),
+    )
+    .await;
+
+    let body = call_tool(
+        &client,
+        &base,
+        &sid,
+        "recording",
+        json!({"action": "checkpoint"}),
+    )
+    .await;
+    assert!(
+        body.contains("created") && body.contains("true"),
+        "checkpoint without an id must be created: {body}"
+    );
+    assert!(
+        body.contains("checkpoint_id") && body.contains("cp-"),
+        "checkpoint without an id must echo back an auto-generated cp-<uuid>: {body}"
+    );
+}
+
+#[tokio::test]
 async fn adversarial_list_checkpoints_empty() {
     let state = test_state();
     let base = start_server(state, &["main"]).await;
