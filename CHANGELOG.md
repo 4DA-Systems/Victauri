@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer advertises an unbuilt Linux-aarch64 binary; `examples/demo-app/test_deep.sh` no longer asserts the
   ancient `0.2.1` version (now version-agnostic) and uses the default port 7373.
 
+### Fixed — second red-team pass (pre-0.7.5)
+
+- **Intent resolution ranked the wrong command** — `resolve("increase counter")` returned `get_counter`
+  (whose *name* contains "counter") above `increment` (whose *intent* is literally "increase counter"),
+  because there was an exact-*name* bonus but no exact-*intent* bonus. Added `SCORE_EXACT_INTENT` so a
+  query that exactly matches a command's natural-language intent dominates incidental name-substring
+  matches. Regression test added.
+- **`assert_semantic` no longer requires `label`** — the field was a required `String`, so a minimal
+  `{expression, condition}` call failed deserialization with an opaque 400 (the tool description never
+  mentioned it). `label` is now `#[serde(default)]`.
+- **`recording.checkpoint` auto-generates an id** — `checkpoint_id` is now optional; when omitted a
+  `cp-<uuid>` is generated and echoed back, so a quick positional marker no longer hard-errors with
+  "missing checkpoint_id".
+- **Stale demo/test scripts** — `examples/demo-app/test_deep.sh` called `audit_accessibility` as a
+  standalone tool (it is an `inspect` action); fixed. Removed the long-superseded root `test_live.sh`,
+  which predated the compound-tool refactor and called dozens of tool names that no longer exist.
+
 ## [0.7.4] - 2026-06-02
 
 ### Fixed — agents could bind the WRONG app / wedge on restart (CDP-fallback root cause)

@@ -454,7 +454,8 @@ pub struct RecordingParams {
     pub action: RecordingAction,
     /// Session ID (for start — optional, UUID generated if omitted).
     pub session_id: Option<String>,
-    /// Checkpoint ID (for checkpoint, required).
+    /// Checkpoint ID (for checkpoint — optional, a `cp-<uuid>` is generated and
+    /// returned if omitted).
     pub checkpoint_id: Option<String>,
     /// Checkpoint label (for checkpoint, optional). Also accepts `label` as an alias.
     #[serde(alias = "label")]

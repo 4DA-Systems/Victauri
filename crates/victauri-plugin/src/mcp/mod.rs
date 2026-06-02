@@ -1726,9 +1726,13 @@ impl VictauriMcpHandler {
                 None => tool_error("no recording is active"),
             },
             RecordingAction::Checkpoint => {
-                let Some(id) = params.checkpoint_id else {
-                    return missing_param("checkpoint_id", "checkpoint");
-                };
+                // checkpoint_id is optional — auto-generate a short id when the
+                // caller just wants a positional marker. The id is echoed back in
+                // the response so it can be referenced later
+                // (events_between_checkpoints / replay).
+                let id = params
+                    .checkpoint_id
+                    .unwrap_or_else(|| format!("cp-{}", uuid::Uuid::new_v4()));
                 let state = params.state.unwrap_or(serde_json::Value::Null);
                 match self
                     .state

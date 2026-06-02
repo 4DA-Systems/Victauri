@@ -560,7 +560,7 @@ check "12.6 remove CSS" "$R" '"ok":true'
 echo ""
 echo "── Module 13: Accessibility ──"
 
-R=$(call_tool "audit_accessibility" '{}')
+R=$(call_tool "inspect" '{"action":"audit_accessibility"}')
 check "13.1 a11y audit runs" "$R" '"violations"\|"summary"'
 check "13.2 audit has warnings" "$R" '"warnings"\|"summary"\|"violations"'
 

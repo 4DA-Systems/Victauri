@@ -631,6 +631,43 @@ fn resolve_command_by_intent() {
 }
 
 #[test]
+fn resolve_exact_intent_beats_incidental_name_match() {
+    // Regression: a query that is *exactly* a command's intent must win over a
+    // command whose name merely contains one of the query words. Before the
+    // exact-intent bonus, `resolve("increase counter")` ranked `get_counter`
+    // (name contains "counter", +5.0) above `increment` (intent is literally
+    // "increase counter" but name matches neither word).
+    let registry = CommandRegistry::new();
+    registry.register(
+        CommandInfo::new("increment")
+            .with_description("Increment the counter by 1 and return the new value")
+            .with_intent("increase counter"),
+    );
+    registry.register(
+        CommandInfo::new("get_counter")
+            .with_description("Get the current counter value")
+            .with_intent("read counter state"),
+    );
+    registry.register(
+        CommandInfo::new("reset_counter")
+            .with_description("Reset the counter to zero")
+            .with_intent("reset counter state"),
+    );
+
+    let results = registry.resolve("increase counter");
+    assert!(!results.is_empty());
+    assert_eq!(
+        results[0].command.name,
+        "increment",
+        "exact intent match must rank first, got {:?}",
+        results
+            .iter()
+            .map(|r| (&r.command.name, r.score))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn resolve_command_by_example() {
     let registry = CommandRegistry::new();
     let mut cmd = CommandInfo::new("export_data").with_description("Export data to CSV");

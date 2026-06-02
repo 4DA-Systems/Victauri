@@ -307,6 +307,14 @@ const SCORE_NAME_SUBSTRING: f64 = 3.0;
 const SCORE_NAME_WORD: f64 = 2.0;
 const SCORE_DESCRIPTION: f64 = 1.5;
 const SCORE_INTENT: f64 = 2.5;
+/// Bonus when the query exactly matches a command's natural-language intent.
+/// Mirrors [`SCORE_EXACT_NAME`]: an exact intent hit is the entire purpose of the
+/// `intent` field, so it must dominate incidental name-substring matches in
+/// unrelated commands. Without it, `resolve("increase counter")` ranks
+/// `get_counter` (whose *name* contains "counter") above `increment` (whose
+/// *intent* is literally "increase counter"). Kept below `SCORE_EXACT_NAME` so a
+/// literal command-name match still edges out a natural-language intent match.
+const SCORE_EXACT_INTENT: f64 = 8.0;
 const SCORE_CATEGORY: f64 = 1.0;
 const SCORE_EXAMPLE_FULL: f64 = 4.0;
 const SCORE_EXAMPLE_WORD: f64 = 0.5;
@@ -345,6 +353,9 @@ fn score_command(cmd: &CommandInfo, query_lower: &str, query_words: &[&str]) -> 
 
     if let Some(intent) = &cmd.intent {
         let intent_lower = intent.to_lowercase();
+        if intent_lower.as_str() == query_lower {
+            exact_bonus += SCORE_EXACT_INTENT;
+        }
         for word in query_words {
             if intent_lower.contains(word) {
                 score += SCORE_INTENT;

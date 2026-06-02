@@ -63,6 +63,9 @@ pub struct SemanticAssertParams {
     /// JavaScript expression to evaluate in the webview. The result is checked against the assertion.
     pub expression: String,
     /// Human-readable label for this assertion (e.g. "user is logged in").
+    /// Optional — defaults to empty so a minimal `{expression, condition}` call
+    /// succeeds instead of failing deserialization with an opaque 400.
+    #[serde(default)]
     pub label: String,
     /// Condition to evaluate against the actual value.
     pub condition: victauri_core::AssertionCondition,
