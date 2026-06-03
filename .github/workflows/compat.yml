@@ -63,6 +63,9 @@ jobs:
         with:
           key: compat-${{ matrix.app }}
 
+      # The five apps use three different JS package managers (pnpm, yarn, bun),
+      # so provision all of them. corepack supplies the pnpm/yarn shims; bun is
+      # installed for Surrealist.
       - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
         if: steps.gate.outputs.run == 'true'
         with:
@@ -72,6 +75,13 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         with:
           node-version: 20
+
+      - uses: oven-sh/setup-bun@v2
+        if: steps.gate.outputs.run == 'true'
+
+      - name: Enable corepack (yarn/pnpm shims)
+        if: steps.gate.outputs.run == 'true'
+        run: corepack enable || true
 
       - name: Retest ${{ matrix.app }} against current Victauri
         if: steps.gate.outputs.run == 'true'

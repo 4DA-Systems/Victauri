@@ -46,11 +46,17 @@ out of the main CI because full frontend + Tauri builds for five apps are slow.
 
 ## Maintaining `apps.json`
 
-Each entry pins `repo`, `ref` (commit SHA), `frontend_build` (run from the repo
-root, must populate `frontendDist`), and `tauri_dir`. The build commands are
-best-effort starting points — the first CI run is expected to confirm or adjust them
-per app (some apps have monorepo or codegen quirks). Bump `ref` deliberately so a
-retest is reproducible against a known app version.
+Each entry pins `repo`, `ref` (commit SHA), `package_manager`, `frontend_build`
+(run from the repo root, must populate `frontendDist`), and `tauri_dir`. Bump `ref`
+deliberately so a retest is reproducible against a known app version.
+
+**These apps move.** Verified 2026-06-03, the five targets have drifted since
+Victauri's original 2026-05 compatibility run: Lettura is now a pnpm **monorepo**
+(`apps/desktop/src-tauri`, not `src-tauri`), and the package managers differ —
+Kanri uses **yarn** (Nuxt → `.output/public`), Surrealist uses **bun**, En Croissant
+needs `pnpm build-vite`, Duckling uses `pnpm build`. So a "retest against current
+Victauri" is also a retest against *current app versions*; when an entry fails at the
+`frontend`/`build` stage, the first thing to check is whether the app restructured.
 
 ## Interpreting results
 
