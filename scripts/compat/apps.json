@@ -1,10 +1,9 @@
 {
   "_comment": [
-    "Real-world Tauri apps used to re-verify Victauri compatibility against the CURRENT version.",
-    "SHAs were captured 2026-06-03 from each repo's default-branch HEAD; bump them deliberately so a retest is reproducible.",
-    "NOTE: these apps evolve — several have restructured since Victauri's original 2026-05 compatibility run (e.g. Lettura is now a pnpm monorepo; package managers differ: yarn/pnpm/bun). tauri_dir, frontend_build, and package_manager below reflect each repo's state at the pinned SHA.",
-    "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist directory BEFORE the debug cargo build — debug binaries embed frontendDist at compile time (no dev server is used here).",
-    "package_manager tells the compat workflow which toolchain to provision (corepack covers pnpm + yarn; bun is installed separately)."
+    "Real-world Tauri apps used to re-verify Victauri compatibility against the CURRENT Victauri version.",
+    "Each app is pinned to a STABLE RELEASE TAG (tag + its commit SHA), captured 2026-06-03 -- not the default-branch HEAD. HEADs of these apps run bleeding-edge, hard-to-build frontends (e.g. En Croissant HEAD uses tsgo + Vite 8 + a pnpm workspace); release tags are what real users run and what builds reproducibly.",
+    "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: pnpm 9 is pinned for the pnpm apps because pnpm >=10 skips native build scripts (esbuild/swc) by default and breaks vite builds.",
+    "These build commands are validated against the pinned tag; bump tag+ref+commands together."
   ],
   "apps": [
     {
@@ -12,50 +11,55 @@
       "name": "Kanri",
       "framework": "Nuxt 3 / Vue 3",
       "repo": "https://github.com/trobonox/kanri.git",
-      "ref": "8dcf4dc18841f2707c6676182922f89dbb6bd6cc",
+      "ref": "612be4929d36ac4a27884a4de95527bda0490dc7",
       "package_manager": "yarn",
       "frontend_build": "corepack enable && yarn install --frozen-lockfile && yarn generate",
-      "tauri_dir": "src-tauri"
+      "tauri_dir": "src-tauri",
+      "tag": "app-v0.8.2"
     },
     {
       "key": "en-croissant",
       "name": "En Croissant",
       "framework": "React / Vite / Mantine",
       "repo": "https://github.com/franciscoBSalgueiro/en-croissant.git",
-      "ref": "9654961d62d023b328591a609431570b7d94aa52",
+      "ref": "3a3dbc5911dd0cd4997c30ea3e8932045e314830",
       "package_manager": "pnpm",
-      "frontend_build": "corepack enable && pnpm install && pnpm build-vite",
-      "tauri_dir": "src-tauri"
+      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile --config.dangerouslyAllowAllBuilds=true && pnpm build-vite",
+      "tauri_dir": "src-tauri",
+      "tag": "v0.15.0"
     },
     {
       "key": "surrealist",
       "name": "Surrealist",
       "framework": "React 19 / Mantine / CodeMirror",
       "repo": "https://github.com/surrealdb/surrealist.git",
-      "ref": "6891c7599557b2c41a9bd8d268eb029fd22b9564",
+      "ref": "011b9371fb9f9ecad0d04b67e6840e40ed6f4420",
       "package_manager": "bun",
       "frontend_build": "bun install && bun run build",
-      "tauri_dir": "src-tauri"
+      "tauri_dir": "src-tauri",
+      "tag": "v1.11.8"
     },
     {
       "key": "duckling",
       "name": "Duckling",
       "framework": "React 19 / Jotai / Vite",
       "repo": "https://github.com/l1xnan/Duckling.git",
-      "ref": "52caf1cbd9c9bd3cbe283c76a25904a249382682",
+      "ref": "edb6c1b4af9b01818634c1e179c72820b86a3782",
       "package_manager": "pnpm",
-      "frontend_build": "corepack enable && pnpm install && pnpm build",
-      "tauri_dir": "src-tauri"
+      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile --config.dangerouslyAllowAllBuilds=true && pnpm build",
+      "tauri_dir": "src-tauri",
+      "tag": "v0.0.50"
     },
     {
       "key": "lettura",
       "name": "Lettura",
       "framework": "React / TailwindCSS (pnpm monorepo)",
       "repo": "https://github.com/zhanglun/lettura.git",
-      "ref": "885e513584bebd493cc6c7a2fe563bbc5cab19ee",
+      "ref": "f4d08c6f5312189a9bbe06331c17fde9ad9419d7",
       "package_manager": "pnpm",
-      "frontend_build": "corepack enable && pnpm install && pnpm -C apps/desktop build",
-      "tauri_dir": "apps/desktop/src-tauri"
+      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile --config.dangerouslyAllowAllBuilds=true && pnpm -C apps/desktop build",
+      "tauri_dir": "apps/desktop/src-tauri",
+      "tag": "v0.1.22"
     }
   ]
 }

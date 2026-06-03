@@ -50,13 +50,25 @@ Each entry pins `repo`, `ref` (commit SHA), `package_manager`, `frontend_build`
 (run from the repo root, must populate `frontendDist`), and `tauri_dir`. Bump `ref`
 deliberately so a retest is reproducible against a known app version.
 
-**These apps move.** Verified 2026-06-03, the five targets have drifted since
-Victauri's original 2026-05 compatibility run: Lettura is now a pnpm **monorepo**
-(`apps/desktop/src-tauri`, not `src-tauri`), and the package managers differ —
-Kanri uses **yarn** (Nuxt → `.output/public`), Surrealist uses **bun**, En Croissant
-needs `pnpm build-vite`, Duckling uses `pnpm build`. So a "retest against current
-Victauri" is also a retest against *current app versions*; when an entry fails at the
-`frontend`/`build` stage, the first thing to check is whether the app restructured.
+**These apps move, and the moving part is the frontend, not Victauri.** Verified
+2026-06-03: the five targets have drifted since Victauri's original 2026-05 run, so
+entries are pinned to **stable release tags** (not HEAD) and the build recipes are
+app-specific:
+
+- **Lettura** restructured into a pnpm **monorepo** (`apps/desktop/src-tauri`).
+- Package managers differ: **Kanri → yarn** (Nuxt, `.output/public`),
+  **Surrealist → bun**, En Croissant / Duckling / Lettura → **pnpm**.
+- The pnpm apps are pnpm-version-sensitive: pnpm ≥10 accepts their settings-only
+  `pnpm-workspace.yaml` but **skips native build scripts** (esbuild/swc) unless
+  `--config.dangerouslyAllowAllBuilds=true` is passed, while pnpm 9 runs the scripts
+  but **rejects** the workspace file. The recipes pin pnpm 10 + allow-all-builds.
+
+When an entry fails at the `frontend` stage, it is almost always the app's own
+toolchain (a new bundler, a codegen step, a package-manager bump) — exactly why this
+harness exists: so the recipe can be fixed in one place and the result stays
+reproducible. The `clone`, `inject` (plugin + capability), `build`-artifact
+detection, and `smoke` stages are Victauri's responsibility and are exercised by the
+demo-app path (`smoke.sh` validated 15/15 against it).
 
 ## Interpreting results
 
