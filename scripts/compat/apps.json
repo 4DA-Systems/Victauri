@@ -1,0 +1,56 @@
+{
+  "_comment": [
+    "Real-world Tauri apps used to re-verify Victauri compatibility against the CURRENT version.",
+    "SHAs were captured 2026-06-03 from each repo's default-branch HEAD; bump them deliberately so a retest is reproducible.",
+    "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist directory BEFORE the debug cargo build — debug binaries embed frontendDist at compile time (a dev server is not used here).",
+    "tauri_dir is the crate dir containing the app's Cargo.toml + tauri.conf.json.",
+    "These build commands are starting points; the first compat CI run is expected to confirm or adjust them per app."
+  ],
+  "apps": [
+    {
+      "key": "kanri",
+      "name": "Kanri",
+      "framework": "Nuxt 3 / Vue 3",
+      "repo": "https://github.com/trobonox/kanri.git",
+      "ref": "8dcf4dc18841f2707c6676182922f89dbb6bd6cc",
+      "frontend_build": "corepack enable && pnpm install && pnpm generate",
+      "tauri_dir": "src-tauri"
+    },
+    {
+      "key": "en-croissant",
+      "name": "En Croissant",
+      "framework": "React / Vite / Mantine",
+      "repo": "https://github.com/franciscoBSalgueiro/en-croissant.git",
+      "ref": "9654961d62d023b328591a609431570b7d94aa52",
+      "frontend_build": "corepack enable && pnpm install && pnpm build",
+      "tauri_dir": "src-tauri"
+    },
+    {
+      "key": "surrealist",
+      "name": "Surrealist",
+      "framework": "React 19 / Mantine / CodeMirror",
+      "repo": "https://github.com/surrealdb/surrealist.git",
+      "ref": "6891c7599557b2c41a9bd8d268eb029fd22b9564",
+      "frontend_build": "corepack enable && pnpm install && pnpm build",
+      "tauri_dir": "src-tauri"
+    },
+    {
+      "key": "duckling",
+      "name": "Duckling",
+      "framework": "React 19 / Jotai / Vite",
+      "repo": "https://github.com/l1xnan/Duckling.git",
+      "ref": "52caf1cbd9c9bd3cbe283c76a25904a249382682",
+      "frontend_build": "corepack enable && pnpm install && pnpm build",
+      "tauri_dir": "src-tauri"
+    },
+    {
+      "key": "lettura",
+      "name": "Lettura",
+      "framework": "React / TailwindCSS",
+      "repo": "https://github.com/zhanglun/lettura.git",
+      "ref": "885e513584bebd493cc6c7a2fe563bbc5cab19ee",
+      "frontend_build": "corepack enable && pnpm install && pnpm build",
+      "tauri_dir": "src-tauri"
+    }
+  ]
+}

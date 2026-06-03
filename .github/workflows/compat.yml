@@ -1,0 +1,87 @@
+name: Compatibility Retest
+
+# Re-verify Victauri against real-world third-party Tauri apps using the CURRENT
+# code in this repo (a path dependency, not a published version). The published
+# "96.9% across 5 apps" numbers were measured on an older Victauri — this is the
+# reproducible job that keeps them honest.
+#
+# Heavy (clones + full frontend + Tauri builds), so it is NOT part of CI: run it
+# on demand or weekly. Each app is its own matrix leg so one app's build breakage
+# doesn't hide the others.
+
+on:
+  workflow_dispatch:
+    inputs:
+      app:
+        description: "Single app key to test (blank = all)"
+        required: false
+        default: ""
+  schedule:
+    # Weekly, Mondays 06:00 UTC.
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compat-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  retest:
+    name: ${{ matrix.app }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with scripts/compat/apps.json.
+        app: [kanri, en-croissant, surrealist, duckling, lettura]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Skip non-selected apps (manual single-app runs)
+        id: gate
+        run: |
+          want="${{ github.event.inputs.app }}"
+          if [ -n "$want" ] && [ "$want" != "${{ matrix.app }}" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install system dependencies
+        if: steps.gate.outputs.run == 'true'
+        uses: ./.github/actions/linux-deps
+        with:
+          xvfb: "true"
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.run == 'true'
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        if: steps.gate.outputs.run == 'true'
+        with:
+          key: compat-${{ matrix.app }}
+
+      - uses: pnpm/action-setup@fe02b34f77f8bc703788d5817da081398fad5dd2 # v4.0.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          version: 9
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.gate.outputs.run == 'true'
+        with:
+          node-version: 20
+
+      - name: Retest ${{ matrix.app }} against current Victauri
+        if: steps.gate.outputs.run == 'true'
+        run: bash scripts/compat/retest-app.sh "${{ matrix.app }}"
+
+      - name: Upload result log
+        if: always() && steps.gate.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: compat-${{ matrix.app }}
+          path: |
+            /tmp/**/app.log
+          if-no-files-found: ignore
