@@ -2,7 +2,7 @@
   "_comment": [
     "Real-world Tauri apps used to re-verify Victauri compatibility against the CURRENT Victauri version.",
     "Each app is pinned to a STABLE RELEASE TAG (tag + its commit SHA), captured 2026-06-03 -- not the default-branch HEAD. HEADs of these apps run bleeding-edge, hard-to-build frontends (e.g. En Croissant HEAD uses tsgo + Vite 8 + a pnpm workspace); release tags are what real users run and what builds reproducibly.",
-    "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: pnpm 9 is pinned for the pnpm apps because pnpm >=10 skips native build scripts (esbuild/swc) by default and breaks vite builds.",
+    "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: the pnpm apps pin pnpm 10.15.0 with --config.dangerouslyAllowAllBuilds=true -- pnpm >=10 accepts these apps' settings-only pnpm-workspace.yaml but skips native build scripts (esbuild/swc) unless builds are explicitly allowed, while pnpm 9 runs the scripts but rejects the workspace file.",
     "These build commands are validated against the pinned tag; bump tag+ref+commands together."
   ],
   "apps": [

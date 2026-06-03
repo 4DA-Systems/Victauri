@@ -41,9 +41,13 @@ jobs:
 
       - name: Skip non-selected apps (manual single-app runs)
         id: gate
+        env:
+          # Pass the dispatch input through env so Bash never interprets its
+          # contents (avoids template-injection via the run script).
+          WANT: ${{ github.event.inputs.app }}
+          THIS_APP: ${{ matrix.app }}
         run: |
-          want="${{ github.event.inputs.app }}"
-          if [ -n "$want" ] && [ "$want" != "${{ matrix.app }}" ]; then
+          if [ -n "$WANT" ] && [ "$WANT" != "$THIS_APP" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
@@ -76,7 +80,7 @@ jobs:
         with:
           node-version: 20
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         if: steps.gate.outputs.run == 'true'
 
       - name: Enable corepack (yarn/pnpm shims)
@@ -89,7 +93,7 @@ jobs:
 
       - name: Upload result log
         if: always() && steps.gate.outputs.run == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: compat-${{ matrix.app }}
           path: |

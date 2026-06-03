@@ -23,7 +23,15 @@ Set-Location $root
 
 Run "cargo fmt --check"   { cargo fmt --all -- --check }
 Run "clippy"              { cargo clippy --workspace --all-targets --features sqlite -- -D warnings }
-Run "doc-count lint"      { bash scripts/check-doc-counts.sh }
+# The doc-count lint is a bash script. Run it when bash is available (git-bash on
+# Windows usually provides it); otherwise skip locally — CI's ubuntu `check` job
+# always enforces it, so a Windows dev without bash isn't blocked.
+if (Get-Command bash -ErrorAction SilentlyContinue) {
+    Run "doc-count lint"  { bash scripts/check-doc-counts.sh }
+} else {
+    Write-Host "`n=== doc-count lint ===" -ForegroundColor Cyan
+    Write-Host "skipped: bash not found (enforced by CI)" -ForegroundColor Yellow
+}
 Run "workspace tests"     { cargo test --workspace --features sqlite }
 Run "chrome bridge tests" { Push-Location extensions/chrome/tests; npx vitest run; $code = $LASTEXITCODE; Pop-Location; $global:LASTEXITCODE = $code }
 

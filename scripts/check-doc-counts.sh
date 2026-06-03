@@ -27,8 +27,18 @@ expect() { # expect <description> <actual> <claimed> <file>
   fi
 }
 
+# Counts matches of an extended regex, tolerating zero matches. grep exits 1 on
+# no match, which under `set -euo pipefail` would hard-exit the script before the
+# lint can report the mismatch as a proper failure — so swallow that exit and
+# return 0 instead.
+count() {
+  local pattern="$1"
+  shift
+  { grep -rhoE "$pattern" "$@" || true; } | wc -l | tr -d ' '
+}
+
 # ── MCP tool count ───────────────────────────────────────────────────────────
-tools=$(grep -rohE '#\[tool\(' crates/victauri-plugin/src/mcp/ | wc -l | tr -d ' ')
+tools=$(count '#\[tool\(' crates/victauri-plugin/src/mcp/)
 echo "MCP tools defined in code: $tools"
 expect "README 'N tools across the full stack'" "$tools" \
   "$(grep -oE '[0-9]+ tools across the full stack' README.md | grep -oE '^[0-9]+' || true)" \
@@ -38,7 +48,7 @@ expect "README 'All N tools'" "$tools" \
   README.md
 
 # ── Chrome extension vitest count ────────────────────────────────────────────
-vitest=$(grep -rhoE '^[[:space:]]*(it|test)\(' extensions/chrome/tests/*.test.js | wc -l | tr -d ' ')
+vitest=$(count '^[[:space:]]*(it|test)\(' extensions/chrome/tests/*.test.js)
 echo "Chrome vitest tests defined: $vitest"
 expect "README 'N vitest tests'" "$vitest" \
   "$(grep -oE '[0-9]+ vitest tests' README.md | grep -oE '^[0-9]+' || true)" \

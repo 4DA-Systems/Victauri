@@ -38,7 +38,10 @@ scripts/compat/retest-app.sh duckling --keep
 ```
 
 Requires: `git`, `jq`, `curl`, `xvfb`, a Rust toolchain with the Tauri Linux system
-deps (`.github/actions/linux-deps`), Node, and `pnpm`.
+deps (`.github/actions/linux-deps`), Node, and the JS package managers the targets
+use — **pnpm** (most), **Yarn** via Corepack (Kanri), and **Bun** (Surrealist). The
+`compat.yml` workflow provisions all three; install them locally before running the
+matching app.
 
 In CI, the **Compatibility Retest** workflow (`.github/workflows/compat.yml`) runs
 this on demand (`workflow_dispatch`, optionally a single app) and weekly. It is kept

@@ -114,17 +114,28 @@ export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_
 xvfb-run -a --server-args="-screen 0 1280x800x24" "$bin" > "$work/app.log" 2>&1 &
 APP_PID=$!
 
-up=false
-for i in $(seq 1 90); do
-  curl -sf http://127.0.0.1:7373/health >/dev/null 2>&1 && { up=true; break; }
+# Victauri binds 7373 by default but falls back through 7374-7383 if the port is
+# taken (and honours VICTAURI_PORT). Discover the actual port instead of assuming
+# 7373, so an app that already uses 7373 isn't a false compatibility failure.
+BASE=""
+ports="${VICTAURI_PORT:-$(seq 7373 7383)}"
+for _ in $(seq 1 90); do
+  for p in $ports; do
+    if curl -sf "http://127.0.0.1:$p/health" >/dev/null 2>&1; then
+      BASE="http://127.0.0.1:$p"
+      break
+    fi
+  done
+  [ -n "$BASE" ] && break
   kill -0 "$APP_PID" 2>/dev/null || { echo "--- app.log ---"; tail -40 "$work/app.log"; die "app exited before the server came up"; }
   sleep 1
 done
-[ "$up" = true ] || { tail -40 "$work/app.log"; die "MCP server never became reachable"; }
+[ -n "$BASE" ] || { tail -40 "$work/app.log"; die "MCP server never became reachable on 127.0.0.1:7373-7383"; }
+echo "server reachable at $BASE"
 
 # Wait for the webview to be eval-able (cold WebView/WebKit init can lag the server).
-for i in $(seq 1 45); do
-  curl -sf -X POST http://127.0.0.1:7373/api/tools/eval_js \
+for _ in $(seq 1 45); do
+  curl -sf -X POST "$BASE/api/tools/eval_js" \
     -H 'content-type: application/json' --data-binary '{"code":"return 1"}' 2>/dev/null | grep -q '"result"' && break
   sleep 2
 done
@@ -133,7 +144,7 @@ done
 echo "--- smoke battery ---"
 stage="smoke"
 smoke_out="$work/smoke.out"
-bash "$here/smoke.sh" http://127.0.0.1:7373 | tee "$smoke_out"
+bash "$here/smoke.sh" "$BASE" | tee "$smoke_out"
 summary=$(tail -1 "$smoke_out")
 checks=$(jq -r '.checks' <<<"$summary" 2>/dev/null || echo 0)
 passed=$(jq -r '.passed' <<<"$summary" 2>/dev/null || echo 0)
