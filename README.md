@@ -23,19 +23,25 @@
 
 ---
 
-Testing Tauri apps today means choosing between frontend mocks that lie about your backend, WebDriver setups that take a weekend, or paying for macOS support. Victauri embeds an [MCP](https://modelcontextprotocol.io) server directly inside your Tauri process — giving test suites and AI agents simultaneous access to the DOM, IPC layer, Rust backend state, and native windows. No WebDriver. No browser dependency. **Works on macOS, Windows, and Linux.**
+Testing Tauri apps today means choosing between frontend mocks that lie about your backend, WebDriver setups that take a weekend, or paying for macOS CI runners. Victauri replaces all three: it embeds a lightweight server inside your Tauri process (debug builds only) that gives your test suite, `curl`, and CI direct access to the DOM, IPC layer, Rust backend state, the database, and native windows — from one test, on all three platforms. No WebDriver. No browser dependency. **Works on macOS, Windows, and Linux.**
 
-> **Tested against 5 real-world Tauri apps** (Kanri, En Croissant, Surrealist, Duckling, Lettura) — **96.9% pass rate** across 895 tests with zero Victauri bugs and zero code changes.
+That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI agent — Claude Code, Cursor, Windsurf — can drive and debug your app with the exact same full-stack access. **Testing is the job; the agent integration is the bonus.**
+
+> **Tested against 5 real-world Tauri apps** (Kanri, En Croissant, Surrealist, Duckling, Lettura) — in our compatibility suite, **867 / 895 tests passed (96.9%)** with zero Victauri bugs and zero changes to the apps. The remaining failures were test-script issues or correct actionability enforcement.
 
 ## What You Get
 
-- **Full-stack verification** — click a button, verify the IPC call, query the database to confirm the write, check the UI updated
+**For your test suite and CI:**
+
+- **Full-stack verification** — click a button, verify the IPC call, query the database to confirm the write, check the UI updated — in one test
 - **Direct backend access** — query SQLite databases, browse app files, read config, inspect process memory — no webview proxy
 - **Ghost command detection** — find frontend calls with no backend handler, and backend commands the frontend never calls
-- **Cross-boundary state checking** — compare DOM state against Rust backend state, catch drift automatically
+- **Cross-boundary state checking** — compare DOM state against Rust backend state and catch the drift between them
 - **Time-travel recording** — record interactions, checkpoint state, replay sequences, generate test files
+- **Cross-platform, no WebDriver** — identical behavior on macOS, Windows, and Linux; runs headless in CI under `xvfb`
 - **Zero production cost** — compiles away entirely in release builds via `#[cfg(debug_assertions)]`
-- **AI agent compatible** — speaks MCP protocol, works with Claude Code, Cursor, Windsurf, and any MCP client
+
+**Bonus — for AI agents:** the same server speaks MCP, so Claude Code, Cursor, Windsurf, and any MCP client get this full-stack access for interactive debugging — no extra setup.
 
 ## Quick Start
 
@@ -336,7 +342,7 @@ victauri/
 │   ├── victauri-cli/        # CLI: init, check, test, record, watch, coverage
 │   └── victauri-watchdog/   # Health-check sidecar for crash recovery
 ├── extensions/
-│   ├── chrome/              # Chrome/Edge/Brave extension (MV3) + 163 vitest tests
+│   ├── chrome/              # Chrome/Edge/Brave extension (MV3) + 169 vitest tests
 │   ├── firefox/             # Firefox extension (MV3)
 │   └── npm/                 # @4da/victauri-browser npm package
 ├── docs/                    # mdbook documentation site
@@ -450,7 +456,8 @@ victauri init    # generates .github/workflows/victauri.yml
 
 - **No production use** — debug builds only, by design
 - **No remote access** — localhost only, no port forwarding
-- **No iframe support** — single-frame webviews only (Tauri standard)
+- **Same-origin frames only** — same-origin iframes are traversed; cross-origin frames are marked and skipped
+- **No live frontend-IPC control** — `fault` injection applies to commands driven through Victauri's own `invoke_command`, not the app's real frontend IPC (that path sits below the layer the JS bridge can reach without CDP)
 - **Pre-1.0** — API may change (semver-checked in CI)
 
 ---
@@ -467,6 +474,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps  # Docs (zero warning
 ```
 
 **Lint policy:** 20 clippy lints (pedantic + nursery) enforced at `deny` level — see `[workspace.lints.clippy]` in `Cargo.toml`.
+
+## Community & Contributing
+
+Victauri is open source and built by [4DA Systems](https://4da.ai), which uses it to test its own Tauri app. We want it to become the default way to test Tauri apps full-stack — and that needs more than one company.
+
+- **Using it on a Tauri app?** Tell us — open a [discussion](https://github.com/runyourempire/victauri/discussions) or issue. We'd love to add you to a "used by" list and learn what broke.
+- **Want to contribute?** See [CONTRIBUTING.md](CONTRIBUTING.md). Good first areas: more `victauri-test` assertion helpers, framework-specific testing guides, and CI recipes.
+- **Found a bug or a Tauri app it doesn't work on?** File an issue with the app and the failing tool call — those reports are the most valuable thing you can send us.
+
+If Victauri saves you a weekend of WebDriver setup, a ⭐ helps other Tauri developers find it.
 
 ## License
 

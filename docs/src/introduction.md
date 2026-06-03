@@ -2,13 +2,17 @@
 
 **Victauri** — Verified Introspection & Control for Tauri Applications.
 
-Victauri gives AI agents X-ray vision and hands inside Tauri apps. Unlike browser automation tools like Playwright (which only see the browser glass), Victauri provides simultaneous access to the webview DOM, the Rust backend, the IPC layer, the database, and native window state — all through a single MCP interface.
+Victauri is full-stack testing for Tauri apps. Click a button in the frontend, verify the Rust command ran, confirm the database row was written — from a single test, on macOS, Windows, and Linux, in CI. Unlike browser automation tools like Playwright (which only see the browser glass), Victauri has simultaneous access to the webview DOM, the IPC layer, the Rust backend, the database, and native window state.
+
+It works by embedding a lightweight server inside your Tauri app's own process — debug builds only; it compiles away to nothing in release. Your test suite, `curl`, or CI talks to it over a plain REST/HTTP API. No WebDriver, no Selenium grid, no browser dependency.
+
+And because that same server also speaks the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), any AI agent — Claude Code, Cursor, Windsurf — gets the exact same full-stack access for interactive debugging. **Testing is the job; the agent integration is the bonus.**
 
 ## Who Is This For?
 
-- **AI agent developers** who need to test, debug, or drive Tauri applications
-- **Tauri app developers** who want automated testing with full-stack visibility
-- **QA engineers** looking for deeper inspection than DOM-only tools provide
+- **Tauri app developers** who want real full-stack tests (frontend → IPC → Rust → database) instead of frontend mocks that lie about the backend
+- **QA and CI engineers** who need cross-platform end-to-end tests without standing up a WebDriver/Selenium grid or paying for macOS runners
+- **AI agent developers** who need to drive, debug, or inspect a running Tauri application over MCP
 
 ## Key Value Proposition
 
@@ -22,7 +26,7 @@ One plugin, one line of code, full-stack access:
 | **Windows** | Multi-window management, screenshots, positioning |
 | **Time-Travel** | Record sessions, checkpoint state, replay events |
 
-All of this is exposed over the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), the standard that AI agents already speak. Connect Claude Code, VS Code Copilot, or any MCP client — and your agent has complete control of the running Tauri application.
+All of this is exposed two ways from the same server: a plain **REST/HTTP API** (`POST /api/tools/{name}`) that your test suite, shell scripts, and CI call directly — no handshake, no session — and the **[Model Context Protocol (MCP)](https://modelcontextprotocol.io/)** for AI agents. Write deterministic tests against REST; connect Claude Code, Cursor, or any MCP client when you want an agent to drive the app interactively.
 
 ## Design Principles
 
@@ -64,4 +68,6 @@ victauri/
 
 ## Current Status
 
-All 7 crates are published to crates.io. Tested against 5 real-world open-source Tauri apps (96.9% pass rate across 895 tests) with zero Victauri bugs found. Supports Tauri 2.0+ with rmcp 1.5.0.
+All 7 crates are published to crates.io. In our own compatibility testing against 5 real-world open-source Tauri apps (Kanri, En Croissant, Surrealist, Duckling, Lettura), 867 of 895 tests passed (96.9%) with zero Victauri bugs and zero changes required to the apps — the remaining failures were test-script issues or correct actionability enforcement. Supports Tauri 2.0+ with rmcp 1.5.0.
+
+Victauri is open source (Apache-2.0) and built by [4DA Systems](https://4da.ai), which uses it to test its own Tauri app. **Adopters and contributors are very welcome** — see [Contributing](https://github.com/runyourempire/victauri/blob/main/CONTRIBUTING.md), and if you ship a Tauri app we'd love to hear how it goes.
