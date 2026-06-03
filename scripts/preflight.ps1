@@ -23,6 +23,7 @@ Set-Location $root
 
 Run "cargo fmt --check"   { cargo fmt --all -- --check }
 Run "clippy"              { cargo clippy --workspace --all-targets --features sqlite -- -D warnings }
+Run "doc-count lint"      { bash scripts/check-doc-counts.sh }
 Run "workspace tests"     { cargo test --workspace --features sqlite }
 Run "chrome bridge tests" { Push-Location extensions/chrome/tests; npx vitest run; $code = $LASTEXITCODE; Pop-Location; $global:LASTEXITCODE = $code }
 

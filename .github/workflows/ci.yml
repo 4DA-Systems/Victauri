@@ -45,6 +45,10 @@ jobs:
           rustup component add rustfmt
           cargo fmt --all -- --check
 
+      - name: Doc-count lint (headline numbers match the code)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/check-doc-counts.sh
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}

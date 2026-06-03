@@ -652,6 +652,14 @@ impl VictauriBuilder {
 
         #[cfg(debug_assertions)]
         {
+            // Hard kill-switch: lets a team force the no-op plugin even in a debug
+            // build (e.g. a release profile compiled with `debug-assertions = true`,
+            // or a shared environment where the introspection server must never bind).
+            if env_truthy("VICTAURI_DISABLE") {
+                tracing::info!("Victauri disabled via VICTAURI_DISABLE — returning no-op plugin");
+                return Ok(Builder::new("victauri").build());
+            }
+
             self.validate()?;
 
             let port = self.resolve_port();
@@ -800,7 +808,7 @@ impl VictauriBuilder {
                         });
                     }
 
-                    tracing::info!("Victauri plugin initialized — MCP server on port {port}");
+                    emit_security_banner(port);
                     Ok(())
                 })
                 .on_event(|app, event| {
@@ -890,6 +898,41 @@ fn format_window_event(label: &str, event: &tauri::WindowEvent) -> (String, Stri
     }
 }
 
+/// Returns `true` if the named environment variable is set to a truthy value
+/// (`1`, `true`, `yes`, or `on`, case-insensitive, surrounding whitespace ignored).
+/// Unset, empty, or any other value is `false`.
+#[cfg(debug_assertions)]
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+/// Emits an unmissable startup banner whenever the introspection server activates.
+///
+/// Victauri is a debug-only tool that exposes JS eval, IPC, the filesystem, and
+/// `SQLite` over localhost. Logging this loudly on every start guarantees it can
+/// never run *silently* — most importantly catching the dangerous case of a
+/// release build accidentally compiled with `debug-assertions = true`, where the
+/// `#[cfg(debug_assertions)]` gate would otherwise let the full server bind with
+/// no visible signal.
+#[cfg(debug_assertions)]
+fn emit_security_banner(port: u16) {
+    tracing::warn!(
+        "┌─ VICTAURI INTROSPECTION SERVER ACTIVE ─────────────────────────────\n\
+         │ Listening on http://127.0.0.1:{port} — exposes JS eval, IPC, the\n\
+         │ filesystem, and SQLite to local clients. DEBUG-ONLY developer tool;\n\
+         │ it must never reach end users.\n\
+         │ Seeing this in a shipped/release build means your release profile has\n\
+         │ `debug-assertions = true`. Turn that off, or hard-disable Victauri\n\
+         │ with the VICTAURI_DISABLE=1 environment variable.\n\
+         └────────────────────────────────────────────────────────────────────"
+    );
+}
+
 /// Initialize the Victauri plugin with default settings (port 7373 or `VICTAURI_PORT` env var).
 ///
 /// In debug builds: starts the embedded MCP server with **authentication enabled**
@@ -898,6 +941,11 @@ fn format_window_event(label: &str, event: &tauri::WindowEvent) -> (String, Stri
 ///
 /// In release builds: returns a no-op plugin. The MCP server, JS bridge, and
 /// all introspection tools are completely stripped — zero overhead, zero attack surface.
+///
+/// Setting the `VICTAURI_DISABLE=1` environment variable forces the no-op plugin
+/// even in a debug build — a hard kill-switch for shared environments or a release
+/// profile compiled with `debug-assertions = true`. When the server does activate
+/// it always logs a prominent startup banner, so it can never run silently.
 ///
 /// For custom configuration, use `VictauriBuilder::new().port(8080).build()`.
 ///
@@ -975,6 +1023,29 @@ mod tests {
     fn builder_auth_token_explicit() {
         let builder = VictauriBuilder::new().auth_token("my-secret");
         assert_eq!(builder.resolve_auth_token(), Some("my-secret".to_string()));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn env_truthy_recognizes_kill_switch_values() {
+        // Unique var name so this never races with other env-touching tests.
+        let key = "VICTAURI_TEST_KILL_SWITCH";
+        // SAFETY: test-only — this var is unique to this test, no concurrent readers.
+        unsafe { std::env::remove_var(key) };
+        assert!(!env_truthy(key), "unset should be false");
+
+        for v in ["1", "true", "TRUE", " yes ", "On"] {
+            // SAFETY: test-only — unique var, no concurrent readers.
+            unsafe { std::env::set_var(key, v) };
+            assert!(env_truthy(key), "{v:?} should be truthy");
+        }
+        for v in ["0", "false", "", "nope"] {
+            // SAFETY: test-only — unique var, no concurrent readers.
+            unsafe { std::env::set_var(key, v) };
+            assert!(!env_truthy(key), "{v:?} should be falsy");
+        }
+        // SAFETY: test-only — restore clean state.
+        unsafe { std::env::remove_var(key) };
     }
 
     #[test]

@@ -15,6 +15,7 @@ run() {
 
 run "cargo fmt --check" cargo fmt --all -- --check
 run "clippy"            cargo clippy --workspace --all-targets --features sqlite -- -D warnings
+run "doc-count lint"    bash scripts/check-doc-counts.sh
 run "workspace tests"   cargo test --workspace --features sqlite
 
 echo; echo "=== chrome bridge tests ==="
