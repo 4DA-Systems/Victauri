@@ -235,6 +235,13 @@ fn cmd_init(root: &Path) -> Result<()> {
                 .with_context(|| format!("failed to write {}", cap_path.display()))?;
             eprintln!("  [+] Created capabilities/victauri.json");
         }
+        // Verify the effective grant covers every window — a capability scoped to
+        // only some windows silently blinds the rest (Tauri ACL drops their IPC).
+        let scan = scan_victauri_capability(&caps_dir);
+        if scan.granted && !scan.covers_all_windows() {
+            eprintln!("  [!] A capability grants 'victauri:default' but not to all windows —");
+            eprintln!("      add \"windows\": [\"*\"] so every window is introspectable.");
+        }
     }
 
     // Step 5: Scan for Tauri commands and create test files
@@ -580,30 +587,46 @@ async fn cmd_doctor() -> Result<()> {
         warn_count += 1;
     }
 
-    // Check 7: Capabilities
+    // Check 7: Capabilities — the #1 silent integration failure.
     let caps_dir = find_capabilities_dir(&cargo_path);
     if let Some(ref caps) = caps_dir {
-        let victauri_cap = caps.join("victauri.json");
-        if victauri_cap.exists() {
-            eprintln!("  [PASS] capabilities/victauri.json exists");
+        let scan = scan_victauri_capability(caps);
+        if !scan.granted {
+            eprintln!("  [WARN] No capability grants 'victauri:default'");
+            eprintln!("         Without it Tauri's ACL silently blocks Victauri — every");
+            eprintln!("         eval_js / dom_snapshot will time out with no error.");
+            eprintln!(
+                "         Run `victauri init`, or add {}:",
+                caps.join("victauri.json").display()
+            );
+            eprintln!("{}", indent_block(generate_capability_json()));
+            warn_count += 1;
+        } else if scan.covers_all_windows() {
+            eprintln!("  [PASS] 'victauri:default' granted to all windows");
             pass_count += 1;
         } else {
-            // Check if any capability file references victauri
-            let has_victauri_perm = std::fs::read_dir(caps).is_ok_and(|entries| {
-                entries.filter_map(Result::ok).any(|e| {
-                    std::fs::read_to_string(e.path())
-                        .unwrap_or_default()
-                        .contains("victauri")
-                })
-            });
-            if has_victauri_perm {
-                eprintln!("  [PASS] Victauri permissions found in capabilities");
-                pass_count += 1;
-            } else {
-                eprintln!("  [WARN] No Victauri capability configured");
-                eprintln!("         Run: victauri init");
-                warn_count += 1;
+            let file = scan.file.as_deref().map_or_else(
+                || "the capability file".to_string(),
+                |p| p.display().to_string(),
+            );
+            match scan.windows.as_deref() {
+                Some(labels) if !labels.is_empty() => {
+                    eprintln!(
+                        "  [WARN] 'victauri:default' only covers window(s): {}",
+                        labels.join(", ")
+                    );
+                    eprintln!("         Other windows will be invisible to Victauri (eval_js /");
+                    eprintln!(
+                        "         dom_snapshot against them time out). Set \"windows\": [\"*\"]"
+                    );
+                    eprintln!("         in {file} to cover every window.");
+                }
+                _ => {
+                    eprintln!("  [WARN] 'victauri:default' grant has no explicit window scope");
+                    eprintln!("         Add \"windows\": [\"*\"] to {file} to be safe.");
+                }
             }
+            warn_count += 1;
         }
     }
 
@@ -1228,6 +1251,14 @@ Playwright only for browser-only work unrelated to this app.
 "#
 }
 
+/// Indents every line of `text` by 9 spaces so it lines up under a doctor advisory.
+fn indent_block(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("         {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn generate_capability_json() -> &'static str {
     r#"{
   "identifier": "victauri",
@@ -1239,6 +1270,85 @@ fn generate_capability_json() -> &'static str {
   ]
 }
 "#
+}
+
+/// What a project's `capabilities/` directory grants Victauri, and to which windows.
+///
+/// The single most common Victauri integration failure is a capability that grants
+/// `victauri:default` to only *some* windows: the others come back blind (every
+/// `eval_js` / `dom_snapshot` against them times out with no error, because Tauri's
+/// ACL silently drops the IPC). This scan makes that misconfiguration detectable
+/// statically instead of as a mystery timeout at runtime.
+#[derive(Default)]
+struct VictauriCapabilityScan {
+    /// At least one capability file grants a `victauri:*` permission.
+    granted: bool,
+    /// The `windows` list of the granting capability: `None` when the field is
+    /// omitted, `Some(labels)` when explicit. A grant covers every window when the
+    /// list contains `"*"`.
+    windows: Option<Vec<String>>,
+    /// The capability file that grants Victauri, for diagnostics.
+    file: Option<PathBuf>,
+}
+
+impl VictauriCapabilityScan {
+    /// True when the grant applies to every window (explicit `"*"` glob).
+    fn covers_all_windows(&self) -> bool {
+        self.windows
+            .as_ref()
+            .is_some_and(|w| w.iter().any(|l| l == "*"))
+    }
+}
+
+/// Returns true if a `permissions` array entry is a `victauri:*` grant. Entries may
+/// be a bare string (`"victauri:default"`) or an object (`{"identifier": "..."}`).
+fn permission_is_victauri(perm: &serde_json::Value) -> bool {
+    perm.as_str()
+        .or_else(|| perm.get("identifier").and_then(serde_json::Value::as_str))
+        .is_some_and(|s| s.starts_with("victauri:"))
+}
+
+/// Scans every `*.json` in `caps_dir` for a capability that grants a `victauri:*`
+/// permission, recording which windows it applies to.
+fn scan_victauri_capability(caps_dir: &Path) -> VictauriCapabilityScan {
+    let mut scan = VictauriCapabilityScan::default();
+    let Ok(entries) = std::fs::read_dir(caps_dir) else {
+        return scan;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
+            continue;
+        };
+        let grants = json
+            .get("permissions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|perms| perms.iter().any(permission_is_victauri));
+        if !grants {
+            continue;
+        }
+        scan.granted = true;
+        scan.file = Some(path.clone());
+        scan.windows = json
+            .get("windows")
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            });
+        // Best possible coverage — no need to inspect remaining files.
+        if scan.covers_all_windows() {
+            break;
+        }
+    }
+    scan
 }
 
 fn find_capabilities_dir(cargo_toml_path: &Path) -> Option<PathBuf> {
@@ -1860,6 +1970,62 @@ mod tests {
                 .iter()
                 .any(|p| p.as_str().is_some_and(|s| s.contains("victauri")))
         );
+    }
+
+    #[test]
+    fn permission_is_victauri_matches_string_and_object_forms() {
+        assert!(permission_is_victauri(&serde_json::json!(
+            "victauri:default"
+        )));
+        assert!(permission_is_victauri(
+            &serde_json::json!({"identifier": "victauri:allow-eval"})
+        ));
+        assert!(!permission_is_victauri(&serde_json::json!("core:default")));
+        assert!(!permission_is_victauri(&serde_json::json!(
+            "not-victauri:default"
+        )));
+        assert!(!permission_is_victauri(&serde_json::json!({"foo": "bar"})));
+    }
+
+    #[test]
+    fn scan_detects_all_windows_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("victauri.json"), generate_capability_json()).unwrap();
+        let scan = scan_victauri_capability(dir.path());
+        assert!(scan.granted);
+        assert!(scan.covers_all_windows());
+        assert!(scan.file.is_some());
+    }
+
+    #[test]
+    fn scan_flags_partial_window_coverage() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("app.json"),
+            r#"{"identifier":"x","windows":["main"],"permissions":["core:default","victauri:default"]}"#,
+        )
+        .unwrap();
+        let scan = scan_victauri_capability(dir.path());
+        assert!(scan.granted, "victauri grant should be detected");
+        assert!(
+            !scan.covers_all_windows(),
+            "a 'main'-only grant must not count as full coverage"
+        );
+        assert_eq!(scan.windows.as_deref(), Some(&["main".to_string()][..]));
+    }
+
+    #[test]
+    fn scan_reports_no_grant_when_only_mentioned_in_text() {
+        let dir = tempfile::tempdir().unwrap();
+        // The word "victauri" appears only in a description — the old substring
+        // check false-passed on this; the parser must not.
+        std::fs::write(
+            dir.path().join("other.json"),
+            r#"{"identifier":"x","description":"not victauri","windows":["*"],"permissions":["core:default"]}"#,
+        )
+        .unwrap();
+        let scan = scan_victauri_capability(dir.path());
+        assert!(!scan.granted);
     }
 
     #[test]

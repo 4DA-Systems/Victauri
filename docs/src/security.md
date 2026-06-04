@@ -16,14 +16,35 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
 }
 ```
 
-This means:
+In a normal release build this means:
 - No MCP server is started in production
 - No JS bridge is injected
 - No HTTP endpoints are exposed
 - No memory is allocated for logs or state
 - The compiled binary has zero overhead from Victauri
 
-You cannot accidentally ship Victauri to users.
+### The one way this gate can fail — and how to stop it
+
+The gate keys off `debug_assertions`, which Cargo disables in the `release` profile **by
+default**. But `debug_assertions` is a profile setting, not a guarantee: if your release
+profile sets `debug-assertions = true` (some teams enable it for extra runtime checks, and
+some workspace/profile inheritance does it unintentionally), the **full Victauri server is
+compiled in and will bind on startup** — an authenticated HTTP server with JS-eval,
+filesystem, and SQLite access, shipped to end users. That is the one configuration that turns
+a debug tool into a production vulnerability.
+
+Two defenses make this safe:
+
+1. **It can never run silently.** Whenever the server activates it logs a prominent
+   `WARN` banner naming the port and explicitly telling you to disable it if you are seeing it
+   in a shipped build. A silent embedded server is the dangerous one; this one shouts.
+2. **A hard kill-switch.** Setting the `VICTAURI_DISABLE=1` environment variable forces the
+   no-op plugin even in a debug build. Use it in shared/staging environments, or as a
+   belt-and-suspenders guard in any release pipeline.
+
+**Recommendation:** keep `debug-assertions = false` in your release profile (the default).
+If you must enable it, set `VICTAURI_DISABLE=1` in the shipped environment, and confirm the
+banner does not appear in your release logs.
 
 ## Bearer Token Authentication
 

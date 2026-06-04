@@ -4,11 +4,9 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.5.x   | Yes       |
-| 0.4.x   | Yes       |
-| 0.3.x   | No        |
-| 0.2.x   | No        |
-| 0.1.x   | No        |
+| 0.7.x   | Yes       |
+| 0.6.x   | Yes       |
+| < 0.6   | No        |
 
 ## Reporting a Vulnerability
 
@@ -44,7 +42,7 @@ We follow coordinated disclosure. We will credit reporters unless they prefer an
 
 - **Tauri core vulnerabilities** — report these to the [Tauri security team](https://github.com/tauri-apps/tauri/security/policy)
 - **Application-level business logic** — vulnerabilities in apps that use Victauri as a dependency are the responsibility of those app authors
-- **Release builds** — all Victauri plugin code is gated behind `#[cfg(debug_assertions)]` and does not exist in release binaries
+- **Release builds with default settings** — Victauri plugin code is gated behind `#[cfg(debug_assertions)]`, so it does not exist in a standard release binary. Note the exception: a release profile compiled with `debug-assertions = true` *will* include the server — set `VICTAURI_DISABLE=1` in that environment (see the [Security guide](docs/src/security.md#the-one-way-this-gate-can-fail))
 - **Denial of service against localhost** — the MCP server is intentionally a debug-only, local-only interface
 
 ## Security Design

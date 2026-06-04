@@ -9,9 +9,19 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref. PRs cancel aggressively (a new push
+# makes the old run moot); pushes to main are left to finish so the release
+# workflow's `require-ci-green` gate always has a conclusive run to point at.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  # Incremental compilation wastes time and cache space in CI (every job is a
+  # cold-ish build); disabling it shrinks the cache and speeds linking.
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   check:
@@ -26,24 +36,27 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          # Save the cache only from main — PR builds reuse it but don't churn it.
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Check formatting
         if: matrix.os == 'ubuntu-latest'
-        run: |
-          rustup component add rustfmt
-          cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      - name: Doc-count lint (headline numbers match the code)
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/check-doc-counts.sh
 
   test:
     name: Test
@@ -57,13 +70,13 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Install bridge test dependencies
         working-directory: crates/victauri-plugin/tests/bridge_tests
@@ -72,87 +85,19 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
-  e2e-real-app:
-    name: Real-App E2E (demo-app, adversarial)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev xvfb
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-
-      # Build the app and the test up front so the run step doesn't rebuild a
-      # running binary. Debug build → the Victauri plugin is active.
-      - name: Build demo-app + adversarial test
-        run: |
-          cargo build -p demo-app --bin demo-app
-          cargo test -p demo-app --test adversarial --no-run
-
-      - name: Run adversarial E2E against the live app
-        run: |
-          set -euo pipefail
-          # Software rendering for headless WebKitGTK in CI.
-          export WEBKIT_DISABLE_DMABUF_RENDERER=1
-          export WEBKIT_DISABLE_COMPOSITING_MODE=1
-          export LIBGL_ALWAYS_SOFTWARE=1
-
-          # Launch the GUI app under a virtual display, in the background.
-          xvfb-run -a --server-args="-screen 0 1280x800x24" \
-            ./target/debug/demo-app > /tmp/demo-app.log 2>&1 &
-          APP_PID=$!
-
-          # Wait for the embedded MCP server, failing fast if the app exits.
-          up=false
-          for i in $(seq 1 90); do
-            if curl -sf http://127.0.0.1:7373/health >/dev/null 2>&1; then
-              echo "demo-app MCP server up after ${i}s"; up=true; break
-            fi
-            if ! kill -0 "$APP_PID" 2>/dev/null; then
-              echo "::error::demo-app exited before the server came up"; cat /tmp/demo-app.log; exit 1
-            fi
-            sleep 1
-          done
-          if [ "$up" != true ]; then
-            echo "::error::demo-app MCP server never became reachable"; cat /tmp/demo-app.log; kill "$APP_PID" || true; exit 1
-          fi
-
-          # Shared-app E2E tests must run sequentially (they mutate app state).
-          set +e
-          VICTAURI_E2E=1 cargo test -p demo-app --test adversarial -- --test-threads=1 --nocapture
-          status=$?
-          set -e
-
-          kill "$APP_PID" 2>/dev/null || true
-          if [ $status -ne 0 ]; then
-            echo "=== demo-app log (last 100 lines) ==="; tail -100 /tmp/demo-app.log || true
-          fi
-          exit $status
-
-      - name: Upload demo-app log on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: demo-app-e2e-log
-          path: /tmp/demo-app.log
-          if-no-files-found: ignore
-
-  # "Below the glass," proven on every desktop platform. On macOS no external tool can
-  # even attach to the WKWebView (Tauri docs: tauri-driver is "only Windows and Linux
-  # ... due to macOS not having a WKWebView driver tool available"), and WebDriver
-  # everywhere is DOM-only (no Rust backend / IPC / DB). This matrix launches a real
-  # Tauri app on macOS, Linux, and Windows and asserts the full stack live: webview +
-  # DOM + IPC→Rust backend + command registry + native. Screenshot and trusted input
-  # are intentionally excluded — they need display/Screen-Recording/Accessibility
-  # grants headless CI cannot give; the same-process introspection that is the wedge
-  # needs none of that.
-  fullstack-proof:
-    name: Full-Stack Proof (${{ matrix.os }})
+  # The canonical "below the glass" proof, run live on every desktop platform.
+  # On macOS no external tool can even attach to the WKWebView (Tauri docs:
+  # tauri-driver is "only Windows and Linux ... due to macOS not having a
+  # WKWebView driver tool available"), and WebDriver everywhere is DOM-only (no
+  # Rust backend / IPC / DB). This launches a real Tauri app on macOS, Linux, and
+  # Windows and asserts the full stack live: webview + DOM + IPC→Rust backend +
+  # registry + native. On Linux it additionally runs the adversarial E2E suite
+  # against the same running app (folded in from the old standalone job so the
+  # app is built and launched once, not twice). Screenshot and trusted input are
+  # excluded — they need display/Screen-Recording/Accessibility grants headless
+  # CI cannot give; the same-process introspection that is the wedge needs none.
+  live-app:
+    name: Live-App Proof (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -163,16 +108,24 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev xvfb
+        uses: ./.github/actions/linux-deps
+        with:
+          xvfb: "true"
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Build demo-app (debug → Victauri plugin active)
         run: cargo build -p demo-app --bin demo-app
+
+      # Compile the adversarial test up front (Linux only) so launching the app
+      # and then running tests doesn't relink a running binary.
+      - name: Pre-compile adversarial E2E (Linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p demo-app --test adversarial --no-run
 
       - name: Prove full-stack introspection live on ${{ matrix.os }}
         shell: bash
@@ -182,7 +135,6 @@ jobs:
           BIN=./target/debug/demo-app
           [ "$RUNNER_OS" = "Windows" ] && BIN=./target/debug/demo-app.exe
 
-          # Launch the real Tauri app in the background (Linux needs a virtual display).
           case "$RUNNER_OS" in
             Linux)
               export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_ALWAYS_SOFTWARE=1
@@ -243,13 +195,25 @@ jobs:
 
           echo "PROVEN on $RUNNER_OS: webview + DOM + IPC→Rust backend + registry + native."
           echo "=============================================================="
+
+          # On Linux, run the full adversarial suite against the same live app
+          # (sequential — the tests mutate shared app state).
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            echo "=== adversarial E2E suite (live) ==="
+            set +e
+            VICTAURI_E2E=1 cargo test -p demo-app --test adversarial -- --test-threads=1 --nocapture
+            adv=$?
+            set -e
+            [ $adv -eq 0 ] || fail "adversarial E2E suite failed (exit $adv)"
+          fi
+
           kill "$APP_PID" 2>/dev/null || true
 
       - name: Upload app log on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fullstack-proof-log-${{ matrix.os }}
+          name: live-app-log-${{ matrix.os }}
           path: app.log
           if-no-files-found: ignore
 
@@ -260,13 +224,13 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Build docs
         run: cargo doc --workspace --no-deps
@@ -280,15 +244,15 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.88"
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Check MSRV
         run: cargo check --workspace
@@ -301,8 +265,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+      # Prebuilt binary — avoids ~3 min compiling cargo-audit from source.
+      - uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
+        with:
+          tool: cargo-audit
 
       - name: Run audit
         run: cargo audit
@@ -322,17 +288,17 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
         with:
           tool: cargo-llvm-cov
 
@@ -358,16 +324,18 @@ jobs:
           fetch-depth: 0
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
-      - name: Install cargo-semver-checks
-        run: cargo install cargo-semver-checks --locked
+      # Prebuilt binary — avoids ~3 min compiling cargo-semver-checks from source.
+      - uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
+        with:
+          tool: cargo-semver-checks
 
       - name: Check semver
         run: cargo semver-checks check-release --workspace
@@ -393,7 +361,7 @@ jobs:
         run: npx vitest run
 
   e2e:
-    name: E2E (${{ matrix.os }})
+    name: E2E Integration (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     strategy:
@@ -405,13 +373,15 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev xvfb
+        uses: ./.github/actions/linux-deps
+        with:
+          xvfb: "true"
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       - name: Install bridge test dependencies
         working-directory: crates/victauri-plugin/tests/bridge_tests

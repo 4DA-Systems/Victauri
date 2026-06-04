@@ -151,6 +151,30 @@ client.dom_snapshot_for("notification").await?;
 
 Apps with many dynamic windows (Spacedrive's 15+ types, Seelen-UI's desktop environment) should target windows by label explicitly.
 
+## Reproducible Retest Harness
+
+The numbers in the next section were measured manually against app versions current
+at the time. To keep compatibility claims honest against the **current** Victauri,
+the repo ships a reproducible harness:
+
+```bash
+scripts/compat/retest-app.sh duckling   # one app
+scripts/compat/retest-all.sh            # all five, with a results table
+```
+
+For each app it clones a **pinned release tag**, injects the current `victauri-plugin`
+(path dependency + `.plugin(victauri_plugin::init())` + a `victauri:default` capability
+for all windows), builds the frontend and a debug Tauri binary, launches it headless,
+and runs an app-agnostic smoke battery (webview eval, DOM refs, native memory, window
+list, a11y/perf audits, storage round-trip — 15 checks, validated 15/15 against the
+demo-app). The **Compatibility Retest** GitHub workflow (`.github/workflows/compat.yml`)
+runs it on demand and weekly. See [`scripts/compat/README.md`](https://github.com/runyourempire/victauri/blob/main/scripts/compat/README.md).
+
+Note: these third-party apps move fast — pinned tags and per-app build recipes
+(three different package managers; pnpm-version-sensitive workspaces) are maintained
+in `scripts/compat/apps.json`. A `frontend`-stage failure is the app's own toolchain,
+not Victauri; the clone → inject → build → smoke pipeline is what proves compatibility.
+
 ## Tested Apps
 
 | App | Stars | Tauri | Frontend | Windows | Commands | Victauri Fit |

@@ -19,9 +19,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -131,9 +129,7 @@ jobs:
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -266,9 +262,7 @@ jobs:
           echo "tag matches workspace version: $VER"
 
       - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev
+        uses: ./.github/actions/linux-deps
 
       - uses: dtolnay/rust-toolchain@stable
 
