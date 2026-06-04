@@ -72,6 +72,106 @@ pub fn scan_discovery_dirs_for_token() -> Option<String> {
     None
 }
 
+/// Non-destructive classification of the discovery directory, used to turn a
+/// bare "connection refused" into an actionable diagnosis.
+#[derive(Debug, Clone)]
+pub enum DiscoveryStatus {
+    /// At least one Victauri server is reachable.
+    Live,
+    /// Discovery directories exist but none are reachable — the app process(es)
+    /// advertised these ports then exited (crashed, closed, or is rebuilding).
+    Stale {
+        /// `(pid, port)` pairs from the stale discovery directories.
+        stale: Vec<(u32, u16)>,
+    },
+    /// No discovery directories at all — the app never started, or it is a
+    /// release build (Victauri is gated to debug builds).
+    None,
+}
+
+impl DiscoveryStatus {
+    /// A human-readable, actionable hint for this status, or `None` when live.
+    #[must_use]
+    pub fn hint(&self) -> Option<String> {
+        match self {
+            Self::Live => None,
+            Self::Stale { stale } => {
+                let detail = stale
+                    .iter()
+                    .map(|(pid, port)| format!("PID {pid} on port {port}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Some(format!(
+                    "A Victauri app was running ({detail}) but its server is now unreachable — \
+                     the app process has exited. It most likely crashed, was closed, or its \
+                     backend is mid-rebuild. Victauri runs inside the app, so it cannot report \
+                     build/compile status itself: check your build or dev-server terminal, then \
+                     relaunch the app and retry."
+                ))
+            }
+            Self::None => Some(
+                "No Victauri server discovery files were found. Either the app is not running, \
+                 or it is a release build (Victauri is enabled only in debug builds via \
+                 #[cfg(debug_assertions)]). Start the app in a debug/dev build and retry."
+                    .to_string(),
+            ),
+        }
+    }
+}
+
+/// Classify the discovery directory **without** deleting stale entries.
+///
+/// Call this before [`scan_discovery_dirs_for_port`] (which cleans up dead dirs)
+/// when you want to explain *why* a connection failed.
+#[must_use]
+pub fn diagnose_discovery() -> DiscoveryStatus {
+    let base = victauri_base_dir();
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return DiscoveryStatus::None;
+    };
+
+    let mut stale = Vec::new();
+    let mut any_dir = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(pid) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if !dir_is_trusted(&path) {
+            continue;
+        }
+        let Ok(port_str) = std::fs::read_to_string(path.join("port")) else {
+            continue;
+        };
+        let Ok(port) = port_str.trim().parse::<u16>() else {
+            continue;
+        };
+        any_dir = true;
+        if std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            std::time::Duration::from_millis(100),
+        )
+        .is_ok()
+        {
+            return DiscoveryStatus::Live;
+        }
+        stale.push((pid, port));
+    }
+
+    if any_dir {
+        DiscoveryStatus::Stale { stale }
+    } else {
+        DiscoveryStatus::None
+    }
+}
+
 struct DiscoveredServer {
     port: u16,
     token: Option<String>,
@@ -124,4 +224,38 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
         servers.push(DiscoveredServer { port, token });
     }
     servers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_status_has_no_hint() {
+        assert!(DiscoveryStatus::Live.hint().is_none());
+    }
+
+    #[test]
+    fn stale_status_names_pid_and_port() {
+        let hint = DiscoveryStatus::Stale {
+            stale: vec![(1234, 7374)],
+        }
+        .hint()
+        .expect("stale has a hint");
+        assert!(hint.contains("1234"), "hint names the PID: {hint}");
+        assert!(hint.contains("7374"), "hint names the port: {hint}");
+        assert!(
+            hint.contains("crashed") || hint.contains("rebuild"),
+            "hint explains the likely cause: {hint}"
+        );
+    }
+
+    #[test]
+    fn none_status_mentions_debug_build() {
+        let hint = DiscoveryStatus::None.hint().expect("none has a hint");
+        assert!(
+            hint.contains("debug") || hint.contains("not running"),
+            "hint explains app-not-running / release-build: {hint}"
+        );
+    }
 }

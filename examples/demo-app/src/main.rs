@@ -6,7 +6,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, WebviewWindow};
 use victauri_plugin::inspectable;
 
@@ -19,6 +20,39 @@ struct AppState {
     settings: Mutex<Settings>,
     contacts: Mutex<Vec<Contact>>,
     notifications: Mutex<Vec<Notification>>,
+}
+
+/// A fire-and-forget background pipeline, mirroring a real app's scoring/analysis
+/// loop. `run_pipeline` returns immediately while work happens on a spawned task;
+/// the only honest ways to know it finished are the `pipeline-complete` event
+/// (await with `wait_for` condition `event`) or the `pipeline` state probe's
+/// `running` flag (await with `wait_for` condition `expression`, or read via
+/// `app_state`). This is exactly the async-completion case Victauri 0.7.6 added
+/// first-class support for.
+struct PipelineState {
+    version: AtomicU32,
+    processed: AtomicU64,
+    running: AtomicBool,
+}
+
+impl PipelineState {
+    fn snapshot(&self) -> serde_json::Value {
+        serde_json::json!({
+            "pipeline_version": self.version.load(Ordering::SeqCst),
+            "processed": self.processed.load(Ordering::SeqCst),
+            "running": self.running.load(Ordering::SeqCst),
+        })
+    }
+}
+
+impl Default for PipelineState {
+    fn default() -> Self {
+        Self {
+            version: AtomicU32::new(5),
+            processed: AtomicU64::new(0),
+            running: AtomicBool::new(false),
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -336,6 +370,43 @@ fn list_notifications(state: tauri::State<'_, AppState>) -> Vec<Notification> {
     state.notifications.lock().unwrap().clone()
 }
 
+// ── Fire-and-forget pipeline (async-completion demo) ───────────────────────
+
+#[tauri::command]
+#[inspectable(
+    description = "Start the background pipeline (fire-and-forget — returns immediately while work runs)",
+    intent = "run pipeline",
+    category = "pipeline",
+    example = "run the pipeline"
+)]
+fn run_pipeline(app: tauri::AppHandle, pipeline: tauri::State<'_, Arc<PipelineState>>) {
+    // Returns immediately. Real work happens on a spawned task; completion is
+    // signalled by the `running` flag flipping false AND a `pipeline-complete`
+    // event. An agent should await one of those, not guess with a sleep.
+    let pipeline = Arc::clone(&pipeline);
+    pipeline.running.store(true, Ordering::SeqCst);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let processed = pipeline.processed.fetch_add(50, Ordering::SeqCst) + 50;
+        pipeline.running.store(false, Ordering::SeqCst);
+        let _ = app.emit(
+            "pipeline-complete",
+            serde_json::json!({ "processed": processed }),
+        );
+    });
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "Get the background pipeline's status (running flag + processed count)",
+    intent = "read pipeline status",
+    category = "pipeline",
+    example = "is the pipeline still running"
+)]
+fn pipeline_status(pipeline: tauri::State<'_, Arc<PipelineState>>) -> serde_json::Value {
+    pipeline.snapshot()
+}
+
 #[tauri::command]
 #[inspectable(
     description = "Mark a notification as read",
@@ -419,6 +490,11 @@ fn get_app_state(state: tauri::State<'_, AppState>) -> serde_json::Value {
 }
 
 fn main() {
+    // Shared pipeline state: one Arc cloned into both the `app_state` probe and
+    // Tauri's managed state (the idiomatic VictauriBuilder::probe pattern).
+    let pipeline = Arc::new(PipelineState::default());
+    let probe_pipeline = Arc::clone(&pipeline);
+
     tauri::Builder::default()
         .plugin(
             victauri_plugin::VictauriBuilder::new()
@@ -443,12 +519,16 @@ fn main() {
                     unread_count__schema(),
                     show_notification_window__schema(),
                     get_app_state__schema(),
+                    run_pipeline__schema(),
+                    pipeline_status__schema(),
                 ])
-                .listen_events(&["notification-added"])
+                .listen_events(&["notification-added", "pipeline-complete"])
+                .probe("pipeline", move || probe_pipeline.snapshot())
                 .build()
                 .expect("victauri config is valid"),
         )
         .manage(AppState::default())
+        .manage(pipeline)
         .invoke_handler(tauri::generate_handler![
             greet,
             get_counter,
@@ -469,6 +549,8 @@ fn main() {
             unread_count,
             show_notification_window,
             get_app_state,
+            run_pipeline,
+            pipeline_status,
         ])
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();

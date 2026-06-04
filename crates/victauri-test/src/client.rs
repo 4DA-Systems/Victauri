@@ -329,9 +329,23 @@ impl VictauriClient {
     /// returns a non-success status. Returns [`TestError::Request`] on
     /// HTTP transport failures.
     pub async fn discover() -> Result<Self, TestError> {
+        // Classify the discovery directory BEFORE `discover_port` runs — that path
+        // deletes stale (unreachable) discovery dirs as a side effect, so the
+        // diagnosis must be captured first to explain a subsequent failure.
+        let diagnosis = crate::discovery::diagnose_discovery();
         let port = Self::discover_port();
         let token = Self::discover_token();
-        Self::connect_with_token(port, token.as_deref()).await
+        match Self::connect_with_token(port, token.as_deref()).await {
+            Ok(client) => Ok(client),
+            Err(TestError::Connection { host, port, reason }) => {
+                let reason = match diagnosis.hint() {
+                    Some(hint) => format!("{reason}\n\n  Discovery diagnosis: {hint}"),
+                    None => reason,
+                };
+                Err(TestError::Connection { host, port, reason })
+            }
+            Err(other) => Err(other),
+        }
     }
 
     fn discover_port() -> u16 {
@@ -1000,6 +1014,87 @@ impl VictauriClient {
             args["poll_ms"] = json!(p);
         }
         self.call_tool("wait_for", args).await
+    }
+
+    /// Poll a JavaScript expression until it is truthy (or equals `expected`),
+    /// awaited server-side. This is the level-triggered, race-free way to wait
+    /// for a fire-and-forget backend command to finish: pass an expression that
+    /// reads a pollable status (it may `await`).
+    ///
+    /// Returns `{ ok: true, value, elapsed_ms }` on success or
+    /// `{ ok: false, error, last_value, last_error, elapsed_ms }` on timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn wait_for_expression(
+        &mut self,
+        expression: &str,
+        expected: Option<Value>,
+        timeout_ms: Option<u64>,
+        poll_ms: Option<u64>,
+    ) -> Result<Value, TestError> {
+        let mut args = json!({ "condition": "expression", "value": expression });
+        if let Some(e) = expected {
+            args["expected"] = e;
+        }
+        if let Some(t) = timeout_ms {
+            args["timeout_ms"] = json!(t);
+        }
+        if let Some(p) = poll_ms {
+            args["poll_ms"] = json!(p);
+        }
+        self.call_tool("wait_for", args).await
+    }
+
+    /// Block until a named Tauri event fires on the app's event bus.
+    ///
+    /// Edge-triggered completion with a `since_ms` look-back (default 2000) so an
+    /// event that fired between an `invoke_command` and this call is still caught.
+    /// The app must emit the event and Victauri must capture it (custom events
+    /// require `VictauriBuilder::listen_events`).
+    ///
+    /// Returns `{ ok: true, event: { name, payload, timestamp }, elapsed_ms }` on
+    /// success or `{ ok: false, error, hint, elapsed_ms }` on timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn wait_for_event(
+        &mut self,
+        event: &str,
+        since_ms: Option<u64>,
+        timeout_ms: Option<u64>,
+        poll_ms: Option<u64>,
+    ) -> Result<Value, TestError> {
+        let mut args = json!({ "condition": "event", "value": event });
+        if let Some(s) = since_ms {
+            args["since_ms"] = json!(s);
+        }
+        if let Some(t) = timeout_ms {
+            args["timeout_ms"] = json!(t);
+        }
+        if let Some(p) = poll_ms {
+            args["poll_ms"] = json!(p);
+        }
+        self.call_tool("wait_for", args).await
+    }
+
+    /// Read application-defined backend state via a registered probe.
+    ///
+    /// With `probe = None`, returns `{ "probes": [names...] }`. With a probe name,
+    /// returns that probe's JSON snapshot. Probes are registered by the app via
+    /// `VictauriBuilder::probe`.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn app_state(&mut self, probe: Option<&str>) -> Result<Value, TestError> {
+        let args = match probe {
+            Some(name) => json!({ "probe": name }),
+            None => json!({}),
+        };
+        self.call_tool("app_state", args).await
     }
 
     /// Start a time-travel recording session.

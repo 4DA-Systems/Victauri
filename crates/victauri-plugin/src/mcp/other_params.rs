@@ -22,6 +22,23 @@ pub enum WaitCondition {
     IpcIdle,
     /// Wait for all network requests to complete.
     NetworkIdle,
+    /// Poll a JavaScript expression until it is truthy (or equals `expected`).
+    ///
+    /// The expression is evaluated in the webview each poll via the same engine
+    /// as `eval_js`, so it may `await` (e.g.
+    /// `(await window.__TAURI_INTERNALS__.invoke('get_status')).running === false`).
+    /// This is the level-triggered, race-free way to await a fire-and-forget
+    /// backend command that exposes a pollable status — no app changes required.
+    Expression,
+    /// Block until a named Tauri event fires on the app's event bus.
+    ///
+    /// Edge-triggered completion: evaluated server-side against Victauri's
+    /// captured event bus, with a `since_ms` look-back so an event that fired in
+    /// the gap between `invoke_command` and this call is not missed. The app must
+    /// emit the event and Victauri must be configured to capture it via
+    /// `VictauriBuilder::listen_events(&["..."])` (window-lifecycle events are
+    /// captured automatically).
+    Event,
 }
 
 impl WaitCondition {
@@ -36,6 +53,8 @@ impl WaitCondition {
             Self::Url => "url",
             Self::IpcIdle => "ipc_idle",
             Self::NetworkIdle => "network_idle",
+            Self::Expression => "expression",
+            Self::Event => "event",
         }
     }
 }
@@ -83,14 +102,33 @@ pub struct SemanticAssertParams {
 pub struct WaitForParams {
     /// Condition to wait for.
     pub condition: WaitCondition,
-    /// Value for the condition (text to find, CSS selector, URL substring).
+    /// Value for the condition: text to find, CSS selector, URL substring,
+    /// JS expression (for `expression`), or Tauri event name (for `event`).
     pub value: Option<String>,
     /// Maximum time to wait in milliseconds. Default: 10000.
     pub timeout_ms: Option<u64>,
     /// Polling interval in milliseconds. Default: 200.
     pub poll_ms: Option<u64>,
+    /// For the `expression` condition: the JSON value the expression must equal
+    /// to satisfy the wait. When omitted, the wait is satisfied as soon as the
+    /// expression evaluates to a truthy value.
+    #[serde(default)]
+    pub expected: Option<serde_json::Value>,
+    /// For the `event` condition: how far back (in milliseconds) to look for a
+    /// matching event when the wait begins, so an event that fired just before
+    /// this call is not missed. Default: 2000.
+    pub since_ms: Option<u64>,
     /// Target webview label.
     pub webview_label: Option<String>,
+}
+
+// ── App State Probes ─────────────────────────────────────────────────────────
+
+/// Parameters for the `app_state` tool.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AppStateParams {
+    /// Name of the probe to run. When omitted, lists all available probe names.
+    pub probe: Option<String>,
 }
 
 // ── Find Elements ──────────────────────────────────────────────────────────

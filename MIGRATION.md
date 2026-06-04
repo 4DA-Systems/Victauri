@@ -1,5 +1,26 @@
 # Migration Guide
 
+## v0.7.5 → v0.7.6 (async-completion + app-state probes — no breaking changes)
+
+All changes are additive; no action required. To take advantage of the new features:
+
+- **Await fire-and-forget backend work instead of sleeping.** `wait_for` has two new
+  conditions. Use `expression` to poll any JS/status expression until truthy (it may
+  `await`), and `event` to block until a named Tauri event fires. The robust pattern is
+  `invoke_command(...)` then `wait_for(expression|event, ...)`. New client helpers:
+  `wait_for_expression`, `wait_for_event`.
+- **Expose app internals via `app_state` probes (opt-in).** Register probes on the
+  builder — `VictauriBuilder::probe("scoring", || json!({ "pipeline_version": v, "stale": n }))` —
+  then read them with the `app_state` tool (`client.app_state(Some("scoring"))`). The
+  idiomatic pattern is to build your shared state as an `Arc` once and clone it into both
+  Tauri's `.manage()` and the probe closure. To capture custom completion events for the
+  `wait_for` `event` condition, add them to `listen_events(&["analysis-complete"])`.
+- **Better connection failures.** `VictauriClient::discover` and `victauri doctor` now
+  explain *why* a connection failed (app crashed/rebuilding vs. never started vs. release
+  build). No code change needed — the error message is just more actionable.
+- **`query_db` remains read-only by design.** To mutate state for a test, drive the app's
+  own commands via `invoke_command` (which respects app invariants) rather than the DB.
+
 ## v0.7.4 → v0.7.5 (red-team hardening — no breaking changes)
 
 All changes are additive or strictly more permissive; no action required. Two

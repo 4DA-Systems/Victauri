@@ -408,3 +408,81 @@ e2e_test!(verify_builder_comprehensive, |client| async move {
 
     report.assert_all_passed();
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// Async-completion awareness (Victauri 0.7.6) — await fire-and-forget work
+// ────────────────────────────────────────────────────────────────────────────
+
+// `run_pipeline` returns immediately while work runs on a background thread.
+// Await its TRUE completion via the `pipeline-complete` Tauri event — no sleeps.
+e2e_test!(pipeline_completion_via_event, |client| async move {
+    client.invoke_command("run_pipeline", None).await.unwrap();
+
+    let result = client
+        .wait_for_event("pipeline-complete", None, Some(5000), Some(50))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result["ok"],
+        serde_json::json!(true),
+        "event wait should succeed: {result}"
+    );
+    assert!(
+        result["event"]["payload"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("processed"),
+        "completion event payload should carry the processed count: {result}"
+    );
+});
+
+// Await completion the level-triggered way: poll a status command via the
+// `expression` condition until the pipeline reports it is no longer running.
+e2e_test!(pipeline_completion_via_expression, |client| async move {
+    client.invoke_command("run_pipeline", None).await.unwrap();
+
+    let result = client
+        .wait_for_expression(
+            "(await window.__TAURI_INTERNALS__.invoke('pipeline_status')).running === false",
+            None,
+            Some(5000),
+            Some(50),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result["ok"],
+        serde_json::json!(true),
+        "expression wait should resolve once running flips false: {result}"
+    );
+});
+
+// app_state probe reads the pipeline's backend state directly (no IPC round-trip).
+e2e_test!(pipeline_state_via_probe, |client| async move {
+    // The probe is always listable.
+    let probes = client.app_state(None).await.unwrap();
+    assert!(
+        serde_json::to_string(&probes).unwrap().contains("pipeline"),
+        "app_state should list the 'pipeline' probe: {probes}"
+    );
+
+    // Drive the pipeline to completion, then read the probe.
+    client.invoke_command("run_pipeline", None).await.unwrap();
+    client
+        .wait_for_event("pipeline-complete", None, Some(5000), Some(50))
+        .await
+        .unwrap();
+
+    let state = client.app_state(Some("pipeline")).await.unwrap();
+    assert_eq!(
+        state["running"],
+        serde_json::json!(false),
+        "pipeline should be idle after completion: {state}"
+    );
+    assert!(
+        state["processed"].as_u64().unwrap_or(0) >= 50,
+        "pipeline should report processed work: {state}"
+    );
+});

@@ -53,6 +53,7 @@ pub fn test_state() -> Arc<VictauriState> {
         bridge_notify: tokio::sync::Notify::new(),
         db_search_paths: Vec::new(),
         screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
+        probes: victauri_plugin::introspection::AppStateProbes::default(),
     })
 }
 

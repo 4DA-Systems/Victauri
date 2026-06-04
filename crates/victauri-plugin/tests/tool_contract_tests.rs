@@ -144,6 +144,7 @@ fn test_state() -> Arc<VictauriState> {
         bridge_notify: tokio::sync::Notify::new(),
         db_search_paths: Vec::new(),
         screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
+        probes: victauri_plugin::introspection::AppStateProbes::default(),
     })
 }
 
@@ -170,6 +171,7 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
         bridge_notify: tokio::sync::Notify::new(),
         db_search_paths: Vec::new(),
         screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
+        probes: victauri_plugin::introspection::AppStateProbes::default(),
     })
 }
 
@@ -2264,5 +2266,227 @@ async fn navigate_go_to_blocks_javascript_url() {
             || contains_text(&body, "blocked")
             || contains_text(&body, "javascript"),
         "javascript: URL should be blocked: {body}"
+    );
+}
+
+// ── P1: wait_for async-completion (expression + event) ───────────────────────
+
+/// POST args to the sessionless REST endpoint and return the response body.
+async fn rest_call(base: &str, tool: &str, args: serde_json::Value) -> String {
+    reqwest::Client::new()
+        .post(format!("{base}/api/tools/{tool}"))
+        .json(&args)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn wait_for_expression_polls_until_truthy() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let state = test_state();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_probe = Arc::clone(&calls);
+    let base = start_callback_server(state, &["main"], move |script| {
+        if script.contains("__TEST_READY__") {
+            // Not ready for the first two polls, then becomes ready.
+            let n = calls_probe.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                "false".to_string()
+            } else {
+                "true".to_string()
+            }
+        } else {
+            "null".to_string()
+        }
+    })
+    .await;
+    let (client, sid) = mcp_session(&base).await;
+    let body = call_tool(
+        &client,
+        &base,
+        &sid,
+        "wait_for",
+        serde_json::json!({
+            "condition": "expression",
+            "value": "window.__TEST_READY__",
+            "timeout_ms": 5000,
+            "poll_ms": 30
+        }),
+    )
+    .await;
+    assert!(
+        !contains_error(&body),
+        "wait_for expression errored: {body}"
+    );
+    assert!(
+        !contains_text(&body, "timeout after"),
+        "expression should have become truthy before timeout: {body}"
+    );
+    assert!(
+        contains_text(&body, "elapsed_ms"),
+        "result should report elapsed_ms: {body}"
+    );
+    assert!(
+        calls.load(Ordering::SeqCst) >= 3,
+        "should have polled until truthy (>=3 evals), got {}",
+        calls.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn wait_for_expression_matches_expected_value() {
+    let state = test_state();
+    let base = start_callback_server(state, &["main"], |script| {
+        if script.contains("__STATUS__") {
+            "\"done\"".to_string()
+        } else {
+            "null".to_string()
+        }
+    })
+    .await;
+    let (client, sid) = mcp_session(&base).await;
+    let body = call_tool(
+        &client,
+        &base,
+        &sid,
+        "wait_for",
+        serde_json::json!({
+            "condition": "expression",
+            "value": "window.__STATUS__",
+            "expected": "done",
+            "timeout_ms": 2000,
+            "poll_ms": 30
+        }),
+    )
+    .await;
+    assert!(
+        !contains_error(&body),
+        "wait_for expression errored: {body}"
+    );
+    assert!(
+        !contains_text(&body, "timeout after"),
+        "expression should equal expected before timeout: {body}"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_expression_requires_value() {
+    let state = test_state();
+    let base = start_callback_server(state, &["main"], |_| "null".to_string()).await;
+    let (client, sid) = mcp_session(&base).await;
+    let body = call_tool(
+        &client,
+        &base,
+        &sid,
+        "wait_for",
+        serde_json::json!({"condition": "expression", "timeout_ms": 500}),
+    )
+    .await;
+    assert!(
+        contains_error(&body) && contains_text(&body, "value"),
+        "missing expression value should error: {body}"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_event_matches_recent_event() {
+    let state = test_state();
+    // A valid, far-future timestamp is unconditionally within the look-back window.
+    state
+        .event_bus
+        .push(victauri_plugin::introspection::CapturedTauriEvent {
+            name: "analysis-complete".to_string(),
+            payload: r#"{"scored":437}"#.to_string(),
+            timestamp: "2099-01-01T00:00:00Z".to_string(),
+        });
+    let base = start_test_server(state, &["main"]).await;
+    let body = rest_call(
+        &base,
+        "wait_for",
+        serde_json::json!({
+            "condition": "event",
+            "value": "analysis-complete",
+            "timeout_ms": 2000,
+            "poll_ms": 30
+        }),
+    )
+    .await;
+    assert!(
+        body.contains("analysis-complete") && body.contains("437"),
+        "event wait should return the matched event + payload: {body}"
+    );
+}
+
+#[tokio::test]
+async fn wait_for_event_outside_lookback_times_out() {
+    let state = test_state();
+    // An old event predates the default 2s look-back, so it must NOT satisfy the wait.
+    state
+        .event_bus
+        .push(victauri_plugin::introspection::CapturedTauriEvent {
+            name: "analysis-complete".to_string(),
+            payload: "{}".to_string(),
+            timestamp: "2000-01-01T00:00:00Z".to_string(),
+        });
+    let base = start_test_server(state, &["main"]).await;
+    let body = rest_call(
+        &base,
+        "wait_for",
+        serde_json::json!({
+            "condition": "event",
+            "value": "analysis-complete",
+            "timeout_ms": 300,
+            "poll_ms": 30
+        }),
+    )
+    .await;
+    assert!(
+        body.contains("timeout after") && body.contains("listen_events"),
+        "stale event should time out with an actionable hint: {body}"
+    );
+}
+
+// ── P2: app_state probes ─────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn app_state_lists_and_runs_probes() {
+    let state = test_state();
+    state.probes.register(
+        "scoring",
+        std::sync::Arc::new(|| serde_json::json!({ "pipeline_version": 5, "stale_items": 0 })),
+    );
+    let base = start_test_server(state, &["main"]).await;
+
+    let list = rest_call(&base, "app_state", serde_json::json!({})).await;
+    assert!(
+        list.contains("scoring"),
+        "should list the probe name: {list}"
+    );
+
+    let run = rest_call(&base, "app_state", serde_json::json!({"probe": "scoring"})).await;
+    assert!(
+        run.contains("pipeline_version") && run.contains('5'),
+        "should run the probe and return its snapshot: {run}"
+    );
+
+    let unknown = rest_call(&base, "app_state", serde_json::json!({"probe": "nope"})).await;
+    assert!(
+        unknown.contains("unknown probe"),
+        "unknown probe should return an actionable error: {unknown}"
+    );
+}
+
+#[tokio::test]
+async fn app_state_lists_empty_when_no_probes() {
+    let state = test_state();
+    let base = start_test_server(state, &["main"]).await;
+    let list = rest_call(&base, "app_state", serde_json::json!({})).await;
+    assert!(
+        list.contains("probes"),
+        "app_state with no probes should still return a probes list: {list}"
     );
 }

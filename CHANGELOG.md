@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-06-05
+
+Driven by an in-the-wild session that used Victauri to debug a real app's scoring
+pipeline (fire-and-forget background work over a large live backlog). The job
+succeeded, and the honest teardown named the friction. This release closes the
+real, generic gaps it surfaced. All additive — `^0.7`-compatible.
+
+### Added — async-completion awareness (the #1 friction)
+
+Fire-and-forget Tauri commands return instantly while work runs on a background
+task, leaving an agent to hand-poll or guess with sleeps. `wait_for` gains two
+conditions to await **true** completion:
+
+- **`expression`** — polls a JS expression every interval until it is truthy (or
+  equals `expected`). It may `await`, so you can await a status command directly:
+  `wait_for { condition: "expression", value: "(await window.__TAURI_INTERNALS__.invoke('get_status')).running === false" }`.
+  Level-triggered and race-free; **no app changes required**. Evaluated server-side
+  via the same engine as `eval_js` (CSP-safe).
+- **`event`** — blocks until a named Tauri event fires, evaluated server-side
+  against the captured event bus with a `since_ms` look-back (default 2000) so an
+  event emitted in the gap after `invoke_command` is not missed. Custom events must
+  be captured via `VictauriBuilder::listen_events(&["…"])`.
+
+New `VictauriClient` helpers: `wait_for_expression`, `wait_for_event`.
+
+### Added — `app_state` tool + state probes (first-class app internals)
+
+Reading domain state (a pipeline's version, a queue's depth, cache stats) used to
+mean `query_db` + grepping logs. Apps can now register probes —
+`VictauriBuilder::probe("name", || json!({ … }))` — and agents read them through the
+new **`app_state`** tool (no args lists probe names; `{ probe: "name" }` returns its
+JSON snapshot). Probes run in the Rust process with **no IPC round-trip and no
+frontend involvement** — the direct-backend introspection a browser-external tool
+cannot do. New `VictauriClient::app_state`. (**25 standalone/compound tools** now.)
+
+### Added — actionable connection diagnostics
+
+A failed connection used to surface as a bare "connection refused", indistinguishable
+from a crash, a never-started app, or a backend mid-rebuild. `VictauriClient::discover`
+now classifies the discovery directory **before** stale-entry cleanup and attaches a
+diagnosis: *stale process* (app exited — crashed/closed/rebuilding; check your build
+terminal), or *none* (app not running, or a release build where Victauri is
+debug-gated). `victauri doctor` surfaces the same diagnosis instead of a flat "[SKIP]".
+
+### Added — demo-app `run_pipeline` / `pipeline_status` + `pipeline` probe
+
+The demo app now mirrors the real fire-and-forget scenario: `run_pipeline` returns
+immediately and emits `pipeline-complete` when its background thread finishes;
+`pipeline_status` exposes a pollable status; a `pipeline` state probe reports
+`{ pipeline_version, processed, running }`. End-to-end tests await completion via
+both the event and the expression path and read state via `app_state`.
+
+### Changed — agent guidance (`victauri init` CLAUDE.md)
+
+The generated agent block now teaches awaiting async backend work with
+`wait_for` (`expression`/`event`) instead of sleeps, reading app internals via
+`app_state` probes, driving specific code paths through `invoke_command`, and that
+`query_db` is read-only by design (mutate via the app's own commands).
+
 ## [0.7.5] - 2026-06-02
 
 Two adversarial red-team passes (cross-model) before release. The first pass found

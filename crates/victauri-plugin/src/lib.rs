@@ -170,6 +170,9 @@ pub struct VictauriState {
     /// `query_db` paths are permitted only when they resolve within one of these
     /// roots (or an app directory).
     pub db_search_paths: Vec<std::path::PathBuf>,
+    /// Application-defined state probes surfaced via the `app_state` tool.
+    /// Registered through [`VictauriBuilder::probe`].
+    pub probes: introspection::AppStateProbes,
 }
 
 /// Builder for configuring the Victauri plugin before adding it to a Tauri app.
@@ -205,6 +208,7 @@ pub struct VictauriBuilder {
     allow_file_navigation: bool,
     listen_events: Vec<String>,
     db_search_paths: Vec<std::path::PathBuf>,
+    probes: Vec<(String, std::sync::Arc<introspection::ProbeFn>)>,
 }
 
 impl Default for VictauriBuilder {
@@ -231,6 +235,7 @@ impl Default for VictauriBuilder {
             allow_file_navigation: false,
             listen_events: Vec::new(),
             db_search_paths: Vec::new(),
+            probes: Vec::new(),
         }
     }
 }
@@ -541,6 +546,38 @@ impl VictauriBuilder {
         self
     }
 
+    /// Register an application state probe surfaced through the `app_state` tool.
+    ///
+    /// A probe is a named closure returning a JSON snapshot of domain-specific
+    /// backend state. It gives an agent first-class, discoverable access to state
+    /// that would otherwise only be reachable by `query_db` + grepping logs —
+    /// e.g. a scoring pipeline's version and queue depth, a cache's hit rate, or
+    /// a scheduler's next-run time. The closure runs in the Rust process with no
+    /// IPC round-trip, so it can read backend state the frontend never sees.
+    ///
+    /// The idiomatic pattern is to build your shared state as an `Arc` first, then
+    /// clone it into both Tauri's `.manage()` and the probe:
+    ///
+    /// ```no_run
+    /// # use std::sync::Arc;
+    /// # use serde_json::json;
+    /// # struct Scoring; impl Scoring { fn version(&self) -> u32 { 5 } fn stale(&self) -> u64 { 0 } }
+    /// let scoring = Arc::new(Scoring);
+    /// let probe_state = Arc::clone(&scoring);
+    /// let builder = victauri_plugin::VictauriBuilder::new().probe("scoring", move || {
+    ///     json!({ "pipeline_version": probe_state.version(), "stale_items": probe_state.stale() })
+    /// });
+    /// # let _ = builder;
+    /// ```
+    #[must_use]
+    pub fn probe<F>(mut self, name: impl Into<String>, probe: F) -> Self
+    where
+        F: Fn() -> serde_json::Value + Send + Sync + 'static,
+    {
+        self.probes.push((name.into(), std::sync::Arc::new(probe)));
+        self
+    }
+
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
     #[must_use]
@@ -673,6 +710,7 @@ impl VictauriBuilder {
             let on_ready = self.on_ready;
             let commands = self.commands;
             let listen_events = self.listen_events;
+            let probes = self.probes;
             let js_init = js_bridge::init_script(&self.bridge_capacities);
 
             Ok(Builder::new("victauri")
@@ -706,8 +744,13 @@ impl VictauriBuilder {
                         bridge_notify: tokio::sync::Notify::new(),
                         screencast: Arc::new(screencast::Screencast::default()),
                         db_search_paths,
+                        probes: introspection::AppStateProbes::default(),
                     });
                     state.startup_timeline.mark("state_created");
+
+                    for (name, probe) in probes {
+                        state.probes.register(name, probe);
+                    }
 
                     app.manage(state.clone());
 

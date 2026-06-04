@@ -35,16 +35,16 @@ use crate::VictauriState;
 use crate::bridge::WebviewBridge;
 
 use helpers::{
-    RecoveryHint, js_string, json_result, missing_param, sanitize_css_color, sanitize_injected_css,
-    tool_disabled, tool_error, tool_error_with_hint, validate_url,
+    RecoveryHint, js_string, json_result, json_truthy, missing_param, sanitize_css_color,
+    sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint, validate_url,
 };
 
 pub use backend_params::*;
 pub use compound_params::*;
 pub use introspection_params::*;
 pub use other_params::{
-    DiagnosticsParams, FindElementsParams, ResolveCommandParams, SemanticAssertParams,
-    WaitCondition, WaitForParams,
+    AppStateParams, DiagnosticsParams, FindElementsParams, ResolveCommandParams,
+    SemanticAssertParams, WaitCondition, WaitForParams,
 };
 pub use server::*;
 pub use verification_params::*;
@@ -586,7 +586,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Wait for a condition to be met. Polls at regular intervals until satisfied or timeout. Conditions: text (text appears), text_gone (text disappears), selector (CSS selector matches), selector_gone, url (URL contains value), ipc_idle (no pending IPC calls), network_idle (no pending network requests).",
+        description = "Wait for a condition to be met. Polls at regular intervals until satisfied or timeout. Conditions: text (text appears), text_gone (text disappears), selector (CSS selector matches), selector_gone, url (URL contains value), ipc_idle (no pending IPC calls), network_idle (no pending network requests), expression (poll a JS expression in `value` until truthy or until it equals `expected` — may `await`, e.g. await a fire-and-forget command's status), event (block until the Tauri event named in `value` fires, with `since_ms` look-back). Use expression/event to await async backend work to true completion instead of guessing with a fixed sleep.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -595,12 +595,26 @@ impl VictauriMcpHandler {
         )
     )]
     async fn wait_for(&self, Parameters(params): Parameters<WaitForParams>) -> CallToolResult {
+        let timeout_ms = params.timeout_ms.unwrap_or(10_000).min(120_000);
+        let poll = params.poll_ms.unwrap_or(200).max(20);
+
+        // The `expression` and `event` conditions are awaited server-side (they
+        // poll the eval engine and the captured event bus respectively), so a
+        // fire-and-forget backend command can be awaited to true completion.
+        match params.condition {
+            WaitCondition::Expression => {
+                return self.wait_for_expression(&params, timeout_ms, poll).await;
+            }
+            WaitCondition::Event => {
+                return self.wait_for_event(&params, timeout_ms, poll).await;
+            }
+            _ => {}
+        }
+
         let value = params
             .value
             .as_ref()
             .map_or_else(|| "null".to_string(), |v| js_string(v));
-        let timeout_ms = params.timeout_ms.unwrap_or(10_000).min(60_000);
-        let poll = params.poll_ms.unwrap_or(200);
         let code = format!(
             "return window.__VICTAURI__?.waitFor({{ condition: {}, value: {value}, timeout_ms: {timeout_ms}, poll_ms: {poll} }})",
             js_string(params.condition.as_str())
@@ -612,6 +626,128 @@ impl VictauriMcpHandler {
         {
             Ok(result) => CallToolResult::success(vec![Content::text(result)]),
             Err(e) => tool_error(e),
+        }
+    }
+
+    /// Poll a JS expression until truthy (or `== expected`), server-side.
+    ///
+    /// Level-triggered and race-free: each poll re-evaluates the expression via
+    /// the same engine as `eval_js`, so it may `await`. Eval errors are treated
+    /// as "not yet met" (the target may not exist during startup) and the last
+    /// error is surfaced on timeout.
+    async fn wait_for_expression(
+        &self,
+        params: &WaitForParams,
+        timeout_ms: u64,
+        poll_ms: u64,
+    ) -> CallToolResult {
+        if !self.state.privacy.is_tool_enabled("eval_js") {
+            return tool_disabled("wait_for(expression) requires eval_js capability");
+        }
+        let Some(expr) = params.value.as_deref().filter(|s| !s.is_empty()) else {
+            return missing_param("value", "wait_for(expression)");
+        };
+        let code = format!("return ({expr});");
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_millis(timeout_ms);
+        let poll = std::time::Duration::from_millis(poll_ms);
+        let mut last_value = serde_json::Value::Null;
+        let mut last_error: Option<String> = None;
+
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let per_eval = remaining
+                .min(std::time::Duration::from_secs(15))
+                .max(std::time::Duration::from_secs(1));
+            match self
+                .eval_with_return_timeout(&code, params.webview_label.as_deref(), per_eval)
+                .await
+            {
+                Ok(raw) => {
+                    let val = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
+                    let met = match &params.expected {
+                        Some(expected) => &val == expected,
+                        None => json_truthy(&val),
+                    };
+                    if met {
+                        return json_result(&serde_json::json!({
+                            "ok": true,
+                            "value": val,
+                            "elapsed_ms": start.elapsed().as_millis() as u64,
+                        }));
+                    }
+                    last_value = val;
+                }
+                Err(e) => last_error = Some(e),
+            }
+
+            if std::time::Instant::now() >= deadline {
+                return json_result(&serde_json::json!({
+                    "ok": false,
+                    "error": format!("timeout after {timeout_ms}ms"),
+                    "last_value": last_value,
+                    "last_error": last_error,
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                }));
+            }
+            tokio::time::sleep(
+                poll.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            )
+            .await;
+        }
+    }
+
+    /// Block until a named Tauri event appears on the captured event bus.
+    ///
+    /// Edge-triggered: matches the most recent event whose timestamp is no older
+    /// than `since_ms` before this call began, so an event fired in the gap
+    /// between `invoke_command` and this call is still caught. Polls the
+    /// event-bus ring buffer — no webview eval involved.
+    async fn wait_for_event(
+        &self,
+        params: &WaitForParams,
+        timeout_ms: u64,
+        poll_ms: u64,
+    ) -> CallToolResult {
+        let Some(name) = params.value.as_deref().filter(|s| !s.is_empty()) else {
+            return missing_param("value", "wait_for(event)");
+        };
+        let since_ms = params.since_ms.unwrap_or(2000);
+        let start = std::time::Instant::now();
+        let baseline = chrono::Utc::now()
+            - chrono::TimeDelta::try_milliseconds(since_ms as i64).unwrap_or_default();
+        let deadline = start + std::time::Duration::from_millis(timeout_ms);
+        let poll = std::time::Duration::from_millis(poll_ms);
+
+        loop {
+            // Search newest-first for a matching event no older than the baseline.
+            let matched = self.state.event_bus.events().into_iter().rev().find(|e| {
+                e.name == name
+                    && chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                        .map_or(true, |ts| ts.with_timezone(&chrono::Utc) >= baseline)
+            });
+            if let Some(ev) = matched {
+                return json_result(&serde_json::json!({
+                    "ok": true,
+                    "event": {
+                        "name": ev.name,
+                        "payload": ev.payload,
+                        "timestamp": ev.timestamp,
+                    },
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                return json_result(&serde_json::json!({
+                    "ok": false,
+                    "error": format!("timeout after {timeout_ms}ms waiting for event '{name}'"),
+                    "hint": "Ensure the app emits this Tauri event and Victauri captures it: \
+                             custom events need VictauriBuilder::listen_events(&[\"…\"]); \
+                             window-lifecycle events are captured automatically.",
+                    "elapsed_ms": start.elapsed().as_millis() as u64,
+                }));
+            }
+            tokio::time::sleep(poll).await;
         }
     }
 
@@ -691,6 +827,38 @@ impl VictauriMcpHandler {
             None => self.state.registry.list(),
         };
         json_result(&commands)
+    }
+
+    #[tool(
+        description = "Read application-defined backend state via a registered probe. With no `probe`, lists available probe names. With a `probe` name, runs it and returns its JSON snapshot. Probes give first-class, discoverable access to domain state (e.g. a scoring pipeline's version + stale-item count, a queue's depth, cache stats) that would otherwise need query_db + log-grepping. Probes run in the Rust process with no IPC round-trip. Apps register them via VictauriBuilder::probe(name, closure).",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn app_state(&self, Parameters(params): Parameters<AppStateParams>) -> CallToolResult {
+        self.track_tool_call();
+        let Some(name) = params.probe else {
+            return json_result(&serde_json::json!({ "probes": self.state.probes.names() }));
+        };
+        if let Some(value) = self.state.probes.run(&name) {
+            json_result(&value)
+        } else {
+            let available = self.state.probes.names();
+            tool_error_with_hint(
+                format!(
+                    "unknown probe '{name}'. Available probes: {}",
+                    if available.is_empty() {
+                        "(none registered — add VictauriBuilder::probe(\"name\", ...))".to_string()
+                    } else {
+                        available.join(", ")
+                    }
+                ),
+                RecoveryHint::CheckInput,
+            )
+        }
     }
 
     #[tool(
@@ -3396,6 +3564,10 @@ impl VictauriMcpHandler {
                 let p: RegistryParams = Self::parse_args(args)?;
                 self.get_registry(Parameters(p)).await
             }
+            "app_state" => {
+                let p: AppStateParams = Self::parse_args(args)?;
+                self.app_state(Parameters(p)).await
+            }
             "get_memory_stats" => self.get_memory_stats().await,
             "get_plugin_info" => self.get_plugin_info().await,
             "get_diagnostics" => {
@@ -4100,7 +4272,9 @@ activity across IPC + DOM + console + network + window events into a coherent na
 set_dialog_response, get_dialog_log), 'recording' (start, stop, checkpoint, list_checkpoints, \
 get_events, events_between, get_replay, export, import, replay), \
 'logs' (console, network, ipc, navigation, dialogs, events, slow_ipc). \
-\n\nOTHER: verify_state, wait_for, assert_semantic, resolve_command, \
+\n\nOTHER: verify_state, wait_for (incl. 'expression'/'event' conditions to await \
+async backend work to true completion), assert_semantic, resolve_command, \
+app_state (app-defined backend state probes), \
 get_memory_stats, get_plugin_info, get_diagnostics.";
 
 impl ServerHandler for VictauriMcpHandler {

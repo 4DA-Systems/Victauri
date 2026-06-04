@@ -644,84 +644,93 @@ async fn cmd_doctor() -> Result<()> {
     // Check 9: Server connectivity
     eprintln!();
     eprintln!("  Checking server connectivity...");
-    if let Ok(mut client) = victauri_test::VictauriClient::discover().await {
-        eprintln!("  [PASS] Connected to Victauri server");
-        pass_count += 1;
-
-        // Check 10: Plugin info
-        if let Ok(info) = client.get_plugin_info().await {
-            let version = info
-                .get("version")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            eprintln!("  [PASS] Plugin responding (v{version})");
+    match victauri_test::VictauriClient::discover().await {
+        Ok(mut client) => {
+            eprintln!("  [PASS] Connected to Victauri server");
             pass_count += 1;
-        } else {
-            eprintln!("  [FAIL] Plugin info unavailable");
-            fail_count += 1;
-        }
 
-        // Check 11: JS bridge
-        if let Ok(val) = client.eval_js("typeof window.__VICTAURI__").await {
-            let bridge_type = val.as_str().unwrap_or("undefined");
-            if bridge_type == "object" {
-                eprintln!("  [PASS] JS bridge loaded and responding");
+            // Check 10: Plugin info
+            if let Ok(info) = client.get_plugin_info().await {
+                let version = info
+                    .get("version")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown");
+                eprintln!("  [PASS] Plugin responding (v{version})");
                 pass_count += 1;
-
-                if let Ok(ver) = client.eval_js("window.__VICTAURI__.version").await {
-                    let ver_str = ver.as_str().unwrap_or("unknown");
-                    eprintln!("         Bridge version: {ver_str}");
-                }
             } else {
-                eprintln!("  [FAIL] JS bridge not loaded (typeof = {bridge_type})");
-                eprintln!("         Check that your webview is rendering and CSP allows scripts");
+                eprintln!("  [FAIL] Plugin info unavailable");
                 fail_count += 1;
             }
-        } else {
-            eprintln!("  [FAIL] JS eval failed");
-            eprintln!("         The webview may not be ready or CSP may block eval");
-            fail_count += 1;
-        }
 
-        // Check 12: DOM snapshot
-        if let Ok(snap) = client.dom_snapshot().await {
-            let element_count = snap
-                .get("element_count")
-                .and_then(serde_json::Value::as_u64)
-                .or_else(|| {
-                    snap.get("tree")
-                        .and_then(|t| t.get("children"))
-                        .and_then(|c| c.as_array())
-                        .map(|a| a.len() as u64)
-                })
-                .unwrap_or(0);
-            eprintln!("  [PASS] DOM snapshot works ({element_count} elements)");
-            pass_count += 1;
-        } else {
-            eprintln!("  [FAIL] DOM snapshot failed");
-            fail_count += 1;
-        }
+            // Check 11: JS bridge
+            if let Ok(val) = client.eval_js("typeof window.__VICTAURI__").await {
+                let bridge_type = val.as_str().unwrap_or("undefined");
+                if bridge_type == "object" {
+                    eprintln!("  [PASS] JS bridge loaded and responding");
+                    pass_count += 1;
 
-        // Check 13: IPC integrity
-        if let Ok(report) = client.check_ipc_integrity().await {
-            let healthy = report
-                .get("healthy")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            if healthy {
-                eprintln!("  [PASS] IPC integrity healthy");
+                    if let Ok(ver) = client.eval_js("window.__VICTAURI__.version").await {
+                        let ver_str = ver.as_str().unwrap_or("unknown");
+                        eprintln!("         Bridge version: {ver_str}");
+                    }
+                } else {
+                    eprintln!("  [FAIL] JS bridge not loaded (typeof = {bridge_type})");
+                    eprintln!(
+                        "         Check that your webview is rendering and CSP allows scripts"
+                    );
+                    fail_count += 1;
+                }
+            } else {
+                eprintln!("  [FAIL] JS eval failed");
+                eprintln!("         The webview may not be ready or CSP may block eval");
+                fail_count += 1;
+            }
+
+            // Check 12: DOM snapshot
+            if let Ok(snap) = client.dom_snapshot().await {
+                let element_count = snap
+                    .get("element_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .or_else(|| {
+                        snap.get("tree")
+                            .and_then(|t| t.get("children"))
+                            .and_then(|c| c.as_array())
+                            .map(|a| a.len() as u64)
+                    })
+                    .unwrap_or(0);
+                eprintln!("  [PASS] DOM snapshot works ({element_count} elements)");
                 pass_count += 1;
             } else {
-                eprintln!("  [WARN] IPC integrity degraded");
-                warn_count += 1;
+                eprintln!("  [FAIL] DOM snapshot failed");
+                fail_count += 1;
             }
-        } else {
-            eprintln!("  [FAIL] IPC integrity check failed");
-            fail_count += 1;
+
+            // Check 13: IPC integrity
+            if let Ok(report) = client.check_ipc_integrity().await {
+                let healthy = report
+                    .get("healthy")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if healthy {
+                    eprintln!("  [PASS] IPC integrity healthy");
+                    pass_count += 1;
+                } else {
+                    eprintln!("  [WARN] IPC integrity degraded");
+                    warn_count += 1;
+                }
+            } else {
+                eprintln!("  [FAIL] IPC integrity check failed");
+                fail_count += 1;
+            }
         }
-    } else {
-        eprintln!("  [SKIP] Server not running — skipping runtime checks");
-        eprintln!("         Start your app to test the full chain: pnpm tauri dev");
+        Err(err) => {
+            // discover() enriches the connection error with a discovery diagnosis
+            // (stale/dead process vs. never-started) — surface it verbatim so the
+            // user knows whether to relaunch, check a crashed process, or wait for
+            // a rebuild, instead of a bare "server not running".
+            eprintln!("  [SKIP] Server not running — skipping runtime checks");
+            eprintln!("         {err}");
+        }
     }
 
     eprintln!();
@@ -1244,6 +1253,40 @@ then fails with `422`/`404`. The bridge avoids that by design.
   session automatically — just retry. If the MCP path is genuinely wedged, the **sessionless
   REST API is the fallback, NOT CDP**: `POST http://127.0.0.1:<port>/api/tools/<tool>` with
   the Bearer token from `<temp>/victauri/<pid>/token` (same capabilities, no session).
+
+### Awaiting async backend work (don't guess with sleeps)
+
+Many Tauri commands are **fire-and-forget**: they spawn background work and return
+immediately (often `null`) while the real work runs. Don't poll by hand or sprinkle fixed
+`sleep`s — use `wait_for` to await true completion:
+
+- **Pollable status (no app changes):** `wait_for` with `condition: "expression"` evaluates a
+  JS expression every poll until it is truthy (or equals `expected`). It may `await`, so you
+  can await a status command directly:
+  `wait_for { condition: "expression", value: "(await window.__TAURI_INTERNALS__.invoke('get_status')).running === false" }`.
+  Level-triggered and race-free.
+- **Completion event:** `wait_for` with `condition: "event"` blocks until a named Tauri event
+  fires, with a `since_ms` look-back so an event emitted in the gap after your `invoke_command`
+  is still caught: `wait_for { condition: "event", value: "analysis-complete" }`. (Custom events
+  must be registered via `VictauriBuilder::listen_events(&["…"])`.)
+
+The robust pattern is `invoke_command(...)` then `wait_for(expression|event, ...)` — never a bare sleep.
+
+### Reading app-specific backend state
+
+If the app registers state probes (`VictauriBuilder::probe("name", || json!({...}))`), call
+`app_state` to read domain state directly from the Rust process — no IPC round-trip, no log
+grepping. `app_state` with no args lists probe names; `app_state { probe: "name" }` returns its
+snapshot. Use this for pipeline/queue/cache internals (version, depth, stats) instead of
+reverse-engineering them from `query_db` + logs.
+
+### Driving specific code paths & mutating test state
+
+- To exercise a specific backend code path, call the relevant command via `invoke_command`
+  (with args). If the path you need isn't reachable from any command, that's an app gap — add a
+  small debug command and drive it.
+- `query_db` is intentionally **read-only**. To mutate state for a test, go through the app's
+  own commands with `invoke_command` (which respects app invariants) rather than writing the DB.
 
 Prefer Victauri over Playwright or CDP for any Tauri-app task it handles; fall back to
 Playwright only for browser-only work unrelated to this app.

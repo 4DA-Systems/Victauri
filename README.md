@@ -235,7 +235,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 
 ## MCP Tools
 
-34 tools across the full stack — backend, IPC, webview, and introspection:
+35 tools across the full stack — backend, IPC, webview, and introspection:
 
 ### Backend tools (direct Rust access, no webview needed)
 
@@ -246,6 +246,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | `read_app_file` | Read files from app backend directories (UTF-8 or base64) |
 | `query_db` | Read-only SQLite queries with auto-discovery |
 | `invoke_command` | Call any Tauri command directly through IPC |
+| `app_state` | Read app-defined backend-state probes (pipeline/queue/cache internals) — no IPC round-trip |
 | `get_memory_stats` | Real-time OS process memory (working set, page faults) |
 
 ### IPC tools
@@ -266,7 +267,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | `dom_snapshot` | Full accessibility tree with ref handles |
 | `find_elements` | Search by text, role, test ID, CSS, label, placeholder, alt, title |
 | `screenshot` | Platform-native window capture (no Chromium) |
-| `wait_for` | Poll for conditions: text, selector, IPC settle |
+| `wait_for` | Poll for conditions: text, selector, IPC settle, JS `expression`, or Tauri `event` — await async backend work without sleeps |
 | `assert_semantic` | Evaluate JS + assert against expected value |
 
 ### Compound tools (multiple actions per tool)
@@ -437,7 +438,7 @@ victauri init    # generates .github/workflows/victauri.yml
 
 - [**Getting Started**](docs/src/getting-started.md) — Setup, capabilities, first connection
 - [**Testing Guide**](docs/src/testing.md) — Locator API, IPC verification, visual regression, CI integration
-- [**Tools Reference**](docs/src/tools-reference.md) — All 34 tools with parameters and examples
+- [**Tools Reference**](docs/src/tools-reference.md) — All 35 tools with parameters and examples
 - [**Architecture**](docs/src/architecture.md) — Embedded design, JS bridge, dual protocol
 - [**Configuration**](docs/src/configuration.md) — Port, auth, privacy, capacity tuning
 - [**Security**](docs/src/security.md) — Threat model, privacy profiles, redaction
