@@ -15,6 +15,11 @@ set -uo pipefail
 BASE="${1:-http://127.0.0.1:7373}"
 T="$BASE/api/tools"
 
+# Auth is on by default; the harness exports the discovered Bearer token. Without
+# it, every /api/tools call 401s (only the unauthenticated /health passes).
+AUTH=()
+[ -n "${VICTAURI_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer ${VICTAURI_TOKEN}")
+
 passed=0
 failed=0
 
@@ -23,7 +28,7 @@ failed=0
 check() {
   local name="$1" tool="$2" body="$3" pat="$4"
   local resp
-  resp=$(curl -sf -X POST "$T/$tool" -H 'content-type: application/json' --data-binary "$body" 2>/dev/null || true)
+  resp=$(curl -sf -X POST "$T/$tool" -H 'content-type: application/json' "${AUTH[@]}" --data-binary "$body" 2>/dev/null || true)
   if printf '%s' "$resp" | grep -qE "$pat"; then
     echo "  PASS  $name"
     passed=$((passed + 1))

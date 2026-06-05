@@ -133,10 +133,19 @@ done
 [ -n "$BASE" ] || { tail -40 "$work/app.log"; die "MCP server never became reachable on 127.0.0.1:7373-7383"; }
 echo "server reachable at $BASE"
 
+# Auth is ON by default — read the auto-generated Bearer token the plugin wrote to
+# its discovery dir (`<temp>/victauri/<pid>/token`), exactly like a real client, so
+# the smoke battery can authenticate. Only one app runs at a time, so the newest
+# token file is ours. Without this every /api/tools call 401s and nothing passes.
+VICTAURI_TOKEN="$(cat "$(ls -t "${TMPDIR:-/tmp}"/victauri/*/token /tmp/victauri/*/token 2>/dev/null | head -1)" 2>/dev/null || true)"
+export VICTAURI_TOKEN
+if [ -n "$VICTAURI_TOKEN" ]; then echo "discovered auth token (${#VICTAURI_TOKEN} chars)"; else echo "WARNING: no auth token found — tool calls may 401"; fi
+
 # Wait for the webview to be eval-able (cold WebView/WebKit init can lag the server).
 for _ in $(seq 1 45); do
   curl -sf -X POST "$BASE/api/tools/eval_js" \
-    -H 'content-type: application/json' --data-binary '{"code":"return 1"}' 2>/dev/null | grep -q '"result"' && break
+    -H 'content-type: application/json' -H "Authorization: Bearer $VICTAURI_TOKEN" \
+    --data-binary '{"code":"return 1"}' 2>/dev/null | grep -q '"result"' && break
   sleep 2
 done
 
