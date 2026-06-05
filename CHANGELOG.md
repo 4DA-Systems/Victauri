@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-06-06
+
+A build-correctness release: `victauri-plugin` now compiles in configurations our
+CI never exercised (it only ever built default-features + debug). The 0.7.7 compat
+retest — which builds the plugin as a `default-features = false` path dep — surfaced
+the whole class.
+
+### Fixed
+
+- **`victauri-plugin` failed to compile with `default-features = false`.**
+  `query_db`'s `#[cfg(feature = "sqlite")]` gating broke the rmcp `#[tool_router]`
+  macro (cfg isn't evaluated at macro-expansion time), so the crate failed with two
+  `E0599`s. `query_db` is now always registered as a tool; the SQLite implementation
+  moved to a `sqlite`-gated `query_db_impl`, and without the feature the tool returns
+  a clear "compiled without the sqlite feature" error. Consumers that drop the heavy
+  rusqlite C dependency via `default-features = false` can now build.
+- **`cargo test --release` failed to compile** — a unit test referenced a
+  `#[cfg(debug_assertions)]` helper; the test is now gated the same way.
+- **`RUSTFLAGS=-Dwarnings cargo build --release` failed** on unused imports/constants
+  — they're used only by the debug-gated MCP server (`init()` is a zero-cost no-op in
+  release), so the release path now allows that intentionally-dead code.
+
+### Changed (CI / internal)
+
+- CI now builds the configurations consumers actually hit so this class can't regress:
+  `clippy --no-default-features` and `clippy --release` (both `--all-targets`,
+  `-D warnings`).
+- The compatibility retest harness now authenticates (sends the Bearer token), so its
+  smoke battery actually runs — it scored Kanri 15/15 against 0.7.7. (Harness only;
+  not part of the published crates.)
+
+_(No API or behavior changes for consumers on the default configuration. npm
+`@4da/victauri-browser` and the VS Code extension are unchanged — crates-only.)_
+
 ## [0.7.7] - 2026-06-05
 
 A focused single-fix release closing the one residual from 0.7.6.

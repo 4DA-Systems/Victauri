@@ -1,5 +1,14 @@
 # Migration Guide
 
+## v0.7.7 → v0.7.8 (build fix — no action required)
+
+Crates-only patch. `victauri-plugin` now compiles with `default-features = false`
+(drops the rusqlite C dependency; `query_db` then returns a clear "sqlite feature
+disabled" error instead of failing to build), and in the `release` profile under
+`-Dwarnings`. No API or behavior changes on the default configuration; npm and the
+VS Code extension are unchanged. Upgrade if you build victauri-plugin with
+`default-features = false` or in release with warnings-as-errors.
+
 ## v0.7.6 → v0.7.7 (bug fix — no action required)
 
 Crates-only patch. `victauri test`'s smoke suite no longer fails on headless CI (the screenshot
