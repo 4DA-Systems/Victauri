@@ -50,13 +50,18 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # The workspace always builds WITH default features, so a consumer that does
-      # `default-features = false` (e.g. to drop the rusqlite C dependency — what the
-      # compat harness does) exercises a path our normal build never hits. Guard it so
-      # victauri-plugin stays compilable without its default features.
-      - name: Clippy (victauri-plugin, no default features)
+      # Our normal build only ever exercises ONE configuration (default features,
+      # debug). These guards cover the build configs real consumers hit that we
+      # otherwise never compile — each has shipped a bug we missed:
+      #   * default-features = false  → query_db broke the rmcp tool_router macro
+      #   * release profile           → debug-only tests/imports failed -Dwarnings
+      - name: Clippy (no default features — incl. tests)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo clippy -p victauri-plugin --no-default-features -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
+
+      - name: Clippy (release profile — incl. tests)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy --workspace --all-targets --release -- -D warnings
 
       - name: Check formatting
         if: matrix.os == 'ubuntu-latest'

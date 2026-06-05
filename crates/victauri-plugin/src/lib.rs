@@ -1,4 +1,9 @@
 #![deny(missing_docs)]
+// In RELEASE builds the entire MCP server is gated out via `#[cfg(debug_assertions)]`
+// (`init()` is a zero-cost no-op), so the imports/constants/helpers it uses are
+// intentionally dead. Don't fail a `-Dwarnings` release build on that expected
+// dead code — without this, `RUSTFLAGS=-Dwarnings cargo build --release` errors.
+#![cfg_attr(not(debug_assertions), allow(unused_imports, dead_code))]
 //! Victauri — full-stack introspection for Tauri apps via an embedded MCP server.
 //!
 //! Add this plugin to your Tauri app for AI-agent-driven testing and debugging:
@@ -1068,6 +1073,10 @@ mod tests {
         assert_eq!(builder.resolve_auth_token(), Some("my-secret".to_string()));
     }
 
+    // `env_truthy` is part of the debug-only kill-switch path, so this test can
+    // only reference it in debug builds (otherwise `cargo test --release` fails to
+    // compile — a config our CI doesn't normally run).
+    #[cfg(debug_assertions)]
     #[test]
     #[allow(unsafe_code)]
     fn env_truthy_recognizes_kill_switch_values() {
