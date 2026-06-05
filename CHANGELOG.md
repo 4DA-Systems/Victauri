@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-06-05
+
+A focused single-fix release closing the one residual from 0.7.6.
+
+### Fixed
+
+- **`victauri test` smoke suite failed on headless CI.** `assert_screenshot_ok` relied on
+  `screenshot()` returning `Ok` even when the tool errored; the 0.7.6 `isError` fix correctly
+  stopped swallowing tool errors, so on a headless runner (no native/X11 window handle to
+  capture) the screenshot check began failing ("1 of 11 checks failed"). It now tolerates the
+  headless "no window handle" tool-error — its documented intent — while still failing on
+  transport/connection errors. Apps with a real display are unaffected (screenshot returns image
+  data as before).
+
+### Changed (CI / internal)
+
+- The repo's own E2E job now builds and tests the **local** `victauri-cli` instead of
+  `cargo install`-ing the published crate, so CI validates the code being released rather than
+  the previous version (added an opt-in `cli-source-path` to the `victauri-test` composite
+  action; external consumers are unaffected and still install the published crate).
+
+_(No API or behavior changes for consumers. npm `@4da/victauri-browser` and the VS Code extension
+are unchanged in 0.7.7 — the fix is crates-only.)_
+
 ## [0.7.6] - 2026-06-05
 
 Driven by an in-the-wild session that used Victauri to debug a real app's scoring
