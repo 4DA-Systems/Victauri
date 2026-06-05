@@ -145,6 +145,7 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "check_ipc_integrity"
                 | "resolve_command"
                 | "wait_for"
+                | "app_state"
                 // Assertions (use eval internally but are test-oriented)
                 | "verify_state"
                 | "assert_semantic"
@@ -193,6 +194,9 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "logs.dialogs"
                 | "logs.events"
                 | "logs.slow_ipc"
+                // logs.clear erases captured logs — a test-time mutation, allowed
+                // in Test/FullControl but NOT in read-only Observe.
+                | "logs.clear"
                 // Inspect (read-only + visual debug)
                 | "inspect"
                 | "inspect.styles"
@@ -223,6 +227,7 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "detect_ghost_commands"
                 | "check_ipc_integrity"
                 | "resolve_command"
+                | "app_state"
                 | "logs"
                 | "logs.console"
                 | "logs.network"
@@ -231,11 +236,13 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "logs.dialogs"
                 | "logs.events"
                 | "logs.slow_ipc"
+                // NOTE: logs.clear is intentionally excluded — clearing logs erases
+                // observable evidence, which the read-only Observe profile forbids.
                 | "inspect"
                 | "inspect.styles"
                 | "inspect.bounds"
-                | "inspect.highlight"
-                | "inspect.clear_highlights"
+                // NOTE: inspect.highlight / clear_highlights are intentionally excluded —
+                // they inject/remove DOM overlay nodes, a mutation Observe forbids.
                 | "inspect.audit_a11y"
                 | "inspect.performance"
                 | "list_windows"
@@ -563,14 +570,33 @@ mod tests {
         assert!(config.is_tool_enabled("logs.dialogs"));
         assert!(config.is_tool_enabled("logs.events"));
         assert!(config.is_tool_enabled("logs.slow_ipc"));
-        // Inspect (read-only)
+        // Inspect (read-only ONLY)
         assert!(config.is_tool_enabled("inspect"));
         assert!(config.is_tool_enabled("inspect.styles"));
         assert!(config.is_tool_enabled("inspect.bounds"));
-        assert!(config.is_tool_enabled("inspect.highlight"));
-        assert!(config.is_tool_enabled("inspect.clear_highlights"));
         assert!(config.is_tool_enabled("inspect.audit_a11y"));
         assert!(config.is_tool_enabled("inspect.performance"));
+        // Mutating actions are NOT read-only and must be blocked in Observe.
+        assert!(!config.is_tool_enabled("inspect.highlight"));
+        assert!(!config.is_tool_enabled("inspect.clear_highlights"));
+        assert!(!config.is_tool_enabled("logs.clear"));
+    }
+
+    #[test]
+    fn observe_allows_app_state_probe_reads() {
+        // app_state runs read-only backend probes — pure observation.
+        assert!(observe_privacy_config().is_tool_enabled("app_state"));
+    }
+
+    #[test]
+    fn test_profile_allows_log_clearing_and_highlight() {
+        // The Test profile is for automation: clearing logs and drawing debug
+        // overlays are legitimate test operations (unlike read-only Observe).
+        let config = test_privacy_config();
+        assert!(config.is_tool_enabled("logs.clear"));
+        assert!(config.is_tool_enabled("inspect.highlight"));
+        assert!(config.is_tool_enabled("inspect.clear_highlights"));
+        assert!(config.is_tool_enabled("app_state"));
     }
 
     #[test]

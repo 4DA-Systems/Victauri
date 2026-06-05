@@ -511,11 +511,22 @@ impl VictauriClient {
             });
         }
 
-        let content = &body["result"]["content"];
+        let result = &body["result"];
+        let content = &result["content"];
+
+        // Honor MCP tool-level errors: a tool that sets `isError: true` returns its
+        // failure message in the content text. Without this check the SDK would
+        // report a failed eval / invalid selector / tool_error as a successful
+        // `Ok(...)`, hiding real failures from callers (red-team P1).
+        let is_tool_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+
         if let Some(arr) = content.as_array()
             && let Some(first) = arr.first()
         {
             if let Some(text) = first["text"].as_str() {
+                if is_tool_error {
+                    return Err(TestError::ToolError(text.to_string()));
+                }
                 if let Ok(parsed) = serde_json::from_str::<Value>(text) {
                     return Ok(parsed);
                 }
@@ -524,6 +535,12 @@ impl VictauriClient {
             if first.get("type").and_then(Value::as_str) == Some("image") {
                 return Ok(first.clone());
             }
+        }
+
+        if is_tool_error {
+            return Err(TestError::ToolError(format!(
+                "tool '{name}' returned an error result: {result}"
+            )));
         }
 
         Ok(body)
