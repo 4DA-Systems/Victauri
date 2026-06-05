@@ -2,6 +2,12 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.7.8 (2026-06-06)
+
+- Version-synced with the Victauri 0.7.8 release. Crates-only build-correctness patch:
+  `victauri-plugin` now compiles with `default-features = false` and in the release
+  profile under `-Dwarnings`. No extension code changes.
+
 ## 0.7.7 (2026-06-05)
 
 - Version-synced with the Victauri 0.7.7 release. Crates-only patch: `victauri test`'s
