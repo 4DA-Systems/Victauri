@@ -1213,7 +1213,6 @@ impl VictauriMcpHandler {
         }
     }
 
-    #[cfg(feature = "sqlite")]
     #[tool(
         description = "Execute a read-only SQL query against a SQLite database in the app's data directory. Auto-discovers database files if no path is specified. Only SELECT/PRAGMA/EXPLAIN/WITH queries are allowed. Returns rows as JSON objects with column names as keys. This provides direct backend database access without going through the webview or IPC.",
         annotations(
@@ -1224,6 +1223,27 @@ impl VictauriMcpHandler {
         )
     )]
     async fn query_db(&self, Parameters(params): Parameters<QueryDbParams>) -> CallToolResult {
+        // query_db is ALWAYS registered as a tool so the rmcp `#[tool_router]` macro
+        // compiles with `default-features = false` (a consumer that drops the heavy
+        // rusqlite C dependency). The actual SQLite implementation only exists with the
+        // `sqlite` feature; without it, return a clear, actionable error.
+        #[cfg(feature = "sqlite")]
+        {
+            self.query_db_impl(params).await
+        }
+        #[cfg(not(feature = "sqlite"))]
+        {
+            let _ = params;
+            tool_error(
+                "query_db is unavailable: this build was compiled without the 'sqlite' \
+                 feature (default-features = false). Re-enable the 'sqlite' feature to use it.",
+            )
+        }
+    }
+
+    /// Real `query_db` implementation — compiled only with the `sqlite` feature.
+    #[cfg(feature = "sqlite")]
+    async fn query_db_impl(&self, params: QueryDbParams) -> CallToolResult {
         let data_dir = match self.bridge.app_data_dir() {
             Ok(d) => d,
             Err(e) => return tool_error(format!("cannot access app data directory: {e}")),
@@ -3584,7 +3604,6 @@ impl VictauriMcpHandler {
                 let p: ReadAppFileParams = Self::parse_args(args)?;
                 self.read_app_file(Parameters(p)).await
             }
-            #[cfg(feature = "sqlite")]
             "query_db" => {
                 let p: QueryDbParams = Self::parse_args(args)?;
                 self.query_db(Parameters(p)).await

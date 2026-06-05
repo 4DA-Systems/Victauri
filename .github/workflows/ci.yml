@@ -50,6 +50,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # The workspace always builds WITH default features, so a consumer that does
+      # `default-features = false` (e.g. to drop the rusqlite C dependency — what the
+      # compat harness does) exercises a path our normal build never hits. Guard it so
+      # victauri-plugin stays compilable without its default features.
+      - name: Clippy (victauri-plugin, no default features)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p victauri-plugin --no-default-features -- -D warnings
+
       - name: Check formatting
         if: matrix.os == 'ubuntu-latest'
         run: cargo fmt --all -- --check
