@@ -23,6 +23,13 @@ pub struct VerifyStateParams {
 pub struct GhostCommandParams {
     /// Optional filter: only consider IPC calls from this webview label.
     pub webview_label: Option<String>,
+    /// Optional time window in milliseconds. When set (> 0), only commands invoked
+    /// within the last `since_ms` ms are considered — a non-destructive way to scope
+    /// detection to the current test's traffic without clearing the session's IPC log
+    /// (the alternative, `logs {action:'clear'}`, wipes it for every reader). Pair with
+    /// invoking the suspect action immediately before this call. Omit to scan the whole
+    /// accumulated log.
+    pub since_ms: Option<i64>,
 }
 
 /// Parameters for the `check_ipc_integrity` tool.

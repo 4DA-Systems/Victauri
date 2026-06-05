@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Driven by the agent-eval A/B (`scripts/agent-eval/RESULTS.md`), which refuted the
+naive "browser tools can't reach the Rust backend" thesis and surfaced the honest,
+defensible one — *browser tools can **poke** a Tauri backend, but only Victauri can
+**read** it safely: the database, the command registry, and the IPC history have no
+`eval_js` equivalent, the backend tools run read-only and webview-independent, and on
+macOS/Linux a CDP-class tool can't attach at all.*
+
+### Added
+
+- **`detect_ghost_commands` gains a `since_ms` time window.** Pass `since_ms` (e.g.
+  `5000`) to scope ghost detection to commands invoked in the last N milliseconds —
+  the non-destructive per-test pattern (invoke the suspect action, then detect). The
+  eval found the session-persistent IPC ring buffer buried a true-positive ghost in
+  stale probe traffic; this lets an agent get a clean signal without `logs
+  {action:'clear'}` (which wipes the log for every reader). New
+  `VictauriClient::detect_ghost_commands_since`. The cutoff is evaluated in the
+  webview's own clock, so there's no Rust↔JS skew.
+
+### Changed
+
+- **Documentation honesty.** The FAQ, introduction, and project pitch no longer claim
+  "Playwright sees only the browser glass" (the eval showed any `eval_js`-capable tool
+  can invoke Tauri commands via `window.__TAURI_INTERNALS__.invoke`). They now lead
+  with the validated *poke-vs-read-safely* thesis and the genuine moat: read-only
+  safety, the no-`eval_js`-equivalent capabilities (`query_db`, registry enumeration,
+  IPC history with bodies, native process state), cross-platform reach, and
+  webview-independent robustness.
+
 ## [0.7.8] - 2026-06-06
 
 A build-correctness release: `victauri-plugin` now compiles in configurations our

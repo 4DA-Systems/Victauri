@@ -844,6 +844,23 @@ impl VictauriClient {
         self.call_tool("detect_ghost_commands", json!({})).await
     }
 
+    /// Detect ghost commands, scoped to commands invoked within the last `since_ms`
+    /// milliseconds.
+    ///
+    /// This is the non-destructive per-test pattern: invoke the suspect action, then
+    /// call this with a small window (e.g. `5000`) so the `frontend_only` result
+    /// reflects only the current test's traffic — not stale probe history accumulated
+    /// in the session's IPC ring buffer. The alternative (`logs {action:'clear'}`)
+    /// wipes the log for every reader.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn detect_ghost_commands_since(&mut self, since_ms: i64) -> Result<Value, TestError> {
+        self.call_tool("detect_ghost_commands", json!({ "since_ms": since_ms }))
+            .await
+    }
+
     /// Check IPC call health (pending, stale, errored).
     ///
     /// # Errors

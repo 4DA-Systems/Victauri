@@ -45,6 +45,31 @@ pub fn json_truthy(value: &serde_json::Value) -> bool {
     }
 }
 
+/// Build the JS that projects the webview IPC log down to just command names for
+/// `detect_ghost_commands`.
+///
+/// When `since_ms` is `Some(ms)` with `ms > 0`, only commands invoked within the
+/// last `ms` milliseconds are included. This is a **non-destructive** way to scope
+/// ghost detection to the current test's traffic — the alternative,
+/// `logs {action:'clear'}`, wipes the session-persistent IPC ring buffer for every
+/// other reader. The cutoff is evaluated in the webview's own clock (`Date.now()`),
+/// so there is no Rust↔JS clock skew. A non-positive or absent `since_ms` projects
+/// the whole accumulated log (the historical behavior).
+#[must_use]
+pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
+    let filter = match since_ms {
+        Some(ms) if ms > 0 => format!(
+            ".filter(function(c){{ return c && c.timestamp && c.timestamp >= (Date.now() - {ms}); }})"
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "return (window.__VICTAURI__?.getIpcLog() || []){filter}\
+         .map(function(c){{ return (c && c.command) || null; }})\
+         .filter(function(x){{ return x; }})"
+    )
+}
+
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![Content::text(json)]),
@@ -244,6 +269,38 @@ mod json_truthy_tests {
         assert!(json_truthy(&json!("ready")));
         assert!(json_truthy(&json!([1])));
         assert!(json_truthy(&json!({ "k": "v" })));
+    }
+}
+
+#[cfg(test)]
+mod ghost_projection_tests {
+    use super::ghost_ipc_projection_js;
+
+    #[test]
+    fn projects_whole_log_when_since_absent() {
+        let js = ghost_ipc_projection_js(None);
+        assert!(js.contains("getIpcLog()"));
+        assert!(js.contains(".map("));
+        // No time window applied.
+        assert!(!js.contains("Date.now()"));
+        assert!(!js.contains("c.timestamp"));
+    }
+
+    #[test]
+    fn applies_window_when_since_positive() {
+        let js = ghost_ipc_projection_js(Some(5000));
+        assert!(js.contains("c.timestamp"));
+        assert!(js.contains("Date.now() - 5000"));
+        // Window is applied before the name projection.
+        let win = js.find("Date.now()").unwrap();
+        let map = js.find(".map(").unwrap();
+        assert!(win < map, "time filter must run before the name map");
+    }
+
+    #[test]
+    fn ignores_nonpositive_since() {
+        assert!(!ghost_ipc_projection_js(Some(0)).contains("Date.now()"));
+        assert!(!ghost_ipc_projection_js(Some(-10)).contains("Date.now()"));
     }
 }
 

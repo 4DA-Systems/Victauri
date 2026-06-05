@@ -35,8 +35,9 @@ use crate::VictauriState;
 use crate::bridge::WebviewBridge;
 
 use helpers::{
-    RecoveryHint, js_string, json_result, json_truthy, missing_param, sanitize_css_color,
-    sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint, validate_url,
+    RecoveryHint, ghost_ipc_projection_js, js_string, json_result, json_truthy, missing_param,
+    sanitize_css_color, sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint,
+    validate_url,
 };
 
 pub use backend_params::*;
@@ -503,7 +504,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Detect ghost commands. Returns TWO separate lists: `frontend_only` = the true ghosts (commands invoked from the frontend that have NO backend handler — likely typos/bugs), and `registry_only` = informational (commands registered in the backend but never invoked from the frontend this session). Reads the JS-side IPC interception log, which ACCUMULATES every command seen this session (including earlier test/probe traffic) — so a `frontend_only` result reflects what was invoked at runtime, not necessarily a real frontend bug. For a clean signal, call `logs {action:'clear'}` first, then exercise the app, then run this.",
+        description = "Detect ghost commands. Returns TWO separate lists: `frontend_only` = the true ghosts (commands invoked from the frontend that have NO backend handler — likely typos/bugs), and `registry_only` = informational (commands registered in the backend but never invoked from the frontend this session). Reads the JS-side IPC interception log, which ACCUMULATES every command seen this session (including earlier test/probe traffic) — so a `frontend_only` result reflects what was invoked at runtime, not necessarily a real frontend bug. For a clean signal, either (a) pass `since_ms` (e.g. 5000) to scope to commands invoked in the last N ms — non-destructive, the preferred per-test pattern: invoke the suspect action, then call this with `since_ms`; or (b) call `logs {action:'clear'}` first, then exercise the app, then run this.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -517,10 +518,11 @@ impl VictauriMcpHandler {
     ) -> CallToolResult {
         // Project only command names in JS — ghost detection never needs request
         // or response bodies, so this stays tiny even when the full IPC log is
-        // huge (avoids the eval size cap on busy apps).
-        let code = "return (window.__VICTAURI__?.getIpcLog() || []).map(function(c){ return (c && c.command) || null; }).filter(function(x){ return x; })";
+        // huge (avoids the eval size cap on busy apps). When `since_ms` is set, the
+        // projection also time-windows to the current test's traffic (non-destructive).
+        let code = ghost_ipc_projection_js(params.since_ms);
         let ipc_json = match self
-            .eval_with_return(code, params.webview_label.as_deref())
+            .eval_with_return(&code, params.webview_label.as_deref())
             .await
         {
             Ok(r) => r,

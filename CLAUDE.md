@@ -4,7 +4,7 @@
 
 **Victauri — Verified Introspection & Control for Tauri Applications.**
 
-X-ray vision and hands for AI agents inside Tauri apps. Unlike Playwright (which sees only the browser glass), Victauri gives agents simultaneous access to the webview DOM, the Rust backend, the IPC layer, the database, and native window state — all through a single MCP interface.
+X-ray vision and hands for AI agents inside Tauri apps. A browser tool with JS eval can *poke* a Tauri backend (Tauri exposes `window.__TAURI_INTERNALS__.invoke`, so it can invoke commands) — but only Victauri can *read* it safely. The database, the command registry, and the IPC history (with response bodies) have no `eval_js` equivalent; the backend tools run read-only through direct `AppHandle` access, independent of the webview; and on macOS WKWebView / Linux WebKitGTK a CDP-class tool can't attach at all. Victauri gives agents simultaneous, read-only access to the webview DOM, the Rust backend, the IPC layer, the database, and native window state — all through a single MCP interface.
 
 **Stack:** Pure Rust workspace (7 crates) | **Target:** Tauri 2.0 applications + any website via Chrome/Firefox extension
 
