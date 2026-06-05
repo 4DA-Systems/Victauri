@@ -2,6 +2,12 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.7.7 (2026-06-05)
+
+- Version-synced with the Victauri 0.7.7 release. Crates-only patch: `victauri test`'s
+  smoke suite no longer fails on headless CI (the screenshot check tolerates the absence
+  of a native window handle). No extension code changes.
+
 ## 0.7.6 (2026-06-05)
 
 - Version-synced with the Victauri 0.7.6 release: async-completion awareness
