@@ -2,6 +2,15 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.7.6 (2026-06-05)
+
+- Version-synced with the Victauri 0.7.6 release: async-completion awareness
+  (`wait_for` gains `expression`/`event` conditions to await fire-and-forget backend
+  work without sleeps), the `app_state` tool + `VictauriBuilder::probe` for first-class
+  in-process backend-state probes, and actionable connection diagnostics. Plus a
+  GPT-5.5 red-team pass (MCP `result.isError` now honored by the SDK, read-only
+  `Observe` privacy profile tightened, tool-invocation double-count fixed). **35 tools.**
+
 ## 0.7.5 (2026-06-02)
 
 - Version-synced with the Victauri 0.7.5 release (two cross-model red-team passes:
