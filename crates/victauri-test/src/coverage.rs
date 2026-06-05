@@ -172,8 +172,14 @@ fn build_report(registered: &[String], called: &[String]) -> Result<CoverageRepo
     most_called.sort_by_key(|c| std::cmp::Reverse(c.calls));
     untested.sort();
 
+    // An empty registry has NOTHING to cover, so report 0% rather than a
+    // misleading 100% "fully covered" — reading a no-commands run as success is a
+    // false positive (red-team P3). The CLI surfaces this as an explicit
+    // "no commands registered" warning (and exits non-zero unless
+    // `--allow-empty-registry`); callers of the library can check
+    // `total_commands == 0` to distinguish "unmeasurable" from "0% covered".
     let coverage_percentage = if total_commands == 0 {
-        100.0
+        0.0
     } else {
         (tested as f64 / total_commands as f64) * 100.0
     };
@@ -228,8 +234,9 @@ mod tests {
 
     #[test]
     fn build_report_no_commands() {
+        // No registered commands = nothing measurable = 0%, NOT a false 100%.
         let report = build_report(&[], &[]).unwrap();
-        assert_eq!(report.coverage_percentage, 100.0);
+        assert_eq!(report.coverage_percentage, 0.0);
         assert_eq!(report.total_commands, 0);
     }
 

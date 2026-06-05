@@ -220,20 +220,61 @@ Verify the health of IPC communication.
 
 ### wait_for
 
-Wait for a condition to become true, polling until timeout.
+Wait for a condition to become true, polling until timeout. Use the `expression`
+and `event` conditions to await async backend work to **true** completion instead
+of guessing with a fixed sleep.
 
 **Parameters:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle` |
-| `value` | string | no | Selector/text/URL to match (not needed for `ipc_idle`/`network_idle`) |
+| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle`, `expression`, `event` |
+| `value` | string | no | Selector/text/URL to match; the JS expression (`expression`); or the Tauri event name (`event`). Not needed for `ipc_idle`/`network_idle` |
+| `expected` | any | no | For `expression`: the JSON value the expression must equal. Omit to wait for the expression to become truthy |
+| `since_ms` | number | no | For `event`: how far back (ms) to accept an already-fired event when the wait begins (default: 2000) |
 | `timeout_ms` | number | no | Max wait time in ms (default: 10000) |
 | `poll_ms` | number | no | Poll interval in ms (default: 200) |
+
+**Conditions for async completion:**
+- **`expression`** — polls a JS expression until truthy (or `== expected`). It may
+  `await`, so you can await a fire-and-forget command's status directly. Level-triggered
+  and race-free; needs no app changes. Returns `{ ok, value, elapsed_ms }`.
+- **`event`** — blocks until a named Tauri event fires (evaluated against the captured
+  event bus, with a `since_ms` look-back). The app must emit the event and Victauri must
+  capture it via `VictauriBuilder::listen_events`. Returns `{ ok, event, elapsed_ms }`.
 
 **Example:**
 ```json
 {"condition": "selector", "value": ".modal.open", "timeout_ms": 3000}
 {"condition": "url", "value": "/dashboard"}
+{"condition": "expression", "value": "(await window.__TAURI_INTERNALS__.invoke('get_status')).running === false", "timeout_ms": 30000}
+{"condition": "event", "value": "analysis-complete", "timeout_ms": 30000}
+```
+
+The robust async pattern is `invoke_command(...)` then `wait_for(expression|event, ...)`.
+
+---
+
+### app_state
+
+Read application-defined backend state through a registered probe. Probes give an
+agent first-class, discoverable access to domain state (a scoring pipeline's version
+and stale-item count, a queue's depth, cache stats) that would otherwise require
+`query_db` + log-grepping. A probe runs in the Rust process with **no IPC round-trip
+and no frontend involvement** — direct-backend introspection a browser-external tool
+cannot do.
+
+Apps register probes via `VictauriBuilder::probe("name", || serde_json::json!({ … }))`
+(build your shared state as an `Arc` once, clone it into both `.manage()` and the probe).
+
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `probe` | string | no | Name of the probe to run. Omit to list all available probe names |
+
+**Example:**
+```json
+{}                       // → { "probes": ["scoring", "queue"] }
+{"probe": "scoring"}     // → { "pipeline_version": 5, "stale_items": 0 }
 ```
 
 ---

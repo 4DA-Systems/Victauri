@@ -702,6 +702,75 @@ impl Default for EventBusMonitor {
     }
 }
 
+// ── Application State Probes ─────────────────────────────────────────────
+
+/// A named closure that returns a snapshot of application-specific backend state
+/// as JSON. Registered via [`VictauriBuilder::probe`](crate::VictauriBuilder::probe).
+pub type ProbeFn = dyn Fn() -> serde_json::Value + Send + Sync + 'static;
+
+/// Registry of application-defined state probes surfaced through the `app_state`
+/// MCP tool.
+///
+/// Probes give an agent first-class, discoverable access to domain state that
+/// would otherwise require `query_db` + log-grepping (e.g. a scoring pipeline's
+/// version, queue depth, or cache stats). Because a probe runs in the Rust
+/// process with direct access to whatever state the app captured into it, it
+/// reads backend state with **no IPC round-trip and no frontend involvement** —
+/// the kind of introspection a browser-external tool like CDP cannot do.
+#[derive(Clone, Default)]
+pub struct AppStateProbes {
+    inner: std::sync::Arc<RwLock<std::collections::BTreeMap<String, std::sync::Arc<ProbeFn>>>>,
+}
+
+impl AppStateProbes {
+    /// Register (or replace) a probe under `name`.
+    pub fn register(&self, name: impl Into<String>, probe: std::sync::Arc<ProbeFn>) {
+        self.inner
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.into(), probe);
+    }
+
+    /// Sorted list of registered probe names.
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Run the named probe and return its JSON snapshot, or `None` if no probe is
+    /// registered under that name.
+    #[must_use]
+    pub fn run(&self, name: &str) -> Option<serde_json::Value> {
+        let probe = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned();
+        probe.map(|p| p())
+    }
+
+    /// Number of registered probes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
+    /// Returns true if no probes are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 // ── Internal Task Tracker ──────────────────────────────────────────────
 
 /// Info about a tracked async task spawned by Victauri.
@@ -1088,6 +1157,48 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_state_probes_register_run_list() {
+        let probes = AppStateProbes::default();
+        assert!(probes.is_empty());
+
+        probes.register(
+            "scoring",
+            std::sync::Arc::new(|| serde_json::json!({ "pipeline_version": 5 })),
+        );
+        probes.register("queue", std::sync::Arc::new(|| serde_json::json!(0)));
+
+        // names() is sorted (BTreeMap).
+        assert_eq!(
+            probes.names(),
+            vec!["queue".to_string(), "scoring".to_string()]
+        );
+        assert_eq!(probes.len(), 2);
+
+        let snapshot = probes.run("scoring").expect("probe runs");
+        assert_eq!(snapshot["pipeline_version"], 5);
+        assert!(probes.run("missing").is_none());
+    }
+
+    #[test]
+    fn app_state_probe_reflects_live_state() {
+        // A probe closes over shared state and reflects mutations at call time —
+        // proving it reads live backend state, not a registration-time snapshot.
+        let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let probe_counter = std::sync::Arc::clone(&counter);
+        let probes = AppStateProbes::default();
+        probes.register(
+            "counter",
+            std::sync::Arc::new(move || {
+                serde_json::json!(probe_counter.load(std::sync::atomic::Ordering::SeqCst))
+            }),
+        );
+
+        assert_eq!(probes.run("counter").unwrap(), serde_json::json!(0));
+        counter.store(42, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(probes.run("counter").unwrap(), serde_json::json!(42));
+    }
 
     #[test]
     fn event_bus_push_and_read() {

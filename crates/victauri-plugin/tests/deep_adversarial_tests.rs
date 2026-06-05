@@ -148,6 +148,7 @@ fn make_state_with_privacy(privacy: PrivacyConfig) -> Arc<VictauriState> {
         bridge_notify: tokio::sync::Notify::new(),
         db_search_paths: Vec::new(),
         screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
+        probes: victauri_plugin::introspection::AppStateProbes::default(),
     })
 }
 
@@ -313,7 +314,7 @@ async fn rest_call_auth(
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn rest_list_tools_returns_all_24() {
+async fn rest_list_tools_returns_all_25() {
     let state = test_state();
     let base = start_server(state, &["main"]).await;
     let client = reqwest::Client::new();
@@ -344,6 +345,7 @@ async fn rest_list_tools_returns_all_24() {
         "assert_semantic",
         "resolve_command",
         "get_registry",
+        "app_state",
         "get_memory_stats",
         "get_plugin_info",
         "get_diagnostics",
@@ -1224,6 +1226,7 @@ async fn privacy_disable_all_tools() {
         "assert_semantic",
         "resolve_command",
         "get_registry",
+        "app_state",
         "get_memory_stats",
         "get_plugin_info",
         "get_diagnostics",

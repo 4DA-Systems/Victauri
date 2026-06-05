@@ -28,6 +28,23 @@ pub fn js_string(s: &str) -> String {
     out
 }
 
+/// JavaScript-style truthiness for a JSON value.
+///
+/// Mirrors what `if (value)` would do in the webview after `eval_js`: `false`,
+/// `null`, `0`, `NaN`, `""`, and (pragmatically) empty arrays/objects are falsy;
+/// everything else is truthy. Used by `wait_for` with the `expression` condition.
+#[must_use]
+pub fn json_truthy(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Null => false,
+        serde_json::Value::Bool(b) => *b,
+        serde_json::Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
+        serde_json::Value::String(s) => !s.is_empty(),
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+    }
+}
+
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![Content::text(json)]),
@@ -201,6 +218,33 @@ pub fn sanitize_injected_css(css: &str, allow_remote: bool) -> Result<(), String
         search_from = arg_end;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod json_truthy_tests {
+    use super::json_truthy;
+    use serde_json::json;
+
+    #[test]
+    fn falsy_values() {
+        assert!(!json_truthy(&json!(null)));
+        assert!(!json_truthy(&json!(false)));
+        assert!(!json_truthy(&json!(0)));
+        assert!(!json_truthy(&json!(0.0)));
+        assert!(!json_truthy(&json!("")));
+        assert!(!json_truthy(&json!([])));
+        assert!(!json_truthy(&json!({})));
+    }
+
+    #[test]
+    fn truthy_values() {
+        assert!(json_truthy(&json!(true)));
+        assert!(json_truthy(&json!(1)));
+        assert!(json_truthy(&json!(-1)));
+        assert!(json_truthy(&json!("ready")));
+        assert!(json_truthy(&json!([1])));
+        assert!(json_truthy(&json!({ "k": "v" })));
+    }
 }
 
 #[cfg(test)]
