@@ -35,6 +35,14 @@ inputs:
     description: Version of victauri-cli to install (empty = latest)
     required: false
     default: ""
+  cli-source-path:
+    description: >-
+      Build & install victauri-cli from this local repo path instead of
+      crates.io. Used by this repo's OWN CI so it validates the code being
+      released (not the already-published crate). External consumers leave this
+      empty to install the published crate.
+    required: false
+    default: ""
   health-timeout:
     description: Seconds to wait for the Victauri server to become healthy
     required: false
@@ -61,7 +69,10 @@ runs:
     - name: Install victauri-cli
       shell: bash
       run: |
-        if [ -n "${{ inputs.victauri-version }}" ]; then
+        if [ -n "${{ inputs.cli-source-path }}" ]; then
+          # Repo CI: validate the code being released, not the published crate.
+          cargo install --path "${{ inputs.cli-source-path }}" --force
+        elif [ -n "${{ inputs.victauri-version }}" ]; then
           cargo install victauri-cli@${{ inputs.victauri-version }}
         else
           cargo install victauri-cli
