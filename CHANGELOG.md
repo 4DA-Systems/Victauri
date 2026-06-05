@@ -66,6 +66,32 @@ The generated agent block now teaches awaiting async backend work with
 `app_state` probes, driving specific code paths through `invoke_command`, and that
 `query_db` is read-only by design (mutate via the app's own commands).
 
+### Fixed — GPT-5.5 adversarial red-team pass
+
+A cross-model adversarial audit of this release surfaced real, mostly pre-existing
+defects (several stale findings were verified and dismissed). Fixed:
+
+- **`VictauriClient` swallowed MCP tool errors** — `call_tool` returned a tool's
+  failure text as `Ok(...)` because it ignored `result.isError`. A failed `eval_js`
+  (`throw`), an invalid selector, or any `tool_error` now correctly surfaces as
+  `Err(TestError::ToolError(..))`. (Aligns the SDK with the existing
+  `regression_eval_throw_returns_mcp_error` / `high_level_api` expectations.)
+- **The read-only `Observe` privacy profile was not read-only** — `inspect.highlight`
+  and `inspect.clear_highlights` inject/remove DOM overlay nodes, and `logs.clear`
+  erases captured IPC/network evidence. These mutating sub-actions were listed but
+  never enforced (their handlers skipped the permission check). They are now enforced
+  and excluded from `Observe` (still allowed in `Test`/`FullControl`).
+- **Tool-invocation metric double-counted** — both transport chokepoints
+  (REST `execute_tool`, MCP `ServerHandler::call_tool`) increment `tool_invocations`,
+  yet ~19 handlers *also* incremented via a redundant `track_tool_call()`, inflating
+  the count on every transport. Removed the per-handler calls; each call now counts
+  exactly once, and *all* tools are counted (not just the ones that opted in).
+- **`release.yml` could cut a GitHub Release without a successful crates.io publish** —
+  `github-release` now `needs: [build, chrome-extension, publish]`.
+- **Coverage reported 100% for an empty registry** — a no-commands run now reports 0%
+  (unmeasurable, not falsely "fully covered"); the CLI still emits its explicit
+  "no commands registered" warning.
+
 ## [0.7.5] - 2026-06-02
 
 Two adversarial red-team passes (cross-model) before release. The first pass found

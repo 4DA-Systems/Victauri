@@ -406,7 +406,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn screenshot(&self, Parameters(params): Parameters<ScreenshotParams>) -> CallToolResult {
-        self.track_tool_call();
         if !self.state.privacy.is_tool_enabled("screenshot") {
             return tool_disabled("screenshot");
         }
@@ -804,7 +803,6 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<ResolveCommandParams>,
     ) -> CallToolResult {
-        self.track_tool_call();
         let limit = params.limit.unwrap_or(5);
         let mut results = self.state.registry.resolve(&params.query);
         results.truncate(limit);
@@ -821,7 +819,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn get_registry(&self, Parameters(params): Parameters<RegistryParams>) -> CallToolResult {
-        self.track_tool_call();
         let commands = match params.query {
             Some(q) => self.state.registry.search(&q),
             None => self.state.registry.list(),
@@ -839,7 +836,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn app_state(&self, Parameters(params): Parameters<AppStateParams>) -> CallToolResult {
-        self.track_tool_call();
         let Some(name) = params.probe else {
             return json_result(&serde_json::json!({ "probes": self.state.probes.names() }));
         };
@@ -871,7 +867,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn get_memory_stats(&self) -> CallToolResult {
-        self.track_tool_call();
         let stats = crate::memory::current_stats();
         json_result(&stats)
     }
@@ -886,7 +881,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn get_plugin_info(&self) -> CallToolResult {
-        self.track_tool_call();
         let disabled: Vec<&str> = self
             .state
             .privacy
@@ -982,7 +976,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn app_info(&self) -> CallToolResult {
-        self.track_tool_call();
         let config = self.bridge.tauri_config();
 
         let data_dir = self.bridge.app_data_dir().ok();
@@ -1069,7 +1062,6 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<ListAppDirParams>,
     ) -> CallToolResult {
-        self.track_tool_call();
         let base = match self.resolve_app_dir(params.directory) {
             Ok(d) => d,
             Err(e) => return tool_error(e),
@@ -1141,7 +1133,6 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<ReadAppFileParams>,
     ) -> CallToolResult {
-        self.track_tool_call();
         let base = match self.resolve_app_dir(params.directory) {
             Ok(d) => d,
             Err(e) => return tool_error(e),
@@ -1233,7 +1224,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn query_db(&self, Parameters(params): Parameters<QueryDbParams>) -> CallToolResult {
-        self.track_tool_call();
         let data_dir = match self.bridge.app_data_dir() {
             Ok(d) => d,
             Err(e) => return tool_error(format!("cannot access app data directory: {e}")),
@@ -1604,7 +1594,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn window(&self, Parameters(params): Parameters<WindowParams>) -> CallToolResult {
-        self.track_tool_call();
         match params.action {
             WindowAction::GetState => {
                 let states = self.bridge.get_window_states(params.label.as_deref());
@@ -1869,7 +1858,6 @@ impl VictauriMcpHandler {
     )]
     async fn recording(&self, Parameters(params): Parameters<RecordingParams>) -> CallToolResult {
         const MAX_SESSION_JSON: usize = 10 * 1024 * 1024;
-        self.track_tool_call();
         if !self.state.privacy.is_tool_enabled("recording") {
             return tool_disabled("recording");
         }
@@ -2110,6 +2098,12 @@ impl VictauriMcpHandler {
                     .await
             }
             InspectAction::Highlight => {
+                // highlight injects a debug overlay node into the page — a DOM
+                // mutation — so it is gated separately and excluded from the
+                // read-only Observe profile (red-team P1).
+                if !self.state.privacy.is_tool_enabled("inspect.highlight") {
+                    return tool_disabled("inspect.highlight");
+                }
                 let Some(ref_id) = &params.ref_id else {
                     return missing_param("ref_id", "highlight");
                 };
@@ -2134,6 +2128,13 @@ impl VictauriMcpHandler {
                     .await
             }
             InspectAction::ClearHighlights => {
+                if !self
+                    .state
+                    .privacy
+                    .is_tool_enabled("inspect.clear_highlights")
+                {
+                    return tool_disabled("inspect.clear_highlights");
+                }
                 self.eval_bridge(
                     "return window.__VICTAURI__?.clearHighlights()",
                     params.webview_label.as_deref(),
@@ -2221,7 +2222,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn route(&self, Parameters(params): Parameters<RouteParams>) -> CallToolResult {
-        self.track_tool_call();
         match params.action {
             RouteAction::Add => {
                 if !self.state.privacy.is_tool_enabled("route.add") {
@@ -2321,7 +2321,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn trace(&self, Parameters(params): Parameters<TraceParams>) -> CallToolResult {
-        self.track_tool_call();
         if !self.state.privacy.is_tool_enabled("trace")
             || !self.state.privacy.is_tool_enabled("screenshot")
         {
@@ -2436,7 +2435,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn animation(&self, Parameters(params): Parameters<AnimationParams>) -> CallToolResult {
-        self.track_tool_call();
         if !self.state.privacy.is_tool_enabled("animation") {
             return tool_disabled("animation");
         }
@@ -2712,6 +2710,12 @@ impl VictauriMcpHandler {
                 self.eval_bridge(&code, None).await
             }
             LogsAction::Clear => {
+                // Clearing the IPC/network logs erases captured evidence — a
+                // mutation of observable state — so it is gated separately and
+                // excluded from the read-only Observe profile (red-team P1).
+                if !self.state.privacy.is_tool_enabled("logs.clear") {
+                    return tool_disabled("logs.clear");
+                }
                 let code = "return (function(){ var b = window.__VICTAURI__; if (!b) return { ok:false, error:'bridge unavailable' }; if (b.clearIpcLog) b.clearIpcLog(); if (b.clearNetworkLog) b.clearNetworkLog(); return { ok:true, cleared:['ipc','network'] }; })()";
                 self.eval_bridge(code, params.webview_label.as_deref())
                     .await
@@ -2749,7 +2753,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn introspect(&self, Parameters(params): Parameters<IntrospectParams>) -> CallToolResult {
-        self.track_tool_call();
         if !self.state.privacy.is_tool_enabled("introspect") {
             return tool_disabled("introspect");
         }
@@ -3122,7 +3125,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn fault(&self, Parameters(params): Parameters<FaultParams>) -> CallToolResult {
-        self.track_tool_call();
         if !self.state.privacy.is_tool_enabled("fault") {
             return tool_disabled("fault");
         }
@@ -3217,7 +3219,6 @@ impl VictauriMcpHandler {
         )
     )]
     async fn explain(&self, Parameters(params): Parameters<ExplainParams>) -> CallToolResult {
-        self.track_tool_call();
         if !self.state.privacy.is_tool_enabled("explain") {
             return tool_disabled("explain");
         }
@@ -3683,10 +3684,6 @@ impl VictauriMcpHandler {
         result
     }
 
-    fn track_tool_call(&self) {
-        self.state.tool_invocations.fetch_add(1, Ordering::Relaxed);
-    }
-
     fn resolve_app_dir(&self, dir: Option<AppDir>) -> Result<std::path::PathBuf, String> {
         match dir.unwrap_or(AppDir::Data) {
             AppDir::Data => self.bridge.app_data_dir(),
@@ -3901,8 +3898,6 @@ impl VictauriMcpHandler {
         webview_label: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
-        self.track_tool_call();
-
         // Wait for the JS bridge ready signal (sent on bridge init) before
         // attempting evals.  For explicitly targeted windows the probe
         // mechanism is still used because the ready signal only proves that

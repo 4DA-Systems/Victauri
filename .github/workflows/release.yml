@@ -301,7 +301,10 @@ jobs:
   github-release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: [build, chrome-extension]
+    # Depend on `publish` so a GitHub Release is never cut for a tag whose crates
+    # failed to reach crates.io — the release would otherwise advertise a version
+    # users cannot `cargo add` (red-team P2).
+    needs: [build, chrome-extension, publish]
     permissions:
       contents: write
     steps:
