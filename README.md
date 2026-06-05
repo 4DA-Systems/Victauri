@@ -27,7 +27,7 @@ Testing Tauri apps today means choosing between frontend mocks that lie about yo
 
 That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI agent — Claude Code, Cursor, Windsurf — can drive and debug your app with the exact same full-stack access. **Testing is the job; the agent integration is the bonus.**
 
-> **Tested against 5 real-world Tauri apps** (Kanri, En Croissant, Surrealist, Duckling, Lettura) — in our compatibility suite, **867 / 895 tests passed (96.9%)** with zero Victauri bugs and zero changes to the apps. The remaining failures were test-script issues or correct actionability enforcement.
+> **Tested against real-world Tauri apps.** In a one-time deep evaluation (May 2026) across 5 open-source apps (Kanri, En Croissant, Surrealist, Duckling, Lettura), **867 / 895 checks passed (96.9%)** with zero Victauri bugs and zero changes to the apps. A **reproducible per-release harness** ([`scripts/compat`](scripts/compat)) now re-verifies on each release — currently **Kanri: 15/15** on 0.7.8; the other four have drifted upstream and don't build in the harness yet (a re-pin is pending — see [compat README](scripts/compat/README.md)).
 
 ## What You Get
 
