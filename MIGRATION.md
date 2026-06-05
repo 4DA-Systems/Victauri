@@ -1,5 +1,12 @@
 # Migration Guide
 
+## v0.7.6 → v0.7.7 (bug fix — no action required)
+
+Crates-only patch. `victauri test`'s smoke suite no longer fails on headless CI (the screenshot
+check now tolerates the absence of a native window handle). No API or behavior changes. npm and
+the VS Code extension are unchanged. If you pinned `victauri-test`/`victauri-cli` `=0.7.6` and run
+`victauri test` in a headless environment, upgrade to `0.7.7`.
+
 ## v0.7.5 → v0.7.6 (async-completion + app-state probes — no breaking changes)
 
 All changes are additive; no action required. To take advantage of the new features:
