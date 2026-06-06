@@ -1638,32 +1638,80 @@
     window.addEventListener('__victauri_nonce_offer', __victauriRequestNonce);
     __victauriRequestNonce();
 
+    // ── Message authentication (audit A4) ─────────────────────────────────────
+    // HMAC-SHA256 keyed by the never-broadcast nonce. The raw nonce is NEVER placed on a
+    // command/response event; only one-way MACs are, so a page that observes the shared
+    // window cannot recover the key, inject a command, or forge a response. SubtleCrypto
+    // needs a secure context (https / localhost); on a non-secure origin the bridge fails
+    // CLOSED rather than accept forgeable id-only traffic.
+    var __vicHasSubtle = typeof crypto !== 'undefined' && !!crypto.subtle;
+    var __vicMacKeyPromise = null;
+    function __vicMacKey() {
+        if (!__vicMacKeyPromise) {
+            __vicMacKeyPromise = crypto.subtle.importKey(
+                'raw', new TextEncoder().encode(__victauriNonce),
+                { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+            );
+        }
+        return __vicMacKeyPromise;
+    }
+    function __vicSafeJson(v) {
+        try { var s = JSON.stringify(v); return s === undefined ? 'null' : s; }
+        catch (e) { return '"[unserializable]"'; }
+    }
+    function __vicMac(parts) {
+        return __vicMacKey().then(function (key) {
+            var data = new TextEncoder().encode(JSON.stringify(parts));
+            return crypto.subtle.sign('HMAC', key, data).then(function (sig) {
+                return Array.prototype.map.call(new Uint8Array(sig),
+                    function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+            });
+        });
+    }
+    function __vicMacEq(a, b) {
+        if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
+        var d = 0;
+        for (var i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+        return d === 0;
+    }
+
     window.addEventListener('__victauri_command', function(event) {
         var detail = event.detail;
-        // Fail closed if the handshake never completed (__victauriNonce === null): reject
-        // every command rather than letting a forged `nonce: null` slip through.
-        if (!detail || __victauriNonce === null || detail.nonce !== __victauriNonce
+        // Fail closed if the handshake never completed or we lack a secure context.
+        if (!detail || __victauriNonce === null || !__vicHasSubtle
             || !detail.id || !detail.method) return;
 
         var id = detail.id;
         var method = detail.method;
         var args = detail.args || {};
 
-        try {
-            var result = executeBridgeMethod(method, args);
-            Promise.resolve(result).then(
-                function(data) { dispatchResponse(id, 'result', data, null); },
-                function(err) { dispatchResponse(id, 'error', null, err.message || String(err)); }
-            );
-        } catch (err) {
-            dispatchResponse(id, 'error', null, err.message || String(err));
-        }
+        // Authenticate the command (audit A4): only honour commands carrying a valid MAC
+        // derived from the never-broadcast nonce. A page cannot forge this, so it can
+        // neither inject commands nor make us mint authenticated responses on its behalf.
+        __vicMac([id, method, __vicSafeJson(args)]).then(function (expected) {
+            if (!__vicMacEq(detail.mac, expected)) return;
+            try {
+                var result = executeBridgeMethod(method, args);
+                Promise.resolve(result).then(
+                    function(data) { dispatchResponse(id, 'result', data, null); },
+                    function(err) { dispatchResponse(id, 'error', null, err.message || String(err)); }
+                );
+            } catch (err) {
+                dispatchResponse(id, 'error', null, err.message || String(err));
+            }
+        });
     });
 
     function dispatchResponse(id, type, data, error) {
-        window.dispatchEvent(new CustomEvent('__victauri_response', {
-            detail: { id: id, type: type, data: data, error: error }
-        }));
+        // Sign the response so the ISOLATED relay can reject a page's forged
+        // `__victauri_response` (audit A4). If we somehow lack crypto, emit nothing —
+        // the relay will time out rather than deliver an unauthenticated result.
+        if (!__vicHasSubtle || __victauriNonce === null) return;
+        __vicMac([id, type, __vicSafeJson(data), error || '']).then(function (m) {
+            window.dispatchEvent(new CustomEvent('__victauri_response', {
+                detail: { id: id, type: type, data: data, error: error, mac: m }
+            }));
+        });
     }
 
     function executeBridgeMethod(method, args) {

@@ -1,11 +1,16 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { createBridgeEnv } from './setup.js';
 
-// Audit #2: a page script can dispatch __victauri_command, but without the secret
-// nonce (established with the ISOLATED relay before page scripts run) the MAIN-world
-// bridge must ignore it. setup.js only auto-stamps the nonce onto nonce-LESS events,
-// so supplying an explicit wrong nonce simulates a hostile page.
-describe('bridge command provenance (audit #2)', () => {
+// Audit #2 / A4: a page script can dispatch __victauri_command on the shared window, but
+// the MAIN-world bridge only honours commands carrying a valid HMAC keyed by the secret
+// nonce. The nonce is established with the ISOLATED relay before page scripts run and is
+// NEVER placed on a command/response event, so a page cannot compute a valid MAC.
+//
+// setup.js mirrors the real relay: it auto-signs only commands a test dispatches with NO
+// `mac` AND NO `nonce`. A command that supplies its own `mac`/`nonce` is treated as
+// page-originated and left UNSIGNED, so these tests prove the bridge rejects anything that
+// lacks a relay-issued MAC.
+describe('bridge command authentication (audit #2 / A4)', () => {
   let env;
   beforeEach(() => {
     env = createBridgeEnv();
@@ -14,7 +19,9 @@ describe('bridge command provenance (audit #2)', () => {
     env.dom.window.close();
   });
 
-  function dispatchRaw(detail) {
+  // Dispatch a command "as a page" — i.e. with attacker-controlled credentials that the
+  // harness will NOT auto-sign. Resolves with the bridge's response, or null if ignored.
+  function dispatchAsPage(detail) {
     return new Promise((resolve) => {
       const handler = (e) => {
         if (e.detail && e.detail.id === detail.id) {
@@ -31,21 +38,48 @@ describe('bridge command provenance (audit #2)', () => {
     });
   }
 
-  it('ignores a command carrying a forged nonce', async () => {
-    const resp = await dispatchRaw({ id: 'forge1', method: 'snapshot', args: {}, nonce: 'forged' });
+  it('ignores a command carrying a forged MAC', async () => {
+    const resp = await dispatchAsPage({ id: 'forge1', method: 'snapshot', args: {}, mac: 'deadbeef'.repeat(8) });
     expect(resp).toBeNull();
   });
 
-  it('ignores a command with no nonce at all', async () => {
-    // Bypass setup.js auto-stamp by giving an empty-string nonce (non-null).
-    const resp = await dispatchRaw({ id: 'forge2', method: 'snapshot', args: {}, nonce: '' });
+  it('ignores a command with an empty MAC', async () => {
+    // An explicit (empty) mac is non-null, so the harness leaves it unsigned.
+    const resp = await dispatchAsPage({ id: 'forge2', method: 'snapshot', args: {}, mac: '' });
     expect(resp).toBeNull();
   });
 
-  it('honours a command carrying the real nonce', async () => {
-    const resp = await dispatchRaw({ id: 'ok1', method: 'snapshot', args: {}, nonce: env.nonce });
+  it('ignores a command that carries only a (stolen) nonce but no valid MAC', async () => {
+    // Even if a page somehow obtained the nonce, putting it on the command does NOT
+    // authenticate it — only a valid HMAC does, and the page cannot compute one.
+    const resp = await dispatchAsPage({ id: 'forge3', method: 'snapshot', args: {}, nonce: env.nonce, mac: 'deadbeef'.repeat(8) });
+    expect(resp).toBeNull();
+  });
+
+  it('honours a command the relay has authenticated', async () => {
+    // No mac/nonce => setup.js signs it with the shared nonce, exactly as the real
+    // ISOLATED relay does for a genuine SW-issued command.
+    const resp = await new Promise((resolve) => {
+      const id = 'ok1';
+      const handler = (e) => {
+        if (e.detail && e.detail.id === id) {
+          env.window.removeEventListener('__victauri_response', handler);
+          resolve(e.detail);
+        }
+      };
+      env.window.addEventListener('__victauri_response', handler);
+      env.window.dispatchEvent(new env.window.CustomEvent('__victauri_command', {
+        detail: { id, method: 'snapshot', args: {} },
+      }));
+      setTimeout(() => {
+        env.window.removeEventListener('__victauri_response', handler);
+        resolve(null);
+      }, 200);
+    });
     expect(resp).not.toBeNull();
     expect(resp.type).toBe('result');
+    // The bridge signs its responses so the relay can reject page-forged ones (audit A4).
+    expect(typeof resp.mac).toBe('string');
   });
 });
 
@@ -55,6 +89,8 @@ describe('bridge command provenance (audit #2)', () => {
 // the re-announced nonce, and then drive the privileged bridge. The fixed design generates
 // the nonce in the ISOLATED relay and delivers it via a SINGLE-SHOT responder that is
 // already spent by the legitimate document_start pull — so a page can never re-elicit it.
+// This is the FIRST line of defence: the page never learns the nonce, so it can never
+// compute a MAC even if the algorithm were known.
 describe('bridge nonce cannot be re-elicited by a page (audit #2 re-announce leak)', () => {
   let env;
   beforeEach(() => {
@@ -103,12 +139,10 @@ describe('bridge nonce cannot be re-elicited by a page (audit #2 re-announce lea
         }
       };
       env.window.addEventListener('__victauri_response', handler);
-      // Drive the bridge with whatever the page managed to capture. A real page that
-      // captured nothing has no nonce; represent that as '' (non-null) so the harness's
-      // auto-stamp convenience does not paper over the rejection. If the page HAD captured
-      // the real nonce (the vulnerability), `stolen` would be passed through and accepted.
+      // The page captured nothing (stolen === null). It has no nonce and cannot compute a
+      // MAC, so it dispatches a command with a bogus mac — which the bridge must ignore.
       env.window.dispatchEvent(new env.window.CustomEvent('__victauri_command', {
-        detail: { id, method: 'snapshot', args: {}, nonce: stolen == null ? '' : stolen },
+        detail: { id, method: 'snapshot', args: {}, nonce: stolen == null ? '' : stolen, mac: 'deadbeef'.repeat(8) },
       }));
       setTimeout(() => {
         env.window.removeEventListener('__victauri_response', handler);

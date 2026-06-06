@@ -17,6 +17,20 @@ export function createBridgeEnv(html = '<html><head><title>Test</title></head><b
 
   const { window } = dom;
 
+  // jsdom provides neither SubtleCrypto nor TextEncoder, but the bridge's audit-A4 message
+  // authentication (HMAC-SHA256 over the channel) needs both. Borrow Node's implementations
+  // so the bridge runs exactly as it does in a real browser secure context. Must be set
+  // BEFORE the bridge script is injected (it reads `crypto.subtle` at load).
+  if (!window.TextEncoder) window.TextEncoder = globalThis.TextEncoder;
+  if (!window.TextDecoder) window.TextDecoder = globalThis.TextDecoder;
+  if (window.crypto && !window.crypto.subtle && globalThis.crypto && globalThis.crypto.subtle) {
+    try {
+      Object.defineProperty(window.crypto, 'subtle', { value: globalThis.crypto.subtle, configurable: true });
+    } catch (e) {
+      try { window.crypto.subtle = globalThis.crypto.subtle; } catch (e2) { /* ignore */ }
+    }
+  }
+
   // jsdom doesn't have PerformanceObserver — stub it
   if (!window.PerformanceObserver) {
     window.PerformanceObserver = class {
@@ -96,14 +110,48 @@ export function createBridgeEnv(html = '<html><head><title>Test</title></head><b
   // Mirror the relay's readiness offer (covers bridge-loaded-first ordering).
   window.dispatchEvent(new window.CustomEvent('__victauri_nonce_offer'));
 
-  // Simulate the ISOLATED relay: stamp the nonce onto nonce-less command events so
-  // existing tests (which dispatch __victauri_command directly) keep working.
+  // Simulate the ISOLATED relay's audit-A4 message authentication: a command a test
+  // dispatches directly carries no MAC, so we sign it with relayNonce (the same secret the
+  // bridge pulled via the handshake) and re-dispatch it WITH a valid `mac` — exactly what
+  // the real content-isolated relay does. The bridge now authenticates commands by MAC, so
+  // an unsigned command would (correctly) be ignored. Signing is async, so the override
+  // re-dispatches on the next microtask; the test's response listener is already attached.
+  function relaySafeJson(v) {
+    try { var s = JSON.stringify(v); return s === undefined ? 'null' : s; }
+    catch (e) { return '"[unserializable]"'; }
+  }
+  let relayMacKeyPromise = null;
+  function relayMacKey() {
+    if (!relayMacKeyPromise) {
+      relayMacKeyPromise = window.crypto.subtle.importKey(
+        'raw', new window.TextEncoder().encode(relayNonce),
+        { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+      );
+    }
+    return relayMacKeyPromise;
+  }
+  function relayMac(parts) {
+    return relayMacKey().then((key) =>
+      window.crypto.subtle.sign('HMAC', key, new window.TextEncoder().encode(JSON.stringify(parts)))
+        .then((sig) => Array.prototype.map.call(new Uint8Array(sig), (b) => ('0' + b.toString(16)).slice(-2)).join(''))
+    );
+  }
   const origDispatch = window.dispatchEvent.bind(window);
   window.dispatchEvent = function (ev) {
-    if (ev && ev.type === '__victauri_command' && ev.detail && ev.detail.nonce == null && relayNonce) {
-      ev = new window.CustomEvent('__victauri_command', {
-        detail: Object.assign({}, ev.detail, { nonce: relayNonce }),
+    // Only sign PRISTINE commands (no mac AND no nonce) — those represent the legit
+    // SW->relay path. A command that supplies its own `mac`/`nonce` is treated as
+    // page-originated and left unsigned, so provenance tests can prove the bridge rejects
+    // anything lacking a relay-issued MAC.
+    if (ev && ev.type === '__victauri_command' && ev.detail
+        && ev.detail.mac == null && ev.detail.nonce == null
+        && relayNonce && window.crypto && window.crypto.subtle) {
+      const d = ev.detail;
+      relayMac([d.id, d.method, relaySafeJson(d.args || {})]).then((mac) => {
+        origDispatch(new window.CustomEvent('__victauri_command', {
+          detail: { id: d.id, method: d.method, args: d.args, mac: mac },
+        }));
       });
+      return true;
     }
     return origDispatch(ev);
   };
