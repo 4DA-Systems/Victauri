@@ -68,6 +68,18 @@ function optionalInstall() {
   return v === "false" || v === "0";
 }
 
+// Whether to auto-register the native messaging host during postinstall.
+// DEFAULT: false. Registering writes native-messaging host manifests into the
+// browser's config directories (and, on Windows, registry keys) — a modification
+// of the user's system that must not happen silently on every `npm install`
+// (audit #1). Opt in explicitly with VICTAURI_BROWSER_AUTO_REGISTER=1 (or
+// `npm install --victauri-register`), or run `npx victauri-browser install`.
+function shouldAutoRegister() {
+  const env = process.env.VICTAURI_BROWSER_AUTO_REGISTER;
+  if (env && /^(1|true|yes|on)$/i.test(env.trim())) return true;
+  return /^(1|true|yes|on)$/i.test(String(process.env.npm_config_victauri_register || ""));
+}
+
 // Register the native messaging host by running the (already hash-verified) binary.
 function registerHost(binaryPath) {
   try {
@@ -81,6 +93,22 @@ function registerHost(binaryPath) {
     console.warn(`Run '${binaryPath} install' manually after installation.`);
     if (err.stderr) console.warn(err.stderr);
   }
+}
+
+// Either auto-register (only when the user opted in) or print the explicit,
+// consented next step. Never modify browser/OS config without opt-in.
+function registerOrInstruct(binaryPath) {
+  if (shouldAutoRegister()) {
+    registerHost(binaryPath);
+    return;
+  }
+  console.log(
+    "\nvictauri-browser: binary installed. To connect it to your browser, register the\n" +
+      "native-messaging host (writes a manifest into the browser config dir / Windows\n" +
+      "registry) by running:\n" +
+      `    npx victauri-browser install <your-extension-id>\n` +
+      "Skipped automatically — set VICTAURI_BROWSER_AUTO_REGISTER=1 to opt into auto-register."
+  );
 }
 
 async function main() {
@@ -107,7 +135,7 @@ async function main() {
   if (fs.existsSync(destPath)) {
     if (sha256(fs.readFileSync(destPath)) === expected) {
       console.log(`victauri-browser-host present and verified at ${destPath}`);
-      registerHost(destPath);
+      registerOrInstruct(destPath);
       return;
     }
     console.warn(`Existing binary at ${destPath} failed hash check — re-downloading.`);
@@ -152,7 +180,7 @@ async function main() {
   fs.writeFileSync(destPath, buf, { mode: 0o755 });
   console.log(`Verified (sha256 ok) and installed to ${destPath}`);
 
-  registerHost(destPath);
+  registerOrInstruct(destPath);
 }
 
 main().catch((err) => {

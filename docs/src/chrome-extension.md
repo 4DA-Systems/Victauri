@@ -158,6 +158,22 @@ Security features:
 - Security headers on all responses
 - Origin guard (blocks non-localhost origins)
 
+## Trust Model (read this)
+
+Browser mode is **cooperative automation for pages you control — not a security
+boundary against a hostile page.** The content script relays commands and
+responses through the page's own JavaScript context (`window` `CustomEvent`s in
+the MAIN world). A malicious page on the inspected tab can observe that channel
+and could inject commands or race a forged response. **Do not treat browser-mode
+results as a trustworthy attestation about an untrusted page**, and don't drive
+the extension against pages you don't trust while expecting tamper-proof output.
+
+This is a deliberate trade-off for a debugging tool. If you need results that are
+robust against a hostile page, use the **Tauri plugin** path instead: it runs in
+the Rust process below the webview and reads backend/IPC/DB state directly. (The
+plugin's `verify_state` / `query_db` / IPC-history tools are the verification
+surface; the browser extension is automation.)
+
 ## Port Behavior
 
 Default port: `7474`. If busy, tries `7475` through `7484`. The `victauri-browser serve` command prints the actual port on startup.
