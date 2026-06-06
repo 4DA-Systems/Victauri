@@ -84,7 +84,7 @@ Right-click any element in the DOM Explorer:
 
 Victauri runs an HTTP server **inside your Tauri app's process**. This extension talks to its REST API, giving it simultaneous access to the webview DOM, Rust backend state, IPC traffic, and native window state — something external tools like Playwright can't do.
 
-The plugin is gated behind `#[cfg(debug_assertions)]` — zero cost in release builds. It compiles away completely.
+The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op in release builds — zero runtime cost (the server never starts). Add it as a `dev-dependency` if you also want it absent from the release binary.
 
 ## Requirements
 

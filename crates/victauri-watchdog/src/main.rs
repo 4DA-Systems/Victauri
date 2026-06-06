@@ -12,6 +12,10 @@ const DEFAULT_INTERVAL_SECS: u64 = 5;
 const MIN_MAX_FAILURES: u32 = 1;
 /// Default consecutive-failure threshold when unset or unparseable.
 const DEFAULT_MAX_FAILURES: u32 = 3;
+/// Hard timeout for a recovery command. A hung recovery (e.g. a command that
+/// blocks forever) must not wedge the watchdog itself, so the child is killed
+/// after this many seconds and the failure is reported.
+const RECOVERY_TIMEOUT_SECS: u64 = 60;
 
 struct Config {
     port: u16,
@@ -208,18 +212,28 @@ fn recovery_program_name(cmd: &str) -> &str {
 }
 
 async fn run_recovery(cmd: &str) -> anyhow::Result<std::process::ExitStatus> {
-    let status = if cfg!(windows) {
+    // Spawn (not `.status()`) so we can enforce a timeout and kill a hung child —
+    // a recovery command that never returns must not block the watchdog forever.
+    let mut child = if cfg!(windows) {
         tokio::process::Command::new("cmd")
             .args(["/C", cmd])
-            .status()
-            .await?
+            .spawn()?
     } else {
         tokio::process::Command::new("sh")
             .args(["-c", cmd])
-            .status()
-            .await?
+            .spawn()?
     };
-    Ok(status)
+    match tokio::time::timeout(Duration::from_secs(RECOVERY_TIMEOUT_SECS), child.wait()).await {
+        Ok(status) => Ok(status?),
+        Err(_elapsed) => {
+            // Kill the wrapping shell so the watchdog loop is freed. (A grandchild
+            // the shell spawned may outlive it; the watchdog's job is to not wedge.)
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "recovery command timed out after {RECOVERY_TIMEOUT_SECS}s and was killed"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

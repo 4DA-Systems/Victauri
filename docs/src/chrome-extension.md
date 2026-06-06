@@ -26,39 +26,61 @@ Or build from source:
 cargo build -p victauri-browser --release
 ```
 
-### 2. Register the Native Messaging Host
+### 2. Load the Chrome Extension (do this first, to get its ID)
+
+1. Open your browser's extension management page (`chrome://extensions`)
+2. Enable "Developer mode"
+3. Click "Load unpacked" and select the `extensions/chrome/` directory from the Victauri repo
+4. Copy the **extension ID** shown on the extension's card — you need it for the next step
+
+### 3. Register the Native Messaging Host
+
+Register the native-messaging host manifest **with the extension's ID** so the
+browser will allow the extension to launch the host:
 
 ```bash
-victauri-browser install
+victauri-browser install <your-extension-id>
 ```
 
-This registers the native messaging host manifest with your browser (Chrome, Edge, Brave, or Arc are auto-detected). The manifest tells the browser how to launch the native host when the extension requests it.
-
-To uninstall:
+This writes the native messaging host manifest into your browser's config dir
+(Chrome, Edge, Brave, or Arc are auto-detected; on Windows it also writes a
+registry key). The manifest's `allowed_origins` is scoped to that extension ID,
+so the ID must match the unpacked extension you loaded in step 2. To uninstall:
 
 ```bash
 victauri-browser uninstall
 ```
 
-### 3. Load the Chrome Extension
-
-1. Open your browser's extension management page (`chrome://extensions`)
-2. Enable "Developer mode"
-3. Click "Load unpacked" and select the `extensions/chrome/` directory from the Victauri repo
-
 ### 4. Connect via MCP
 
-The native host starts an HTTP server on `localhost:7474` (with fallback to 7475-7484 if the port is busy).
+The native host starts an HTTP server on `localhost:7474` (with fallback to
+7475-7484 if the port is busy). **Auth is on by default**, so a bare `url` will be
+rejected with `401` — you must supply the Bearer token. The host either
+auto-generates a token (written to the discovery dir,
+`<temp>/victauri/<pid>/token`) or you can set a fixed one via the
+`VICTAURI_BROWSER_AUTH_TOKEN` environment variable before starting it:
+
+```bash
+# Fixed token (recommended for a stable .mcp.json):
+VICTAURI_BROWSER_AUTH_TOKEN=my-token victauri-browser serve
+```
+
+Then point your MCP client at the host port with that token:
 
 ```json
 {
   "mcpServers": {
     "victauri-browser": {
-      "url": "http://127.0.0.1:7474/mcp"
+      "url": "http://127.0.0.1:7474/mcp",
+      "headers": { "Authorization": "Bearer my-token" }
     }
   }
 }
 ```
+
+If you let the host auto-generate the token instead, read it from
+`<temp>/victauri/<pid>/token` and use it as the Bearer value (the same discovery
+file Victauri's own clients read automatically).
 
 ## Architecture
 

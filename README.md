@@ -324,7 +324,7 @@ Victauri runs **inside** the Tauri process — same thread pool, same memory spa
 | **State accuracy** | Zero drift (reads live state) | Stale (snapshot + transfer) |
 | **Backend access** | Full (AppHandle, DB, state) | Limited (webview only) |
 | **Setup** | One line in Cargo.toml | Separate process + config |
-| **Release build** | Compiles away entirely | Must be disabled manually |
+| **Release build** | `init()` is a no-op (zero runtime cost) | Must be disabled manually |
 
 **Port selection:** Victauri tries port 7373 first, then falls back through 7374-7383 if taken. The actual port is written to a temp directory for automatic client discovery.
 
@@ -368,11 +368,25 @@ victauri/
 Victauri isn't limited to Tauri apps. The browser extension + native host brings the same MCP inspection to **any website**:
 
 ```bash
-cargo install victauri-browser
-victauri-browser-host install    # Registers native messaging host
+cargo install victauri-browser                       # builds the `victauri-browser-host` binary
+# Load extensions/chrome/ as an unpacked extension FIRST, copy its extension ID, then:
+victauri-browser-host install <your-extension-id>    # registers native messaging host for that extension
 ```
 
-Load `extensions/chrome/` (or `extensions/firefox/`) as an unpacked extension. Connect any MCP client to `http://127.0.0.1:7474/mcp`. 20 MCP tools available. Chromium browsers (Chrome, Edge, Brave, Arc) are supported by the `victauri-browser install` native-host registration; the Firefox MV3 port is provided but its native-messaging manifest must currently be registered manually (different manifest location + an `allowed_extensions` id rather than Chromium's `allowed_origins`).
+Load `extensions/chrome/` (or `extensions/firefox/`) as an unpacked extension, then register the host with that extension's ID (above). **Auth is on by default**, so connect with the Bearer token — either set a fixed `VICTAURI_BROWSER_AUTH_TOKEN` before starting the host, or read the auto-generated token from the discovery file (`<temp>/victauri/<pid>/token`):
+
+```json
+{
+  "mcpServers": {
+    "victauri-browser": {
+      "url": "http://127.0.0.1:7474/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
+    }
+  }
+}
+```
+
+20 MCP tools available. Chromium browsers (Chrome, Edge, Brave, Arc) are supported by the `victauri-browser-host install` native-host registration; the Firefox MV3 port is provided but its native-messaging manifest must currently be registered manually (different manifest location + an `allowed_extensions` id rather than Chromium's `allowed_origins`).
 
 See the [Chrome Extension Guide](docs/src/chrome-extension.md).
 

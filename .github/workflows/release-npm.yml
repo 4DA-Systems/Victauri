@@ -16,17 +16,25 @@ on:
         type: boolean
         default: true
 
+# Least-privilege: default to read-only. The publish job needs no GitHub token
+# scopes at all (it authenticates to npm via NODE_AUTH_TOKEN), so nothing is
+# broadened here. The job-level block makes the read-only default explicit.
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: Publish npm package
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: extensions/npm
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 20
           registry-url: "https://registry.npmjs.org"
@@ -44,7 +52,7 @@ jobs:
 
       - name: Install + validate (pack)
         run: |
-          npm install --no-audit --no-fund || true
+          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
           npm pack --dry-run
 
       - name: Publish to npm

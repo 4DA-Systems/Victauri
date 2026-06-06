@@ -151,7 +151,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
     { /* full MCP server setup */ }
     
     #[cfg(not(debug_assertions))]
-    { /* no-op plugin with zero overhead */ }
+    { /* no-op plugin — zero runtime cost */ }
 }
 ```
 
@@ -159,4 +159,8 @@ In release builds:
 - No axum server is started
 - No JS bridge is injected
 - No memory is allocated for event logs
-- The binary size increase is zero
+- `init()` is a no-op — zero runtime cost
+
+Note: the crate still **compiles into** your build. The `#[cfg(debug_assertions)]`
+gate removes the runtime behaviour, not the dependency. To also keep its compiled
+code out of release binaries, add `victauri-plugin` as a `[dev-dependencies]` entry.

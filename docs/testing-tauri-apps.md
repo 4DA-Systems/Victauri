@@ -146,7 +146,7 @@ Add the plugin to your Tauri app:
 
 ```rust
 tauri::Builder::default()
-    .plugin(victauri_plugin::init())  // compiles away in release builds
+    .plugin(victauri_plugin::init())  // no-op in release builds (zero runtime cost)
     .invoke_handler(tauri::generate_handler![greet, increment, list_todos])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

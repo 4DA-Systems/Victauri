@@ -24,7 +24,7 @@ No, by design. The entire plugin is gated behind `#[cfg(debug_assertions)]` and 
 
 In **debug builds**: The JS bridge adds a small overhead for network/console/navigation interception (hooks into `fetch`, `console.*`, and history APIs). The MCP server itself uses negligible resources when idle.
 
-In **release builds**: Zero overhead. The plugin is completely compiled out.
+In **release builds**: Zero *runtime* cost. The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` returns a no-op — no axum server, no JS bridge, no event logs. The crate itself still compiles into your build unless you add it as a `[dev-dependencies]` entry; to also drop its compiled footprint from release binaries, keep it dev-only.
 
 ### How is this different from Playwright?
 

@@ -85,6 +85,12 @@ const DEFAULT_LOG_LIMIT: usize = 100;
 /// log stays well under [`MAX_EVAL_RESULT_LEN`] even on heavy-traffic apps.
 const MAX_LOG_FIELD_BYTES: usize = 4096;
 
+/// Hard cap on entries returned by `list_app_dir` (recursive). Without it a
+/// directory with millions of files (or a wide tree at max depth) would build an
+/// unbounded result Vec and blow the eval/output cap (audit B7). When hit, the
+/// listing stops and the response is marked `truncated: true`.
+const MAX_DIR_ENTRIES: usize = 10_000;
+
 const RESOURCE_URI_IPC_LOG: &str = "victauri://ipc-log";
 const RESOURCE_URI_WINDOWS: &str = "victauri://windows";
 const RESOURCE_URI_STATE: &str = "victauri://state";
@@ -1129,6 +1135,7 @@ impl VictauriMcpHandler {
         let mut entries = Vec::new();
 
         Self::list_dir_recursive(&target, &base, 0, max_depth, pattern, &mut entries);
+        let truncated = entries.len() >= MAX_DIR_ENTRIES;
 
         json_result(&serde_json::json!({
             "base": base.to_string_lossy(),
@@ -1136,6 +1143,7 @@ impl VictauriMcpHandler {
             "exists": true,
             "entries": entries,
             "count": entries.len(),
+            "truncated": truncated,
         }))
     }
 
@@ -1179,9 +1187,21 @@ impl VictauriMcpHandler {
         let max_bytes = params.max_bytes.unwrap_or(1_048_576).min(10_485_760);
         let metadata = std::fs::metadata(&target).map_err(|e| e.to_string());
 
-        match std::fs::read(&target) {
+        // Bounded read (audit B7): pull at most max_bytes+1 instead of slurping the
+        // whole file into memory and then truncating — a multi-GB file must not be
+        // fully allocated just to return a 1 MB window. The +1 detects truncation;
+        // the reported size comes from metadata, not the (capped) read.
+        let read_result = std::fs::File::open(&target).and_then(|f| {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            f.take(max_bytes as u64 + 1).read_to_end(&mut buf)?;
+            Ok(buf)
+        });
+        match read_result {
             Ok(mut bytes) => {
-                let original_size = bytes.len();
+                let original_size = metadata
+                    .as_ref()
+                    .map_or_else(|_| bytes.len(), |m| m.len() as usize);
                 let truncated = bytes.len() > max_bytes;
                 if truncated {
                     bytes.truncate(max_bytes);
@@ -3782,10 +3802,16 @@ impl VictauriMcpHandler {
         pattern: Option<&str>,
         entries: &mut Vec<serde_json::Value>,
     ) {
+        if entries.len() >= MAX_DIR_ENTRIES {
+            return;
+        }
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in read_dir.flatten() {
+            if entries.len() >= MAX_DIR_ENTRIES {
+                return;
+            }
             let path = entry.path();
             if path.is_symlink() {
                 continue;

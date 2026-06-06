@@ -190,6 +190,43 @@ fn strip_css_comments(css: &str) -> String {
     out
 }
 
+/// Decode CSS escape sequences so an obfuscated `\40 import` / `\75 rl(` / `\2f\2f`
+/// can't slip past a literal-string scan that the browser's CSS parser would still
+/// decode and act on. Handles the two CSS escape forms: `\` + 1–6 hex digits
+/// (optionally followed by one whitespace) → that code point, and `\` + any other
+/// char → that char literally. A trailing lone `\` is dropped.
+fn decode_css_escapes(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut chars = css.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        // Collect up to 6 hex digits.
+        let mut hex = String::new();
+        while hex.len() < 6 && chars.peek().is_some_and(char::is_ascii_hexdigit) {
+            hex.push(chars.next().unwrap());
+        }
+        if hex.is_empty() {
+            // `\` + non-hex → literal next char (e.g. `\@` → `@`); lone `\` dropped.
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            // One optional trailing whitespace terminates a hex escape.
+            if chars.peek().is_some_and(char::is_ascii_whitespace) {
+                chars.next();
+            }
+            match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                Some(decoded) => out.push(decoded),
+                None => out.push('\u{FFFD}'),
+            }
+        }
+    }
+    out
+}
+
 /// Validate CSS submitted to `css inject` before it is added to the page. By default this
 /// rejects two remote-fetch vectors that turn a debugging tool into a data-exfiltration /
 /// `SSRF` channel (especially dangerous when chained with prompt injection from page-sourced
@@ -211,7 +248,10 @@ pub fn sanitize_injected_css(css: &str, allow_remote: bool) -> Result<(), String
     if allow_remote {
         return Ok(());
     }
-    let scan = strip_css_comments(css).to_ascii_lowercase();
+    // Strip comments, then DECODE escapes, then lowercase — so `\40 import` and
+    // `\75 rl(` (and an escaped `\2f\2f` remote URL) are normalized to the forms
+    // the scan below matches, closing the CSS-escape bypass.
+    let scan = decode_css_escapes(&strip_css_comments(css)).to_ascii_lowercase();
     if scan.contains("@import") {
         return Err(
             "`@import` is blocked in injected CSS (it fetches a remote stylesheet — \
@@ -344,5 +384,36 @@ mod injected_css_tests {
         assert!(
             sanitize_injected_css("body{background:url(https://cdn.example/x.png)}", true).is_ok()
         );
+    }
+
+    #[test]
+    fn blocks_css_escape_obfuscated_import() {
+        // `\40 import` decodes to `@import`; `\100 6d port` style hex escapes too.
+        assert!(sanitize_injected_css("\\40 import url(https://evil.com/x.css);", false).is_err());
+        assert!(sanitize_injected_css("\\000040import 'https://evil.com';", false).is_err());
+        // `\@import` (backslash + literal char) also normalizes to `@import`.
+        assert!(sanitize_injected_css("\\@import url(//evil.com)", false).is_err());
+    }
+
+    #[test]
+    fn blocks_css_escape_obfuscated_remote_url() {
+        // `\75 rl(` decodes to `url(` (hex escape + space-terminator).
+        assert!(
+            sanitize_injected_css("body{background:\\75 rl(https://evil.com/x)}", false).is_err()
+        );
+        // Escaped protocol-relative `//` via unambiguous 6-digit escapes (matches CSS
+        // greedy hex parsing: `\2f` followed by a hex char would eat it, so a real
+        // attacker uses the 6-digit or space-terminated form).
+        assert!(
+            sanitize_injected_css("body{background:url(\\00002f\\00002fevil.com/x)}", false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn escape_decoding_preserves_legitimate_css() {
+        // A legitimately-escaped local content value must still pass.
+        assert!(sanitize_injected_css("a::before{content:'\\2022'}", false).is_ok());
+        assert!(sanitize_injected_css("body{color:red}", false).is_ok());
     }
 }

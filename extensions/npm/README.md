@@ -68,13 +68,17 @@ victauri-browser version
 
 ## Connecting an MCP Client
 
-Add to your `.mcp.json`:
+**Auth is on by default** — a bare `url` is rejected with `401`. Supply the Bearer
+token: either set a fixed `VICTAURI_BROWSER_AUTH_TOKEN` before the host starts, or
+read the auto-generated token from the discovery file
+(`<temp>/victauri/<pid>/token`). Then add to your `.mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "victauri-browser": {
-      "url": "http://127.0.0.1:7474/mcp"
+      "url": "http://127.0.0.1:7474/mcp",
+      "headers": { "Authorization": "Bearer <token>" }
     }
   }
 }

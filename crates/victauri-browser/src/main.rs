@@ -92,6 +92,10 @@ async fn serve() -> anyhow::Result<()> {
 
     let auth_token = std::env::var("VICTAURI_BROWSER_AUTH_TOKEN")
         .ok()
+        // An empty/whitespace env var must not become an empty Bearer credential
+        // (which would lock out every request); treat it as "unset" and fall
+        // through to auto-generating a real token.
+        .filter(|t| !t.trim().is_empty())
         .or_else(|| {
             let token = auth::generate_token();
             // Never log the full token (audit B5): it grants access to the host.
@@ -225,7 +229,11 @@ async fn process_message(
 
 async fn try_bind(preferred: u16) -> anyhow::Result<tokio::net::TcpListener> {
     for offset in 0..=PORT_RANGE {
-        let port = preferred + offset;
+        // checked_add: a `preferred` near u16::MAX would otherwise overflow
+        // `preferred + offset` (panic in debug, wrap in release).
+        let Some(port) = preferred.checked_add(offset) else {
+            break;
+        };
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
@@ -239,7 +247,7 @@ async fn try_bind(preferred: u16) -> anyhow::Result<tokio::net::TcpListener> {
     }
     anyhow::bail!(
         "no available port in range {preferred}-{}",
-        preferred + PORT_RANGE
+        preferred.saturating_add(PORT_RANGE)
     )
 }
 

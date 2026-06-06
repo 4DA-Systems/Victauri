@@ -105,10 +105,14 @@ pub use victauri_macros::inspectable;
 #[macro_export]
 macro_rules! register_commands {
     ($app:expr, $($schema_call:expr),+ $(,)?) => {{
-        let state = $app.state::<std::sync::Arc<$crate::VictauriState>>();
-        $(
-            state.registry.register($schema_call);
-        )+
+        // `try_state` (not `state`) so this is a no-op in RELEASE builds: there
+        // `init()` returns a no-op plugin that never manages `VictauriState`, and
+        // `state()` would PANIC on the missing type. Registration is debug-only.
+        if let Some(state) = $app.try_state::<std::sync::Arc<$crate::VictauriState>>() {
+            $(
+                state.registry.register($schema_call);
+            )+
+        }
     }};
 }
 

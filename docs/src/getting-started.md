@@ -17,7 +17,7 @@ Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 victauri-plugin = "0.5"
 ```
 
-The plugin must be a regular dependency (not `[dev-dependencies]`) because it runs inside your app process. In release builds, `init()` returns a no-op plugin with zero overhead — no feature flags needed.
+The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary, so for a zero compiled-footprint release, add it under `[dev-dependencies]` instead and gate your `init()` call with `#[cfg(debug_assertions)]`.
 
 ## Step 2: Initialize the Plugin
 
