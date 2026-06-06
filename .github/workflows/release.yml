@@ -3,7 +3,12 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      # Canonical crate version tags ONLY — semver `vMAJOR.MINOR.PATCH`.
+      # A bare `v*` also matches `vscode-v*` (release-vscode.yml), which would
+      # fire the full crates.io publish + binary release on a VS Code tag and
+      # race that workflow. This pattern requires a digit right after `v`, so it
+      # is disjoint from `vscode-v*` and `npm-v*` (red-team A6).
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 env:
   CARGO_TERM_COLOR: always
@@ -21,7 +26,11 @@ jobs:
       - name: Install system dependencies
         uses: ./.github/actions/linux-deps
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Action code pinned to a SHA (no semver tags exist on this repo); the Rust
+      # channel stays dynamic via `toolchain: stable` so we still get latest stable.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
@@ -131,8 +140,11 @@ jobs:
         if: runner.os == 'Linux'
         uses: ./.github/actions/linux-deps
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Action code pinned to a SHA (no semver tags exist on this repo); the Rust
+      # channel stays dynamic via `toolchain: stable` so we still get latest stable.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
@@ -253,8 +265,15 @@ jobs:
 
       - name: Assert tag matches workspace version
         run: |
+          set -euo pipefail
           TAG="${GITHUB_REF#refs/tags/v}"
-          VER="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          # Anchor on `version =` (the [workspace.package] key) so we can't match a
+          # stray `version-*` key; bail loudly if the parse comes back empty.
+          VER="$(grep -m1 -E '^version[[:space:]]*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          if [ -z "$VER" ]; then
+            echo "::error::could not parse workspace version from Cargo.toml"
+            exit 1
+          fi
           if [ "$TAG" != "$VER" ]; then
             echo "::error::tag v$TAG does not match workspace version $VER"
             exit 1
@@ -264,7 +283,11 @@ jobs:
       - name: Install system dependencies
         uses: ./.github/actions/linux-deps
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Action code pinned to a SHA (no semver tags exist on this repo); the Rust
+      # channel stays dynamic via `toolchain: stable` so we still get latest stable.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
