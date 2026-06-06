@@ -4,7 +4,7 @@
 
 Victauri is full-stack testing for Tauri apps. Click a button in the frontend, verify the Rust command ran, confirm the database row was written — from a single test, on macOS, Windows, and Linux, in CI. Unlike browser automation tools like Playwright — which can't even attach to a Tauri webview on macOS or Linux — Victauri runs inside the app process with simultaneous, read-only access to the webview DOM, the IPC layer, the Rust backend, the database, and native window state.
 
-It works by embedding a lightweight server inside your Tauri app's own process — debug builds only; it compiles away to nothing in release. Your test suite, `curl`, or CI talks to it over a plain REST/HTTP API. No WebDriver, no Selenium grid, no browser dependency.
+It works by embedding a lightweight server inside your Tauri app's own process — debug builds only; the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release. Your test suite, `curl`, or CI talks to it over a plain REST/HTTP API. No WebDriver, no Selenium grid, no browser dependency.
 
 And because that same server also speaks the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), any AI agent — Claude Code, Cursor, Windsurf — gets the exact same full-stack access for interactive debugging. **Testing is the job; the agent integration is the bonus.**
 
@@ -32,7 +32,7 @@ All of this is exposed two ways from the same server: a plain **REST/HTTP API** 
 
 1. **Same-process** — The MCP server runs inside the Tauri app process, not as a separate sidecar. This gives sub-millisecond tool response times and direct `AppHandle` access.
 
-2. **Zero-cost in release** — Everything is gated behind `#[cfg(debug_assertions)]`. In release builds, the plugin is a complete no-op with zero binary size overhead.
+2. **Zero runtime cost in release** — The server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. (The crate still compiles in as a dependency; add it as a `dev-dependency` if you want it absent from the release binary entirely.)
 
 3. **Full-stack** — WebView + IPC + Backend + DB, not just DOM. Cross-boundary verification catches state drift between frontend and backend.
 
