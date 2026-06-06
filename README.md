@@ -348,7 +348,7 @@ victauri/
 │   └── npm/                 # @4da/victauri-browser npm package
 ├── docs/                    # mdbook documentation site
 └── examples/
-    └── demo-app/            # Multi-window Tauri app with 19 instrumented commands
+    └── demo-app/            # Multi-window Tauri app with 21 instrumented commands
 ```
 
 | Crate | Purpose | Tauri dependency? |
@@ -459,7 +459,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - [**Chrome Extension**](docs/src/chrome-extension.md) — Browser MCP for any website
 - [**FAQ**](docs/src/faq.md) — Common questions and troubleshooting
 - [**VS Code Extension**](editors/vscode/) — Live inspection from your editor
-- [**Demo App**](examples/demo-app/) — Reference app with 19 instrumented commands
+- [**Demo App**](examples/demo-app/) — Reference app with 21 instrumented commands
 - [**Agent Session**](examples/agent-session.md) — Real AI agent transcript
 - [**Migration Guide**](MIGRATION.md) — Upgrading between versions
 - [**Contributing**](CONTRIBUTING.md) — How to contribute

@@ -1224,8 +1224,10 @@ windows. Available when the app is running in debug mode.
 the app process with sub-ms response times and direct AppHandle access — it sees
 everything, not just the webview.
 
-Key tools that only Victauri can provide (not available via CDP/Playwright):
-- `invoke_command` — call any registered Tauri command directly
+Key Victauri tools (the read-only backend/DB introspection below has no CDP/Playwright
+equivalent — and on macOS/Linux CDP can't attach to a Tauri webview at all):
+- `invoke_command` — call any registered Tauri command directly (also records timing and
+  honours fault injection; an eval-capable tool can also reach `__TAURI_INTERNALS__.invoke`)
 - `verify_state` — cross-boundary frontend/backend state verification
 - `detect_ghost_commands` — find commands with no backend handler
 - `check_ipc_integrity` — verify IPC pipeline health

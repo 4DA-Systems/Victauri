@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-06-07
+
 Driven by the agent-eval A/B (`scripts/agent-eval/RESULTS.md`), which refuted the
 naive "browser tools can't reach the Rust backend" thesis and surfaced the honest,
 defensible one — *browser tools can **poke** a Tauri backend, but only Victauri can
@@ -76,9 +78,22 @@ structural authorization bypass; the rest hardens the real machine-touching surf
   postinstall no longer auto-registers the native-messaging host (browser manifests +
   Windows registry) on every install — opt in with `VICTAURI_BROWSER_AUTO_REGISTER=1`
   or run `npx victauri-browser install <ext-id>`.
-- **Browser trust model documented honestly (audit A4):** browser mode is cooperative
-  automation, not a verification boundary against a hostile page (the relay crosses the
-  page's own JS context). Use the Tauri plugin path for tamper-resistant verification.
+- **Browser extension channel forgery closed (audit A4).** The ISOLATED↔MAIN content-script
+  channel shipped the secret nonce inside every `__victauri_command` event on the shared
+  `window`, so a hostile page could read it and race a forged `__victauri_response` (the relay
+  matched responses by id only) — verified exploitable in real Chromium. Commands AND responses
+  are now authenticated with an HMAC-SHA256 keyed by the nonce, which is exchanged only in the
+  synchronous `document_start` handshake and never placed on a post-page event; the relay/bridge
+  ignore any message without a valid MAC (and fail CLOSED on non-secure http:// origins, where
+  Web Crypto is unavailable). Closes both response forgery and command injection; re-verified in
+  real Chromium. Chrome + Firefox; reusable `extensions/chrome/tests/e2e/a4-channel-forgery.mjs`.
+  Browser mode remains **experimental** (no per-domain/tab privilege model yet); prefer the Tauri
+  plugin path for the strongest guarantees.
+- **Browser extension now loads.** The manifests referenced `icons/icon-*.png` that did not
+  exist in the repo and weren't generated at build, so Chrome refused to load the unpacked
+  extension. Added the icon set (Chrome + Firefox) and bumped both manifests off the stale 0.7.1.
+  Fixed the Firefox `strict_min_version` to 128 (the `world: "MAIN"` content script the bridge
+  needs is only enabled by default in Firefox 128 — it was silently broken on the declared 109).
 - **Release/CI hardening (audit A6/C6/D8/#8):** the crate-release workflow only triggers
   on `v[0-9]+.[0-9]+.[0-9]+` tags (a `vscode-*` tag can't fire the crates.io publish);
   third-party actions pinned to commit SHAs; the GitHub Release stays gated on the

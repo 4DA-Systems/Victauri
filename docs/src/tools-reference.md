@@ -1,6 +1,6 @@
 # Tools Reference
 
-Victauri exposes 34 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
+Victauri exposes 35 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
 
 All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
 
