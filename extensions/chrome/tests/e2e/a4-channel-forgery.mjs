@@ -66,17 +66,10 @@ const HOSTILE_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>A4
 })();
 </script></head><body><h1>hostile</h1></body></html>`;
 
-// The committed manifest references icons that are generated at packaging time; load from a
-// sanitized copy with the icon refs stripped so Chromium accepts the unpacked extension.
-function sanitizedExtension() {
-  const dst = fs.mkdtempSync(path.join(os.tmpdir(), 'vic-a4-ext-'));
-  fs.cpSync(EXT_SRC, dst, { recursive: true });
-  const mpath = path.join(dst, 'manifest.json');
-  const m = JSON.parse(fs.readFileSync(mpath, 'utf8'));
-  delete m.icons;
-  if (m.action) delete m.action.default_icon;
-  fs.writeFileSync(mpath, JSON.stringify(m, null, 2));
-  return dst;
+// Load the REAL committed extension directory unmodified. This also validates that the
+// manifest (icons included) loads cleanly in Chromium — the regression that 7b66ce0 fixed.
+function realExtension() {
+  return EXT_SRC;
 }
 
 function serve() {
@@ -93,7 +86,7 @@ async function main() {
   const pw = loadPlaywright();
   if (!pw || !pw.chromium) skip('Playwright not available — install it to run this real-browser test.');
 
-  const ext = sanitizedExtension();
+  const ext = realExtension();
   const userDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vic-a4-user-'));
   const { srv, port } = await serve();
   const url = `http://127.0.0.1:${port}/`;
@@ -149,7 +142,7 @@ async function main() {
     if (ctx) await ctx.close().catch(() => {});
     srv.close();
     try { fs.rmSync(userDir, { recursive: true, force: true }); } catch { /* ignore */ }
-    try { fs.rmSync(ext, { recursive: true, force: true }); } catch { /* ignore */ }
+    // NOTE: `ext` is the real repo extension dir (loaded unmodified) — never delete it.
   }
 
   if (process.exitCode) console.error('\nA4 channel-forgery test FAILED.');

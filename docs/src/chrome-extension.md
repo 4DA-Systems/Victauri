@@ -39,7 +39,7 @@ Register the native-messaging host manifest **with the extension's ID** so the
 browser will allow the extension to launch the host:
 
 ```bash
-victauri-browser install <your-extension-id>
+victauri-browser-host install <your-extension-id>
 ```
 
 This writes the native messaging host manifest into your browser's config dir
@@ -48,7 +48,7 @@ registry key). The manifest's `allowed_origins` is scoped to that extension ID,
 so the ID must match the unpacked extension you loaded in step 2. To uninstall:
 
 ```bash
-victauri-browser uninstall
+victauri-browser-host uninstall
 ```
 
 ### 4. Connect via MCP
@@ -62,7 +62,7 @@ auto-generates a token (written to the discovery dir,
 
 ```bash
 # Fixed token (recommended for a stable .mcp.json):
-VICTAURI_BROWSER_AUTH_TOKEN=my-token victauri-browser serve
+VICTAURI_BROWSER_AUTH_TOKEN=my-token victauri-browser-host serve
 ```
 
 Then point your MCP client at the host port with that token:
@@ -167,7 +167,7 @@ The native host supports Bearer token authentication:
 ```bash
 # Set via environment variable (note: the browser host uses its own
 # VICTAURI_BROWSER_AUTH_TOKEN var, not the plugin's VICTAURI_AUTH_TOKEN)
-VICTAURI_BROWSER_AUTH_TOKEN=my-token victauri-browser serve
+VICTAURI_BROWSER_AUTH_TOKEN=my-token victauri-browser-host serve
 ```
 
 When no token is set, the host auto-generates one and writes it to the
@@ -198,7 +198,7 @@ surface; the browser extension is automation.)
 
 ## Port Behavior
 
-Default port: `7474`. If busy, tries `7475` through `7484`. The `victauri-browser serve` command prints the actual port on startup.
+Default port: `7474`. If busy, tries `7475` through `7484`. The `victauri-browser-host serve` command prints the actual port on startup.
 
 ## Tab Management
 

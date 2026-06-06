@@ -146,7 +146,7 @@ fn main() {
 
 ## Optional: REST API
 
-All 34 tools are also available via a REST API without MCP session overhead:
+All 35 tools are also available via a REST API without MCP session overhead:
 
 ```bash
 # List available tools
@@ -161,6 +161,6 @@ curl -X POST http://127.0.0.1:7373/api/tools/eval_js \
 ## Next Steps
 
 - [Architecture](./architecture.md) — Understand how Victauri works under the hood
-- [Tools Reference](./tools-reference.md) — Complete list of all 34 tools
+- [Tools Reference](./tools-reference.md) — Complete list of all 35 tools
 - [Configuration](./configuration.md) — Customize port, auth, privacy, and more
 - [Testing](./testing.md) — Write automated tests with the victauri-test crate

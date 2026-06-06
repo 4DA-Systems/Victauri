@@ -2,7 +2,7 @@
 
 **Victauri** — Verified Introspection & Control for Tauri Applications.
 
-Victauri is full-stack testing for Tauri apps. Click a button in the frontend, verify the Rust command ran, confirm the database row was written — from a single test, on macOS, Windows, and Linux, in CI. Unlike browser automation tools like Playwright — which can't even attach to a Tauri webview on macOS or Linux — Victauri runs inside the app process with simultaneous, read-only access to the webview DOM, the IPC layer, the Rust backend, the database, and native window state.
+Victauri is full-stack testing for Tauri apps. Click a button in the frontend, verify the Rust command ran, confirm the database row was written — from a single test, on macOS, Windows, and Linux, in CI. Unlike browser automation tools like Playwright — which can't even attach to a Tauri webview on macOS or Linux — Victauri runs inside the app process with simultaneous access to the webview DOM, the IPC layer, the Rust backend, the database, and native window state (the backend and database tools are read-only).
 
 It works by embedding a lightweight server inside your Tauri app's own process — debug builds only; the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release. Your test suite, `curl`, or CI talks to it over a plain REST/HTTP API. No WebDriver, no Selenium grid, no browser dependency.
 

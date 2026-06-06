@@ -46,6 +46,15 @@ expect "README 'N tools across the full stack'" "$tools" \
 expect "README 'All N tools'" "$tools" \
   "$(grep -oE 'All [0-9]+ tools' README.md | grep -oE '[0-9]+' || true)" \
   README.md
+expect "getting-started 'All N tools ... REST'" "$tools" \
+  "$(grep -oE 'All [0-9]+ tools are also available' docs/src/getting-started.md | grep -oE '[0-9]+' || true)" \
+  docs/src/getting-started.md
+expect "getting-started 'Complete list of all N tools'" "$tools" \
+  "$(grep -oE 'Complete list of all [0-9]+ tools' docs/src/getting-started.md | grep -oE '[0-9]+' | head -1 || true)" \
+  docs/src/getting-started.md
+expect "tools-reference 'exposes N MCP tools'" "$tools" \
+  "$(grep -oE 'exposes [0-9]+ MCP tools' docs/src/tools-reference.md | grep -oE '[0-9]+' || true)" \
+  docs/src/tools-reference.md
 
 # ── Chrome extension vitest count ────────────────────────────────────────────
 vitest=$(count '^[[:space:]]*(it|test)\(' extensions/chrome/tests/*.test.js)

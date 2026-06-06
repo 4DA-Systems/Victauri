@@ -1,5 +1,26 @@
 # Migration Guide
 
+## v0.7.8 → v0.7.9 (security hardening — no API breaks, some behavior changes)
+
+Response to a cross-model adversarial audit. No public Rust API changed, but a few
+behaviors did — review if you relied on them:
+
+- **Privacy enforcement is now strict at dispatch.** `recording.replay`/`flush` are
+  FullControl-only; `verify_state`/`assert_semantic` are no longer in the Test profile;
+  `route.clear`/`clear_all` and every compound action are gated by the operator's
+  disable/allow/block lists (previously some actions slipped past). If you drove these
+  under a restricted profile, grant the capability explicitly.
+- **Empty/whitespace auth tokens now disable auth** (with a loud warning) instead of
+  enabling auth-but-bypassable. Set a real token or use `auth_disabled()` intentionally.
+- **npm `@4da/victauri-browser` no longer auto-registers** the native-messaging host on
+  install. Opt in with `VICTAURI_BROWSER_AUTO_REGISTER=1` or run
+  `npx victauri-browser install <ext-id>`.
+- **Browser extension:** the channel is now HMAC-authenticated (audit A4) and **requires a
+  secure context** (https / localhost) — on a plain http:// origin the bridge fails closed.
+  The **Firefox** extension now requires **Firefox 128+** (it relies on a `world: "MAIN"`
+  content script). Browser mode remains experimental; use the Tauri plugin for the strongest
+  guarantees.
+
 ## v0.7.7 → v0.7.8 (build fix — no action required)
 
 Crates-only patch. `victauri-plugin` now compiles with `default-features = false`
