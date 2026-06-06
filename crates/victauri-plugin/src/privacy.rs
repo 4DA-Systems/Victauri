@@ -92,6 +92,29 @@ impl PrivacyConfig {
         is_allowed_by_profile(self.profile, tool_or_action)
     }
 
+    /// Authoritative dispatch gate for a tool call.
+    ///
+    /// `bare_tool` is the top-level tool name (e.g. `"recording"`); `capability`
+    /// is the canonical matrix identity for the specific action (e.g.
+    /// `"recording.replay"`), as resolved by
+    /// [`crate::mcp::authz::canonical_capability`]. A call is allowed only when:
+    ///
+    /// 1. the operator has not explicitly disabled the whole tool by its bare name
+    ///    (`disable_tool("recording")` must block every `recording.*` action); AND
+    /// 2. the resolved capability is permitted by the profile and not itself in
+    ///    `disabled_tools`.
+    ///
+    /// This is what closes the per-action authorization gap: an action whose
+    /// handler forgot to check it is still gated here, and a bare-name disable now
+    /// covers all of a compound tool's actions.
+    #[must_use]
+    pub fn is_call_allowed(&self, bare_tool: &str, capability: &str) -> bool {
+        if self.disabled_tools.contains(bare_tool) {
+            return false;
+        }
+        self.is_tool_enabled(capability)
+    }
+
     /// Check whether `invoke_command` is allowed for a specific command name.
     ///
     /// In `Test` profile, `invoke_command` is only allowed if the command is on the
@@ -146,9 +169,12 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "resolve_command"
                 | "wait_for"
                 | "app_state"
-                // Assertions (use eval internally but are test-oriented)
-                | "verify_state"
-                | "assert_semantic"
+                // NOTE: verify_state and assert_semantic are intentionally NOT in
+                // the Test allowlist. Both execute a caller-supplied JS expression
+                // (`frontend_expr` / `expression`) — that is arbitrary eval, which
+                // the Test profile forbids. Listing them here advertised a
+                // capability that the eval_js gate then always rejected (audit B4).
+                // They remain available in FullControl.
                 // Interactions
                 | "interact"
                 | "interact.click"
@@ -210,8 +236,13 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "window"
                 | "window.get_state"
                 | "window.list"
+                | "window.introspectability"
                 | "get_window_state"
-                // Navigate (read-only actions)
+                // Navigate (read-only actions). The bare `navigate` name is listed
+                // so the tool surfaces in `list_tools`; the per-action matrix below
+                // (and the centralized authz resolver) is what gates `go_to` /
+                // `set_dialog_response` (mutations) to FullControl only.
+                | "navigate"
                 | "navigate.go_back"
                 | "navigate.get_history"
                 | "navigate.get_dialog_log"
@@ -249,6 +280,7 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "window"
                 | "window.get_state"
                 | "window.list"
+                | "window.introspectability"
                 | "get_window_state"
                 | "wait_for"
         ),
@@ -425,9 +457,12 @@ mod tests {
     }
 
     #[test]
-    fn test_profile_blocks_navigation() {
+    fn test_profile_blocks_navigation_mutations() {
         let config = test_privacy_config();
-        assert!(!config.is_tool_enabled("navigate"));
+        // The bare `navigate` tool surfaces in list_tools (read actions are
+        // allowed), but the mutating navigation actions stay FullControl-only —
+        // the centralized authz resolver gates on these per-action identities.
+        assert!(config.is_tool_enabled("navigate"));
         assert!(!config.is_tool_enabled("navigate.go_to"));
         assert!(!config.is_tool_enabled("set_dialog_response"));
         assert!(!config.is_tool_enabled("navigate.set_dialog_response"));
@@ -461,7 +496,6 @@ mod tests {
         let config = test_privacy_config();
         assert!(config.is_tool_enabled("dom_snapshot"));
         assert!(config.is_tool_enabled("find_elements"));
-        assert!(config.is_tool_enabled("verify_state"));
         assert!(config.is_tool_enabled("detect_ghost_commands"));
         assert!(config.is_tool_enabled("check_ipc_integrity"));
         assert!(config.is_tool_enabled("get_registry"));
@@ -469,7 +503,29 @@ mod tests {
         assert!(config.is_tool_enabled("get_plugin_info"));
         assert!(config.is_tool_enabled("resolve_command"));
         assert!(config.is_tool_enabled("wait_for"));
-        assert!(config.is_tool_enabled("assert_semantic"));
+    }
+
+    #[test]
+    fn test_profile_blocks_arbitrary_eval_assertions() {
+        // verify_state and assert_semantic run a caller-supplied JS expression,
+        // i.e. arbitrary eval, which the Test profile forbids (audit B4).
+        let config = test_privacy_config();
+        assert!(!config.is_tool_enabled("verify_state"));
+        assert!(!config.is_tool_enabled("assert_semantic"));
+    }
+
+    #[test]
+    fn test_profile_allows_navigation_reads_and_introspectability() {
+        // B4 fix: per-action navigation reads must be reachable in Test (the bare
+        // `navigate` name is now listed so the central authz check resolves them).
+        let config = test_privacy_config();
+        assert!(config.is_tool_enabled("navigate.go_back"));
+        assert!(config.is_tool_enabled("navigate.get_history"));
+        assert!(config.is_tool_enabled("navigate.get_dialog_log"));
+        assert!(config.is_tool_enabled("window.introspectability"));
+        // Navigation mutations stay FullControl-only.
+        assert!(!config.is_tool_enabled("navigate.go_to"));
+        assert!(!config.is_tool_enabled("navigate.set_dialog_response"));
     }
 
     // ── Profile: Observe ───────────────────────────────────────────────────

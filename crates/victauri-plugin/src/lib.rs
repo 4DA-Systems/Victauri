@@ -1226,7 +1226,9 @@ mod tests {
         assert!(config.is_tool_enabled("recording"));
         assert!(!config.is_tool_enabled("eval_js"));
         assert!(!config.is_tool_enabled("screenshot"));
-        assert!(!config.is_tool_enabled("navigate"));
+        // The bare `navigate` tool surfaces (read actions allowed), but the
+        // mutating `go_to` action stays FullControl-only.
+        assert!(!config.is_tool_enabled("navigate.go_to"));
     }
 
     #[test]

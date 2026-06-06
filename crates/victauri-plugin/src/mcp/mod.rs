@@ -4,6 +4,7 @@
 // structs are already factored into sub-modules (webview_params, window_params,
 // etc.) to keep this file focused on dispatch logic.
 
+mod authz;
 mod backend_params;
 mod compound_params;
 mod helpers;
@@ -3531,8 +3532,12 @@ impl VictauriMcpHandler {
         name: &str,
         args: serde_json::Value,
     ) -> Result<CallToolResult, rest::ToolCallError> {
-        if !self.state.privacy.is_tool_enabled(name) {
-            return Ok(tool_disabled(name));
+        // Centralized authorization: resolve the canonical `tool.action` capability
+        // and gate on it BEFORE dispatch, so every compound action is checked
+        // uniformly (not just the ones whose handler remembers to). See `authz`.
+        let capability = authz::canonical_capability(name, &args);
+        if !self.state.privacy.is_call_allowed(name, &capability) {
+            return Ok(tool_disabled(&capability));
         }
         self.state.tool_invocations.fetch_add(1, Ordering::Relaxed);
         let start = std::time::Instant::now();
@@ -4327,9 +4332,13 @@ impl ServerHandler for VictauriMcpHandler {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let tool_name: String = request.name.as_ref().to_owned();
-        if !self.state.privacy.is_tool_enabled(&tool_name) {
-            tracing::debug!(tool = %tool_name, "tool call blocked by privacy config");
-            return Ok(tool_disabled(&tool_name));
+        // Centralized authorization: gate on the canonical `tool.action` capability
+        // resolved from the call arguments, matching the REST path in `execute_tool`.
+        let args_value = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+        let capability = authz::canonical_capability(&tool_name, &args_value);
+        if !self.state.privacy.is_call_allowed(&tool_name, &capability) {
+            tracing::debug!(tool = %tool_name, capability = %capability, "tool call blocked by privacy config");
+            return Ok(tool_disabled(&capability));
         }
         self.state
             .tool_invocations
@@ -5134,5 +5143,311 @@ mod tests {
     #[test]
     fn css_color_empty_string() {
         assert_eq!(sanitize_css_color("").unwrap(), "");
+    }
+}
+
+/// Dispatch-level authorization tests.
+///
+/// These exercise the REAL `execute_tool` dispatch path (not just the privacy
+/// string matrix) to prove that blocked tools/actions actually return
+/// `tool_disabled` and never reach their handler. This is the negative security
+/// suite the audit required (Gate #5): the prior tests validated
+/// `is_tool_enabled(...)` in isolation, which let structural dispatch bypasses
+/// pass undetected.
+#[cfg(test)]
+mod authz_dispatch_tests {
+    use super::*;
+    use crate::bridge::WebviewBridge;
+    use crate::privacy::PrivacyConfig;
+    use std::collections::{HashMap, HashSet};
+    use victauri_core::{CommandRegistry, EventLog, EventRecorder, WindowState};
+
+    /// A bridge whose eval always fails immediately, so an *allowed* action that
+    /// reaches the bridge returns a non-privacy error fast (no 30s hang), while a
+    /// *blocked* action is rejected by dispatch before the bridge is ever touched.
+    struct RejectingBridge;
+
+    impl WebviewBridge for RejectingBridge {
+        fn eval_webview(&self, _label: Option<&str>, _script: &str) -> Result<(), String> {
+            Err("eval rejected in authz dispatch test".to_string())
+        }
+        fn get_window_states(&self, _label: Option<&str>) -> Vec<WindowState> {
+            Vec::new()
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_native_handle(&self, _label: Option<&str>) -> Result<isize, String> {
+            Err("no handle".to_string())
+        }
+        fn manage_window(&self, _label: Option<&str>, _action: &str) -> Result<String, String> {
+            Err("no window".to_string())
+        }
+        fn resize_window(&self, _l: Option<&str>, _w: u32, _h: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn move_window(&self, _l: Option<&str>, _x: i32, _y: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_window_title(&self, _l: Option<&str>, _t: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn state_with(privacy: PrivacyConfig) -> Arc<VictauriState> {
+        Arc::new(VictauriState {
+            event_log: EventLog::new(1000),
+            registry: CommandRegistry::new(),
+            port: std::sync::atomic::AtomicU16::new(0),
+            pending_evals: Arc::new(Mutex::new(HashMap::new())),
+            recorder: EventRecorder::new(1000),
+            privacy,
+            eval_timeout: std::time::Duration::from_millis(100),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            started_at: std::time::Instant::now(),
+            tool_invocations: std::sync::atomic::AtomicU64::new(0),
+            allow_file_navigation: false,
+            command_timings: crate::introspection::CommandTimings::new(),
+            fault_registry: crate::introspection::FaultRegistry::new(),
+            contract_store: crate::introspection::ContractStore::new(),
+            startup_timeline: crate::introspection::StartupTimeline::new(),
+            event_bus: crate::introspection::EventBusMonitor::default(),
+            task_tracker: crate::introspection::TaskTracker::new(),
+            bridge_ready: std::sync::atomic::AtomicBool::new(true),
+            bridge_notify: tokio::sync::Notify::new(),
+            db_search_paths: Vec::new(),
+            screencast: Arc::new(crate::screencast::Screencast::default()),
+            probes: crate::introspection::AppStateProbes::default(),
+        })
+    }
+
+    fn handler(privacy: PrivacyConfig) -> VictauriMcpHandler {
+        VictauriMcpHandler::new(state_with(privacy), Arc::new(RejectingBridge))
+    }
+
+    /// True iff the result is a privacy/authorization block (vs any other error).
+    fn is_privacy_blocked(r: &CallToolResult) -> bool {
+        r.is_error == Some(true)
+            && r.content.iter().any(|c| {
+                matches!(&c.raw, RawContent::Text(t)
+                    if t.text.contains("disabled by privacy configuration"))
+            })
+    }
+
+    async fn call(h: &VictauriMcpHandler, tool: &str, args: serde_json::Value) -> CallToolResult {
+        match h.execute_tool(tool, args).await {
+            Ok(r) => r,
+            Err(_) => panic!("dispatch returned a transport error (arg parse failure)"),
+        }
+    }
+
+    // ── Observe profile: every mutation/eval/compound-action must be blocked ──
+
+    #[tokio::test]
+    async fn observe_blocks_mutations_and_eval_through_dispatch() {
+        let h = handler(crate::privacy::observe_privacy_config());
+        let blocked: &[(&str, serde_json::Value)] = &[
+            ("eval_js", serde_json::json!({"code": "1"})),
+            ("screenshot", serde_json::json!({})),
+            ("invoke_command", serde_json::json!({"command": "greet"})),
+            ("verify_state", serde_json::json!({"frontend_expr": "1"})),
+            (
+                "assert_semantic",
+                serde_json::json!({"expression": "1", "condition": "truthy"}),
+            ),
+            (
+                "interact",
+                serde_json::json!({"action": "click", "ref_id": "e1"}),
+            ),
+            (
+                "input",
+                serde_json::json!({"action": "fill", "ref_id": "e1", "value": "x"}),
+            ),
+            (
+                "storage",
+                serde_json::json!({"action": "set", "key": "k", "value": "v"}),
+            ),
+            (
+                "storage",
+                serde_json::json!({"action": "delete", "key": "k"}),
+            ),
+            (
+                "window",
+                serde_json::json!({"action": "manage", "manage_action": "close"}),
+            ),
+            (
+                "window",
+                serde_json::json!({"action": "set_title", "title": "x"}),
+            ),
+            (
+                "navigate",
+                serde_json::json!({"action": "go_to", "url": "https://e.com"}),
+            ),
+            (
+                "css",
+                serde_json::json!({"action": "inject", "css": "body{}"}),
+            ),
+            ("route", serde_json::json!({"action": "clear_all"})),
+            ("recording", serde_json::json!({"action": "start"})),
+            ("recording", serde_json::json!({"action": "replay"})),
+            ("logs", serde_json::json!({"action": "clear"})),
+            (
+                "fault",
+                serde_json::json!({"action": "inject", "command": "x", "fault_type": "error"}),
+            ),
+            (
+                "introspect",
+                serde_json::json!({"action": "command_timings"}),
+            ),
+        ];
+        for (tool, args) in blocked {
+            let r = call(&h, tool, args.clone()).await;
+            assert!(
+                is_privacy_blocked(&r),
+                "Observe must block {tool} {args} at dispatch, got: {:?}",
+                r.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observe_allows_read_only_through_dispatch() {
+        let h = handler(crate::privacy::observe_privacy_config());
+        // These reads must NOT be privacy-blocked (they may fail for other reasons
+        // against the rejecting bridge, but never with a privacy block).
+        let allowed: &[(&str, serde_json::Value)] = &[
+            ("get_registry", serde_json::json!({})),
+            ("get_memory_stats", serde_json::json!({})),
+            ("window", serde_json::json!({"action": "list"})),
+            ("logs", serde_json::json!({"action": "ipc"})),
+            (
+                "inspect",
+                serde_json::json!({"action": "get_styles", "ref_id": "e1"}),
+            ),
+        ];
+        for (tool, args) in allowed {
+            let r = call(&h, tool, args.clone()).await;
+            assert!(
+                !is_privacy_blocked(&r),
+                "Observe must allow {tool} {args} at dispatch (blocked unexpectedly)"
+            );
+        }
+    }
+
+    // ── Test profile: interactions allowed, eval/replay/route blocked ─────────
+
+    #[tokio::test]
+    async fn test_profile_dispatch_boundaries() {
+        let h = handler(crate::privacy::test_privacy_config());
+        // Allowed in Test:
+        for (tool, args) in [
+            (
+                "interact",
+                serde_json::json!({"action": "click", "ref_id": "e1"}),
+            ),
+            (
+                "input",
+                serde_json::json!({"action": "fill", "ref_id": "e1", "value": "x"}),
+            ),
+            (
+                "storage",
+                serde_json::json!({"action": "set", "key": "k", "value": "v"}),
+            ),
+            ("navigate", serde_json::json!({"action": "go_back"})),
+            ("recording", serde_json::json!({"action": "start"})),
+            ("logs", serde_json::json!({"action": "clear"})),
+        ] {
+            let r = call(&h, tool, args.clone()).await;
+            assert!(!is_privacy_blocked(&r), "Test must allow {tool} {args}");
+        }
+        // Blocked in Test (arbitrary eval, navigation mutation, replay, FullControl tools):
+        for (tool, args) in [
+            ("eval_js", serde_json::json!({"code": "1"})),
+            ("verify_state", serde_json::json!({"frontend_expr": "1"})),
+            (
+                "navigate",
+                serde_json::json!({"action": "go_to", "url": "https://e.com"}),
+            ),
+            ("recording", serde_json::json!({"action": "replay"})),
+            (
+                "route",
+                serde_json::json!({"action": "add", "pattern": "x"}),
+            ),
+            ("css", serde_json::json!({"action": "inject", "css": "x"})),
+            (
+                "window",
+                serde_json::json!({"action": "set_title", "title": "x"}),
+            ),
+        ] {
+            let r = call(&h, tool, args.clone()).await;
+            assert!(is_privacy_blocked(&r), "Test must block {tool} {args}");
+        }
+    }
+
+    // ── disabled_tools: bare-name disable covers all of a compound tool's
+    //    actions, and per-action disable is honored even when the handler
+    //    historically did not check it (the route.clear bypass). ──────────────
+
+    #[tokio::test]
+    async fn disabling_bare_compound_tool_blocks_all_actions() {
+        let cfg = PrivacyConfig {
+            disabled_tools: HashSet::from(["recording".to_string()]),
+            ..Default::default()
+        }; // FullControl with the whole `recording` tool disabled
+        let h = handler(cfg);
+        for action in ["start", "stop", "replay", "import", "export"] {
+            let r = call(&h, "recording", serde_json::json!({"action": action})).await;
+            assert!(
+                is_privacy_blocked(&r),
+                "disabling bare `recording` must block recording.{action}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn disabling_specific_action_is_honored_at_dispatch() {
+        // The historical bypass: `route.clear`'s handler had no per-action check,
+        // so a `disabled_tools` entry for it was silently ignored. The central
+        // gate now enforces it.
+        let cfg = PrivacyConfig {
+            disabled_tools: HashSet::from([
+                "route.clear".to_string(),
+                "route.clear_all".to_string(),
+            ]),
+            ..Default::default()
+        }; // FullControl: everything else allowed
+        let h = handler(cfg);
+
+        let blocked = call(&h, "route", serde_json::json!({"action": "clear", "id": 1})).await;
+        assert!(is_privacy_blocked(&blocked), "route.clear must be blocked");
+        let blocked_all = call(&h, "route", serde_json::json!({"action": "clear_all"})).await;
+        assert!(
+            is_privacy_blocked(&blocked_all),
+            "route.clear_all must be blocked"
+        );
+
+        // A sibling action the operator did NOT disable is still reachable.
+        let allowed = call(&h, "route", serde_json::json!({"action": "list"})).await;
+        assert!(
+            !is_privacy_blocked(&allowed),
+            "route.list must remain allowed"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_control_allows_everything_at_dispatch() {
+        let h = handler(PrivacyConfig::default());
+        for (tool, args) in [
+            ("recording", serde_json::json!({"action": "replay"})),
+            ("route", serde_json::json!({"action": "clear_all"})),
+            ("eval_js", serde_json::json!({"code": "1"})),
+            ("fault", serde_json::json!({"action": "list"})),
+        ] {
+            let r = call(&h, tool, args.clone()).await;
+            assert!(
+                !is_privacy_blocked(&r),
+                "FullControl must allow {tool} {args}"
+            );
+        }
     }
 }
