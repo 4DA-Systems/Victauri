@@ -5471,6 +5471,11 @@ mod authz_dispatch_tests {
         );
     }
 
+    // Command-policy enforcement on invoke paths (A1/A2) and resource gating (B1)
+    // are covered with side-effect detection (a bridge that records actual invokes)
+    // in the `command_policy_dispatch_tests` module below — that proves the blocked
+    // command never reaches the bridge, not merely that an error string is returned.
+
     #[tokio::test]
     async fn full_control_allows_everything_at_dispatch() {
         let h = handler(PrivacyConfig::default());
@@ -5484,6 +5489,411 @@ mod authz_dispatch_tests {
             assert!(
                 !is_privacy_blocked(&r),
                 "FullControl must allow {tool} {args}"
+            );
+        }
+    }
+}
+
+/// Command-policy enforcement on EVERY command-invoking path (audit #30/#31, triage A1/A2).
+///
+/// The prior privacy suite validated the permission-string matrix — `is_tool_enabled("x")`
+/// in isolation — which let structural dispatch bypasses pass undetected (the audit's
+/// central criticism: "tests validate the STRING MATRIX, not actual dispatch behavior").
+///
+/// These tests instead drive the REAL dispatcher with a bridge that records every script
+/// handed to `eval_webview`, and assert the dangerous **side effect** — the
+/// `__TAURI_INTERNALS__.invoke(<command>)` script — is NEVER emitted when the command is on
+/// the operator's blocklist, on each path that invokes commands OUTSIDE `invoke_command`:
+/// `recording.replay`, `recording.import` + `replay`, `introspect.contract_record`, and
+/// `introspect.contract_check`. Each has a positive control proving an *allowed* command IS
+/// invoked (so a blanket-block can't make the negative test pass vacuously).
+#[cfg(test)]
+mod command_policy_dispatch_tests {
+    use super::*;
+    use crate::bridge::WebviewBridge;
+    use crate::privacy::PrivacyConfig;
+    use serde_json::json;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex as StdMutex;
+    use victauri_core::{
+        AppEvent, CommandRegistry, EventLog, EventRecorder, IpcCall, IpcResult, RecordedEvent,
+        RecordedSession, WindowState,
+    };
+
+    /// A bridge that RECORDS every script passed to `eval_webview` (so a test can assert a
+    /// blocklisted command's invoke was never emitted) then fails the eval fast — an allowed
+    /// command is observably *attempted* without hanging on a callback that never arrives.
+    #[derive(Clone, Default)]
+    struct RecordingBridge {
+        scripts: Arc<StdMutex<Vec<String>>>,
+    }
+
+    impl RecordingBridge {
+        /// True iff any recorded eval script invoked `command` via the Tauri IPC bridge.
+        fn invoked(&self, command: &str) -> bool {
+            let needle = format!("invoke({}", js_string(command));
+            self.scripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|s| s.contains(&needle))
+        }
+    }
+
+    impl WebviewBridge for RecordingBridge {
+        fn eval_webview(&self, _label: Option<&str>, script: &str) -> Result<(), String> {
+            self.scripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(script.to_string());
+            // Return Ok so `eval_with_return` injects BOTH its watchdog and the
+            // user-code script (it bails on the first Err). No callback ever fires,
+            // so the call simply times out at the 100ms test `eval_timeout` — we only
+            // care WHICH scripts reached the bridge, never the eval's return value.
+            Ok(())
+        }
+        fn get_window_states(&self, _l: Option<&str>) -> Vec<WindowState> {
+            Vec::new()
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn get_native_handle(&self, _l: Option<&str>) -> Result<isize, String> {
+            Err("no handle".to_string())
+        }
+        fn manage_window(&self, _l: Option<&str>, _a: &str) -> Result<String, String> {
+            Err("no window".to_string())
+        }
+        fn resize_window(&self, _l: Option<&str>, _w: u32, _h: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn move_window(&self, _l: Option<&str>, _x: i32, _y: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_window_title(&self, _l: Option<&str>, _t: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn state_with(privacy: PrivacyConfig) -> Arc<VictauriState> {
+        Arc::new(VictauriState {
+            event_log: EventLog::new(1000),
+            registry: CommandRegistry::new(),
+            port: std::sync::atomic::AtomicU16::new(0),
+            pending_evals: Arc::new(Mutex::new(HashMap::new())),
+            recorder: EventRecorder::new(1000),
+            privacy,
+            eval_timeout: std::time::Duration::from_millis(100),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            started_at: std::time::Instant::now(),
+            tool_invocations: std::sync::atomic::AtomicU64::new(0),
+            allow_file_navigation: false,
+            command_timings: crate::introspection::CommandTimings::new(),
+            fault_registry: crate::introspection::FaultRegistry::new(),
+            contract_store: crate::introspection::ContractStore::new(),
+            startup_timeline: crate::introspection::StartupTimeline::new(),
+            event_bus: crate::introspection::EventBusMonitor::default(),
+            task_tracker: crate::introspection::TaskTracker::new(),
+            bridge_ready: std::sync::atomic::AtomicBool::new(true),
+            bridge_notify: tokio::sync::Notify::new(),
+            db_search_paths: Vec::new(),
+            screencast: Arc::new(crate::screencast::Screencast::default()),
+            probes: crate::introspection::AppStateProbes::default(),
+        })
+    }
+
+    // FullControl, except the named commands are blocklisted — exactly the scenario
+    // the audit flagged: an operator who trusts `command_blocklist` to stop a
+    // dangerous command.
+    fn blocking(cmds: &[&str]) -> PrivacyConfig {
+        PrivacyConfig {
+            command_blocklist: cmds.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn ipc_event(command: &str) -> AppEvent {
+        AppEvent::Ipc(IpcCall {
+            id: format!("c-{command}"),
+            command: command.to_string(),
+            timestamp: chrono::Utc::now(),
+            duration_ms: Some(1),
+            result: IpcResult::Ok(json!(true)),
+            arg_size_bytes: 0,
+            webview_label: "main".to_string(),
+        })
+    }
+
+    fn result_text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| match &c.raw {
+                RawContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    async fn call(h: &VictauriMcpHandler, tool: &str, args: serde_json::Value) -> CallToolResult {
+        match h.execute_tool(tool, args).await {
+            Ok(r) => r,
+            Err(_) => panic!("dispatch returned a transport error (arg parse failure)"),
+        }
+    }
+
+    // ── recording.replay (audit #30/#31, A1) ─────────────────────────────────
+
+    #[tokio::test]
+    async fn replay_never_invokes_a_blocklisted_command() {
+        let bridge = RecordingBridge::default();
+        let state = state_with(blocking(&["delete_account"]));
+        state.recorder.start("s1".to_string()).unwrap();
+        state.recorder.record_event(ipc_event("delete_account"));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+
+        let r = call(&h, "recording", json!({"action": "replay"})).await;
+
+        assert!(
+            !bridge.invoked("delete_account"),
+            "SIDE-EFFECT LEAK: replay handed a blocklisted command's invoke to the bridge (audit #30/#31)"
+        );
+        assert!(
+            result_text(&r).contains("blocked"),
+            "replay should report the command as blocked, got: {}",
+            result_text(&r)
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_does_invoke_an_allowed_command() {
+        // Positive control: proves the negative test isn't vacuous (the path really
+        // reaches the bridge for a permitted command).
+        let bridge = RecordingBridge::default();
+        let state = state_with(PrivacyConfig::default());
+        state.recorder.start("s1".to_string()).unwrap();
+        state.recorder.record_event(ipc_event("greet"));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+
+        let _ = call(&h, "recording", json!({"action": "replay"})).await;
+
+        assert!(
+            bridge.invoked("greet"),
+            "positive control failed: an ALLOWED command was not invoked, so the negative test proves nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn imported_session_cannot_invoke_a_blocklisted_command() {
+        // audit #31: a crafted session handed to an agent ("replay this to reproduce")
+        // must not become arbitrary command invocation.
+        let bridge = RecordingBridge::default();
+        let state = state_with(blocking(&["wipe_database"]));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+
+        let session = RecordedSession {
+            id: "poisoned".to_string(),
+            started_at: chrono::Utc::now(),
+            events: vec![RecordedEvent {
+                index: 0,
+                timestamp: chrono::Utc::now(),
+                event: ipc_event("wipe_database"),
+            }],
+            checkpoints: Vec::new(),
+        };
+        let session_json = serde_json::to_string(&session).unwrap();
+
+        let imp = call(
+            &h,
+            "recording",
+            json!({"action": "import", "session_json": session_json}),
+        )
+        .await;
+        assert_ne!(
+            imp.is_error,
+            Some(true),
+            "import itself should succeed: {}",
+            result_text(&imp)
+        );
+
+        let r = call(&h, "recording", json!({"action": "replay"})).await;
+        assert!(
+            !bridge.invoked("wipe_database"),
+            "SIDE-EFFECT LEAK: an imported session replayed a blocklisted command (audit #31)"
+        );
+        assert!(result_text(&r).contains("blocked"));
+    }
+
+    // ── introspect.contract_record / contract_check (audit #30, A2) ───────────
+
+    #[tokio::test]
+    async fn contract_record_never_invokes_a_blocklisted_command() {
+        let bridge = RecordingBridge::default();
+        let state = state_with(blocking(&["delete_account"]));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+
+        let r = call(
+            &h,
+            "introspect",
+            json!({"action": "contract_record", "command": "delete_account", "args": {"confirm": true}}),
+        )
+        .await;
+
+        assert!(
+            !bridge.invoked("delete_account"),
+            "SIDE-EFFECT LEAK: contract_record invoked a blocklisted command (audit #30)"
+        );
+        assert_eq!(r.is_error, Some(true));
+        assert!(
+            result_text(&r).contains("blocked by privacy configuration"),
+            "got: {}",
+            result_text(&r)
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_record_does_invoke_an_allowed_command() {
+        let bridge = RecordingBridge::default();
+        let state = state_with(PrivacyConfig::default());
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+
+        let _ = call(
+            &h,
+            "introspect",
+            json!({"action": "contract_record", "command": "get_settings"}),
+        )
+        .await;
+
+        assert!(
+            bridge.invoked("get_settings"),
+            "positive control failed: contract_record did not invoke an allowed command"
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_check_never_reinvokes_a_now_blocklisted_command() {
+        // A baseline recorded before the command was blocked must not be re-invoked
+        // once the operator adds it to the blocklist (audit #30).
+        let bridge = RecordingBridge::default();
+        let state = state_with(blocking(&["delete_account"]));
+        state
+            .contract_store
+            .record(crate::introspection::ContractBaseline {
+                command: "delete_account".to_string(),
+                args: json!({}),
+                shape: crate::introspection::JsonShape::from_value(&json!(true)),
+                sample: "true".to_string(),
+                recorded_at: chrono_now(),
+            });
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+
+        let _ = call(&h, "introspect", json!({"action": "contract_check"})).await;
+
+        assert!(
+            !bridge.invoked("delete_account"),
+            "SIDE-EFFECT LEAK: contract_check re-invoked a now-blocklisted command (audit #30)"
+        );
+    }
+
+    // ── MCP resources honour the privacy gate (audit B1) ──────────────────────
+
+    #[test]
+    fn resource_reads_are_gated_by_their_mirrored_capability() {
+        // Resources bypass the tool dispatcher, so the read path must apply the same
+        // gate. Disabling the capability a resource mirrors must block the resource.
+        let cfg = PrivacyConfig {
+            disabled_tools: HashSet::from([
+                "logs.ipc".to_string(),
+                "window.list".to_string(),
+                "get_plugin_info".to_string(),
+            ]),
+            ..Default::default()
+        };
+        for uri in [
+            RESOURCE_URI_IPC_LOG,
+            RESOURCE_URI_WINDOWS,
+            RESOURCE_URI_STATE,
+        ] {
+            let cap = resource_required_capability(uri).expect("resource maps to a capability");
+            assert!(
+                !cfg.is_tool_enabled(cap),
+                "disabling capability {cap} must gate resource {uri} (audit B1)"
+            );
+        }
+        // Sanity: with nothing disabled, all three resources read.
+        let full = PrivacyConfig::default();
+        for uri in [
+            RESOURCE_URI_IPC_LOG,
+            RESOURCE_URI_WINDOWS,
+            RESOURCE_URI_STATE,
+        ] {
+            assert!(full.is_tool_enabled(resource_required_capability(uri).unwrap()));
+        }
+    }
+
+    // ── empty/whitespace auth token collapses to NO auth (audit B2) ───────────
+
+    #[tokio::test]
+    async fn empty_auth_token_collapses_to_no_auth() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        for token in [Some(String::new()), Some("   ".to_string())] {
+            let app = crate::mcp::server::build_app_full(
+                state_with(PrivacyConfig::default()),
+                Arc::new(RecordingBridge::default()),
+                token.clone(),
+                None,
+            );
+            let req = axum::extract::Request::builder()
+                .uri("/info")
+                .header("host", "127.0.0.1")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                200,
+                "/info must be reachable with empty token {token:?} (no auth layer)"
+            );
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(
+                body["auth_required"],
+                json!(false),
+                "empty/whitespace token must report auth_required:false, not looks-protected-isnt (audit B2); token={token:?}"
+            );
+        }
+    }
+
+    // ── app_info env allowlist drops secrets (audit #5/B3) ────────────────────
+
+    #[test]
+    fn is_safe_env_key_drops_secrets_keeps_safe() {
+        for secret in [
+            "VICTAURI_AUTH_TOKEN",
+            "TAURI_SIGNING_PRIVATE_KEY",
+            "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+            "CARGO_REGISTRY_TOKEN",
+            "AWS_SECRET_ACCESS_KEY",
+            "DATABASE_DSN",
+            "GH_PAT",
+        ] {
+            assert!(
+                !is_safe_env_key(secret),
+                "{secret} is secret-shaped and must NOT be surfaced by app_info (audit #5)"
+            );
+        }
+        for safe in [
+            "HOME",
+            "LANG",
+            "TERM",
+            "XDG_RUNTIME_DIR",
+            "TAURI_ENV_PLATFORM",
+        ] {
+            assert!(
+                is_safe_env_key(safe),
+                "{safe} should be surfaced by app_info"
             );
         }
     }
