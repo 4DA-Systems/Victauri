@@ -246,7 +246,11 @@ async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u1
     }
 
     for offset in 1..=PORT_FALLBACK_RANGE {
-        let port = preferred + offset;
+        // Saturating/checked add: a `preferred` near u16::MAX (e.g. 65530) would
+        // otherwise overflow `preferred + offset` (panic in debug, wrap in release).
+        let Some(port) = preferred.checked_add(offset) else {
+            break;
+        };
         if let Ok(listener) = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
             return Ok((listener, port));
         }
@@ -254,7 +258,7 @@ async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u1
 
     anyhow::bail!(
         "could not bind to any port in range {preferred}-{}",
-        preferred + PORT_FALLBACK_RANGE
+        preferred.saturating_add(PORT_FALLBACK_RANGE)
     )
 }
 

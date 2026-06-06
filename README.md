@@ -39,7 +39,7 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 - **Cross-boundary state checking** — compare DOM state against Rust backend state and catch the drift between them
 - **Time-travel recording** — record interactions, checkpoint state, replay sequences, generate test files
 - **Cross-platform, no WebDriver** — identical behavior on macOS, Windows, and Linux; runs headless in CI under `xvfb`
-- **Zero production cost** — compiles away entirely in release builds via `#[cfg(debug_assertions)]`
+- **Zero runtime cost in release** — the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. (The crate still compiles in; add it as a `dev-dependency` if you want it absent from the release binary entirely.)
 
 **Bonus — for AI agents:** the same server speaks MCP, so Claude Code, Cursor, Windsurf, and any MCP client get this full-stack access for interactive debugging — no extra setup.
 
@@ -77,7 +77,7 @@ tauri::Builder::default()
     .expect("error while running tauri application");
 ```
 
-In release builds, `init()` returns a no-op plugin — zero overhead, no feature flags needed.
+In release builds, `init()` returns a no-op plugin — the server never starts, so there's zero runtime cost and no feature flags needed.
 
 ### Run tests
 
@@ -372,7 +372,7 @@ cargo install victauri-browser
 victauri-browser-host install    # Registers native messaging host
 ```
 
-Load `extensions/chrome/` (or `extensions/firefox/`) as an unpacked extension. Connect any MCP client to `http://127.0.0.1:7474/mcp`. 20 MCP tools available. Works with Chrome, Edge, Brave, Arc, and Firefox.
+Load `extensions/chrome/` (or `extensions/firefox/`) as an unpacked extension. Connect any MCP client to `http://127.0.0.1:7474/mcp`. 20 MCP tools available. Chromium browsers (Chrome, Edge, Brave, Arc) are supported by the `victauri-browser install` native-host registration; the Firefox MV3 port is provided but its native-messaging manifest must currently be registered manually (different manifest location + an `allowed_extensions` id rather than Chromium's `allowed_origins`).
 
 See the [Chrome Extension Guide](docs/src/chrome-extension.md).
 
@@ -382,7 +382,7 @@ See the [Chrome Extension Guide](docs/src/chrome-extension.md).
 
 Victauri is designed for development, not production:
 
-- **Debug-only**: compiles away in release builds (`#[cfg(debug_assertions)]`)
+- **Debug-only**: the server is `#[cfg(debug_assertions)]`-gated, so `init()` is a no-op and nothing listens in release builds
 - **Localhost-only**: binds to 127.0.0.1, DNS rebinding protection
 - **Auth on by default**: auto-generated Bearer token, auto-discovered by clients (`.auth_disabled()` to opt out)
 - **Rate limited**: 1000 req/sec, token-bucket algorithm
