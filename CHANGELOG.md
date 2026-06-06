@@ -34,6 +34,61 @@ macOS/Linux a CDP-class tool can't attach at all.*
   safety, the no-`eval_js`-equivalent capabilities (`query_db`, registry enumeration,
   IPC history with bodies, native process state), cross-platform reach, and
   webview-independent robustness.
+- **Honest release-cost claim (audit B6).** "Compiles away to nothing / zero binary
+  size overhead" is corrected to **zero *runtime* cost** — the server is
+  `#[cfg(debug_assertions)]`-gated so `init()` is a no-op in release, but the crate
+  still compiles in (add it as a `dev-dependency` for zero binary footprint).
+- **Firefox scope (audit C4):** the native-host installer registers Chromium browsers;
+  the Firefox MV3 port's native-messaging manifest must be registered manually.
+
+### Security
+
+Response to a two-pass cross-model (GPT-5.5) adversarial audit. The keystone was a
+structural authorization bypass; the rest hardens the real machine-touching surfaces
+(npm, the browser native host, and CI), since the in-app plugin is a no-op in release.
+
+- **Centralized action-level authorization (audit A3/B4 — the keystone).** The
+  dispatchers gated only on the bare tool name, leaving per-action enforcement to each
+  handler — so actions whose handler forgot to check (e.g. `route.clear`/`clear_all`)
+  were reachable even when an operator disabled them, and the Test profile's per-action
+  matrix entries were unreachable. A new `mcp::authz::canonical_capability` resolves the
+  authoritative `tool.action` identity, and both the REST and MCP dispatchers gate on
+  `PrivacyConfig::is_call_allowed(bare_tool, capability)` before dispatch. `recording.
+  replay`/`flush` are now FullControl-only; `verify_state`/`assert_semantic` (arbitrary
+  eval) are correctly removed from the Test profile. A new **negative dispatch test
+  suite** proves through the real dispatch path that blocked actions cannot execute.
+- **MCP resources now honor privacy (audit B1).** `read_resource`/`subscribe` applied
+  redaction but no access control — a strict profile that blocked log/window reads as
+  tools could still read them as resources. They now apply the same capability gate.
+- **Empty auth tokens rejected (audit B2).** A `Some("")`/whitespace token enabled the
+  auth middleware while reporting `auth_required: true` and accepting an empty Bearer.
+  Empty tokens are normalized to "no auth" with a loud warning.
+- **`query_db` PRAGMA allowlist (audit C10).** Side-effecting PRAGMAs (`wal_checkpoint`,
+  `optimize`, `incremental_vacuum`) are now rejected even without an `=`, on top of the
+  existing READ_ONLY open flag and write-form block.
+- **Port-fallback overflow (audit C7):** `try_bind` no longer overflows `u16` when the
+  preferred port is near 65535 (`checked_add`).
+- **Browser native host (audit B5/C3/B9/C5):** stop logging the full bearer token (add
+  a user-only discovery file); require a real extension id on install (no silent
+  `EXTENSION_ID` placeholder); reap pending dispatch entries on write failure; add an
+  HTTP concurrency limit; npm postinstall fails loud instead of silently exiting 0.
+- **npm install no longer modifies the system without consent (audit #1):** the
+  postinstall no longer auto-registers the native-messaging host (browser manifests +
+  Windows registry) on every install — opt in with `VICTAURI_BROWSER_AUTO_REGISTER=1`
+  or run `npx victauri-browser install <ext-id>`.
+- **Browser trust model documented honestly (audit A4):** browser mode is cooperative
+  automation, not a verification boundary against a hostile page (the relay crosses the
+  page's own JS context). Use the Tauri plugin path for tamper-resistant verification.
+- **Release/CI hardening (audit A6/C6/D8/#8):** the crate-release workflow only triggers
+  on `v[0-9]+.[0-9]+.[0-9]+` tags (a `vscode-*` tag can't fire the crates.io publish);
+  third-party actions pinned to commit SHAs; the GitHub Release stays gated on the
+  crates publish + `require-ci-green`.
+- **Watchdog DoS bounds (audit B12):** clamp the poll interval (≥1s) and failure
+  threshold (≥1) so a zero value can't busy-loop / recover every poll; stop logging the
+  full recovery command line.
+- **Dependencies (audit D10):** verified vitest (4.1.8) and tmp (0.2.7) already patched;
+  added the missing `extensions/npm` lockfile; remaining cargo-audit advisories are all
+  transitive through tauri/wry/notify with no fix available (documented).
 
 ## [0.7.8] - 2026-06-06
 
