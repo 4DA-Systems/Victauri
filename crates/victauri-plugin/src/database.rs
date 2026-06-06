@@ -132,7 +132,15 @@ static SAFE_PRAGMAS: &[&str] = &[
 fn pragma_name(sql: &str) -> Option<String> {
     let cleaned = strip_sql_comments(sql);
     let lower = cleaned.trim_start().to_lowercase();
-    let rest = lower.strip_prefix("pragma")?.trim_start();
+    let stripped = lower.strip_prefix("pragma")?.trim_start();
+    // Normalize away SQL identifier-quoting so quoted forms like `PRAGMA "main".table_info`
+    // or `PRAGMA [main].table_info` parse to the same name as the bare form (avoids a
+    // false-positive block of a legitimate quoted read PRAGMA).
+    let normalized: String = stripped
+        .chars()
+        .filter(|c| !matches!(c, '"' | '`' | '[' | ']'))
+        .collect();
+    let rest = normalized.trim_start();
     // Optional `schema.` qualifier: only treat the part before the first '.' as a
     // schema when it's a bare identifier (no '(', '=', whitespace) — otherwise the
     // '.' belongs to a quoted arg and `rest` already starts with the name.
@@ -649,7 +657,26 @@ mod tests {
             pragma_name("PRAGMA table_info(users)").as_deref(),
             Some("table_info")
         );
+        // Quoted/bracketed schema qualifiers normalize to the same name (no false block).
+        assert_eq!(
+            pragma_name(r#"PRAGMA "main".table_info(users)"#).as_deref(),
+            Some("table_info")
+        );
+        assert_eq!(
+            pragma_name("PRAGMA [main].wal_checkpoint").as_deref(),
+            Some("wal_checkpoint")
+        );
         assert_eq!(pragma_name("SELECT 1"), None);
+    }
+
+    #[test]
+    fn quoted_schema_read_pragma_is_allowed_but_quoted_side_effect_blocked() {
+        let (_f, path) = create_test_db();
+        // A legitimate quoted-schema read PRAGMA must not be falsely blocked.
+        assert!(query(&path, r#"PRAGMA "main".table_info(users)"#, &[], None).is_ok());
+        // …but a side-effecting one stays blocked even when quoted.
+        let err = query(&path, "PRAGMA [main].wal_checkpoint", &[], None).unwrap_err();
+        assert!(err.contains("read-only introspection PRAGMAs"));
     }
 
     #[test]

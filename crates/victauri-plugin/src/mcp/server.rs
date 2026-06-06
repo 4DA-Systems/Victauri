@@ -21,6 +21,28 @@ pub fn build_app(state: Arc<VictauriState>, bridge: Arc<dyn WebviewBridge>) -> a
     build_app_with_options(state, bridge, None)
 }
 
+/// Normalize an auth token: an empty/whitespace-only `Some("")` collapses to `None`
+/// (no auth) with a loud warning (audit B2).
+///
+/// A `Some("")` token would otherwise enable the auth middleware AND report
+/// `auth_required: true` while accepting an empty Bearer credential — an
+/// auth-enabled-but-bypassable state. Applied uniformly to both the request gate
+/// and the discovery-file token so they can never disagree.
+#[must_use]
+fn normalize_auth_token(auth_token: Option<String>) -> Option<String> {
+    match auth_token {
+        Some(t) if t.trim().is_empty() => {
+            tracing::warn!(
+                "Victauri: configured auth token is empty/whitespace — treating as NO auth. \
+                 Set a non-empty VICTAURI_AUTH_TOKEN / auth_token(), or use auth_disabled() \
+                 to intentionally run without authentication."
+            );
+            None
+        }
+        other => other,
+    }
+}
+
 /// Build an Axum router for the MCP server with an optional auth token and rate limiter.
 pub fn build_app_with_options(
     state: Arc<VictauriState>,
@@ -37,22 +59,9 @@ pub fn build_app_full(
     auth_token: Option<String>,
     rate_limiter: Option<Arc<crate::auth::RateLimiterState>>,
 ) -> axum::Router {
-    // Normalize an empty/whitespace-only auth token to "no auth" (audit B2). A
-    // `Some("")` token would otherwise enable the auth middleware AND report
-    // `auth_required: true` while accepting an empty Bearer credential — an
-    // auth-enabled-but-bypassable state. Collapse it to `None` and warn loudly so
-    // the server is never in a "looks protected, isn't" condition.
-    let auth_token = match auth_token {
-        Some(t) if t.trim().is_empty() => {
-            tracing::warn!(
-                "Victauri: configured auth token is empty/whitespace — treating as NO auth. \
-                 Set a non-empty VICTAURI_AUTH_TOKEN / auth_token(), or use auth_disabled() \
-                 to intentionally run without authentication."
-            );
-            None
-        }
-        other => other,
-    };
+    // Normalize an empty/whitespace-only auth token to "no auth" (audit B2) so the
+    // server is never "looks protected, isn't".
+    let auth_token = normalize_auth_token(auth_token);
 
     // Capture the host app's identity for `/info` (first-contact verification: an agent
     // can confirm it reached the RIGHT app, not another Victauri instance on a shared port).
@@ -181,6 +190,9 @@ pub async fn start_server_with_options<R: Runtime>(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let bridge: Arc<dyn WebviewBridge> = Arc::new(app_handle);
+    // Normalize once so the discovery-file token and the request gate agree (B2):
+    // an empty token must not be written to the discovery file as if auth were on.
+    let auth_token = normalize_auth_token(auth_token);
     let token_for_file = auth_token.clone();
     let app = build_app_with_options(state.clone(), bridge.clone(), auth_token);
 
@@ -551,6 +563,21 @@ async fn event_drain_loop(
 mod tests {
     use super::*;
     use victauri_core::{AppEvent, InteractionKind, IpcResult};
+
+    #[test]
+    fn normalize_auth_token_collapses_empty() {
+        // Audit B2: an empty/whitespace token must become "no auth", never an
+        // auth-enabled-but-empty-credential state.
+        assert_eq!(normalize_auth_token(Some(String::new())), None);
+        assert_eq!(normalize_auth_token(Some("   ".to_string())), None);
+        assert_eq!(normalize_auth_token(Some("\t\n".to_string())), None);
+        // A real token is preserved; explicit None stays None.
+        assert_eq!(
+            normalize_auth_token(Some("secret-123".to_string())).as_deref(),
+            Some("secret-123")
+        );
+        assert_eq!(normalize_auth_token(None), None);
+    }
 
     #[tokio::test]
     async fn try_bind_preferred_port_available() {

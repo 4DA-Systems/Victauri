@@ -251,4 +251,351 @@ mod tests {
         assert!(!is_compound_tool("eval_js"));
         assert!(!is_compound_tool("invoke_command"));
     }
+
+    // The COMPLETE authorization spec: every compound (tool, action) pair, its
+    // canonical capability id, and whether it is permitted in the Observe / Test
+    // profiles (FullControl permits everything). This table is the single source of
+    // truth — if a new action variant is added to a compound tool's enum and not
+    // mapped here (and in `action_capability` + the privacy matrix), the tests below
+    // fail. It proves there is no unmapped action silently falling back to the bare
+    // tool name, and no profile mismatch.
+    //
+    // Columns: (tool, action, expected_capability, allowed_in_observe, allowed_in_test)
+    const AUTHZ_SPEC: &[(&str, &str, &str, bool, bool)] = &[
+        // interact — all FullControl/Test, never Observe (mutating)
+        ("interact", "click", "interact.click", false, true),
+        (
+            "interact",
+            "double_click",
+            "interact.double_click",
+            false,
+            true,
+        ),
+        ("interact", "hover", "interact.hover", false, true),
+        ("interact", "focus", "interact.focus", false, true),
+        (
+            "interact",
+            "scroll_into_view",
+            "interact.scroll_into_view",
+            false,
+            true,
+        ),
+        (
+            "interact",
+            "select_option",
+            "interact.select_option",
+            false,
+            true,
+        ),
+        // input
+        ("input", "fill", "input.fill", false, true),
+        ("input", "type_text", "input.type_text", false, true),
+        ("input", "press_key", "input.press_key", false, true),
+        // window — reads allowed in Observe+Test; mutations FullControl-only
+        ("window", "get_state", "window.get_state", true, true),
+        ("window", "list", "window.list", true, true),
+        (
+            "window",
+            "introspectability",
+            "window.introspectability",
+            true,
+            true,
+        ),
+        ("window", "manage", "window.manage", false, false),
+        ("window", "resize", "window.resize", false, false),
+        ("window", "move_to", "window.move_to", false, false),
+        ("window", "set_title", "window.set_title", false, false),
+        // storage — writes+reads in Test, nothing in Observe
+        ("storage", "get", "storage.get", false, true),
+        ("storage", "set", "storage.set", false, true),
+        ("storage", "delete", "storage.delete", false, true),
+        ("storage", "get_cookies", "storage.get_cookies", false, true),
+        // navigate — reads in Test (B4 fix), mutations FullControl-only
+        ("navigate", "go_to", "navigate.go_to", false, false),
+        ("navigate", "go_back", "navigate.go_back", false, true),
+        (
+            "navigate",
+            "get_history",
+            "navigate.get_history",
+            false,
+            true,
+        ),
+        (
+            "navigate",
+            "set_dialog_response",
+            "navigate.set_dialog_response",
+            false,
+            false,
+        ),
+        (
+            "navigate",
+            "get_dialog_log",
+            "navigate.get_dialog_log",
+            false,
+            true,
+        ),
+        // recording — Test except replay/flush (FullControl-only)
+        ("recording", "start", "recording.start", false, true),
+        ("recording", "stop", "recording.stop", false, true),
+        (
+            "recording",
+            "checkpoint",
+            "recording.checkpoint",
+            false,
+            true,
+        ),
+        (
+            "recording",
+            "list_checkpoints",
+            "recording.list_checkpoints",
+            false,
+            true,
+        ),
+        (
+            "recording",
+            "get_events",
+            "recording.get_events",
+            false,
+            true,
+        ),
+        (
+            "recording",
+            "events_between",
+            "recording.events_between",
+            false,
+            true,
+        ),
+        (
+            "recording",
+            "get_replay",
+            "recording.get_replay",
+            false,
+            true,
+        ),
+        ("recording", "export", "recording.export", false, true),
+        ("recording", "import", "recording.import", false, true),
+        ("recording", "replay", "recording.replay", false, false),
+        ("recording", "flush", "recording.flush", false, false),
+        // inspect — reads in Observe+Test; highlight/clear_highlights Test-only
+        ("inspect", "get_styles", "inspect.styles", true, true),
+        (
+            "inspect",
+            "get_bounding_boxes",
+            "inspect.bounds",
+            true,
+            true,
+        ),
+        ("inspect", "highlight", "inspect.highlight", false, true),
+        (
+            "inspect",
+            "clear_highlights",
+            "inspect.clear_highlights",
+            false,
+            true,
+        ),
+        (
+            "inspect",
+            "audit_accessibility",
+            "inspect.audit_a11y",
+            true,
+            true,
+        ),
+        (
+            "inspect",
+            "get_performance",
+            "inspect.performance",
+            true,
+            true,
+        ),
+        // css — FullControl-only
+        ("css", "inject", "css.inject", false, false),
+        ("css", "remove", "css.remove", false, false),
+        // route — FullControl-only (every action, incl. the historically-ungated clear)
+        ("route", "add", "route.add", false, false),
+        ("route", "list", "route.list", false, false),
+        ("route", "clear", "route.clear", false, false),
+        ("route", "clear_all", "route.clear_all", false, false),
+        ("route", "matches", "route.matches", false, false),
+        // trace — FullControl-only
+        ("trace", "start", "trace.start", false, false),
+        ("trace", "stop", "trace.stop", false, false),
+        ("trace", "status", "trace.status", false, false),
+        ("trace", "frames", "trace.frames", false, false),
+        // animation — FullControl-only
+        ("animation", "list", "animation.list", false, false),
+        ("animation", "scrub", "animation.scrub", false, false),
+        ("animation", "sample", "animation.sample", false, false),
+        // logs — reads in Observe+Test; clear Test-only
+        ("logs", "console", "logs.console", true, true),
+        ("logs", "network", "logs.network", true, true),
+        ("logs", "ipc", "logs.ipc", true, true),
+        ("logs", "navigation", "logs.navigation", true, true),
+        ("logs", "dialogs", "logs.dialogs", true, true),
+        ("logs", "events", "logs.events", true, true),
+        ("logs", "slow_ipc", "logs.slow_ipc", true, true),
+        ("logs", "clear", "logs.clear", false, true),
+        // introspect — FullControl-only (all 14 actions)
+        (
+            "introspect",
+            "command_timings",
+            "introspect.command_timings",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "coverage",
+            "introspect.coverage",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "contract_record",
+            "introspect.contract_record",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "contract_check",
+            "introspect.contract_check",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "contract_list",
+            "introspect.contract_list",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "contract_clear",
+            "introspect.contract_clear",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "startup_timing",
+            "introspect.startup_timing",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "capabilities",
+            "introspect.capabilities",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "db_health",
+            "introspect.db_health",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "plugin_state",
+            "introspect.plugin_state",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "processes",
+            "introspect.processes",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "plugin_tasks",
+            "introspect.plugin_tasks",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "event_bus",
+            "introspect.event_bus",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "event_bus_clear",
+            "introspect.event_bus_clear",
+            false,
+            false,
+        ),
+        // fault — FullControl-only
+        ("fault", "inject", "fault.inject", false, false),
+        ("fault", "list", "fault.list", false, false),
+        ("fault", "clear", "fault.clear", false, false),
+        ("fault", "clear_all", "fault.clear_all", false, false),
+        // explain — FullControl-only
+        ("explain", "summary", "explain.summary", false, false),
+        (
+            "explain",
+            "last_action",
+            "explain.last_action",
+            false,
+            false,
+        ),
+        ("explain", "diff", "explain.diff", false, false),
+    ];
+
+    #[test]
+    fn authz_spec_is_complete_and_correct() {
+        use crate::privacy::{PrivacyConfig, observe_privacy_config, test_privacy_config};
+        let observe = observe_privacy_config();
+        let test = test_privacy_config();
+        let full = PrivacyConfig::default();
+
+        for &(tool, action, expected_cap, observe_ok, test_ok) in AUTHZ_SPEC {
+            // 1. The resolver must map to the canonical id (never the bare fallback).
+            let resolved = canonical_capability(tool, &json!({ "action": action }));
+            assert_eq!(
+                resolved, expected_cap,
+                "{tool}.{action} resolved to {resolved:?}, expected {expected_cap:?}"
+            );
+            assert!(
+                resolved.contains('.'),
+                "{tool}.{action} fell back to a bare name ({resolved}) — unmapped action"
+            );
+            // 2. Profile semantics must match the spec exactly.
+            assert_eq!(
+                observe.is_tool_enabled(expected_cap),
+                observe_ok,
+                "Observe profile mismatch for {expected_cap}"
+            );
+            assert_eq!(
+                test.is_tool_enabled(expected_cap),
+                test_ok,
+                "Test profile mismatch for {expected_cap}"
+            );
+            // 3. FullControl always permits.
+            assert!(
+                full.is_tool_enabled(expected_cap),
+                "FullControl must permit {expected_cap}"
+            );
+        }
+    }
+
+    #[test]
+    fn authz_spec_covers_every_compound_tool() {
+        // Guards against adding a compound tool to COMPOUND_TOOLS but forgetting to
+        // spec its actions here (which would let an action go untested).
+        for tool in COMPOUND_TOOLS {
+            assert!(
+                AUTHZ_SPEC.iter().any(|(t, ..)| t == tool),
+                "compound tool {tool} has no entries in AUTHZ_SPEC"
+            );
+        }
+    }
 }
