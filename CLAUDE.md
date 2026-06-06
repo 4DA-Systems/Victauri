@@ -198,7 +198,45 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-06-06)
+## Current State (2026-06-07)
+
+### v0.7.9 — adversarial-audit hardening (two GPT-5.5 passes)
+
+Response to a two-pass cross-model (GPT-5.5) adversarial audit. The first verdict was
+"BLOCK PUBLIC USE", driven by a structural authorization bypass; the re-audit (after the
+fixes) upgraded to "embedded plugin approaching trusted-local developer preview; browser
+mode + release pipeline not for unrestricted public/autonomous use yet". No public Rust
+API broke; some behaviors changed (see MIGRATION). Highlights:
+
+- **Centralized action-level authorization (keystone).** Both dispatchers (REST +
+  MCP) now gate on the canonical `tool.action` capability via
+  `mcp::authz::canonical_capability` + `PrivacyConfig::is_call_allowed`, not the bare
+  tool name. Closes the per-action bypass (e.g. `route.clear` had no check; a
+  `disabled_tools` action entry was silently ignored) and the Test-profile
+  unreachable-action mismatch. An exhaustive `AUTHZ_SPEC` test pins every
+  (tool, action) → capability → per-profile allow/deny, and a negative dispatch suite
+  (with a recording bridge) proves blocked actions never reach the bridge — incl.
+  command-blocklist enforcement on replay/contract/invoke.
+- **MCP resources** now honor the privacy gate (were redaction-only). **Empty auth
+  tokens** normalized to "no auth" (plugin) / auto-generate (browser) instead of a
+  broken empty-Bearer state. **`query_db` PRAGMA allowlist** (blocks side-effecting
+  PRAGMAs even without `=`). **`read_app_file`** bounded read + **`list_app_dir`** entry
+  cap (no whole-file/unbounded-dir allocation). **`register_commands!`** uses
+  `try_state` (was panicking in release). **CSS-escape bypass** in `css inject` closed
+  (decode escapes before scan). **Port-fallback `u16` overflow** fixed in plugin AND
+  browser host. **Discovery dir** hardened (symlink-aware reset + exclusive O_EXCL file
+  creation, mode-at-creation) on both. **Watchdog** recovery command now has a 60s
+  timeout (was unbounded). **Browser mode labeled EXPERIMENTAL** (cooperative-debugging,
+  not a hostile-page boundary) + the **A4 relay redesign** (HMAC-authenticated
+  command/response channel — the nonce never goes on the page-visible wire, so a hostile
+  page can neither inject a command nor forge a response). **Extension `default_locale`**
+  added (chrome + firefox manifests wouldn't load unpacked without it). **Release
+  workflows** pin third-party actions + vsce/ovsx by SHA/exact version with least-priv
+  permissions; **npm postinstall** no longer auto-registers the native host without
+  consent. Docs corrected (honest "zero *runtime* cost", browser connect steps).
+- **Process lesson:** GPT initially audited a stale clone (`D:\victauri` @ v0.7.2, 89
+  commits behind) → all findings obsolete. Always verify the reviewer's checkout SHA ==
+  `origin/main` before trusting an audit.
 
 ### v0.7.8 — victauri-plugin compiles in release + no-default-features configs
 
