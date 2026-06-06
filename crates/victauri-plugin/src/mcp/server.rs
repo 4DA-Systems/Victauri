@@ -301,26 +301,65 @@ fn restrict_to_current_user(path: &std::path::Path) {
         .status();
 }
 
-fn write_port_file(port: u16, identifier: Option<&str>, product_name: Option<&str>) {
-    let dir = discovery_dir();
-    let _ = std::fs::create_dir_all(&dir);
+/// Reset the per-process discovery dir to a fresh, user-owned `0700` directory,
+/// defeating a pre-planted directory OR a symlink at that path on a shared `/tmp`
+/// (audit: discovery paths vulnerable to pre-planted dirs / symlinked token files).
+fn ensure_private_dir(dir: &std::path::Path) {
+    // Remove a SYMLINK or a regular FILE squatting at the path (the attack vectors:
+    // a planted symlink redirecting our writes). An existing real directory is left
+    // in place — this function is called for each discovery file, so it must be
+    // idempotent and must NOT wipe sibling files already written this run. The
+    // exclusive `create_new` in `write_private_file` defends each file regardless.
+    if let Ok(meta) = std::fs::symlink_metadata(dir)
+        && (meta.file_type().is_symlink() || meta.is_file())
+    {
+        let _ = std::fs::remove_file(dir);
+    }
+    let _ = std::fs::create_dir_all(dir);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
     }
     #[cfg(windows)]
-    restrict_to_current_user(&dir);
+    restrict_to_current_user(dir);
+}
 
-    let port_path = dir.join("port");
-    if let Err(e) = std::fs::write(&port_path, port.to_string()) {
-        tracing::debug!("could not write port file: {e}");
+/// Write `contents` to `path` as a fresh, user-only file. Uses exclusive
+/// (`create_new` / `O_EXCL`) creation so a pre-planted file OR symlink at `path`
+/// is refused rather than written through, and sets `0600` at creation on Unix so
+/// there is no window where the file exists with default-umask permissions.
+fn write_private_file(path: &std::path::Path, contents: &str) {
+    // Clear any stale/pre-planted entry (symlink-aware) so our exclusive create
+    // succeeds for a fresh file; a symlink racing in afterwards is refused by
+    // `create_new` (O_EXCL treats a final-component symlink as "exists").
+    if std::fs::symlink_metadata(path).is_ok() {
+        let _ = std::fs::remove_file(path);
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&port_path, std::fs::Permissions::from_mode(0o600));
+    let result = {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .and_then(|mut f| f.write_all(contents.as_bytes()))
+    };
+    #[cfg(not(unix))]
+    let result = std::fs::write(path, contents);
+    if let Err(e) = result {
+        tracing::debug!("could not write discovery file {}: {e}", path.display());
     }
+    #[cfg(windows)]
+    restrict_to_current_user(path);
+}
+
+fn write_port_file(port: u16, identifier: Option<&str>, product_name: Option<&str>) {
+    let dir = discovery_dir();
+    ensure_private_dir(&dir);
+    write_private_file(&dir.join("port"), &port.to_string());
     // Write metadata for multi-server discovery. The app `identifier` lets a discovery
     // client (e.g. `victauri bridge --app <id>`) select the RIGHT app when several Victauri
     // instances are running, instead of guessing — the root cause of agents binding to the
@@ -333,37 +372,13 @@ fn write_port_file(port: u16, identifier: Option<&str>, product_name: Option<&st
         "started_at": chrono::Utc::now().to_rfc3339(),
         "version": env!("CARGO_PKG_VERSION"),
     });
-    let meta_path = dir.join("metadata.json");
-    let _ = std::fs::write(&meta_path, metadata.to_string());
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&meta_path, std::fs::Permissions::from_mode(0o600));
-    }
+    write_private_file(&dir.join("metadata.json"), &metadata.to_string());
 }
 
 fn write_token_file(token: &str) {
     let dir = discovery_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-    #[cfg(windows)]
-    restrict_to_current_user(&dir);
-
-    let token_path = dir.join("token");
-    if let Err(e) = std::fs::write(&token_path, token) {
-        tracing::debug!("could not write token file: {e}");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(windows)]
-    restrict_to_current_user(&token_path);
+    ensure_private_dir(&dir);
+    write_private_file(&dir.join("token"), token);
 }
 
 fn remove_port_file() {

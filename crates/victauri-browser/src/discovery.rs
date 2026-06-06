@@ -45,8 +45,17 @@ fn restrict_to_current_user(path: &Path) {
 fn restrict_to_current_user(_path: &Path) {}
 
 /// Create the discovery dir (if needed) and lock it down to the current user.
+///
+/// Removes a SYMLINK or regular FILE squatting at the path first (a planted
+/// symlink on a shared `/tmp` could redirect our writes); an existing real
+/// directory is left in place (idempotent across the per-file writes below).
 fn ensure_dir() -> PathBuf {
     let dir = discovery_dir();
+    if let Ok(meta) = std::fs::symlink_metadata(&dir)
+        && (meta.file_type().is_symlink() || meta.is_file())
+    {
+        let _ = std::fs::remove_file(&dir);
+    }
     let _ = std::fs::create_dir_all(&dir);
     #[cfg(unix)]
     {
@@ -57,17 +66,33 @@ fn ensure_dir() -> PathBuf {
     dir
 }
 
-/// Write `content` to `<discovery_dir>/<name>` with user-only file permissions.
+/// Write `content` to `<discovery_dir>/<name>` as a fresh, user-only file. Uses
+/// exclusive (`create_new` / `O_EXCL`) creation so a pre-planted file OR symlink
+/// is refused rather than written through, and sets `0600` at creation on Unix so
+/// there is no window where the file exists with default-umask permissions.
 fn write_locked(dir: &Path, name: &str, content: &str) {
     let path = dir.join(name);
-    if let Err(e) = std::fs::write(&path, content) {
-        tracing::debug!("could not write discovery file {name}: {e}");
-        return;
+    // Clear any stale/pre-planted entry (symlink-aware) so the exclusive create
+    // succeeds for our own fresh file; a symlink racing in afterwards is refused.
+    if std::fs::symlink_metadata(&path).is_ok() {
+        let _ = std::fs::remove_file(&path);
     }
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    let result = {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .and_then(|mut f| f.write_all(content.as_bytes()))
+    };
+    #[cfg(not(unix))]
+    let result = std::fs::write(&path, content);
+    if let Err(e) = result {
+        tracing::debug!("could not write discovery file {name}: {e}");
+        return;
     }
     restrict_to_current_user(&path);
 }

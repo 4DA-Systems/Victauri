@@ -3,6 +3,7 @@
     "name": "Victauri Browser",
     "version": "0.7.1",
     "description": "MCP-native inspection for any website. X-ray vision for AI agents.",
+    "default_locale": "en",
     "browser_specific_settings": {
         "gecko": {
             "id": "victauri@4da.ai",

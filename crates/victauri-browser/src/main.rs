@@ -121,6 +121,17 @@ async fn serve() -> anyhow::Result<()> {
     let addr = listener.local_addr()?;
     tracing::info!("victauri-browser listening on http://{addr}");
 
+    // EXPERIMENTAL label (audit recommendation #1): browser mode relays commands
+    // and responses through the inspected page's own JS context, so it is
+    // cooperative automation — NOT a security boundary against a hostile page. Make
+    // that loud at startup so it is never mistaken for a trustworthy attestation.
+    tracing::warn!(
+        "victauri-browser is EXPERIMENTAL and for cooperative debugging of pages you \
+         trust — it is NOT a security boundary against a hostile page (a malicious page \
+         can observe/forge the relay channel). For tamper-resistant backend/IPC/DB \
+         introspection, use the Tauri plugin instead."
+    );
+
     // Write the discovery files so a client can auto-discover the port + token
     // (user-only perms) instead of reading the token from the log (audit B5).
     discovery::write(addr.port(), auth_token.as_deref());
