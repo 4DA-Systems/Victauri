@@ -74,6 +74,101 @@ fn is_pragma_write(sql: &str) -> bool {
     false
 }
 
+/// Read-only / introspection PRAGMAs permitted on the user-facing `query` path.
+///
+/// A positive allowlist (audit C10): even without an `=`, some PRAGMAs have side
+/// effects (`wal_checkpoint`, `optimize`, `incremental_vacuum`, `shrink_memory`,
+/// `wal_checkpoint(TRUNCATE)`). The `READ_ONLY` open flag already blocks real
+/// writes, but allowlisting the PRAGMA name makes the read-only contract explicit
+/// and refuses side-effecting introspection outright.
+#[cfg(feature = "sqlite")]
+static SAFE_PRAGMAS: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "foreign_key_check",
+    "collation_list",
+    "database_list",
+    "compile_options",
+    "function_list",
+    "module_list",
+    "pragma_list",
+    "journal_mode",
+    "journal_size_limit",
+    "page_count",
+    "page_size",
+    "max_page_count",
+    "schema_version",
+    "user_version",
+    "application_id",
+    "data_version",
+    "freelist_count",
+    "cache_size",
+    "encoding",
+    "auto_vacuum",
+    "busy_timeout",
+    "wal_autocheckpoint",
+    "legacy_file_format",
+    "locking_mode",
+    "secure_delete",
+    "synchronous",
+    "temp_store",
+    "mmap_size",
+    "cache_spill",
+    "cell_size_check",
+    "integrity_check",
+    "quick_check",
+    "stats",
+];
+
+/// Extract the lowercased PRAGMA name from a `PRAGMA [schema.]name ...` statement,
+/// tolerating an optional `schema.` qualifier. Returns `None` for a non-PRAGMA or
+/// a malformed one.
+#[cfg(feature = "sqlite")]
+fn pragma_name(sql: &str) -> Option<String> {
+    let cleaned = strip_sql_comments(sql);
+    let lower = cleaned.trim_start().to_lowercase();
+    let rest = lower.strip_prefix("pragma")?.trim_start();
+    // Optional `schema.` qualifier: only treat the part before the first '.' as a
+    // schema when it's a bare identifier (no '(', '=', whitespace) — otherwise the
+    // '.' belongs to a quoted arg and `rest` already starts with the name.
+    let after_schema = match rest.split_once('.') {
+        Some((maybe_schema, tail))
+            if !maybe_schema.is_empty()
+                && maybe_schema
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_') =>
+        {
+            tail
+        }
+        _ => rest,
+    };
+    let name: String = after_schema
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// True if `sql` is a PRAGMA whose name is NOT on [`SAFE_PRAGMAS`] (a malformed
+/// PRAGMA is also rejected). Non-PRAGMA statements are not flagged here.
+#[cfg(feature = "sqlite")]
+fn is_disallowed_pragma(sql: &str) -> bool {
+    let cleaned = strip_sql_comments(sql);
+    if !cleaned.trim_start().to_lowercase().starts_with("pragma") {
+        return false;
+    }
+    match pragma_name(sql) {
+        Some(name) => !SAFE_PRAGMAS.contains(&name.as_str()),
+        None => true,
+    }
+}
+
 /// Discover `SQLite` database files in a directory (non-recursive, max depth 2).
 #[cfg(feature = "sqlite")]
 #[must_use]
@@ -273,6 +368,17 @@ pub fn query(
     if is_pragma_write(sql) {
         return Err(
             "PRAGMA writes (PRAGMA name = value) are not allowed (read-only access)".to_string(),
+        );
+    }
+
+    // Positive PRAGMA allowlist (audit C10): reject side-effecting PRAGMAs
+    // (wal_checkpoint, optimize, incremental_vacuum, …) even without an `=`.
+    if is_disallowed_pragma(sql) {
+        return Err(
+            "only read-only introspection PRAGMAs are allowed (e.g. table_info, \
+             integrity_check, page_count); side-effecting PRAGMAs such as \
+             wal_checkpoint/optimize/incremental_vacuum are blocked"
+                .to_string(),
         );
     }
 
@@ -489,6 +595,61 @@ mod tests {
         let (_f, path) = create_test_db();
         assert!(query(&path, "PRAGMA journal_mode", &[], None).is_ok());
         assert!(query(&path, "PRAGMA user_version", &[], None).is_ok());
+    }
+
+    #[test]
+    fn rejects_side_effecting_pragmas() {
+        // Audit C10: side-effecting PRAGMAs without `=` are blocked by the allowlist.
+        let (_f, path) = create_test_db();
+        for sql in [
+            "PRAGMA wal_checkpoint",
+            "PRAGMA wal_checkpoint(TRUNCATE)",
+            "PRAGMA optimize",
+            "PRAGMA incremental_vacuum",
+            "PRAGMA shrink_memory",
+            "PRAGMA main.wal_checkpoint",
+            "pragma  optimize ",
+        ] {
+            let err = query(&path, sql, &[], None).unwrap_err();
+            assert!(
+                err.contains("read-only introspection PRAGMAs"),
+                "expected allowlist block for: {sql} (got: {err})"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_safe_introspection_pragmas() {
+        let (_f, path) = create_test_db();
+        for sql in [
+            "PRAGMA table_info(users)",
+            "PRAGMA integrity_check",
+            "PRAGMA page_count",
+            "PRAGMA foreign_key_list(users)",
+            "PRAGMA main.table_info(users)",
+        ] {
+            assert!(
+                query(&path, sql, &[], None).is_ok(),
+                "expected ok for: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn pragma_name_handles_schema_qualifier_and_args() {
+        assert_eq!(
+            pragma_name("PRAGMA wal_checkpoint").as_deref(),
+            Some("wal_checkpoint")
+        );
+        assert_eq!(
+            pragma_name("PRAGMA main.table_info(users)").as_deref(),
+            Some("table_info")
+        );
+        assert_eq!(
+            pragma_name("PRAGMA table_info(users)").as_deref(),
+            Some("table_info")
+        );
+        assert_eq!(pragma_name("SELECT 1"), None);
     }
 
     #[test]

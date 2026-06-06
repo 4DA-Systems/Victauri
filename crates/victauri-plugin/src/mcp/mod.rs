@@ -89,6 +89,22 @@ const RESOURCE_URI_IPC_LOG: &str = "victauri://ipc-log";
 const RESOURCE_URI_WINDOWS: &str = "victauri://windows";
 const RESOURCE_URI_STATE: &str = "victauri://state";
 
+/// Map an MCP resource URI to the privacy capability that gates its
+/// tool-equivalent read. Resources are served outside the tool dispatcher, so
+/// this lets `read_resource`/`subscribe` apply the same privacy matrix (audit
+/// B1). Returns `None` for an unknown URI (handled as not-found downstream).
+fn resource_required_capability(uri: &str) -> Option<&'static str> {
+    match uri {
+        // Reading the IPC log via a resource == the `logs ipc` tool action.
+        RESOURCE_URI_IPC_LOG => Some("logs.ipc"),
+        // Window states == the `window list` action.
+        RESOURCE_URI_WINDOWS => Some("window.list"),
+        // The state summary == reading plugin info.
+        RESOURCE_URI_STATE => Some("get_plugin_info"),
+        _ => None,
+    }
+}
+
 const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const SAFE_ENV_PREFIXES: &[&str] = &[
@@ -4414,6 +4430,17 @@ impl ServerHandler for VictauriMcpHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResult, ErrorData> {
         let uri = &request.uri;
+        // Resources bypass the tool dispatcher, so they must apply the same privacy
+        // gate themselves (audit B1): a strict profile that blocks log/window reads
+        // as tools must not be able to read the same data via a resource.
+        if let Some(cap) = resource_required_capability(uri.as_str())
+            && !self.state.privacy.is_tool_enabled(cap)
+        {
+            return Err(ErrorData::invalid_request(
+                format!("resource {uri} is not permitted by the current privacy configuration"),
+                None,
+            ));
+        }
         let json = match uri.as_str() {
             RESOURCE_URI_IPC_LOG => {
                 if let Ok(json) = self
@@ -4467,6 +4494,16 @@ impl ServerHandler for VictauriMcpHandler {
         _context: RequestContext<RoleServer>,
     ) -> Result<(), ErrorData> {
         let uri = &request.uri;
+        // Same privacy gate as read_resource (audit B1) — don't let a blocked
+        // resource be subscribed to for push updates.
+        if let Some(cap) = resource_required_capability(uri.as_str())
+            && !self.state.privacy.is_tool_enabled(cap)
+        {
+            return Err(ErrorData::invalid_request(
+                format!("resource {uri} is not permitted by the current privacy configuration"),
+                None,
+            ));
+        }
         match uri.as_str() {
             RESOURCE_URI_IPC_LOG | RESOURCE_URI_WINDOWS | RESOURCE_URI_STATE => {
                 self.subscriptions.lock().await.insert(uri.clone());

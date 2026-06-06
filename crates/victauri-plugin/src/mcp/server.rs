@@ -37,6 +37,23 @@ pub fn build_app_full(
     auth_token: Option<String>,
     rate_limiter: Option<Arc<crate::auth::RateLimiterState>>,
 ) -> axum::Router {
+    // Normalize an empty/whitespace-only auth token to "no auth" (audit B2). A
+    // `Some("")` token would otherwise enable the auth middleware AND report
+    // `auth_required: true` while accepting an empty Bearer credential — an
+    // auth-enabled-but-bypassable state. Collapse it to `None` and warn loudly so
+    // the server is never in a "looks protected, isn't" condition.
+    let auth_token = match auth_token {
+        Some(t) if t.trim().is_empty() => {
+            tracing::warn!(
+                "Victauri: configured auth token is empty/whitespace — treating as NO auth. \
+                 Set a non-empty VICTAURI_AUTH_TOKEN / auth_token(), or use auth_disabled() \
+                 to intentionally run without authentication."
+            );
+            None
+        }
+        other => other,
+    };
+
     // Capture the host app's identity for `/info` (first-contact verification: an agent
     // can confirm it reached the RIGHT app, not another Victauri instance on a shared port).
     let tauri_cfg = bridge.tauri_config();
