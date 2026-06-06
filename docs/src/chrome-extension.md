@@ -143,9 +143,14 @@ Web Page
 The native host supports Bearer token authentication:
 
 ```bash
-# Set via environment variable
-VICTAURI_AUTH_TOKEN=my-token victauri-browser serve
+# Set via environment variable (note: the browser host uses its own
+# VICTAURI_BROWSER_AUTH_TOKEN var, not the plugin's VICTAURI_AUTH_TOKEN)
+VICTAURI_BROWSER_AUTH_TOKEN=my-token victauri-browser serve
 ```
+
+When no token is set, the host auto-generates one and writes it to the
+discovery directory (`<temp>/victauri/<pid>/token`, user-only permissions) so a
+client can read it instead of scraping the process log.
 
 Security features:
 - Constant-time token comparison

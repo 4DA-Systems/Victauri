@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use victauri_browser::auth;
 use victauri_browser::bridge_dispatch::BridgeDispatch;
+use victauri_browser::discovery;
 use victauri_browser::installer;
 use victauri_browser::mcp_handler::VictauriBrowserHandler;
 use victauri_browser::native_messaging;
@@ -26,7 +27,26 @@ async fn main() -> anyhow::Result<()> {
 
     match command {
         "install" => {
-            let extension_id = args.get(2).map_or("EXTENSION_ID", String::as_str);
+            // Require a real extension id (audit C3). The old default passed the
+            // literal placeholder "EXTENSION_ID"; `installer::install` now rejects
+            // it, but we fail fast here with usage guidance instead of a raw error.
+            let Some(extension_id) = args.get(2).map(String::as_str) else {
+                eprintln!(
+                    "error: missing Chrome extension id.\n\
+                     usage: victauri-browser-host install <extension-id>\n\
+                     The extension id is 32 lowercase letters (a-p) shown at \
+                     chrome://extensions with Developer mode enabled."
+                );
+                std::process::exit(2);
+            };
+            if !installer::is_valid_extension_id(extension_id) {
+                eprintln!(
+                    "error: {extension_id:?} is not a valid Chrome extension id \
+                     (must be exactly 32 chars, each a-p).\n\
+                     Find it at chrome://extensions (enable Developer mode)."
+                );
+                std::process::exit(2);
+            }
             let binary = std::env::current_exe()?.to_string_lossy().to_string();
             let path = installer::install(&binary, extension_id)?;
             println!("Native messaging host registered at: {path}");
@@ -74,7 +94,14 @@ async fn serve() -> anyhow::Result<()> {
         .ok()
         .or_else(|| {
             let token = auth::generate_token();
-            tracing::info!("Generated auth token: {token}");
+            // Never log the full token (audit B5): it grants access to the host.
+            // Log only a short prefix for correlation; the full token is written
+            // to the user-only discovery file for clients to auto-discover.
+            tracing::info!(
+                "Generated auth token {}… (full token in discovery dir: {})",
+                token.chars().take(8).collect::<String>(),
+                discovery::discovery_dir().join("token").display(),
+            );
             Some(token)
         });
 
@@ -84,13 +111,21 @@ async fn serve() -> anyhow::Result<()> {
     spawn_native_reader(Arc::clone(&dispatch), Arc::clone(&tab_manager));
 
     let handler = VictauriBrowserHandler::new(Arc::clone(&tab_manager), dispatch);
-    let app = server::build_app(handler, auth_token);
+    let app = server::build_app(handler, auth_token.clone());
 
-    let addr = try_bind(port).await?;
+    let listener = try_bind(port).await?;
+    let addr = listener.local_addr()?;
     tracing::info!("victauri-browser listening on http://{addr}");
 
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // Write the discovery files so a client can auto-discover the port + token
+    // (user-only perms) instead of reading the token from the log (audit B5).
+    discovery::write(addr.port(), auth_token.as_deref());
+
+    let serve_result = axum::serve(listener, app).await;
+
+    // Best-effort cleanup so stale entries don't linger after a clean exit.
+    discovery::remove();
+    serve_result?;
 
     Ok(())
 }
@@ -188,17 +223,16 @@ async fn process_message(
     }
 }
 
-async fn try_bind(preferred: u16) -> anyhow::Result<SocketAddr> {
+async fn try_bind(preferred: u16) -> anyhow::Result<tokio::net::TcpListener> {
     for offset in 0..=PORT_RANGE {
         let port = preferred + offset;
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         match tokio::net::TcpListener::bind(addr).await {
             Ok(listener) => {
-                drop(listener);
                 if offset > 0 {
                     tracing::info!("Port {preferred} taken, using {port}");
                 }
-                return Ok(addr);
+                return Ok(listener);
             }
             Err(_) => continue,
         }

@@ -76,6 +76,9 @@ pub fn build_app_full(
             axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
         )
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        // Bound concurrent in-flight requests so a flood can't exhaust memory/tasks
+        // (audit B9). Mirrors victauri-plugin's ConcurrencyLimitLayer::new(64).
+        .layer(tower::limit::ConcurrencyLimitLayer::new(64))
         .layer(axum::middleware::from_fn(auth::security_headers))
         .layer(axum::middleware::from_fn(auth::origin_guard))
         .layer(axum::middleware::from_fn(auth::dns_rebinding_guard))

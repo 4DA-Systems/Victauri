@@ -87,9 +87,14 @@ impl BridgeDispatch {
 
         {
             let mut writer = self.writer.lock().await;
-            crate::native_messaging::write_message(&mut *writer, &msg)
-                .await
-                .map_err(|e| format!("native messaging write failed: {e}"))?;
+            if let Err(e) = crate::native_messaging::write_message(&mut *writer, &msg).await {
+                // The command never reached the extension, so its response will
+                // never arrive — reap the pending entry now instead of leaving it
+                // to occupy a MAX_PENDING slot until the 30s timeout (audit B9).
+                drop(writer);
+                self.cleanup_pending(&id).await;
+                return Err(format!("native messaging write failed: {e}"));
+            }
         }
 
         match tokio::time::timeout(DISPATCH_TIMEOUT, rx).await {
@@ -159,6 +164,47 @@ impl BridgeDispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer whose `poll_write` always fails — used to verify that a failed
+    /// native-messaging send reaps its pending entry instead of leaking it.
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("simulated stdout failure")))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_write_failure_reaps_pending_entry() {
+        let dispatch = BridgeDispatch::new(FailingWriter);
+
+        let result = dispatch
+            .dispatch(Some(1), "snapshot", serde_json::json!({}))
+            .await;
+
+        // The write failed, so dispatch returns an error...
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("write failed"));
+        // ...and crucially the pending map is empty — no leaked slot (audit B9).
+        assert_eq!(dispatch.pending_count().await, 0);
+    }
 
     #[tokio::test]
     async fn on_response_resolves_pending() {
