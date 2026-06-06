@@ -97,7 +97,7 @@ impl PrivacyConfig {
     /// `bare_tool` is the top-level tool name (e.g. `"recording"`); `capability`
     /// is the canonical matrix identity for the specific action (e.g.
     /// `"recording.replay"`), as resolved by
-    /// [`crate::mcp::authz::canonical_capability`]. A call is allowed only when:
+    /// `mcp::authz::canonical_capability`. A call is allowed only when:
     ///
     /// 1. the operator has not explicitly disabled the whole tool by its bare name
     ///    (`disable_tool("recording")` must block every `recording.*` action); AND
