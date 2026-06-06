@@ -60,6 +60,14 @@ function downloadToBuffer(url, maxRedirects = 5) {
   });
 }
 
+// Whether the user has opted into "optional" installs (`npm install --no-optional`
+// or `npm_config_optional=false`). When set, a download outage is treated as
+// non-fatal so it can't block an unrelated `npm install`; otherwise we fail loudly.
+function optionalInstall() {
+  const v = process.env.npm_config_optional;
+  return v === "false" || v === "0";
+}
+
 // Register the native messaging host by running the (already hash-verified) binary.
 function registerHost(binaryPath) {
   try {
@@ -112,12 +120,20 @@ async function main() {
   try {
     buf = await downloadToBuffer(url);
   } catch (err) {
-    // Network/transient failure: nothing unsafe happened (no binary written/run),
-    // so don't hard-fail `npm install` — guide the user to install manually.
-    console.error(`\nFailed to download binary: ${err.message}`);
+    // The download failed, so the binary is NOT installed. Previously this
+    // returned success and `npm install` looked clean while the package was
+    // unusable (silent failure, audit C5). Fail loudly with a non-zero exit so
+    // CI and users see the problem, while still printing recovery steps.
+    // Honour the standard opt-out so a download outage can't wedge an unrelated
+    // `npm install` for users who accept installing the binary later.
+    console.error(`\nvictauri-browser: failed to download ${asset} (v${VERSION}): ${err.message}`);
     console.error(`  Download manually: https://github.com/${REPO}/releases/tag/v${VERSION}`);
     console.error("  Or build from source: cargo install victauri-browser");
-    return;
+    if (optionalInstall()) {
+      console.error("  (npm_config_optional set — treating as non-fatal)");
+      return;
+    }
+    process.exit(1);
   }
 
   const got = sha256(buf);
@@ -140,7 +156,13 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`postinstall error: ${err.message}`);
-  // Unexpected error after the security-critical checks — don't break npm install.
-  process.exit(0);
+  // An unexpected error means the binary may not be installed. Fail loudly with a
+  // non-zero exit (audit C5) instead of masking it as success — unless the user
+  // opted into optional installs, in which case stay non-fatal.
+  console.error(`victauri-browser postinstall error: ${err.message}`);
+  if (optionalInstall()) {
+    console.error("  (npm_config_optional set — treating as non-fatal)");
+    process.exit(0);
+  }
+  process.exit(1);
 });

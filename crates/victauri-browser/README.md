@@ -61,7 +61,7 @@ curl -X POST http://127.0.0.1:7474/api/tools/dom_snapshot
 ## Security
 
 - **Localhost only** -- `127.0.0.1`, never `0.0.0.0`
-- **Bearer auth** -- optional token via `--token` flag or `VICTAURI_AUTH_TOKEN` env var
+- **Bearer auth** -- on by default; auto-generated token written to the discovery dir (`<temp>/victauri/<pid>/token`), or set a fixed token via the `VICTAURI_BROWSER_AUTH_TOKEN` env var
 - **Rate limiting** -- token-bucket rate limiter
 - **Origin guard** -- rejects cross-origin requests
 - **Port fallback** -- tries :7474-7484 if the preferred port is taken
