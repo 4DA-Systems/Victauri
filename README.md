@@ -343,7 +343,7 @@ victauri/
 │   ├── victauri-cli/        # CLI: init, check, test, record, watch, coverage
 │   └── victauri-watchdog/   # Health-check sidecar for crash recovery
 ├── extensions/
-│   ├── chrome/              # Chrome/Edge/Brave extension (MV3) + 170 vitest tests
+│   ├── chrome/              # Chrome/Edge/Brave extension (MV3) + 175 vitest tests
 │   ├── firefox/             # Firefox extension (MV3)
 │   └── npm/                 # @4da/victauri-browser npm package
 ├── docs/                    # mdbook documentation site

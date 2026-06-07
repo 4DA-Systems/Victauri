@@ -96,7 +96,7 @@ jobs:
 
       - name: Install bridge test dependencies
         working-directory: crates/victauri-plugin/tests/bridge_tests
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: Run tests
         run: cargo test --workspace
@@ -328,7 +328,7 @@ jobs:
 
       - name: Install bridge test dependencies
         working-directory: crates/victauri-plugin/tests/bridge_tests
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
@@ -413,7 +413,7 @@ jobs:
 
       - name: Install bridge test dependencies
         working-directory: crates/victauri-plugin/tests/bridge_tests
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: Build demo app
         run: cargo build -p demo-app
