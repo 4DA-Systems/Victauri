@@ -49,10 +49,17 @@ fn restrict_to_current_user(path: &Path) -> bool {
         return false;
     };
     let path_str = path.to_string_lossy();
+    // Remove the common world/group principals (Everyone, BUILTIN\Users, Authenticated Users)
+    // before granting owner-only: `/inheritance:r` strips only INHERITED ACEs and `/grant:r`
+    // replaces only the owner's, so a pre-planted explicit `Everyone:(F)` would otherwise survive.
     std::process::Command::new("icacls")
         .args([
             &*path_str,
             "/inheritance:r",
+            "/remove",
+            "*S-1-1-0",
+            "*S-1-5-32-545",
+            "*S-1-5-11",
             "/grant:r",
             &format!("{username}:F"),
             "/q",

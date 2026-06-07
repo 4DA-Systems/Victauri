@@ -55,8 +55,11 @@ change.
   whole run, forcing the sessionless REST API for everything. Stateless mode has no session
   to lose, so that 422 class cannot occur, and responses are returned as plain
   `application/json`. All 35 request/response tools and one-shot `resources/read` are
-  unaffected; the only capability dropped by default is server-initiated SSE push (MCP
-  resource *subscriptions*), which can be restored with the new `build_app_stateful`. The
+  unaffected. Stateless drops only the long-lived server-push SSE channel — and Victauri
+  never actually implemented resource-update push (subscribe/unsubscribe only recorded
+  intent; nothing emitted notifications), so no working feature is lost. The hollow
+  `resources.subscribe` capability is no longer advertised. `build_app_stateful` keeps the
+  stateful session transport available for clients that require the session protocol. The
   `victauri-test` client and `victauri bridge` handle either mode transparently.
 
 ### Security

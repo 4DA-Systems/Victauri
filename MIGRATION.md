@@ -28,12 +28,12 @@ is required of consumers. Review only if you parse these tool outputs:
   `application/json`. This removes the `422 "expected initialize request"` wedge that hit
   long or restart-heavy agent sessions. **No action needed for normal use** — the
   `victauri-test` client and the `victauri bridge` already handle both transports, and all
-  tools plus one-shot `resources/read` are unchanged. **Only if you relied on MCP resource
-  *subscriptions*** (server-initiated `victauri://{ipc-log,windows,state}` push, which need
-  a long-lived SSE stream): that push is disabled in stateless mode. Re-enable the stateful
-  transport by building the router with the new `victauri_plugin::mcp::build_app_stateful`
-  instead of `build_app` / `build_app_with_options`. Reading those resources on demand still
-  works in either mode.
+  tools plus one-shot `resources/read` are unchanged. Resource-update *push* notifications
+  are unaffected because they were never implemented (subscribe/unsubscribe only recorded
+  intent; nothing emitted updates) — the hollow `resources.subscribe` capability is now
+  simply not advertised. If your client specifically requires the stateful session-based
+  Streamable-HTTP protocol, build the router with the new
+  `victauri_plugin::mcp::build_app_stateful` instead of `build_app` / `build_app_with_options`.
 
 ## v0.7.8 → v0.7.9 (security hardening — no API breaks, some behavior changes)
 

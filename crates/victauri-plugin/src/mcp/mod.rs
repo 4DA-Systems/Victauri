@@ -4394,11 +4394,15 @@ get_memory_stats, get_plugin_info, get_diagnostics.";
 
 impl ServerHandler for VictauriMcpHandler {
     fn get_info(&self) -> ServerInfo {
+        // NOTE: we advertise `resources` (read) but NOT `resources.subscribe`. A real
+        // server-initiated `notifications/resources/updated` push was never implemented
+        // (subscribe/unsubscribe only record intent in memory; nothing emits updates), and
+        // the default stateless transport has no SSE channel to push over anyway. Advertising
+        // a subscribe capability we cannot honour misleads clients — read resources on demand.
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
-                .enable_resources_subscribe()
                 .build(),
         )
         .with_instructions(SERVER_INSTRUCTIONS)
