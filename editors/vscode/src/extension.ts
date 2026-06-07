@@ -59,7 +59,11 @@ export function activate(context: vscode.ExtensionContext): void {
       const port = config.get<number>("port", 7373);
       const configToken = config.get<string>("authToken", "");
 
-      const discovered = await discoverServer(port);
+      // A configured token is an explicit credential for the configured port.
+      // Never send it to a different auto-discovered localhost service.
+      const discovered = configToken
+        ? { port, token: undefined }
+        : await discoverServer(port);
       const actualPort = discovered.port;
       const token = configToken || discovered.token || undefined;
 
@@ -370,6 +374,11 @@ async function discoverServer(
   const baseDir = path.join(tmpDir, "victauri");
 
   try {
+    // The root owner can swap a previously checked child directory. Refuse the
+    // entire discovery tree unless the root itself is trusted.
+    if (!(await dirIsTrusted(baseDir))) {
+      return { port: defaultPort, token: undefined };
+    }
     const entries = await fs.readdir(baseDir, { withFileTypes: true });
     const servers: DiscoveredServer[] = [];
 

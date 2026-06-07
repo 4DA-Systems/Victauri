@@ -1634,6 +1634,12 @@
     var __vicThen = Function.prototype.call.bind(Promise.prototype.then);
     var __vicDispatchEvent = window.dispatchEvent.bind(window);
     var __vicCustomEvent = CustomEvent;
+    var __vicUint8Array = Uint8Array;
+    var __vicArrayMap = Function.prototype.call.bind(Array.prototype.map);
+    var __vicArrayJoin = Function.prototype.call.bind(Array.prototype.join);
+    var __vicNumberToString = Function.prototype.call.bind(Number.prototype.toString);
+    var __vicStringSlice = Function.prototype.call.bind(String.prototype.slice);
+    var __vicStringCharCodeAt = Function.prototype.call.bind(String.prototype.charCodeAt);
 
     // Provenance gate (audit #2): only honour commands carrying the secret nonce that the
     // ISOLATED relay hands us during a one-shot handshake at document_start, before any
@@ -1690,15 +1696,19 @@
         return __vicThen(keyPromise, function (key) {
             var data = __vicEncode(__vicStringify(parts));
             return __vicThen(__vicSign('HMAC', key, data), function (sig) {
-                return Array.prototype.map.call(new Uint8Array(sig),
-                    function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
+                return __vicArrayJoin(__vicArrayMap(new __vicUint8Array(sig),
+                    function (b) {
+                        return __vicStringSlice('0' + __vicNumberToString(b, 16), -2);
+                    }), '');
             });
         });
     }
     function __vicMacEq(a, b) {
         if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
         var d = 0;
-        for (var i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+        for (var i = 0; i < a.length; i++) {
+            d |= __vicStringCharCodeAt(a, i) ^ __vicStringCharCodeAt(b, i);
+        }
         return d === 0;
     }
     function __vicConsumeCommandId(id) {

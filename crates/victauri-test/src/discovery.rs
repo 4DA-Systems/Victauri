@@ -75,24 +75,58 @@ fn dir_is_trusted(_path: &std::path::Path) -> bool {
     true
 }
 
-/// Scan per-process discovery directories and return the port of a live server.
-///
-/// Returns `None` if no live server is found, or if multiple are found (ambiguous).
-pub fn scan_discovery_dirs_for_port() -> Option<u16> {
-    let servers = find_live_servers();
-    if servers.len() == 1 {
-        return Some(servers[0].port);
-    }
-    None
+/// Discover one unambiguous live server, keeping its port and token together.
+pub fn scan_discovery_dirs_for_connection() -> Option<(u16, Option<String>)> {
+    unique_connection(&find_live_servers())
 }
 
-/// Scan per-process discovery directories and return the token of a live server.
-pub fn scan_discovery_dirs_for_token() -> Option<String> {
+/// Return a discovery token only when exactly one live entry advertises `port`.
+pub fn scan_discovery_dirs_for_token_on_port(port: u16) -> Option<String> {
+    unique_token_for_port(&find_live_servers(), port)
+}
+
+/// Return the live discovery entry belonging to one spawned process.
+pub fn scan_discovery_dir_for_pid(pid: u32) -> Option<(u16, Option<String>)> {
     let servers = find_live_servers();
-    if servers.len() == 1 {
-        return servers[0].token.clone();
+    let mut matches = servers.iter().filter(|server| server.pid == pid);
+    let server = matches.next()?;
+    if matches.next().is_some() {
+        return None;
     }
-    None
+    Some((server.port, server.token.clone()))
+}
+
+/// Explicit configured port, if valid.
+pub fn configured_port() -> Option<u16> {
+    std::env::var("VICTAURI_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+}
+
+fn configured_token() -> Option<String> {
+    std::env::var("VICTAURI_AUTH_TOKEN")
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+}
+
+/// Resolve a connection without ever pairing a token with a different port.
+pub fn resolve_connection() -> (u16, Option<String>) {
+    let explicit_port = configured_port();
+    let explicit_token = configured_token();
+
+    if let Some(port) = explicit_port {
+        let token = explicit_token.or_else(|| scan_discovery_dirs_for_token_on_port(port));
+        return (port, token);
+    }
+
+    // A configured token is an explicit credential for the default endpoint. Do not
+    // send it to an arbitrary auto-discovered server.
+    if let Some(token) = explicit_token {
+        return (7373, Some(token));
+    }
+
+    scan_discovery_dirs_for_connection().unwrap_or((7373, None))
 }
 
 /// Non-destructive classification of the discovery directory, used to turn a
@@ -199,8 +233,25 @@ pub fn diagnose_discovery() -> DiscoveryStatus {
 }
 
 struct DiscoveredServer {
+    pid: u32,
     port: u16,
     token: Option<String>,
+}
+
+fn unique_connection(servers: &[DiscoveredServer]) -> Option<(u16, Option<String>)> {
+    if servers.len() != 1 {
+        return None;
+    }
+    Some((servers[0].port, servers[0].token.clone()))
+}
+
+fn unique_token_for_port(servers: &[DiscoveredServer], port: u16) -> Option<String> {
+    let mut matching = servers.iter().filter(|server| server.port == port);
+    let server = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    server.token.clone()
 }
 
 fn find_live_servers() -> Vec<DiscoveredServer> {
@@ -221,9 +272,9 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
         let Some(pid_str) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if pid_str.parse::<u32>().is_err() {
+        let Ok(pid) = pid_str.parse::<u32>() else {
             continue;
-        }
+        };
         // Only trust dirs we own — never read a token from, or delete, a dir a
         // local attacker could have planted (audit #15).
         if !dir_is_trusted(&path) {
@@ -250,7 +301,7 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-        servers.push(DiscoveredServer { port, token });
+        servers.push(DiscoveredServer { pid, port, token });
     }
     servers
 }
@@ -299,5 +350,53 @@ mod tests {
             hint.contains("debug") || hint.contains("not running"),
             "hint explains app-not-running / release-build: {hint}"
         );
+    }
+
+    #[test]
+    fn connection_selection_keeps_port_and_token_together() {
+        let servers = vec![DiscoveredServer {
+            pid: 10,
+            port: 7374,
+            token: Some("token-b".to_string()),
+        }];
+        assert_eq!(
+            unique_connection(&servers),
+            Some((7374, Some("token-b".to_string())))
+        );
+    }
+
+    #[test]
+    fn token_selection_never_crosses_or_ambiguously_matches_ports() {
+        let servers = vec![
+            DiscoveredServer {
+                pid: 10,
+                port: 7373,
+                token: Some("token-a".to_string()),
+            },
+            DiscoveredServer {
+                pid: 11,
+                port: 7374,
+                token: Some("token-b".to_string()),
+            },
+        ];
+        assert_eq!(
+            unique_token_for_port(&servers, 7374).as_deref(),
+            Some("token-b")
+        );
+        assert_eq!(unique_token_for_port(&servers, 7999), None);
+
+        let duplicate = vec![
+            DiscoveredServer {
+                pid: 12,
+                port: 7373,
+                token: Some("old-token".to_string()),
+            },
+            DiscoveredServer {
+                pid: 13,
+                port: 7373,
+                token: Some("new-token".to_string()),
+            },
+        ];
+        assert_eq!(unique_token_for_port(&duplicate, 7373), None);
     }
 }

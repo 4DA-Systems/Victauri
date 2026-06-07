@@ -82,6 +82,9 @@ fi
 # (e.g. a release tag with no extension changes). When an extension genuinely
 # changes, bump the top-level "version" field in its own package.json / manifest.json.
 
+# 8. Composite action default CLI version
+replace_in_file ".github/actions/victauri-test/action.yml" "default: \"$OLD_VERSION\"" "default: \"$NEW_VERSION\"" "victauri-test action CLI pin"
+
 # 9. JS bridge version
 replace_in_file "crates/victauri-plugin/src/js_bridge.rs" "version: '$OLD_VERSION'" "version: '$NEW_VERSION'" "JS bridge version"
 

@@ -156,7 +156,13 @@ pub fn action_capability(tool: &str, action: &str) -> Option<String> {
             | "clear" => format!("logs.{action}"),
             _ => return None,
         },
-        "introspect" => format!("introspect.{action}"),
+        "introspect" => match action {
+            "command_timings" | "coverage" | "contract_record" | "contract_check"
+            | "contract_list" | "contract_clear" | "startup_timing" | "capabilities"
+            | "db_health" | "plugin_state" | "processes" | "plugin_tasks" | "event_bus"
+            | "event_bus_clear" => format!("introspect.{action}"),
+            _ => return None,
+        },
         "fault" => match action {
             "inject" | "list" | "clear" | "clear_all" => format!("fault.{action}"),
             _ => return None,
@@ -240,6 +246,10 @@ mod tests {
         assert_eq!(
             canonical_capability("route", &json!({"action": "nonsense"})),
             "route"
+        );
+        assert_eq!(
+            canonical_capability("introspect", &json!({"action": "nonsense"})),
+            "introspect"
         );
     }
 

@@ -353,12 +353,34 @@ fn unix_private_dir_is_trusted(path: &std::path::Path) -> bool {
 
 /// Restrict a file or directory to current-user-only access on Windows via `icacls`.
 #[cfg(windows)]
-fn restrict_to_current_user(path: &std::path::Path) {
-    let Ok(username) = std::env::var("USERNAME") else {
-        return;
+#[allow(unsafe_code)]
+fn current_windows_username() -> Option<String> {
+    use windows::Win32::System::WindowsProgramming::GetUserNameW;
+    use windows::core::PWSTR;
+
+    let mut buffer = [0_u16; 257];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `buffer` is writable for `len` UTF-16 code units and remains alive
+    // for the duration of the call. `GetUserNameW` writes at most that capacity.
+    unsafe {
+        GetUserNameW(Some(PWSTR(buffer.as_mut_ptr())), &raw mut len).ok()?;
+    }
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(len as usize);
+    String::from_utf16(&buffer[..end])
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
+#[cfg(windows)]
+fn restrict_to_current_user(path: &std::path::Path) -> bool {
+    let Some(username) = current_windows_username() else {
+        return false;
     };
     let path_str = path.to_string_lossy();
-    let _ = std::process::Command::new("icacls")
+    std::process::Command::new("icacls")
         .args([
             &*path_str,
             "/inheritance:r",
@@ -369,7 +391,8 @@ fn restrict_to_current_user(path: &std::path::Path) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Trust the discovery path only when both the shared root and PID directory are owned
@@ -391,7 +414,10 @@ fn ensure_private_dir(dir: &std::path::Path) -> bool {
             return false;
         }
         #[cfg(windows)]
-        restrict_to_current_user(dir);
+        if !restrict_to_current_user(dir) {
+            let _ = std::fs::remove_dir_all(dir);
+            return false;
+        }
     }
     true
 }
@@ -419,12 +445,34 @@ fn write_private_file(path: &std::path::Path, contents: &str) {
             .and_then(|mut f| f.write_all(contents.as_bytes()))
     };
     #[cfg(not(unix))]
-    let result = std::fs::write(path, contents);
+    let result = {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .and_then(|mut f| f.write_all(contents.as_bytes()))
+    };
+    // Report a write failure; on Windows additionally lock the new file down to the
+    // current user and remove it if the ACL cannot be applied (never leave a discovery
+    // file world-readable). Split per-platform so neither config trips `-D warnings`:
+    // the Windows-only post-step would otherwise make an early `return` needless on Unix.
+    #[cfg(windows)]
+    match result {
+        Ok(()) => {
+            if !restrict_to_current_user(path) {
+                let _ = std::fs::remove_file(path);
+                tracing::warn!("could not restrict discovery file {}", path.display());
+            }
+        }
+        Err(e) => {
+            tracing::debug!("could not write discovery file {}: {e}", path.display());
+        }
+    }
+    #[cfg(not(windows))]
     if let Err(e) = result {
         tracing::debug!("could not write discovery file {}: {e}", path.display());
     }
-    #[cfg(windows)]
-    restrict_to_current_user(path);
 }
 
 fn write_port_file(port: u16, identifier: Option<&str>, product_name: Option<&str>) {

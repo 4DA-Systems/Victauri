@@ -32,9 +32,9 @@ inputs:
     required: false
     default: ""
   victauri-version:
-    description: Version of victauri-cli to install (empty = latest)
+    description: Version of victauri-cli to install
     required: false
-    default: ""
+    default: "0.7.10"
   cli-source-path:
     description: >-
       Build & install victauri-cli from this local repo path instead of
@@ -68,34 +68,48 @@ runs:
   steps:
     - name: Install victauri-cli
       shell: bash
+      env:
+        CLI_SOURCE_PATH: ${{ inputs.cli-source-path }}
+        VICTAURI_VERSION: ${{ inputs.victauri-version }}
       run: |
-        if [ -n "${{ inputs.cli-source-path }}" ]; then
+        if [ -n "$CLI_SOURCE_PATH" ]; then
           # Repo CI: validate the code being released, not the published crate.
-          cargo install --path "${{ inputs.cli-source-path }}" --force
-        elif [ -n "${{ inputs.victauri-version }}" ]; then
-          cargo install victauri-cli@${{ inputs.victauri-version }}
+          cargo install --path "$CLI_SOURCE_PATH" --locked --force
+        elif [[ "$VICTAURI_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          cargo install "victauri-cli@$VICTAURI_VERSION" --locked
         else
-          cargo install victauri-cli
+          echo "::error::victauri-version must be an exact semver (for example, 0.7.10)"
+          exit 1
         fi
 
     - name: Wait for Victauri server
       id: health
       shell: bash
+      env:
+        VICTAURI_PORT: ${{ inputs.port }}
+        HEALTH_TIMEOUT: ${{ inputs.health-timeout }}
       run: |
-        port="${{ inputs.port }}"
-        timeout=${{ inputs.health-timeout }}
+        if ! [[ "$VICTAURI_PORT" =~ ^[0-9]+$ ]] || (( VICTAURI_PORT < 1 || VICTAURI_PORT > 65535 )); then
+          echo "::error::port must be an integer between 1 and 65535"
+          exit 1
+        fi
+        if ! [[ "$HEALTH_TIMEOUT" =~ ^[0-9]+$ ]]; then
+          echo "::error::health-timeout must be a non-negative integer"
+          exit 1
+        fi
+
         elapsed=0
-        echo "Waiting for Victauri server on port ${port}..."
-        until curl -sf "http://127.0.0.1:${port}/health" > /dev/null 2>&1; do
-          if [ "$elapsed" -ge "$timeout" ]; then
-            echo "::error::Victauri server did not become healthy within ${timeout}s on port ${port}"
+        echo "Waiting for Victauri server on port ${VICTAURI_PORT}..."
+        until curl -sf "http://127.0.0.1:${VICTAURI_PORT}/health" > /dev/null 2>&1; do
+          if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
+            echo "::error::Victauri server did not become healthy within ${HEALTH_TIMEOUT}s on port ${VICTAURI_PORT}"
             exit 1
           fi
           sleep 1
           elapsed=$((elapsed + 1))
         done
         echo "Server healthy after ${elapsed}s"
-        echo "port=${port}" >> "$GITHUB_OUTPUT"
+        echo "port=${VICTAURI_PORT}" >> "$GITHUB_OUTPUT"
 
     - name: Run diagnostics
       if: inputs.check == 'true'
@@ -109,22 +123,30 @@ runs:
       shell: bash
       env:
         VICTAURI_PORT: ${{ inputs.port }}
+        MAX_LOAD_MS: ${{ inputs.max-load-ms }}
+        MAX_HEAP_MB: ${{ inputs.max-heap-mb }}
+        JUNIT_PATH: ${{ inputs.junit-path }}
       run: |
-        args="--max-load-ms ${{ inputs.max-load-ms }} --max-heap-mb ${{ inputs.max-heap-mb }}"
-        if [ -n "${{ inputs.junit-path }}" ]; then
-          args="$args --junit ${{ inputs.junit-path }}"
-          echo "junit-path=${{ inputs.junit-path }}" >> "$GITHUB_OUTPUT"
+        args=(--max-load-ms "$MAX_LOAD_MS" --max-heap-mb "$MAX_HEAP_MB")
+        if [ -n "$JUNIT_PATH" ]; then
+          if [[ "$JUNIT_PATH" == *$'\n'* || "$JUNIT_PATH" == *$'\r'* ]]; then
+            echo "::error::junit-path must not contain newlines"
+            exit 1
+          fi
+          args+=(--junit "$JUNIT_PATH")
+          echo "junit-path=${JUNIT_PATH}" >> "$GITHUB_OUTPUT"
         fi
-        victauri test $args
+        victauri test "${args[@]}"
 
     - name: Run coverage report
       if: inputs.coverage == 'true'
       shell: bash
       env:
         VICTAURI_PORT: ${{ inputs.port }}
+        COVERAGE_THRESHOLD: ${{ inputs.coverage-threshold }}
       run: |
-        args="--allow-empty-registry"
-        if [ -n "${{ inputs.coverage-threshold }}" ]; then
-          args="$args --threshold ${{ inputs.coverage-threshold }}"
+        args=(--allow-empty-registry)
+        if [ -n "$COVERAGE_THRESHOLD" ]; then
+          args+=(--threshold "$COVERAGE_THRESHOLD")
         fi
-        victauri coverage $args
+        victauri coverage "${args[@]}"

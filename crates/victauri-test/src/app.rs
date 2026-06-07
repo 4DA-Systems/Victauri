@@ -111,7 +111,7 @@ impl TestApp {
     ///
     /// Returns [`TestError::Connection`] if the demo app fails to start.
     pub async fn spawn_demo() -> Result<Self, TestError> {
-        let port = discover_port();
+        let port = crate::discovery::configured_port().unwrap_or(0);
         let parts = ["cargo", "run", "-p", "demo-app"];
 
         let mut child = Command::new(parts[0])
@@ -236,14 +236,14 @@ impl TestApp {
                 });
             }
 
-            let port = self.discover_actual_port();
+            let (port, token) = self.discover_actual_connection();
             let url = format!("http://127.0.0.1:{port}/health");
 
             if let Ok(resp) = http.get(&url).send().await
                 && resp.status().is_success()
             {
                 self.port = port;
-                self.token = discover_token();
+                self.token = token;
                 return Ok(());
             }
 
@@ -269,11 +269,20 @@ impl TestApp {
         )
     }
 
-    fn discover_actual_port(&self) -> u16 {
-        if self.port != 0 {
-            return self.port;
+    fn discover_actual_connection(&self) -> (u16, Option<String>) {
+        // A spawned app must be selected by its child PID. Falling back to a sole
+        // unrelated discovery entry can make tests drive the wrong running app.
+        if let Some(child) = &self.child {
+            return crate::discovery::scan_discovery_dir_for_pid(child.id()).unwrap_or((0, None));
         }
-        discover_port()
+        if self.port != 0 {
+            let token = std::env::var("VICTAURI_AUTH_TOKEN")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| crate::discovery::scan_discovery_dirs_for_token_on_port(self.port));
+            return (self.port, token);
+        }
+        crate::discovery::resolve_connection()
     }
 }
 
@@ -320,26 +329,4 @@ fn spawn_stderr_reader(
     });
 
     (lines, handle)
-}
-
-fn discover_port() -> u16 {
-    if let Ok(p) = std::env::var("VICTAURI_PORT")
-        && let Ok(port) = p.parse::<u16>()
-    {
-        return port;
-    }
-    if let Some(port) = crate::discovery::scan_discovery_dirs_for_port() {
-        return port;
-    }
-    7373
-}
-
-fn discover_token() -> Option<String> {
-    if let Ok(token) = std::env::var("VICTAURI_AUTH_TOKEN") {
-        return Some(token);
-    }
-    if let Some(token) = crate::discovery::scan_discovery_dirs_for_token() {
-        return Some(token);
-    }
-    None
 }

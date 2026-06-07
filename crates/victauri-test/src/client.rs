@@ -2,7 +2,6 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::assertions::VerifyBuilder;
-use crate::discovery::{scan_discovery_dirs_for_port, scan_discovery_dirs_for_token};
 use crate::error::TestError;
 use crate::visual::{VisualDiff, VisualOptions};
 
@@ -333,8 +332,7 @@ impl VictauriClient {
         // deletes stale (unreachable) discovery dirs as a side effect, so the
         // diagnosis must be captured first to explain a subsequent failure.
         let diagnosis = crate::discovery::diagnose_discovery();
-        let port = Self::discover_port();
-        let token = Self::discover_token();
+        let (port, token) = crate::discovery::resolve_connection();
         match Self::connect_with_token(port, token.as_deref()).await {
             Ok(client) => Ok(client),
             Err(TestError::Connection { host, port, reason }) => {
@@ -346,30 +344,6 @@ impl VictauriClient {
             }
             Err(other) => Err(other),
         }
-    }
-
-    fn discover_port() -> u16 {
-        if let Ok(p) = std::env::var("VICTAURI_PORT")
-            && let Ok(port) = p.parse::<u16>()
-        {
-            return port;
-        }
-        // Scan per-process discovery directories for live servers
-        if let Some(port) = scan_discovery_dirs_for_port() {
-            return port;
-        }
-        7373
-    }
-
-    fn discover_token() -> Option<String> {
-        if let Ok(token) = std::env::var("VICTAURI_AUTH_TOKEN") {
-            return Some(token);
-        }
-        // Scan per-process discovery directories
-        if let Some(token) = scan_discovery_dirs_for_token() {
-            return Some(token);
-        }
-        None
     }
 
     /// Check whether the server is still reachable.

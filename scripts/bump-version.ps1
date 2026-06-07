@@ -9,6 +9,7 @@
 #   - Cargo.toml [workspace.package] version
 #   - Cargo.toml [workspace.dependencies] victauri-* pins
 #   - Cargo.lock (via cargo check)
+#   - .github/actions/victauri-test/action.yml (pinned CLI install default)
 #   - crates/victauri-plugin/src/js_bridge.rs (bridge version constant)
 #   - crates/victauri-plugin/tests/bridge_tests.rs (version assertions)
 #   - docs/src/getting-started.md (example output)
@@ -109,6 +110,9 @@ if ($cargoContent -match $pinPattern) {
 # they actually change. Force-bumping them on every core release made them rot
 # (a release tag with no extension changes). When an extension genuinely changes,
 # bump the top-level "version" field in its own package.json / manifest.json.
+
+# 8. Composite action default CLI version
+Update-File ".github\actions\victauri-test\action.yml" "default: `"$OldVersion`"" "default: `"$NewVersion`"" "victauri-test action CLI pin"
 
 # 9. JS bridge version (hardcoded in bridge init script)
 Update-File "crates\victauri-plugin\src\js_bridge.rs" "version: '$OldVersion'" "version: '$NewVersion'" "JS bridge version"

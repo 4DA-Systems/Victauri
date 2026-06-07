@@ -22,12 +22,34 @@ pub fn discovery_dir() -> PathBuf {
 
 /// Restrict a file or directory to current-user-only access on Windows via `icacls`.
 #[cfg(windows)]
-fn restrict_to_current_user(path: &Path) {
-    let Ok(username) = std::env::var("USERNAME") else {
-        return;
+#[allow(unsafe_code)]
+fn current_windows_username() -> Option<String> {
+    use windows::Win32::System::WindowsProgramming::GetUserNameW;
+    use windows::core::PWSTR;
+
+    let mut buffer = [0_u16; 257];
+    let mut len = buffer.len() as u32;
+    // SAFETY: `buffer` is writable for `len` UTF-16 code units and remains alive
+    // for the duration of the call. `GetUserNameW` writes at most that capacity.
+    unsafe {
+        GetUserNameW(Some(PWSTR(buffer.as_mut_ptr())), &raw mut len).ok()?;
+    }
+    let end = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(len as usize);
+    String::from_utf16(&buffer[..end])
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
+#[cfg(windows)]
+fn restrict_to_current_user(path: &Path) -> bool {
+    let Some(username) = current_windows_username() else {
+        return false;
     };
     let path_str = path.to_string_lossy();
-    let _ = std::process::Command::new("icacls")
+    std::process::Command::new("icacls")
         .args([
             &*path_str,
             "/inheritance:r",
@@ -38,11 +60,14 @@ fn restrict_to_current_user(path: &Path) {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(not(windows))]
-fn restrict_to_current_user(_path: &Path) {}
+fn restrict_to_current_user(_path: &Path) -> bool {
+    true
+}
 
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
@@ -132,7 +157,10 @@ fn ensure_dir() -> Option<PathBuf> {
         if std::fs::create_dir_all(&dir).is_err() {
             return None;
         }
-        restrict_to_current_user(&dir);
+        if !restrict_to_current_user(&dir) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return None;
+        }
     }
     Some(dir)
 }
@@ -160,12 +188,22 @@ fn write_locked(dir: &Path, name: &str, content: &str) {
             .and_then(|mut f| f.write_all(content.as_bytes()))
     };
     #[cfg(not(unix))]
-    let result = std::fs::write(&path, content);
+    let result = {
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .and_then(|mut f| f.write_all(content.as_bytes()))
+    };
     if let Err(e) = result {
         tracing::debug!("could not write discovery file {name}: {e}");
         return;
     }
-    restrict_to_current_user(&path);
+    if !restrict_to_current_user(&path) {
+        let _ = std::fs::remove_file(&path);
+        tracing::warn!("could not restrict discovery file {}", path.display());
+    }
 }
 
 /// Write the discovery files for this running host.

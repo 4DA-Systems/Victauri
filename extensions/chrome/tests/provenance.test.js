@@ -43,6 +43,22 @@ describe('bridge command authentication (audit #2 / A4)', () => {
     expect(resp).toBeNull();
   });
 
+  it('ignores a forged MAC after the page replaces String.prototype.charCodeAt', async () => {
+    const originalCharCodeAt = env.window.String.prototype.charCodeAt;
+    env.window.String.prototype.charCodeAt = () => 0;
+    try {
+      const resp = await dispatchAsPage({
+        id: 'forge-prototype',
+        method: 'snapshot',
+        args: {},
+        mac: 'deadbeef'.repeat(8),
+      });
+      expect(resp).toBeNull();
+    } finally {
+      env.window.String.prototype.charCodeAt = originalCharCodeAt;
+    }
+  });
+
   it('ignores a command with an empty MAC', async () => {
     // An explicit (empty) mac is non-null, so the harness leaves it unsigned.
     const resp = await dispatchAsPage({ id: 'forge2', method: 'snapshot', args: {}, mac: '' });

@@ -9,7 +9,8 @@
 //   (3) read the channel nonce, NOR
 //   (4) steal the HMAC key by replacing MAIN-world WebCrypto, NOR
 //   (5) replay an observed valid command, NOR
-//   (6) substitute command arguments or response data after MAC capture,
+//   (6) substitute command arguments or response data after MAC capture, NOR
+//   (7) bypass MAC comparison by replacing page-world built-in prototypes,
 // while a legitimate command still returns the correct result.
 //
 // This is the canonical proof that the HMAC-authenticated channel (content-isolated.js /
@@ -52,7 +53,7 @@ const HOSTILE_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>A4
     sawNonce: null, capturedKey: null, importHookInstalled: false, observed: [],
     injectedId: 'HOSTILE-INJECT', replayedCommand: false, legitExecutions: 0,
     commandMutationAttempted: false, mutatedCommandExecutions: 0,
-    responseMutationAttempted: false
+    responseMutationAttempted: false, comparisonHookInstalled: false
   };
   // Attack 0: replace MAIN-world WebCrypto after document_start. A lazy key import leaks
   // the raw nonce here; a hardened bridge has already imported it with a captured method.
@@ -65,6 +66,14 @@ const HOSTILE_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>A4
     return originalImportKey.apply(this, arguments);
   };
   window.__hostile.importHookInstalled = crypto.subtle.importKey !== originalImportKey;
+  // Attack 0b: content-main runs in MAIN world, so prototype methods looked up after
+  // document_start are page-controlled. If MAC comparison calls the live
+  // String.prototype.charCodeAt, returning zero for every character makes any two
+  // same-length MACs compare equal.
+  var originalCharCodeAt = String.prototype.charCodeAt;
+  String.prototype.charCodeAt = function () { return 0; };
+  window.__hostile.comparisonHookInstalled =
+    String.prototype.charCodeAt !== originalCharCodeAt;
   // Attack 1: learn the nonce + race a forged response for any in-flight command id.
   window.addEventListener('__victauri_command', function (e) {
     var d = e && e.detail; if (!d) return;
@@ -189,6 +198,8 @@ async function main() {
     else pass('hostile WebCrypto importKey hook installed');
     if (hostile.capturedKey) fail('HMAC KEY LEAKED through page-replaced WebCrypto');
     else pass('HMAC key import stayed on captured pristine WebCrypto');
+    if (!hostile.comparisonHookInstalled) fail('hostile MAC-comparison prototype hook was not installed');
+    else pass('hostile MAC-comparison prototype hook installed');
 
     // (5) A valid observed command must execute exactly once even when replayed.
     if (!hostile.replayedCommand) fail('hostile page did not replay the observed command');
