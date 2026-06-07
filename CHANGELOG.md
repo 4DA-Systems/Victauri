@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-06-07
+
+Driven by an in-the-wild session that drove **live 4DA** over the REST bridge and
+documented five frictions. The two that were real, generic correctness bugs (verified
+against HEAD, not the session summary) are fixed here — live-verified against the
+demo-app and green across the full multi-platform CI incl. Live-App Proof on all three
+OS. All changes are **additive / bugfix — no breaking output-schema change** (Semver
+Checks green), so consumers on `"0.7"` (e.g. 4DA) pick them up with no requirement
+change.
+
+### Fixed
+
+- **`introspect command_timings` is no longer blind to the app's real frontend IPC.**
+  It only ever recorded commands driven through Victauri's own `invoke_command` tool,
+  so it reported `0 profiled` while a live app made hundreds of real calls. It now
+  *also* derives per-command `call_count` + min/max/avg/p95 latency from the live IPC
+  log (new `ipc_traffic` field) — the figure that reflects actual usage — alongside a
+  `note` making the two sources explicit. `ipc_commands_observed` is also reported.
+- **`introspect coverage` no longer reports "0 invoked" on busy apps.** It eval'd the
+  full `getIpcLog()` *with* request/response bodies, which exceeds the 5 MB eval-result
+  cap on a heavy-traffic app → empty parse → `0 invoked` despite live traffic (the same
+  busy-app failure mode fixed for `logs`/ghost-detection on 2026-05-29, which had missed
+  this call site). Switched to the body-free command-name projection; added
+  `ipc_calls_observed` so a zero is now diagnosable.
+- **`detect_ghost_commands` no longer over-claims.** `frontend_only` means "absent from
+  Victauri's `#[inspectable]` introspection registry" — a strict *subset* of the real
+  `tauri::generate_handler!` set — but the docstrings and tool description claimed "no
+  backend handler", so any app not fully using `#[inspectable]` (e.g. one with an empty
+  registry) had every real command flagged as a ghost. Corrected the wording and added
+  a purely-additive `reliability` (`none` / `low` / `high`) + plain-language `note`.
+
+### Changed
+
+- **`detect_ghost_commands` output is enriched (additive).** Adds `reliability` + `note`;
+  the existing `frontend_only` / `registry_only` / totals fields are preserved verbatim.
+- **`victauri-cli doctor`** and the **`victauri-test` `NoGhostCommands`** smoke check are
+  now reliability-aware — they no longer treat `frontend_only` entries as bugs unless the
+  registry is complete (`reliability: high`). (`NoGhostCommands` also had a latent
+  always-passes bug — it read a `ghost_commands` key that never existed — now fixed.)
+
+### Security
+
+- **`victauri bridge` discovery now verifies directory ownership before trusting a token**
+  (audit #15, read side). The bridge — the stdio MCP proxy Claude Code connects through —
+  scanned `<temp>/victauri/<pid>/` and read the Bearer token after only a process-liveness
+  check. On a shared-temp Unix host a local attacker could plant a fake `<pid>` directory
+  (named after one of their own live processes) pointing at a server they control and
+  harvest the real token (and feed forged tool results). `discover_servers` now applies the
+  same `dir_is_trusted` guard `victauri-test` already used: a directory is trusted only if
+  it is a real directory (not a symlink), owned by the current uid, and not group/other-
+  writable. No effect on Windows (per-user temp). Found by the pre-release internal sweep.
+
 ## [0.7.9] - 2026-06-07
 
 Driven by the agent-eval A/B (`scripts/agent-eval/RESULTS.md`), which refuted the

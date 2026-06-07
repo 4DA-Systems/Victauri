@@ -427,6 +427,17 @@ fn discover_servers() -> Vec<ServerInfo> {
             continue;
         }
         let dir = entry.path();
+        // Shared-temp hardening (audit #15, read side). The discovery root lives under a
+        // world-writable temp dir on Unix, so a local attacker can plant a fake `<pid>`
+        // directory — named after one of THEIR own live processes, so `is_process_alive`
+        // passes — pointing at a server they control, and harvest the real Bearer token we
+        // send it (and feed us forged tool results). Trust a directory only if it is a real
+        // directory we own and is not group/other-writable — the same guard
+        // `victauri-test::discovery` already applies. The bridge is the path Claude Code
+        // connects through, so this is the highest-value read-side sink.
+        if !dir_is_trusted(&dir) {
+            continue;
+        }
         let Ok(port_s) = std::fs::read_to_string(dir.join("port")) else {
             continue;
         };
@@ -501,6 +512,44 @@ fn is_process_alive(pid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Trust a discovery directory only if it is a real directory (not a symlink), owned by the
+/// current user, and not group/other-writable. Mirrors `victauri-test::discovery::dir_is_trusted`
+/// — the bridge had no such check (audit #15 read-side residual), and it is the path Claude Code
+/// connects through. No `unsafe` (this crate is `#![forbid(unsafe_code)]`): the effective uid is
+/// read back from a probe file we create.
+#[cfg(unix)]
+fn dir_is_trusted(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_dir() {
+        return false; // reject symlinks / non-dirs
+    }
+    let Some(euid) = current_euid() else {
+        return false; // can't establish our uid -> don't trust
+    };
+    meta.uid() == euid && (meta.permissions().mode() & 0o022) == 0
+}
+
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let probe =
+        std::env::temp_dir().join(format!(".victauri_bridge_uidprobe_{}", std::process::id()));
+    std::fs::write(&probe, b"").ok()?;
+    let uid = std::fs::metadata(&probe).ok().map(|m| m.uid());
+    let _ = std::fs::remove_file(&probe);
+    uid
+}
+
+/// On Windows the per-user temp dir is not world-writable, so the shared-temp planting
+/// attack does not apply; trust the directory.
+#[cfg(not(unix))]
+fn dir_is_trusted(_path: &std::path::Path) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +622,14 @@ mod tests {
         let pid = std::process::id(); // alive → passes is_process_alive
         let dir = std::env::temp_dir().join("victauri").join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
+        // Make ownership/permissions deterministic so `dir_is_trusted` passes regardless of
+        // the runner's umask (a umask of 002 would otherwise leave the dir group-writable
+        // and the read-side trust guard would correctly reject it).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         std::fs::write(dir.join("port"), "61999").unwrap();
         std::fs::write(dir.join("token"), "tok-xyz").unwrap();
         std::fs::write(
@@ -597,5 +654,35 @@ mod tests {
         ));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Audit #15 read-side: a planted, world-writable discovery dir (the shape an attacker
+    // creates in a shared /tmp) must NOT be trusted, so its token is never read/sent.
+    #[cfg(unix)]
+    #[test]
+    fn dir_is_trusted_rejects_world_writable_and_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = std::env::temp_dir().join(format!("vic_trust_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+
+        // Owned, 0700 -> trusted.
+        let good = base.join("good");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(dir_is_trusted(&good), "0700 owner dir must be trusted");
+
+        // Group/other-writable -> rejected.
+        let bad = base.join("bad");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!dir_is_trusted(&bad), "world-writable dir must be rejected");
+
+        // Symlink (even to a trusted target) -> rejected (no symlink following).
+        let link = base.join("link");
+        let _ = std::os::unix::fs::symlink(&good, &link);
+        assert!(!dir_is_trusted(&link), "symlinked dir must be rejected");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
