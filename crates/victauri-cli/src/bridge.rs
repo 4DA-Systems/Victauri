@@ -60,6 +60,11 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     // Cache the MCP handshake so a session can be re-established transparently after the
     // backend restarts — the host (e.g. Claude Code) only sends `initialize` once.
     let cached_init: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    // Set once an `initialize` succeeds with no `Mcp-Session-Id`: the server is running in
+    // stateless mode, so there is no session to mint or lose. In that mode we must NOT
+    // re-`initialize` before every request (it would double every call for no benefit) and
+    // there is no stale-session class to recover from.
+    let stateless: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
 
     let http = build_client()?;
 
@@ -96,7 +101,7 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
             // is the initialize). This is what makes restart-recovery actually work — the
             // old code cleared the session then re-sent the tool call with no session, which
             // the server rejects with 422 "expect initialize".
-            if !is_initialize {
+            if !is_initialize && !*stateless.lock().expect("stateless lock") {
                 let need_reinit = session_id.lock().expect("session lock").is_none();
                 if need_reinit {
                     let init = cached_init.lock().expect("cached_init lock").clone();
@@ -122,6 +127,9 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
                 Ok(out) => {
                     if let Some(new_sid) = out.session_id {
                         *session_id.lock().expect("session lock") = Some(new_sid);
+                    } else if is_initialize && !out.stale_session {
+                        // initialize succeeded but returned no session id → stateless server.
+                        *stateless.lock().expect("stateless lock") = true;
                     }
 
                     if out.stale_session {

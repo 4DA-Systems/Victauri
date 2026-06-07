@@ -152,7 +152,10 @@ pub struct VictauriClient {
     base_url: String,
     host: String,
     port: u16,
-    session_id: String,
+    /// MCP session id, minted by `initialize` in *stateful* mode. `None` when the server runs in
+    /// *stateless* mode (the Victauri default since the 422-wedge fix) — then no session header is
+    /// sent and the stale-session 422 recovery path simply never triggers.
+    session_id: Option<String>,
     next_id: u64,
     auth_token: Option<String>,
 }
@@ -206,15 +209,20 @@ impl VictauriClient {
     }
 
     /// Run the MCP `initialize` + `notifications/initialized` handshake and return the
-    /// minted session id. Shared by [`Self::connect_with_token`] and [`Self::reinitialize`]
-    /// so a fresh session can be established without rebuilding the whole client.
+    /// minted session id, if any. Shared by [`Self::connect_with_token`] and
+    /// [`Self::reinitialize`] so a fresh session can be established without rebuilding the
+    /// whole client.
+    ///
+    /// Returns `Ok(None)` when the server is in **stateless** mode (no `mcp-session-id` header on
+    /// the initialize response) — that is valid, not an error, and means subsequent requests carry
+    /// no session id. Returns `Ok(Some(id))` in stateful mode.
     async fn perform_handshake(
         http: &reqwest::Client,
         base_url: &str,
         host: &str,
         port: u16,
         token: Option<&str>,
-    ) -> Result<String, TestError> {
+    ) -> Result<Option<String>, TestError> {
         let init_body = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -267,26 +275,26 @@ impl VictauriClient {
             });
         }
 
+        // Stateful mode returns an `mcp-session-id` header to echo on later calls; stateless mode
+        // returns none. Absence is NOT an error here — it just means there is no session to track.
         let session_id = init_resp
             .headers()
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| TestError::Connection {
-                host: host.to_string(),
-                port,
-                reason: "no mcp-session-id header".into(),
-            })?
-            .to_string();
+            .map(str::to_string);
 
         let mut notify_req = http
             .post(format!("{base_url}/mcp"))
             .header("Content-Type", "application/json")
-            .header("mcp-session-id", &session_id)
+            .header("Accept", "application/json, text/event-stream")
             .json(&json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized"
             }));
 
+        if let Some(ref sid) = session_id {
+            notify_req = notify_req.header("mcp-session-id", sid);
+        }
         if let Some(t) = token {
             notify_req = notify_req.header("Authorization", format!("Bearer {t}"));
         }
@@ -419,8 +427,11 @@ impl VictauriClient {
                 .post(format!("{}/mcp", self.base_url))
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json, text/event-stream")
-                .header("mcp-session-id", &self.session_id)
                 .json(&call_body);
+            // Only carry a session id in stateful mode; stateless mode has none.
+            if let Some(ref sid) = self.session_id {
+                req = req.header("mcp-session-id", sid);
+            }
             if let Some(ref t) = self.auth_token {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
@@ -1257,10 +1268,11 @@ impl VictauriClient {
         self.port
     }
 
-    /// Get the MCP session ID.
+    /// Get the MCP session ID. Empty string when the server runs in stateless mode
+    /// (no session is minted), so the `&str` signature is preserved.
     #[must_use]
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        self.session_id.as_deref().unwrap_or("")
     }
 
     pub(crate) fn http_client(&self) -> &reqwest::Client {

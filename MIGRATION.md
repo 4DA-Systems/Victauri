@@ -22,6 +22,18 @@ is required of consumers. Review only if you parse these tool outputs:
 - **Behavioral (no action needed):** `victauri-cli doctor` and the `victauri-test`
   `NoGhostCommands` smoke check now treat `frontend_only` as bugs only at
   `reliability: high`, so they no longer false-fail apps that don't use `#[inspectable]`.
+- **MCP transport is now stateless by default (behavior change).** The embedded `/mcp`
+  server no longer mints an `Mcp-Session-Id` or requires the `initialize` handshake to be
+  echoed on later calls; each request is self-contained and responses are plain
+  `application/json`. This removes the `422 "expected initialize request"` wedge that hit
+  long or restart-heavy agent sessions. **No action needed for normal use** — the
+  `victauri-test` client and the `victauri bridge` already handle both transports, and all
+  tools plus one-shot `resources/read` are unchanged. **Only if you relied on MCP resource
+  *subscriptions*** (server-initiated `victauri://{ipc-log,windows,state}` push, which need
+  a long-lived SSE stream): that push is disabled in stateless mode. Re-enable the stateful
+  transport by building the router with the new `victauri_plugin::mcp::build_app_stateful`
+  instead of `build_app` / `build_app_with_options`. Reading those resources on demand still
+  works in either mode.
 
 ## v0.7.8 → v0.7.9 (security hardening — no API breaks, some behavior changes)
 
