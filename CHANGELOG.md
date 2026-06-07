@@ -59,6 +59,39 @@ change.
   it is a real directory (not a symlink), owned by the current uid, and not group/other-
   writable. No effect on Windows (per-user temp). Found by the pre-release internal sweep.
 
+#### Red-team audit hardening (external cross-model adversarial pass)
+
+A cross-model (GPT/Codex) adversarial audit of the pre-release `b9fd6de` found, and this
+release fixes, the following — each independently reviewed and verified against the code:
+
+- **A4 browser channel — WebCrypto key-import hook (critical).** The MAIN-world bridge
+  imported its HMAC key lazily via the page-controllable global `crypto.subtle`, with the
+  raw nonce as key material — a hostile page that patched `crypto.subtle.importKey`/`sign`
+  at `document_start` could steal the nonce and defeat the A4 authentication. The bridge now
+  captures pristine `crypto.subtle`/`TextEncoder`/`JSON`/`Promise` references at
+  `document_start` (before page scripts run) and imports the key eagerly during the nonce
+  handshake. (Browser extension — EXPERIMENTAL, separate cadence.)
+- **A4 command replay + signed-payload TOCTOU.** Authenticated command ids are now consumed
+  before execution (a page replaying a valid command event can't repeat side effects), and the
+  exact MAC'd args are snapshotted as JSON and executed as an immutable copy (the shared event
+  detail was page-mutable during the async MAC verification). Mirrored in both worlds.
+- **Weak nonce fallback.** Without a CSPRNG the ISOLATED relay fell back to a guessable
+  `Date.now()+Math.random()` nonce; it now returns `null` and the channel fails closed.
+- **Cross-port auth-token leak.** On the `VICTAURI_PORT` override path the bridge paired the
+  *first* token found among any running app with the requested port — sending one app's Bearer
+  token to an unrelated localhost port. Token is now matched to its exact port (`token_for_port`).
+- **Unix symlink-clobber + discovery-token disclosure.** Discovery-dir setup chmod'd *through*
+  a planted symlink and wrote the token through it; uid probes used symlink-following
+  `fs::write`. Now refuses symlinked/untrusted paths, uses `O_EXCL` probe files, never chmods a
+  symlink target, and won't `remove_dir_all` a directory it does not own. Applied across the
+  plugin server, the CLI bridge, the test client, and the browser host discovery.
+- **Release pipeline / supply chain.** SHA-pinned the remaining floating GitHub Actions
+  (`docs.yml`, `surface-audit.yml`); added a protected `environment: release` to the npm and
+  VS Code publish jobs; removed the `|| npm install` lockfile-bypass fallbacks (`npm ci`
+  everywhere); switched credentialed publishes to `npx --no-install`; and the crates publish
+  job now additionally `needs` the release-binary build and the packaged extension before the
+  irreversible publish.
+
 ## [0.7.9] - 2026-06-07
 
 Driven by the agent-eval A/B (`scripts/agent-eval/RESULTS.md`), which refuted the
