@@ -182,19 +182,29 @@ Security features:
 
 ## Trust Model (read this)
 
-Browser mode is **cooperative automation for pages you control — not a security
-boundary against a hostile page.** The content script relays commands and
-responses through the page's own JavaScript context (`window` `CustomEvent`s in
-the MAIN world). A malicious page on the inspected tab can observe that channel
-and could inject commands or race a forged response. **Do not treat browser-mode
-results as a trustworthy attestation about an untrusted page**, and don't drive
-the extension against pages you don't trust while expecting tamper-proof output.
+Browser mode is **experimental, cooperative automation.** Three things to understand:
 
-This is a deliberate trade-off for a debugging tool. If you need results that are
-robust against a hostile page, use the **Tauri plugin** path instead: it runs in
-the Rust process below the webview and reads backend/IPC/DB state directly. (The
-plugin's `verify_state` / `query_db` / IPC-history tools are the verification
-surface; the browser extension is automation.)
+**Channel integrity (audit A4 — fixed in 0.7.9).** The content script relays commands and
+responses through the page's own JavaScript context (`window` `CustomEvent`s in the MAIN
+world), which a page can observe. As of 0.7.9 both directions are authenticated with an
+HMAC-SHA256 keyed by a nonce exchanged during `document_start` before any page script runs,
+so a hostile page can **no longer** inject a command or race a forged response — the relay
+and bridge reject anything without a valid MAC. Verified in a real browser
+(`extensions/chrome/tests/e2e/a4-channel-forgery.mjs`).
+
+**Secure context required.** Web Crypto (`crypto.subtle`), which the authenticated channel
+needs, only exists in a secure context. The bridge works on **https://** pages and on
+**http://localhost / 127.0.0.1**, but **fails closed on a plain `http://` origin** — it
+refuses to operate rather than fall back to an unauthenticated channel. If the extension
+goes silent on an http site, that is why; use https or the Tauri plugin.
+
+**Still not a full security boundary.** There is not yet a per-domain/tab privilege model
+or output redaction for browser mode, and the bridge shares the page's MAIN world. So while
+the channel is now tamper-resistant, treat browser mode as automation for pages you are
+inspecting deliberately. For results that must be robust regardless of the page, use the
+**Tauri plugin** path: it runs in the Rust process below the webview and reads backend /
+IPC / DB state directly (`verify_state` / `query_db` / IPC-history are the verification
+surface).
 
 ## Port Behavior
 

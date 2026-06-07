@@ -334,20 +334,25 @@ These are **features, not gratuitous grants** — but they are powerful. Install
 if you need full web inspection, and prefer the embedded Tauri plugin (capability-gated, debug-only)
 for app testing.
 
-**On the MAIN-world bridge and its nonce gate (be precise about what it does and doesn't do):**
-The bridge in the page's MAIN world has a per-page nonce gate, but it is a **speed-bump, not a
-security boundary**. The nonce is now generated in the ISOLATED relay and handed to MAIN via a
-**single-shot handshake at `document_start`** (so a page can no longer *request* a re-announce to
-pull it — that recovery path is closed, and the bridge fails closed if the handshake never
-completes). It is, however, still transmitted on page-observable `window` CustomEvents whenever a
-real command flows, so a passive hostile page can read the nonce off a legitimate command and then
-forge its own. This matters **little in practice**
-because the MAIN-world bridge runs in the page's *own* JS context — driving it grants the page nothing
-it doesn't already have (DOM access, `document.cookie`, `localStorage`, eval-in-self). The genuinely
-privileged capabilities — **httpOnly cookies (`chrome.cookies`) and screenshots** — are handled in the
-**service worker** and are **not reachable by a forged page event** (a page cannot impersonate
-`chrome.runtime`). The real residual risk is **response forgery**: a hostile
-page can inject fabricated results for the agent's in-flight commands, feeding the agent attacker-
-controlled data (a prompt-injection vector — see [Untrusted Content & Prompt Injection](#untrusted-content--prompt-injection)).
-Treat the extension as a privileged component, do not run it in auto-approve mode against hostile sites,
-and rely on the service-worker gating — not the MAIN nonce — for the capabilities that matter.
+**On the MAIN-world bridge and its authentication (be precise about what it does and doesn't do):**
+The ISOLATED↔MAIN channel is authenticated with an **HMAC-SHA256** keyed by a nonce exchanged via a
+**single-shot handshake at `document_start`** — before any page script runs — and the raw nonce is
+**never** placed on a page-observable event again. Commands and responses carry only a one-way MAC,
+so a hostile page on the inspected tab can **no longer** read the secret, inject a command, or race
+a forged response: the relay and bridge reject any message without a valid MAC, and the bridge
+**fails closed** if the handshake never completes or the origin is not a secure context (Web Crypto
+is unavailable on plain `http://`). This was verified exploitable *before* the fix and verified
+closed *after*, in a real browser (`extensions/chrome/tests/e2e/a4-channel-forgery.mjs`). Audit A4,
+fixed in 0.7.9.
+
+What the channel fix does **not** change: the bridge still runs in the page's *own* MAIN-world JS
+context, so driving it grants the page nothing it doesn't already have (DOM, `document.cookie`,
+`localStorage`, eval-in-self), and there is **not yet** a per-domain/tab privilege model or output
+redaction for browser mode (it remains experimental). The genuinely privileged capabilities —
+**httpOnly cookies (`chrome.cookies`) and screenshots** — are handled in the **service worker** over
+the trusted `chrome.runtime` channel and are **not reachable by a page event** (a page cannot
+impersonate `chrome.runtime`). Treat the extension as experimental and privileged: don't run it in
+auto-approve mode against hostile sites, and for results that must be robust regardless of the page,
+use the embedded Tauri plugin. Prompt-injection considerations still apply to any page content an
+agent ingests (DOM text, logs, network bodies) — see
+[Untrusted Content & Prompt Injection](#untrusted-content--prompt-injection).
