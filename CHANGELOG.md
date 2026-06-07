@@ -64,6 +64,32 @@ change.
 
 ### Security
 
+- **A blank auth token no longer disables auth — the contract is now uniformly
+  "auth on by default unless `auth_disabled()`".** v0.7.9 *normalized* an empty or
+  whitespace `auth_token("")` / `VICTAURI_AUTH_TOKEN=""` to **no auth** (a silent
+  fail-open: a botched env var or build script could turn auth off without anyone calling
+  `auth_disabled()`). The plugin builder's `resolve_auth_token` now treats a blank
+  configured token as *unset* and **generates a real auto-token** instead, so auth stays
+  on unless the operator explicitly opts out. The CLI `victauri bridge` got the matching
+  client-side fix: on the `VICTAURI_PORT` override path a blank `VICTAURI_AUTH_TOKEN` is
+  treated as unset and falls through to the token discovered for that exact port, rather
+  than sending an empty Bearer that would 401 every call (`normalize_env_token`). This
+  reverses the v0.7.9 "empty tokens normalized to no auth" behavior noted below.
+- **Discovery directory is now locked to the current user with a true owner-only DACL on
+  Windows (round-4 audit #4).** The previous `icacls /inheritance:r /remove … /grant:r`
+  hardening stripped inherited ACEs and the common world/group principals, but a *pre-planted
+  explicit ACE for an arbitrary principal* (the auditor's example: `BUILTIN\Guests`) survived,
+  because `/grant:r` replaces only the owner's ACE. Victauri now (1) **verifies the directory
+  is owned by the current user** before trusting it — refusing an attacker-pre-planted dir on
+  a shared `TEMP` (the Windows counterpart to the existing Unix uid check) — and (2) **replaces
+  the DACL with a PROTECTED owner-only DACL** via the Win32 security API
+  (`SetNamedSecurityInfoW`), so no inherited or pre-existing explicit ACE can survive. The old
+  `icacls` path remains only as a logged fallback if the API call fails on an unusual
+  filesystem. Applied to both the plugin server and the browser native host; proven by a test
+  that plants a `Guests` ACE and asserts it is gone after the lockdown. (The plugin is
+  `#[cfg(debug_assertions)]`-gated and the default per-user `TEMP` is not writable by other
+  users, so the prior residual was never exploitable on a default setup — this closes it for
+  non-default shared-`TEMP` layouts too.)
 - **`victauri bridge` discovery now verifies directory ownership before trusting a token**
   (audit #15, read side). The bridge — the stdio MCP proxy Claude Code connects through —
   scanned `<temp>/victauri/<pid>/` and read the Bearer token after only a process-liveness
@@ -164,7 +190,9 @@ structural authorization bypass; the rest hardens the real machine-touching surf
   tools could still read them as resources. They now apply the same capability gate.
 - **Empty auth tokens rejected (audit B2).** A `Some("")`/whitespace token enabled the
   auth middleware while reporting `auth_required: true` and accepting an empty Bearer.
-  Empty tokens are normalized to "no auth" with a loud warning.
+  Empty tokens are normalized to "no auth" with a loud warning. **(Superseded in 0.7.10
+  — see above: a blank token now generates a real auto-token instead of disabling auth,
+  so the contract is uniformly "auth on by default unless `auth_disabled()`".)**
 - **`query_db` PRAGMA allowlist (audit C10).** Side-effecting PRAGMAs (`wal_checkpoint`,
   `optimize`, `incremental_vacuum`) are now rejected even without an `=`, on top of the
   existing READ_ONLY open flag and write-form block.
@@ -671,8 +699,8 @@ plus three UX footguns. All fixed below.
 
 ### Changed
 
-- **BREAKING:** **victauri-plugin**: Authentication **disabled by default** — the MCP server binds to `127.0.0.1` only and the plugin is `#[cfg(debug_assertions)]`-gated, so auth adds friction without meaningful security for local dev. Use `auth_enabled()`, `auth_token("...")`, or `VICTAURI_AUTH_TOKEN` env var to opt in.
-- **victauri-plugin**: `auth_disabled()` is now a backwards-compatible no-op (auth is already off by default)
+- **BREAKING:** **victauri-plugin**: Authentication **disabled by default** — the MCP server binds to `127.0.0.1` only and the plugin is `#[cfg(debug_assertions)]`-gated, so auth adds friction without meaningful security for local dev. Use `auth_enabled()`, `auth_token("...")`, or `VICTAURI_AUTH_TOKEN` env var to opt in. **(Historical: REVERSED in [0.5.6] — auth has been ON by default since v0.5.6 with an auto-generated token; opt out with `auth_disabled()`. This 0.4.0 default is no longer current.)**
+- **victauri-plugin**: `auth_disabled()` is now a backwards-compatible no-op (auth is already off by default) **(Historical — no longer true since [0.5.6]: `auth_disabled()` now actually disables the default auto-token.)**
 - **victauri-plugin**: `generate_auth_token()` now delegates to `auth_enabled()` logic
 
 ### Added

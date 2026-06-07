@@ -81,31 +81,12 @@ jobs:
             asset-name: victauri-cli-macos-aarch64
             use-cross: false
 
-          # victauri-browser (binary: victauri-browser-host)
-          - binary: victauri-browser
-            bin-name: victauri-browser-host
-            target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
-            asset-name: victauri-browser-host-linux-x86_64
-            use-cross: false
-          - binary: victauri-browser
-            bin-name: victauri-browser-host
-            target: x86_64-pc-windows-msvc
-            os: windows-latest
-            asset-name: victauri-browser-host-windows-x86_64.exe
-            use-cross: false
-          - binary: victauri-browser
-            bin-name: victauri-browser-host
-            target: x86_64-apple-darwin
-            os: macos-latest
-            asset-name: victauri-browser-host-macos-x86_64
-            use-cross: false
-          - binary: victauri-browser
-            bin-name: victauri-browser-host
-            target: aarch64-apple-darwin
-            os: macos-latest
-            asset-name: victauri-browser-host-macos-aarch64
-            use-cross: false
+          # NB: victauri-browser (the native-messaging host binary) is intentionally
+          # NOT built or shipped on a `v*` crate release. Browser mode is EXPERIMENTAL
+          # and is frozen at 0.7.9 until its security story (incl. owner-only discovery
+          # ACLs across non-default shared-TEMP layouts) is fully closed in a dedicated
+          # browser release. The 0.7.10 `v*` tag is a pure embedded-plugin crates/security
+          # patch — see CHANGELOG [0.7.10] and the round-4 audit scope decision.
 
           # victauri-watchdog (binary: victauri-watchdog)
           - binary: victauri-watchdog
@@ -181,29 +162,9 @@ jobs:
           path: ${{ matrix.asset-name }}
           if-no-files-found: error
 
-  # ─────────────────────────────────────────────────────────────────────
-  # Package Chrome extension
-  # ─────────────────────────────────────────────────────────────────────
-  chrome-extension:
-    name: Package Chrome Extension
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Create extension zip
-        run: |
-          cd extensions/chrome
-          zip -r ../../victauri-chrome-extension.zip . \
-            -x "tests/*" \
-            -x "node_modules/*"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: victauri-chrome-extension
-          path: victauri-chrome-extension.zip
-          if-no-files-found: error
+  # NB: the Chrome extension zip is intentionally NOT packaged or attached on a `v*`
+  # crate release (browser mode is EXPERIMENTAL and frozen at 0.7.9 — see the matrix
+  # note above and CHANGELOG [0.7.10]).
 
   # ─────────────────────────────────────────────────────────────────────
   # Require the FULL CI (all platforms + real-app E2E) to have passed for this
@@ -251,9 +212,9 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    # Crates cannot be unpublished. Require the release-profile binaries and
-    # packaged extension to exist before making the version irreversible.
-    needs: [test, build, chrome-extension, require-ci-green]
+    # Crates cannot be unpublished. Require the release-profile binaries to build
+    # before making the version irreversible.
+    needs: [test, build, require-ci-green]
     # Least privilege for the job that holds the crates.io token (audit #8).
     permissions:
       contents: read
@@ -312,9 +273,12 @@ jobs:
             fi
             sleep 30
           }
+          # NB: victauri-browser is intentionally NOT published on this `v*` release —
+          # browser mode is EXPERIMENTAL and frozen at 0.7.9 (round-4 audit scope).
+          # It is a leaf binary crate; nothing in the workspace depends on it, so the
+          # remaining crates publish cleanly without it.
           publish victauri-core
           publish victauri-macros
-          publish victauri-browser
           publish victauri-plugin
           publish victauri-test
           publish victauri-cli
@@ -329,7 +293,7 @@ jobs:
     # Depend on `publish` so a GitHub Release is never cut for a tag whose crates
     # failed to reach crates.io — the release would otherwise advertise a version
     # users cannot `cargo add` (red-team P2).
-    needs: [build, chrome-extension, publish]
+    needs: [build, publish]
     permissions:
       contents: write
     steps:
@@ -364,23 +328,19 @@ jobs:
         run: |
           mkdir -p release-assets
 
-          # Move binaries (each is in its own directory named after the artifact)
-          for dir in artifacts/victauri-cli-* artifacts/victauri-browser-host-* artifacts/victauri-watchdog-*; do
+          # Move binaries (each is in its own directory named after the artifact).
+          # NB: victauri-browser-host and the Chrome extension zip are intentionally
+          # not part of this `v*` release (browser mode frozen at 0.7.9 — round-4 audit).
+          for dir in artifacts/victauri-cli-* artifacts/victauri-watchdog-*; do
             if [ -d "$dir" ]; then
               cp "$dir"/* release-assets/
             fi
           done
 
-          # Move Chrome extension zip
-          cp artifacts/victauri-chrome-extension/victauri-chrome-extension.zip release-assets/
-
           # Make Unix binaries executable
           chmod +x release-assets/victauri-cli-linux-x86_64 || true
           chmod +x release-assets/victauri-cli-macos-x86_64 || true
           chmod +x release-assets/victauri-cli-macos-aarch64 || true
-          chmod +x release-assets/victauri-browser-host-linux-x86_64 || true
-          chmod +x release-assets/victauri-browser-host-macos-x86_64 || true
-          chmod +x release-assets/victauri-browser-host-macos-aarch64 || true
           chmod +x release-assets/victauri-watchdog-linux-x86_64 || true
           chmod +x release-assets/victauri-watchdog-macos-x86_64 || true
           chmod +x release-assets/victauri-watchdog-macos-aarch64 || true

@@ -71,6 +71,27 @@ Every request except `/health` must include a valid Bearer token.
 3. Clients must include `Authorization: Bearer <token>` in every request
 4. Token comparison uses constant-time equality to prevent timing attacks
 
+### Discovery-directory protection
+
+The per-process discovery directory (`<temp>/victauri/<pid>/`) holds the auth token, so it
+is locked to the current user:
+
+- **Unix:** the directory is created `0700`, and both it and the shared root are trusted only
+  when they are real directories (not symlinks) owned by the current uid and not
+  group/other-writable. A planted or world-writable path is refused, never trusted.
+- **Windows:** before any token is trusted, Victauri verifies the directory is **owned by the
+  current user** (an attacker who pre-created it on a shared `TEMP` would be its owner, so the
+  directory is refused). It then replaces the directory's DACL with a **protected, owner-only
+  DACL** via the Win32 security API, so no inherited ACE and no pre-planted explicit ACE for
+  any other principal (e.g. `BUILTIN\Guests`) can survive. If that API call fails on an
+  unusual filesystem, Victauri falls back to a best-effort `icacls` lockdown (and logs a
+  warning); in that fallback only, a custom-SID ACE pre-planted by another principal on a
+  **non-default shared** `TEMP` could persist — the default Windows per-user `TEMP` is not
+  writable by other users, so it is unaffected.
+
+In all cases the token file itself is created exclusively (`O_EXCL` / `create_new`) so a
+pre-planted file or symlink at its path is rejected rather than written through.
+
 ### Configuration
 
 ```rust

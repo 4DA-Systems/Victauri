@@ -34,6 +34,17 @@ is required of consumers. Review only if you parse these tool outputs:
   simply not advertised. If your client specifically requires the stateful session-based
   Streamable-HTTP protocol, build the router with the new
   `victauri_plugin::mcp::build_app_stateful` instead of `build_app` / `build_app_with_options`.
+- **Auth contract correction (security — reverses a v0.7.9 behavior).** A blank
+  `auth_token("")` or `VICTAURI_AUTH_TOKEN=""` **no longer disables auth.** v0.7.9
+  normalized an empty/whitespace token to "no auth", which was a silent fail-open — a
+  botched env var or build script could turn authentication off without anyone calling
+  `auth_disabled()`. The builder now treats a blank configured token as *unset* and
+  **auto-generates a real token**, so the contract is uniformly **"auth is on by default
+  unless you call `auth_disabled()`"**. The `victauri bridge` CLI got the matching fix on
+  the `VICTAURI_PORT` path (a blank `VICTAURI_AUTH_TOKEN` falls through to the discovered
+  token rather than sending an empty Bearer). **Action:** if you were *relying* on a blank
+  token to disable auth, call `auth_disabled()` explicitly instead. Most users need no
+  change — `VictauriClient::discover()` / `victauri bridge` read the auto-token already.
 
 ## v0.7.8 → v0.7.9 (security hardening — no API breaks, some behavior changes)
 
@@ -47,6 +58,9 @@ behaviors did — review if you relied on them:
   under a restricted profile, grant the capability explicitly.
 - **Empty/whitespace auth tokens now disable auth** (with a loud warning) instead of
   enabling auth-but-bypassable. Set a real token or use `auth_disabled()` intentionally.
+  **(Superseded in v0.7.10 — see above: a blank token now auto-generates a real token and
+  keeps auth ON; only `auth_disabled()` turns it off. Do not rely on a blank token to
+  disable auth.)**
 - **npm `@4da/victauri-browser` no longer auto-registers** the native-messaging host on
   install. Opt in with `VICTAURI_BROWSER_AUTO_REGISTER=1` or run
   `npx victauri-browser install <ext-id>`.
@@ -412,6 +426,12 @@ victauri-test = "0.5"
 ## v0.3.x → v0.4.0
 
 ### Breaking Change: Auth Disabled by Default
+
+> **⚠️ Historical (no longer current).** This 0.4.0 default was **REVERSED in v0.5.6**:
+> authentication has been **ON by default** since v0.5.6 (auto-generated token written to
+> the discovery directory; opt out with `auth_disabled()`). The text below describes only
+> the 0.3→0.4 transition and does not reflect the current contract — see the v0.5.5 → v0.5.6
+> and v0.7.9 → v0.7.10 sections above.
 
 Authentication is now **disabled by default**. Previously, the plugin auto-generated a UUID Bearer token on startup. This caused silent MCP connection failures when the token wasn't configured in `.mcp.json`.
 

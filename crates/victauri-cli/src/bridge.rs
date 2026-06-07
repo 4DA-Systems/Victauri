@@ -321,8 +321,10 @@ async fn discover_and_select(wait: bool, app: Option<&str>) -> Result<ServerInfo
         {
             return Ok(ServerInfo {
                 port,
-                token: std::env::var("VICTAURI_AUTH_TOKEN")
-                    .ok()
+                // An EMPTY/whitespace `VICTAURI_AUTH_TOKEN` is "not configured", NOT
+                // "send an empty Bearer" — it must fall through to the discovered token
+                // for this exact port (see `normalize_env_token`).
+                token: normalize_env_token(std::env::var("VICTAURI_AUTH_TOKEN").ok())
                     .or_else(|| discover_token_for_port(port)),
                 identifier: None,
                 product_name: None,
@@ -482,6 +484,20 @@ fn discover_servers() -> Vec<ServerInfo> {
         });
     }
     out
+}
+
+/// Normalize a configured `VICTAURI_AUTH_TOKEN` value: an empty or whitespace-only
+/// token is "not configured" (`None`), never an empty Bearer header.
+///
+/// The MCP server's contract is "auth is on by default unless `auth_disabled()`": the
+/// plugin builder's `resolve_auth_token` generates a real token rather than disabling
+/// auth when the configured token is blank. This is the client-side mirror — a botched
+/// `VICTAURI_AUTH_TOKEN=""` must NOT make the bridge send an empty token to an
+/// auth-enabled server (which would 401 every call); it must fall through to the token
+/// discovered for the target port. Matches the filter used by every other token read
+/// site (`discover_servers`, `victauri-test` discovery/app/client).
+fn normalize_env_token(raw: Option<String>) -> Option<String> {
+    raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 /// Token belonging to the exact server selected by a `VICTAURI_PORT` override.
@@ -756,5 +772,38 @@ mod tests {
         assert!(!dir_is_trusted(&link), "symlinked dir must be rejected");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // Round-4 audit, blocker #3 (CLI empty-token fallback): a blank `VICTAURI_AUTH_TOKEN`
+    // must be treated as "unset" so the bridge falls through to the discovered token, NOT
+    // sent as an empty Bearer to an auth-enabled server (which would 401 every call).
+    #[test]
+    fn normalize_env_token_treats_blank_as_unset() {
+        assert_eq!(normalize_env_token(None), None, "unset -> None");
+        assert_eq!(
+            normalize_env_token(Some(String::new())),
+            None,
+            "empty -> None"
+        );
+        assert_eq!(
+            normalize_env_token(Some("   ".to_string())),
+            None,
+            "spaces -> None"
+        );
+        assert_eq!(
+            normalize_env_token(Some("\t\r\n ".to_string())),
+            None,
+            "whitespace -> None"
+        );
+        assert_eq!(
+            normalize_env_token(Some("real-token".to_string())).as_deref(),
+            Some("real-token"),
+            "real token preserved"
+        );
+        assert_eq!(
+            normalize_env_token(Some("  padded  ".to_string())).as_deref(),
+            Some("padded"),
+            "surrounding whitespace trimmed"
+        );
     }
 }

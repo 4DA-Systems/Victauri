@@ -435,18 +435,245 @@ fn current_windows_username() -> Option<String> {
         .filter(|name| !name.is_empty())
 }
 
+/// NUL-terminated UTF-16 encoding of a path for the Win32 `*W` APIs.
 #[cfg(windows)]
-fn restrict_to_current_user(path: &std::path::Path) -> bool {
+fn to_wide(path: &std::path::Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+/// A standalone, owned copy of the current process user's SID.
+///
+/// `GetTokenInformation` returns a `TOKEN_USER` whose `Sid` pointer aliases into the
+/// token-info buffer; we copy the SID bytes out so the value is self-contained and the
+/// pointer stays valid for the lifetime of this struct.
+#[cfg(windows)]
+struct OwnedSid(Vec<u8>);
+
+#[cfg(windows)]
+impl OwnedSid {
+    fn as_psid(&self) -> windows::Win32::Security::PSID {
+        windows::Win32::Security::PSID(self.0.as_ptr() as *mut core::ffi::c_void)
+    }
+}
+
+/// Copy the SID from a token-information class into an owned buffer.
+///
+/// Used for `TokenUser` (the account SID) and `TokenOwner` (the SID that *owns objects
+/// this process creates*). Both `TOKEN_USER` (`.User.Sid`) and `TOKEN_OWNER` (`.Owner`)
+/// lead with the `PSID` at offset 0, so the SID pointer is read from the start of the
+/// returned buffer.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn token_sid(class: windows::Win32::Security::TOKEN_INFORMATION_CLASS) -> Option<OwnedSid> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetLengthSid, GetTokenInformation, PSID, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from `OpenProcessToken` and is closed exactly once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut token = HANDLE::default();
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle valid for the call; `token` is a
+    // writable out-param. On success it owns a real handle, closed by `TokenGuard` below.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token).ok()? };
+    let _guard = TokenGuard(token);
+
+    let mut len = 0_u32;
+    // SAFETY: size probe — a null buffer with len 0 makes the call write the required size
+    // into `len` and fail with ERROR_INSUFFICIENT_BUFFER (ignored; we only want `len`).
+    unsafe {
+        let _ = GetTokenInformation(token, class, None, 0, &raw mut len);
+    }
+    if len == 0 {
+        return None;
+    }
+    let mut buf = vec![0_u8; len as usize];
+    // SAFETY: `buf` is writable for `len` bytes; on success it holds the requested struct.
+    unsafe {
+        GetTokenInformation(
+            token,
+            class,
+            Some(buf.as_mut_ptr().cast::<core::ffi::c_void>()),
+            len,
+            &raw mut len,
+        )
+        .ok()?;
+    }
+    // SAFETY: both `TOKEN_USER` and `TOKEN_OWNER` lead with the `PSID` at offset 0, so the
+    // SID pointer is the first pointer-sized field of `buf`.
+    let sid_ptr = unsafe { *buf.as_ptr().cast::<PSID>() };
+    // SAFETY: `sid_ptr` points to a valid SID within `buf`.
+    let sid_len = unsafe { GetLengthSid(sid_ptr) };
+    if sid_len == 0 {
+        return None;
+    }
+    let mut sid = vec![0_u8; sid_len as usize];
+    // SAFETY: `sid_ptr` is valid for `sid_len` bytes (per `GetLengthSid`); `sid` has capacity.
+    unsafe {
+        core::ptr::copy_nonoverlapping(sid_ptr.0.cast::<u8>(), sid.as_mut_ptr(), sid_len as usize);
+    }
+    Some(OwnedSid(sid))
+}
+
+/// SIDs that legitimately own a directory *this* process creates: the token USER and the
+/// token's default OWNER. They are identical for a normal user, but an **elevated** admin
+/// token's default owner is the `BUILTIN\Administrators` group — so objects an elevated
+/// process creates are owned by that group, not the user. Accepting either is what makes
+/// the ownership check correct under elevation (where it would otherwise reject every
+/// directory we create and break discovery entirely).
+#[cfg(windows)]
+fn acceptable_owner_sids() -> Vec<OwnedSid> {
+    use windows::Win32::Security::{TokenOwner, TokenUser};
+    [TokenUser, TokenOwner]
+        .into_iter()
+        .filter_map(token_sid)
+        .collect()
+}
+
+/// True iff `path` exists and its owner SID is one this process would create objects as
+/// (its token user, or — under elevation — its token's default owner group).
+///
+/// This is the Windows counterpart to the Unix uid check: it refuses a discovery
+/// directory an attacker pre-created on a shared TEMP (the attacker would be its owner),
+/// closing the PID-preplant vector before any token is trusted.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn dir_owned_by_current_user(path: &std::path::Path) -> bool {
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows::Win32::Security::{
+        EqualSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    use windows::core::PCWSTR;
+
+    let acceptable = acceptable_owner_sids();
+    if acceptable.is_empty() {
+        return false;
+    }
+    let wide = to_wide(path);
+    let mut owner = PSID::default();
+    let mut psd = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: `wide` is a NUL-terminated path; we request OWNER info only; `owner` aliases
+    // into `psd`, which the OS allocates and we free with `LocalFree` below.
+    let rc = unsafe {
+        GetNamedSecurityInfoW(
+            PCWSTR(wide.as_ptr()),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION,
+            Some(&raw mut owner),
+            None,
+            None,
+            None,
+            &raw mut psd,
+        )
+    };
+    if rc != ERROR_SUCCESS {
+        return false;
+    }
+    // SAFETY: `owner` (within `psd`) and each `sid` are valid SIDs for the comparison.
+    let owned = acceptable
+        .iter()
+        .any(|sid| unsafe { EqualSid(owner, sid.as_psid()).is_ok() });
+    // SAFETY: `psd` was allocated by `GetNamedSecurityInfoW`; freed exactly once.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(psd.0)));
+    }
+    owned
+}
+
+/// Replace `path`'s DACL with a PROTECTED, owner-only DACL (current user: full control,
+/// inherited by children).
+///
+/// Unlike `icacls /inheritance:r /grant:r` — which strips only inherited ACEs and replaces
+/// only the owner's grant, leaving any pre-planted explicit ACE for another principal
+/// (e.g. `BUILTIN\Guests`) intact — this rebuilds the DACL from scratch and marks it
+/// PROTECTED, so NO inherited or pre-existing explicit ACE survives. Returns true on
+/// success.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn apply_owner_only_dacl(path: &std::path::Path) -> bool {
+    use windows::Win32::Foundation::{ERROR_SUCCESS, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{
+        EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+        SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows::Win32::Security::{
+        ACE_FLAGS, ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+    };
+    use windows::core::PWSTR;
+
+    use windows::Win32::Security::TokenUser;
+
+    // Full control (GENERIC_ALL) granted to the owner; inherited by sub-containers/objects.
+    const GENERIC_ALL_RIGHTS: u32 = 0x1000_0000;
+    const SUB_CONTAINERS_AND_OBJECTS_INHERIT: u32 = 0x3;
+
+    // Grant the token USER (the running account) full control — even when the directory's
+    // owner is the Administrators group (elevated), the running user retains access.
+    let Some(me) = token_sid(TokenUser) else {
+        return false;
+    };
+
+    let explicit = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: GENERIC_ALL_RIGHTS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: ACE_FLAGS(SUB_CONTAINERS_AND_OBJECTS_INHERIT),
+        Trustee: TRUSTEE_W {
+            pMultipleTrustee: core::ptr::null_mut(),
+            MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: PWSTR(me.as_psid().0.cast::<u16>()),
+        },
+    };
+
+    let mut new_acl: *mut ACL = core::ptr::null_mut();
+    // SAFETY: one explicit entry, no prior ACL; on success `new_acl` is a LocalAlloc'd ACL
+    // that we free with `LocalFree` below.
+    let rc = unsafe { SetEntriesInAclW(Some(&[explicit]), None, &raw mut new_acl) };
+    if rc != ERROR_SUCCESS || new_acl.is_null() {
+        return false;
+    }
+
+    let mut wide = to_wide(path);
+    // SAFETY: `wide` is a NUL-terminated mutable path; `new_acl` is a valid ACL. PROTECTED
+    // strips inheritance and any other explicit ACE, leaving exactly the owner-only DACL.
+    let set_rc = unsafe {
+        SetNamedSecurityInfoW(
+            PWSTR(wide.as_mut_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    };
+    // SAFETY: `new_acl` came from `SetEntriesInAclW`; freed exactly once.
+    unsafe {
+        let _ = LocalFree(Some(HLOCAL(new_acl.cast::<core::ffi::c_void>())));
+    }
+    set_rc == ERROR_SUCCESS
+}
+
+/// Best-effort `icacls` fallback used only if the Win32 DACL replacement fails (e.g. an
+/// unusual filesystem). Strips inherited + common world/group principals and grants the
+/// owner. Weaker than `apply_owner_only_dacl` (a custom-SID pre-plant could survive), so
+/// it runs only when the robust path is unavailable.
+#[cfg(windows)]
+fn icacls_restrict_to_current_user(path: &std::path::Path) -> bool {
     let Some(username) = current_windows_username() else {
         return false;
     };
     let path_str = path.to_string_lossy();
-    // `/inheritance:r` strips INHERITED ACEs and `/grant:r USER:F` replaces only USER's grant —
-    // neither removes a pre-planted EXPLICIT ACE for another principal (e.g. an attacker who
-    // guessed our PID on a shared TEMP and pre-created the dir with `Everyone:(F)`). Explicitly
-    // remove the common world/group principals (Everyone S-1-1-0, BUILTIN\Users S-1-5-32-545,
-    // Authenticated Users S-1-5-11) before granting owner-only. (Residual: a custom-SID pre-plant
-    // on a non-default shared TEMP still survives; the Windows default per-user TEMP closes that.)
     std::process::Command::new("icacls")
         .args([
             &*path_str,
@@ -464,6 +691,21 @@ fn restrict_to_current_user(path: &std::path::Path) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|status| status.success())
+}
+
+/// Lock `path` down to owner-only access. Robust path first (PROTECTED owner-only DACL via
+/// the Win32 security API), falling back to `icacls` only if that fails — fail-closed
+/// (a `false` return makes the caller refuse and remove the directory).
+#[cfg(windows)]
+fn restrict_to_current_user(path: &std::path::Path) -> bool {
+    if apply_owner_only_dacl(path) {
+        return true;
+    }
+    tracing::warn!(
+        "owner-only DACL apply failed for {}; falling back to icacls",
+        path.display()
+    );
+    icacls_restrict_to_current_user(path)
 }
 
 /// Trust the discovery path only when both the shared root and PID directory are owned
@@ -485,9 +727,23 @@ fn ensure_private_dir(dir: &std::path::Path) -> bool {
             return false;
         }
         #[cfg(windows)]
-        if !restrict_to_current_user(dir) {
-            let _ = std::fs::remove_dir_all(dir);
-            return false;
+        {
+            // Refuse a directory we don't own — on a shared TEMP an attacker who pre-created
+            // our PID dir would be its owner. Mirrors the Unix uid check; defeats PID-preplant
+            // before any token is written/trusted. (A dir WE just created we own, so this
+            // passes for the normal path.)
+            if !dir_owned_by_current_user(dir) {
+                tracing::warn!(
+                    "refusing discovery dir not owned by current user: {}",
+                    dir.display()
+                );
+                let _ = std::fs::remove_dir_all(dir);
+                return false;
+            }
+            if !restrict_to_current_user(dir) {
+                let _ = std::fs::remove_dir_all(dir);
+                return false;
+            }
         }
     }
     true
@@ -782,6 +1038,70 @@ async fn event_drain_loop(
 mod tests {
     use super::*;
     use victauri_core::{AppEvent, InteractionKind, IpcResult};
+
+    // Round-4 audit blocker #4: a pre-planted explicit ACE for an arbitrary principal
+    // (the auditor used BUILTIN\Guests) must NOT survive the discovery-dir hardening.
+    // Proves the robust owner-only DACL replacement closes the icacls residual.
+    #[cfg(windows)]
+    #[test]
+    fn owner_only_dacl_removes_pre_planted_guests_ace() {
+        use std::process::Command;
+        let dir = std::env::temp_dir()
+            .join("victauri_acl_test")
+            .join(format!("p{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+
+        // We just created it, so the ownership guard must accept it (owner == token user,
+        // or the Administrators group under elevation).
+        assert!(
+            dir_owned_by_current_user(&dir),
+            "a freshly created dir must be recognized as owned by this process"
+        );
+
+        let path_str = dir.to_string_lossy().to_string();
+
+        // Pre-plant an inheritable explicit ACE for BUILTIN\Guests (S-1-5-32-546).
+        let Ok(grant) = Command::new("icacls")
+            .args([path_str.as_str(), "/grant", "*S-1-5-32-546:(OI)(CI)F", "/q"])
+            .output()
+        else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // icacls unavailable — skip rather than false-fail
+        };
+        if !grant.status.success() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return; // could not plant the ACE (restricted env) — skip
+        }
+
+        let before = Command::new("icacls")
+            .arg(path_str.as_str())
+            .output()
+            .expect("icacls read");
+        let before_s = String::from_utf8_lossy(&before.stdout);
+        assert!(
+            before_s.contains("Guests"),
+            "pre-condition: the planted Guests ACE should be visible, got:\n{before_s}"
+        );
+
+        // Apply the robust owner-only DACL replacement.
+        assert!(
+            apply_owner_only_dacl(&dir),
+            "apply_owner_only_dacl must succeed on a directory we own"
+        );
+
+        let after = Command::new("icacls")
+            .arg(path_str.as_str())
+            .output()
+            .expect("icacls read");
+        let after_s = String::from_utf8_lossy(&after.stdout);
+        assert!(
+            !after_s.contains("Guests"),
+            "the pre-planted Guests ACE must NOT survive the owner-only DACL, got:\n{after_s}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn normalize_auth_token_collapses_empty() {
