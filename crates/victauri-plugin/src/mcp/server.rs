@@ -53,11 +53,41 @@ pub fn build_app_with_options(
 }
 
 /// Build an Axum router with full control over auth token and rate limiter.
+///
+/// The MCP transport runs **stateless** (the default since the 422 stale-session fix). For the
+/// stateful transport (sessions + server-initiated SSE push, required by MCP resource
+/// *subscriptions*) use [`build_app_stateful`].
 pub fn build_app_full(
     state: Arc<VictauriState>,
     bridge: Arc<dyn WebviewBridge>,
     auth_token: Option<String>,
     rate_limiter: Option<Arc<crate::auth::RateLimiterState>>,
+) -> axum::Router {
+    build_app_full_inner(state, bridge, auth_token, rate_limiter, false)
+}
+
+/// Build an Axum router whose MCP transport runs in **stateful** mode (sessions + SSE push),
+/// re-enabling MCP resource subscriptions.
+///
+/// The production default ([`build_app_full`]) is *stateless* because stateful mode mints an
+/// in-memory `Mcp-Session-Id` that dies on app restart / idle / SSE drop, after which rmcp answers
+/// `422` and generic MCP clients wedge for the whole run. Opt into stateful only when you need
+/// server-initiated push to subscribers; request/response tools do not.
+#[doc(hidden)]
+pub fn build_app_stateful(
+    state: Arc<VictauriState>,
+    bridge: Arc<dyn WebviewBridge>,
+    auth_token: Option<String>,
+) -> axum::Router {
+    build_app_full_inner(state, bridge, auth_token, None, true)
+}
+
+fn build_app_full_inner(
+    state: Arc<VictauriState>,
+    bridge: Arc<dyn WebviewBridge>,
+    auth_token: Option<String>,
+    rate_limiter: Option<Arc<crate::auth::RateLimiterState>>,
+    stateful: bool,
 ) -> axum::Router {
     // Normalize an empty/whitespace-only auth token to "no auth" (audit B2) so the
     // server is never "looks protected, isn't".
@@ -78,10 +108,39 @@ pub fn build_app_full(
     let handler = VictauriMcpHandler::new(state.clone(), bridge);
     let rest = super::rest::router(handler.clone());
 
+    // Run the Streamable-HTTP MCP transport STATELESS by default (rmcp's default is stateful).
+    //
+    // Why: stateful mode mints an in-memory `Mcp-Session-Id` at `initialize` that every later
+    // request must echo. That session dies on app restart (the in-memory store is gone — and a
+    // `tauri dev` app restarts constantly), on idle eviction, or on SSE-stream drop. rmcp then
+    // answers the next call with `422 "expected initialize request"`. The MCP spec signals an
+    // expired session with `404` (clients re-init on that); `422` is non-standard, so a generic
+    // MCP client (e.g. the agent harness, which speaks rmcp directly and can't use our recovering
+    // `victauri bridge`) never recognises it as "re-init needed" and stays wedged for the whole
+    // run — the root cause of falling back to the REST API for everything.
+    //
+    // Stateless mode has no session id and no session to lose, so the 422 class cannot occur. The
+    // handler is already built per-request (`move || Ok(handler.clone())` above), exactly what
+    // stateless mode needs. `with_json_response(true)` returns `application/json` directly instead
+    // of an SSE frame for these request/response tools (the test client and `victauri bridge`
+    // already parse JSON-or-SSE, so this is transparent). The only capability given up is
+    // server-initiated SSE push — i.e. MCP resource *subscriptions* (`victauri://{ipc-log,windows,
+    // state}` notify); all 35 request/response tools and one-shot `resources/read` are unaffected.
+    // `build_app_stateful` (`stateful = true`) restores the session/SSE transport for subscribers.
+    //
+    // NB: `StreamableHttpServerConfig` is `#[non_exhaustive]`, so it cannot be built with struct
+    // literal syntax outside rmcp — the builder methods are the only way to override defaults.
+    let mcp_config = if stateful {
+        StreamableHttpServerConfig::default()
+    } else {
+        StreamableHttpServerConfig::default()
+            .with_stateful_mode(false)
+            .with_json_response(true)
+    };
     let mcp_service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
-        StreamableHttpServerConfig::default(),
+        mcp_config,
     );
 
     let auth_state = Arc::new(crate::auth::AuthState {

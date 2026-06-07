@@ -11,7 +11,9 @@ use victauri_core::{
 };
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
-use victauri_plugin::mcp::{VictauriMcpHandler, build_app, build_app_with_options};
+use victauri_plugin::mcp::{
+    VictauriMcpHandler, build_app, build_app_stateful, build_app_with_options,
+};
 use victauri_plugin::privacy::PrivacyConfig;
 
 use common::{SimpleMockBridge, test_state};
@@ -148,7 +150,7 @@ impl WebviewBridge for CallbackMockBridge {
 
 async fn start_test_server(state: Arc<VictauriState>, labels: &[&str]) -> String {
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(labels));
-    let app = build_app(state, bridge);
+    let app = build_app_stateful(state, bridge, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -161,7 +163,7 @@ async fn start_test_server(state: Arc<VictauriState>, labels: &[&str]) -> String
 
 async fn start_auth_test_server(state: Arc<VictauriState>, labels: &[&str], token: &str) -> String {
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(labels));
-    let app = build_app_with_options(state, bridge, Some(token.to_string()));
+    let app = build_app_stateful(state, bridge, Some(token.to_string()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -182,7 +184,43 @@ async fn start_callback_server(
         state.pending_evals.clone(),
         response_fn,
     ));
+    let app = build_app_stateful(state, bridge, None);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    format!("http://{addr}")
+}
+
+/// Spawn the MCP server in its production **stateless** transport mode (the default that ships
+/// via `build_app`). The handshake/auth helpers above use the stateful builder so the existing
+/// session-protocol tests keep exercising that path; these stateless helpers validate the
+/// default transport that real agents hit.
+async fn start_stateless_test_server(state: Arc<VictauriState>, labels: &[&str]) -> String {
+    let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(labels));
     let app = build_app(state, bridge);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    format!("http://{addr}")
+}
+
+/// Stateless server WITH Bearer auth enabled (`build_app_with_options` is stateless by default).
+/// Used to prove that dropping the MCP session does NOT weaken authentication.
+async fn start_stateless_auth_test_server(
+    state: Arc<VictauriState>,
+    labels: &[&str],
+    token: &str,
+) -> String {
+    let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(labels));
+    let app = build_app_with_options(state, bridge, Some(token.to_string()));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -431,6 +469,162 @@ async fn mcp_initialize_returns_session() {
     assert!(
         session_id.is_some(),
         "MCP response should include session ID header"
+    );
+}
+
+// ── Stateless transport (production default) ────────────────────────────────
+// These guard the P0 fix: the default server runs stateless, so there is no
+// `Mcp-Session-Id` and a tool call without a session must NOT 422 — the wedge that
+// previously forced the REST fallback for the whole run.
+
+#[tokio::test]
+async fn stateless_initialize_returns_no_session_id() {
+    let base = start_stateless_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "0.1.0"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        resp.status().is_success(),
+        "initialize returned {}",
+        resp.status()
+    );
+    assert!(
+        resp.headers().get("mcp-session-id").is_none(),
+        "stateless mode must NOT mint a session id"
+    );
+}
+
+#[tokio::test]
+async fn stateless_tool_call_without_session_does_not_422() {
+    // The crux of the P0 fix: with no session handshake at all, a tools/list must succeed
+    // (in stateful mode this same request 422s with "expected initialize request").
+    let base = start_stateless_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "stateless tool call must never 422 (the wedge the fix removes)"
+    );
+    assert!(
+        resp.status().is_success(),
+        "tools/list returned {}",
+        resp.status()
+    );
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("eval_js"),
+        "tools/list should return the tool catalog"
+    );
+}
+
+#[tokio::test]
+async fn stateless_returns_plain_json_response() {
+    // `json_response = true` returns application/json directly instead of an SSE frame.
+    let base = start_stateless_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        content_type.contains("application/json"),
+        "stateless json_response should return application/json, got {content_type}"
+    );
+}
+
+#[tokio::test]
+async fn stateless_still_enforces_auth() {
+    // Dropping the MCP session must NOT weaken authentication: the `Mcp-Session-Id` was only a
+    // correlation id, never an authz boundary. With auth enabled, a stateless tool call with no
+    // Bearer token must be rejected, and the same call with the correct token must succeed.
+    let base = start_stateless_auth_test_server(test_state(), &["main"], "secret-token").await;
+    let client = reqwest::Client::new();
+
+    let call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {}
+    });
+
+    // No token → unauthorized (NOT silently served just because there's no session to check).
+    let unauth = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&call)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauth.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "stateless mode must still reject an unauthenticated tool call"
+    );
+
+    // Correct token → served.
+    let authed = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", "Bearer secret-token")
+        .json(&call)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        authed.status().is_success(),
+        "stateless mode with a valid token should serve the call, got {}",
+        authed.status()
     );
 }
 
@@ -1060,7 +1254,7 @@ async fn state_port_reflected_in_info() {
     });
 
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(&["main"]));
-    let app = build_app(state, bridge);
+    let app = build_app_stateful(state, bridge, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1406,7 +1600,7 @@ fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
 async fn start_privacy_test_server(config: PrivacyConfig, labels: &[&str]) -> String {
     let state = privacy_state(config);
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(labels));
-    let app = build_app(state, bridge);
+    let app = build_app_stateful(state, bridge, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -3748,7 +3942,7 @@ async fn mcp_eval_js_exceeds_pending_limit_returns_error() {
     // Use a callback server that does NOT resolve callbacks — we just need
     // the handler to attempt eval_with_return and hit the limit check.
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(&["main"]));
-    let app = build_app(state, bridge);
+    let app = build_app_stateful(state, bridge, None);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

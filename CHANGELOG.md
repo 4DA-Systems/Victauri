@@ -46,6 +46,18 @@ change.
   now reliability-aware — they no longer treat `frontend_only` entries as bugs unless the
   registry is complete (`reliability: high`). (`NoGhostCommands` also had a latent
   always-passes bug — it read a `ghost_commands` key that never existed — now fixed.)
+- **The MCP `/mcp` transport now runs STATELESS by default** (rmcp's default is stateful).
+  Stateful mode minted an in-memory `Mcp-Session-Id` at `initialize` that dies on app
+  restart / idle eviction / SSE-stream drop, after which rmcp answers `422 "expected
+  initialize request"`. Because `422` is non-standard for an expired session (the spec uses
+  `404`), a generic MCP client — including the agent harness that speaks rmcp directly and
+  cannot use the recovering `victauri bridge` — never re-initializes and stays wedged for the
+  whole run, forcing the sessionless REST API for everything. Stateless mode has no session
+  to lose, so that 422 class cannot occur, and responses are returned as plain
+  `application/json`. All 35 request/response tools and one-shot `resources/read` are
+  unaffected; the only capability dropped by default is server-initiated SSE push (MCP
+  resource *subscriptions*), which can be restored with the new `build_app_stateful`. The
+  `victauri-test` client and `victauri bridge` handle either mode transparently.
 
 ### Security
 

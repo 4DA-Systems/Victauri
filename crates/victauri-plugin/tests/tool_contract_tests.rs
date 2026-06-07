@@ -8,7 +8,7 @@ use tokio::sync::Mutex;
 use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
-use victauri_plugin::mcp::build_app;
+use victauri_plugin::mcp::build_app_stateful;
 use victauri_plugin::privacy::PrivacyConfig;
 
 use common::SimpleMockBridge;
@@ -185,7 +185,7 @@ async fn start_callback_server(
         state.pending_evals.clone(),
         response_fn,
     ));
-    let app = build_app(state, bridge);
+    let app = build_app_stateful(state, bridge, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -196,7 +196,7 @@ async fn start_callback_server(
 
 async fn start_test_server(state: Arc<VictauriState>, labels: &[&str]) -> String {
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(labels));
-    let app = build_app(state, bridge);
+    let app = build_app_stateful(state, bridge, None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
