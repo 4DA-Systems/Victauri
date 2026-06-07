@@ -605,10 +605,19 @@ impl VictauriBuilder {
         if self.auth_explicitly_disabled {
             return None;
         }
-        if let Some(ref token) = self.auth_token {
+        // An EMPTY/whitespace configured token or env var is treated as "not configured" and
+        // falls through to a freshly generated token — it must NOT disable auth. The contract is
+        // "auth is on by default unless `auth_disabled()`"; a botched `VICTAURI_AUTH_TOKEN=""`
+        // (or `.auth_token("")`) previously collapsed to no-auth downstream, a silent fail-open
+        // that bypassed that contract without the caller ever invoking `auth_disabled()`.
+        if let Some(ref token) = self.auth_token
+            && !token.trim().is_empty()
+        {
             return Some(token.clone());
         }
-        if let Ok(token) = std::env::var("VICTAURI_AUTH_TOKEN") {
+        if let Ok(token) = std::env::var("VICTAURI_AUTH_TOKEN")
+            && !token.trim().is_empty()
+        {
             return Some(token);
         }
         Some(auth::generate_token())
@@ -1146,6 +1155,21 @@ mod tests {
             builder.resolve_auth_token().is_none(),
             "auth_disabled should override explicit token"
         );
+    }
+
+    #[test]
+    fn builder_empty_explicit_token_does_not_disable_auth() {
+        // Fail-open guard: an empty/whitespace token must NOT become "no auth"; it falls
+        // through to a freshly generated token. Only `auth_disabled()` disables auth.
+        for blank in ["", "   ", "\t\n"] {
+            let resolved = VictauriBuilder::new()
+                .auth_token(blank)
+                .resolve_auth_token();
+            assert!(
+                resolved.as_deref().is_some_and(|t| !t.trim().is_empty()),
+                "empty explicit token {blank:?} must resolve to a generated token, not no-auth"
+            );
+        }
     }
 
     #[test]

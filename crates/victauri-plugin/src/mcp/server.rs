@@ -66,13 +66,15 @@ pub fn build_app_full(
     build_app_full_inner(state, bridge, auth_token, rate_limiter, false)
 }
 
-/// Build an Axum router whose MCP transport runs in **stateful** mode (sessions + SSE push),
-/// re-enabling MCP resource subscriptions.
+/// Build an Axum router whose MCP transport runs in **stateful** mode (sessions + a long-lived SSE
+/// channel), for clients that require the session-based Streamable-HTTP protocol.
 ///
 /// The production default ([`build_app_full`]) is *stateless* because stateful mode mints an
 /// in-memory `Mcp-Session-Id` that dies on app restart / idle / SSE drop, after which rmcp answers
-/// `422` and generic MCP clients wedge for the whole run. Opt into stateful only when you need
-/// server-initiated push to subscribers; request/response tools do not.
+/// `422` and generic MCP clients wedge for the whole run. Opt into stateful only if your client
+/// needs the session protocol. (Note: Victauri does not currently implement server-initiated
+/// resource-update push, so neither transport delivers MCP resource *subscription* notifications;
+/// the `subscribe` capability is intentionally not advertised — read resources on demand.)
 #[doc(hidden)]
 pub fn build_app_stateful(
     state: Arc<VictauriState>,
@@ -439,10 +441,20 @@ fn restrict_to_current_user(path: &std::path::Path) -> bool {
         return false;
     };
     let path_str = path.to_string_lossy();
+    // `/inheritance:r` strips INHERITED ACEs and `/grant:r USER:F` replaces only USER's grant —
+    // neither removes a pre-planted EXPLICIT ACE for another principal (e.g. an attacker who
+    // guessed our PID on a shared TEMP and pre-created the dir with `Everyone:(F)`). Explicitly
+    // remove the common world/group principals (Everyone S-1-1-0, BUILTIN\Users S-1-5-32-545,
+    // Authenticated Users S-1-5-11) before granting owner-only. (Residual: a custom-SID pre-plant
+    // on a non-default shared TEMP still survives; the Windows default per-user TEMP closes that.)
     std::process::Command::new("icacls")
         .args([
             &*path_str,
             "/inheritance:r",
+            "/remove",
+            "*S-1-1-0",
+            "*S-1-5-32-545",
+            "*S-1-5-11",
             "/grant:r",
             &format!("{username}:F"),
             "/q",
