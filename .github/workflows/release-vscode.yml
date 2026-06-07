@@ -28,6 +28,7 @@ jobs:
   publish:
     name: Build & publish VS Code extension
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: write # required: attach .vsix to the GitHub Release
     defaults:
@@ -41,7 +42,7 @@ jobs:
           node-version: 20
 
       - name: Install dependencies
-        run: npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Typecheck
         run: npm run lint
@@ -60,21 +61,20 @@ jobs:
             exit 1
           fi
 
-      # Pin publish tooling to exact versions (supply-chain). @vscode/vsce@3.9.1
-      # matches the version resolved by editors/vscode/package-lock.json (devDep
-      # range "^3.0.0"); ovsx@1.0.0 is the current known-good Open VSX CLI.
+      # Publish tooling is installed strictly from package-lock.json above. `--no-install`
+      # prevents npx from fetching mutable registry code during a credentialed release.
       - name: Package .vsix
-        run: npx --yes @vscode/vsce@3.9.1 package --no-dependencies -o victauri.vsix
+        run: npx --no-install vsce package --no-dependencies -o victauri.vsix
 
       - name: Publish to VS Code Marketplace
         if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false'
-        run: npx --yes @vscode/vsce@3.9.1 publish --packagePath victauri.vsix -p "$VSCE_PAT"
+        run: npx --no-install vsce publish --packagePath victauri.vsix -p "$VSCE_PAT"
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
       - name: Publish to Open VSX (Cursor / VSCodium / agent IDEs)
         if: ${{ (startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false') && env.OVSX_TOKEN != '' }}
-        run: npx --yes ovsx@1.0.0 publish victauri.vsix -p "$OVSX_TOKEN"
+        run: npx --no-install ovsx publish victauri.vsix -p "$OVSX_TOKEN"
         env:
           OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
 

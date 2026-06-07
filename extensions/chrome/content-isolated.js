@@ -22,12 +22,12 @@ const bridgeNonce = (() => {
         crypto.getRandomValues(a);
         return Array.prototype.map.call(a, (b) => ('0' + b.toString(16)).slice(-2)).join('');
     } catch (e) {
-        return String(Date.now()) + Math.random().toString(36).slice(2);
+        return null;
     }
 })();
 let nonceDelivered = false;
 window.addEventListener('__victauri_nonce_req', () => {
-    if (nonceDelivered) return; // single-shot: never re-deliver to a late (page) requester
+    if (nonceDelivered || !bridgeNonce) return; // fail closed without a CSPRNG
     nonceDelivered = true;
     window.dispatchEvent(new CustomEvent('__victauri_nonce', { detail: { nonce: bridgeNonce } }));
 });
@@ -43,7 +43,7 @@ window.dispatchEvent(new CustomEvent('__victauri_nonce_offer'));
 // rather than fall back to forgeable id-only matching. The signed message is
 // `JSON.stringify(parts)` so it is canonical and identical on both sides (no separator
 // ambiguity).
-const __hasSubtle = typeof crypto !== 'undefined' && !!crypto.subtle;
+const __hasSubtle = !!bridgeNonce && typeof crypto !== 'undefined' && !!crypto.subtle;
 let __macKeyPromise = null;
 function __macKey() {
     if (!__macKeyPromise) {
@@ -84,6 +84,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const id = message.id;
     const method = message.method;
     const args = message.args || {};
+    const argsJson = __safeJson(args);
+    const argsSnapshot = JSON.parse(argsJson);
 
     const responsePromise = new Promise((resolve) => {
         const handler = (event) => {
@@ -93,10 +95,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             // with the right id, but cannot produce a valid MAC without the secret nonce.
             // Unauthenticated/forged responses are ignored — we keep waiting for the real
             // one (or the timeout), so a forged race cannot win.
-            __mac([d.id, d.type, __safeJson(d.data), d.error || '']).then((expected) => {
-                if (!__macEq(d.mac, expected)) return;
+            // Snapshot every signed field before awaiting WebCrypto. The shared event detail
+            // remains page-mutable after this listener returns.
+            const responseId = d.id;
+            const responseType = d.type;
+            const responseDataJson = __safeJson(d.data);
+            const responseData = d.data === undefined ? undefined : JSON.parse(responseDataJson);
+            const responseError = d.error || null;
+            const responseMac = d.mac;
+            __mac([responseId, responseType, responseDataJson, responseError || '']).then((expected) => {
+                if (!__macEq(responseMac, expected)) return;
                 window.removeEventListener('__victauri_response', handler);
-                resolve({ id: d.id, type: d.type, data: d.data, error: d.error });
+                resolve({
+                    id: responseId, type: responseType,
+                    data: responseData, error: responseError
+                });
             });
         };
         window.addEventListener('__victauri_response', handler);
@@ -108,9 +121,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
 
     // Dispatch the command authenticated with a MAC; the raw nonce never goes on the wire.
-    __mac([id, method, __safeJson(args)]).then((m) => {
+    __mac([id, method, argsJson]).then((m) => {
         window.dispatchEvent(new CustomEvent('__victauri_command', {
-            detail: { id, method, args, mac: m }
+            detail: { id, method, args: argsSnapshot, mac: m }
         }));
     });
 

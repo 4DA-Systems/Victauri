@@ -26,6 +26,7 @@ jobs:
   publish:
     name: Publish npm package
     runs-on: ubuntu-latest
+    environment: release
     permissions:
       contents: read
     defaults:
@@ -52,7 +53,7 @@ jobs:
 
       - name: Install + validate (pack)
         run: |
-          npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+          npm ci --no-audit --no-fund
           npm pack --dry-run
 
       - name: Publish to npm

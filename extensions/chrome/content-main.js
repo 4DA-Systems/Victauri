@@ -1616,6 +1616,24 @@
     // ── Command Dispatch (browser extension bridge) ──────────────────────────
 
     var AsyncFunction = Object.getPrototypeOf(async function(){}).constructor;
+    // MAIN-world globals become page-controlled once author scripts run. Capture every
+    // primitive used by the authenticated channel while this document_start script still
+    // has pristine references, and pin the frozen bridge object we installed above.
+    var __vicBridge = window.__VICTAURI__;
+    var __vicSubtle = typeof crypto !== 'undefined' ? crypto.subtle : null;
+    var __vicImportKey = __vicSubtle && __vicSubtle.importKey
+        ? __vicSubtle.importKey.bind(__vicSubtle) : null;
+    var __vicSign = __vicSubtle && __vicSubtle.sign
+        ? __vicSubtle.sign.bind(__vicSubtle) : null;
+    var __vicEncoder = typeof TextEncoder !== 'undefined' ? new TextEncoder() : null;
+    var __vicEncode = __vicEncoder && __vicEncoder.encode
+        ? __vicEncoder.encode.bind(__vicEncoder) : null;
+    var __vicStringify = JSON.stringify.bind(JSON);
+    var __vicParse = JSON.parse.bind(JSON);
+    var __vicPromiseResolve = Promise.resolve.bind(Promise);
+    var __vicThen = Function.prototype.call.bind(Promise.prototype.then);
+    var __vicDispatchEvent = window.dispatchEvent.bind(window);
+    var __vicCustomEvent = CustomEvent;
 
     // Provenance gate (audit #2): only honour commands carrying the secret nonce that the
     // ISOLATED relay hands us during a one-shot handshake at document_start, before any
@@ -1624,12 +1642,28 @@
     // nonce is NEVER broadcast in response to a page-triggerable event, so a page can
     // dispatch __victauri_command but cannot learn the nonce and cannot drive the bridge.
     var __victauriNonce = null;
+    var __vicMacKeyPromise = null;
+    var __vicConsumedCommandIds = Object.create(null);
+
+    // Import the non-extractable key during the synchronous nonce handshake. Deferring this
+    // until the first agent command would let a hostile page replace SubtleCrypto.importKey
+    // and steal the raw nonce.
+    function __vicMacKey() {
+        if (!__vicMacKeyPromise && __victauriNonce !== null && __vicImportKey && __vicEncode) {
+            __vicMacKeyPromise = __vicImportKey(
+                'raw', __vicEncode(__victauriNonce),
+                { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+            );
+        }
+        return __vicMacKeyPromise;
+    }
     function __victauriRequestNonce() {
-        window.dispatchEvent(new CustomEvent('__victauri_nonce_req'));
+        __vicDispatchEvent(new __vicCustomEvent('__victauri_nonce_req'));
     }
     window.addEventListener('__victauri_nonce', function (event) {
         if (__victauriNonce === null && event.detail && event.detail.nonce) {
             __victauriNonce = event.detail.nonce;
+            __vicMacKey();
         }
     });
     // If ISOLATED loaded first, our initial request reaches its still-armed responder; if
@@ -1644,25 +1678,17 @@
     // window cannot recover the key, inject a command, or forge a response. SubtleCrypto
     // needs a secure context (https / localhost); on a non-secure origin the bridge fails
     // CLOSED rather than accept forgeable id-only traffic.
-    var __vicHasSubtle = typeof crypto !== 'undefined' && !!crypto.subtle;
-    var __vicMacKeyPromise = null;
-    function __vicMacKey() {
-        if (!__vicMacKeyPromise) {
-            __vicMacKeyPromise = crypto.subtle.importKey(
-                'raw', new TextEncoder().encode(__victauriNonce),
-                { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-            );
-        }
-        return __vicMacKeyPromise;
-    }
+    var __vicHasSubtle = !!(__vicImportKey && __vicSign && __vicEncode);
     function __vicSafeJson(v) {
-        try { var s = JSON.stringify(v); return s === undefined ? 'null' : s; }
+        try { var s = __vicStringify(v); return s === undefined ? 'null' : s; }
         catch (e) { return '"[unserializable]"'; }
     }
     function __vicMac(parts) {
-        return __vicMacKey().then(function (key) {
-            var data = new TextEncoder().encode(JSON.stringify(parts));
-            return crypto.subtle.sign('HMAC', key, data).then(function (sig) {
+        var keyPromise = __vicMacKey();
+        if (!keyPromise) return null;
+        return __vicThen(keyPromise, function (key) {
+            var data = __vicEncode(__vicStringify(parts));
+            return __vicThen(__vicSign('HMAC', key, data), function (sig) {
                 return Array.prototype.map.call(new Uint8Array(sig),
                     function (b) { return ('0' + b.toString(16)).slice(-2); }).join('');
             });
@@ -1674,25 +1700,39 @@
         for (var i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
         return d === 0;
     }
+    function __vicConsumeCommandId(id) {
+        if (__vicConsumedCommandIds[id] === true) return false;
+        __vicConsumedCommandIds[id] = true;
+        return true;
+    }
 
     window.addEventListener('__victauri_command', function(event) {
         var detail = event.detail;
         // Fail closed if the handshake never completed or we lack a secure context.
         if (!detail || __victauriNonce === null || !__vicHasSubtle
-            || !detail.id || !detail.method) return;
+            || typeof detail.id !== 'string' || typeof detail.method !== 'string') return;
 
         var id = detail.id;
         var method = detail.method;
-        var args = detail.args || {};
+        var argsJson = __vicSafeJson(detail.args || {});
+        var commandMac = detail.mac;
 
         // Authenticate the command (audit A4): only honour commands carrying a valid MAC
         // derived from the never-broadcast nonce. A page cannot forge this, so it can
         // neither inject commands nor make us mint authenticated responses on its behalf.
-        __vicMac([id, method, __vicSafeJson(args)]).then(function (expected) {
-            if (!__vicMacEq(detail.mac, expected)) return;
+        var macPromise = __vicMac([id, method, argsJson]);
+        if (!macPromise) return;
+        __vicThen(macPromise, function (expected) {
+            // The page can observe and redispatch a valid command event. Consume the
+            // authenticated id before execution so a replay cannot repeat side effects.
+            if (!__vicMacEq(commandMac, expected) || !__vicConsumeCommandId(id)) return;
             try {
+                // Execute an immutable snapshot of the exact args covered by the MAC. The
+                // shared event detail is page-mutable while WebCrypto verification awaits.
+                var args = __vicParse(argsJson);
+                if (!args || typeof args !== 'object') return;
                 var result = executeBridgeMethod(method, args);
-                Promise.resolve(result).then(
+                __vicThen(__vicPromiseResolve(result),
                     function(data) { dispatchResponse(id, 'result', data, null); },
                     function(err) { dispatchResponse(id, 'error', null, err.message || String(err)); }
                 );
@@ -1707,15 +1747,20 @@
         // `__victauri_response` (audit A4). If we somehow lack crypto, emit nothing —
         // the relay will time out rather than deliver an unauthenticated result.
         if (!__vicHasSubtle || __victauriNonce === null) return;
-        __vicMac([id, type, __vicSafeJson(data), error || '']).then(function (m) {
-            window.dispatchEvent(new CustomEvent('__victauri_response', {
-                detail: { id: id, type: type, data: data, error: error, mac: m }
+        var dataJson = __vicSafeJson(data);
+        var responseData = data === undefined ? undefined : __vicParse(dataJson);
+        var responseError = error || null;
+        var macPromise = __vicMac([id, type, dataJson, responseError || '']);
+        if (!macPromise) return;
+        __vicThen(macPromise, function (m) {
+            __vicDispatchEvent(new __vicCustomEvent('__victauri_response', {
+                detail: { id: id, type: type, data: responseData, error: responseError, mac: m }
             }));
         });
     }
 
     function executeBridgeMethod(method, args) {
-        var bridge = window.__VICTAURI__;
+        var bridge = __vicBridge;
         switch (method) {
             case 'snapshot': return bridge.snapshot(args.format);
             case 'findElements': return bridge.findElements(args);

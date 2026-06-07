@@ -280,6 +280,77 @@ fn discovery_dir() -> std::path::PathBuf {
         .join(std::process::id().to_string())
 }
 
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+        let probe = std::env::temp_dir().join(format!(
+            ".victauri_plugin_uidprobe_{}_{}",
+            std::process::id(),
+            sequence
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
+            .ok();
+        if let Some(file) = file {
+            let uid = file.metadata().ok().map(|m| m.uid());
+            drop(file);
+            let _ = std::fs::remove_file(probe);
+            if uid.is_some() {
+                return uid;
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn ensure_unix_private_dir(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let Some(euid) = current_euid() else {
+        return false;
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() || meta.uid() != euid {
+                return false;
+            }
+            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_err() {
+                return false;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            if builder.create(path).is_err() {
+                return false;
+            }
+        }
+        Err(_) => return false,
+    }
+    unix_private_dir_is_trusted(path)
+}
+
+#[cfg(unix)]
+fn unix_private_dir_is_trusted(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Some(euid) = current_euid() else {
+        return false;
+    };
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.file_type().is_dir() && meta.uid() == euid && (meta.permissions().mode() & 0o077) == 0
+    })
+}
+
 /// Restrict a file or directory to current-user-only access on Windows via `icacls`.
 #[cfg(windows)]
 fn restrict_to_current_user(path: &std::path::Path) {
@@ -301,28 +372,28 @@ fn restrict_to_current_user(path: &std::path::Path) {
         .status();
 }
 
-/// Reset the per-process discovery dir to a fresh, user-owned `0700` directory,
-/// defeating a pre-planted directory OR a symlink at that path on a shared `/tmp`
-/// (audit: discovery paths vulnerable to pre-planted dirs / symlinked token files).
-fn ensure_private_dir(dir: &std::path::Path) {
-    // Remove a SYMLINK or a regular FILE squatting at the path (the attack vectors:
-    // a planted symlink redirecting our writes). An existing real directory is left
-    // in place — this function is called for each discovery file, so it must be
-    // idempotent and must NOT wipe sibling files already written this run. The
-    // exclusive `create_new` in `write_private_file` defends each file regardless.
-    if let Ok(meta) = std::fs::symlink_metadata(dir)
-        && (meta.file_type().is_symlink() || meta.is_file())
-    {
-        let _ = std::fs::remove_file(dir);
-    }
-    let _ = std::fs::create_dir_all(dir);
+/// Trust the discovery path only when both the shared root and PID directory are owned
+/// by this process's effective user. Refuse planted paths instead of deleting them.
+fn ensure_private_dir(dir: &std::path::Path) -> bool {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let Some(root) = dir.parent() else {
+            return false;
+        };
+        if !ensure_unix_private_dir(root) || !ensure_unix_private_dir(dir) {
+            tracing::warn!("refusing untrusted discovery path {}", dir.display());
+            return false;
+        }
     }
-    #[cfg(windows)]
-    restrict_to_current_user(dir);
+    #[cfg(not(unix))]
+    {
+        if std::fs::create_dir_all(dir).is_err() {
+            return false;
+        }
+        #[cfg(windows)]
+        restrict_to_current_user(dir);
+    }
+    true
 }
 
 /// Write `contents` to `path` as a fresh, user-only file. Uses exclusive
@@ -358,7 +429,9 @@ fn write_private_file(path: &std::path::Path, contents: &str) {
 
 fn write_port_file(port: u16, identifier: Option<&str>, product_name: Option<&str>) {
     let dir = discovery_dir();
-    ensure_private_dir(&dir);
+    if !ensure_private_dir(&dir) {
+        return;
+    }
     write_private_file(&dir.join("port"), &port.to_string());
     // Write metadata for multi-server discovery. The app `identifier` lets a discovery
     // client (e.g. `victauri bridge --app <id>`) select the RIGHT app when several Victauri
@@ -377,12 +450,24 @@ fn write_port_file(port: u16, identifier: Option<&str>, product_name: Option<&st
 
 fn write_token_file(token: &str) {
     let dir = discovery_dir();
-    ensure_private_dir(&dir);
+    if !ensure_private_dir(&dir) {
+        return;
+    }
     write_private_file(&dir.join("token"), token);
 }
 
 fn remove_port_file() {
-    let _ = std::fs::remove_dir_all(discovery_dir());
+    let dir = discovery_dir();
+    #[cfg(unix)]
+    {
+        let Some(root) = dir.parent() else {
+            return;
+        };
+        if !unix_private_dir_is_trusted(root) || !unix_private_dir_is_trusted(&dir) {
+            return;
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Parse a single bridge event JSON value into an [`AppEvent`](victauri_core::AppEvent).
@@ -630,6 +715,23 @@ mod tests {
         assert_eq!(meta["product_name"], "Example");
         remove_port_file();
         assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_refuses_symlink_without_chmodding_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("target");
+        let link = base.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(!ensure_unix_private_dir(&link));
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "symlink target permissions must be untouched");
     }
 
     // ── parse_bridge_event: dom_interaction ────────────────────────────────

@@ -242,7 +242,7 @@
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --watch",
-    "package": "npx @vscode/vsce package",
+    "package": "npx --no-install vsce package",
     "lint": "tsc --noEmit"
   },
   "devDependencies": {
@@ -250,6 +250,7 @@
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.0.0",
     "esbuild": "^0.25.0",
+    "ovsx": "1.0.0",
     "typescript": "^5.5.0"
   }
 }

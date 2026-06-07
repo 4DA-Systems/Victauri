@@ -36,7 +36,7 @@ jobs:
 
       - name: Install bridge test dependencies
         working-directory: crates/victauri-plugin/tests/bridge_tests
-        run: npm install
+        run: npm ci --no-audit --no-fund
 
       - name: Run tests
         run: cargo test --workspace
@@ -251,7 +251,9 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: [test, require-ci-green]
+    # Crates cannot be unpublished. Require the release-profile binaries and
+    # packaged extension to exist before making the version irreversible.
+    needs: [test, build, chrome-extension, require-ci-green]
     # Least privilege for the job that holds the crates.io token (audit #8).
     permissions:
       contents: read

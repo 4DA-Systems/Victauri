@@ -33,17 +33,40 @@ fn dir_is_trusted(path: &std::path::Path) -> bool {
 }
 
 /// Determine the current effective uid without `unsafe` code (this crate
-/// `#![forbid(unsafe_code)]`): create a file we own and read back its owner uid.
+/// `#![forbid(unsafe_code)]`): exclusively create a file and read back its owner uid.
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    let probe = std::env::temp_dir().join(format!(".victauri_uidprobe_{}", std::process::id()));
-    std::fs::write(&probe, b"").ok()?;
-    let uid = match std::fs::metadata(&probe) {
-        Ok(m) => Some(m.uid()),
-        Err(_) => None,
-    };
-    let _ = std::fs::remove_file(&probe);
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+        let probe = std::env::temp_dir().join(format!(
+            ".victauri_uidprobe_{}_{}",
+            std::process::id(),
+            sequence
+        ));
+        if let Some(uid) = uid_from_exclusive_probe(&probe) {
+            return Some(uid);
+        }
+    }
+    None
+}
+
+/// Create a UID probe without following a pre-planted symlink in the shared temp dir.
+#[cfg(unix)]
+fn uid_from_exclusive_probe(probe: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(probe)
+        .ok()?;
+    let uid = file.metadata().ok().map(|m| m.uid());
+    drop(file);
+    let _ = std::fs::remove_file(probe);
     uid
 }
 
@@ -126,6 +149,9 @@ impl DiscoveryStatus {
 #[must_use]
 pub fn diagnose_discovery() -> DiscoveryStatus {
     let base = victauri_base_dir();
+    if !dir_is_trusted(&base) {
+        return DiscoveryStatus::None;
+    }
     let Ok(entries) = std::fs::read_dir(&base) else {
         return DiscoveryStatus::None;
     };
@@ -179,6 +205,9 @@ struct DiscoveredServer {
 
 fn find_live_servers() -> Vec<DiscoveredServer> {
     let base = victauri_base_dir();
+    if !dir_is_trusted(&base) {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(&base) else {
         return Vec::new();
     };
@@ -229,6 +258,19 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn uid_probe_refuses_preplanted_symlink_without_clobbering_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let probe = dir.path().join("probe");
+        std::fs::write(&target, "must-survive").unwrap();
+        std::os::unix::fs::symlink(&target, &probe).unwrap();
+
+        assert_eq!(uid_from_exclusive_probe(&probe), None);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "must-survive");
+    }
 
     #[test]
     fn live_status_has_no_hint() {

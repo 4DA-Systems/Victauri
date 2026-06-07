@@ -44,26 +44,97 @@ fn restrict_to_current_user(path: &Path) {
 #[cfg(not(windows))]
 fn restrict_to_current_user(_path: &Path) {}
 
-/// Create the discovery dir (if needed) and lock it down to the current user.
-///
-/// Removes a SYMLINK or regular FILE squatting at the path first (a planted
-/// symlink on a shared `/tmp` could redirect our writes); an existing real
-/// directory is left in place (idempotent across the per-file writes below).
-fn ensure_dir() -> PathBuf {
-    let dir = discovery_dir();
-    if let Ok(meta) = std::fs::symlink_metadata(&dir)
-        && (meta.file_type().is_symlink() || meta.is_file())
-    {
-        let _ = std::fs::remove_file(&dir);
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+        let probe = std::env::temp_dir().join(format!(
+            ".victauri_browser_uidprobe_{}_{}",
+            std::process::id(),
+            sequence
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&probe)
+            .ok();
+        if let Some(file) = file {
+            let uid = file.metadata().ok().map(|m| m.uid());
+            drop(file);
+            let _ = std::fs::remove_file(probe);
+            if uid.is_some() {
+                return uid;
+            }
+        }
     }
-    let _ = std::fs::create_dir_all(&dir);
+    None
+}
+
+/// Create or tighten a Unix discovery directory without trusting a planted path.
+#[cfg(unix)]
+fn ensure_unix_private_dir(path: &Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let Some(euid) = current_euid() else {
+        return false;
+    };
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() || meta.uid() != euid {
+                return false;
+            }
+            if std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).is_err() {
+                return false;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            if builder.create(path).is_err() {
+                return false;
+            }
+        }
+        Err(_) => return false,
+    }
+    unix_private_dir_is_trusted(path)
+}
+
+#[cfg(unix)]
+fn unix_private_dir_is_trusted(path: &Path) -> bool {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let Some(euid) = current_euid() else {
+        return false;
+    };
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        meta.file_type().is_dir() && meta.uid() == euid && (meta.permissions().mode() & 0o077) == 0
+    })
+}
+
+/// Create the discovery root and process dir only when both paths are trusted.
+fn ensure_dir() -> Option<PathBuf> {
+    let dir = discovery_dir();
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        let root = dir.parent()?;
+        if !ensure_unix_private_dir(root) || !ensure_unix_private_dir(&dir) {
+            tracing::warn!("refusing untrusted discovery path {}", dir.display());
+            return None;
+        }
     }
-    restrict_to_current_user(&dir);
-    dir
+    #[cfg(not(unix))]
+    {
+        if std::fs::create_dir_all(&dir).is_err() {
+            return None;
+        }
+        restrict_to_current_user(&dir);
+    }
+    Some(dir)
 }
 
 /// Write `content` to `<discovery_dir>/<name>` as a fresh, user-only file. Uses
@@ -102,7 +173,9 @@ fn write_locked(dir: &Path, name: &str, content: &str) {
 /// `token` is written only when `Some` (auth enabled); the `metadata.json` always
 /// records `auth_required` so a client knows whether to expect a token file.
 pub fn write(port: u16, token: Option<&str>) {
-    let dir = ensure_dir();
+    let Some(dir) = ensure_dir() else {
+        return;
+    };
 
     write_locked(&dir, "port", &port.to_string());
 
@@ -123,7 +196,17 @@ pub fn write(port: u16, token: Option<&str>) {
 
 /// Remove the discovery directory (best-effort, on shutdown).
 pub fn remove() {
-    let _ = std::fs::remove_dir_all(discovery_dir());
+    let dir = discovery_dir();
+    #[cfg(unix)]
+    {
+        let Some(root) = dir.parent() else {
+            return;
+        };
+        if !unix_private_dir_is_trusted(root) || !unix_private_dir_is_trusted(&dir) {
+            return;
+        }
+    }
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[cfg(test)]
@@ -168,5 +251,26 @@ mod tests {
         // --- remove() clears the directory ---
         remove();
         assert!(!dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_dir_refuses_symlink_without_chmodding_target() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "victauri-browser-discovery-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let target = base.join("target");
+        let link = base.join("link");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        assert!(!ensure_unix_private_dir(&link));
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "symlink target permissions must be untouched");
+        let _ = std::fs::remove_dir_all(base);
     }
 }

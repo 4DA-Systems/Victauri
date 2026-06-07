@@ -81,6 +81,110 @@ describe('bridge command authentication (audit #2 / A4)', () => {
     // The bridge signs its responses so the relay can reject page-forged ones (audit A4).
     expect(typeof resp.mac).toBe('string');
   });
+
+  it('does not import the HMAC key through page-replaced WebCrypto', async () => {
+    const subtleProto = Object.getPrototypeOf(env.window.crypto.subtle);
+    const originalImportKey = subtleProto.importKey;
+    let capturedRawKey = null;
+    subtleProto.importKey = function (format, keyData) {
+      if (format === 'raw') capturedRawKey = Array.from(new Uint8Array(keyData));
+      return originalImportKey.apply(this, arguments);
+    };
+
+    try {
+      const resp = await new Promise((resolve) => {
+        const id = 'pristine-crypto';
+        const handler = (e) => {
+          if (e.detail && e.detail.id === id) {
+            env.window.removeEventListener('__victauri_response', handler);
+            resolve(e.detail);
+          }
+        };
+        env.window.addEventListener('__victauri_response', handler);
+        env.window.dispatchEvent(new env.window.CustomEvent('__victauri_command', {
+          detail: { id, method: 'snapshot', args: {} },
+        }));
+      });
+      expect(resp.type).toBe('result');
+      expect(capturedRawKey).toBeNull();
+    } finally {
+      subtleProto.importKey = originalImportKey;
+    }
+  });
+
+  it('executes an observed authenticated command only once when replayed', async () => {
+    env.window.__REPLAY_EXECUTIONS__ = 0;
+    let replayed = false;
+    const replay = (e) => {
+      const d = e.detail;
+      if (d && d.id === 'replay-once' && d.mac && !replayed) {
+        replayed = true;
+        env.window.dispatchEvent(new env.window.CustomEvent('__victauri_command', { detail: d }));
+      }
+    };
+    env.window.addEventListener('__victauri_command', replay);
+
+    const resp = await new Promise((resolve) => {
+      const handler = (e) => {
+        if (e.detail && e.detail.id === 'replay-once') {
+          env.window.removeEventListener('__victauri_response', handler);
+          resolve(e.detail);
+        }
+      };
+      env.window.addEventListener('__victauri_response', handler);
+      env.window.dispatchEvent(new env.window.CustomEvent('__victauri_command', {
+        detail: {
+          id: 'replay-once',
+          method: 'eval',
+          args: { code: 'return (window.__REPLAY_EXECUTIONS__ += 1)' },
+        },
+      }));
+    });
+
+    env.window.removeEventListener('__victauri_command', replay);
+    expect(replayed).toBe(true);
+    expect(resp.data).toBe('1');
+    expect(env.window.__REPLAY_EXECUTIONS__).toBe(1);
+  });
+
+  it('executes the immutable signed args when the page mutates event detail', async () => {
+    env.window.__SIGNED_EXECUTIONS__ = 0;
+    env.window.__MUTATED_EXECUTIONS__ = 0;
+    let mutationAttempted = false;
+    const mutate = (e) => {
+      const d = e.detail;
+      if (d && d.id === 'args-snapshot' && d.mac) {
+        queueMicrotask(() => {
+          mutationAttempted = true;
+          d.args.code = 'return (window.__MUTATED_EXECUTIONS__ += 1)';
+        });
+      }
+    };
+    env.window.addEventListener('__victauri_command', mutate);
+
+    const resp = await new Promise((resolve) => {
+      const handler = (e) => {
+        if (e.detail && e.detail.id === 'args-snapshot') {
+          env.window.removeEventListener('__victauri_response', handler);
+          resolve(e.detail);
+        }
+      };
+      env.window.addEventListener('__victauri_response', handler);
+      env.window.dispatchEvent(new env.window.CustomEvent('__victauri_command', {
+        detail: {
+          id: 'args-snapshot',
+          method: 'eval',
+          args: { code: 'return (window.__SIGNED_EXECUTIONS__ += 1)' },
+        },
+      }));
+    });
+
+    env.window.removeEventListener('__victauri_command', mutate);
+    expect(mutationAttempted).toBe(true);
+    expect(resp.data).toBe('1');
+    expect(env.window.__SIGNED_EXECUTIONS__).toBe(1);
+    expect(env.window.__MUTATED_EXECUTIONS__).toBe(0);
+  });
 });
 
 // Audit #2 (the re-announce leak): an earlier fix generated the nonce in the MAIN world
