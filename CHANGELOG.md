@@ -47,6 +47,18 @@ change.
   registry is complete (`reliability: high`). (`NoGhostCommands` also had a latent
   always-passes bug — it read a `ghost_commands` key that never existed — now fixed.)
 
+### Security
+
+- **`victauri bridge` discovery now verifies directory ownership before trusting a token**
+  (audit #15, read side). The bridge — the stdio MCP proxy Claude Code connects through —
+  scanned `<temp>/victauri/<pid>/` and read the Bearer token after only a process-liveness
+  check. On a shared-temp Unix host a local attacker could plant a fake `<pid>` directory
+  (named after one of their own live processes) pointing at a server they control and
+  harvest the real token (and feed forged tool results). `discover_servers` now applies the
+  same `dir_is_trusted` guard `victauri-test` already used: a directory is trusted only if
+  it is a real directory (not a symlink), owned by the current uid, and not group/other-
+  writable. No effect on Windows (per-user temp). Found by the pre-release internal sweep.
+
 ## [0.7.9] - 2026-06-07
 
 Driven by the agent-eval A/B (`scripts/agent-eval/RESULTS.md`), which refuted the
