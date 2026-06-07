@@ -1,5 +1,28 @@
 # Migration Guide
 
+## v0.7.9 → v0.7.10 (bugfix — additive, no API or output-schema breaks)
+
+No public Rust API changed and no existing tool-output field was renamed or removed
+(Semver Checks green). The changes are additive enrichments plus two bugfixes; nothing
+is required of consumers. Review only if you parse these tool outputs:
+
+- **`detect_ghost_commands`** now also returns `reliability` (`none` / `low` / `high`)
+  and a `note`. The existing `frontend_only`, `registry_only`, and total fields are
+  unchanged. If you treated `frontend_only` as a confirmed-bug list, gate on
+  `reliability == "high"` — entries are only true ghosts when the `#[inspectable]`
+  registry mirrors the app's full command set (otherwise they are real, merely
+  uninstrumented commands).
+- **`introspect command_timings`** now also returns `ipc_traffic` (per-command
+  call_count + min/max/avg/p95 latency from the live IPC log) and `ipc_commands_observed`.
+  The existing `commands` / `total_commands_profiled` fields (Victauri-driven invokes)
+  are unchanged — but note they only ever counted commands you drove through the
+  `invoke_command` tool; `ipc_traffic` is the one reflecting the app's real frontend use.
+- **`introspect coverage`** now also returns `ipc_calls_observed`. It no longer eval's
+  the full IPC log with bodies, so on busy apps it stops spuriously reporting `0 invoked`.
+- **Behavioral (no action needed):** `victauri-cli doctor` and the `victauri-test`
+  `NoGhostCommands` smoke check now treat `frontend_only` as bugs only at
+  `reliability: high`, so they no longer false-fail apps that don't use `#[inspectable]`.
+
 ## v0.7.8 → v0.7.9 (security hardening — no API breaks, some behavior changes)
 
 Response to a cross-model adversarial audit. No public Rust API changed, but a few

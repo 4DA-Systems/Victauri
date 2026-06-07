@@ -200,6 +200,44 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-06-07)
 
+### v0.7.10 — real-frontend-traffic profiling + honest ghost detection (in-the-wild driven)
+
+Driven by an in-the-wild session that drove **live 4DA** over the REST bridge and
+documented five frictions. Two were real, generic correctness bugs (verified against
+HEAD, not the session summary); both fixed, live-verified against the demo-app, and
+shipped here. The other three are honest limitations or app-side config (documented).
+All changes additive/bugfix — **no breaking output-schema change** (Semver Checks
+green); stays in `^0.7` so 4DA picks it up with no requirement change.
+
+- **`introspect command_timings` / `coverage` no longer blind to the app's real
+  frontend IPC.** `command_timings` only ever recorded commands driven through
+  Victauri's own `invoke_command` tool, so it reported "0 profiled" while a live app
+  made hundreds of real calls. It now *also* derives per-command `call_count` +
+  min/max/avg/p95 latency from the live IPC log (`ipc_traffic`) — the figure that
+  reflects actual usage — with a `note` making the two sources explicit. `coverage`
+  eval'd the **full `getIpcLog()` (with bodies)**, which blows the 5 MB eval result
+  cap on a busy app → empty parse → "0 invoked" despite live traffic (the same
+  busy-app failure mode fixed for `logs`/ghost-detection on 2026-05-29 — coverage was
+  missed in that pass). Switched to the body-free name projection; added
+  `ipc_calls_observed` so a zero is diagnosable.
+- **`detect_ghost_commands` stopped over-claiming.** `frontend_only` means "absent
+  from Victauri's `#[inspectable]` introspection registry" — a strict *subset* of the
+  real `generate_handler!` set — but the core docstrings AND the tool description
+  literally claimed "no backend handler". Any app not fully using `#[inspectable]`
+  (e.g. 4DA, empty registry) had every real command flagged (4DA's real `set_language`
+  was the live example). Corrected the false wording everywhere and added a
+  **purely-additive** `reliability` (`none`/`low`/`high`) + plain-language `note` an
+  agent must read before treating `frontend_only` as a bug list. `victauri-cli doctor`
+  + the `victauri-test` `NoGhostCommands` smoke check are now reliability-aware (the
+  latter also fixed a latent always-passes bug reading a never-existent `ghost_commands`
+  key). 7 new unit tests; full gate + Live-App Proof green on all 3 OS (PR #5).
+- **Deferred (with reasons, not blind-fixed):** the MCP "422 after ~1 min" session
+  staleness is rmcp transport behavior already mitigated by the `victauri bridge`
+  stdio proxy (auto-recovers) + sessionless REST — a client/config matter (4DA's
+  `.mcp.json` already uses the bridge), not a Victauri code bug. Transparent-window
+  capture already fails *loudly* (`screenshot.rs` detects `WS_EX_LAYERED`); a true fix
+  needs Windows.Graphics.Capture (WinRT) — a feature, not a patch.
+
 ### v0.7.9 — adversarial-audit hardening (two GPT-5.5 passes)
 
 Response to a two-pass cross-model (GPT-5.5) adversarial audit. The first verdict was
