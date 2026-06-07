@@ -172,16 +172,24 @@ fn classify_severity(
 
 // ── Ghost command detection ─────────────────────────────────────────────────
 
-/// Report of commands that exist on only one side of the IPC boundary.
+/// Report of commands that exist on only one side of the *introspection registry*
+/// boundary (frontend IPC traffic vs. the registry Victauri knows about).
 ///
-/// The two sides are kept in separate fields because they mean very different
-/// things: `frontend_only` is the set of *true ghost commands* (invoked from the
-/// frontend but with no backend handler — likely bugs or typos), while
-/// `registry_only` is purely informational (registered handlers that were never
-/// invoked during the observation window).
+/// IMPORTANT — what `frontend_only` does and does **not** mean: it is the set of
+/// commands invoked from the frontend that are **absent from Victauri's
+/// introspection registry** (the `#[inspectable]` / `register_command_names` set).
+/// That registry is usually a *subset* of the app's real `tauri::generate_handler!`
+/// command set, so a `frontend_only` entry is **only** a true "ghost" (a call with
+/// no backend handler — a typo/dead command) when the registry mirrors the app's
+/// full handler list. If the registry is empty or sparse, `frontend_only` is
+/// dominated by perfectly real, merely-uninstrumented commands and must NOT be read
+/// as a bug list. The MCP/REST `detect_ghost_commands` tool annotates each report
+/// with a `reliability` signal for exactly this reason. `registry_only` is purely
+/// informational (registered handlers never invoked during the observation window).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GhostCommandReport {
-    /// True ghost commands: invoked from the frontend but not registered in the backend.
+    /// Commands invoked from the frontend but absent from Victauri's introspection
+    /// registry. A *candidate* ghost — only a real ghost if the registry is complete.
     pub frontend_only: Vec<GhostCommand>,
     /// Informational: registered in the backend but never invoked from the frontend.
     pub registry_only: Vec<GhostCommand>,
@@ -206,7 +214,9 @@ pub struct GhostCommand {
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum GhostSource {
-    /// Command invoked from the frontend but not registered in the backend.
+    /// Command invoked from the frontend but absent from Victauri's introspection
+    /// registry. A candidate ghost — only a true missing-handler bug if the registry
+    /// mirrors the app's full `generate_handler!` command set.
     FrontendOnly,
     /// Command registered in the backend but never invoked from the frontend.
     RegistryOnly,
@@ -326,7 +336,10 @@ impl fmt::Display for IpcIntegrityReport {
 ///
 /// let frontend_cmds = vec!["save".to_string(), "delete".to_string()];
 /// let report = detect_ghost_commands(&frontend_cmds, &registry);
-/// assert_eq!(report.frontend_only.len(), 1); // "delete" is frontend-only (a true ghost)
+/// // "delete" is frontend-only: invoked but absent from the registry. Here the
+/// // registry is the full command set, so it is a true ghost; with a partial
+/// // registry it would merely be uninstrumented. See `reliability` on the tool.
+/// assert_eq!(report.frontend_only.len(), 1);
 /// ```
 #[must_use]
 pub fn detect_ghost_commands(
@@ -350,7 +363,11 @@ pub fn detect_ghost_commands(
                 name: name.to_string(),
                 source: GhostSource::FrontendOnly,
                 description: Some(
-                    "Command invoked from frontend but not registered in backend".to_string(),
+                    "Invoked from the frontend but absent from Victauri's introspection \
+                     registry (#[inspectable]/register_command_names). NOT necessarily a \
+                     real ghost — only a missing-handler bug if the registry mirrors the \
+                     app's full command set."
+                        .to_string(),
                 ),
             });
         }

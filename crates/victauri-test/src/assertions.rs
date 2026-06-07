@@ -400,16 +400,31 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
         Check::NoGhostCommands => {
             let result = client.detect_ghost_commands().await?;
             let ghosts = result
-                .get("ghost_commands")
+                .get("frontend_only")
+                .or_else(|| result.get("ghost_commands"))
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len);
+            // `frontend_only` is only a real bug list when the registry mirrors the
+            // app's full command set. Without that (reliability none/low), the entries
+            // are real-but-uninstrumented commands — failing here would punish every app
+            // that doesn't use #[inspectable]. Only treat as ghosts when reliability is high.
+            let reliability = result
+                .get("reliability")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let counts_as_ghosts = ghosts > 0 && reliability == "high";
             Ok(CheckResult {
                 description: "no ghost commands".to_string(),
-                passed: ghosts == 0,
-                detail: if ghosts == 0 {
-                    String::new()
+                passed: !counts_as_ghosts,
+                detail: if counts_as_ghosts {
+                    format!("{ghosts} ghost command(s) found (reliability: high)")
+                } else if ghosts > 0 {
+                    format!(
+                        "{ghosts} frontend-only command(s) found but registry is \
+                         incomplete (reliability: {reliability}) — not treated as ghosts"
+                    )
                 } else {
-                    format!("{ghosts} ghost command(s) found")
+                    String::new()
                 },
             })
         }

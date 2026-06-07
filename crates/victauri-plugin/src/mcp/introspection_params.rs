@@ -5,9 +5,12 @@ use serde::Deserialize;
 #[derive(Debug, Copy, Clone, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum IntrospectAction {
-    /// Get per-command execution timing statistics (min/max/avg/p95).
+    /// Get per-command execution timing statistics (min/max/avg/p95). Returns both
+    /// `commands` (Victauri-driven `invoke_command` calls) and `ipc_traffic` (the app's
+    /// REAL frontend IPC, derived from the live IPC log — the one reflecting actual use).
     CommandTimings,
-    /// Report which registered commands have been called during this session.
+    /// Report which registered commands have been called during this session. Also
+    /// returns `ipc_calls_observed` and `invoked_not_registered` from the live IPC log.
     Coverage,
     /// Record the current response shape of a command as a baseline contract.
     ContractRecord,

@@ -429,14 +429,29 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
         .await
         .context("ghost command detection failed")?;
     let ghost_list = ghosts
-        .get("ghost_commands")
+        .get("frontend_only")
         .and_then(|g| g.as_array())
-        .or_else(|| ghosts.get("frontend_only").and_then(|f| f.as_array()));
+        .or_else(|| ghosts.get("ghost_commands").and_then(|g| g.as_array()));
+    // Honesty signal: `frontend_only` is only a real bug list when the introspection
+    // registry mirrors the app's full command set. Report candidates as candidates.
+    let reliability = ghosts
+        .get("reliability")
+        .and_then(|r| r.as_str())
+        .unwrap_or("unknown");
     if let Some(list) = ghost_list {
         if list.is_empty() {
             eprintln!("  Ghost commands: none");
         } else {
-            eprintln!("  Ghost commands: {} detected", list.len());
+            if reliability == "none" || reliability == "low" {
+                eprintln!(
+                    "  Ghost commands: {} candidate(s) (reliability: {reliability} — likely \
+                     uninstrumented real commands, not bugs; verify against the app's \
+                     generate_handler! list)",
+                    list.len()
+                );
+            } else {
+                eprintln!("  Ghost commands: {} detected", list.len());
+            }
             for g in list.iter().take(5) {
                 if let Some(name) = g.as_str() {
                     eprintln!("    - {name}");
@@ -1229,7 +1244,7 @@ equivalent — and on macOS/Linux CDP can't attach to a Tauri webview at all):
 - `invoke_command` — call any registered Tauri command directly (also records timing and
   honours fault injection; an eval-capable tool can also reach `__TAURI_INTERNALS__.invoke`)
 - `verify_state` — cross-boundary frontend/backend state verification
-- `detect_ghost_commands` — find commands with no backend handler
+- `detect_ghost_commands` — find frontend calls absent from the introspection registry (read the `reliability` field: only a real "no backend handler" bug when the registry mirrors the app's full command set; with no/partial `#[inspectable]` it lists real, uninstrumented commands)
 - `check_ipc_integrity` — verify IPC pipeline health
 - `introspect` — command timings, IPC contract testing, coverage, startup timing, capabilities
 - `fault` — inject IPC faults (delay, error, drop, corrupt) for chaos engineering

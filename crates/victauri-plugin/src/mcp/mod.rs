@@ -36,9 +36,9 @@ use crate::VictauriState;
 use crate::bridge::WebviewBridge;
 
 use helpers::{
-    RecoveryHint, ghost_ipc_projection_js, js_string, json_result, json_truthy, missing_param,
-    sanitize_css_color, sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint,
-    validate_url,
+    RecoveryHint, annotate_ghost_reliability, ghost_ipc_projection_js, ipc_timing_projection_js,
+    ipc_timing_stats, js_string, json_result, json_truthy, missing_param, sanitize_css_color,
+    sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint, validate_url,
 };
 
 pub use backend_params::*;
@@ -527,7 +527,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Detect ghost commands. Returns TWO separate lists: `frontend_only` = the true ghosts (commands invoked from the frontend that have NO backend handler — likely typos/bugs), and `registry_only` = informational (commands registered in the backend but never invoked from the frontend this session). Reads the JS-side IPC interception log, which ACCUMULATES every command seen this session (including earlier test/probe traffic) — so a `frontend_only` result reflects what was invoked at runtime, not necessarily a real frontend bug. For a clean signal, either (a) pass `since_ms` (e.g. 5000) to scope to commands invoked in the last N ms — non-destructive, the preferred per-test pattern: invoke the suspect action, then call this with `since_ms`; or (b) call `logs {action:'clear'}` first, then exercise the app, then run this.",
+        description = "Detect candidate ghost commands. Returns `frontend_only` = commands invoked from the frontend that are ABSENT from Victauri's introspection registry, and `registry_only` = registered commands never invoked this session (informational). CRITICAL: `frontend_only` is a candidate list, NOT a confirmed-bug list. Victauri's registry only contains commands the app exposed via #[inspectable]/register_command_names — usually a SUBSET of the real `tauri::generate_handler!` set. A command is a TRUE ghost (no backend handler — a typo/dead call) only if the registry mirrors the app's full command set. ALWAYS read the returned `reliability` field first: `none` (empty registry → list is meaningless as a bug list), `low` (sparse registry → most entries are real, just uninstrumented), `high` (registry covers traffic → entries are likely genuine). When reliability is low/none, confirm a suspected ghost against the app's Rust source (grep generate_handler!) before reporting it. Reads the JS-side IPC interception log (ACCUMULATES all session traffic). For a clean signal scope with `since_ms` (e.g. 5000) — invoke the suspect action, then call this with `since_ms` — or `logs {action:'clear'}` then exercise the app.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -563,7 +563,7 @@ impl VictauriMcpHandler {
             .collect();
 
         let report = victauri_core::detect_ghost_commands(&frontend_commands, &self.state.registry);
-        json_result(&report)
+        json_result(&annotate_ghost_reliability(&report))
     }
 
     #[tool(
@@ -2819,13 +2819,46 @@ impl VictauriMcpHandler {
         match params.action {
             IntrospectAction::CommandTimings => {
                 let mut stats = self.state.command_timings.all_stats();
+                let driven_count = stats.len();
                 if let Some(threshold) = params.slow_threshold_ms {
                     stats.retain(|s| s.avg_ms >= threshold);
                 }
+
+                // Real frontend traffic: derive per-command latency from the live IPC
+                // log so the profiler is not blind to commands the app itself drives.
+                // `command_timings` (above) only records Victauri-driven invoke_command
+                // calls — on a running app that counter is typically 0 while the app
+                // makes hundreds of real calls. The IPC log captures those with
+                // duration; the name+duration projection stays under the eval cap.
+                let code = ipc_timing_projection_js(None);
+                let mut ipc_traffic = match self
+                    .eval_with_return(&code, params.webview_label.as_deref())
+                    .await
+                {
+                    Ok(json_str) => serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+                        .map(|entries| ipc_timing_stats(&entries))
+                        .unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
+                if let Some(threshold) = params.slow_threshold_ms {
+                    ipc_traffic.retain(|s| {
+                        s.get("avg_ms")
+                            .and_then(serde_json::Value::as_f64)
+                            .is_some_and(|a| a >= threshold)
+                    });
+                }
+
                 let result = serde_json::json!({
                     "commands": stats,
-                    "total_commands_profiled": self.state.command_timings.all_stats().len(),
+                    "total_commands_profiled": driven_count,
+                    "ipc_traffic": ipc_traffic,
+                    "ipc_commands_observed": ipc_traffic.len(),
                     "slow_threshold_ms": params.slow_threshold_ms,
+                    "note": "`commands` profiles ONLY commands you drove through Victauri's \
+                             invoke_command tool (often empty on a live app). `ipc_traffic` \
+                             profiles the app's REAL frontend IPC, derived from the live IPC \
+                             log (per-command call_count + min/max/avg/p95 latency) — that is \
+                             the one reflecting actual usage.",
                 });
                 json_result(&result)
             }
@@ -2838,26 +2871,25 @@ impl VictauriMcpHandler {
                     .map(|c| c.name.clone())
                     .collect();
 
-                let code = "return window.__VICTAURI__?.getIpcLog()";
-                let invoked: std::collections::HashSet<String> = match self
-                    .eval_with_return(code, params.webview_label.as_deref())
-                    .await
-                {
-                    Ok(json_str) => {
-                        if let Ok(entries) =
-                            serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
-                        {
-                            entries
-                                .iter()
-                                .filter_map(|e| e.get("command").and_then(|c| c.as_str()))
-                                .map(String::from)
-                                .collect()
-                        } else {
-                            std::collections::HashSet::new()
-                        }
-                    }
-                    Err(_) => std::collections::HashSet::new(),
-                };
+                // Project to command NAMES ONLY. The previous full `getIpcLog()` carried
+                // request/response bodies and blew the eval result cap on busy apps,
+                // silently returning an empty set and reporting "0 invoked" despite live
+                // traffic. This is the same name projection ghost detection uses.
+                let code = ghost_ipc_projection_js(None);
+                let (invoked, ipc_calls_observed): (std::collections::HashSet<String>, usize) =
+                    match self
+                        .eval_with_return(&code, params.webview_label.as_deref())
+                        .await
+                    {
+                        Ok(json_str) => match serde_json::from_str::<Vec<String>>(&json_str) {
+                            Ok(names) => {
+                                let count = names.len();
+                                (names.into_iter().collect(), count)
+                            }
+                            Err(_) => (std::collections::HashSet::new(), 0),
+                        },
+                        Err(_) => (std::collections::HashSet::new(), 0),
+                    };
 
                 let uncovered: Vec<&String> = registered
                     .iter()
@@ -2871,14 +2903,34 @@ impl VictauriMcpHandler {
                     (covered as f64 / registered.len() as f64) * 100.0
                 };
 
+                let note = if registered.is_empty() {
+                    Some(
+                        "The introspection registry is empty (the app does not use \
+                         #[inspectable]/register_command_names), so coverage_pct is a \
+                         placeholder 100%. `invoked_not_registered` still lists the real \
+                         commands seen on the live IPC log — use it to inventory actual \
+                         traffic.",
+                    )
+                } else if ipc_calls_observed == 0 {
+                    Some(
+                        "No IPC calls were observed on the live log. If the app is actively \
+                         making calls, confirm the target webview and that Tauri IPC routes \
+                         through fetch to ipc.localhost (some commands use the native channel).",
+                    )
+                } else {
+                    None
+                };
+
                 let result = serde_json::json!({
                     "registered_commands": registered.len(),
                     "invoked_commands": invoked.len(),
+                    "ipc_calls_observed": ipc_calls_observed,
                     "coverage_pct": (coverage_pct * 10.0).round() / 10.0,
                     "uncovered": uncovered,
                     "invoked_not_registered": invoked.iter()
                         .filter(|cmd| !registered.contains(cmd))
                         .collect::<Vec<_>>(),
+                    "note": note,
                 });
                 json_result(&result)
             }

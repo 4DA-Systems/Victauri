@@ -70,6 +70,164 @@ pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
     )
 }
 
+/// Wrap a [`GhostCommandReport`] with an honesty signal so an agent never reads a
+/// raw `frontend_only` list as a bug list.
+///
+/// `frontend_only` is "invoked but absent from Victauri's *introspection registry*"
+/// — which is a true ghost (missing-handler bug) ONLY when that registry mirrors the
+/// app's full `generate_handler!` set. Most apps register a subset (or nothing) via
+/// `#[inspectable]`/`register_command_names`, so without this signal the list is
+/// dominated by perfectly real, merely-uninstrumented commands. This is the exact
+/// false-positive that flagged 4DA's `set_language` (a real, registered command) as
+/// a ghost. The returned envelope is purely additive: it preserves the original
+/// report fields and adds `reliability` + a plain-language `note` an agent must read
+/// before treating `frontend_only` as a bug list.
+///
+/// [`GhostCommandReport`]: victauri_core::GhostCommandReport
+#[must_use]
+pub fn annotate_ghost_reliability(report: &victauri_core::GhostCommandReport) -> serde_json::Value {
+    let registry = report.total_registry_commands;
+    let fe_total = report.total_frontend_commands;
+    let fe_only = report.frontend_only.len();
+    let ratio = if fe_total > 0 {
+        fe_only as f64 / fe_total as f64
+    } else {
+        0.0
+    };
+
+    let (reliability, note) = if registry == 0 {
+        (
+            "none",
+            "The introspection registry is EMPTY, so every frontend command appears under \
+             `frontend_only`. This is NOT a ghost-command bug list — it just means the app \
+             does not use #[inspectable]/register_command_names. To make ghost detection \
+             meaningful, register the app's commands; otherwise cross-check suspected ghosts \
+             against the app's `tauri::generate_handler!` list directly (e.g. grep the Rust \
+             source)."
+                .to_string(),
+        )
+    } else if ratio > 0.5 {
+        (
+            "low",
+            format!(
+                "The registry knows {registry} command(s) but {fe_only} of {fe_total} frontend \
+                 commands are absent from it. Most `frontend_only` entries are therefore most \
+                 likely REAL commands that simply lack #[inspectable], not missing-handler \
+                 bugs. Treat them as candidates only — confirm a true ghost by checking the \
+                 app's `generate_handler!` list (a real ghost has no Rust handler at all)."
+            ),
+        )
+    } else {
+        (
+            "high",
+            "The registry covers most observed frontend traffic, so `frontend_only` entries are \
+             likely genuine ghosts (invoked with no matching backend handler). Still worth a \
+             quick source check before treating one as a bug."
+                .to_string(),
+        )
+    };
+
+    // Purely additive: the original report fields are preserved verbatim (no schema
+    // break for existing consumers) and enriched with the honesty signal. `reliability`
+    // + `note` are what an agent must read before treating `frontend_only` as bugs.
+    serde_json::json!({
+        "reliability": reliability,
+        "note": note,
+        "frontend_only": report.frontend_only,
+        "registry_only": report.registry_only,
+        "total_frontend_commands": report.total_frontend_commands,
+        "total_registry_commands": report.total_registry_commands,
+    })
+}
+
+/// Project the webview IPC log down to `{command, duration_ms}` pairs only — never
+/// the request/response bodies.
+///
+/// The full `getIpcLog()` carries request args + response bodies; on a heavy-traffic
+/// real app that easily exceeds the eval result cap, which silently returned an empty
+/// string and made `coverage`/`command_timings` report **zero** real traffic even
+/// while the app was making hundreds of calls. This minimal projection stays small.
+/// `since_ms` time-windows like [`ghost_ipc_projection_js`].
+#[must_use]
+pub fn ipc_timing_projection_js(since_ms: Option<i64>) -> String {
+    let filter = match since_ms {
+        Some(ms) if ms > 0 => format!(
+            ".filter(function(c){{ return c && c.timestamp && c.timestamp >= (Date.now() - {ms}); }})"
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "return (window.__VICTAURI__?.getIpcLog() || []){filter}\
+         .map(function(c){{ return (c && c.command) ? {{ command: c.command, \
+         duration_ms: (typeof c.duration_ms === 'number' ? c.duration_ms : null) }} : null; }})\
+         .filter(function(x){{ return x; }})"
+    )
+}
+
+/// Compute per-command latency stats (count / min / max / avg / p95 ms) from raw IPC
+/// `{command, duration_ms}` entries produced by [`ipc_timing_projection_js`].
+///
+/// Pending calls (null `duration_ms`) count toward `call_count` but not the latency
+/// figures (`timed_samples` reports how many had a measured duration). Output is
+/// sorted by `call_count` descending. This turns the live IPC log into a real
+/// profile of the app's own frontend traffic — the data `command_timings` was blind
+/// to because its counter only sees Victauri-driven `invoke_command` calls.
+#[must_use]
+pub fn ipc_timing_stats(entries: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    use std::collections::BTreeMap;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut durations: BTreeMap<String, Vec<f64>> = BTreeMap::new();
+    for e in entries {
+        let Some(cmd) = e.get("command").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        *counts.entry(cmd.to_string()).or_default() += 1;
+        if let Some(d) = e.get("duration_ms").and_then(serde_json::Value::as_f64) {
+            durations.entry(cmd.to_string()).or_default().push(d);
+        }
+    }
+
+    let mut out: Vec<serde_json::Value> = counts
+        .into_iter()
+        .map(|(cmd, call_count)| {
+            let mut durs = durations.remove(&cmd).unwrap_or_default();
+            durs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = durs.len();
+            let (min, max, avg, p95) = if n == 0 {
+                (None, None, None, None)
+            } else {
+                let sum: f64 = durs.iter().sum();
+                let p95_idx = (((n as f64) * 0.95).ceil() as usize)
+                    .saturating_sub(1)
+                    .min(n - 1);
+                let round1 = |v: f64| (v * 10.0).round() / 10.0;
+                (
+                    Some(round1(durs[0])),
+                    Some(round1(durs[n - 1])),
+                    Some(round1(sum / n as f64)),
+                    Some(round1(durs[p95_idx])),
+                )
+            };
+            serde_json::json!({
+                "command": cmd,
+                "call_count": call_count,
+                "timed_samples": n,
+                "min_ms": min,
+                "max_ms": max,
+                "avg_ms": avg,
+                "p95_ms": p95,
+            })
+        })
+        .collect();
+
+    out.sort_by(|a, b| {
+        b.get("call_count")
+            .and_then(serde_json::Value::as_u64)
+            .cmp(&a.get("call_count").and_then(serde_json::Value::as_u64))
+    });
+    out
+}
+
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![Content::text(json)]),
@@ -415,5 +573,118 @@ mod injected_css_tests {
         // A legitimately-escaped local content value must still pass.
         assert!(sanitize_injected_css("a::before{content:'\\2022'}", false).is_ok());
         assert!(sanitize_injected_css("body{color:red}", false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod ipc_timing_tests {
+    use super::{ipc_timing_projection_js, ipc_timing_stats};
+    use serde_json::json;
+
+    #[test]
+    fn projection_is_body_free() {
+        let js = ipc_timing_projection_js(None);
+        // Only command + duration are projected — never request/response bodies, so
+        // the result stays under the eval cap on busy apps (the bug that made the old
+        // full-getIpcLog coverage path return zero).
+        assert!(js.contains("c.command"));
+        assert!(js.contains("duration_ms"));
+        assert!(!js.contains("result"));
+        assert!(!js.contains("args"));
+        assert!(!js.contains("Date.now()"));
+        assert!(ipc_timing_projection_js(Some(5000)).contains("Date.now() - 5000"));
+    }
+
+    #[test]
+    fn stats_aggregate_per_command_with_percentiles() {
+        let entries = vec![
+            json!({ "command": "get_settings", "duration_ms": 10.0 }),
+            json!({ "command": "get_settings", "duration_ms": 30.0 }),
+            json!({ "command": "get_settings", "duration_ms": 20.0 }),
+            json!({ "command": "save", "duration_ms": 5.0 }),
+        ];
+        let stats = ipc_timing_stats(&entries);
+        assert_eq!(stats.len(), 2);
+        // Sorted by call_count desc — get_settings (3) first.
+        assert_eq!(stats[0]["command"], "get_settings");
+        assert_eq!(stats[0]["call_count"], 3);
+        assert_eq!(stats[0]["timed_samples"], 3);
+        assert_eq!(stats[0]["min_ms"], 10.0);
+        assert_eq!(stats[0]["max_ms"], 30.0);
+        assert_eq!(stats[0]["avg_ms"], 20.0);
+        assert_eq!(stats[1]["command"], "save");
+        assert_eq!(stats[1]["call_count"], 1);
+    }
+
+    #[test]
+    fn pending_calls_count_but_do_not_skew_latency() {
+        let entries = vec![
+            json!({ "command": "run_pipeline", "duration_ms": null }),
+            json!({ "command": "run_pipeline", "duration_ms": 100.0 }),
+        ];
+        let stats = ipc_timing_stats(&entries);
+        assert_eq!(stats[0]["call_count"], 2);
+        assert_eq!(stats[0]["timed_samples"], 1);
+        assert_eq!(stats[0]["avg_ms"], 100.0);
+    }
+
+    #[test]
+    fn empty_input_yields_empty_stats() {
+        assert!(ipc_timing_stats(&[]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ghost_reliability_tests {
+    use super::annotate_ghost_reliability;
+    use victauri_core::{GhostCommand, GhostCommandReport, GhostSource};
+
+    fn fe(name: &str) -> GhostCommand {
+        GhostCommand {
+            name: name.to_string(),
+            source: GhostSource::FrontendOnly,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn empty_registry_is_unreliable() {
+        // 4DA's exact scenario: a real registered command (set_language) shows up as
+        // frontend_only purely because the app uses no #[inspectable] registry.
+        let report = GhostCommandReport {
+            frontend_only: vec![fe("set_language")],
+            registry_only: vec![],
+            total_frontend_commands: 1,
+            total_registry_commands: 0,
+        };
+        let v = annotate_ghost_reliability(&report);
+        assert_eq!(v["reliability"], "none");
+        assert!(v["note"].as_str().unwrap().contains("EMPTY"));
+        // The original field is preserved; the honesty lives in reliability + note.
+        assert_eq!(v["frontend_only"][0]["name"], "set_language");
+    }
+
+    #[test]
+    fn sparse_registry_is_low_confidence() {
+        let report = GhostCommandReport {
+            frontend_only: vec![fe("a"), fe("b"), fe("c")],
+            registry_only: vec![],
+            total_frontend_commands: 4,
+            total_registry_commands: 2,
+        };
+        let v = annotate_ghost_reliability(&report);
+        assert_eq!(v["reliability"], "low");
+    }
+
+    #[test]
+    fn complete_registry_is_high_confidence() {
+        let report = GhostCommandReport {
+            frontend_only: vec![fe("typo_cmd")],
+            registry_only: vec![],
+            total_frontend_commands: 20,
+            total_registry_commands: 50,
+        };
+        let v = annotate_ghost_reliability(&report);
+        assert_eq!(v["reliability"], "high");
     }
 }
