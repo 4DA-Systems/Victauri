@@ -6,7 +6,10 @@
 // page can NEITHER:
 //   (1) forge the response the agent (service worker) receives, NOR
 //   (2) inject a command the bridge executes, NOR
-//   (3) read the channel nonce,
+//   (3) read the channel nonce, NOR
+//   (4) steal the HMAC key by replacing MAIN-world WebCrypto, NOR
+//   (5) replay an observed valid command, NOR
+//   (6) substitute command arguments or response data after MAC capture,
 // while a legitimate command still returns the correct result.
 //
 // This is the canonical proof that the HMAC-authenticated channel (content-isolated.js /
@@ -45,17 +48,54 @@ function loadPlaywright() {
 const HOSTILE_HTML = `<!doctype html><html><head><meta charset="utf-8"><title>A4 hostile</title>
 <script>
 (function () {
-  window.__hostile = { sawNonce: null, observed: [], injectedId: 'HOSTILE-INJECT' };
+  window.__hostile = {
+    sawNonce: null, capturedKey: null, importHookInstalled: false, observed: [],
+    injectedId: 'HOSTILE-INJECT', replayedCommand: false, legitExecutions: 0,
+    commandMutationAttempted: false, mutatedCommandExecutions: 0,
+    responseMutationAttempted: false
+  };
+  // Attack 0: replace MAIN-world WebCrypto after document_start. A lazy key import leaks
+  // the raw nonce here; a hardened bridge has already imported it with a captured method.
+  var subtleProto = Object.getPrototypeOf(crypto.subtle);
+  var originalImportKey = subtleProto.importKey;
+  subtleProto.importKey = function (format, keyData) {
+    if (format === 'raw') {
+      window.__hostile.capturedKey = Array.from(new Uint8Array(keyData));
+    }
+    return originalImportKey.apply(this, arguments);
+  };
+  window.__hostile.importHookInstalled = crypto.subtle.importKey !== originalImportKey;
   // Attack 1: learn the nonce + race a forged response for any in-flight command id.
   window.addEventListener('__victauri_command', function (e) {
     var d = e && e.detail; if (!d) return;
     if (d.nonce) window.__hostile.sawNonce = d.nonce;
     if (d.id) window.dispatchEvent(new CustomEvent('__victauri_response', {
-      detail: { id: d.id, type: 'result', data: 'FORGED-BY-HOSTILE-PAGE', error: null }
-    }));
+       detail: { id: d.id, type: 'result', data: 'FORGED-BY-HOSTILE-PAGE', error: null }
+     }));
+    // Attack 3: replay the first observed valid command. Without an authenticated
+    // once-only command id this repeats side effects while preserving a valid MAC.
+    if (d.id && d.mac && !window.__hostile.replayedCommand) {
+      window.__hostile.replayedCommand = true;
+      window.dispatchEvent(new CustomEvent('__victauri_command', { detail: d }));
+    }
+    // Attack 4: mutate signed args after the bridge listener has captured the MAC input but
+    // before asynchronous WebCrypto verification completes.
+    if (d.id && d.mac) queueMicrotask(function () {
+      window.__hostile.commandMutationAttempted = true;
+      d.args.code = 'return (window.__hostile.mutatedCommandExecutions += 1)';
+    });
   }, true);
   window.addEventListener('__victauri_response', function (e) {
-    var d = e && e.detail; if (d) window.__hostile.observed.push({ id: d.id, hasMac: typeof d.mac === 'string', data: d.data });
+    var d = e && e.detail;
+    if (d) {
+      window.__hostile.observed.push({ id: d.id, hasMac: typeof d.mac === 'string', data: d.data });
+      // Attack 5: mutate signed response data after the relay snapshots the MAC input but
+      // before asynchronous verification resolves.
+      if (d.mac) queueMicrotask(function () {
+        window.__hostile.responseMutationAttempted = true;
+        d.data = 'MUTATED-BY-HOSTILE-PAGE';
+      });
+    }
   }, true);
   // Attack 2: forge a command (bogus MAC) to make the bridge run a sensitive method.
   setTimeout(function () {
@@ -115,9 +155,14 @@ async function main() {
 
     // Drive a legitimate command exactly like the service worker does.
     const resp = await sw.evaluate(async ({ tabId }) => await new Promise((resolve) => {
-      const to = setTimeout(() => resolve({ __timeout: true }), 8000);
-      chrome.tabs.sendMessage(tabId,
-        { type: 'victauri_command', id: 'verify-' + Math.random().toString(36).slice(2), method: 'eval', args: { code: '40 + 2' } },
+       const to = setTimeout(() => resolve({ __timeout: true }), 8000);
+       chrome.tabs.sendMessage(tabId,
+        {
+          type: 'victauri_command',
+          id: 'verify-' + Math.random().toString(36).slice(2),
+          method: 'eval',
+          args: { code: 'return (window.__hostile.legitExecutions += 1)' }
+        },
         (r) => { clearTimeout(to); resolve(r); });
     }), { tabId });
 
@@ -125,8 +170,8 @@ async function main() {
     const data = resp && (resp.data !== undefined ? resp.data : resp);
 
     // (1) Response forgery must be rejected — the SW must receive the REAL result.
-    if (data === '42') pass('legitimate command returns the real result (not the forgery)');
-    else fail(`legitimate command did not return "42" (got ${JSON.stringify(data)})`);
+    if (data === '1') pass('legitimate command returns the real result (not the forgery)');
+    else fail(`legitimate command did not return "1" (got ${JSON.stringify(data)})`);
     if (data === 'FORGED-BY-HOSTILE-PAGE') fail('RESPONSE FORGERY ACCEPTED — A4 regressed');
     else pass('forged response rejected');
 
@@ -138,6 +183,29 @@ async function main() {
     // (3) The nonce must never appear on a page-observable event.
     if (hostile.sawNonce) fail(`NONCE LEAKED to the page (${hostile.sawNonce})`);
     else pass('nonce never leaked to the page');
+
+    // (4) MAIN-world WebCrypto replacement must not observe the raw HMAC key.
+    if (!hostile.importHookInstalled) fail('hostile WebCrypto importKey hook was not installed');
+    else pass('hostile WebCrypto importKey hook installed');
+    if (hostile.capturedKey) fail('HMAC KEY LEAKED through page-replaced WebCrypto');
+    else pass('HMAC key import stayed on captured pristine WebCrypto');
+
+    // (5) A valid observed command must execute exactly once even when replayed.
+    if (!hostile.replayedCommand) fail('hostile page did not replay the observed command');
+    else pass('hostile page replayed the observed valid command');
+    if (hostile.legitExecutions !== 1) fail(`COMMAND REPLAY EXECUTED ${hostile.legitExecutions} times`);
+    else pass('replayed valid command was rejected before duplicate execution');
+
+    // (6) Signed payloads must be snapshotted before asynchronous MAC verification.
+    if (!hostile.commandMutationAttempted || !hostile.responseMutationAttempted) {
+      fail('hostile page did not attempt signed-payload mutation');
+    } else {
+      pass('hostile page attempted command and response payload substitution');
+    }
+    if (hostile.mutatedCommandExecutions !== 0) fail('MUTATED COMMAND ARGUMENTS EXECUTED');
+    else pass('post-MAC command argument mutation was rejected');
+    if (data === 'MUTATED-BY-HOSTILE-PAGE') fail('MUTATED RESPONSE DATA ACCEPTED');
+    else pass('post-MAC response data mutation was rejected');
   } finally {
     if (ctx) await ctx.close().catch(() => {});
     srv.close();
@@ -146,7 +214,7 @@ async function main() {
   }
 
   if (process.exitCode) console.error('\nA4 channel-forgery test FAILED.');
-  else console.log('\nA4 channel-forgery test PASSED — response forgery, command injection, and nonce leak all closed.');
+  else console.log('\nA4 channel-forgery test PASSED — forgery, injection, leakage, replay, and payload substitution all closed.');
 }
 
 main().catch((e) => { console.error('error:', e && e.message || e); process.exit(2); });

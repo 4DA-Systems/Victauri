@@ -315,7 +315,7 @@ async fn discover_and_select(wait: bool, app: Option<&str>) -> Result<ServerInfo
                 port,
                 token: std::env::var("VICTAURI_AUTH_TOKEN")
                     .ok()
-                    .or_else(discover_any_token),
+                    .or_else(|| discover_token_for_port(port)),
                 identifier: None,
                 product_name: None,
             });
@@ -415,6 +415,11 @@ fn select(live: &[ServerInfo], app: Option<&str>) -> Selection {
 fn discover_servers() -> Vec<ServerInfo> {
     let root = std::env::temp_dir().join("victauri");
     let mut out = Vec::new();
+    // The root itself is security-sensitive: its owner can rename a trusted PID
+    // directory after our child check and swap in attacker-controlled files.
+    if !dir_is_trusted(&root) {
+        return out;
+    }
     let Ok(entries) = std::fs::read_dir(&root) else {
         return out;
     };
@@ -471,9 +476,18 @@ fn discover_servers() -> Vec<ServerInfo> {
     out
 }
 
-/// First token found among live discovery entries (used only for the `VICTAURI_PORT` override).
-fn discover_any_token() -> Option<String> {
-    discover_servers().into_iter().find_map(|s| s.token)
+/// Token belonging to the exact server selected by a `VICTAURI_PORT` override.
+///
+/// Never send a token discovered for one app to an unrelated localhost port.
+fn discover_token_for_port(port: u16) -> Option<String> {
+    token_for_port(&discover_servers(), port)
+}
+
+fn token_for_port(servers: &[ServerInfo], port: u16) -> Option<String> {
+    servers
+        .iter()
+        .find(|server| server.port == port)
+        .and_then(|server| server.token.clone())
 }
 
 async fn health_ok(port: u16) -> bool {
@@ -516,7 +530,7 @@ fn is_process_alive(pid: u32) -> bool {
 /// current user, and not group/other-writable. Mirrors `victauri-test::discovery::dir_is_trusted`
 /// — the bridge had no such check (audit #15 read-side residual), and it is the path Claude Code
 /// connects through. No `unsafe` (this crate is `#![forbid(unsafe_code)]`): the effective uid is
-/// read back from a probe file we create.
+/// read back from an exclusively-created probe file.
 #[cfg(unix)]
 fn dir_is_trusted(path: &std::path::Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -534,12 +548,37 @@ fn dir_is_trusted(path: &std::path::Path) -> bool {
 
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
-    use std::os::unix::fs::MetadataExt;
-    let probe =
-        std::env::temp_dir().join(format!(".victauri_bridge_uidprobe_{}", std::process::id()));
-    std::fs::write(&probe, b"").ok()?;
-    let uid = std::fs::metadata(&probe).ok().map(|m| m.uid());
-    let _ = std::fs::remove_file(&probe);
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+    for _ in 0..16 {
+        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+        let probe = std::env::temp_dir().join(format!(
+            ".victauri_bridge_uidprobe_{}_{}",
+            std::process::id(),
+            sequence
+        ));
+        if let Some(uid) = uid_from_exclusive_probe(&probe) {
+            return Some(uid);
+        }
+    }
+    None
+}
+
+/// Create a UID probe without following a pre-planted symlink in the shared temp dir.
+#[cfg(unix)]
+fn uid_from_exclusive_probe(probe: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(probe)
+        .ok()?;
+    let uid = file.metadata().ok().map(|m| m.uid());
+    drop(file);
+    let _ = std::fs::remove_file(probe);
     uid
 }
 
@@ -553,6 +592,19 @@ fn dir_is_trusted(_path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn uid_probe_refuses_preplanted_symlink_without_clobbering_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let probe = dir.path().join("probe");
+        std::fs::write(&target, "must-survive").unwrap();
+        std::os::unix::fs::symlink(&target, &probe).unwrap();
+
+        assert_eq!(uid_from_exclusive_probe(&probe), None);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "must-survive");
+    }
 
     fn srv(id: &str, name: &str, port: u16) -> ServerInfo {
         ServerInfo {
@@ -603,6 +655,18 @@ mod tests {
             select(&live, Some("com.nope.app")),
             Selection::None
         ));
+    }
+
+    #[test]
+    fn token_selection_never_crosses_ports() {
+        let mut first = srv("com.a.app", "A", 7373);
+        first.token = Some("token-a".to_string());
+        let mut second = srv("com.b.app", "B", 7374);
+        second.token = Some("token-b".to_string());
+        let servers = vec![first, second];
+
+        assert_eq!(token_for_port(&servers, 7374).as_deref(), Some("token-b"));
+        assert_eq!(token_for_port(&servers, 7999), None);
     }
 
     #[test]

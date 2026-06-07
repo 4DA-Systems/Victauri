@@ -39,4 +39,14 @@ describe('content-isolated.js structure', () => {
   it('returns true for async response', () => {
     expect(source).toContain('return true');
   });
+
+  it('fails closed instead of falling back to a predictable nonce', () => {
+    expect(source).not.toContain('Math.random');
+    expect(source).toContain('nonceDelivered || !bridgeNonce');
+  });
+
+  it('snapshots signed response fields before asynchronous verification', () => {
+    expect(source).toContain('const responseDataJson = __safeJson(d.data)');
+    expect(source).toContain('data: responseData');
+  });
 });

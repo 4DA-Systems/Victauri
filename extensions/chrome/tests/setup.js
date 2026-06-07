@@ -136,6 +136,9 @@ export function createBridgeEnv(html = '<html><head><title>Test</title></head><b
         .then((sig) => Array.prototype.map.call(new Uint8Array(sig), (b) => ('0' + b.toString(16)).slice(-2)).join(''))
     );
   }
+  // The real relay lives in the ISOLATED world, so a page cannot hook its WebCrypto.
+  // Prepare the harness relay key before tests simulate hostile MAIN-world replacement.
+  relayMacKey();
   const origDispatch = window.dispatchEvent.bind(window);
   window.dispatchEvent = function (ev) {
     // Only sign PRISTINE commands (no mac AND no nonce) — those represent the legit
