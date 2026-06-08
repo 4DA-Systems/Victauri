@@ -668,6 +668,46 @@ fn resolve_exact_intent_beats_incidental_name_match() {
 }
 
 #[test]
+fn resolve_tiebreak_is_deterministic_and_specificity_ranked() {
+    // VIC-3 regression: with NO metadata (the common real-app case), several commands can
+    // match a single query word equally. The result must be (a) DETERMINISTIC — never
+    // arbitrary HashMap order — and (b) specificity-ranked: a shorter, more fully-covered
+    // name outranks the same word buried in a longer name, instead of an opaque N-way tie.
+    let registry = CommandRegistry::new();
+    for name in [
+        "save_settings",
+        "get_app_settings_advanced",
+        "settings",
+        "reset_settings_to_default",
+    ] {
+        registry.register(CommandInfo::new(name)); // no description/intent/category
+    }
+
+    let r1: Vec<String> = registry
+        .resolve("settings")
+        .into_iter()
+        .map(|s| s.command.name)
+        .collect();
+    // Deterministic across repeated calls (would flake on HashMap order without the tiebreak).
+    for _ in 0..10 {
+        let again: Vec<String> = registry
+            .resolve("settings")
+            .into_iter()
+            .map(|s| s.command.name)
+            .collect();
+        assert_eq!(r1, again, "resolve ordering must be deterministic");
+    }
+    // The exact single-token name `settings` (coverage 1.0) ranks first.
+    assert_eq!(
+        r1[0], "settings",
+        "most specific name must rank first: {r1:?}"
+    );
+    // No two adjacent results are an opaque equal-score tie left in arbitrary order:
+    // the full result is a stable, repeatable ranking (asserted above).
+    assert!(r1.len() >= 3);
+}
+
+#[test]
 fn resolve_command_by_example() {
     let registry = CommandRegistry::new();
     let mut cmd = CommandInfo::new("export_data").with_description("Export data to CSV");

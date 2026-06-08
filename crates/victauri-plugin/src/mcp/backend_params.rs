@@ -1,6 +1,25 @@
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+/// Deserialize `args` as a JSON object (or absent), rejecting scalars/arrays. The documented
+/// contract is that `args` is an object of `{parameter_name: value}`; forwarding a scalar or
+/// array to `__TAURI_INTERNALS__.invoke` would break the handler's argument expectations, so we
+/// reject it with a clear error at the boundary instead of letting it slip through.
+fn deserialize_optional_object<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(serde_json::Value::Object(_)) => Ok(value),
+        Some(_) => Err(serde::de::Error::custom(
+            "`args` must be a JSON object of {parameter_name: value} (got a scalar or array)",
+        )),
+    }
+}
+
 /// Parameters for the `get_registry` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct RegistryParams {
@@ -13,7 +32,13 @@ pub struct RegistryParams {
 pub struct InvokeCommandParams {
     /// The Tauri command name to invoke (e.g. "greet", "`save_settings`").
     pub command: String,
-    /// Arguments as a JSON object. Keys are parameter names. Omit for commands with no arguments.
+    /// Command arguments as a JSON OBJECT nested under this `args` key — keys are the Tauri
+    /// command's parameter names, e.g. `{"command":"get_item","args":{"itemId":42}}`. Do NOT
+    /// put parameters at the top level next to `command` (a flat `{"command":...,"itemId":42}`
+    /// leaves `args` empty and the handler sees a missing argument). Omit for no-arg commands.
+    /// Forwarded verbatim to `__TAURI_INTERNALS__.invoke(command, args)` — identical via the
+    /// MCP tool and the REST `POST /api/tools/invoke_command` endpoint.
+    #[serde(default, deserialize_with = "deserialize_optional_object")]
     pub args: Option<serde_json::Value>,
     /// Target webview label.
     pub webview_label: Option<String>,

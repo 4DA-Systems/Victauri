@@ -241,7 +241,15 @@ impl CommandRegistry {
             })
             .collect();
 
-        scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+        // Primary: descending score. Secondary: a DETERMINISTIC tiebreak by command name
+        // so equal-scoring commands never come back in arbitrary (HashMap iteration) order —
+        // the "degenerate N-way tie with no tiebreak" of VIC-3. Combined with the name-coverage
+        // term in `score_command`, ranking now degrades gracefully instead of opaquely.
+        scored.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.command.name.cmp(&b.command.name))
+        });
         scored
     }
 }
@@ -318,6 +326,13 @@ const SCORE_EXACT_INTENT: f64 = 8.0;
 const SCORE_CATEGORY: f64 = 1.0;
 const SCORE_EXAMPLE_FULL: f64 = 4.0;
 const SCORE_EXAMPLE_WORD: f64 = 0.5;
+/// Whole-command specificity bonus: the fraction of the command's NAME tokens covered by
+/// the query, scaled by this weight. It rewards a more complete name match (a query word
+/// hitting the short `settings` outranks the same word buried in `get_app_settings_v2`),
+/// so when several commands match a single query word equally — the VIC-3 N-way tie — the
+/// more specific one ranks higher. Small by design: it breaks near-ties without ever
+/// overriding intent/exact-name/description signal.
+const SCORE_NAME_COVERAGE: f64 = 1.0;
 
 /// Scores a command against a query. Per-word contributions (substring, word,
 /// description, intent, category, example-word matches) are normalized by query
@@ -385,8 +400,20 @@ fn score_command(cmd: &CommandInfo, query_lower: &str, query_words: &[&str]) -> 
         }
     }
 
+    // Name-coverage specificity (graceful tiebreak — see SCORE_NAME_COVERAGE). Fraction of
+    // the command's name tokens the query covers; a whole-command bonus, not per-word.
+    let matched_name_words = name_words
+        .iter()
+        .filter(|w| !w.is_empty() && query_words.contains(w))
+        .count();
+    let name_coverage = if name_words.is_empty() {
+        0.0
+    } else {
+        matched_name_words as f64 / name_words.len() as f64
+    };
+
     // Normalize per-word contributions so scores are comparable across queries of different lengths.
     let word_count = query_words.len() as f64;
     let per_word_score = score / word_count;
-    exact_bonus + per_word_score
+    exact_bonus + per_word_score + SCORE_NAME_COVERAGE * name_coverage
 }
