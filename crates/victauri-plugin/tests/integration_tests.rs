@@ -2590,11 +2590,11 @@ async fn callback_mock_ghost_commands_detected() {
     state.registry.register(cmd);
 
     let base = start_callback_server(state, &["main"], |code| {
-        // detect_ghost_commands now projects command names in JS
-        // (`getIpcLog().map(c => c.command)`), so the bridge returns a string
-        // array rather than full IPC entries.
+        // detect_ghost_commands now projects a per-command OUTCOME summary in JS
+        // (`{command, ok, err}` per distinct command), so the bridge returns that shape.
+        // `greet` returned success (a real handler); `secret_cmd` errored "not found".
         if code.contains("getIpcLog") {
-            r#"["greet","secret_cmd"]"#.to_string()
+            r#"[{"command":"greet","ok":true,"err":null},{"command":"secret_cmd","ok":false,"err":"command secret_cmd not found"}]"#.to_string()
         } else {
             "null".to_string()
         }
@@ -2611,9 +2611,33 @@ async fn callback_mock_ghost_commands_detected() {
     )
     .await;
 
+    // `secret_cmd` errored "not found" → a confirmed ghost. `greet` returned success → a
+    // verified handler, never flagged. Unwrap the MCP SSE envelope to the tool's JSON text.
+    let envelope = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .find(|s| !s.trim().is_empty())
+        .expect("SSE data frame");
+    let env: serde_json::Value = serde_json::from_str(envelope).unwrap();
+    let text = env["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool result text");
+    let v: serde_json::Value = serde_json::from_str(text).unwrap();
     assert!(
-        body.contains("secret_cmd"),
-        "ghost command detection should find unregistered commands, got: {body}"
+        v["confirmed_ghosts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["name"] == "secret_cmd"),
+        "secret_cmd (errored 'not found') must be a confirmed ghost, got: {text}"
+    );
+    assert_eq!(
+        v["verified_handlers"], 1,
+        "greet returned success → verified handler: {text}"
+    );
+    assert!(
+        v["frontend_only"].as_array().unwrap().is_empty(),
+        "neither command is a weak candidate (one verified, one confirmed): {text}"
     );
 }
 

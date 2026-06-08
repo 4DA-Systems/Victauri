@@ -143,7 +143,7 @@ fn bridge_init_version_and_idempotent() {
         setup_js: None,
         tests: vec![
             TestCase {
-                name: "version is 0.7.8".into(),
+                name: "version equals the crate version".into(),
                 code: "return window.__VICTAURI__.version;".into(),
                 setup_html: None,
                 setup_js: None,
@@ -192,7 +192,12 @@ fn bridge_init_version_and_idempotent() {
         return;
     };
     assert_all_pass(&results);
-    assert_eq!(results[0].result.as_ref().unwrap(), "0.7.8");
+    // VIC-2 regression: the JS bridge version MUST equal the crate version (injected from
+    // CARGO_PKG_VERSION by init_script), never a drifting hardcoded literal.
+    assert_eq!(
+        results[0].result.as_ref().unwrap(),
+        env!("CARGO_PKG_VERSION")
+    );
     assert_eq!(results[1].result.as_ref().unwrap(), "object");
     assert_eq!(results[2].result.as_ref().unwrap(), "same");
     let missing: Vec<String> =
@@ -3977,7 +3982,7 @@ fn diagnostics_basic() {
                     return {
                         has_warnings: Array.isArray(diag.warnings),
                         has_info: typeof diag.info === 'object',
-                        has_version: diag.info.bridge_version === '0.7.8',
+                        bridge_version: diag.info.bridge_version,
                         has_url: typeof diag.info.url === 'string',
                         has_dom_elements: typeof diag.info.dom_elements === 'number',
                         has_protocol: typeof diag.info.protocol === 'string',
@@ -3995,7 +4000,9 @@ fn diagnostics_basic() {
     let r = results[0].result.as_ref().unwrap();
     assert_eq!(r["has_warnings"], true);
     assert_eq!(r["has_info"], true);
-    assert_eq!(r["has_version"], true);
+    // VIC-2 regression: get_diagnostics' bridge_version must be the live crate version,
+    // not a stale literal (the bug: reported 0.7.8 on a 0.7.10 process).
+    assert_eq!(r["bridge_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(r["has_url"], true);
     assert_eq!(r["has_dom_elements"], true);
     assert_eq!(r["has_protocol"], true);

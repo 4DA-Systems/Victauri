@@ -70,73 +70,180 @@ pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
     )
 }
 
-/// Wrap a [`GhostCommandReport`] with an honesty signal so an agent never reads a
-/// raw `frontend_only` list as a bug list.
+/// Build the JS that projects the webview IPC log down to a per-command **outcome**
+/// summary for `detect_ghost_commands`: `{{ command, ok, err }}` per distinct command.
 ///
-/// `frontend_only` is "invoked but absent from Victauri's *introspection registry*"
-/// — which is a true ghost (missing-handler bug) ONLY when that registry mirrors the
-/// app's full `generate_handler!` set. Most apps register a subset (or nothing) via
-/// `#[inspectable]`/`register_command_names`, so without this signal the list is
-/// dominated by perfectly real, merely-uninstrumented commands. This is the exact
-/// false-positive that flagged 4DA's `set_language` (a real, registered command) as
-/// a ghost. The returned envelope is purely additive: it preserves the original
-/// report fields and adds `reliability` + a plain-language `note` an agent must read
-/// before treating `frontend_only` as a bug list.
-///
-/// [`GhostCommandReport`]: victauri_core::GhostCommandReport
+/// This is the basis of outcome-based ghost detection (VIC-1). A command that returned
+/// success (`ok`) at least once **demonstrably has a backend handler** and can never be a
+/// ghost — regardless of whether the app registered it via `#[inspectable]`. A command that
+/// only ever errored with a "not found" message is a confirmed ghost. Aggregating per
+/// command (not per call) keeps the payload tiny even on a busy app (the same eval-cap
+/// concern that made the names-only projection necessary); the error sample is capped.
 #[must_use]
-pub fn annotate_ghost_reliability(report: &victauri_core::GhostCommandReport) -> serde_json::Value {
-    let registry = report.total_registry_commands;
-    let fe_total = report.total_frontend_commands;
-    let fe_only = report.frontend_only.len();
-    let ratio = if fe_total > 0 {
-        fe_only as f64 / fe_total as f64
-    } else {
-        0.0
+pub fn ghost_ipc_outcomes_js(since_ms: Option<i64>) -> String {
+    let filter = match since_ms {
+        Some(ms) if ms > 0 => format!(
+            ".filter(function(c){{ return c && c.timestamp && c.timestamp >= (Date.now() - {ms}); }})"
+        ),
+        _ => String::new(),
     };
+    format!(
+        "return (function() {{\
+         \n  var log = (window.__VICTAURI__?.getIpcLog() || []){filter};\
+         \n  var byCmd = {{}};\
+         \n  for (var i = 0; i < log.length; i++) {{\
+         \n    var c = log[i]; if (!c || !c.command) continue;\
+         \n    var e = byCmd[c.command] || {{ command: c.command, ok: false, err: null }};\
+         \n    if (c.status === 'ok') {{ e.ok = true; }}\
+         \n    else if (c.status === 'error') {{\
+         \n      var body = ((c.result != null ? String(c.result) : '') + ' ' + (c.error != null ? String(c.error) : ''));\
+         \n      var sample = body.slice(0, 160).toLowerCase();\
+         \n      /* keep the most diagnostic sample: a 'not found' error always wins over a generic one */\
+         \n      if (!e.err || sample.indexOf('not found') !== -1) {{ e.err = sample; }}\
+         \n    }}\
+         \n    byCmd[c.command] = e;\
+         \n  }}\
+         \n  return Object.keys(byCmd).map(function(k) {{ return byCmd[k]; }});\
+         \n}})();"
+    )
+}
 
-    let (reliability, note) = if registry == 0 {
-        (
-            "none",
-            "The introspection registry is EMPTY, so every frontend command appears under \
-             `frontend_only`. This is NOT a ghost-command bug list — it just means the app \
-             does not use #[inspectable]/register_command_names. To make ghost detection \
-             meaningful, register the app's commands; otherwise cross-check suspected ghosts \
-             against the app's `tauri::generate_handler!` list directly (e.g. grep the Rust \
-             source)."
-                .to_string(),
-        )
-    } else if ratio > 0.5 {
-        (
-            "low",
-            format!(
-                "The registry knows {registry} command(s) but {fe_only} of {fe_total} frontend \
-                 commands are absent from it. Most `frontend_only` entries are therefore most \
-                 likely REAL commands that simply lack #[inspectable], not missing-handler \
-                 bugs. Treat them as candidates only — confirm a true ghost by checking the \
-                 app's `generate_handler!` list (a real ghost has no Rust handler at all)."
-            ),
-        )
-    } else {
-        (
-            "high",
-            "The registry covers most observed frontend traffic, so `frontend_only` entries are \
-             likely genuine ghosts (invoked with no matching backend handler). Still worth a \
-             quick source check before treating one as a bug."
-                .to_string(),
-        )
-    };
+/// A per-command IPC outcome observed in the webview log (parsed from
+/// [`ghost_ipc_outcomes_js`]).
+#[derive(Debug, serde::Deserialize)]
+pub struct IpcOutcome {
+    /// The invoked command name.
+    pub command: String,
+    /// `true` if the command returned success (HTTP 200) at least once → it provably has a
+    /// backend handler.
+    #[serde(default)]
+    pub ok: bool,
+    /// A lowercased sample of an error response (for not-found detection); `None` if the
+    /// command never errored.
+    #[serde(default)]
+    pub err: Option<String>,
+}
 
-    // Purely additive: the original report fields are preserved verbatim (no schema
-    // break for existing consumers) and enriched with the honesty signal. `reliability`
-    // + `note` are what an agent must read before treating `frontend_only` as bugs.
+/// Tauri framework/plugin commands (e.g. `plugin:event|emit`, `plugin:updater|check`) are
+/// never application-level ghosts — they are handled by Tauri or its plugins, not the app's
+/// `generate_handler!`. (Victauri's own `plugin:victauri|*` traffic is already filtered out
+/// at the JS layer.)
+fn is_framework_builtin(name: &str) -> bool {
+    name.starts_with("plugin:")
+}
+
+/// Does an error sample indicate the COMMAND has no backend handler (a true ghost)? Tauri
+/// rejects an unregistered command with a "command `<name>` not found"-class message.
+///
+/// A bare "not found" is deliberately NOT enough — it also matches ordinary application errors
+/// (e.g. a real `get_user` handler returning "user not found"), which would be a false ghost. So
+/// "not found" only counts when the message also references the command (the word "command" or
+/// the command name itself), matching Tauri's actual not-found format. "unknown command" /
+/// "not registered" are unambiguous and match on their own. A permission failure
+/// ("not allowed"/"forbidden") is intentionally NOT matched — the handler exists, it is blocked.
+fn error_means_not_found(err: &str, command: &str) -> bool {
+    err.contains("unknown command")
+        || err.contains("not registered")
+        || (err.contains("not found")
+            && (err.contains("command") || err.contains(&command.to_lowercase())))
+}
+
+/// Build the enriched ghost-command report from observed IPC OUTCOMES (VIC-1).
+///
+/// Replaces the registry-only diff — which falsely flagged every real-but-uninstrumented
+/// command (e.g. 4DA's `set_language`) and every framework builtin as a ghost — with an
+/// outcome-based classification that is correct regardless of how much the app uses
+/// `#[inspectable]`:
+///
+/// * **`confirmed_ghosts`** — invoked, never succeeded, errored "not found": real ghosts
+///   (no backend handler), high confidence, registry-independent.
+/// * **`verified_handlers`** — returned success at least once → a handler provably exists →
+///   never flagged (this is what excludes `set_language`).
+/// * **`frontend_only`** — weaker candidate tier: invoked, absent from the registry, NOT a
+///   framework builtin, and never observed succeeding. Confirm against the app's
+///   `generate_handler!` before treating as a bug.
+/// * **`excluded_builtins`** — framework `plugin:*` commands, surfaced for transparency.
+///
+/// Output is additive JSON (no Rust API break); `registry_only` is unchanged.
+#[must_use]
+pub fn build_ghost_report(
+    outcomes: &[IpcOutcome],
+    registry: &victauri_core::CommandRegistry,
+) -> serde_json::Value {
+    use std::collections::HashSet;
+
+    let invoked: Vec<String> = outcomes.iter().map(|o| o.command.clone()).collect();
+    let handled: HashSet<&str> = outcomes
+        .iter()
+        .filter(|o| o.ok)
+        .map(|o| o.command.as_str())
+        .collect();
+    let report = victauri_core::detect_ghost_commands(&invoked, registry);
+
+    // Confirmed ghosts: never succeeded, not a framework builtin, errored "not found".
+    let mut confirmed: Vec<(&str, &str)> = Vec::new();
+    for o in outcomes {
+        if !o.ok
+            && !is_framework_builtin(&o.command)
+            && let Some(err) = o.err.as_deref()
+            && error_means_not_found(err, &o.command)
+        {
+            confirmed.push((o.command.as_str(), err));
+        }
+    }
+    let confirmed_names: HashSet<&str> = confirmed.iter().map(|(n, _)| *n).collect();
+
+    // Corrected `frontend_only`: registry-absent candidates, minus proven handlers, minus
+    // framework builtins, minus the already-listed confirmed ghosts.
+    let frontend_only: Vec<_> = report
+        .frontend_only
+        .iter()
+        .filter(|g| {
+            !handled.contains(g.name.as_str())
+                && !is_framework_builtin(&g.name)
+                && !confirmed_names.contains(g.name.as_str())
+        })
+        .cloned()
+        .collect();
+
+    let excluded_builtins: Vec<&str> = report
+        .frontend_only
+        .iter()
+        .map(|g| g.name.as_str())
+        .filter(|n| is_framework_builtin(n))
+        .collect();
+
+    let registry_total = report.total_registry_commands;
+    let reliability = if registry_total > 0 { "high" } else { "low" };
+    let note = format!(
+        "Outcome-based ghost detection. `confirmed_ghosts` ({confirmed}) were invoked, never \
+         returned success, and errored 'not found' — real missing-handler bugs, high confidence, \
+         independent of the registry. `verified_handlers` ({verified}) returned success so they \
+         provably HAVE a handler and are never flagged (this is why a real command such as \
+         set_language is no longer a false positive). `frontend_only` ({fe}) is the weaker \
+         candidate tier: invoked, never observed succeeding, not a framework builtin, and absent \
+         from the introspection registry ({registry_total} known) — confirm against the app's \
+         generate_handler! before filing. `excluded_builtins` are Tauri/plugin framework \
+         commands, never app ghosts. The `reliability` field describes only `frontend_only`; \
+         `confirmed_ghosts` is high-confidence regardless.",
+        confirmed = confirmed.len(),
+        verified = handled.len(),
+        fe = frontend_only.len(),
+    );
+
     serde_json::json!({
-        "reliability": reliability,
-        "note": note,
-        "frontend_only": report.frontend_only,
+        "confirmed_ghosts": confirmed
+            .iter()
+            .map(|(name, error)| serde_json::json!({ "name": name, "error": error }))
+            .collect::<Vec<_>>(),
+        "verified_handlers": handled.len(),
+        "frontend_only": frontend_only,
+        "excluded_builtins": excluded_builtins,
         "registry_only": report.registry_only,
         "total_frontend_commands": report.total_frontend_commands,
-        "total_registry_commands": report.total_registry_commands,
+        "total_registry_commands": registry_total,
+        "reliability": reliability,
+        "note": note,
     })
 }
 
@@ -635,56 +742,111 @@ mod ipc_timing_tests {
 }
 
 #[cfg(test)]
-mod ghost_reliability_tests {
-    use super::annotate_ghost_reliability;
-    use victauri_core::{GhostCommand, GhostCommandReport, GhostSource};
+mod ghost_report_tests {
+    use super::{IpcOutcome, build_ghost_report};
+    use victauri_core::{CommandInfo, CommandRegistry};
 
-    fn fe(name: &str) -> GhostCommand {
-        GhostCommand {
-            name: name.to_string(),
-            source: GhostSource::FrontendOnly,
-            description: None,
+    fn outcome(command: &str, ok: bool, err: Option<&str>) -> IpcOutcome {
+        IpcOutcome {
+            command: command.to_string(),
+            ok,
+            err: err.map(str::to_string),
         }
     }
 
     #[test]
-    fn empty_registry_is_unreliable() {
-        // 4DA's exact scenario: a real registered command (set_language) shows up as
-        // frontend_only purely because the app uses no #[inspectable] registry.
-        let report = GhostCommandReport {
-            frontend_only: vec![fe("set_language")],
-            registry_only: vec![],
-            total_frontend_commands: 1,
-            total_registry_commands: 0,
-        };
-        let v = annotate_ghost_reliability(&report);
-        assert_eq!(v["reliability"], "none");
-        assert!(v["note"].as_str().unwrap().contains("EMPTY"));
-        // The original field is preserved; the honesty lives in reliability + note.
-        assert_eq!(v["frontend_only"][0]["name"], "set_language");
+    fn succeeded_command_is_never_a_ghost() {
+        // VIC-1, the exact 4DA false positive: `set_language` is a real command the app uses;
+        // it returns success. The old registry-diff flagged it as a ghost (the app has an empty
+        // #[inspectable] registry). Outcome-based detection must classify it as a verified
+        // handler and NEVER place it in frontend_only.
+        let registry = CommandRegistry::new(); // empty — the 4DA scenario
+        let v = build_ghost_report(&[outcome("set_language", true, None)], &registry);
+        assert_eq!(v["verified_handlers"], 1);
+        assert!(
+            v["frontend_only"].as_array().unwrap().is_empty(),
+            "a command that returned success must not be a ghost"
+        );
+        assert!(v["confirmed_ghosts"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn sparse_registry_is_low_confidence() {
-        let report = GhostCommandReport {
-            frontend_only: vec![fe("a"), fe("b"), fe("c")],
-            registry_only: vec![],
-            total_frontend_commands: 4,
-            total_registry_commands: 2,
-        };
-        let v = annotate_ghost_reliability(&report);
-        assert_eq!(v["reliability"], "low");
+    fn framework_builtins_are_excluded() {
+        // plugin:event|emit / plugin:updater|check are Tauri framework commands, never app ghosts.
+        let registry = CommandRegistry::new();
+        let outcomes = [
+            outcome("plugin:event|emit", false, Some("some error")),
+            outcome("plugin:updater|check", false, None),
+        ];
+        let v = build_ghost_report(&outcomes, &registry);
+        assert!(v["frontend_only"].as_array().unwrap().is_empty());
+        assert!(v["confirmed_ghosts"].as_array().unwrap().is_empty());
+        assert_eq!(v["excluded_builtins"].as_array().unwrap().len(), 2);
     }
 
     #[test]
-    fn complete_registry_is_high_confidence() {
-        let report = GhostCommandReport {
-            frontend_only: vec![fe("typo_cmd")],
-            registry_only: vec![],
-            total_frontend_commands: 20,
-            total_registry_commands: 50,
-        };
-        let v = annotate_ghost_reliability(&report);
-        assert_eq!(v["reliability"], "high");
+    fn not_found_error_is_a_confirmed_ghost() {
+        // A frontend call to a command with no handler errors "not found" → confirmed ghost,
+        // high confidence, registry-independent. Not double-listed in frontend_only.
+        let registry = CommandRegistry::new();
+        let v = build_ghost_report(
+            &[outcome(
+                "get_widgetz",
+                false,
+                Some("command get_widgetz not found"),
+            )],
+            &registry,
+        );
+        let confirmed = v["confirmed_ghosts"].as_array().unwrap();
+        assert_eq!(confirmed.len(), 1);
+        assert_eq!(confirmed[0]["name"], "get_widgetz");
+        assert!(v["frontend_only"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn app_level_not_found_is_not_a_confirmed_ghost() {
+        // A real command returning an application "X not found" error (here `get_user` →
+        // "user not found") must NOT be mistaken for a missing-handler ghost: the message does
+        // not reference the command/handler. It falls to the weak candidate tier instead.
+        let registry = CommandRegistry::new();
+        let v = build_ghost_report(
+            &[outcome("get_user", false, Some("user not found"))],
+            &registry,
+        );
+        assert!(
+            v["confirmed_ghosts"].as_array().unwrap().is_empty(),
+            "an app-level 'not found' must not be a confirmed ghost: {}",
+            v["confirmed_ghosts"]
+        );
+        assert_eq!(v["frontend_only"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn never_succeeded_unregistered_is_a_weak_candidate() {
+        // Errored for a NON-not-found reason, not in registry, not a builtin, never succeeded:
+        // a frontend_only candidate (weaker tier), not a confirmed ghost.
+        let registry = CommandRegistry::new();
+        let v = build_ghost_report(
+            &[outcome(
+                "save_thing",
+                false,
+                Some("validation failed: bad arg"),
+            )],
+            &registry,
+        );
+        assert!(v["confirmed_ghosts"].as_array().unwrap().is_empty());
+        let fo = v["frontend_only"].as_array().unwrap();
+        assert_eq!(fo.len(), 1);
+        assert_eq!(fo[0]["name"], "save_thing");
+    }
+
+    #[test]
+    fn registered_command_is_not_flagged_even_if_it_only_errored() {
+        // A command present in the registry is known to exist; even if it only errored this
+        // session it is never frontend_only.
+        let registry = CommandRegistry::new();
+        registry.register(CommandInfo::new("known_cmd"));
+        let v = build_ghost_report(&[outcome("known_cmd", false, Some("oops"))], &registry);
+        assert!(v["frontend_only"].as_array().unwrap().is_empty());
     }
 }

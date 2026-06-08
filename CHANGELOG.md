@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.11] - 2026-06-08
+
+Driven by a real session driving **live 4DA**'s embedded Victauri 0.7.10. Six issues
+(VIC-1..6) were filed against Victauri; all are addressed here. Additive / bugfix — **no
+breaking output-schema change** (Semver Checks green), so `"0.7"` consumers pick it up.
+
+### Fixed
+
+- **`detect_ghost_commands` is now OUTCOME-based, not a registry diff (VIC-1, core-value).**
+  It used to diff frontend-invoked commands against Victauri's `#[inspectable]` registry — an
+  incomplete subset of the real `tauri::generate_handler!` set (which Tauri exposes no runtime
+  API to enumerate) — so every real-but-uninstrumented command (4DA's `set_language`) and every
+  framework `plugin:*` builtin was reported as a ghost; 0.7.10 only added a caveat. It now keys
+  on the IPC **outcome**: a command that returned success at least once **provably has a
+  handler** (`verified_handlers`, never flagged — this is what excludes `set_language`); a
+  command that only ever errored "not found" is a `confirmed_ghosts` entry (high confidence,
+  registry-independent); `plugin:*` commands are `excluded_builtins`. The legacy `frontend_only`
+  remains as a much-tighter weak-candidate tier (invoked, never succeeded, not a builtin, absent
+  from the registry). Additive output fields; 5 regression tests.
+- **`get_diagnostics.bridge_version` no longer drifts (VIC-2).** The JS bridge's self-reported
+  version was a hand-maintained literal that the bump script find-replaced each release; it
+  silently stuck at `0.7.8` through 0.7.10, so `get_diagnostics` reported a stale `bridge_version`
+  on a fresh process and the startup self-check logged a false "Bridge version mismatch" every
+  launch. `init_script()` now injects `env!("CARGO_PKG_VERSION")` into a placeholder, so the JS
+  bridge version is **always** the crate version (matching the Rust `BRIDGE_VERSION` const) and
+  cannot drift again. The bridge tests assert this equality.
+- **`resolve_command` no longer returns opaque N-way ties (VIC-3).** When command metadata was
+  absent, several commands tied on score and came back in arbitrary (HashMap) order. Added a
+  deterministic name tiebreak plus a small name-coverage specificity bonus, so ranking degrades
+  gracefully (a query word hitting the short `settings` outranks the same word buried in
+  `get_app_settings_v2`).
+- **`introspect event_bus` is capped (VIC-4).** It dumped the full Tauri + app event buffers (up
+  to ~11k events / ~1.68 MB / tens of thousands of lines), overflowing the tool result cap. It
+  now returns the newest `limit` events per category (default 100) with the true `count` and a
+  `truncated` flag, and accepts `limit` / `since_ms` to scope output.
+- **Clearer MCP-restart diagnostics (VIC-5).** The 422 stale-session class was already eliminated
+  by 0.7.10's stateless-by-default transport, and `victauri bridge` already auto-reconnects on an
+  app restart. The remaining rough edge — an opaque "server unreachable" while the app rebuilds —
+  now returns an actionable message explaining the app is likely restarting and the bridge
+  reconnects automatically.
+
+### Changed
+
+- **`invoke_command` args contract clarified (VIC-6).** Investigation confirmed the MCP and REST
+  paths are identical (same `InvokeCommandParams`, same `execute_tool` dispatch and forwarding),
+  so a "missing argument" via MCP but not REST is a caller passing args flat instead of nested
+  under `args`. The tool/param description now states the shape explicitly
+  (`{"command":"…","args":{…}}`). No behavior change.
+
 ## [0.7.10] - 2026-06-07
 
 Driven by an in-the-wild session that drove **live 4DA** over the REST bridge and

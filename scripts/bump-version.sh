@@ -85,11 +85,9 @@ fi
 # 8. Composite action default CLI version
 replace_in_file ".github/actions/victauri-test/action.yml" "default: \"$OLD_VERSION\"" "default: \"$NEW_VERSION\"" "victauri-test action CLI pin"
 
-# 9. JS bridge version
-replace_in_file "crates/victauri-plugin/src/js_bridge.rs" "version: '$OLD_VERSION'" "version: '$NEW_VERSION'" "JS bridge version"
-
-# 10. Bridge test file
-replace_in_file "crates/victauri-plugin/tests/bridge_tests.rs" "$OLD_VERSION" "$NEW_VERSION" "bridge_tests.rs version assertions"
+# 9. JS bridge version — NO LONGER bumped here. init_script() injects the crate version
+#    (env!("CARGO_PKG_VERSION")) into the __VICTAURI_BRIDGE_VERSION__ placeholder, so the JS
+#    bridge version can never drift (VIC-2); the bridge tests assert against CARGO_PKG_VERSION.
 
 # 11-12. Docs
 replace_in_file "docs/src/getting-started.md" "\"version\":\"$OLD_VERSION\"" "\"version\":\"$NEW_VERSION\"" "docs getting-started"

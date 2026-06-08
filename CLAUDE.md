@@ -198,7 +198,44 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-06-07)
+## Current State (2026-06-08)
+
+### v0.7.11 — in-the-wild fixes from a live 4DA MCP session (6 issues, no shortcuts)
+
+Driven by a real session driving live 4DA's embedded Victauri 0.7.10 (RUN1/2). Six issues
+(VIC-1..6) filed against Victauri; all addressed properly here. Additive/bugfix — no breaking
+output-schema change (Semver Checks green); stays in `^0.7` so 4DA picks it up.
+
+- **VIC-1 (core-value): `detect_ghost_commands` is now OUTCOME-based, not a registry diff.**
+  The old logic diffed frontend-invoked commands against the `#[inspectable]` registry (an
+  incomplete subset of the real `generate_handler!` set Tauri exposes no runtime API for), so
+  every real-but-uninstrumented command (4DA's `set_language`) and every framework `plugin:*`
+  builtin was flagged a ghost; 0.7.10 only added a caveat. Now: a command that returned success
+  ≥1 time **provably has a handler** → `verified_handlers`, never flagged. A command that only
+  errored "not found" → `confirmed_ghosts` (high-confidence, registry-independent). `plugin:*`
+  → `excluded_builtins`. `frontend_only` is the much-tighter weak-candidate tier. 5 regression
+  tests. The JS projection now captures per-command `{ok, err}` (still tiny).
+- **VIC-2: `get_diagnostics.bridge_version` no longer drifts.** It was a hand-maintained JS
+  literal (`'0.7.8'`) the bump script find-replaced each release; it silently stuck at 0.7.8
+  through 0.7.10 (reported stale on a fresh 0.7.10 process + logged a false startup mismatch).
+  `init_script()` now injects `env!("CARGO_PKG_VERSION")` into a placeholder, so the JS bridge
+  version is ALWAYS the crate version (like the Rust `BRIDGE_VERSION` const). Bump script rule
+  removed; bridge tests assert against `CARGO_PKG_VERSION`.
+- **VIC-3: `resolve_command` no longer returns opaque N-way ties.** Equal scores fell back to
+  arbitrary HashMap order. Added a deterministic name tiebreak + a small name-coverage
+  specificity bonus so ranking degrades gracefully (a query word hitting short `settings`
+  outranks the same word buried in `get_app_settings_v2`). Regression test.
+- **VIC-4: `introspect event_bus` is capped.** It dumped the full buffers (up to ~11k events /
+  1.68 MB / 60k lines), overflowing the result cap. Now returns the newest `limit` (default 100)
+  per category with `count`/`truncated`, plus `limit`/`since_ms` params.
+- **VIC-5: MCP restart resilience (already mostly fixed in 0.7.10).** The 422 session class was
+  closed by 0.7.10's stateless-by-default transport; the `victauri bridge` already
+  auto-reconnects on app restart (re-discovers port). Improved the only residual — a clearer,
+  actionable "unreachable, app likely rebuilding, auto-reconnects" message instead of an opaque one.
+- **VIC-6: confirmed harness-side, not a Victauri bug.** MCP and REST `invoke_command` use the
+  IDENTICAL `InvokeCommandParams` + `execute_tool` dispatch + forwarding, so args flow the same;
+  the "missing itemId" was the MCP caller passing args flat instead of nested under `args`.
+  Clarified the `args` contract in the tool description (nest under `args`).
 
 ### v0.7.10 — real-frontend-traffic profiling + honest ghost detection (in-the-wild driven)
 

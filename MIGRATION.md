@@ -1,5 +1,30 @@
 # Migration Guide
 
+## v0.7.10 → v0.7.11 (bugfix — additive, no API or output-schema breaks)
+
+Six in-the-wild fixes from a live 4DA session. No public Rust API changed and no existing
+tool-output field was removed (Semver Checks green); nothing is required of consumers. Review
+only if you parse these tool outputs:
+
+- **`detect_ghost_commands` is now outcome-based.** It no longer reports real-but-uninstrumented
+  commands or framework `plugin:*` builtins as ghosts. New fields: `confirmed_ghosts`
+  (high-confidence — invoked, never succeeded, errored "not found"), `verified_handlers` (count
+  of commands proven to have a handler), `excluded_builtins`. `frontend_only` is preserved but is
+  now a much tighter weak-candidate list (a command that returned success is never in it). If you
+  treated `frontend_only` as a bug list, prefer `confirmed_ghosts`; `frontend_only` remains
+  "confirm against `generate_handler!`".
+- **`get_diagnostics.bridge_version`** now always equals the crate version (was a stale literal,
+  e.g. `0.7.8` on a 0.7.10 build). If you asserted on the old literal, assert on the live version.
+- **`introspect event_bus`** now returns at most `limit` events per category (default 100,
+  newest first) instead of the entire buffer, with `count` (true total) and `truncated`. Pass a
+  larger `limit` or a `since_ms` window for more. If you relied on it returning every event in one
+  call, page with `limit`/`since_ms`.
+- **`resolve_command`** ranking is now deterministic on ties and slightly more specificity-aware;
+  if you asserted on exact tie *ordering*, re-check — it is now stable and more correct.
+- **`invoke_command`** behaviour is unchanged; the `args` doc now states the shape explicitly —
+  arguments must be nested under `args` (`{"command":"…","args":{…}}`), not placed flat next to
+  `command`.
+
 ## v0.7.9 → v0.7.10 (bugfix — additive, no API or output-schema breaks)
 
 No public Rust API changed and no existing tool-output field was renamed or removed
