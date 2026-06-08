@@ -13,7 +13,12 @@ pub struct RegistryParams {
 pub struct InvokeCommandParams {
     /// The Tauri command name to invoke (e.g. "greet", "`save_settings`").
     pub command: String,
-    /// Arguments as a JSON object. Keys are parameter names. Omit for commands with no arguments.
+    /// Command arguments as a JSON OBJECT nested under this `args` key — keys are the Tauri
+    /// command's parameter names, e.g. `{"command":"get_item","args":{"itemId":42}}`. Do NOT
+    /// put parameters at the top level next to `command` (a flat `{"command":...,"itemId":42}`
+    /// leaves `args` empty and the handler sees a missing argument). Omit for no-arg commands.
+    /// Forwarded verbatim to `__TAURI_INTERNALS__.invoke(command, args)` — identical via the
+    /// MCP tool and the REST `POST /api/tools/invoke_command` endpoint.
     pub args: Option<serde_json::Value>,
     /// Target webview label.
     pub webview_label: Option<String>,

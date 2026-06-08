@@ -184,7 +184,12 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
                             });
                         }
                     }
-                    last_err = Some(format!("Victauri server unreachable: {e}"));
+                    last_err = Some(format!(
+                        "Victauri server unreachable ({e}). The app is likely restarting or \
+                         rebuilding (a `tauri dev` rebuild can take seconds); the bridge \
+                         re-discovers and reconnects automatically, so retry the call once the \
+                         app is back up."
+                    ));
                     continue;
                 }
             }

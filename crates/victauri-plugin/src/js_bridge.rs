@@ -47,7 +47,14 @@ pub fn init_script(caps: &BridgeCapacities) -> String {
         navigation_log = caps.navigation_log,
         dialog_log = caps.dialog_log,
         long_tasks = caps.long_tasks,
-    ) + INIT_SCRIPT_BODY
+    )
+    // Inject the crate version into the JS bridge's self-reported version so it ALWAYS
+    // equals `get_plugin_info`'s `BRIDGE_VERSION` (= CARGO_PKG_VERSION). Previously the
+    // JS version was a hand-maintained literal that the bump script find-replaced each
+    // release — it silently drifted (stuck at 0.7.8 through 0.7.10), so `get_diagnostics`
+    // reported a stale `bridge_version` and the startup self-check logged a false
+    // "Bridge version mismatch" on every launch. Deriving it here makes drift impossible.
+        + &INIT_SCRIPT_BODY.replace("__VICTAURI_BRIDGE_VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
 /// The body of the init script (after capacity variable declarations).
@@ -229,7 +236,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     // ── Public API ───────────────────────────────────────────────────────────
 
     window.__VICTAURI__ = {
-        version: '0.7.8',
+        version: '__VICTAURI_BRIDGE_VERSION__',
         _captureIpcBodies: true,
 
         // ── DOM ──────────────────────────────────────────────────────────────

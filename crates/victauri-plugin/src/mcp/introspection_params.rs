@@ -63,6 +63,9 @@ pub struct IntrospectParams {
     /// Target webview for actions that need JS eval.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub webview_label: Option<String>,
+    // NB: `event_bus` options (`limit`, `since_ms`) are read from the generic `args` object
+    // rather than dedicated fields — adding public fields to this externally-constructible
+    // struct would be a semver-major break (it must stay additive within ^0.7).
 }
 
 /// Actions available in the `fault` compound tool.

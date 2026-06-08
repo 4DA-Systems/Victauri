@@ -114,11 +114,10 @@ if ($cargoContent -match $pinPattern) {
 # 8. Composite action default CLI version
 Update-File ".github\actions\victauri-test\action.yml" "default: `"$OldVersion`"" "default: `"$NewVersion`"" "victauri-test action CLI pin"
 
-# 9. JS bridge version (hardcoded in bridge init script)
-Update-File "crates\victauri-plugin\src\js_bridge.rs" "version: '$OldVersion'" "version: '$NewVersion'" "JS bridge version"
-
-# 10. Bridge test file (hardcoded version assertions)
-Update-File "crates\victauri-plugin\tests\bridge_tests.rs" "$OldVersion" "$NewVersion" "bridge_tests.rs version assertions"
+# 9. JS bridge version — NO LONGER bumped here. `init_script()` injects the crate version
+#    (env!("CARGO_PKG_VERSION")) into the `__VICTAURI_BRIDGE_VERSION__` placeholder, so the JS
+#    bridge version can never drift from the crate version (VIC-2). The bridge tests assert
+#    against CARGO_PKG_VERSION, so they need no per-release edit either.
 
 # 11. docs/src/getting-started.md version in example output
 Update-File "docs\src\getting-started.md" "`"version`":`"$OldVersion`"" "`"version`":`"$NewVersion`"" "docs getting-started.md example"

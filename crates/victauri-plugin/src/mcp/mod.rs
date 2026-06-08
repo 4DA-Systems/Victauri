@@ -36,9 +36,10 @@ use crate::VictauriState;
 use crate::bridge::WebviewBridge;
 
 use helpers::{
-    RecoveryHint, annotate_ghost_reliability, ghost_ipc_projection_js, ipc_timing_projection_js,
-    ipc_timing_stats, js_string, json_result, json_truthy, missing_param, sanitize_css_color,
-    sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint, validate_url,
+    RecoveryHint, build_ghost_report, ghost_ipc_outcomes_js, ghost_ipc_projection_js,
+    ipc_timing_projection_js, ipc_timing_stats, js_string, json_result, json_truthy, missing_param,
+    sanitize_css_color, sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint,
+    validate_url,
 };
 
 pub use backend_params::*;
@@ -527,7 +528,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Detect candidate ghost commands. Returns `frontend_only` = commands invoked from the frontend that are ABSENT from Victauri's introspection registry, and `registry_only` = registered commands never invoked this session (informational). CRITICAL: `frontend_only` is a candidate list, NOT a confirmed-bug list. Victauri's registry only contains commands the app exposed via #[inspectable]/register_command_names — usually a SUBSET of the real `tauri::generate_handler!` set. A command is a TRUE ghost (no backend handler — a typo/dead call) only if the registry mirrors the app's full command set. ALWAYS read the returned `reliability` field first: `none` (empty registry → list is meaningless as a bug list), `low` (sparse registry → most entries are real, just uninstrumented), `high` (registry covers traffic → entries are likely genuine). When reliability is low/none, confirm a suspected ghost against the app's Rust source (grep generate_handler!) before reporting it. Reads the JS-side IPC interception log (ACCUMULATES all session traffic). For a clean signal scope with `since_ms` (e.g. 5000) — invoke the suspect action, then call this with `since_ms` — or `logs {action:'clear'}` then exercise the app.",
+        description = "Detect ghost commands (frontend calls with no backend handler) by IPC OUTCOME, not by guessing from Victauri's registry. Returns: `confirmed_ghosts` = commands invoked that NEVER returned success and errored 'not found' — real missing-handler bugs, HIGH confidence and independent of whether the app uses #[inspectable]; `verified_handlers` = count of commands that returned success at least once (they provably HAVE a handler, so they are never flagged — this is why a real command like `set_language` is no longer a false positive); `frontend_only` = the WEAKER candidate tier (invoked, never observed succeeding, NOT a Tauri/plugin framework builtin, and absent from the introspection registry) — confirm against the app's `tauri::generate_handler!` before filing; `excluded_builtins` = framework `plugin:*` commands (never app ghosts); `registry_only` = registered commands never invoked (informational). The `reliability` field describes only `frontend_only`; `confirmed_ghosts` is high-confidence regardless. Reads the JS-side IPC interception log (ACCUMULATES all session traffic). For a clean signal scope with `since_ms` (e.g. 5000) — invoke the suspect action, then call this with `since_ms` — or `logs {action:'clear'}` then exercise the app.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -539,11 +540,12 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<GhostCommandParams>,
     ) -> CallToolResult {
-        // Project only command names in JS — ghost detection never needs request
-        // or response bodies, so this stays tiny even when the full IPC log is
-        // huge (avoids the eval size cap on busy apps). When `since_ms` is set, the
-        // projection also time-windows to the current test's traffic (non-destructive).
-        let code = ghost_ipc_projection_js(params.since_ms);
+        // Project a per-command OUTCOME summary in JS ({command, ok, err}, deduped). Ghost
+        // detection is outcome-based (VIC-1): a command that returned success provably has a
+        // handler and is never a ghost; one that errored "not found" is a confirmed ghost.
+        // Aggregating per command keeps this tiny even on a busy app (avoids the eval cap).
+        // When `since_ms` is set, the projection time-windows to the current test's traffic.
+        let code = ghost_ipc_outcomes_js(params.since_ms);
         let ipc_json = match self
             .eval_with_return(&code, params.webview_label.as_deref())
             .await
@@ -552,18 +554,12 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to read IPC log: {e}")),
         };
 
-        let command_names: Vec<String> = match serde_json::from_str(&ipc_json) {
+        let outcomes: Vec<crate::mcp::helpers::IpcOutcome> = match serde_json::from_str(&ipc_json) {
             Ok(v) => v,
             Err(e) => return tool_error(format!("failed to parse IPC log JSON: {e}")),
         };
-        let frontend_commands: Vec<String> = command_names
-            .into_iter()
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
 
-        let report = victauri_core::detect_ghost_commands(&frontend_commands, &self.state.registry);
-        json_result(&annotate_ghost_reliability(&report))
+        json_result(&build_ghost_report(&outcomes, &self.state.registry))
     }
 
     #[tool(
@@ -2802,7 +2798,7 @@ impl VictauriMcpHandler {
             - `plugin_state`: Snapshot of the Victauri plugin's internal state (event log, registry, faults, recording, timings, etc.).\n\
             - `processes`: Enumerate the host process and all child processes (sidecars, background workers) with PID, name, and memory usage.\n\
             - `plugin_tasks`: List Victauri's own spawned async tasks (MCP server, event drain) with status.\n\
-            - `event_bus`: List all captured Tauri events (automatically intercepted via listen_any — no app opt-in needed).\n\
+            - `event_bus`: List captured Tauri events + app events (auto-intercepted via listen_any — no app opt-in needed). Returns the newest events per category (default 100) so the full buffers (up to ~11k events / megabytes) never overflow the result; `count` is the true total and `truncated` flags a capped slice. Scope via the `args` object: `{\"action\":\"event_bus\",\"args\":{\"limit\":500,\"since_ms\":5000}}`.\n\
             - `event_bus_clear`: Clear the event bus capture buffer.",
         annotations(
             read_only_hint = true,
@@ -3188,15 +3184,65 @@ impl VictauriMcpHandler {
                 json_result(&result)
             }
             IntrospectAction::EventBus => {
-                let tauri_events = self.state.event_bus.events();
-                let app_events = self.state.event_log.snapshot();
+                // Default cap so the full buffers (up to 1k Tauri + 10k app events, often
+                // megabytes / tens of thousands of lines) can never overflow the tool result
+                // cap (VIC-4). Newest events first; `count` is the full total so a truncated
+                // slice is always diagnosable. Optional `limit` / `since_ms` are read from the
+                // generic `args` object (a dedicated public field would be a semver-major break).
+                let opts = params.args.as_ref();
+                let limit = opts
+                    .and_then(|a| a.get("limit"))
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok())
+                    .unwrap_or(100);
+                let since_ms = opts
+                    .and_then(|a| a.get("since_ms"))
+                    .and_then(serde_json::Value::as_u64);
+                let cutoff = since_ms.map(|ms| {
+                    chrono::Utc::now()
+                        - chrono::TimeDelta::milliseconds(i64::try_from(ms).unwrap_or(i64::MAX))
+                });
+
+                let all_tauri = self.state.event_bus.events();
+                let tauri_total = all_tauri.len();
+                let tauri_matched: Vec<_> = all_tauri
+                    .into_iter()
+                    .filter(|e| match cutoff {
+                        Some(cut) => chrono::DateTime::parse_from_rfc3339(&e.timestamp)
+                            .map_or(true, |t| t.with_timezone(&chrono::Utc) >= cut),
+                        None => true,
+                    })
+                    .collect();
+                let tauri_matched_count = tauri_matched.len();
+                let tauri_events: Vec<_> = tauri_matched.into_iter().rev().take(limit).collect();
+
+                let all_app = self.state.event_log.snapshot();
+                let app_total = all_app.len();
+                let app_matched: Vec<_> = match cutoff {
+                    Some(cut) => all_app
+                        .into_iter()
+                        .filter(|e| e.timestamp() >= cut)
+                        .collect(),
+                    None => all_app,
+                };
+                let app_matched_count = app_matched.len();
+                let app_events: Vec<_> = app_matched.into_iter().rev().take(limit).collect();
+
                 let result = serde_json::json!({
+                    "limit": limit,
+                    "since_ms": since_ms,
                     "tauri_events": {
-                        "count": tauri_events.len(),
+                        "count": tauri_total,
+                        "matched": tauri_matched_count,
+                        "returned": tauri_events.len(),
+                        "truncated": tauri_matched_count > tauri_events.len(),
                         "events": tauri_events,
                     },
                     "app_events": {
-                        "count": app_events.len(),
+                        "count": app_total,
+                        "matched": app_matched_count,
+                        "returned": app_events.len(),
+                        "truncated": app_matched_count > app_events.len(),
                         "capacity": self.state.event_log.capacity(),
                         "events": app_events,
                     },
@@ -5722,6 +5768,45 @@ mod command_policy_dispatch_tests {
             Ok(r) => r,
             Err(_) => panic!("dispatch returned a transport error (arg parse failure)"),
         }
+    }
+
+    // ── introspect event_bus output cap (VIC-4) ──────────────────────────────
+    #[tokio::test]
+    async fn event_bus_caps_output_to_limit() {
+        // The full buffers can be tens of thousands of events (megabytes); the action must cap
+        // output (default 100, newest first) and still report the true total + a truncated flag.
+        use crate::introspection::CapturedTauriEvent;
+        let state = state_with(PrivacyConfig::default());
+        for i in 0..150 {
+            state.event_bus.push(CapturedTauriEvent {
+                name: format!("evt-{i}"),
+                payload: "{}".to_string(),
+                timestamp: chrono::Utc::now().to_rfc3339(),
+            });
+        }
+        let h = VictauriMcpHandler::new(state, Arc::new(RecordingBridge::default()));
+
+        // Default limit (100).
+        let r = call(&h, "introspect", json!({"action": "event_bus"})).await;
+        let v: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(
+            v["tauri_events"]["count"], 150,
+            "true total must be reported"
+        );
+        assert_eq!(v["tauri_events"]["returned"], 100, "default cap is 100");
+        assert_eq!(v["tauri_events"]["truncated"], true);
+        assert_eq!(v["tauri_events"]["events"].as_array().unwrap().len(), 100);
+
+        // Explicit smaller limit (passed via the generic `args` object).
+        let r = call(
+            &h,
+            "introspect",
+            json!({"action": "event_bus", "args": {"limit": 10}}),
+        )
+        .await;
+        let v: serde_json::Value = serde_json::from_str(&result_text(&r)).unwrap();
+        assert_eq!(v["tauri_events"]["returned"], 10);
+        assert_eq!(v["tauri_events"]["events"].as_array().unwrap().len(), 10);
     }
 
     // ── recording.replay (audit #30/#31, A1) ─────────────────────────────────
