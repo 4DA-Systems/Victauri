@@ -20,6 +20,7 @@ jobs:
   test:
     name: Test gate
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -51,6 +52,7 @@ jobs:
     name: Build ${{ matrix.binary }} (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     needs: test
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -176,6 +178,9 @@ jobs:
   require-ci-green:
     name: Require CI green for this commit
     runs-on: ubuntu-latest
+    # Higher than the in-step poll budget (80 × 30s ≈ 40 min) so the timeout is a
+    # backstop against a hung runner, not a premature cut of the legitimate wait.
+    timeout-minutes: 50
     permissions:
       actions: read
       contents: read
@@ -212,6 +217,7 @@ jobs:
   publish:
     name: Publish to crates.io
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     # Crates cannot be unpublished. Require the release-profile binaries to build
     # before making the version irreversible.
     needs: [test, build, require-ci-green]
@@ -290,6 +296,7 @@ jobs:
   github-release:
     name: GitHub Release
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Depend on `publish` so a GitHub Release is never cut for a tag whose crates
     # failed to reach crates.io — the release would otherwise advertise a version
     # users cannot `cargo add` (red-team P2).

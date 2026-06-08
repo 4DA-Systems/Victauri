@@ -1,0 +1,13 @@
+# cargo-audit configuration — https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# Escape hatch for the `Security Audit` CI job (which runs `cargo audit`), mirroring
+# the role deny.toml's [advisories] plays for the `Dependency Checks` (cargo-deny) job.
+# A newly-published RustSec advisory against a transitive dep can turn `main` red — and
+# block a release — through no change of ours. Add the id to `ignore` below with a dated
+# reason when an advisory is irrelevant/unfixable, rather than weakening the whole check.
+# NOTE: to unblock a release you must ignore the id in BOTH this file and deny.toml.
+
+[advisories]
+ignore = [
+    # "RUSTSEC-0000-0000", # 2026-01-01: not exploitable — affected API unused; fix tracked at <url>
+]
