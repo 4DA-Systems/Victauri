@@ -511,7 +511,7 @@ jobs:
     steps:
       - name: Verify all required jobs succeeded
         run: |
-          results='${{ join(needs.*.result, ",") }}'
+          results='${{ join(needs.*.result, ',') }}'
           echo "dependency results: $results"
           case ",$results," in
             *,failure,* | *,cancelled,*)
