@@ -4874,7 +4874,6 @@ dependencies = [
  "futures-util",
  "http",
  "http-body",
- "http-body-util",
  "iri-string",
  "pin-project-lite",
  "tower",
@@ -5123,29 +5122,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "victauri-browser"
-version = "0.7.11"
-dependencies = [
- "anyhow",
- "axum",
- "chrono",
- "http-body-util",
- "reqwest 0.12.28",
- "rmcp",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "victauri-core",
- "windows",
-]
 
 [[package]]
 name = "victauri-cli"

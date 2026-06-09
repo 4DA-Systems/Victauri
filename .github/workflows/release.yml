@@ -7,7 +7,7 @@ on:
       # A bare `v*` also matches `vscode-v*` (release-vscode.yml), which would
       # fire the full crates.io publish + binary release on a VS Code tag and
       # race that workflow. This pattern requires a digit right after `v`, so it
-      # is disjoint from `vscode-v*` and `npm-v*` (red-team A6).
+      # is disjoint from `vscode-v*` (red-team A6).
       - "v[0-9]+.[0-9]+.[0-9]+"
 
 env:
@@ -83,13 +83,6 @@ jobs:
             asset-name: victauri-cli-macos-aarch64
             use-cross: false
 
-          # NB: victauri-browser (the native-messaging host binary) is intentionally
-          # NOT built or shipped on a `v*` crate release. Browser mode is EXPERIMENTAL
-          # and is frozen at 0.7.9 until its security story (incl. owner-only discovery
-          # ACLs across non-default shared-TEMP layouts) is fully closed in a dedicated
-          # browser release. The 0.7.10 `v*` tag is a pure embedded-plugin crates/security
-          # patch — see CHANGELOG [0.7.10] and the round-4 audit scope decision.
-
           # victauri-watchdog (binary: victauri-watchdog)
           - binary: victauri-watchdog
             bin-name: victauri-watchdog
@@ -163,10 +156,6 @@ jobs:
           name: ${{ matrix.asset-name }}
           path: ${{ matrix.asset-name }}
           if-no-files-found: error
-
-  # NB: the Chrome extension zip is intentionally NOT packaged or attached on a `v*`
-  # crate release (browser mode is EXPERIMENTAL and frozen at 0.7.9 — see the matrix
-  # note above and CHANGELOG [0.7.10]).
 
   # ─────────────────────────────────────────────────────────────────────
   # Require the FULL CI (all platforms + real-app E2E) to have passed for this
@@ -279,10 +268,6 @@ jobs:
             fi
             sleep 30
           }
-          # NB: victauri-browser is intentionally NOT published on this `v*` release —
-          # browser mode is EXPERIMENTAL and frozen at 0.7.9 (round-4 audit scope).
-          # It is a leaf binary crate; nothing in the workspace depends on it, so the
-          # remaining crates publish cleanly without it.
           publish victauri-core
           publish victauri-macros
           publish victauri-plugin
@@ -336,8 +321,6 @@ jobs:
           mkdir -p release-assets
 
           # Move binaries (each is in its own directory named after the artifact).
-          # NB: victauri-browser-host and the Chrome extension zip are intentionally
-          # not part of this `v*` release (browser mode frozen at 0.7.9 — round-4 audit).
           for dir in artifacts/victauri-cli-* artifacts/victauri-watchdog-*; do
             if [ -d "$dir" ]; then
               cp "$dir"/* release-assets/

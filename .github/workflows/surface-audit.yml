@@ -42,15 +42,6 @@ jobs:
           else ST="✅ in sync"; fi
           echo "| crates.io (victauri-plugin) | $REPO_CRATE | $PUB_CRATE | $ST |" >> "$GITHUB_STEP_SUMMARY"
 
-          # --- npm (browser host installer) ---
-          REPO_NPM=$(node -p "require('./extensions/npm/package.json').version")
-          NPM_NAME=$(node -p "require('./extensions/npm/package.json').name")
-          PUB_NPM=$(npm view "$NPM_NAME" version 2>/dev/null || echo "unknown")
-          if [ "$PUB_NPM" = "unknown" ]; then ST="⚠️ not published / query failed";
-          elif newer "$REPO_NPM" "$PUB_NPM"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
-          else ST="✅ in sync"; fi
-          echo "| npm ($NPM_NAME) | $REPO_NPM | $PUB_NPM | $ST |" >> "$GITHUB_STEP_SUMMARY"
-
           # --- VS Code Marketplace ---
           REPO_VSC=$(node -p "require('./editors/vscode/package.json').version")
           PUB_VSC=$(curl -fsSL -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \

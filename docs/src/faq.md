@@ -140,22 +140,6 @@ The `rmcp` crate's `#[tool_router]` and `#[tool_handler]` macros require all too
 
 Yes. The MCP server handles concurrent connections. Each connection gets its own MCP session. State (event log, recorder, bridge) is shared across sessions via `Arc` and thread-safe primitives.
 
-## Browser Extension
-
-### Does the Chrome extension work without the Tauri plugin?
-
-Yes. The Chrome extension (`victauri-browser`) is completely standalone. It provides MCP access to any website — no Tauri app required. It's a separate crate with its own binary.
-
-### Can I use both the plugin and extension together?
-
-Yes. They run on different ports (plugin on 7373, extension on 7474) and serve different purposes:
-- Plugin: inspects your Tauri app's webview + backend
-- Extension: inspects arbitrary web pages in the browser
-
-### Which browsers are supported?
-
-Chrome, Edge, Brave, and Arc (all Chromium-based browsers that support Manifest V3 and native messaging).
-
 ## Troubleshooting
 
 ### "Bridge not found" or `__VICTAURI__` is undefined

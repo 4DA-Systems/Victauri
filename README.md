@@ -16,7 +16,6 @@
   <a href="https://github.com/runyourempire/victauri/actions/workflows/ci.yml"><img src="https://github.com/runyourempire/victauri/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://crates.io/crates/victauri-plugin"><img src="https://img.shields.io/crates/v/victauri-plugin.svg" alt="crates.io"></a>
   <a href="https://docs.rs/victauri-plugin"><img src="https://docs.rs/victauri-plugin/badge.svg" alt="docs.rs"></a>
-  <a href="https://www.npmjs.com/package/@4da/victauri-browser"><img src="https://img.shields.io/npm/v/@4da/victauri-browser.svg" alt="npm: @4da/victauri-browser"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
   <a href="https://doc.rust-lang.org/edition-guide/rust-2024/index.html"><img src="https://img.shields.io/badge/MSRV-1.88+-informational" alt="MSRV: 1.88+"></a>
 </p>
@@ -336,16 +335,11 @@ Victauri runs **inside** the Tauri process — same thread pool, same memory spa
 victauri/
 ├── crates/
 │   ├── victauri-plugin/     # Tauri plugin + MCP server + JS bridge (the main crate)
-│   ├── victauri-browser/    # Native host: MCP for any website via browser extension
 │   ├── victauri-core/       # Shared types (events, registry, snapshots, verification)
 │   ├── victauri-macros/     # #[inspectable] proc macro for command schemas
 │   ├── victauri-test/       # Test client + Locator API + assertion helpers
 │   ├── victauri-cli/        # CLI: init, check, test, record, watch, coverage
 │   └── victauri-watchdog/   # Health-check sidecar for crash recovery
-├── extensions/
-│   ├── chrome/              # Chrome/Edge/Brave extension (MV3) + 176 vitest tests
-│   ├── firefox/             # Firefox extension (MV3)
-│   └── npm/                 # @4da/victauri-browser npm package
 ├── docs/                    # mdbook documentation site
 └── examples/
     └── demo-app/            # Multi-window Tauri app with 21 instrumented commands
@@ -354,41 +348,11 @@ victauri/
 | Crate | Purpose | Tauri dependency? |
 |---|---|---|
 | `victauri-plugin` | Embed in your app — MCP server + bridge | Yes |
-| `victauri-browser` | Browser extension native host — any website | No |
 | `victauri-test` | Use in your tests — client + assertions | No |
 | `victauri-cli` | Install globally — scaffold + diagnose | No |
 | `victauri-macros` | Use on commands — `#[inspectable]` | No |
 | `victauri-core` | Shared types (usually not used directly) | No |
 | `victauri-watchdog` | Run as sidecar for crash recovery | No |
-
----
-
-## Browser Extension
-
-Victauri isn't limited to Tauri apps. The browser extension + native host brings the same MCP inspection to **any website**:
-
-```bash
-cargo install victauri-browser                       # builds the `victauri-browser-host` binary
-# Load extensions/chrome/ as an unpacked extension FIRST, copy its extension ID, then:
-victauri-browser-host install <your-extension-id>    # registers native messaging host for that extension
-```
-
-Load `extensions/chrome/` (or `extensions/firefox/`) as an unpacked extension, then register the host with that extension's ID (above). **Auth is on by default**, so connect with the Bearer token — either set a fixed `VICTAURI_BROWSER_AUTH_TOKEN` before starting the host, or read the auto-generated token from the discovery file (`<temp>/victauri/<pid>/token`):
-
-```json
-{
-  "mcpServers": {
-    "victauri-browser": {
-      "url": "http://127.0.0.1:7474/mcp",
-      "headers": { "Authorization": "Bearer <token>" }
-    }
-  }
-}
-```
-
-20 MCP tools available. Chromium browsers (Chrome, Edge, Brave, Arc) are supported by the `victauri-browser-host install` native-host registration; the Firefox MV3 port is provided but its native-messaging manifest must currently be registered manually (different manifest location + an `allowed_extensions` id rather than Chromium's `allowed_origins`).
-
-See the [Chrome Extension Guide](docs/src/chrome-extension.md).
 
 ---
 
@@ -456,7 +420,6 @@ victauri init    # generates .github/workflows/victauri.yml
 - [**Architecture**](docs/src/architecture.md) — Embedded design, JS bridge, dual protocol
 - [**Configuration**](docs/src/configuration.md) — Port, auth, privacy, capacity tuning
 - [**Security**](docs/src/security.md) — Threat model, privacy profiles, redaction
-- [**Chrome Extension**](docs/src/chrome-extension.md) — Browser MCP for any website
 - [**FAQ**](docs/src/faq.md) — Common questions and troubleshooting
 - [**VS Code Extension**](editors/vscode/) — Live inspection from your editor
 - [**Demo App**](examples/demo-app/) — Reference app with 21 instrumented commands

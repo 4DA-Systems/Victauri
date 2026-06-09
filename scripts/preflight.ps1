@@ -33,7 +33,6 @@ if (Get-Command bash -ErrorAction SilentlyContinue) {
     Write-Host "skipped: bash not found (enforced by CI)" -ForegroundColor Yellow
 }
 Run "workspace tests"     { cargo test --workspace --features sqlite }
-Run "chrome bridge tests" { Push-Location extensions/chrome/tests; npx vitest run; $code = $LASTEXITCODE; Pop-Location; $global:LASTEXITCODE = $code }
 
 Write-Host ""
 if ($failed.Count -gt 0) {

@@ -104,12 +104,9 @@ if ($cargoContent -match $pinPattern) {
     }
 }
 
-# NOTE: the browser extensions (chrome/firefox/npm) and the VS Code extension are
-# DECOUPLED from the core workspace version. They ship on their own cadence and are
-# versioned independently — bump them in their own package.json/manifest only when
-# they actually change. Force-bumping them on every core release made them rot
-# (a release tag with no extension changes). When an extension genuinely changes,
-# bump the top-level "version" field in its own package.json / manifest.json.
+# NOTE: the VS Code extension is DECOUPLED from the core workspace version. It ships
+# on its own cadence (`vscode-v*` tag) and is versioned independently — bump the
+# top-level "version" field in editors/vscode/package.json only when it actually changes.
 
 # 8. Composite action default CLI version
 Update-File ".github\actions\victauri-test\action.yml" "default: `"$OldVersion`"" "default: `"$NewVersion`"" "victauri-test action CLI pin"

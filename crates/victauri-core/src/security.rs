@@ -1,8 +1,8 @@
-//! Shared security primitives for Victauri's localhost HTTP servers.
+//! Shared security primitives for Victauri's localhost HTTP server.
 //!
-//! This module provides the pure-logic building blocks that both `victauri-plugin`
-//! and `victauri-browser` use in their axum middleware stacks.  Keeping them here
-//! eliminates copy-paste drift between the two crates.
+//! This module provides the pure-logic building blocks that `victauri-plugin`
+//! uses in its axum middleware stack. Keeping them here (rather than inline in the
+//! plugin) keeps the security logic unit-testable without a Tauri runtime.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 

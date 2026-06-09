@@ -6,14 +6,20 @@
 
 X-ray vision and hands for AI agents inside Tauri apps. A browser tool with JS eval can *poke* a Tauri backend (Tauri exposes `window.__TAURI_INTERNALS__.invoke`, so it can invoke commands) — but only Victauri can *read* it safely. The database, the command registry, and the IPC history (with response bodies) have no `eval_js` equivalent; the backend tools run read-only through direct `AppHandle` access, independent of the webview; and on macOS WKWebView / Linux WebKitGTK a CDP-class tool can't attach at all. Victauri gives agents simultaneous, read-only access to the webview DOM, the Rust backend, the IPC layer, the database, and native window state — all through a single MCP interface.
 
-**Stack:** Pure Rust workspace (7 crates) | **Target:** Tauri 2.0 applications + any website via Chrome/Firefox extension
+**Stack:** Pure Rust workspace (6 crates) | **Target:** Tauri 2.0 applications
+
+> **Browser mode removed (2026-06-09).** The `victauri-browser` crate + Chrome/Firefox
+> extensions + npm package (`@4da/victauri-browser`) — an exploration to inspect *any
+> website* — were deleted: off-thesis (Victauri's moat is being *inside* the Tauri process,
+> where CDP/Playwright can't attach), the highest-risk surface (the only hostile-page
+> boundary), and unused. Browser automation is better served by Playwright/CDP. Some deep
+> historical "Current State" entries below still describe it as past context.
 
 ## Commands
 
 ```bash
 cargo build --workspace                               # Build all crates
 cargo test --workspace                                # Run all Rust tests
-cd extensions/chrome/tests && npx vitest run           # Run 163 JS bridge tests
 cargo bench -p victauri-core                          # Criterion benchmarks (16)
 cargo clippy --workspace --all-targets                # Lint (20 enforced lints)
 cargo fmt --all -- --check                            # Format check
@@ -41,18 +47,15 @@ After running the script, manually update:
 ```
 victauri/
 ├── crates/
-│   ├── victauri-browser/    # Chrome extension native host: MCP for any website
 │   ├── victauri-cli/        # CLI: init, check, test, record, doctor, watch, invoke, coverage
 │   ├── victauri-core/       # Shared types: events, registry, snapshots, verification
 │   ├── victauri-macros/     # Proc macros: #[inspectable] for command instrumentation
 │   ├── victauri-plugin/     # Tauri plugin: embedded MCP server + JS bridge + tools
 │   ├── victauri-test/       # Test client + assertion helpers + smoke suite
 │   └── victauri-watchdog/   # Crash-recovery sidecar (monitors plugin health)
-├── extensions/
-│   ├── chrome/              # Chrome/Edge/Brave extension (MV3) + 163 vitest tests
-│   ├── firefox/             # Firefox extension (MV3) — browser.* namespace port
-│   └── npm/                 # npm package: @4da/victauri-browser (binary installer)
-├── docs/                    # mdbook documentation site (10 pages)
+├── editors/
+│   └── vscode/              # VS Code extension
+├── docs/                    # mdbook documentation site
 └── examples/
     └── demo-app/            # Multi-window Tauri app with comprehensive test suite
 ```
@@ -73,23 +76,6 @@ victauri/
 | **Backend** | State reading, DB queries, memory tracking | Direct `AppHandle` access (same process) |
 
 ## Crate Responsibilities
-
-### victauri-browser
-Native messaging host binary + Chrome extension for browser MCP inspection.
-- `main.rs` — CLI (install/uninstall/serve/version), native message reader loop, port fallback :7474-7484
-- `native_messaging.rs` — Chrome native messaging wire protocol (32-bit LE length prefix + UTF-8 JSON)
-- `bridge_dispatch.rs` — UUID command dispatch via oneshot channels, 30s timeout, cancel-all on disconnect
-- `mcp_handler.rs` — 20-tool router: dispatches through bridge to Chrome extension content script
-- `mcp_server.rs` — rmcp `ServerHandler` impl with JSON Schema tool definitions for MCP Streamable HTTP
-- `server.rs` — axum router: `/mcp` (MCP protocol), `/api/tools` (REST), `/health`, `/info`
-- `auth.rs` — Bearer token auth (constant-time eq), token-bucket rate limiter (Retry-After on 429), DNS rebinding guard, origin guard (URL-parsed), security headers (nosniff, no-store, DENY, CORS null, CSP)
-- `tab_state.rs` — Per-tab state tracking (URL, title, bridge ready), active tab resolution
-- `installer.rs` — Cross-platform native host manifest registration (Chrome/Edge/Brave/Arc on Win/Mac/Linux)
-- Chrome extension: MV3 service worker (native messaging + tab lifecycle + CDP + screenshot), ISOLATED world relay, MAIN world JS bridge (1700+ lines — DOM, interactions, a11y, perf, CSS, recording), dark popup UI
-- Firefox extension: Full MV3 port using `browser.*` namespace, background scripts (not service workers), no CDP
-- npm package: `@4da/victauri-browser` with postinstall binary download from GitHub releases
-- 99 Rust tests (5 native_messaging + 4 bridge_dispatch + 6 mcp_handler + 6 mcp_server + 12 server integration + 5 tab_state + 4 installer + 3 auth + 2 router + 52 E2E pipeline)
-- 163 JS tests (vitest + jsdom): find-elements (28), interactions (20), helpers (16), dom-snapshot (14), logs (13), css-inspect (12), storage (10), eval (10), performance (9), recording (8), service-worker (8), content-isolated (8), waitfor (7)
 
 ### victauri-core
 Shared types used by all other crates. No Tauri dependency.
