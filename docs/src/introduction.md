@@ -49,17 +49,12 @@ Victauri is a Rust workspace with 7 crates:
 ```
 victauri/
 ├── crates/
-│   ├── victauri-browser/    # Chrome extension native host: MCP for any website
 │   ├── victauri-cli/        # CLI: init, check, test, record, watch, coverage
 │   ├── victauri-core/       # Shared types: events, registry, snapshots
 │   ├── victauri-macros/     # Proc macros: #[inspectable]
 │   ├── victauri-plugin/     # Tauri plugin: embedded MCP server + JS bridge
 │   ├── victauri-test/       # Test client + assertion helpers
 │   └── victauri-watchdog/   # Crash-recovery health monitor
-├── extensions/
-│   ├── chrome/              # Chrome/Edge/Brave extension (MV3)
-│   ├── firefox/             # Firefox extension (MV3)
-│   └── npm/                 # victauri-browser npm package
 ├── editors/
 │   └── vscode/              # VS Code extension
 └── examples/

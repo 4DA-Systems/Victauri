@@ -1,9 +1,0 @@
-pub mod auth;
-pub mod bridge_dispatch;
-pub mod discovery;
-pub mod installer;
-pub mod mcp_handler;
-pub mod mcp_server;
-pub mod native_messaging;
-pub mod server;
-pub mod tab_state;

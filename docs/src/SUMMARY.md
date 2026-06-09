@@ -10,5 +10,4 @@
 - [Compatibility](./compatibility.md)
 - [Configuration](./configuration.md)
 - [Security](./security.md)
-- [Chrome Extension](./chrome-extension.md)
 - [FAQ](./faq.md)

@@ -75,12 +75,9 @@ else
     echo "  OK    Cargo.toml [workspace.dependencies] victauri-* pins"
 fi
 
-# NOTE: the browser extensions (chrome/firefox/npm) and the VS Code extension are
-# DECOUPLED from the core workspace version — they ship on their own cadence and are
-# versioned independently (bump them in their own package.json/manifest when you
-# actually change them). Force-bumping them on every core release made them rot
-# (e.g. a release tag with no extension changes). When an extension genuinely
-# changes, bump the top-level "version" field in its own package.json / manifest.json.
+# NOTE: the VS Code extension is DECOUPLED from the core workspace version — it ships
+# on its own cadence (vscode-v* tag) and is versioned independently. Bump the
+# top-level "version" field in editors/vscode/package.json only when it changes.
 
 # 8. Composite action default CLI version
 replace_in_file ".github/actions/victauri-test/action.yml" "default: \"$OLD_VERSION\"" "default: \"$NEW_VERSION\"" "victauri-test action CLI pin"

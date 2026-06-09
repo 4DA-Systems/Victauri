@@ -7,7 +7,6 @@ members = [
     "crates/victauri-test",
     "crates/victauri-cli",
     "crates/victauri-watchdog",
-    "crates/victauri-browser",
     "examples/demo-app",
 ]
 

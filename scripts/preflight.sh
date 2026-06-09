@@ -18,9 +18,6 @@ run "clippy"            cargo clippy --workspace --all-targets --features sqlite
 run "doc-count lint"    bash scripts/check-doc-counts.sh
 run "workspace tests"   cargo test --workspace --features sqlite
 
-echo; echo "=== chrome bridge tests ==="
-if ( cd extensions/chrome/tests && npx vitest run ); then echo "ok: chrome bridge tests"; else echo "FAILED: chrome bridge tests"; failed+=("chrome-vitest"); fi
-
 echo
 if [ "${#failed[@]}" -gt 0 ]; then
   echo "PREFLIGHT FAILED: ${failed[*]}"
