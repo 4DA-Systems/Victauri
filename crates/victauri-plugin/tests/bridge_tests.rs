@@ -4424,6 +4424,58 @@ fn network_ipc_body_capture() {
 }
 
 #[test]
+fn ipc_log_classifies_by_tauri_response_header_not_http_status() {
+    // Tauri returns HTTP 200 for BOTH a successful command AND a failed / "not
+    // found" one; the real Ok/Err is in the `Tauri-Response` header. getIpcLog
+    // must classify on that header, not on the HTTP status — otherwise every
+    // call logs as "ok" and ghost detection / error surfacing go blind.
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![TestCase {
+            name: "getIpcLog status reflects Tauri-Response, error body surfaced".into(),
+            code: r"
+                    await fetch('http://ipc.localhost/good_cmd', { method: 'POST', body: '{}' });
+                    await fetch('http://ipc.localhost/ghost_cmd', {
+                        method: 'POST', body: '{}',
+                        headers: { 'x-vtest-tauri-response': 'error', 'x-vtest-body': 'Command ghost_cmd not found' }
+                    });
+                    var log = window.__VICTAURI__.getIpcLog();
+                    var good = log.find(function(e) { return e.command === 'good_cmd'; });
+                    var ghost = log.find(function(e) { return e.command === 'ghost_cmd'; });
+                    return {
+                        good_status: good && good.status,
+                        ghost_status: ghost && ghost.status,
+                        ghost_error_mentions_not_found: !!(ghost && ghost.error && ghost.error.indexOf('not found') !== -1),
+                    };
+                "
+            .into(),
+            setup_html: None,
+            setup_js: None,
+        }],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = results[0].result.as_ref().unwrap();
+    // HTTP 200 for both, but the outcome header distinguishes them.
+    assert_eq!(
+        r["good_status"], "ok",
+        "successful command should log as ok"
+    );
+    assert_eq!(
+        r["ghost_status"], "error",
+        "a Tauri-Response:error command (HTTP 200) must log as error, not ok"
+    );
+    assert_eq!(
+        r["ghost_error_mentions_not_found"], true,
+        "the command-error body must be surfaced in the entry's error field"
+    );
+}
+
+#[test]
 fn event_listener_counter() {
     let def = TestDef {
         bridge_script: bridge_script(),

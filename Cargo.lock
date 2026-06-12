@@ -1245,6 +1245,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "gauntlet-app"
+version = "0.7.11"
+dependencies = [
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tokio",
+ "victauri-core",
+ "victauri-plugin",
+ "victauri-test",
+]
+
+[[package]]
 name = "gdk"
 version = "0.18.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

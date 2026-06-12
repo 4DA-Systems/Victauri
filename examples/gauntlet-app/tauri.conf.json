@@ -1,0 +1,25 @@
+{
+  "productName": "victauri-gauntlet",
+  "identifier": "com.example.victauri-gauntlet",
+  "build": {
+    "frontendDist": "frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data:"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Victauri Gauntlet",
+        "width": 1000,
+        "height": 700,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": false
+  }
+}

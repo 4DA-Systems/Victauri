@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "Capabilities for the gauntlet app. NOTE: the 'blind' window is deliberately omitted so it has NO victauri:default grant — Victauri must report it as not-introspectable and must not let it stall the other windows.",
+  "windows": ["main", "secondary"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "victauri:default"
+  ]
+}

@@ -589,8 +589,13 @@ impl VictauriMcpHandler {
                 if (log.length === 0 && net.length > 5) {{
                     warning = 'Zero IPC calls captured but ' + net.length + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
                 }}
+                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
+                // A command that completed with an Err is a HEALTHY round-trip (it returned)
+                // — every real app exercises error paths, so counting those as 'unhealthy'
+                // would cry wolf. The error_count/errored_calls surface them for visibility,
+                // but only stale calls flip `healthy`.
                 return {{
-                    healthy: stale.length === 0 && errored.length === 0,
+                    healthy: stale.length === 0,
                     total_calls: log.length,
                     pending_count: pending.length,
                     stale_count: stale.length,

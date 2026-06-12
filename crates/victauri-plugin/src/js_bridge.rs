@@ -562,15 +562,37 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (raw.indexOf(victauriPrefix) === 0) continue;
                 var command;
                 try { command = decodeURIComponent(raw); } catch(e) { command = raw; }
+                // Classify by COMMAND outcome, not just HTTP status. Tauri returns
+                // HTTP 200 for a failed command (incl. "command not found") and signals
+                // the real result via the `Tauri-Response` header captured as ipc_response.
+                // Precedence: pending > transport error (HTTP >= 400 / 'error') > command
+                // error (ipc_response 'error') > ok.
+                var st;
+                if (n.status === 'pending') { st = 'pending'; }
+                else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
+                else if (n.ipc_response === 'error') { st = 'error'; }
+                else { st = 'ok'; }
+                var errText = null;
+                if (st === 'error') {
+                    if (n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
+                        errText = 'HTTP ' + n.status;
+                    } else if (n.response_body != null) {
+                        // Command-level error: the body carries the error message.
+                        errText = typeof n.response_body === 'string'
+                            ? n.response_body : JSON.stringify(n.response_body);
+                    } else {
+                        errText = 'command error';
+                    }
+                }
                 entries.push({
                     id: n.id,
                     command: command,
                     args: n.request_args || {},
                     timestamp: n.timestamp,
-                    status: n.status === 200 ? 'ok' : (n.status === 'pending' ? 'pending' : 'error'),
+                    status: st,
                     duration_ms: n.duration_ms,
                     result: n.response_body || null,
-                    error: n.status !== 200 && n.status !== 'pending' ? 'HTTP ' + n.status : null,
+                    error: errText,
                 });
             }
             if (limit) return entries.slice(-limit);
@@ -2029,6 +2051,13 @@ const INIT_SCRIPT_BODY: &str = r#"
                         entry.duration_ms = Date.now() - entry.timestamp;
 
                         if (isIpc) {
+                            // Capture Tauri's command-outcome signal. The HTTP status is 200
+                            // for BOTH a successful command AND a failed/"not found" one — the
+                            // real Ok/Err result is carried in the `Tauri-Response` header
+                            // ('ok' | 'error'). Without this, every IPC call logs as "ok",
+                            // which blinds ghost detection (an unregistered command looks like
+                            // a verified handler). 'ok' | 'error' | null (older Tauri / no hdr).
+                            try { entry.ipc_response = response.headers.get('Tauri-Response'); } catch (e) {}
                             if (window.__VICTAURI__._captureIpcBodies !== false) {
                                 var cloned = response.clone();
                                 cloned.text().then(function(text) {
