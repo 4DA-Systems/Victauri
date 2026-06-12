@@ -1207,9 +1207,9 @@ const INIT_SCRIPT_BODY: &str = r#"
                     dom_interactive_ms: Math.round(nav.domInteractive - nav.startTime),
                     dom_complete_ms: Math.round(nav.domComplete - nav.startTime),
                     load_event_ms: Math.round(nav.loadEventEnd - nav.startTime),
-                    transfer_size: nav.transferSize,
-                    encoded_body_size: nav.encodedBodySize,
-                    decoded_body_size: nav.decodedBodySize,
+                    transfer_size: nav.transferSize || 0,
+                    encoded_body_size: nav.encodedBodySize || 0,
+                    decoded_body_size: nav.decodedBodySize || 0,
                 };
             }
 
@@ -1235,29 +1235,53 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }),
             };
 
-            // Paint timing
+            // Engine capability probe. Several perf APIs below are Chromium/WebView2-
+            // ONLY and are simply undefined on WebKit (WKWebView/macOS, WebKitGTK/Linux)
+            // — Victauri's moat platforms. Without this, those fields silently vanish
+            // there and an agent reads "no heap / no long tasks / no paint" as real data
+            // (and a heap-budget assertion passes regardless of memory). Feature-detect
+            // explicitly so the unavailability is reported, never silent.
+            var supportedEntryTypes = (typeof PerformanceObserver !== 'undefined' && PerformanceObserver.supportedEntryTypes) || [];
+            result.engine = {
+                js_heap_supported: typeof performance.memory !== 'undefined',
+                long_task_supported: supportedEntryTypes.indexOf('longtask') !== -1,
+                paint_timing_supported: supportedEntryTypes.indexOf('paint') !== -1,
+                user_agent: navigator.userAgent,
+            };
+
+            // Paint timing (Chromium-first; Safari ~14.1; WebKitGTK varies)
             var paints = performance.getEntriesByType('paint');
-            result.paint = {};
-            for (var i = 0; i < paints.length; i++) {
-                result.paint[paints[i].name] = Math.round(paints[i].startTime);
+            if (paints.length === 0 && !result.engine.paint_timing_supported) {
+                result.paint = { unavailable: true, reason: 'Paint Timing API not supported on this webview engine' };
+            } else {
+                result.paint = {};
+                for (var i = 0; i < paints.length; i++) {
+                    result.paint[paints[i].name] = Math.round(paints[i].startTime);
+                }
             }
 
-            // Memory (Chrome/Edge)
+            // JS heap — performance.memory is Chromium/WebView2-only.
             if (performance.memory) {
                 result.js_heap = {
                     used_mb: Math.round(performance.memory.usedJSHeapSize / 1048576 * 100) / 100,
                     total_mb: Math.round(performance.memory.totalJSHeapSize / 1048576 * 100) / 100,
                     limit_mb: Math.round(performance.memory.jsHeapSizeLimit / 1048576 * 100) / 100,
                 };
+            } else {
+                result.js_heap = { unavailable: true, reason: 'performance.memory is Chromium/WebView2-only; undefined on WebKit (WKWebView/WebKitGTK)' };
             }
 
-            // Long tasks (if PerformanceObserver captured any)
+            // Long tasks — Long Tasks API ('longtask' entry type) is Chromium-only.
             if (longTasks.length > 0) {
                 result.long_tasks = {
                     count: longTasks.length,
                     total_ms: Math.round(longTasks.reduce(function(s, t) { return s + t.duration; }, 0)),
                     worst_ms: Math.round(Math.max.apply(null, longTasks.map(function(t) { return t.duration; }))),
                 };
+            } else if (!result.engine.long_task_supported) {
+                result.long_tasks = { unavailable: true, reason: 'Long Tasks API is Chromium-only' };
+            } else {
+                result.long_tasks = { count: 0, total_ms: 0, worst_ms: 0 };
             }
 
             // DOM stats

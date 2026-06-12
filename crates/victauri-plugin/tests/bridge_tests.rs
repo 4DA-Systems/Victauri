@@ -1839,6 +1839,66 @@ fn performance_metrics() {
 }
 
 #[test]
+fn performance_metrics_signals_engine_capability_gaps() {
+    // jsdom (like WebKit/WKWebView/WebKitGTK) has no `performance.memory`, no
+    // Long Tasks API, and no Paint Timing. The Chromium-only fields must be
+    // reported as explicitly `unavailable` — NOT silently omitted — so an agent
+    // on a moat platform can tell "no data because unsupported" from "no data
+    // because zero". Regression guard for the same bug class as the IPC scheme.
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![TestCase {
+            name: "perf result reports engine capabilities + unavailable fields".into(),
+            code: r"
+                    var r = window.__VICTAURI__.getPerformanceMetrics();
+                    return {
+                        has_engine: !!r.engine,
+                        heap_supported: r.engine && r.engine.js_heap_supported,
+                        heap_unavailable: r.js_heap && r.js_heap.unavailable === true,
+                        heap_has_reason: r.js_heap && typeof r.js_heap.reason === 'string',
+                        longtask_unavailable: r.long_tasks && r.long_tasks.unavailable === true,
+                        dom_still_present: !!(r.dom && typeof r.dom.elements === 'number'),
+                    };
+                "
+            .into(),
+            setup_html: None,
+            setup_js: None,
+        }],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = results[0].result.as_ref().unwrap();
+    assert_eq!(
+        r["has_engine"], true,
+        "perf result must carry an engine capability block"
+    );
+    assert_eq!(
+        r["heap_supported"], false,
+        "jsdom has no performance.memory"
+    );
+    assert_eq!(
+        r["heap_unavailable"], true,
+        "js_heap must be marked unavailable, not silently omitted, on engines without performance.memory"
+    );
+    assert_eq!(
+        r["heap_has_reason"], true,
+        "unavailable js_heap must explain why"
+    );
+    assert_eq!(
+        r["longtask_unavailable"], true,
+        "Long Tasks API absent → must be marked unavailable"
+    );
+    assert_eq!(
+        r["dom_still_present"], true,
+        "DOM stats (engine-agnostic) must still be present"
+    );
+}
+
+#[test]
 fn find_elements() {
     let def = TestDef {
         bridge_script: bridge_script(),

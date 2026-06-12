@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use tauri::{Emitter, WebviewWindow};
+use tauri::{Emitter, Manager, WebviewWindow};
 use victauri_core::CommandInfo;
 use victauri_plugin::inspectable;
 
@@ -174,6 +174,19 @@ fn registry_schemas() -> Vec<CommandInfo> {
     schemas
 }
 
+/// Create + seed a small `SQLite` database with a known schema and rows so the
+/// `query_db` battery has a real table to read (and `query_db`'s read-only
+/// enforcement has a real table to fail a write against).
+fn seed_db(path: &std::path::Path) -> rusqlite::Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL, qty INTEGER NOT NULL);
+         DELETE FROM widgets;
+         INSERT INTO widgets (id, name, qty) VALUES (1, 'alpha', 10), (2, 'beta', 20), (3, 'gamma', 30);",
+    )?;
+    Ok(())
+}
+
 fn main() {
     let pipeline = Arc::new(PipelineState::default());
     let probe_pipeline = Arc::clone(&pipeline);
@@ -201,6 +214,16 @@ fn main() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // Seed a real SQLite DB in the app data dir (a default query_db search
+            // root) so query_db / introspect db_health have a real schema + rows to
+            // read — the backend differentiator that nothing else in CI exercises.
+            if let Ok(dir) = app.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = seed_db(&dir.join("gauntlet.db")) {
+                    eprintln!("gauntlet: failed to seed db: {e}");
+                }
+            }
 
             // Secondary window — granted victauri:default (introspectable).
             WebviewWindow::builder(

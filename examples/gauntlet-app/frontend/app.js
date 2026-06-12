@@ -69,6 +69,19 @@ async function boot() {
   const pipelineBtn = document.getElementById("pipeline-btn");
   if (pipelineBtn) pipelineBtn.addEventListener("click", () => invoke("run_pipeline", {}));
 
+  // Re-triggerable sweep: removing then re-adding `run` restarts the animation,
+  // so the `animation` tool can be driven repeatedly.
+  const sweepBtn = document.getElementById("sweep-btn");
+  if (sweepBtn) {
+    sweepBtn.addEventListener("click", () => {
+      const toast = document.getElementById("sweep-toast");
+      if (!toast) return;
+      toast.classList.remove("run");
+      void toast.offsetWidth; // force reflow so the animation re-runs
+      toast.classList.add("run");
+    });
+  }
+
   // Mark readiness deterministically so the battery can wait on a stable signal.
   setStatus("gauntlet-ready");
   document.body.setAttribute("data-gauntlet-ready", "1");
