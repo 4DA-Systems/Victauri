@@ -238,6 +238,72 @@ jobs:
           path: app.log
           if-no-files-found: ignore
 
+  gauntlet:
+    name: Scale Gauntlet (Linux)
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install system dependencies (Linux)
+        uses: ./.github/actions/linux-deps
+        with:
+          xvfb: "true"
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Build gauntlet-app (debug → Victauri plugin active)
+        run: cargo build -p gauntlet-app --bin gauntlet-app
+
+      - name: Pre-compile the gauntlet battery
+        run: cargo test -p gauntlet-app --test gauntlet --no-run
+
+      - name: Run the scale gauntlet against the live app
+        shell: bash
+        run: |
+          set -euo pipefail
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a --server-args="-screen 0 1280x800x24" ./target/debug/gauntlet-app > gauntlet.log 2>&1 &
+          APP_PID=$!
+
+          up=false
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:7373/health >/dev/null 2>&1; then echo "server up after ${i}s"; up=true; break; fi
+            kill -0 "$APP_PID" 2>/dev/null || { echo "::error::gauntlet app exited before the server came up"; cat gauntlet.log; exit 1; }
+            sleep 1
+          done
+          [ "$up" = true ] || { echo "::error::gauntlet server never became reachable"; cat gauntlet.log; kill "$APP_PID" 2>/dev/null || true; exit 1; }
+
+          # Wait for the webview to become eval-able (cold init can lag the server).
+          wv=false
+          for i in $(seq 1 45); do
+            r=$(curl -sf -X POST http://127.0.0.1:7373/api/tools/eval_js -H 'content-type: application/json' --data-binary '{"code":"return 6*7"}' 2>/dev/null || true)
+            if echo "$r" | grep -q '42'; then echo "webview eval-able after ${i} tries"; wv=true; break; fi
+            sleep 2
+          done
+          [ "$wv" = true ] || { echo "::error::gauntlet webview never became eval-able"; cat gauntlet.log; kill "$APP_PID" 2>/dev/null || true; exit 1; }
+
+          set +e
+          VICTAURI_GAUNTLET=1 VICTAURI_PORT=7373 cargo test -p gauntlet-app --test gauntlet -- --test-threads=1 --nocapture
+          rc=$?
+          set -e
+          kill "$APP_PID" 2>/dev/null || true
+          [ $rc -eq 0 ] || { echo "::error::scale gauntlet failed (exit $rc)"; echo '--- gauntlet.log ---'; cat gauntlet.log; exit 1; }
+
+      - name: Upload gauntlet log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gauntlet-log
+          path: gauntlet.log
+          if-no-files-found: ignore
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
@@ -476,6 +542,7 @@ jobs:
         check,
         test,
         live-app,
+        gauntlet,
         docs,
         msrv,
         security,
