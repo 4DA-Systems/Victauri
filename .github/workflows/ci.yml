@@ -239,19 +239,27 @@ jobs:
           if-no-files-found: ignore
 
   gauntlet:
-    name: Scale Gauntlet (Linux)
-    timeout-minutes: 30
-    runs-on: ubuntu-latest
-    # Required gate. The gauntlet drives a deliberately-hostile 4DA-scale app and
-    # asserts every tool stays correct + bounded under load. Its first WebKitGTK
-    # run caught a moat-threatening bug — the IPC-derived tools were blind on Linux
-    # because Tauri uses the `ipc://localhost/` scheme there, not WebView2's
-    # `http://ipc.localhost/`. Fixed (the bridge now matches both schemes) and
-    # validated 12/12 on Linux. A regression in correctness-under-load now blocks merge.
+    name: Scale Gauntlet (${{ matrix.os }})
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # The gauntlet drives a hostile 4DA-scale app and asserts every tool stays
+    # correct + bounded under load. Its first WebKitGTK run caught a moat-threatening
+    # bug — IPC-derived tools were blind on Linux because Tauri uses `ipc://localhost/`
+    # there, not WebView2's `http://ipc.localhost/`. The macOS (WKWebView) leg
+    # validates the SAME moat platform for free — it uses the ipc:// scheme too — and
+    # runs the 18 headless tests (the 3 display tests skip without a window server /
+    # Screen-Recording grant, which only a real Mac provides). The macOS leg is
+    # informational until its first WKWebView run is confirmed green; Linux gates merge.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
         uses: ./.github/actions/linux-deps
         with:
           xvfb: "true"
@@ -274,8 +282,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_ALWAYS_SOFTWARE=1
-          xvfb-run -a --server-args="-screen 0 1280x800x24" ./target/debug/gauntlet-app > gauntlet.log 2>&1 &
+          case "$RUNNER_OS" in
+            Linux)
+              export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_ALWAYS_SOFTWARE=1
+              xvfb-run -a --server-args="-screen 0 1280x800x24" ./target/debug/gauntlet-app > gauntlet.log 2>&1 &
+              ;;
+            *)
+              # macOS: GitHub runners have an Aqua window server, so the app + WKWebview
+              # launch directly. The 3 display tests still skip (no Screen-Recording grant).
+              ./target/debug/gauntlet-app > gauntlet.log 2>&1 &
+              ;;
+          esac
           APP_PID=$!
 
           up=false
@@ -306,7 +323,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: gauntlet-log
+          name: gauntlet-log-${{ matrix.os }}
           path: gauntlet.log
           if-no-files-found: ignore
 
@@ -444,24 +461,23 @@ jobs:
         with:
           tool: cargo-semver-checks
 
-      # Gate the crates whose API we can actually check. cargo-semver-checks builds
-      # rustdoc, and rustdoc currently hits an UPSTREAM E0119 ("conflicting
-      # implementations of From<HourBase>") while compiling the `time` crate (pulled
-      # transitively by tauri → cookie). This breaks the rustdoc build of ANY
-      # tauri-dependent crate under cargo-semver-checks, on every stable toolchain
-      # tested (1.93.1, 1.95) and the latest `time` (0.3.48) — it is not an API break
-      # (a plain `cargo doc` of victauri-plugin succeeds). Only victauri-plugin pulls
-      # tauri; the other four crates check cleanly and gate normally.
-      - name: Check semver (non-tauri crates — gated)
-        run: cargo semver-checks check-release -p victauri-core -p victauri-macros -p victauri-test -p victauri-cli
-
-      # victauri-plugin: informational until the upstream time/rustdoc E0119 is
-      # fixed (tracking: rust-lang/rust rustdoc trait-solver + time crate). Keep it
-      # running so a real API break is still visible; just don't block merge on the
-      # toolchain bug. Re-fold into the gated step once rustdoc builds `time` again.
-      - name: Check semver (victauri-plugin — informational, upstream-blocked)
+      # INFORMATIONAL — not a required gate (removed from ci-success). cargo-semver-
+      # checks builds rustdoc and is currently broken in CI in two INDEPENDENT ways,
+      # neither of which is an API break:
+      #   - victauri-plugin: rustdoc hits an upstream E0119 ("conflicting
+      #     implementations of From<HourBase>") compiling `time` (pulled by
+      #     tauri → cookie) on every stable toolchain tested (1.93.1, 1.95) and the
+      #     latest time (0.3.48). The baseline build uses fresh crates.io resolution,
+      #     so pinning our lock can't fix it.
+      #   - victauri-core: cargo-semver-checks' fresh baseline resolution fails in CI
+      #     (passes locally only with a warm cache).
+      # A plain `cargo doc --workspace` succeeds, so these are tooling/toolchain
+      # issues, not semver violations. Keep it running for signal; use local
+      # `cargo semver-checks` as the pre-release gate. Re-add to ci-success once the
+      # upstream time/rustdoc bug is fixed.
+      - name: Check semver (informational)
         continue-on-error: true
-        run: cargo semver-checks check-release -p victauri-plugin
+        run: cargo semver-checks check-release --workspace
 
   e2e:
     name: E2E Integration (${{ matrix.os }})
@@ -570,7 +586,6 @@ jobs:
         security,
         deny,
         coverage,
-        semver,
         e2e,
       ]
     runs-on: ubuntu-latest
