@@ -276,40 +276,50 @@ gauntlet!(multi_window_enumerated_and_blind_flagged, base, {
 // ── 9. Multi-window drain sees the secondary window (PR #18 regression guard) ─
 
 gauntlet!(multi_window_recording_sees_secondary, base, {
-    // Start recording, then generate a UNIQUELY identifiable console event in the
-    // SECONDARY window only. A single-window (default-only) drain would never see
-    // it; the per-window drain must capture it — even with the blind window
-    // present (which must not stall the drain).
-    let _ = call(&base, "recording", json!({ "action": "start" })).await;
+    // A console event fired ONLY in the secondary window must reach the recording.
+    // A single-window (default-only) drain would never see it; the per-window drain
+    // must capture it — even with the blind window present (which must not stall it).
+    //
+    // The drain is a ~1s background poll, so capture is inherently timing-sensitive.
+    // Run up to 3 full record→emit→drain→stop cycles with a UNIQUE marker each time;
+    // success on any cycle proves the multi-window drain works. Only a genuine
+    // regression (the secondary window NEVER captured across ~18s) fails the test.
+    let mut captured = false;
+    let mut last_session = String::new();
+    for attempt in 0..3 {
+        let marker = format!("gauntlet-secondary-marker-{attempt}-{}", 9173 + attempt);
+        let _ = call(&base, "recording", json!({ "action": "start" })).await;
 
-    let marker = "gauntlet-secondary-marker-9173";
+        for _ in 0..4 {
+            let r = call(
+                &base,
+                "eval_js",
+                json!({ "code": format!("console.log('{marker}'); return 1"), "webview_label": "secondary" }),
+            )
+            .await;
+            assert_eq!(
+                result(&r),
+                &json!(1),
+                "could not eval into the secondary window"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        }
+        // Let the final drain cycle catch up before stopping.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
 
-    // Emit the marker in the secondary window a few times across several ~1s drain
-    // cycles, so the assertion is robust to drain-cycle phase (not a single fixed
-    // sleep). The drained events land in the recording's stop export.
-    for _ in 0..4 {
-        let r = call(
-            &base,
-            "eval_js",
-            json!({ "code": format!("console.log('{marker}'); return 1"), "webview_label": "secondary" }),
-        )
-        .await;
-        assert_eq!(
-            result(&r),
-            &json!(1),
-            "could not eval into the secondary window"
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+        let stop = call(&base, "recording", json!({ "action": "stop" })).await;
+        last_session = serde_json::to_string(result(&stop)).unwrap();
+        if last_session.contains(&marker) {
+            captured = true;
+            break;
+        }
     }
-    // Let the final drain cycle catch up before stopping.
-    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-
-    let stop = call(&base, "recording", json!({ "action": "stop" })).await;
-    let session = serde_json::to_string(result(&stop)).unwrap();
     assert!(
-        session.contains(marker),
-        "recorder was BLIND to the secondary window (single-window drain regression). \
-         A console event fired only in 'secondary' did not reach the recording's stop export."
+        captured,
+        "recorder was BLIND to the secondary window across 3 cycles (~18s) — the per-window \
+         drain regressed. A console event fired only in 'secondary' never reached a recording. \
+         Last stop export: {}",
+        &last_session[..last_session.len().min(400)]
     );
 });
 

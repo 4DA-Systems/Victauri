@@ -4424,6 +4424,48 @@ fn network_ipc_body_capture() {
 }
 
 #[test]
+fn ipc_log_captures_both_webview2_and_webkit_schemes() {
+    // Tauri's IPC URL is platform-dependent: WebView2 (Windows) uses
+    // `http://ipc.localhost/<cmd>`; WebKitGTK (Linux) and WKWebView (macOS) use
+    // `ipc://localhost/<cmd>`. The scale gauntlet proved the bridge was BLIND to
+    // the ipc:// scheme — every IPC-derived tool (ghost detection, integrity,
+    // event stream) returned nothing on Linux. getIpcLog must capture both.
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![TestCase {
+            name: "getIpcLog captures http://ipc.localhost AND ipc://localhost".into(),
+            code: r"
+                    await fetch('http://ipc.localhost/win_cmd', { method: 'POST', body: '{}' });
+                    await fetch('ipc://localhost/nix_cmd', { method: 'POST', body: '{}' });
+                    var log = window.__VICTAURI__.getIpcLog();
+                    return {
+                        has_http_scheme: !!log.find(function(e){ return e.command === 'win_cmd'; }),
+                        has_ipc_scheme: !!log.find(function(e){ return e.command === 'nix_cmd'; }),
+                    };
+                "
+            .into(),
+            setup_html: None,
+            setup_js: None,
+        }],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = results[0].result.as_ref().unwrap();
+    assert_eq!(
+        r["has_http_scheme"], true,
+        "WebView2 http scheme not captured"
+    );
+    assert_eq!(
+        r["has_ipc_scheme"], true,
+        "WebKitGTK/WKWebView ipc:// scheme not captured (Linux/macOS IPC blindness)"
+    );
+}
+
+#[test]
 fn ipc_log_classifies_by_tauri_response_header_not_http_status() {
     // Tauri returns HTTP 200 for BOTH a successful command AND a failed / "not
     // found" one; the real Ok/Err is in the `Tauri-Response` header. getIpcLog

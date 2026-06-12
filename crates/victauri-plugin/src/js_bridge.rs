@@ -113,6 +113,20 @@ const INIT_SCRIPT_BODY: &str = r#"
     var mutationLog = [];
     var networkLog = [];
     var networkCounter = 0;
+    // Tauri's IPC transport URL is platform-dependent: WebView2 (Windows) uses
+    // `http://ipc.localhost/<cmd>`, while WebKitGTK (Linux) and WKWebView (macOS)
+    // use the custom `ipc://localhost/<cmd>` scheme. Match BOTH so the IPC-derived
+    // tools (getIpcLog / ghost detection / integrity / event stream) work on every
+    // platform — not just Windows. Returns the (still URL-encoded) command path if
+    // the URL is a Tauri IPC URL, else null.
+    var IPC_PREFIXES = ['http://ipc.localhost/', 'ipc://localhost/'];
+    function ipcCommandPath(url) {
+        for (var pi = 0; pi < IPC_PREFIXES.length; pi++) {
+            if (url.indexOf(IPC_PREFIXES[pi]) === 0) return url.substring(IPC_PREFIXES[pi].length);
+        }
+        return null;
+    }
+    function isIpcUrl(url) { return ipcCommandPath(url) !== null; }
     var navigationLog = [];
     var dialogLog = [];
     var interactionLog = [];
@@ -552,13 +566,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── IPC Log ──────────────────────────────────────────────────────────
 
         getIpcLog: function(limit) {
-            var ipcPrefix = 'http://ipc.localhost/';
             var victauriPrefix = 'plugin%3Avictauri%7C';
             var entries = [];
             for (var i = 0; i < networkLog.length; i++) {
                 var n = networkLog[i];
-                if (n.url.indexOf(ipcPrefix) !== 0) continue;
-                var raw = n.url.substring(ipcPrefix.length);
+                var raw = ipcCommandPath(n.url);
+                if (raw === null) continue;
                 if (raw.indexOf(victauriPrefix) === 0) continue;
                 var command;
                 try { command = decodeURIComponent(raw); } catch(e) { command = raw; }
@@ -600,9 +613,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
 
         clearIpcLog: function() {
-            var ipcPrefix = 'http://ipc.localhost/';
             for (var i = networkLog.length - 1; i >= 0; i--) {
-                if (networkLog[i].url.indexOf(ipcPrefix) === 0) networkLog.splice(i, 1);
+                if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
             }
         },
 
@@ -816,15 +828,13 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }
             });
 
-            var ipcPrefix = 'http://ipc.localhost/';
             var victauriPrefix = 'plugin%3Avictauri%7C';
             networkLog.forEach(function(n) {
-                if (n.timestamp >= ts && n.url.indexOf(ipcPrefix) === 0) {
-                    var raw = n.url.substring(ipcPrefix.length);
-                    if (raw.indexOf(victauriPrefix) === 0) return;
-                    var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
-                    events.push({ type: 'ipc', command: cmd, status: n.status === 200 ? 'ok' : (n.status === 'pending' ? 'pending' : 'error'), duration_ms: n.duration_ms, timestamp: n.timestamp });
-                }
+                if (n.timestamp < ts) return;
+                var raw = ipcCommandPath(n.url);
+                if (raw === null || raw.indexOf(victauriPrefix) === 0) return;
+                var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
+                events.push({ type: 'ipc', command: cmd, status: n.status === 200 ? 'ok' : (n.status === 'pending' ? 'pending' : 'error'), duration_ms: n.duration_ms, timestamp: n.timestamp });
             });
 
             networkLog.forEach(function(n) {
@@ -884,7 +894,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     } else if (opts.condition === 'url' && opts.value) {
                         met = window.location.href.indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'ipc_idle') {
-                        met = networkLog.filter(function(n) { return n.url.indexOf('http://ipc.localhost/') === 0; }).every(function(n) { return n.status !== 'pending'; });
+                        met = networkLog.filter(function(n) { return isIpcUrl(n.url); }).every(function(n) { return n.status !== 'pending'; });
                     } else if (opts.condition === 'network_idle') {
                         met = networkLog.every(function(n) { return n.status !== 'pending'; });
                     }
@@ -1981,7 +1991,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var id = ++networkCounter;
                 var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
                 var method = (init && init.method) || (input && input.method) || 'GET';
-                var isIpc = url.indexOf('http://ipc.localhost/') === 0;
+                var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isIpc && url.indexOf('plugin%3Avictauri%7C') !== -1;
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
 
