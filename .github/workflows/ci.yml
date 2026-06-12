@@ -444,8 +444,24 @@ jobs:
         with:
           tool: cargo-semver-checks
 
-      - name: Check semver
-        run: cargo semver-checks check-release --workspace
+      # Gate the crates whose API we can actually check. cargo-semver-checks builds
+      # rustdoc, and rustdoc currently hits an UPSTREAM E0119 ("conflicting
+      # implementations of From<HourBase>") while compiling the `time` crate (pulled
+      # transitively by tauri → cookie). This breaks the rustdoc build of ANY
+      # tauri-dependent crate under cargo-semver-checks, on every stable toolchain
+      # tested (1.93.1, 1.95) and the latest `time` (0.3.48) — it is not an API break
+      # (a plain `cargo doc` of victauri-plugin succeeds). Only victauri-plugin pulls
+      # tauri; the other four crates check cleanly and gate normally.
+      - name: Check semver (non-tauri crates — gated)
+        run: cargo semver-checks check-release -p victauri-core -p victauri-macros -p victauri-test -p victauri-cli
+
+      # victauri-plugin: informational until the upstream time/rustdoc E0119 is
+      # fixed (tracking: rust-lang/rust rustdoc trait-solver + time crate). Keep it
+      # running so a real API break is still visible; just don't block merge on the
+      # toolchain bug. Re-fold into the gated step once rustdoc builds `time` again.
+      - name: Check semver (victauri-plugin — informational, upstream-blocked)
+        continue-on-error: true
+        run: cargo semver-checks check-release -p victauri-plugin
 
   e2e:
     name: E2E Integration (${{ matrix.os }})
