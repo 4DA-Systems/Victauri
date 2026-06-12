@@ -397,12 +397,15 @@ gauntlet!(server_survives_the_gauntlet, base, {
 // ── 13. query_db reads a real seeded database (backend differentiator) ────────
 
 gauntlet!(query_db_reads_seeded_database, base, {
-    // The app seeds a `widgets` table (3 rows) in its app-data dir — a default
-    // query_db search root. Read it, and confirm read-only enforcement blocks a write.
+    // The app seeds a `widgets` table (3 rows) into gauntlet.db in its app-data dir.
+    // Specify `path` explicitly: auto-discovery picks an ARBITRARY db when several
+    // exist, and on WebKitGTK/WKWebView the app-data dir also holds WebKit's own
+    // SQLite files — so a path-less query_db can read the wrong database on the moat
+    // platforms (it returned "no such table: widgets" on Linux until we pinned this).
     let r = call(
         &base,
         "query_db",
-        json!({ "query": "SELECT id, name, qty FROM widgets ORDER BY id" }),
+        json!({ "path": "gauntlet.db", "query": "SELECT id, name, qty FROM widgets ORDER BY id" }),
     )
     .await;
     let body = serde_json::to_string(result(&r)).unwrap();
@@ -412,7 +415,12 @@ gauntlet!(query_db_reads_seeded_database, base, {
     );
 
     // A write must be rejected (read-only by design).
-    let w = call(&base, "query_db", json!({ "query": "DELETE FROM widgets" })).await;
+    let w = call(
+        &base,
+        "query_db",
+        json!({ "path": "gauntlet.db", "query": "DELETE FROM widgets" }),
+    )
+    .await;
     assert!(
         w.get("error").is_some(),
         "query_db allowed a write — read-only enforcement broken: {w}"
