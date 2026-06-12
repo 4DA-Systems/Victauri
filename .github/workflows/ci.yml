@@ -246,15 +246,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    # The gauntlet drives a hostile 4DA-scale app and asserts every tool stays
-    # correct + bounded under load. Its first WebKitGTK run caught a moat-threatening
-    # bug — IPC-derived tools were blind on Linux because Tauri uses `ipc://localhost/`
-    # there, not WebView2's `http://ipc.localhost/`. The macOS (WKWebView) leg
-    # validates the SAME moat platform for free — it uses the ipc:// scheme too — and
-    # runs the 18 headless tests (the 3 display tests skip without a window server /
-    # Screen-Recording grant, which only a real Mac provides). The macOS leg is
-    # informational until its first WKWebView run is confirmed green; Linux gates merge.
-    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    # REQUIRED GATE on BOTH moat platforms. The gauntlet drives a hostile 4DA-scale
+    # app and asserts every tool stays correct + bounded under load. Its first
+    # WebKitGTK run caught a moat-threatening bug — IPC-derived tools were blind on
+    # Linux because Tauri uses `ipc://localhost/` there, not WebView2's
+    # `http://ipc.localhost/`. The macOS (WKWebView) leg validates the SAME moat
+    # platform for free; it ran 21/21 green on the GitHub runner AND was confirmed
+    # 21/21 (twice, deterministically) on real Apple-silicon hardware (Tahoe 26.3 /
+    # M2 Pro, 2026-06-13), so it now gates merge too. It runs the 18 headless tests;
+    # the 3 display tests skip without a window server / Screen-Recording grant
+    # (only a real Mac provides those — see .claude/plans/macos-validation-runbook.md).
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
