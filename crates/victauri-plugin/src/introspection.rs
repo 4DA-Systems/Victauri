@@ -42,7 +42,7 @@ const MAX_TIMING_SAMPLES: usize = 1024;
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct TimingSamples {
-    /// Most-recent durations (ring, capped at [`MAX_TIMING_SAMPLES`]) for p95.
+    /// Most-recent durations (ring, capped at `MAX_TIMING_SAMPLES`) for p95.
     recent: VecDeque<Duration>,
     /// Total invocations recorded (all time).
     count: u64,
@@ -69,7 +69,7 @@ impl TimingSamples {
 
     /// Compute aggregate statistics. `count`, `min`, `max`, `avg`, and `total`
     /// reflect the full history; `p95` is estimated over the most recent
-    /// [`MAX_TIMING_SAMPLES`] samples.
+    /// `MAX_TIMING_SAMPLES` samples.
     #[must_use]
     pub fn stats(&self, command: &str) -> CommandTimingStats {
         if self.count == 0 {
