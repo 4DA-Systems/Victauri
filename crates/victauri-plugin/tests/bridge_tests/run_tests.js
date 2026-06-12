@@ -222,6 +222,14 @@ async function run() {
             : input && input.url
               ? input.url
               : String(input);
+        // Let a test simulate Tauri's command-outcome header: a request header
+        // `x-vtest-tauri-response: error` makes the response carry
+        // `Tauri-Response: error` (Tauri returns HTTP 200 either way). Defaults
+        // to 'ok', matching a real successful command.
+        var reqHeaders = (init && init.headers) || {};
+        var tauriResp = reqHeaders["x-vtest-tauri-response"] || "ok";
+        var respBody =
+          reqHeaders["x-vtest-body"] != null ? reqHeaders["x-vtest-body"] : "";
         // Return a resolved promise with a fake Response that supports clone()
         function makeResponse() {
           return {
@@ -229,9 +237,9 @@ async function run() {
             status: 200,
             statusText: "OK",
             url: url,
-            headers: new Map(),
+            headers: new Map([["Tauri-Response", tauriResp]]),
             text: function () {
-              return Promise.resolve("");
+              return Promise.resolve(respBody);
             },
             json: function () {
               return Promise.resolve({});

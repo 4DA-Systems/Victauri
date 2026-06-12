@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Blind</title>
+</head>
+<body>
+  <!-- This window is deliberately NOT granted victauri:default (omitted from
+       capabilities/default.json), so the Victauri bridge's IPC callbacks are
+       silently dropped by Tauri's permission layer. Victauri must:
+         (a) report this window as NOT introspectable, and
+         (b) NOT let its blindness (a 5s eval timeout) stall the drain of the
+             healthy windows. -->
+  <h1 data-testid="blind-title">Blind window (no capability)</h1>
+</body>
+</html>

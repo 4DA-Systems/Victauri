@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Victauri Gauntlet</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; background: #0a0a0e; color: #ddd; padding: 24px; }
+    h1 { color: #ef4444; font-size: 1.6em; }
+    .subtitle { color: #888; margin-bottom: 16px; font-size: 0.9em; }
+    #status { font-family: monospace; color: #22c55e; margin-bottom: 16px; }
+    button { background: #1f1f28; color: #ddd; border: 1px solid #333; padding: 8px 14px; border-radius: 6px; cursor: pointer; margin: 4px; }
+    #grid { display: grid; grid-template-columns: repeat(20, 1fr); gap: 1px; margin-top: 16px; }
+    .cell { background: #15151c; font-size: 7px; padding: 1px; text-align: center; color: #555; }
+  </style>
+  <!-- Strict CSP (script-src 'self') blocks inline scripts and eval(): all
+       page logic must come from this external file. This proves the app's
+       own code stays CSP-clean while Victauri's eval_js still works (the bridge
+       runs as a privileged init script, outside the page CSP sandbox). -->
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <h1>Victauri Scale Gauntlet</h1>
+  <p class="subtitle">A deliberately hostile, 4DA-scale app. If Victauri stays correct and bounded here, it stays correct on a real app.</p>
+  <div id="status" data-testid="status">booting…</div>
+  <button id="flood-btn" data-testid="flood-btn">Flood IPC</button>
+  <button id="ghost-btn" data-testid="ghost-btn">Invoke a ghost command</button>
+  <button id="pipeline-btn" data-testid="pipeline-btn">Run async pipeline</button>
+  <!-- A large DOM (thousands of nodes) is generated into #grid by app.js to
+       stress dom_snapshot, find_elements, and large-DOM diagnostics. -->
+  <div id="grid" data-testid="grid"></div>
+</body>
+</html>

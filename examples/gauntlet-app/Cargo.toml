@@ -1,0 +1,31 @@
+[package]
+name = "gauntlet-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deliberately hostile, 4DA-scale Tauri app — the Victauri scale gauntlet (hundreds of commands, multi-window incl. a capability-less blind window, IPC flood, large payloads, large DOM, strict CSP)"
+publish = false
+
+[build-dependencies]
+tauri-build = { workspace = true }
+
+[dependencies]
+victauri-plugin = { workspace = true }
+victauri-core = { workspace = true }
+tauri = { workspace = true, features = ["wry"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+victauri-test = { workspace = true }
+tokio = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+[[test]]
+name = "gauntlet"
+path = "tests/gauntlet.rs"
+harness = true
+
+[lints]
+workspace = true
