@@ -30,18 +30,19 @@ In **release builds**: Zero *runtime* cost. The plugin is gated behind `#[cfg(de
 
 Two ways that matter, and we'll be precise because the naive "it sees the DOM, we see everything" line is only half true.
 
-**1. Playwright can't attach to a Tauri app at all on most platforms.** It drives a browser over CDP, but Tauri renders in the OS webview — WKWebView on macOS, WebKitGTK on Linux — where there is no CDP surface to attach to. Only WebView2 on Windows exposes a CDP-class debugging surface. Victauri lives *inside* the app process, so it works identically on macOS, Windows, and Linux.
+**1. Playwright's CDP path can't attach to a Tauri app on most platforms.** Playwright drives a browser over CDP, but Tauri renders in the OS webview — WKWebView on macOS, WebKitGTK on Linux — where there is no CDP surface. Only WebView2 on Windows exposes a CDP-class surface. (To be precise: these webviews *do* have their own remote-inspection protocols — WebKit's Inspector Protocol, automatable via `WebKitWebDriver` on Linux and `webinspectord` on macOS — and `tauri-driver` uses WebDriver where available. So it's not that nothing can attach; it's that CDP-based tooling like Playwright can't, and the WebDriver paths are platform-specific, webview-only, and give no backend access.) Victauri lives *inside* the app process, so one integration works identically on macOS, Windows, and Linux.
 
-**2. Even where a browser tool *can* attach (Windows), it can poke the backend but can't read it safely.** Tauri exposes `window.__TAURI_INTERNALS__.invoke` in the webview, so any tool with JS evaluation can *invoke* a registered command — Victauri does not have a monopoly on "reaching the backend." But to learn what the backend is actually doing, a browser tool has to *mutate live state* (call write commands, submit forms, click-storm). And several things have **no JavaScript equivalent at all**:
+**2. Even where a browser tool *can* attach, it can poke the backend but can't read it safely.** Tauri exposes `window.__TAURI_INTERNALS__.invoke` in the webview, so any tool with JS evaluation can *invoke* a registered command — Victauri does not have a monopoly on "reaching the backend." But to learn what the backend is actually doing, a browser tool has to *mutate live state* (call write commands, submit forms, click-storm). Some things have **no JavaScript equivalent at all** — they exist only through `AppHandle`:
 
 - **The database** — browser JS can't open a local SQLite file. Victauri's `query_db` reads it **read-only** through direct `AppHandle` access (verified against a live 339 MB / 150-table production DB in 2 calls).
-- **The command registry** — you can *invoke* a command from JS, but you can't *enumerate* what commands exist or detect a ghost (frontend-invoked but unregistered) call. Victauri can.
-- **The IPC history, with response bodies** — the browser Performance API reports HTTP 200 even when a command returned `Err`, and exposes no bodies. Victauri's IPC log retains both request and response.
+- **The command registry** — you can *invoke* a command from JS, but you can't *enumerate* the registered `#[inspectable]` schemas from the page. Victauri reads them directly from the backend.
 - **The native process** — `performance.memory` is the JS heap; it can't see the OS process RSS or the child-process table. Victauri reads both.
 
-Because those backend tools go through `AppHandle` and not the webview, they keep working even when the webview's JS bridge is down — exactly when an `eval_js`-dependent tool gets nothing.
+These three go through `AppHandle`, not the webview, so they keep working even when the webview's JS bridge is down — exactly when an `eval_js`-dependent tool gets nothing.
 
-**The honest one-liner:** browser tools can *poke* a Tauri backend; only Victauri can *read* it safely — read-only, cross-platform, and independent of the webview.
+Victauri's **IPC history with response bodies** is worth being precise about: it is *not* a non-JS backend channel. Tauri sends IPC as `fetch()` calls and Victauri's in-page bridge intercepts them, so the IPC log is JS-derived and needs a live webview. The edge over a plain browser tool is the *capture quality*: the browser Performance API reports HTTP 200 even when a command returned `Err` and exposes no bodies, whereas the bridge retains the request args, the real response body, and the true status. That's a privileged in-app interceptor, not direct backend access.
+
+**The honest one-liner:** browser tools can *poke* a Tauri backend; Victauri reads the database, registry, and process directly through `AppHandle`, captures full IPC bodies the browser can't, and does it from one cross-platform integration.
 
 ### How is this different from Tauri's built-in testing?
 

@@ -222,12 +222,18 @@ client.verify()
 
 ### Ghost Command Detection
 
-Find orphaned commands — called in the frontend but missing from the backend:
+Find commands the frontend invokes that have no backend handler — detected by IPC
+*outcome* (the call errored "not found" and never succeeded), so it works whether or
+not the app uses `#[inspectable]`:
 
 ```rust
 let ghosts = client.detect_ghost_commands().await?;
-assert!(ghosts["ghost_commands"].as_array().unwrap().is_empty(),
-    "Found ghost commands: {ghosts}");
+// `confirmed_ghosts` is the high-confidence tier: invoked, errored "not found",
+// never observed succeeding. (`frontend_only` is a weaker registry-based candidate
+// tier — confirm those against your `generate_handler!` set before filing.)
+let confirmed = ghosts["confirmed_ghosts"].as_array()
+    .expect("detect_ghost_commands returns a confirmed_ghosts array");
+assert!(confirmed.is_empty(), "Found ghost commands: {ghosts}");
 ```
 
 See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regression testing, IPC coverage, accessibility auditing, performance monitoring, time-travel recording, CI integration, and more.
@@ -240,22 +246,26 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 
 ### Backend tools (direct Rust access, no webview needed)
 
+These read through `AppHandle` and keep working even when the webview's JS bridge is down.
+
 | Tool | What it does |
 |---|---|
 | `app_info` | App config, directory paths, env vars, discovered databases, process info |
 | `list_app_dir` | Browse files in app data/config/log/local_data directories |
 | `read_app_file` | Read files from app backend directories (UTF-8 or base64) |
 | `query_db` | Read-only SQLite queries with auto-discovery |
-| `invoke_command` | Call any Tauri command directly through IPC |
 | `app_state` | Read app-defined backend-state probes (pipeline/queue/cache internals) — no IPC round-trip |
 | `get_memory_stats` | Real-time OS process memory (working set, page faults) |
+| `get_registry` | List all `#[inspectable]` command schemas |
 
 ### IPC tools
 
+These observe or drive Tauri IPC. `invoke_command` and the ghost/integrity tools work through the in-webview JS bridge (they need a live webview); they read or replay the bridge's fetch-intercepted IPC log.
+
 | Tool | What it does |
 |---|---|
-| `get_registry` | List all `#[inspectable]` command schemas |
-| `detect_ghost_commands` | Find orphaned frontend IPC calls with no backend handler |
+| `invoke_command` | Call any Tauri command through the webview's IPC bridge |
+| `detect_ghost_commands` | Flag commands that errored "not found" and never succeeded — real missing-handler bugs, detected by IPC outcome (not registry guesswork) |
 | `check_ipc_integrity` | Detect stuck/stale/errored IPC calls |
 | `verify_state` | Compare frontend DOM against backend state |
 | `resolve_command` | Natural language to matching Tauri command |
@@ -284,7 +294,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | **`inspect`** | `styles`, `bounds`, `highlight`, `audit_accessibility`, `get_performance` |
 | **`logs`** | `console`, `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc` |
 | **`css`** | `inject`, `remove` |
-| **`introspect`** | `command_timings`, `coverage`, `contract_record`, `contract_check`, `startup_timing`, `capabilities`, `db_health`, `plugin_state`, `processes`, `plugin_tasks`, `event_bus` |
+| **`introspect`** | `command_timings`, `coverage`, `contract_record`, `contract_check`, `contract_list`, `contract_clear`, `startup_timing`, `capabilities`, `db_health`, `plugin_state`, `processes`, `plugin_tasks`, `event_bus`, `event_bus_clear` |
 | **`fault`** | `inject` (delay/error/drop/corrupt), `list`, `clear`, `clear_all` |
 | **`explain`** | `summary`, `last_action`, `diff` |
 | `get_plugin_info` | Plugin config: port, tools, privacy, version |
@@ -438,6 +448,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - **No remote access** — localhost only, no port forwarding
 - **Same-origin frames only** — same-origin iframes are traversed; cross-origin frames are marked and skipped
 - **No live frontend-IPC control** — `fault` injection applies to commands driven through Victauri's own `invoke_command`, not the app's real frontend IPC (that path sits below the layer the JS bridge can reach without CDP)
+- **Trusted (OS-level) input is Windows-only** — `interact`/`input` with `trusted: true` use real `SendInput` events on Windows; on macOS and Linux they fall back to synthetic DOM events (`isTrusted: false`)
 - **Pre-1.0** — API may change (semver-checked in CI)
 
 ---

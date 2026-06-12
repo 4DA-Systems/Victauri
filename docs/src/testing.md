@@ -334,12 +334,18 @@ assert!(result["divergences"].as_array().unwrap().is_empty());
 
 ### Ghost Command Detection
 
-Find orphaned commands — called in the frontend but missing from the backend:
+Find commands the frontend invokes that have no backend handler — detected by IPC
+*outcome* (errored "not found", never succeeded), so it works whether or not the app
+uses `#[inspectable]`:
 
 ```rust
 let ghosts = client.detect_ghost_commands().await?;
-assert!(ghosts["ghost_commands"].as_array().unwrap().is_empty(),
-    "Found ghost commands: {ghosts}");
+// `confirmed_ghosts` = high-confidence real bugs (invoked, errored "not found",
+// never observed succeeding). `frontend_only` is a weaker registry-based candidate
+// tier — confirm those against your `generate_handler!` set before filing.
+let confirmed = ghosts["confirmed_ghosts"].as_array()
+    .expect("detect_ghost_commands returns a confirmed_ghosts array");
+assert!(confirmed.is_empty(), "Found ghost commands: {ghosts}");
 ```
 
 ### IPC Health Check
