@@ -242,14 +242,12 @@ jobs:
     name: Scale Gauntlet (Linux)
     timeout-minutes: 30
     runs-on: ubuntu-latest
-    # INFORMATIONAL (not yet a required gate): the gauntlet's first WebKitGTK run
-    # revealed that Victauri's fetch-interception IPC log is EMPTY on Linux — the
-    # IPC-derived tools (ghost detection, logs ipc, multi-window recording) appear
-    # blind on WebKitGTK because its Tauri IPC may not use page-level fetch to
-    # ipc.localhost. The battery is validated 12/12 on Windows/WebView2; the test
-    # now dumps the captured network URLs on Linux so we can identify the actual
-    # transport and fix the interceptor, then promote this job to a required gate.
-    continue-on-error: true
+    # Required gate. The gauntlet drives a deliberately-hostile 4DA-scale app and
+    # asserts every tool stays correct + bounded under load. Its first WebKitGTK
+    # run caught a moat-threatening bug — the IPC-derived tools were blind on Linux
+    # because Tauri uses the `ipc://localhost/` scheme there, not WebView2's
+    # `http://ipc.localhost/`. Fixed (the bridge now matches both schemes) and
+    # validated 12/12 on Linux. A regression in correctness-under-load now blocks merge.
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -550,6 +548,7 @@ jobs:
         check,
         test,
         live-app,
+        gauntlet,
         docs,
         msrv,
         security,
