@@ -30,23 +30,49 @@ pub struct CommandTimingStats {
     pub total_ms: f64,
 }
 
-/// Accumulated raw timing samples for a single command.
+/// Maximum recent samples retained per command for percentile estimation.
+/// `count`, `total`, `min`, and `max` are tracked as running aggregates, so they
+/// stay accurate over the command's full history; only the p95 estimate is
+/// windowed to this many of the most recent samples. This bounds memory under a
+/// long agent soak that hammers `invoke_command` (the prior `Vec` grew forever
+/// and was re-sorted in full on every `command_timings` read).
+const MAX_TIMING_SAMPLES: usize = 1024;
+
+/// Accumulated timing data for a single command — bounded memory.
 #[derive(Debug, Default)]
+#[non_exhaustive]
 pub struct TimingSamples {
-    /// Duration of each invocation, in order.
-    pub samples: Vec<Duration>,
+    /// Most-recent durations (ring, capped at [`MAX_TIMING_SAMPLES`]) for p95.
+    recent: VecDeque<Duration>,
+    /// Total invocations recorded (all time).
+    count: u64,
+    /// Sum of all durations (all time) — for accurate mean/total.
+    total: Duration,
+    /// All-time minimum duration.
+    min: Option<Duration>,
+    /// All-time maximum duration.
+    max: Option<Duration>,
 }
 
 impl TimingSamples {
     /// Add a timing sample.
     pub fn record(&mut self, duration: Duration) {
-        self.samples.push(duration);
+        self.count += 1;
+        self.total = self.total.saturating_add(duration);
+        self.min = Some(self.min.map_or(duration, |m| m.min(duration)));
+        self.max = Some(self.max.map_or(duration, |m| m.max(duration)));
+        if self.recent.len() == MAX_TIMING_SAMPLES {
+            self.recent.pop_front();
+        }
+        self.recent.push_back(duration);
     }
 
-    /// Compute aggregate statistics.
+    /// Compute aggregate statistics. `count`, `min`, `max`, `avg`, and `total`
+    /// reflect the full history; `p95` is estimated over the most recent
+    /// [`MAX_TIMING_SAMPLES`] samples.
     #[must_use]
     pub fn stats(&self, command: &str) -> CommandTimingStats {
-        if self.samples.is_empty() {
+        if self.count == 0 {
             return CommandTimingStats {
                 command: command.to_string(),
                 count: 0,
@@ -57,29 +83,32 @@ impl TimingSamples {
                 total_ms: 0.0,
             };
         }
-        let mut sorted: Vec<f64> = self
-            .samples
-            .iter()
-            .map(|d| d.as_secs_f64() * 1000.0)
-            .collect();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let to_ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let round2 = |v: f64| (v * 100.0).round() / 100.0;
 
-        let count = sorted.len() as u64;
-        let total: f64 = sorted.iter().sum();
-        let min = sorted[0];
-        let max = sorted[sorted.len() - 1];
-        let avg = total / sorted.len() as f64;
-        let p95_idx = ((sorted.len() as f64) * 0.95).ceil() as usize;
-        let p95 = sorted[p95_idx.min(sorted.len() - 1)];
+        let total_ms = to_ms(self.total);
+        let avg_ms = total_ms / self.count as f64;
+        let min_ms = self.min.map_or(0.0, to_ms);
+        let max_ms = self.max.map_or(0.0, to_ms);
+
+        // p95 over the recent window (bounded; representative of current behavior).
+        let mut sorted: Vec<f64> = self.recent.iter().copied().map(to_ms).collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let p95 = if sorted.is_empty() {
+            0.0
+        } else {
+            let idx = ((sorted.len() as f64) * 0.95).ceil() as usize;
+            sorted[idx.min(sorted.len() - 1)]
+        };
 
         CommandTimingStats {
             command: command.to_string(),
-            count,
-            min_ms: (min * 100.0).round() / 100.0,
-            max_ms: (max * 100.0).round() / 100.0,
-            avg_ms: (avg * 100.0).round() / 100.0,
-            p95_ms: (p95 * 100.0).round() / 100.0,
-            total_ms: (total * 100.0).round() / 100.0,
+            count: self.count,
+            min_ms: round2(min_ms),
+            max_ms: round2(max_ms),
+            avg_ms: round2(avg_ms),
+            p95_ms: round2(p95),
+            total_ms: round2(total_ms),
         }
     }
 }
@@ -1275,6 +1304,39 @@ mod tests {
         let stats = samples.stats("empty");
         assert_eq!(stats.count, 0);
         assert_eq!(stats.min_ms, 0.0);
+    }
+
+    #[test]
+    fn timing_samples_bounded_but_count_accurate() {
+        // Record far more than the ring capacity. Memory must stay bounded
+        // (recent window <= MAX_TIMING_SAMPLES) while count/min/max/total remain
+        // accurate over the FULL history — not just the retained window. This test
+        // fails if the cap is removed (unbounded growth) or if the running
+        // aggregates are dropped in favor of windowed-only stats.
+        let mut samples = TimingSamples::default();
+        let n = MAX_TIMING_SAMPLES * 3;
+        for i in 0..n {
+            // Durations 1..=n ms; the smallest (1ms) and largest (n ms) fall
+            // outside the retained recent window, proving min/max are all-time.
+            samples.record(Duration::from_millis((i + 1) as u64));
+        }
+        assert!(
+            samples.recent.len() <= MAX_TIMING_SAMPLES,
+            "recent window must stay bounded, got {}",
+            samples.recent.len()
+        );
+        let stats = samples.stats("soak");
+        assert_eq!(stats.count, n as u64, "count must reflect full history");
+        assert!(
+            (stats.min_ms - 1.0).abs() < 0.5,
+            "all-time min lost: {}",
+            stats.min_ms
+        );
+        assert!(
+            (stats.max_ms - n as f64).abs() < 0.5,
+            "all-time max lost: {}",
+            stats.max_ms
+        );
     }
 
     #[test]

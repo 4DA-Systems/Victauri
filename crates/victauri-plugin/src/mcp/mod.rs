@@ -4580,10 +4580,14 @@ impl ServerHandler for VictauriMcpHandler {
         }
         let json = match uri.as_str() {
             RESOURCE_URI_IPC_LOG => {
-                if let Ok(json) = self
-                    .eval_with_return("return window.__VICTAURI__?.getIpcLog()", None)
-                    .await
-                {
+                // Use the body-free, capped projection — NOT the full body-carrying
+                // getIpcLog(). On a busy app the full log blows the eval result cap, the
+                // eval fails, and we silently fall back to the Rust event_log (which is
+                // itself default-window-drained) — serving a subset that looks complete.
+                // trimmed_log_js bounds entries + truncates oversized fields so the
+                // resource stays correct under load. (Matches the `logs ipc` tool.)
+                let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", DEFAULT_LOG_LIMIT);
+                if let Ok(json) = self.eval_with_return(&code, None).await {
                     json
                 } else {
                     let calls = self.state.event_log.ipc_calls();
