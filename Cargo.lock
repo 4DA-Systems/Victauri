@@ -1249,6 +1249,7 @@ name = "gauntlet-app"
 version = "0.7.11"
 dependencies = [
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",

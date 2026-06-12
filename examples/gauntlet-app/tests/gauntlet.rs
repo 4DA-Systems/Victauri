@@ -27,6 +27,14 @@ fn is_gauntlet() -> bool {
     std::env::var("VICTAURI_GAUNTLET").is_ok()
 }
 
+/// Display-dependent tests (screenshot, filmstrip capture, trusted input) need a
+/// real window server + Screen-Recording/Accessibility grants that headless CI
+/// (xvfb) can't provide. They run on the macOS validation box and local Windows
+/// (set `VICTAURI_GAUNTLET_DISPLAY=1`), and skip on headless Linux CI.
+fn has_display() -> bool {
+    std::env::var("VICTAURI_GAUNTLET_DISPLAY").is_ok()
+}
+
 async fn base_url() -> String {
     victauri_test::connect()
         .await
@@ -384,4 +392,220 @@ gauntlet!(server_survives_the_gauntlet, base, {
         server_alive(&base).await,
         "server did not survive the gauntlet"
     );
+});
+
+// ── 13. query_db reads a real seeded database (backend differentiator) ────────
+
+gauntlet!(query_db_reads_seeded_database, base, {
+    // The app seeds a `widgets` table (3 rows) in its app-data dir — a default
+    // query_db search root. Read it, and confirm read-only enforcement blocks a write.
+    let r = call(
+        &base,
+        "query_db",
+        json!({ "query": "SELECT id, name, qty FROM widgets ORDER BY id" }),
+    )
+    .await;
+    let body = serde_json::to_string(result(&r)).unwrap();
+    assert!(
+        body.contains("alpha") && body.contains("gamma"),
+        "query_db did not read the seeded widgets table: {body}"
+    );
+
+    // A write must be rejected (read-only by design).
+    let w = call(&base, "query_db", json!({ "query": "DELETE FROM widgets" })).await;
+    assert!(
+        w.get("error").is_some(),
+        "query_db allowed a write — read-only enforcement broken: {w}"
+    );
+});
+
+// ── 14. Performance metrics report engine capabilities (cross-engine) ─────────
+
+gauntlet!(perf_metrics_report_engine_capabilities, base, {
+    // get_performance must always return an engine-capability block + DOM stats.
+    // JS heap / long tasks / paint are Chromium-only: on WebKit (macOS/Linux) they
+    // must be marked `unavailable`, NOT silently missing — same silent-blindness
+    // class as the IPC scheme bug.
+    let r = call(&base, "inspect", json!({ "action": "get_performance" })).await;
+    let perf = result(&r);
+    assert!(
+        perf["engine"].is_object(),
+        "perf result missing engine capability block: {perf}"
+    );
+    assert!(
+        perf["dom"]["elements"].as_u64().is_some(),
+        "engine-agnostic DOM stats missing from perf: {perf}"
+    );
+    let heap = &perf["js_heap"];
+    assert!(
+        heap["used_mb"].is_number() || heap["unavailable"] == json!(true),
+        "js_heap neither present nor marked unavailable (silent blindness): {perf}"
+    );
+});
+
+// ── 15. Fault injection applies to an agent-driven command ───────────────────
+
+gauntlet!(fault_injection_applies, base, {
+    // Inject an Error fault on flood_marker, drive it via invoke_command, confirm
+    // the fault took effect (the call now errors), then clear it.
+    let _ = call(&base, "fault", json!({ "action": "clear_all" })).await;
+    let inj = call(
+        &base,
+        "fault",
+        json!({ "action": "inject", "command": "flood_marker", "fault_type": "error", "error_message": "gauntlet-injected-fault" }),
+    )
+    .await;
+    assert!(inj.get("error").is_none(), "fault inject failed: {inj}");
+
+    let faulted = invoke(&base, "flood_marker", json!({ "seq": 1 })).await;
+    let txt = serde_json::to_string(&faulted).unwrap();
+    assert!(
+        txt.contains("gauntlet-injected-fault") || faulted.get("error").is_some(),
+        "injected fault did not take effect: {txt}"
+    );
+
+    let _ = call(&base, "fault", json!({ "action": "clear_all" })).await;
+    let ok = invoke(&base, "flood_marker", json!({ "seq": 2 })).await;
+    assert!(
+        ok.get("error").is_none(),
+        "command still faulted after clear_all: {ok}"
+    );
+});
+
+// ── 16. introspect action sweep (backend introspection breadth) ──────────────
+
+gauntlet!(introspect_action_sweep, base, {
+    // Each backend-introspection action must return a structured result (not an
+    // error) at 4DA scale. These are direct-AppHandle reads — the genuinely
+    // non-webview part of the "full-stack" pitch.
+    for action in [
+        "coverage",
+        "db_health",
+        "plugin_state",
+        "processes",
+        "capabilities",
+        "startup_timing",
+        "plugin_tasks",
+        "event_bus",
+    ] {
+        let r = call(&base, "introspect", json!({ "action": action })).await;
+        assert!(
+            r.get("error").is_none(),
+            "introspect {action} errored at scale: {r}"
+        );
+    }
+});
+
+// ── 17. app_state probe is readable (no IPC round-trip) ──────────────────────
+
+gauntlet!(app_state_probe_readable, base, {
+    // The app registers a `pipeline` probe. Reading it returns the live backend
+    // snapshot directly (no webview, no IPC) — a CDP-impossible read.
+    let r = call(&base, "app_state", json!({ "probe": "pipeline" })).await;
+    let body = serde_json::to_string(result(&r)).unwrap();
+    assert!(
+        body.contains("running") && body.contains("processed"),
+        "app_state pipeline probe missing expected fields: {body}"
+    );
+});
+
+// ── 18. animation: list + scrub the miscalibrated sweep (geometry, headless-ok) ─
+
+gauntlet!(animation_lists_and_scrubs_the_sweep, base, {
+    // Trigger the broken sweep, then read it via the animation engine. `list` and
+    // geometry-only `scrub` are pure WAAPI (no native capture), so they run
+    // headless. Validates motion introspection cross-engine.
+    let trigger = "var t=document.getElementById('sweep-toast'); t.classList.remove('run'); void t.offsetWidth; t.classList.add('run'); return 1";
+
+    let _ = call(&base, "eval_js", json!({ "code": trigger })).await;
+    let list = call(&base, "animation", json!({ "action": "list" })).await;
+    let list_txt = serde_json::to_string(result(&list)).unwrap();
+    assert!(
+        list_txt.contains("sweepBroken") || list_txt.contains("translateX"),
+        "animation list did not see the running sweep: {list_txt}"
+    );
+
+    let _ = call(&base, "eval_js", json!({ "code": trigger })).await;
+    let scrub = call(
+        &base,
+        "animation",
+        json!({ "action": "scrub", "selector": "#sweep-toast", "points": 6, "capture": false }),
+    )
+    .await;
+    assert!(
+        scrub.get("error").is_none(),
+        "animation scrub (geometry) failed: {scrub}"
+    );
+});
+
+// ── 19-21. DISPLAY-GATED: screenshot + filmstrip + trusted input ─────────────
+// These need a real window server (Screen Recording on macOS); they run on the
+// macOS validation box and local Windows (VICTAURI_GAUNTLET_DISPLAY=1) and skip
+// on headless Linux CI.
+
+gauntlet!(display_screenshot_is_valid_png, base, {
+    if !has_display() {
+        eprintln!(
+            "SKIPPED display_screenshot_is_valid_png — set VICTAURI_GAUNTLET_DISPLAY=1 on a machine with a real display"
+        );
+        return;
+    }
+    let r = call(&base, "screenshot", json!({})).await;
+    let body = serde_json::to_string(result(&r)).unwrap();
+    assert!(
+        body.contains("iVBORw0KGgo"),
+        "screenshot did not return a valid PNG (no PNG magic): {}",
+        &body[..body.len().min(120)]
+    );
+    assert!(
+        body.len() > 2000,
+        "screenshot PNG implausibly small ({} chars) — likely a blank capture",
+        body.len()
+    );
+});
+
+gauntlet!(display_animation_filmstrip_captures, base, {
+    if !has_display() {
+        eprintln!(
+            "SKIPPED display_animation_filmstrip_captures — needs VICTAURI_GAUNTLET_DISPLAY=1"
+        );
+        return;
+    }
+    let trigger = "var t=document.getElementById('sweep-toast'); t.classList.remove('run'); void t.offsetWidth; t.classList.add('run'); return 1";
+    let _ = call(&base, "eval_js", json!({ "code": trigger })).await;
+    // scrub WITH capture exercises the platform-divergent raw window-capture +
+    // filmstrip compositor (the macOS CGWindowList path nothing else in CI hits).
+    let r = call(
+        &base,
+        "animation",
+        json!({ "action": "scrub", "selector": "#sweep-toast", "points": 4, "capture": true }),
+    )
+    .await;
+    let body = serde_json::to_string(result(&r)).unwrap();
+    assert!(
+        body.contains("iVBORw0KGgo"),
+        "animation filmstrip capture produced no PNG: {}",
+        &body[..body.len().min(160)]
+    );
+});
+
+gauntlet!(display_trusted_input, base, {
+    if !has_display() {
+        eprintln!("SKIPPED display_trusted_input — needs VICTAURI_GAUNTLET_DISPLAY=1");
+        return;
+    }
+    // trusted:true uses real OS input on Windows (SendInput); on macOS/Linux it's a
+    // stub that must fall back cleanly (clear error, not a crash). Either way the
+    // call returns a structured response and leaves the server alive.
+    let r = call(
+        &base,
+        "input",
+        json!({ "action": "type_text", "test_id": "trusted-target", "text": "vic", "trusted": true }),
+    )
+    .await;
+    assert!(
+        r.is_object(),
+        "trusted input gave no structured response: {r}"
+    );
+    assert!(server_alive(&base).await, "server died on trusted input");
 });

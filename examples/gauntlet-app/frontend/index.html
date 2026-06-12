@@ -13,7 +13,20 @@
     button { background: #1f1f28; color: #ddd; border: 1px solid #333; padding: 8px 14px; border-radius: 6px; cursor: pointer; margin: 4px; }
     #grid { display: grid; grid-template-columns: repeat(20, 1fr); gap: 1px; margin-top: 16px; }
     .cell { background: #15151c; font-size: 7px; padding: 1px; text-align: center; color: #555; }
-  </style>
+    input { background: #15151c; color: #ddd; border: 1px solid #333; padding: 6px; border-radius: 4px; }
+    /* A deliberately MISCALIBRATED sweep: intended to settle flush at
+       translateX(0), but overshoots 48px past the target over 1200ms. Exercises
+       the `animation` tool (list/scrub/sample) + the platform-divergent raw
+       window-capture path (filmstrip) on every webview engine. */
+    .sweep-stage { height: 40px; overflow: hidden; margin-top: 12px; position: relative; }
+    .sweep-toast { position: absolute; padding: 8px 14px; background: #ef4444; color: #fff;
+      border-radius: 8px; font-size: 0.9em; transform: translateX(420px); }
+    @keyframes sweepBroken {
+      from { transform: translateX(420px); }
+      to   { transform: translateX(-48px); }
+    }
+    .sweep-toast.run { animation: sweepBroken 1200ms cubic-bezier(0.5, -0.6, 0.9, 1.4) forwards; }
+</style>
   <!-- Strict CSP (script-src 'self') blocks inline scripts and eval(): all
        page logic must come from this external file. This proves the app's
        own code stays CSP-clean while Victauri's eval_js still works (the bridge
@@ -27,6 +40,13 @@
   <button id="flood-btn" data-testid="flood-btn">Flood IPC</button>
   <button id="ghost-btn" data-testid="ghost-btn">Invoke a ghost command</button>
   <button id="pipeline-btn" data-testid="pipeline-btn">Run async pipeline</button>
+  <input id="trusted-target" data-testid="trusted-target" placeholder="trusted-input target" />
+  <!-- Animation sweep: re-triggerable, miscalibrated. Drives the `animation`
+       tool + the native raw-capture filmstrip (platform-divergent). -->
+  <div class="sweep-stage">
+    <div id="sweep-toast" data-testid="sweep-toast" class="sweep-toast">Notification</div>
+  </div>
+  <button id="sweep-btn" data-testid="sweep-btn">Play sweep</button>
   <!-- A large DOM (thousands of nodes) is generated into #grid by app.js to
        stress dom_snapshot, find_elements, and large-DOM diagnostics. -->
   <div id="grid" data-testid="grid"></div>
