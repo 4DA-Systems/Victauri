@@ -959,7 +959,12 @@ async fn event_drain_loop(
     bridge: Arc<dyn WebviewBridge>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut last_drain_ts: f64 = 0.0;
+    // Per-window high-water marks. A single shared timestamp made every window
+    // after the first miss any events older than the previous window's latest —
+    // so the Rust event_log, the recorder (time-travel), and `explain` were blind
+    // to every non-default window (e.g. 4DA's notification/briefing windows).
+    // Track a watermark per label and drain every live window.
+    let mut watermarks: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
     loop {
         tokio::select! {
@@ -967,71 +972,110 @@ async fn event_drain_loop(
             _ = shutdown.changed() => break,
         }
 
-        let code = format!("return window.__VICTAURI__?.getEventStream({last_drain_ts})");
-        let id = uuid::Uuid::new_v4().to_string();
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        {
-            let mut pending = state.pending_evals.lock().await;
-            if pending.len() >= MAX_PENDING_EVALS {
-                continue;
-            }
-            pending.insert(id.clone(), tx);
-        }
-
-        let id_js = super::helpers::js_string(&id);
-        let inject = format!(
-            r"
-            (async () => {{
-                try {{
-                    const __result = await (async () => {{ {code} }})();
-                    await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                        id: {id_js},
-                        result: JSON.stringify(__result)
-                    }});
-                }} catch (e) {{
-                    await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                        id: {id_js},
-                        result: JSON.stringify({{ __error: e.message }})
-                    }});
-                }}
-            }})();
-            "
-        );
-
-        if bridge.eval_webview(None, &inject).is_err() {
-            state.pending_evals.lock().await.remove(&id);
+        let labels = bridge.list_window_labels();
+        if labels.is_empty() {
             continue;
         }
+        // Drop watermarks for windows that have closed so the map can't grow
+        // unbounded across many ephemeral windows.
+        watermarks.retain(|label, _| labels.contains(label));
 
-        let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
-        else {
-            state.pending_evals.lock().await.remove(&id);
-            continue;
-        };
-
-        let events: Vec<serde_json::Value> = match serde_json::from_str(&result) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-
-        for ev in &events {
-            let ts = ev
-                .get("timestamp")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            if ts > last_drain_ts {
-                last_drain_ts = ts;
-            }
-
-            if let Some(app_event) = parse_bridge_event(ev) {
-                state.event_log.push(app_event.clone());
-                if state.recorder.is_recording() {
-                    state.recorder.record_event(app_event);
-                }
+        // Drain all windows concurrently. A blind window (e.g. one missing the
+        // `victauri:default` capability) hangs until the 5s eval timeout; draining
+        // sequentially would let it stall every other window's drain. Concurrency
+        // keeps a healthy window's events flowing regardless of a blind sibling.
+        let mut set = tokio::task::JoinSet::new();
+        for label in &labels {
+            let since = watermarks.get(label).copied().unwrap_or(0.0);
+            let state = Arc::clone(&state);
+            let bridge = Arc::clone(&bridge);
+            let label = label.clone();
+            set.spawn(async move {
+                let newest = drain_window(&state, &bridge, &label, since).await;
+                (label, newest)
+            });
+        }
+        while let Some(res) = set.join_next().await {
+            if let Ok((label, Some(newest))) = res {
+                watermarks.insert(label, newest);
             }
         }
     }
+}
+
+/// Drain one window's event stream into the event log / recorder. Returns the
+/// newest event timestamp seen (to advance the window's watermark), or `None` if
+/// nothing was drained (pending-eval saturation, eval-injection failure, callback
+/// timeout, or an unparseable result). Returning `None` leaves the watermark
+/// unchanged, so a transient failure simply re-fetches the same window next tick.
+async fn drain_window(
+    state: &Arc<VictauriState>,
+    bridge: &Arc<dyn WebviewBridge>,
+    label: &str,
+    since: f64,
+) -> Option<f64> {
+    let code = format!("return window.__VICTAURI__?.getEventStream({since})");
+    let id = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    {
+        let mut pending = state.pending_evals.lock().await;
+        if pending.len() >= MAX_PENDING_EVALS {
+            return None;
+        }
+        pending.insert(id.clone(), tx);
+    }
+
+    let id_js = super::helpers::js_string(&id);
+    let inject = format!(
+        r"
+        (async () => {{
+            try {{
+                const __result = await (async () => {{ {code} }})();
+                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
+                    id: {id_js},
+                    result: JSON.stringify(__result)
+                }});
+            }} catch (e) {{
+                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
+                    id: {id_js},
+                    result: JSON.stringify({{ __error: e.message }})
+                }});
+            }}
+        }})();
+        "
+    );
+
+    if bridge.eval_webview(Some(label), &inject).is_err() {
+        state.pending_evals.lock().await.remove(&id);
+        return None;
+    }
+
+    let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await else {
+        state.pending_evals.lock().await.remove(&id);
+        return None;
+    };
+
+    let events: Vec<serde_json::Value> = serde_json::from_str(&result).ok()?;
+
+    let mut newest = since;
+    for ev in &events {
+        let ts = ev
+            .get("timestamp")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        if ts > newest {
+            newest = ts;
+        }
+
+        if let Some(app_event) = parse_bridge_event(ev) {
+            state.event_log.push(app_event.clone());
+            if state.recorder.is_recording() {
+                state.recorder.record_event(app_event);
+            }
+        }
+    }
+    Some(newest)
 }
 
 #[cfg(test)]
