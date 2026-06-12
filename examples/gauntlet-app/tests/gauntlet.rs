@@ -176,7 +176,23 @@ gauntlet!(ipc_log_bounded_under_flood, base, {
     }
     let r = call(&base, "logs", json!({ "action": "ipc", "limit": 100 })).await;
     let entries = first_array(result(&r));
-    assert!(!entries.is_empty(), "IPC log empty despite a flood");
+    if entries.is_empty() {
+        // DIAGNOSTIC: Victauri derives the IPC log from intercepting `fetch()` to
+        // http://ipc.localhost/. If the log is empty after a real flood, this
+        // platform's Tauri IPC isn't going through page-level fetch (suspected on
+        // WebKitGTK). Dump what the network interceptor DID capture so CI reveals
+        // the actual transport/URL scheme instead of a bare "empty" failure.
+        let net = call(
+            &base,
+            "eval_js",
+            json!({ "code": "return (window.__VICTAURI__.getNetworkLog ? window.__VICTAURI__.getNetworkLog(null, 20) : []).map(function(n){return n.url;})" }),
+        )
+        .await;
+        panic!(
+            "IPC log empty despite a flood — fetch-based IPC capture may not work on this \
+             platform's webview. Network URLs actually captured: {net}"
+        );
+    }
     assert!(
         entries.len() <= 100,
         "IPC log ignored the limit under load: {} entries",
