@@ -42,17 +42,23 @@ use helpers::{
     tool_disabled, tool_error, tool_error_with_hint, validate_url,
 };
 
-pub use backend_params::*;
-pub use compound_params::*;
-pub use introspection_params::*;
-pub use other_params::{
+// MCP tool *parameter* types are an internal protocol surface: they are deserialized
+// from MCP/JSON, used only inside this crate's (private) tool methods, and change every
+// release as actions/fields are added. They are deliberately NOT part of the public API
+// (`pub(crate)`, not `pub use`), so adding a tool action or field is not a breaking change
+// and `cargo semver-checks` stays meaningful. Only `server::*` (build_app*,
+// VictauriMcpHandler) is the public MCP surface consumers actually use.
+pub(crate) use backend_params::*;
+pub(crate) use compound_params::*;
+pub(crate) use introspection_params::*;
+pub(crate) use other_params::{
     AppStateParams, DiagnosticsParams, FindElementsParams, ResolveCommandParams,
     SemanticAssertParams, WaitCondition, WaitForParams,
 };
 pub use server::*;
-pub use verification_params::*;
-pub use webview_params::*;
-pub use window_params::*;
+pub(crate) use verification_params::*;
+pub(crate) use webview_params::*;
+pub(crate) use window_params::*;
 
 // ── MCP Handler ──────────────────────────────────────────────────────────────
 
@@ -4085,13 +4091,31 @@ impl VictauriMcpHandler {
             .await
     }
 
+    /// Atomically reserve a pending-eval slot under a SINGLE lock: reject if the map is
+    /// already at the concurrency ceiling, otherwise insert. This makes `MAX_PENDING_EVALS`
+    /// a TRUE hard ceiling — a separate check-then-insert races (concurrent callers all pass
+    /// a stale check, then each inserts, blowing past the cap). On a saturated map it also
+    /// fails fast (before any eval is injected) with the real "too many concurrent" cause
+    /// rather than letting a probe burn its full timeout.
+    async fn reserve_pending(
+        &self,
+        id: &str,
+        tx: tokio::sync::oneshot::Sender<String>,
+    ) -> Result<(), String> {
+        let mut pending = self.state.pending_evals.lock().await;
+        if pending.len() >= MAX_PENDING_EVALS {
+            return Err(format!(
+                "too many concurrent eval requests (limit: {MAX_PENDING_EVALS})"
+            ));
+        }
+        pending.insert(id.to_string(), tx);
+        Ok(())
+    }
+
     async fn probe_bridge(&self, webview_label: Option<&str>) -> Result<(), String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        {
-            let mut pending = self.state.pending_evals.lock().await;
-            pending.insert(id.clone(), tx);
-        }
+        self.reserve_pending(&id, tx).await?;
         let id_js = js_string(&id);
         let probe = format!(
             r#"(async()=>{{await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback',{{id:{id_js},result:'"probe_ok"'}});}})();"#
@@ -4118,17 +4142,12 @@ impl VictauriMcpHandler {
         webview_label: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
-        // Hard concurrency ceiling — checked FIRST, before the bridge-ready wait
-        // and the liveness probe. The probe itself reserves a pending-eval slot,
-        // so checking the cap only at insert time (below) would let the probe step
-        // past it; worse, on a saturated map the bridge is usually wedged, so the
-        // probe would just burn its full 2s timeout before surfacing a misleading
-        // "bridge not responding" instead of the real "too many concurrent" cause.
-        if self.state.pending_evals.lock().await.len() >= MAX_PENDING_EVALS {
-            return Err(format!(
-                "too many concurrent eval requests (limit: {MAX_PENDING_EVALS})"
-            ));
-        }
+        // The hard concurrency ceiling is enforced atomically at every reservation
+        // (`reserve_pending`, used by both the probe and the real eval below) — NOT with a
+        // separate early check, which races: concurrent callers would all pass a stale
+        // `len()` read before any of them inserts. The probe is the first reservation, so a
+        // saturated map is rejected fast (before any eval is injected) with the real "too
+        // many concurrent" cause.
 
         // Wait for the JS bridge ready signal (sent on bridge init) before
         // attempting evals.  For explicitly targeted windows the probe
@@ -4180,16 +4199,7 @@ impl VictauriMcpHandler {
 
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-
-        {
-            let mut pending = self.state.pending_evals.lock().await;
-            if pending.len() >= MAX_PENDING_EVALS {
-                return Err(format!(
-                    "too many concurrent eval requests (limit: {MAX_PENDING_EVALS})"
-                ));
-            }
-            pending.insert(id.clone(), tx);
-        }
+        self.reserve_pending(&id, tx).await?;
 
         // Auto-prepend `return` so bare expressions produce a value — but ONLY
         // for single expressions. Multi-statement blocks (or code containing an
@@ -6045,6 +6055,57 @@ mod command_policy_dispatch_tests {
             bridge.invoked("get_settings"),
             "positive control failed: contract_record did not invoke an allowed command"
         );
+    }
+
+    // ── pending-eval concurrency ceiling (audit: TOCTOU race) ────────────────
+    #[tokio::test]
+    async fn reserve_pending_is_a_hard_ceiling_under_concurrency() {
+        // A check-then-insert (lock, read len(), unlock, …, lock, insert) races: many
+        // concurrent callers all pass a STALE len() check before any inserts, blowing past
+        // MAX_PENDING_EVALS. `reserve_pending` checks AND inserts under one lock, so the cap
+        // is a true ceiling. Pre-fill to MAX-5, fire 50 concurrent reservations: EXACTLY 5
+        // may succeed and the map must NEVER exceed the cap.
+        let state = state_with(PrivacyConfig::default());
+        {
+            let mut p = state.pending_evals.lock().await;
+            for i in 0..(MAX_PENDING_EVALS - 5) {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                p.insert(format!("pre-{i}"), tx);
+            }
+        }
+        let h = Arc::new(VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(RecordingBridge::default()),
+        ));
+        let mut tasks = Vec::new();
+        for i in 0..50 {
+            let h = h.clone();
+            tasks.push(tokio::spawn(async move {
+                let (tx, _rx) = tokio::sync::oneshot::channel();
+                // keep rx alive until the reservation has been decided
+                let ok = h.reserve_pending(&format!("c-{i}"), tx).await.is_ok();
+                (ok, _rx)
+            }));
+        }
+        let mut granted = 0;
+        let mut keep = Vec::new();
+        for t in tasks {
+            let (ok, rx) = t.await.unwrap();
+            if ok {
+                granted += 1;
+            }
+            keep.push(rx); // hold receivers so reserved entries are not dropped/removed
+        }
+        let len = state.pending_evals.lock().await.len();
+        assert!(
+            len <= MAX_PENDING_EVALS,
+            "ceiling breached: {len} > {MAX_PENDING_EVALS}"
+        );
+        assert_eq!(
+            granted, 5,
+            "exactly the 5 free slots should have been reserved, got {granted}"
+        );
+        drop(keep);
     }
 
     #[tokio::test]

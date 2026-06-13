@@ -34,7 +34,7 @@ inputs:
   victauri-version:
     description: Version of victauri-cli to install
     required: false
-    default: "0.7.12"
+    default: "0.8.0"
   cli-source-path:
     description: >-
       Build & install victauri-cli from this local repo path instead of

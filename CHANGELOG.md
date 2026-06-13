@@ -7,14 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.7.12] - 2026-06-14
+## [0.8.0] - 2026-06-14
 
 Driven by the scale-gauntlet cross-engine net and an exhaustive live sweep of 4DA
 (379 commands, 747 MB SQLite), then **validated end-to-end against 4DA rebuilt from
-source** (every fix proven inside the live process). Additive / bugfix — no public Rust
-API change and no removed tool-output field (all new code is crate-internal), so `"0.7"`
-consumers pick it up. Full CI matrix green (ubuntu/windows/macOS + gauntlet + live-app
-proof + semver + MSRV).
+source** (every fix proven inside the live process), and hardened by a GPT-5.5 adversarial
+audit before release.
+
+**Breaking (minor-version bump under 0.x).** The tool-OUTPUT schemas and runtime behaviour
+are backward-compatible — agents/MCP clients need no change. The break is a Rust public-API
+cleanup: internal MCP protocol types are no longer re-exported, so a path-dependency on
+`victauri-plugin` must move from `"0.7"` to `"0.8"`. See MIGRATION.md.
+
+### Changed (breaking)
+
+- **MCP tool *parameter* types are no longer public API.** The `*Params` / action enums
+  (e.g. `IntrospectAction`, `EvalJsParams`) were re-exported from `victauri_plugin::mcp::*`;
+  they are an internal protocol surface deserialized from JSON, used only by this crate's
+  private tool methods, and they change every release. They are now `pub(crate)`, so adding
+  a tool action or field is no longer a (mechanical) breaking change and `cargo
+  semver-checks` stays meaningful for the plugin. No consumer used these types.
+- **`introspection::TimingSamples` is now crate-private** and the unbounded `pub samples:
+  Vec<Duration>` field is gone — replaced by a bounded ring buffer (fixes an unbounded
+  per-command memory growth). `CommandTimings` and the other `introspection` types consumers
+  actually use remain public.
+- Consumers: bump the dependency requirement `victauri-plugin = "0.7"` → `"0.8"` (and
+  `victauri-test`). Nothing else changes.
 
 ### Added
 

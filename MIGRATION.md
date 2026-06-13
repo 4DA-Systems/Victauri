@@ -1,10 +1,29 @@
 # Migration Guide
 
-## v0.7.11 → v0.7.12 (additive / bugfix — no API or output-schema breaks)
+## v0.7.11 → v0.8.0 (Rust public-API cleanup — tool behaviour/output unchanged)
 
-No public Rust API changed and no existing tool-output field was removed (all new code is
-crate-internal); `"0.7"` consumers upgrade with no changes. Review only if you script these
-tools:
+**The only required change for most consumers: bump the dependency requirement.**
+
+```toml
+# Cargo.toml (e.g. 4DA src-tauri)
+victauri-plugin = "0.8"   # was "0.7"
+victauri-test   = "0.8"   # was "0.7"   (if used)
+```
+
+Tool OUTPUT schemas and runtime behaviour are backward-compatible — MCP clients/agents and
+the REST API need no change. The minor bump (breaking under 0.x semver) is purely a Rust
+public-API cleanup:
+
+- **MCP tool *parameter* types are no longer public** (`IntrospectAction`, `EvalJsParams`,
+  the other `*Params` — previously re-exported from `victauri_plugin::mcp::*`). They are an
+  internal protocol surface (deserialized from JSON, used only by private tool methods). If
+  you somehow referenced one in Rust, you no longer can — but no known consumer did.
+- **`introspection::TimingSamples` is now crate-private**, and its unbounded
+  `pub samples: Vec<Duration>` field is gone (replaced by a bounded ring buffer). The
+  `introspection` types consumers actually construct (`CommandTimings`, `FaultRegistry`, …)
+  remain public.
+
+Then, optionally, review if you script these tools:
 
 - **New `introspect command_catalog` action** (optional). `get_registry`'s description now
   points to it for apps that don't use `#[inspectable]`. Returns

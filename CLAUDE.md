@@ -186,12 +186,26 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-06-14)
 
-### v0.7.12 — cross-engine gauntlet + IPC command catalog + robustness
+### v0.8.0 — cross-engine gauntlet + IPC command catalog + robustness
 
 Driven by the scale-gauntlet cross-engine net and an exhaustive live sweep of 4DA
 (com.4da.app, 379 commands, 747 MB SQLite), then **validated end-to-end against 4DA
-rebuilt from this branch** (all fixes proven inside the live process, not prototypes).
-Full CI matrix green (ubuntu/windows/macOS + gauntlet + live-app proof + semver + MSRV).
+rebuilt from this branch** (all fixes proven inside the live process, not prototypes),
+and hardened by a **GPT-5.5 adversarial audit** (caught a JS prototype-pollution edge case,
+a pending-eval TOCTOU race, and the public-API semver break below — all fixed).
+Full CI matrix green (ubuntu/windows/macOS + gauntlet + live-app proof + MSRV).
+
+**Why 0.8.0 (not 0.7.12 — the deliberate break with the ^0.7-for-4DA habit).** The audit's
+`cargo semver-checks` showed the MCP tool *parameter* types (`IntrospectAction`, the `*Params`)
+and `introspection::TimingSamples` were public API (`pub use mcp::*params::*`, `pub mod
+introspection`) — so every release that adds a tool action mechanically broke semver, which is
+why the plugin's CI semver-check was informational. Rather than ship yet another "informational"
+break, these internal protocol/accumulator types are now `pub(crate)` (the public MCP surface is
+just `build_app*` + `VictauriMcpHandler`). One honest 0.8.0 break makes future 0.8.x releases
+semver-clean. **Consumers (4DA) bump `victauri-plugin`/`victauri-test` `"0.7"` → `"0.8"`** —
+tool output + behaviour are unchanged. (CI semver-check stays informational only until the
+upstream `time`/rustdoc E0119 that breaks cargo-semver-checks in CI is fixed; local
+`cargo semver-checks` is the authoritative pre-publish gate and is green.)
 
 - **`introspect command_catalog` (NEW action).** Mines the live IPC log for each
   command's argument + result *shapes* (inferred in JS so bodies never ship —
