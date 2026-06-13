@@ -37,9 +37,9 @@ use crate::bridge::WebviewBridge;
 
 use helpers::{
     RecoveryHint, build_ghost_report, ghost_ipc_outcomes_js, ghost_ipc_projection_js,
-    ipc_timing_projection_js, ipc_timing_stats, js_string, json_result, json_truthy, missing_param,
-    sanitize_css_color, sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint,
-    validate_url,
+    ipc_catalog_projection_js, ipc_timing_projection_js, ipc_timing_stats, js_string, json_result,
+    json_truthy, merge_command_catalog, missing_param, sanitize_css_color, sanitize_injected_css,
+    tool_disabled, tool_error, tool_error_with_hint, validate_url,
 };
 
 pub use backend_params::*;
@@ -177,10 +177,8 @@ pub struct VictauriMcpHandler {
     bridge: Arc<dyn WebviewBridge>,
     subscriptions: Arc<Mutex<HashSet<String>>>,
     bridge_checked: Arc<AtomicBool>,
-    probed_labels: Arc<Mutex<HashSet<String>>>,
-    /// Window keys whose previous eval timed out. The next eval on such a window
-    /// does a fast liveness probe so a reloaded/crashed bridge fails fast with a
-    /// clear error instead of blocking the full timeout again.
+    /// Window keys whose previous eval timed out. Retained only to annotate the
+    /// error on the *next* eval (the bridge is probed before every eval anyway).
     timed_out_labels: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -589,8 +587,13 @@ impl VictauriMcpHandler {
                 if (log.length === 0 && net.length > 5) {{
                     warning = 'Zero IPC calls captured but ' + net.length + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
                 }}
+                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
+                // A command that completed with an Err is a HEALTHY round-trip (it returned)
+                // — every real app exercises error paths, so counting those as 'unhealthy'
+                // would cry wolf. The error_count/errored_calls surface them for visibility,
+                // but only stale calls flip `healthy`.
                 return {{
-                    healthy: stale.length === 0 && errored.length === 0,
+                    healthy: stale.length === 0,
                     total_calls: log.length,
                     pending_count: pending.length,
                     stale_count: stale.length,
@@ -831,7 +834,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "List or search all registered Tauri commands with their argument schemas. Pass query to filter by name/description substring. Commands are registered via #[inspectable] macro.",
+        description = "List or search all registered Tauri commands with their argument schemas. Pass query to filter by name/description substring. Commands are registered via the #[inspectable] macro — apps that don't use it return names with null schemas; for those, use `introspect command_catalog` to recover real argument/result shapes from the live IPC log.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2788,6 +2791,7 @@ impl VictauriMcpHandler {
             Actions:\n\
             - `command_timings`: Per-command execution timing stats (min/max/avg/p95). Set `slow_threshold_ms` to filter.\n\
             - `coverage`: Which registered commands have been called during this session.\n\
+            - `command_catalog`: Per-command argument + result SHAPES mined from the live IPC log, merged with the registry — real call/return schemas even for apps that don't use #[inspectable] (where get_registry is names-only). The highest-signal way to learn how to drive an app's commands.\n\
             - `contract_record`: Record a command's response shape as a baseline (requires `command`).\n\
             - `contract_check`: Check all recorded contracts for schema drift.\n\
             - `contract_list`: List all recorded contract baselines.\n\
@@ -2927,6 +2931,48 @@ impl VictauriMcpHandler {
                         .filter(|cmd| !registered.contains(cmd))
                         .collect::<Vec<_>>(),
                     "note": note,
+                });
+                json_result(&result)
+            }
+            IntrospectAction::CommandCatalog => {
+                // Mine the live IPC log for per-command argument + result SHAPES (inferred
+                // in JS, bodies never shipped — so it stays under the eval cap on busy apps)
+                // and merge with the #[inspectable] registry. This is the answer to a real
+                // live gap: an app without #[inspectable] (e.g. 4DA — 379 commands, every
+                // registry field null) gives an agent command NAMES but no call/return
+                // schema; the IPC log holds the actual shapes, so we project them out.
+                let code = ipc_catalog_projection_js();
+                let ipc_entries: Vec<serde_json::Value> = match self
+                    .eval_with_return(&code, params.webview_label.as_deref())
+                    .await
+                {
+                    Ok(json_str) => serde_json::from_str(&json_str).unwrap_or_default(),
+                    Err(e) => return tool_error(format!("failed to read IPC log: {e}")),
+                };
+
+                let registry = self.state.registry.list();
+                let catalog = merge_command_catalog(&ipc_entries, &registry);
+                let observed = catalog
+                    .iter()
+                    .filter(|c| {
+                        c.get("observed")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false)
+                    })
+                    .count();
+
+                let result = serde_json::json!({
+                    "catalog": catalog,
+                    "observed_count": observed,
+                    "registered_count": registry.len(),
+                    "total": catalog.len(),
+                    "note": "`arg_shape`/`result_shape` are STRUCTURES inferred from the live \
+                             IPC log (keys + value types, not values) — how to CALL each command \
+                             and what it RETURNS, even for apps that don't use #[inspectable]. \
+                             `observed:false` means the command is in the registry but hasn't \
+                             been seen on the wire this session (drive the app's UI to populate \
+                             its shape). `declared_*` fields, when present, come from \
+                             #[inspectable] and are authoritative over the inferred shape.",
                 });
                 json_result(&result)
             }
@@ -3661,7 +3707,6 @@ impl VictauriMcpHandler {
             bridge,
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             bridge_checked: Arc::new(AtomicBool::new(false)),
-            probed_labels: Arc::new(Mutex::new(HashSet::new())),
             timed_out_labels: Arc::new(Mutex::new(HashSet::new())),
         }
     }
@@ -4073,6 +4118,18 @@ impl VictauriMcpHandler {
         webview_label: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
+        // Hard concurrency ceiling — checked FIRST, before the bridge-ready wait
+        // and the liveness probe. The probe itself reserves a pending-eval slot,
+        // so checking the cap only at insert time (below) would let the probe step
+        // past it; worse, on a saturated map the bridge is usually wedged, so the
+        // probe would just burn its full 2s timeout before surfacing a misleading
+        // "bridge not responding" instead of the real "too many concurrent" cause.
+        if self.state.pending_evals.lock().await.len() >= MAX_PENDING_EVALS {
+            return Err(format!(
+                "too many concurrent eval requests (limit: {MAX_PENDING_EVALS})"
+            ));
+        }
+
         // Wait for the JS bridge ready signal (sent on bridge init) before
         // attempting evals.  For explicitly targeted windows the probe
         // mechanism is still used because the ready signal only proves that
@@ -4097,26 +4154,28 @@ impl VictauriMcpHandler {
         let label_key =
             webview_label.map_or_else(|| "\u{1}__default__".to_string(), str::to_string);
 
-        // Proactively probe explicitly-targeted windows once (cached), so a
-        // hidden/unready window fails fast rather than after the full timeout.
-        if webview_label.is_some() {
-            let already_probed = self.probed_labels.lock().await.contains(&label_key);
-            if !already_probed {
-                self.probe_bridge(webview_label).await?;
-                self.probed_labels.lock().await.insert(label_key.clone());
-            }
-        }
-
-        // Resilience: if the PREVIOUS eval on this window timed out, the bridge
-        // may have gone away (the webview reloaded or the app crashed). Do a
-        // fast liveness probe so this call fails in ~2s with a clear error
-        // instead of blocking the full timeout again. If the bridge is alive
-        // (the earlier timeout was slow code / an infinite loop), the probe
-        // succeeds quickly and we proceed normally.
-        if self.timed_out_labels.lock().await.remove(&label_key) {
-            self.probe_bridge(webview_label).await.map_err(|e| {
-                format!("{e} (previous eval on this window timed out; the webview may have reloaded or the app stopped responding)")
-            })?;
+        // Liveness probe before EVERY eval — on the DEFAULT window as well as
+        // labeled ones. The probe is a tiny round-trip that returns in ~ms on a
+        // healthy bridge and fails fast (~2s) on a dead/hung/reloading one, turning
+        // a full-timeout hang (e.g. 30s) into an immediate, clear "bridge not
+        // responding" error. This was the #1 live-4DA friction: a webview that
+        // reloads mid-session (HMR) made the very next tool call hang the full
+        // timeout, and the DEFAULT window — the most common target — was never
+        // probed at all. Probing every call (not once-cached) is what guarantees
+        // *zero* 30s hangs even across repeated reloads; the healthy-path cost is a
+        // single sub-millisecond localhost round-trip, negligible against the value
+        // of never stalling an agent into a CDP fallback. (A saturated pending-eval
+        // map is already rejected above, before this probe.)
+        let prev_timed_out = self.timed_out_labels.lock().await.remove(&label_key);
+        if let Err(e) = self.probe_bridge(webview_label).await {
+            return Err(if prev_timed_out {
+                format!(
+                    "{e} (a previous eval on this window also timed out — the webview \
+                     likely reloaded or the app stopped responding)"
+                )
+            } else {
+                e
+            });
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -4580,10 +4639,14 @@ impl ServerHandler for VictauriMcpHandler {
         }
         let json = match uri.as_str() {
             RESOURCE_URI_IPC_LOG => {
-                if let Ok(json) = self
-                    .eval_with_return("return window.__VICTAURI__?.getIpcLog()", None)
-                    .await
-                {
+                // Use the body-free, capped projection — NOT the full body-carrying
+                // getIpcLog(). On a busy app the full log blows the eval result cap, the
+                // eval fails, and we silently fall back to the Rust event_log (which is
+                // itself default-window-drained) — serving a subset that looks complete.
+                // trimmed_log_js bounds entries + truncates oversized fields so the
+                // resource stays correct under load. (Matches the `logs ipc` tool.)
+                let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", DEFAULT_LOG_LIMIT);
+                if let Ok(json) = self.eval_with_return(&code, None).await {
                     json
                 } else {
                     let calls = self.state.event_log.ipc_calls();
@@ -5660,12 +5723,35 @@ mod command_policy_dispatch_tests {
     /// A bridge that RECORDS every script passed to `eval_webview` (so a test can assert a
     /// blocklisted command's invoke was never emitted) then fails the eval fast — an allowed
     /// command is observably *attempted* without hanging on a callback that never arrives.
+    ///
+    /// When constructed via [`RecordingBridge::answering`] it also resolves the pre-eval
+    /// liveness probe, simulating a healthy webview so an ALLOWED command's invoke actually
+    /// reaches the bridge. Default-constructed bridges leave the probe unanswered — which is
+    /// fine for negative tests, since a blocked command is rejected at the privacy gate
+    /// *before* any eval (and thus never probes).
     #[derive(Clone, Default)]
     struct RecordingBridge {
         scripts: Arc<StdMutex<Vec<String>>>,
+        pending_evals: Option<crate::PendingCallbacks>,
+    }
+
+    /// Extract the 36-char eval id from a probe script of the form `…id:"<uuid>"…`.
+    fn extract_probe_id(script: &str) -> Option<String> {
+        let start = script.find("id:\"")? + 4;
+        script.get(start..start + 36).map(str::to_string)
     }
 
     impl RecordingBridge {
+        /// A recording bridge that answers the liveness probe with the state's pending-evals
+        /// map, so a permitted command's eval proceeds past the probe and is observably
+        /// injected.
+        fn answering(pending_evals: crate::PendingCallbacks) -> Self {
+            Self {
+                scripts: Arc::default(),
+                pending_evals: Some(pending_evals),
+            }
+        }
+
         /// True iff any recorded eval script invoked `command` via the Tauri IPC bridge.
         fn invoked(&self, command: &str) -> bool {
             let needle = format!("invoke({}", js_string(command));
@@ -5683,10 +5769,25 @@ mod command_policy_dispatch_tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(script.to_string());
+            // If wired with a pending-evals map, answer the pre-eval liveness probe
+            // (simulating a healthy webview) so the real eval proceeds past it. The
+            // real eval is still left unanswered, so it times out fast at the 100ms
+            // test `eval_timeout` — we only care WHICH scripts reached the bridge,
+            // never the eval's return value.
+            if let Some(pending) = &self.pending_evals
+                && script.contains("probe_ok")
+                && let Some(id) = extract_probe_id(script)
+            {
+                let pending = pending.clone();
+                std::thread::spawn(move || {
+                    let mut map = pending.blocking_lock();
+                    if let Some(tx) = map.remove(&id) {
+                        let _ = tx.send("\"probe_ok\"".to_string());
+                    }
+                });
+            }
             // Return Ok so `eval_with_return` injects BOTH its watchdog and the
-            // user-code script (it bails on the first Err). No callback ever fires,
-            // so the call simply times out at the 100ms test `eval_timeout` — we only
-            // care WHICH scripts reached the bridge, never the eval's return value.
+            // user-code script (it bails on the first Err).
             Ok(())
         }
         fn get_window_states(&self, _l: Option<&str>) -> Vec<WindowState> {
@@ -5845,8 +5946,8 @@ mod command_policy_dispatch_tests {
     async fn replay_does_invoke_an_allowed_command() {
         // Positive control: proves the negative test isn't vacuous (the path really
         // reaches the bridge for a permitted command).
-        let bridge = RecordingBridge::default();
         let state = state_with(PrivacyConfig::default());
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
         state.recorder.start("s1".to_string()).unwrap();
         state.recorder.record_event(ipc_event("greet"));
         let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
@@ -5929,8 +6030,8 @@ mod command_policy_dispatch_tests {
 
     #[tokio::test]
     async fn contract_record_does_invoke_an_allowed_command() {
-        let bridge = RecordingBridge::default();
         let state = state_with(PrivacyConfig::default());
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
         let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
 
         let _ = call(

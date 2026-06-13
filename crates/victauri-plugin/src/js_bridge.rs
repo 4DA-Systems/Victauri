@@ -113,6 +113,20 @@ const INIT_SCRIPT_BODY: &str = r#"
     var mutationLog = [];
     var networkLog = [];
     var networkCounter = 0;
+    // Tauri's IPC transport URL is platform-dependent: WebView2 (Windows) uses
+    // `http://ipc.localhost/<cmd>`, while WebKitGTK (Linux) and WKWebView (macOS)
+    // use the custom `ipc://localhost/<cmd>` scheme. Match BOTH so the IPC-derived
+    // tools (getIpcLog / ghost detection / integrity / event stream) work on every
+    // platform — not just Windows. Returns the (still URL-encoded) command path if
+    // the URL is a Tauri IPC URL, else null.
+    var IPC_PREFIXES = ['http://ipc.localhost/', 'ipc://localhost/'];
+    function ipcCommandPath(url) {
+        for (var pi = 0; pi < IPC_PREFIXES.length; pi++) {
+            if (url.indexOf(IPC_PREFIXES[pi]) === 0) return url.substring(IPC_PREFIXES[pi].length);
+        }
+        return null;
+    }
+    function isIpcUrl(url) { return ipcCommandPath(url) !== null; }
     var navigationLog = [];
     var dialogLog = [];
     var interactionLog = [];
@@ -552,25 +566,46 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── IPC Log ──────────────────────────────────────────────────────────
 
         getIpcLog: function(limit) {
-            var ipcPrefix = 'http://ipc.localhost/';
             var victauriPrefix = 'plugin%3Avictauri%7C';
             var entries = [];
             for (var i = 0; i < networkLog.length; i++) {
                 var n = networkLog[i];
-                if (n.url.indexOf(ipcPrefix) !== 0) continue;
-                var raw = n.url.substring(ipcPrefix.length);
+                var raw = ipcCommandPath(n.url);
+                if (raw === null) continue;
                 if (raw.indexOf(victauriPrefix) === 0) continue;
                 var command;
                 try { command = decodeURIComponent(raw); } catch(e) { command = raw; }
+                // Classify by COMMAND outcome, not just HTTP status. Tauri returns
+                // HTTP 200 for a failed command (incl. "command not found") and signals
+                // the real result via the `Tauri-Response` header captured as ipc_response.
+                // Precedence: pending > transport error (HTTP >= 400 / 'error') > command
+                // error (ipc_response 'error') > ok.
+                var st;
+                if (n.status === 'pending') { st = 'pending'; }
+                else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
+                else if (n.ipc_response === 'error') { st = 'error'; }
+                else { st = 'ok'; }
+                var errText = null;
+                if (st === 'error') {
+                    if (n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
+                        errText = 'HTTP ' + n.status;
+                    } else if (n.response_body != null) {
+                        // Command-level error: the body carries the error message.
+                        errText = typeof n.response_body === 'string'
+                            ? n.response_body : JSON.stringify(n.response_body);
+                    } else {
+                        errText = 'command error';
+                    }
+                }
                 entries.push({
                     id: n.id,
                     command: command,
                     args: n.request_args || {},
                     timestamp: n.timestamp,
-                    status: n.status === 200 ? 'ok' : (n.status === 'pending' ? 'pending' : 'error'),
+                    status: st,
                     duration_ms: n.duration_ms,
                     result: n.response_body || null,
-                    error: n.status !== 200 && n.status !== 'pending' ? 'HTTP ' + n.status : null,
+                    error: errText,
                 });
             }
             if (limit) return entries.slice(-limit);
@@ -578,9 +613,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
 
         clearIpcLog: function() {
-            var ipcPrefix = 'http://ipc.localhost/';
             for (var i = networkLog.length - 1; i >= 0; i--) {
-                if (networkLog[i].url.indexOf(ipcPrefix) === 0) networkLog.splice(i, 1);
+                if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
             }
         },
 
@@ -794,15 +828,13 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }
             });
 
-            var ipcPrefix = 'http://ipc.localhost/';
             var victauriPrefix = 'plugin%3Avictauri%7C';
             networkLog.forEach(function(n) {
-                if (n.timestamp >= ts && n.url.indexOf(ipcPrefix) === 0) {
-                    var raw = n.url.substring(ipcPrefix.length);
-                    if (raw.indexOf(victauriPrefix) === 0) return;
-                    var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
-                    events.push({ type: 'ipc', command: cmd, status: n.status === 200 ? 'ok' : (n.status === 'pending' ? 'pending' : 'error'), duration_ms: n.duration_ms, timestamp: n.timestamp });
-                }
+                if (n.timestamp < ts) return;
+                var raw = ipcCommandPath(n.url);
+                if (raw === null || raw.indexOf(victauriPrefix) === 0) return;
+                var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
+                events.push({ type: 'ipc', command: cmd, status: n.status === 200 ? 'ok' : (n.status === 'pending' ? 'pending' : 'error'), duration_ms: n.duration_ms, timestamp: n.timestamp });
             });
 
             networkLog.forEach(function(n) {
@@ -862,7 +894,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     } else if (opts.condition === 'url' && opts.value) {
                         met = window.location.href.indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'ipc_idle') {
-                        met = networkLog.filter(function(n) { return n.url.indexOf('http://ipc.localhost/') === 0; }).every(function(n) { return n.status !== 'pending'; });
+                        met = networkLog.filter(function(n) { return isIpcUrl(n.url); }).every(function(n) { return n.status !== 'pending'; });
                     } else if (opts.condition === 'network_idle') {
                         met = networkLog.every(function(n) { return n.status !== 'pending'; });
                     }
@@ -1175,9 +1207,9 @@ const INIT_SCRIPT_BODY: &str = r#"
                     dom_interactive_ms: Math.round(nav.domInteractive - nav.startTime),
                     dom_complete_ms: Math.round(nav.domComplete - nav.startTime),
                     load_event_ms: Math.round(nav.loadEventEnd - nav.startTime),
-                    transfer_size: nav.transferSize,
-                    encoded_body_size: nav.encodedBodySize,
-                    decoded_body_size: nav.decodedBodySize,
+                    transfer_size: nav.transferSize || 0,
+                    encoded_body_size: nav.encodedBodySize || 0,
+                    decoded_body_size: nav.decodedBodySize || 0,
                 };
             }
 
@@ -1203,29 +1235,53 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }),
             };
 
-            // Paint timing
+            // Engine capability probe. Several perf APIs below are Chromium/WebView2-
+            // ONLY and are simply undefined on WebKit (WKWebView/macOS, WebKitGTK/Linux)
+            // — Victauri's moat platforms. Without this, those fields silently vanish
+            // there and an agent reads "no heap / no long tasks / no paint" as real data
+            // (and a heap-budget assertion passes regardless of memory). Feature-detect
+            // explicitly so the unavailability is reported, never silent.
+            var supportedEntryTypes = (typeof PerformanceObserver !== 'undefined' && PerformanceObserver.supportedEntryTypes) || [];
+            result.engine = {
+                js_heap_supported: typeof performance.memory !== 'undefined',
+                long_task_supported: supportedEntryTypes.indexOf('longtask') !== -1,
+                paint_timing_supported: supportedEntryTypes.indexOf('paint') !== -1,
+                user_agent: navigator.userAgent,
+            };
+
+            // Paint timing (Chromium-first; Safari ~14.1; WebKitGTK varies)
             var paints = performance.getEntriesByType('paint');
-            result.paint = {};
-            for (var i = 0; i < paints.length; i++) {
-                result.paint[paints[i].name] = Math.round(paints[i].startTime);
+            if (paints.length === 0 && !result.engine.paint_timing_supported) {
+                result.paint = { unavailable: true, reason: 'Paint Timing API not supported on this webview engine' };
+            } else {
+                result.paint = {};
+                for (var i = 0; i < paints.length; i++) {
+                    result.paint[paints[i].name] = Math.round(paints[i].startTime);
+                }
             }
 
-            // Memory (Chrome/Edge)
+            // JS heap — performance.memory is Chromium/WebView2-only.
             if (performance.memory) {
                 result.js_heap = {
                     used_mb: Math.round(performance.memory.usedJSHeapSize / 1048576 * 100) / 100,
                     total_mb: Math.round(performance.memory.totalJSHeapSize / 1048576 * 100) / 100,
                     limit_mb: Math.round(performance.memory.jsHeapSizeLimit / 1048576 * 100) / 100,
                 };
+            } else {
+                result.js_heap = { unavailable: true, reason: 'performance.memory is Chromium/WebView2-only; undefined on WebKit (WKWebView/WebKitGTK)' };
             }
 
-            // Long tasks (if PerformanceObserver captured any)
+            // Long tasks — Long Tasks API ('longtask' entry type) is Chromium-only.
             if (longTasks.length > 0) {
                 result.long_tasks = {
                     count: longTasks.length,
                     total_ms: Math.round(longTasks.reduce(function(s, t) { return s + t.duration; }, 0)),
                     worst_ms: Math.round(Math.max.apply(null, longTasks.map(function(t) { return t.duration; }))),
                 };
+            } else if (!result.engine.long_task_supported) {
+                result.long_tasks = { unavailable: true, reason: 'Long Tasks API is Chromium-only' };
+            } else {
+                result.long_tasks = { count: 0, total_ms: 0, worst_ms: 0 };
             }
 
             // DOM stats
@@ -1959,7 +2015,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var id = ++networkCounter;
                 var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
                 var method = (init && init.method) || (input && input.method) || 'GET';
-                var isIpc = url.indexOf('http://ipc.localhost/') === 0;
+                var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isIpc && url.indexOf('plugin%3Avictauri%7C') !== -1;
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
 
@@ -2029,6 +2085,13 @@ const INIT_SCRIPT_BODY: &str = r#"
                         entry.duration_ms = Date.now() - entry.timestamp;
 
                         if (isIpc) {
+                            // Capture Tauri's command-outcome signal. The HTTP status is 200
+                            // for BOTH a successful command AND a failed/"not found" one — the
+                            // real Ok/Err result is carried in the `Tauri-Response` header
+                            // ('ok' | 'error'). Without this, every IPC call logs as "ok",
+                            // which blinds ghost detection (an unregistered command looks like
+                            // a verified handler). 'ok' | 'error' | null (older Tauri / no hdr).
+                            try { entry.ipc_response = response.headers.get('Tauri-Response'); } catch (e) {}
                             if (window.__VICTAURI__._captureIpcBodies !== false) {
                                 var cloned = response.clone();
                                 cloned.text().then(function(text) {

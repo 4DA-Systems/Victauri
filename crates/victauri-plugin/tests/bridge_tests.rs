@@ -1839,6 +1839,66 @@ fn performance_metrics() {
 }
 
 #[test]
+fn performance_metrics_signals_engine_capability_gaps() {
+    // jsdom (like WebKit/WKWebView/WebKitGTK) has no `performance.memory`, no
+    // Long Tasks API, and no Paint Timing. The Chromium-only fields must be
+    // reported as explicitly `unavailable` — NOT silently omitted — so an agent
+    // on a moat platform can tell "no data because unsupported" from "no data
+    // because zero". Regression guard for the same bug class as the IPC scheme.
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![TestCase {
+            name: "perf result reports engine capabilities + unavailable fields".into(),
+            code: r"
+                    var r = window.__VICTAURI__.getPerformanceMetrics();
+                    return {
+                        has_engine: !!r.engine,
+                        heap_supported: r.engine && r.engine.js_heap_supported,
+                        heap_unavailable: r.js_heap && r.js_heap.unavailable === true,
+                        heap_has_reason: r.js_heap && typeof r.js_heap.reason === 'string',
+                        longtask_unavailable: r.long_tasks && r.long_tasks.unavailable === true,
+                        dom_still_present: !!(r.dom && typeof r.dom.elements === 'number'),
+                    };
+                "
+            .into(),
+            setup_html: None,
+            setup_js: None,
+        }],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = results[0].result.as_ref().unwrap();
+    assert_eq!(
+        r["has_engine"], true,
+        "perf result must carry an engine capability block"
+    );
+    assert_eq!(
+        r["heap_supported"], false,
+        "jsdom has no performance.memory"
+    );
+    assert_eq!(
+        r["heap_unavailable"], true,
+        "js_heap must be marked unavailable, not silently omitted, on engines without performance.memory"
+    );
+    assert_eq!(
+        r["heap_has_reason"], true,
+        "unavailable js_heap must explain why"
+    );
+    assert_eq!(
+        r["longtask_unavailable"], true,
+        "Long Tasks API absent → must be marked unavailable"
+    );
+    assert_eq!(
+        r["dom_still_present"], true,
+        "DOM stats (engine-agnostic) must still be present"
+    );
+}
+
+#[test]
 fn find_elements() {
     let def = TestDef {
         bridge_script: bridge_script(),
@@ -4421,6 +4481,100 @@ fn network_ipc_body_capture() {
     assert_eq!(r["has_args"], true);
     assert_eq!(r["query"], "hello");
     assert_eq!(r["limit"], 10);
+}
+
+#[test]
+fn ipc_log_captures_both_webview2_and_webkit_schemes() {
+    // Tauri's IPC URL is platform-dependent: WebView2 (Windows) uses
+    // `http://ipc.localhost/<cmd>`; WebKitGTK (Linux) and WKWebView (macOS) use
+    // `ipc://localhost/<cmd>`. The scale gauntlet proved the bridge was BLIND to
+    // the ipc:// scheme — every IPC-derived tool (ghost detection, integrity,
+    // event stream) returned nothing on Linux. getIpcLog must capture both.
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![TestCase {
+            name: "getIpcLog captures http://ipc.localhost AND ipc://localhost".into(),
+            code: r"
+                    await fetch('http://ipc.localhost/win_cmd', { method: 'POST', body: '{}' });
+                    await fetch('ipc://localhost/nix_cmd', { method: 'POST', body: '{}' });
+                    var log = window.__VICTAURI__.getIpcLog();
+                    return {
+                        has_http_scheme: !!log.find(function(e){ return e.command === 'win_cmd'; }),
+                        has_ipc_scheme: !!log.find(function(e){ return e.command === 'nix_cmd'; }),
+                    };
+                "
+            .into(),
+            setup_html: None,
+            setup_js: None,
+        }],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = results[0].result.as_ref().unwrap();
+    assert_eq!(
+        r["has_http_scheme"], true,
+        "WebView2 http scheme not captured"
+    );
+    assert_eq!(
+        r["has_ipc_scheme"], true,
+        "WebKitGTK/WKWebView ipc:// scheme not captured (Linux/macOS IPC blindness)"
+    );
+}
+
+#[test]
+fn ipc_log_classifies_by_tauri_response_header_not_http_status() {
+    // Tauri returns HTTP 200 for BOTH a successful command AND a failed / "not
+    // found" one; the real Ok/Err is in the `Tauri-Response` header. getIpcLog
+    // must classify on that header, not on the HTTP status — otherwise every
+    // call logs as "ok" and ghost detection / error surfacing go blind.
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![TestCase {
+            name: "getIpcLog status reflects Tauri-Response, error body surfaced".into(),
+            code: r"
+                    await fetch('http://ipc.localhost/good_cmd', { method: 'POST', body: '{}' });
+                    await fetch('http://ipc.localhost/ghost_cmd', {
+                        method: 'POST', body: '{}',
+                        headers: { 'x-vtest-tauri-response': 'error', 'x-vtest-body': 'Command ghost_cmd not found' }
+                    });
+                    var log = window.__VICTAURI__.getIpcLog();
+                    var good = log.find(function(e) { return e.command === 'good_cmd'; });
+                    var ghost = log.find(function(e) { return e.command === 'ghost_cmd'; });
+                    return {
+                        good_status: good && good.status,
+                        ghost_status: ghost && ghost.status,
+                        ghost_error_mentions_not_found: !!(ghost && ghost.error && ghost.error.indexOf('not found') !== -1),
+                    };
+                "
+            .into(),
+            setup_html: None,
+            setup_js: None,
+        }],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = results[0].result.as_ref().unwrap();
+    // HTTP 200 for both, but the outcome header distinguishes them.
+    assert_eq!(
+        r["good_status"], "ok",
+        "successful command should log as ok"
+    );
+    assert_eq!(
+        r["ghost_status"], "error",
+        "a Tauri-Response:error command (HTTP 200) must log as error, not ok"
+    );
+    assert_eq!(
+        r["ghost_error_mentions_not_found"], true,
+        "the command-error body must be surfaced in the entry's error field"
+    );
 }
 
 #[test]

@@ -8,6 +8,47 @@ use victauri_core::{CommandRegistry, EventLog, EventRecorder, WindowState};
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
 
+// ── Liveness-probe answering ───────────────────────────────────────────────
+// Every MCP eval is now preceded by a tiny liveness probe (a `victauri_eval_callback`
+// carrying `result:'"probe_ok"'`) so a dead/hung bridge fails fast (~2s) instead of
+// blocking the full eval timeout (up to 30s). A callback-style mock bridge must
+// answer that probe to behave like a healthy webview — otherwise the probe times
+// out and the real eval never runs (and the suite pays 2s per eval-path test).
+
+/// If `script` is the pre-eval liveness probe, resolve its pending callback so the
+/// real eval proceeds. Returns `true` when it was a probe — the caller should then
+/// `return Ok(())` without treating it as a real eval.
+///
+/// The resolution runs on a fresh OS thread (mirroring the real callback arriving
+/// asynchronously) so it can `blocking_lock` the async pending-evals map without a
+/// runtime-reentrancy panic.
+pub fn answer_liveness_probe(
+    script: &str,
+    pending_evals: &victauri_plugin::PendingCallbacks,
+) -> bool {
+    if !script.contains("probe_ok") {
+        return false;
+    }
+    if let Some(id) = extract_probe_id(script) {
+        let pending = pending_evals.clone();
+        std::thread::spawn(move || {
+            let mut map = pending.blocking_lock();
+            if let Some(tx) = map.remove(&id) {
+                let _ = tx.send("\"probe_ok\"".to_string());
+            }
+        });
+    }
+    true
+}
+
+/// Extract the 36-char eval id from a probe script of the form `…id:"<uuid>"…`.
+/// The probe uses no space after `id:` (distinguishing it from the eval wrapper's
+/// `id: "<uuid>"`), and contains no user code, so this match is unambiguous.
+fn extract_probe_id(script: &str) -> Option<String> {
+    let start = script.find("id:\"")? + 4;
+    script.get(start..start + 36).map(str::to_string)
+}
+
 // ── Shared Window State Builder ────────────────────────────────────────────
 
 pub fn make_windows(labels: &[&str]) -> Vec<WindowState> {
