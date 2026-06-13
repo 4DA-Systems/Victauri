@@ -1,5 +1,29 @@
 # Migration Guide
 
+## v0.7.11 → v0.7.12 (additive / bugfix — no API or output-schema breaks)
+
+No public Rust API changed and no existing tool-output field was removed (all new code is
+crate-internal); `"0.7"` consumers upgrade with no changes. Review only if you script these
+tools:
+
+- **New `introspect command_catalog` action** (optional). `get_registry`'s description now
+  points to it for apps that don't use `#[inspectable]`. Returns
+  `{catalog, observed_count, registered_count, total, note}`; each catalog entry has
+  `command`, `observed`, `call_count`, and (when observed) `arg_shape` / `result_shape` /
+  `error_count` / `last_status`. Read-only; available in the `FullControl` profile only
+  (like the other `introspect` actions), and disableable via
+  `disabled_tools: ["introspect.command_catalog"]`.
+- **Behaviour change (non-breaking): a liveness probe runs before every webview eval.** On a
+  healthy bridge this is a sub-millisecond round-trip and invisible. On a dead/reloading
+  bridge a webview call (`eval_js`, `dom_snapshot`, …) now fails in ~2 s with "bridge not
+  responding" instead of hanging the full timeout (~30 s) — including the **default
+  (unlabeled) window**, which was previously unprobed. If you tuned retry/timeout logic
+  around the old ~30 s hang, you can shorten it.
+- **`query_db` / `introspect db_health` now find the database regardless of launch CWD.**
+  Relative `db_search_paths` resolve against the executable's ancestors as well as the CWD.
+  If you previously worked around the database being unreachable from certain launch
+  directories, that workaround is no longer needed.
+
 ## v0.7.10 → v0.7.11 (bugfix — additive, no API or output-schema breaks)
 
 Six in-the-wild fixes from a live 4DA session. No public Rust API changed and no existing

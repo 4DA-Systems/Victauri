@@ -186,7 +186,7 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-06-14)
 
-### Cross-engine gauntlet + IPC command catalog + robustness (merged to main, PR #19; unreleased)
+### v0.7.12 — cross-engine gauntlet + IPC command catalog + robustness
 
 Driven by the scale-gauntlet cross-engine net and an exhaustive live sweep of 4DA
 (com.4da.app, 379 commands, 747 MB SQLite), then **validated end-to-end against 4DA

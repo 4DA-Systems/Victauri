@@ -157,10 +157,10 @@ pub fn action_capability(tool: &str, action: &str) -> Option<String> {
             _ => return None,
         },
         "introspect" => match action {
-            "command_timings" | "coverage" | "contract_record" | "contract_check"
-            | "contract_list" | "contract_clear" | "startup_timing" | "capabilities"
-            | "db_health" | "plugin_state" | "processes" | "plugin_tasks" | "event_bus"
-            | "event_bus_clear" => format!("introspect.{action}"),
+            "command_timings" | "coverage" | "command_catalog" | "contract_record"
+            | "contract_check" | "contract_list" | "contract_clear" | "startup_timing"
+            | "capabilities" | "db_health" | "plugin_state" | "processes" | "plugin_tasks"
+            | "event_bus" | "event_bus_clear" => format!("introspect.{action}"),
             _ => return None,
         },
         "fault" => match action {
@@ -456,6 +456,13 @@ mod tests {
             "introspect",
             "coverage",
             "introspect.coverage",
+            false,
+            false,
+        ),
+        (
+            "introspect",
+            "command_catalog",
+            "introspect.command_catalog",
             false,
             false,
         ),
