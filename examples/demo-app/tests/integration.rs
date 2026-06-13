@@ -224,8 +224,15 @@ e2e_test!(settings_cross_boundary, |client| async move {
 
 e2e_test!(ipc_integrity_check, |client| async move {
     let report = client.check_ipc_integrity().await.unwrap();
+    // INTEGRITY = round-trip soundness: only *stale* (never-returned) calls are
+    // unhealthy. A command that returned an Err is still a healthy round-trip, so
+    // `check_ipc_integrity` deliberately lets only stale calls flip `healthy` (see
+    // the tool in mcp/mod.rs). The demo-app's own `contact_form_validation_errors`
+    // test drives one deliberately-errored frontend IPC call into the shared log,
+    // so asserting `error_count == 0` contradicts that contract and fails even on a
+    // perfectly sound IPC layer (regression: it red'd E2E on every main push).
     assert!(report["healthy"].as_bool().unwrap());
-    assert_eq!(report["error_count"].as_u64().unwrap(), 0);
+    assert_eq!(report["stale_count"].as_u64().unwrap(), 0);
 });
 
 e2e_test!(command_registry_populated, |client| async move {
