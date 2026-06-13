@@ -88,6 +88,11 @@ fn extract_inner_code(script: &str) -> String {
 
 impl WebviewBridge for CallbackMockBridge {
     fn eval_webview(&self, _label: Option<&str>, script: &str) -> Result<(), String> {
+        // Answer the pre-eval liveness probe so this mock behaves like a healthy
+        // webview and the real eval proceeds (otherwise the probe times out ~2s).
+        if common::answer_liveness_probe(script, &self.pending_evals) {
+            return Ok(());
+        }
         // The eval wrapper carries the result envelope marker `__victauri_ok`; the
         // parse-watchdog companion script injected alongside it does not. Skip the
         // watchdog here, exactly as a real webview only fires the watchdog's callback via
@@ -2638,6 +2643,73 @@ async fn callback_mock_ghost_commands_detected() {
     assert!(
         v["frontend_only"].as_array().unwrap().is_empty(),
         "neither command is a weak candidate (one verified, one confirmed): {text}"
+    );
+}
+
+#[tokio::test]
+async fn introspect_command_catalog_merges_ipc_shapes_with_registry() {
+    // The live gap this closes: an app without #[inspectable] (e.g. 4DA) exposes 379
+    // commands whose registry entries are all-null — names with no call/return schema.
+    // `command_catalog` mines the IPC log for each command's inferred arg/result SHAPE
+    // and merges it with the registry, so an agent learns how to drive the commands.
+    let state = test_state();
+    state.registry.register(CommandInfo::new("registered_only"));
+
+    let base = start_callback_server(state, &["main"], |code| {
+        // The catalog projection is the only eval carrying `arg_shape`; answer it with a
+        // synthetic IPC-derived catalog (one observed command with an inferred arg shape).
+        if code.contains("arg_shape") {
+            r#"[{"command":"open_url","call_count":7,"error_count":0,"last_status":"ok","arg_shape":{"url":"string"},"result_shape":"null"}]"#.to_string()
+        } else {
+            "null".to_string()
+        }
+    })
+    .await;
+
+    let (client, session_id) = mcp_session(&base).await;
+    let body = mcp_call_tool(
+        &client,
+        &base,
+        &session_id,
+        "introspect",
+        serde_json::json!({"action": "command_catalog"}),
+    )
+    .await;
+
+    let envelope = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .find(|s| !s.trim().is_empty())
+        .expect("SSE data frame");
+    let env: serde_json::Value = serde_json::from_str(envelope).unwrap();
+    let text = env["result"]["content"][0]["text"]
+        .as_str()
+        .expect("tool result text");
+    let v: serde_json::Value = serde_json::from_str(text).unwrap();
+
+    assert_eq!(
+        v["observed_count"], 1,
+        "one command seen on the wire: {text}"
+    );
+    assert_eq!(v["registered_count"], 1, "one registered command: {text}");
+    let cat = v["catalog"].as_array().expect("catalog array");
+
+    let open = cat
+        .iter()
+        .find(|c| c["command"] == "open_url")
+        .unwrap_or_else(|| panic!("open_url missing: {text}"));
+    assert_eq!(open["observed"], true);
+    assert_eq!(open["call_count"], 7);
+    // The agent-facing payoff: the inferred argument schema mined from real traffic.
+    assert_eq!(open["arg_shape"]["url"], "string");
+
+    let reg = cat
+        .iter()
+        .find(|c| c["command"] == "registered_only")
+        .unwrap_or_else(|| panic!("registered_only missing: {text}"));
+    assert_eq!(
+        reg["observed"], false,
+        "a registered-but-unseen command is part of the surface, flagged unobserved: {text}"
     );
 }
 

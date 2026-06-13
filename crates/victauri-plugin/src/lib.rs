@@ -740,6 +740,12 @@ impl VictauriBuilder {
                     startup_timeline.mark("registry_created");
                     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
+                    // Resolve configured db search paths against multiple anchors so a
+                    // CWD-relative path (e.g. 4DA's "../data", relative to src-tauri/) is
+                    // found regardless of the launch CWD — the binary usually runs from
+                    // target/debug/, so CWD-only resolution silently misses the database.
+                    let db_search_paths = resolve_db_search_paths(&db_search_paths);
+
                     let state = Arc::new(VictauriState {
                         event_log,
                         registry,
@@ -1006,6 +1012,71 @@ fn emit_security_banner(port: u16) {
 /// Setting the `VICTAURI_DISABLE=1` environment variable forces the no-op plugin
 /// even in a debug build — a hard kill-switch for shared environments or a release
 /// profile compiled with `debug-assertions = true`. When the server does activate
+/// Resolve configured `db_search_paths` against multiple stable anchors so a
+/// relative path is found regardless of the launch CWD.
+///
+/// Real apps register CWD-relative paths — e.g. 4DA's `../data` is relative to
+/// `src-tauri/` — but the binary usually runs from `target/debug/` or a bundle,
+/// so resolving only against the current directory silently misses the database
+/// (the single most valuable backend surface). We resolve each relative path
+/// against the CWD **and every ancestor of the executable**, keeping each
+/// candidate that exists as a directory. Absolute paths pass through. The result
+/// is deduped canonical directories.
+fn resolve_db_search_paths(configured: &[std::path::PathBuf]) -> Vec<std::path::PathBuf> {
+    resolve_db_search_paths_against(configured, &db_search_anchors())
+}
+
+/// Collect stable anchor directories for resolving relative db search paths: the
+/// CWD plus every ancestor of the executable.
+fn db_search_anchors() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let mut anchors: Vec<PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        anchors.push(cwd);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent().map(PathBuf::from);
+        // Walk up the executable's ancestors (target/debug -> target -> src-tauri
+        // -> project root -> ...), so a path relative to any of them resolves.
+        for _ in 0..8 {
+            match dir {
+                Some(d) => {
+                    anchors.push(d.clone());
+                    dir = d.parent().map(PathBuf::from);
+                }
+                None => break,
+            }
+        }
+    }
+    anchors
+}
+
+/// Pure core (testable): resolve each configured path against the given anchors,
+/// keeping every candidate that exists as a directory. Absolute paths pass
+/// through. Result is deduped canonical directories.
+fn resolve_db_search_paths_against(
+    configured: &[std::path::PathBuf],
+    anchors: &[std::path::PathBuf],
+) -> Vec<std::path::PathBuf> {
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for p in configured {
+        if p.is_absolute() {
+            out.push(p.canonicalize().unwrap_or_else(|_| p.clone()));
+        } else {
+            for a in anchors {
+                if let Ok(c) = a.join(p).canonicalize()
+                    && c.is_dir()
+                {
+                    out.push(c);
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// it always logs a prominent startup banner, so it can never run silently.
 ///
 /// For custom configuration, use `VictauriBuilder::new().port(8080).build()`.
@@ -1039,6 +1110,61 @@ pub fn init_auto_discover<R: Runtime>() -> TauriPlugin<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_search_resolves_relative_path_via_a_non_cwd_anchor() {
+        // Reproduces the live-4DA gap: the DB lives under one anchor (e.g. the
+        // project dir) via a relative path, but the process CWD is elsewhere
+        // (e.g. target/debug). Multi-anchor resolution must still find it.
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("myapp");
+        let data = project.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("app.db"), b"x").unwrap();
+        // Simulate the binary running from project/src-tauri/target/debug: the CWD
+        // anchor (an unrelated dir) does NOT contain "../data", but the
+        // "src-tauri" ancestor does.
+        let wrong_cwd = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&wrong_cwd).unwrap();
+        let src_tauri = project.join("src-tauri");
+        std::fs::create_dir_all(&src_tauri).unwrap();
+
+        let configured = vec![PathBuf::from("../data")]; // 4DA's exact config
+        // CWD-only resolution (the old behavior) finds nothing:
+        let cwd_only =
+            resolve_db_search_paths_against(&configured, std::slice::from_ref(&wrong_cwd));
+        assert!(
+            cwd_only.is_empty(),
+            "CWD-only should miss the db, got {cwd_only:?}"
+        );
+        // Multi-anchor resolution (CWD + the src-tauri ancestor) finds it:
+        let multi = resolve_db_search_paths_against(&configured, &[wrong_cwd, src_tauri]);
+        let want = data.canonicalize().unwrap();
+        assert!(
+            multi.contains(&want),
+            "multi-anchor should resolve ../data to {want:?}, got {multi:?}"
+        );
+    }
+
+    #[test]
+    fn db_search_passes_absolute_and_dedups() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let abs = data.canonicalize().unwrap();
+        // Same dir reachable two ways must dedupe to one canonical entry.
+        let out = resolve_db_search_paths_against(
+            &[abs.clone(), PathBuf::from("data")],
+            &[tmp.path().to_path_buf(), tmp.path().to_path_buf()],
+        );
+        assert_eq!(
+            out.iter().filter(|p| **p == abs).count(),
+            1,
+            "must dedupe: {out:?}"
+        );
+    }
 
     #[test]
     fn builder_default_values() {

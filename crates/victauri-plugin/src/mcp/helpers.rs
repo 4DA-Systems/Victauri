@@ -335,6 +335,159 @@ pub fn ipc_timing_stats(entries: &[serde_json::Value]) -> Vec<serde_json::Value>
     out
 }
 
+/// JS projection that mines the live IPC log into a per-command **catalog** of
+/// argument and result *shapes* — the data an app's `generate_handler!` set exposes
+/// at runtime but `#[inspectable]`-free apps never put in the registry (4DA: 379
+/// commands, every schema field null).
+///
+/// Shapes are inferred **in JS** and bounded (depth- and key-capped, primitives
+/// reduced to their `typeof`, arrays to a single element shape) so the payload stays
+/// tiny regardless of how large the real argument/result bodies are — the same
+/// busy-app eval-cap failure that bit `coverage`/ghost-detection is structurally
+/// avoided here (we never ship the bodies, only their structure).
+///
+/// Per command it captures: `call_count`, `error_count`, `last_status`, the first
+/// observed `arg_shape`, and the first **successful** `result_shape` (falling back to
+/// any result when no success was seen).
+#[must_use]
+pub fn ipc_catalog_projection_js() -> String {
+    // NB: kept as one returned expression so `eval_with_return` wraps it correctly.
+    "return (function(){\
+        var MAXD = 5, MAXK = 60;\
+        function shape(v, d){\
+            if (v === null) return 'null';\
+            if (v === undefined) return 'undefined';\
+            if (d >= MAXD) return '\u{2026}';\
+            if (Array.isArray(v)) return v.length ? { items: shape(v[0], d+1) } : 'array(empty)';\
+            if (typeof v === 'object'){\
+                var o = {}, n = 0;\
+                for (var k in v){\
+                    if (!Object.prototype.hasOwnProperty.call(v,k)) continue;\
+                    if (n++ >= MAXK){ o['\u{2026}'] = 'more'; break; }\
+                    o[k] = shape(v[k], d+1);\
+                }\
+                return o;\
+            }\
+            return typeof v;\
+        }\
+        var log = window.__VICTAURI__ && window.__VICTAURI__.getIpcLog ? (window.__VICTAURI__.getIpcLog() || []) : [];\
+        var cat = {};\
+        for (var i = 0; i < log.length; i++){\
+            var e = log[i]; if (!e || !e.command) continue;\
+            var c = cat[e.command] || (cat[e.command] = { command: e.command, call_count: 0, error_count: 0, arg_shape: null, result_shape: null, last_status: null });\
+            c.call_count++;\
+            var isErr = (e.status && e.status !== 'ok') || (e.error != null);\
+            if (isErr) c.error_count++;\
+            c.last_status = e.status || (isErr ? 'error' : 'ok');\
+            if (c.arg_shape === null && e.args !== undefined) c.arg_shape = shape(e.args, 0);\
+            if (c.result_shape === null && !isErr && e.result !== undefined) c.result_shape = shape(e.result, 0);\
+        }\
+        for (var j = 0; j < log.length; j++){\
+            var e2 = log[j]; if (!e2 || !e2.command) continue;\
+            var c2 = cat[e2.command];\
+            if (c2 && c2.result_shape === null && e2.result !== undefined) c2.result_shape = shape(e2.result, 0);\
+        }\
+        return Object.keys(cat).map(function(k){ return cat[k]; });\
+    })()"
+        .to_string()
+}
+
+/// Merge an IPC-derived command catalog (from [`ipc_catalog_projection_js`]) with the
+/// `#[inspectable]` registry into a single, agent-facing catalog.
+///
+/// Every command is emitted once. IPC-observed commands carry their live
+/// `call_count`/`error_count`/`last_status` and inferred `arg_shape`/`result_shape`;
+/// commands known only to the registry are emitted with `observed: false` so an agent
+/// still sees the full command surface. Any registry metadata (`description`,
+/// `intent`, declared `args`, `return_type`) is attached when present. Sorted by
+/// observed call count (busiest first), then name.
+#[must_use]
+pub fn merge_command_catalog(
+    ipc_entries: &[serde_json::Value],
+    registry: &[victauri_core::CommandInfo],
+) -> Vec<serde_json::Value> {
+    use std::collections::BTreeMap;
+
+    // registry name -> info, for metadata enrichment + the unobserved tail.
+    let reg: BTreeMap<&str, &victauri_core::CommandInfo> =
+        registry.iter().map(|c| (c.name.as_str(), c)).collect();
+
+    let mut out: Vec<serde_json::Value> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+    for e in ipc_entries {
+        let Some(name) = e.get("command").and_then(|c| c.as_str()) else {
+            continue;
+        };
+        seen.insert(name.to_string());
+        let mut entry = serde_json::json!({
+            "command": name,
+            "observed": true,
+            "call_count": e.get("call_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            "error_count": e.get("error_count").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            "last_status": e.get("last_status").cloned().unwrap_or(serde_json::Value::Null),
+            "arg_shape": e.get("arg_shape").cloned().unwrap_or(serde_json::Value::Null),
+            "result_shape": e.get("result_shape").cloned().unwrap_or(serde_json::Value::Null),
+        });
+        attach_registry_metadata(&mut entry, reg.get(name).copied());
+        out.push(entry);
+    }
+
+    // Registry commands never seen on the wire — still part of the command surface.
+    for info in registry {
+        if seen.contains(&info.name) {
+            continue;
+        }
+        let mut entry = serde_json::json!({
+            "command": info.name,
+            "observed": false,
+            "call_count": 0,
+        });
+        attach_registry_metadata(&mut entry, Some(info));
+        out.push(entry);
+    }
+
+    out.sort_by(|a, b| {
+        let ca = a
+            .get("call_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let cb = b
+            .get("call_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        cb.cmp(&ca).then_with(|| {
+            a.get("command")
+                .and_then(serde_json::Value::as_str)
+                .cmp(&b.get("command").and_then(serde_json::Value::as_str))
+        })
+    });
+    out
+}
+
+/// Attach non-empty `#[inspectable]` registry metadata (description, intent, declared
+/// args, return type) to a catalog entry, when the command is registered with it.
+fn attach_registry_metadata(
+    entry: &mut serde_json::Value,
+    info: Option<&victauri_core::CommandInfo>,
+) {
+    let (Some(obj), Some(info)) = (entry.as_object_mut(), info) else {
+        return;
+    };
+    if let Some(d) = &info.description {
+        obj.insert("description".into(), serde_json::json!(d));
+    }
+    if let Some(i) = &info.intent {
+        obj.insert("intent".into(), serde_json::json!(i));
+    }
+    if !info.args.is_empty() {
+        obj.insert("declared_args".into(), serde_json::json!(info.args));
+    }
+    if let Some(rt) = &info.return_type {
+        obj.insert("declared_return".into(), serde_json::json!(rt));
+    }
+}
+
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![Content::text(json)]),
@@ -680,6 +833,89 @@ mod injected_css_tests {
         // A legitimately-escaped local content value must still pass.
         assert!(sanitize_injected_css("a::before{content:'\\2022'}", false).is_ok());
         assert!(sanitize_injected_css("body{color:red}", false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod command_catalog_tests {
+    use super::merge_command_catalog;
+    use serde_json::json;
+    use victauri_core::CommandInfo;
+
+    fn entry(v: &serde_json::Value, name: &str) -> serde_json::Value {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["command"] == json!(name))
+            .unwrap_or_else(|| panic!("no catalog entry for {name}"))
+            .clone()
+    }
+
+    #[test]
+    fn observed_commands_carry_shapes_and_stats_and_sort_by_call_count() {
+        // Two commands seen on the wire; the busier one must sort first.
+        let ipc = vec![
+            json!({
+                "command": "get_settings", "call_count": 4, "error_count": 0,
+                "last_status": "ok",
+                "arg_shape": "null",
+                "result_shape": { "license": "object", "llm": { "model": "string" } },
+            }),
+            json!({
+                "command": "open_url", "call_count": 9, "error_count": 1,
+                "last_status": "ok",
+                "arg_shape": { "url": "string" }, "result_shape": "null",
+            }),
+        ];
+        let out = merge_command_catalog(&ipc, &[]);
+        assert_eq!(out.len(), 2);
+        // Busiest first.
+        assert_eq!(out[0]["command"], json!("open_url"));
+        assert_eq!(out[0]["observed"], json!(true));
+        assert_eq!(out[0]["call_count"], json!(9));
+        assert_eq!(out[0]["error_count"], json!(1));
+        // The inferred arg shape is preserved verbatim — this is the agent-facing payoff.
+        assert_eq!(out[0]["arg_shape"], json!({ "url": "string" }));
+        let gs = entry(&json!(out), "get_settings");
+        assert_eq!(gs["result_shape"]["llm"]["model"], json!("string"));
+    }
+
+    #[test]
+    fn registered_but_unobserved_commands_are_included_with_metadata() {
+        // A command in the #[inspectable] registry but never seen on the wire must still
+        // appear (full command surface), flagged observed:false, with its metadata.
+        let info = CommandInfo::new("rare_command")
+            .with_description("does a rare thing")
+            .with_intent("do the rare thing");
+        let out = merge_command_catalog(&[], std::slice::from_ref(&info));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["command"], json!("rare_command"));
+        assert_eq!(out[0]["observed"], json!(false));
+        assert_eq!(out[0]["call_count"], json!(0));
+        assert_eq!(out[0]["description"], json!("does a rare thing"));
+        assert_eq!(out[0]["intent"], json!("do the rare thing"));
+        // No IPC-inferred shape for an unobserved command.
+        assert!(out[0].get("arg_shape").is_none());
+    }
+
+    #[test]
+    fn observed_command_is_enriched_with_registry_metadata_not_duplicated() {
+        // Same command both observed AND registered → ONE entry, observed, with the
+        // inferred shape PLUS the registry's authoritative declared metadata.
+        let ipc = vec![json!({
+            "command": "greet", "call_count": 2, "error_count": 0, "last_status": "ok",
+            "arg_shape": { "name": "string" }, "result_shape": "string",
+        })];
+        let info = CommandInfo::new("greet").with_description("greets a user");
+        let out = merge_command_catalog(&ipc, std::slice::from_ref(&info));
+        assert_eq!(
+            out.len(),
+            1,
+            "must not duplicate an observed+registered command"
+        );
+        assert_eq!(out[0]["observed"], json!(true));
+        assert_eq!(out[0]["arg_shape"], json!({ "name": "string" }));
+        assert_eq!(out[0]["description"], json!("greets a user"));
     }
 }
 

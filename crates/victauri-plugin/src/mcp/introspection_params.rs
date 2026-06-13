@@ -12,6 +12,11 @@ pub enum IntrospectAction {
     /// Report which registered commands have been called during this session. Also
     /// returns `ipc_calls_observed` and `invoked_not_registered` from the live IPC log.
     Coverage,
+    /// Build a command catalog by mining the live IPC log for each command's argument
+    /// and result *shapes*, merged with the `#[inspectable]` registry. Gives an agent
+    /// real call/return schemas for an app's commands even when the app does not use
+    /// `#[inspectable]` (the registry would otherwise be names-only).
+    CommandCatalog,
     /// Record the current response shape of a command as a baseline contract.
     ContractRecord,
     /// Check all recorded contracts for schema drift.

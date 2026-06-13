@@ -64,6 +64,11 @@ fn extract_eval_id(script: &str) -> Option<String> {
 
 impl WebviewBridge for CallbackMockBridge {
     fn eval_webview(&self, _label: Option<&str>, script: &str) -> Result<(), String> {
+        // Answer the pre-eval liveness probe so this mock behaves like a healthy
+        // webview and the real eval proceeds (otherwise the probe times out ~2s).
+        if common::answer_liveness_probe(script, &self.pending_evals) {
+            return Ok(());
+        }
         // Skip the parse-watchdog companion script (no `__victauri_ok` marker); only the
         // real eval wrapper produces a result, mirroring a real webview.
         if !script.contains("__victauri_ok") {
@@ -350,14 +355,16 @@ async fn concurrent_20_tool_calls() {
 async fn concurrent_10_eval_calls() {
     let state = test_state();
     let base = start_callback_server(state, &["main"], |_| "\"ok\"".to_string()).await;
-    let (client, sid) = mcp_session(&base).await;
 
+    // One session per task — a single stateful session multiplexed across
+    // concurrent POSTs stalls each SSE response until the session keep-alive
+    // elapses (`resp.text()` blocks minutes); `concurrent_5_sessions` proves
+    // separate sessions return in ms. Real concurrency is multi-client anyway.
     let mut handles = Vec::new();
     for i in 0..10 {
-        let c = client.clone();
         let u = base.clone();
-        let s = sid.clone();
         handles.push(tokio::spawn(async move {
+            let (c, s) = mcp_session(&u).await;
             let body = call_tool(
                 &c,
                 &u,

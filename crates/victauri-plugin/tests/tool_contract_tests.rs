@@ -64,6 +64,11 @@ fn extract_eval_id(script: &str) -> Option<String> {
 
 impl WebviewBridge for CallbackMockBridge {
     fn eval_webview(&self, _label: Option<&str>, script: &str) -> Result<(), String> {
+        // Answer the pre-eval liveness probe so this mock behaves like a healthy
+        // webview and the real eval proceeds (otherwise the probe times out ~2s).
+        if common::answer_liveness_probe(script, &self.pending_evals) {
+            return Ok(());
+        }
         // Skip the parse-watchdog companion script (no `__victauri_ok` marker); only the
         // real eval wrapper produces a result, mirroring a real webview.
         if !script.contains("__victauri_ok") {

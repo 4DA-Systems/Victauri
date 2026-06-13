@@ -66,6 +66,11 @@ fn extract_eval_id(script: &str) -> Option<String> {
 
 impl WebviewBridge for CallbackMockBridge {
     fn eval_webview(&self, _label: Option<&str>, script: &str) -> Result<(), String> {
+        // Answer the pre-eval liveness probe so this mock behaves like a healthy
+        // webview and the real eval proceeds (otherwise the probe times out ~2s).
+        if common::answer_liveness_probe(script, &self.pending_evals) {
+            return Ok(());
+        }
         // Skip the parse-watchdog companion script (no `__victauri_ok` marker); only the
         // real eval wrapper produces a result, mirroring a real webview.
         if !script.contains("__victauri_ok") {
@@ -1459,14 +1464,18 @@ async fn concurrent_10_sessions_window_list() {
 async fn concurrent_eval_unique_uuids() {
     let state = test_state();
     let base = start_callback_server(state, &["main"], |_| "\"ok\"".to_string()).await;
-    let (client, sid) = mcp_session(&base).await;
 
+    // Each task uses its OWN MCP session. A single stateful session multiplexed
+    // across concurrent POSTs leaves each request's SSE response stream open until
+    // the session keep-alive elapses, so `resp.text()` blocks for minutes — a
+    // transport artifact of sharing one session, NOT a server limit
+    // (`concurrent_5_sessions` returns in ms). Real multi-client concurrency uses a
+    // session per client, which is what this exercises.
     let mut handles = Vec::new();
     for i in 0..10 {
-        let c = client.clone();
         let u = base.clone();
-        let s = sid.clone();
         handles.push(tokio::spawn(async move {
+            let (c, s) = mcp_session(&u).await;
             let body = call_tool(
                 &c,
                 &u,
@@ -1490,14 +1499,14 @@ async fn concurrent_eval_unique_uuids() {
 async fn concurrent_tool_invocation_counter() {
     let state = test_state();
     let base = start_server(state.clone(), &["main"]).await;
-    let (client, sid) = mcp_session(&base).await;
 
+    // One session per task — see `concurrent_eval_unique_uuids` for why a shared
+    // stateful session stalls concurrent SSE responses.
     let mut handles = Vec::new();
     for _ in 0..50 {
-        let c = client.clone();
         let u = base.clone();
-        let s = sid.clone();
         handles.push(tokio::spawn(async move {
+            let (c, s) = mcp_session(&u).await;
             call_tool(&c, &u, &s, "window", json!({"action": "list"})).await;
         }));
     }
@@ -1646,7 +1655,6 @@ async fn concurrent_rapid_session_creation() {
 async fn concurrent_mixed_tool_types() {
     let state = test_state();
     let base = start_server(state, &["main"]).await;
-    let (client, sid) = mcp_session(&base).await;
 
     let tools_and_args: Vec<(&str, serde_json::Value)> = vec![
         ("window", json!({"action": "list"})),
@@ -1656,15 +1664,16 @@ async fn concurrent_mixed_tool_types() {
         ("resolve_command", json!({"query": "test"})),
     ];
 
+    // One session per task — see `concurrent_eval_unique_uuids` for why a shared
+    // stateful session stalls concurrent SSE responses.
     let mut handles = Vec::new();
     for (tool, args) in &tools_and_args {
         for _ in 0..5 {
-            let c = client.clone();
             let u = base.clone();
-            let s = sid.clone();
             let tool = tool.to_string();
             let args = args.clone();
             handles.push(tokio::spawn(async move {
+                let (c, s) = mcp_session(&u).await;
                 let body = call_tool(&c, &u, &s, &tool, args).await;
                 assert!(
                     !body.is_empty(),
