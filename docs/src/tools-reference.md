@@ -655,6 +655,7 @@ Deep backend introspection — command performance profiling, IPC contract testi
 |--------|-----------|-------------|
 | `command_timings` | `slow_threshold_ms` | Per-command execution timing stats (min/max/avg/p95) |
 | `coverage` | — | Which registered commands have been called this session |
+| `command_catalog` | — | Per-command argument + result *shapes* mined from the live IPC log, merged with the registry — real call/return schemas even when the app doesn't use `#[inspectable]` (where `get_registry` is names-only) |
 | `contract_record` | `command`, `args` | Record a command's response shape as baseline |
 | `contract_check` | — | Check all recorded contracts for schema drift |
 | `contract_list` | — | List all recorded contract baselines |
@@ -672,6 +673,7 @@ Deep backend introspection — command performance profiling, IPC contract testi
 ```json
 {"action": "command_timings", "slow_threshold_ms": 100}
 {"action": "coverage"}
+{"action": "command_catalog"}
 {"action": "contract_record", "command": "get_settings"}
 {"action": "contract_check"}
 {"action": "startup_timing"}
