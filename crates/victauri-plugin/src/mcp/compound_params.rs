@@ -14,17 +14,6 @@ pub enum StorageType {
     Session,
 }
 
-impl StorageType {
-    /// Returns the JavaScript property name for this storage type.
-    #[must_use]
-    pub fn js_property(self) -> &'static str {
-        match self {
-            Self::Local => "localStorage",
-            Self::Session => "sessionStorage",
-        }
-    }
-}
-
 impl fmt::Display for StorageType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

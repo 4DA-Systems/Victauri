@@ -7,6 +7,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-06-14
+
+Driven by the scale-gauntlet cross-engine net and an exhaustive live sweep of 4DA
+(379 commands, 747 MB SQLite), then **validated end-to-end against 4DA rebuilt from
+source** (every fix proven inside the live process), and hardened by a GPT-5.5 adversarial
+audit before release.
+
+**Breaking (minor-version bump under 0.x).** The tool-OUTPUT schemas and runtime behaviour
+are backward-compatible — agents/MCP clients need no change. The break is a Rust public-API
+cleanup: internal MCP protocol types are no longer re-exported, so a path-dependency on
+`victauri-plugin` must move from `"0.7"` to `"0.8"`. See MIGRATION.md.
+
+### Changed (breaking)
+
+- **MCP tool *parameter* types are no longer public API.** The `*Params` / action enums
+  (e.g. `IntrospectAction`, `EvalJsParams`) were re-exported from `victauri_plugin::mcp::*`;
+  they are an internal protocol surface deserialized from JSON, used only by this crate's
+  private tool methods, and they change every release. They are now `pub(crate)`, so adding
+  a tool action or field is no longer a (mechanical) breaking change and `cargo
+  semver-checks` stays meaningful for the plugin. No consumer used these types.
+- **`introspection::TimingSamples` is now crate-private** and the unbounded `pub samples:
+  Vec<Duration>` field is gone — replaced by a bounded ring buffer (fixes an unbounded
+  per-command memory growth). `CommandTimings` and the other `introspection` types consumers
+  actually use remain public.
+- Consumers: bump the dependency requirement `victauri-plugin = "0.7"` → `"0.8"` (and
+  `victauri-test`). Nothing else changes.
+
+### Added
+
+- **`introspect command_catalog`** — mines the live IPC log for each command's argument
+  and result *shapes* (inferred in JS so response bodies never leave the webview), merged
+  with the `#[inspectable]` registry. Gives an agent real call/return schemas even when
+  the app does not use `#[inspectable]` (where `get_registry` returns names with null
+  schemas). Observed commands carry `call_count` / `error_count` / `last_status` plus
+  inferred `arg_shape` / `result_shape`; registry-only commands appear as `observed:false`.
+  `get_registry`'s description now points to it. (Live on 4DA: 34 observed commands with
+  real nested schemas.)
+
+### Fixed
+
+- **Cross-engine bridge correctness (WebKit).** Fixed Chromium/`WebView2`-only JS-bridge
+  assumptions that were silently wrong on `WKWebView` (macOS) / WebKitGTK (Linux): the IPC
+  scheme (`ipc://` vs `http://ipc.localhost`) and the perf APIs (`performance.memory` /
+  longtask / paint). A new cross-engine gauntlet (`examples/gauntlet-app` + battery) is a
+  **required CI gate on Linux and macOS** to prevent regressions.
+- **Bridge resilience.** The liveness probe now runs before every eval, including the
+  **default (unlabeled) window** — previously only labeled windows were proactively
+  probed, so the most common path hung the full eval timeout (~30 s) on first contact with
+  a reloaded/unready bridge. It now fails fast (~2 s) with a clear message. A hard
+  pending-eval capacity check runs **before** the probe.
+- **Database reachability.** Relative `db_search_paths` (e.g. `../data`) now resolve
+  against the launch CWD **and every executable ancestor**, so `query_db` /
+  `introspect db_health` find the database regardless of the directory the app was launched
+  from (binaries usually run from `target/debug/`). Live-proven: reached the 4DA database
+  from a `target/debug` CWD that defeats the old CWD-only resolution.
+- **Three correctness-under-load defects** surfaced by the robustness battery.
+
+### Security
+
+- **`introspect command_catalog` is gated per-action.** It maps to the
+  `introspect.command_catalog` capability (FullControl-only, like its sibling introspection
+  actions) and is pinned in the exhaustive `AUTHZ_SPEC` test, so
+  `disabled_tools: ["introspect.command_catalog"]` is honored — closing a per-action
+  authorization gap (the action would otherwise fall back to the bare `introspect`
+  capability) before it shipped.
+
+### Internal
+
+- Plugin test suite ~10–15 min → ~40 s: four concurrent tests shared one stateful MCP
+  session whose SSE responses stalled `resp.text()` ~300 s each; moved to per-task
+  sessions. 499 plugin tests green; clippy `--all-targets` / `--no-default-features` /
+  `--release -Dwarnings` / `fmt` clean across the matrix.
+
 ## [0.7.11] - 2026-06-08
 
 Driven by a real session driving **live 4DA**'s embedded Victauri 0.7.10. Six issues

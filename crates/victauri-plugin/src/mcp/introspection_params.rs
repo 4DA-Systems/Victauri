@@ -12,11 +12,6 @@ pub enum IntrospectAction {
     /// Report which registered commands have been called during this session. Also
     /// returns `ipc_calls_observed` and `invoked_not_registered` from the live IPC log.
     Coverage,
-    /// Build a command catalog by mining the live IPC log for each command's argument
-    /// and result *shapes*, merged with the `#[inspectable]` registry. Gives an agent
-    /// real call/return schemas for an app's commands even when the app does not use
-    /// `#[inspectable]` (the registry would otherwise be names-only).
-    CommandCatalog,
     /// Record the current response shape of a command as a baseline contract.
     ContractRecord,
     /// Check all recorded contracts for schema drift.
@@ -41,6 +36,14 @@ pub enum IntrospectAction {
     EventBus,
     /// Clear the event bus capture buffer.
     EventBusClear,
+    /// Build a command catalog by mining the live IPC log for each command's argument
+    /// and result *shapes*, merged with the `#[inspectable]` registry. Gives an agent
+    /// real call/return schemas for an app's commands even when the app does not use
+    /// `#[inspectable]` (the registry would otherwise be names-only).
+    ///
+    /// NOTE: kept LAST so adding it does not shift the discriminants of the existing
+    /// variants (serde matches by name, but a mid-enum insert is a needless semver break).
+    CommandCatalog,
 }
 
 /// Parameters for the `introspect` compound tool.
@@ -61,8 +64,10 @@ pub struct IntrospectParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub args: Option<serde_json::Value>,
 
-    /// For `db_health`: path to the `SQLite` database file.
+    /// For `db_health`: path to the `SQLite` database file. Read only by the
+    /// `sqlite`-gated db-health impl; accepted (and ignored) without that feature.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
     pub db_path: Option<String>,
 
     /// Target webview for actions that need JS eval.
@@ -158,8 +163,4 @@ pub struct ExplainParams {
     /// How many seconds to look back (default: 30 for summary, 5 for `last_action`, 10 for diff).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seconds: Option<u64>,
-
-    /// Target webview for JS eval (console/network log retrieval).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub webview_label: Option<String>,
 }

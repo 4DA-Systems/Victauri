@@ -85,7 +85,12 @@ pub struct ReadAppFileParams {
 }
 
 /// Parameters for the `query_db` tool.
+///
+/// The fields are consumed by the `sqlite`-gated query implementation; without that
+/// feature `query_db` is a stub that returns a clear error, so the fields are accepted
+/// (for a stable schema) but not read.
 #[derive(Debug, Deserialize, JsonSchema)]
+#[cfg_attr(not(feature = "sqlite"), allow(dead_code))]
 pub struct QueryDbParams {
     /// Path to the `SQLite` database file, relative to the app data directory.
     /// If omitted, Victauri auto-discovers `SQLite` databases in the app data directory.

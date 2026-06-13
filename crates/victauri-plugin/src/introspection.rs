@@ -39,9 +39,11 @@ pub struct CommandTimingStats {
 const MAX_TIMING_SAMPLES: usize = 1024;
 
 /// Accumulated timing data for a single command — bounded memory.
+///
+/// Internal accumulator behind `CommandTimings` (crate-private — never part of the public
+/// API, so its layout can evolve freely without a semver break).
 #[derive(Debug, Default)]
-#[non_exhaustive]
-pub struct TimingSamples {
+pub(crate) struct TimingSamples {
     /// Most-recent durations (ring, capped at `MAX_TIMING_SAMPLES`) for p95.
     recent: VecDeque<Duration>,
     /// Total invocations recorded (all time).

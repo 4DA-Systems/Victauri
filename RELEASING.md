@@ -12,7 +12,11 @@ fails loudly if any published version falls behind the repo.
 | `CARGO_REGISTRY_TOKEN` | core release → crates.io | crates.io API token |
 | `VSCE_PAT` | VS Code release → Marketplace | Azure DevOps PAT, *Marketplace → Manage* (publisher `4da-systems`) |
 | `OVSX_TOKEN` *(optional)* | VS Code release → Open VSX | open-vsx.org token (Cursor / VSCodium / agent IDEs) |
-| `NPM_TOKEN` | npm release | npmjs automation token, publish rights on `victauri-browser` |
+
+> **Browser mode was removed (2026-06-09).** The `victauri-browser` crate, the Chrome/Firefox
+> extensions, and the `@4da/victauri-browser` npm package are gone (crates.io yanked, npm
+> unpublished). Victauri is Tauri-only. The `NPM_TOKEN` secret and the browser/npm release
+> tracks below no longer exist.
 
 ## Before you tag — the pre-publish gate
 
@@ -39,9 +43,8 @@ to ~40 min, then requires success.)
 # edit CHANGELOG.md, commit
 git tag v0.8.0 && git push origin main --tags
 ```
-`release.yml`: test gate → cross-platform binaries (cli/browser-host/watchdog) →
-publish all 7 crates to crates.io in dependency order → GitHub Release. Chrome
-extension is zipped and attached.
+`release.yml`: test gate → cross-platform binaries (cli/watchdog) →
+publish the crates to crates.io in dependency order → GitHub Release.
 
 ## VS Code extension — `vscode-v*` (decoupled)
 
@@ -54,30 +57,15 @@ git commit -am "vscode: ..." && git tag vscode-v0.7.2 && git push origin main --
 Marketplace (+ Open VSX if `OVSX_TOKEN` set) → attach `.vsix` to a GitHub Release.
 Run it from the Actions tab with `dry_run=true` to build/package without publishing.
 
-## npm package — `npm-v*` (decoupled)
-
-```bash
-cd extensions/npm && npm version 0.7.2 --no-git-tag-version && cd ../..
-git commit -am "npm: ..." && git tag npm-v0.7.2 && git push origin main --tags
-```
-`release-npm.yml`: validate (`npm pack --dry-run`) → `npm publish`.
-
-## Browser extensions (Chrome / Firefox)
-
-Chrome is zipped on the core release. Publishing to the **Chrome Web Store** /
-**Firefox AMO** is currently **manual** (upload the zip in each store's dashboard) —
-these stores need per-store API credentials + review; automate later if the browser
-line is revived (it's currently frozen — see CLAUDE.md / strategy notes).
-
 ## Surface Audit (rot detector)
 
 `surface-audit.yml` runs **Mondays 09:00 UTC** (and on demand). It compares the repo
-version of each surface against what's actually published (crates.io, npm, VS Code
+version of each surface against what's actually published (crates.io, VS Code
 Marketplace), verifies the VS Code extension still builds, and **fails (emails you)**
 if anything drifted. This is what stops a repeat of the 0.2.0-vs-0.7.1 rot.
 
 ## Versioning rule
 
-The **core workspace** has one shared version (`bump-version.sh`). The extensions are
-**independent** — bump each one's own `package.json`/`manifest.json` only when it
-changes. Do not force-bump extensions on a core release (that's what caused rot).
+The **core workspace** has one shared version (`bump-version.sh`). The VS Code extension
+is **independent** — bump its own `package.json` only when it changes. Do not force-bump
+the extension on a core release (that's what caused rot).

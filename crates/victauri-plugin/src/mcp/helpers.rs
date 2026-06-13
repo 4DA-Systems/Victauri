@@ -360,7 +360,7 @@ pub fn ipc_catalog_projection_js() -> String {
             if (d >= MAXD) return '\u{2026}';\
             if (Array.isArray(v)) return v.length ? { items: shape(v[0], d+1) } : 'array(empty)';\
             if (typeof v === 'object'){\
-                var o = {}, n = 0;\
+                var o = Object.create(null), n = 0;\
                 for (var k in v){\
                     if (!Object.prototype.hasOwnProperty.call(v,k)) continue;\
                     if (n++ >= MAXK){ o['\u{2026}'] = 'more'; break; }\
@@ -371,7 +371,7 @@ pub fn ipc_catalog_projection_js() -> String {
             return typeof v;\
         }\
         var log = window.__VICTAURI__ && window.__VICTAURI__.getIpcLog ? (window.__VICTAURI__.getIpcLog() || []) : [];\
-        var cat = {};\
+        var cat = Object.create(null);\
         for (var i = 0; i < log.length; i++){\
             var e = log[i]; if (!e || !e.command) continue;\
             var c = cat[e.command] || (cat[e.command] = { command: e.command, call_count: 0, error_count: 0, arg_shape: null, result_shape: null, last_status: null });\
