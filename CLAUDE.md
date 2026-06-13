@@ -184,7 +184,43 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-06-08)
+## Current State (2026-06-14)
+
+### Cross-engine gauntlet + IPC command catalog + robustness (merged to main, PR #19; unreleased)
+
+Driven by the scale-gauntlet cross-engine net and an exhaustive live sweep of 4DA
+(com.4da.app, 379 commands, 747 MB SQLite), then **validated end-to-end against 4DA
+rebuilt from this branch** (all fixes proven inside the live process, not prototypes).
+Full CI matrix green (ubuntu/windows/macOS + gauntlet + live-app proof + semver + MSRV).
+
+- **`introspect command_catalog` (NEW action).** Mines the live IPC log for each
+  command's argument + result *shapes* (inferred in JS so bodies never ship —
+  structurally avoids the busy-app eval-cap blowup), merged with the `#[inspectable]`
+  registry. Gives an agent real call/return schemas even for apps that don't use
+  `#[inspectable]` (where `get_registry` is names-only — 4DA: 379 cmds, all-null).
+  Observed commands carry `call_count`/`error_count`/`last_status` +
+  `arg_shape`/`result_shape`; registry-only commands appear as `observed:false`.
+  `get_registry`'s description now points to it. Helpers `ipc_catalog_projection_js`
+  + `merge_command_catalog` (3 unit tests) + 1 integration test. Live on 4DA: 34
+  observed commands with real nested schemas.
+- **Bridge resilience.** The liveness probe now runs before EVERY eval, including the
+  DEFAULT (unlabeled) window — previously only labeled windows were proactively
+  probed, so the most common path hung the full eval timeout (~30s) on first contact
+  with a reloaded/unready bridge. Now fails fast (~2s). A hard pending-eval **capacity
+  check runs BEFORE the probe** so a saturated map returns the real cause, not a probe
+  timeout. Live: 0.01s healthy eval; ~7s fast-fail when the bridge was down.
+- **DB discovery.** Relative `db_search_paths` (e.g. 4DA's `../data`) now resolve
+  against the CWD **and every executable ancestor**, so the DB is found regardless of
+  launch CWD (binaries usually run from `target/debug/`). Live-proven: reached
+  `D:\4DA\data\4da.db` from a `target\debug` CWD that breaks the old CWD-only code.
+- **Cross-engine gauntlet (the net).** `examples/gauntlet-app` + battery, promoted to
+  a REQUIRED CI gate on Linux AND macOS (WKWebView). Caught + fixed Chromium/WebView2-
+  only JS-bridge assumptions silently wrong on WebKit: IPC scheme (`ipc://` vs
+  `http://ipc.localhost`), perf APIs (`performance.memory`/longtask/paint).
+- **Test infra.** Shared `answer_liveness_probe` so callback mock bridges answer the
+  new pre-eval probe; 4 concurrent tests moved off a shared stateful MCP session (SSE
+  stall ~300s each from `resp.text()` waiting for stream close) to per-task sessions —
+  full plugin suite ~10-15 min → ~40s. 499 plugin tests green; clippy + fmt clean.
 
 ### v0.7.11 — in-the-wild fixes from a live 4DA MCP session (6 issues, no shortcuts)
 
@@ -671,7 +707,7 @@ Tested against 4 third-party open-source Tauri 2 apps with fully built frontends
 - **victauri-macros**: `#[inspectable]` proc macro with `description`, `intent`, `category`, `example` attributes. Uses proper `syn::meta` parsing (not string matching). Generates `<fn>__schema()` returning `CommandInfo` with full intent metadata. 4 integration tests.
 - **victauri-plugin**: Full MCP server with **35 tools** + 3 resources. Tools organized by category:
   - **Standalone (20)**: eval_js, dom_snapshot, find_elements, invoke_command, screenshot, verify_state, detect_ghost_commands, check_ipc_integrity, wait_for (text/selector/url/ipc_idle/network_idle + **expression**/**event** for awaiting async backend work), assert_semantic, resolve_command, get_registry, **app_state** (app-defined backend-state probes), get_memory_stats, get_plugin_info, get_diagnostics, app_info, list_app_dir, read_app_file, query_db
-  - **Compound (15)**: interact (click/hover/focus/scroll/select), input (fill/type/press_key), window (get_state/list/manage/resize/move/set_title), storage (get/set/delete/cookies), navigate (go_to/back/history/dialogs), recording (start/stop/checkpoint/events/export/import/replay), inspect (styles/bounds/highlight/a11y/perf), css (inject/remove), route (network interception), trace (screencast ring buffer), animation (list/scrub/sample), logs (console/network/ipc/navigation/dialogs/events/slow_ipc), **introspect** (command_timings/coverage/contract_record/contract_check/contract_list/contract_clear/startup_timing/capabilities/db_health/plugin_state/processes/plugin_tasks/event_bus/event_bus_clear), **fault** (inject/list/clear/clear_all), **explain** (summary/last_action/diff)
+  - **Compound (15)**: interact (click/hover/focus/scroll/select), input (fill/type/press_key), window (get_state/list/manage/resize/move/set_title), storage (get/set/delete/cookies), navigate (go_to/back/history/dialogs), recording (start/stop/checkpoint/events/export/import/replay), inspect (styles/bounds/highlight/a11y/perf), css (inject/remove), route (network interception), trace (screencast ring buffer), animation (list/scrub/sample), logs (console/network/ipc/navigation/dialogs/events/slow_ipc), **introspect** (command_timings/coverage/command_catalog/contract_record/contract_check/contract_list/contract_clear/startup_timing/capabilities/db_health/plugin_state/processes/plugin_tasks/event_bus/event_bus_clear), **fault** (inject/list/clear/clear_all), **explain** (summary/last_action/diff)
   Resources: victauri://ipc-log, victauri://windows, victauri://state with subscribe/unsubscribe. JS bridge v0.7.8 with IPC interception, network monitoring, storage access, navigation tracking, dialog capture, extended interactions, and waitFor. `EventRecorder` with 50,000 event capacity. **Release-safe**: `init()` returns a no-op plugin in release builds via `#[cfg(debug_assertions)]` gate. `VictauriBuilder` for port/capacity/auth configuration + `VICTAURI_PORT`/`VICTAURI_AUTH_TOKEN` env vars. Bearer token auth middleware (**enabled by default** with auto-generated UUID v4 token, case-insensitive per RFC 7235). `auth_disabled()` to opt out, or `auth_token("...")` for a fixed token. Token-bucket rate limiter (AtomicU64, 1000 req/sec default). Privacy layer with command allowlists/blocklists, tool disabling, regex-based output redaction, strict mode. Tool enable/disable via builder. 203 unit tests + 128 integration tests + 38 adversarial tests + 85 tool contract tests + 30 bridge tests + 22 stress tests + 19 platform tests.
 - **victauri-test**: Typed MCP HTTP client (`VictauriClient`) with auto-session management (initialize + notifications/initialized). 23 convenience methods for tool calls (eval_js, dom_snapshot, click, fill, etc). 6 standalone assertion helpers: `assert_json_eq`, `assert_json_truthy`, `assert_no_a11y_violations`, `assert_performance_budget`, `assert_ipc_healthy`, `assert_state_matches`. 11 client assertion methods: `assert_eval_works`, `assert_dom_snapshot_valid`, `assert_screenshot_ok`, `assert_windows_exist`, `assert_ipc_integrity_ok`, `assert_accessible`, `assert_dom_complete_under`, `assert_heap_under_mb`, `assert_no_uncaught_errors`, `assert_recording_lifecycle`, `assert_health_hardened`. Built-in `smoke_test()` suite (11 checks, returns `SmokeReport` with timing + JUnit XML). `SmokeConfig` for custom thresholds. Supports Bearer token auth via `connect_with_token`. Published to crates.io as standalone crate.
 - **victauri-cli**: CLI binary (`victauri`) with 8 commands: `init` (scaffold test directory + CLAUDE.md with agent instructions), `check` (server diagnostics), `test` (built-in smoke suite — 11 checks with pass/fail + JUnit XML), `record` (capture interactions → test file), `doctor` (full setup diagnosis), `watch` (file watcher → re-run tests), `invoke` (call any Tauri IPC command from terminal), `coverage` (IPC command coverage report). `victauri test` auto-discovers the running app, runs all smoke checks, prints a summary, exits 0/1 for CI. Configurable `--max-load-ms` and `--max-heap-mb` thresholds. `victauri init` creates/appends CLAUDE.md with instructions that make AI agents prefer Victauri over CDP/Playwright.
