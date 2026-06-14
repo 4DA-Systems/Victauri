@@ -92,6 +92,7 @@ pub struct SemanticAssertParams {
     #[serde(default)]
     pub expected: serde_json::Value,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -119,6 +120,7 @@ pub struct WaitForParams {
     /// this call is not missed. Default: 2000.
     pub since_ms: Option<u64>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -165,6 +167,7 @@ pub struct FindElementsParams {
     /// Filter by enabled state.
     pub enabled: Option<bool>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -172,6 +175,7 @@ pub struct FindElementsParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct DiagnosticsParams {
     /// Target a specific webview window by label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 

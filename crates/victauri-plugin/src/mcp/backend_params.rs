@@ -41,6 +41,7 @@ pub struct InvokeCommandParams {
     #[serde(default, deserialize_with = "deserialize_optional_object")]
     pub args: Option<serde_json::Value>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
