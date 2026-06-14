@@ -200,11 +200,13 @@ request), constantly, even idle. 0.7.11 drained only the default window (≈1/s,
 `recorder.is_recording()`** — zero idle eval-callback churn → the reload race can't be amplified by
 background activity. `explain`/`event_bus` JS events now require an active recording (documented
 trade-off; the continuous capture WAS the churn). Regression test now reloads the webview while
-introspecting (the trigger the 0.8.1 test failed to exercise). **The definitive proof is an extended
-4DA dogfood soak with the bridge ENABLED (not `VICTAURI_DISABLE=1`) — handed to the dogfood terminal;
-a short clean window is NOT proof for an intermittent race.** Secondary amplifier not yet touched:
-the probe-before-every-eval doubles on-demand (tool-call) eval churn — left for a follow-up if soak
-still shows residual.
+introspecting (the trigger the 0.8.1 test failed to exercise). **VERIFIED FIXED (2026-06-15) by an
+extended 4DA dogfood soak with the bridge ENABLED: `tauri dev` parent process alive 89 min continuous
++ a clean 30-iteration soak, 0 crashes (0.8.0 died in 1-2 cycles, 0.8.1 in ~10-15 min). 4DA now runs
+with full bridge introspection — no `VICTAURI_DISABLE=1`.** (A short clean window is NOT proof for an
+intermittent race — use the reliable crash signal: the `tauri dev` PARENT process liveness via
+`Get-Process`, not the bare child / WER / `tasklist /FI`.) The secondary probe-before-every-eval
+amplifier was NOT needed and is left untouched.
 
 ### v0.8.1 — host-crash fix (main-thread webview access) + security/robustness hardening
 
