@@ -2,6 +2,20 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.8.0 (2026-06-14)
+
+- Version-synced with the Victauri 0.8.0 release. Ships the security hardening from
+  the 0.7.10 red-team audit that never reached a published `.vsix` (the marketplace was
+  last updated at 0.7.9):
+  - **No token leak to auto-discovered services.** A configured `authToken` is now
+    treated as an explicit credential for the configured port only — it is no longer
+    sent to a different auto-discovered localhost service.
+  - **Discovery-tree trust check.** The discovery root is verified as trusted before any
+    child entry is read, so a hostile root owner can't swap in a previously-checked dir.
+  - Dependency security bumps (pinned `@vscode/vsce`/`ovsx`, refreshed lockfile).
+- No new extension features; the Victauri 0.8.0 release itself is a Rust public-API
+  cleanup (tool behaviour/output unchanged).
+
 ## 0.7.8 (2026-06-06)
 
 - Version-synced with the Victauri 0.7.8 release. Crates-only build-correctness patch:
