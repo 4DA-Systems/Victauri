@@ -1,7 +1,57 @@
 #[cfg(feature = "sqlite")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "sqlite")]
+use std::sync::Arc;
+#[cfg(feature = "sqlite")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "sqlite")]
 use std::time::{Duration, Instant};
+
+/// Arms a wall-clock watchdog that calls `Connection::interrupt()` at the deadline, then stops
+/// and joins it on drop. The `progress_handler` only fires every N VDBE opcodes, so a single
+/// long-running op (a big sort/scan, `quick_check` on a huge DB) can run well past the deadline
+/// before the handler is consulted; the interrupt handle makes the CPU deadline a hard one.
+#[cfg(feature = "sqlite")]
+pub(crate) struct InterruptGuard {
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(feature = "sqlite")]
+impl InterruptGuard {
+    pub(crate) fn arm(conn: &rusqlite::Connection, deadline: Duration) -> Self {
+        let done = Arc::new(AtomicBool::new(false));
+        let interrupt = conn.get_interrupt_handle();
+        let done_for_thread = done.clone();
+        let poll = Duration::from_millis(25).min(deadline.max(Duration::from_millis(1)));
+        let handle = std::thread::spawn(move || {
+            let start = Instant::now();
+            while start.elapsed() < deadline {
+                if done_for_thread.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(poll);
+            }
+            if !done_for_thread.load(Ordering::Acquire) {
+                interrupt.interrupt();
+            }
+        });
+        Self {
+            done,
+            handle: Some(handle),
+        }
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl Drop for InterruptGuard {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
 
 #[cfg(feature = "sqlite")]
 const MAX_ROWS_DEFAULT: usize = 100;
@@ -483,6 +533,10 @@ fn query_with_limits(
         QUERY_PROGRESS_OPS,
         Some(move || started.elapsed() >= query_timeout),
     );
+    // Hard wall-clock backstop: the progress handler under-samples a single long op, so also
+    // arm an interrupt-handle watchdog. Lives until the query completes (drops/joins on every
+    // return path, including `?` errors below).
+    let _interrupt = InterruptGuard::arm(&conn, query_timeout);
 
     let mut stmt = conn
         .prepare(sql)
