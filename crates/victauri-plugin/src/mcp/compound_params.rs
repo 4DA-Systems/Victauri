@@ -134,6 +134,7 @@ pub struct InteractParams {
     /// implemented on Windows.
     pub trusted: Option<bool>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -180,6 +181,7 @@ pub struct InputParams {
     /// without native-input support. Currently implemented on Windows.
     pub trusted: Option<bool>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -338,6 +340,7 @@ pub struct StorageParams {
     /// Value to store (for set action). Will be JSON-serialized if not a string.
     pub value: Option<serde_json::Value>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -385,6 +388,7 @@ pub struct NavigateParams {
     /// Response text for prompt dialogs (for `set_dialog_response`).
     pub text: Option<String>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -460,6 +464,7 @@ pub struct RecordingParams {
     /// JSON string of a previously exported `RecordedSession` (for import).
     pub session_json: Option<String>,
     /// Target webview label (for replay).
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -513,6 +518,7 @@ pub struct InspectParams {
     #[serde(rename = "highlight_label")]
     pub label: Option<String>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -551,6 +557,7 @@ pub struct CssParams {
     #[serde(default)]
     pub allow_remote: bool,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -667,6 +674,7 @@ pub struct RouteParams {
     /// Maximum match-log entries to return (for matches).
     pub limit: Option<usize>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -712,6 +720,7 @@ pub struct TraceParams {
     /// Maximum frames to return (for frames). 0 or omitted returns all buffered.
     pub limit: Option<usize>,
     /// Target webview label to capture.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -767,6 +776,7 @@ pub struct AnimationParams {
     /// (`sample`, read) If true, clear recorded sessions after returning them.
     pub clear: Option<bool>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -829,5 +839,6 @@ pub struct LogsParams {
     /// fetch interceptor rather than polling.
     pub wait_for_capture: Option<bool>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }

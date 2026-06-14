@@ -15,6 +15,7 @@ pub struct VerifyStateParams {
     /// Arguments for the `backend_command`, if any.
     pub backend_args: Option<serde_json::Value>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
 
@@ -22,6 +23,7 @@ pub struct VerifyStateParams {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GhostCommandParams {
     /// Optional filter: only consider IPC calls from this webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
     /// Optional time window in milliseconds. When set (> 0), only commands invoked
     /// within the last `since_ms` ms are considered — a non-destructive way to scope
@@ -38,5 +40,6 @@ pub struct IpcIntegrityParams {
     /// Age in milliseconds after which a pending IPC call is considered stale. Default: 5000.
     pub stale_threshold_ms: Option<i64>,
     /// Target webview label.
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
