@@ -781,7 +781,7 @@ dependencies = [
 
 [[package]]
 name = "demo-app"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "reqwest 0.12.28",
  "serde",
@@ -1246,7 +1246,7 @@ dependencies = [
 
 [[package]]
 name = "gauntlet-app"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "reqwest 0.12.28",
  "rusqlite",
@@ -5141,7 +5141,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "victauri-cli"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5160,7 +5160,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-core"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axum",
  "chrono",
@@ -5177,7 +5177,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-macros"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -5188,7 +5188,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-plugin"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -5222,7 +5222,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-test"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -5240,7 +5240,7 @@ dependencies = [
 
 [[package]]
 name = "victauri-watchdog"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "reqwest 0.12.28",

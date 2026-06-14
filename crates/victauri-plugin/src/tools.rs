@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tauri::{Manager, Runtime, State};
+use tauri::{Runtime, State};
 use victauri_core::{IpcCall, WindowState};
 
 use crate::VictauriState;
@@ -123,41 +123,17 @@ pub async fn victauri_get_window_state<R: Runtime>(
     app: tauri::AppHandle<R>,
     label: Option<String>,
 ) -> Result<Vec<WindowState>, String> {
-    let windows = app.webview_windows();
-    let mut states = Vec::new();
-
-    for (win_label, window) in &windows {
-        if let Some(ref filter) = label
-            && win_label != filter
-        {
-            continue;
-        }
-
-        let pos = window.outer_position().unwrap_or_default();
-        let size = window.inner_size().unwrap_or_default();
-
-        states.push(WindowState {
-            label: win_label.clone(),
-            title: window.title().unwrap_or_default(),
-            url: window.url().map(|u| u.to_string()).unwrap_or_default(),
-            visible: window.is_visible().unwrap_or(false),
-            focused: window.is_focused().unwrap_or(false),
-            maximized: window.is_maximized().unwrap_or(false),
-            minimized: window.is_minimized().unwrap_or(false),
-            fullscreen: window.is_fullscreen().unwrap_or(false),
-            position: (pos.x, pos.y),
-            size: (size.width, size.height),
-        });
-    }
-
-    Ok(states)
+    Ok(crate::bridge::WebviewBridge::get_window_states(
+        &app,
+        label.as_deref(),
+    ))
 }
 
 #[tauri::command]
 pub async fn victauri_list_windows<R: Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Vec<String>, String> {
-    Ok(app.webview_windows().keys().cloned().collect())
+    Ok(crate::bridge::WebviewBridge::list_window_labels(&app))
 }
 
 #[tauri::command]

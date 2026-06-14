@@ -155,69 +155,117 @@ fn find_window<'a, R: Runtime>(
     }
 }
 
+/// Run `f` on the Tauri **main (UI) thread** and return its result.
+///
+/// Every webview/window access MUST happen on the main thread. Tauri's window/webview
+/// handles wrap a non-`Send` `Rc<WebView>` (and a `RefCell`-backed window store) that are
+/// guarded only by an `unsafe impl Send` with a *main-thread-only* contract. The Victauri
+/// MCP server runs on a background (axum/tokio) thread, so touching those handles directly —
+/// e.g. `self.webview_windows()` cloning the `Rc` — races the main thread's own refcounting
+/// (notably `tauri::ipc::protocol::get` while the app handles its real IPC). Two threads
+/// mutating a non-atomic `Rc` count corrupts it → use-after-free, which surfaces as
+/// `STATUS_*_BUFFER_OVERRUN` once Rust's debug `assert_unchecked` on `Rc::inc_strong`
+/// (1.78+) starts checking it. See Tauri issue #10001 for the identical crash class.
+///
+/// `run_on_main_thread` marshals the closure onto the UI thread (and runs it inline if we are
+/// already on it), so all `Rc` access stays single-threaded. The closure's value comes back
+/// over a oneshot `std::sync::mpsc` channel; the bounded `recv` is a safety net against a
+/// wedged event loop and never blocks the main thread (the closure runs *there*, the wait
+/// happens on the calling background thread).
+fn on_main<R, T, F>(app: &tauri::AppHandle<R>, what: &str, f: F) -> Result<T, String>
+where
+    R: Runtime,
+    T: Send + 'static,
+    F: FnOnce(&tauri::AppHandle<R>) -> T + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let app_for_closure = app.clone();
+    app.run_on_main_thread(move || {
+        // Send only fails if the caller already timed out and dropped the receiver — ignore.
+        let _ = tx.send(f(&app_for_closure));
+    })
+    .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))?;
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .map_err(|e| format!("{what} did not complete on the main thread: {e}"))
+}
+
 impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
-        let windows = self.webview_windows();
-        let webview = find_window(&windows, label)?;
-        webview.eval(script).map_err(|e| e.to_string())
+        let label = label.map(str::to_string);
+        let script = script.to_string();
+        on_main(self, "eval_webview", move |app| {
+            let windows = app.webview_windows();
+            let webview = find_window(&windows, label.as_deref())?;
+            webview.eval(&script).map_err(|e| e.to_string())
+        })?
     }
 
     fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
-        let windows = self.webview_windows();
-        let mut states = Vec::new();
+        let label = label.map(str::to_string);
+        on_main(self, "get_window_states", move |app| {
+            let windows = app.webview_windows();
+            let mut states = Vec::new();
 
-        for (win_label, window) in &windows {
-            if let Some(filter) = label
-                && win_label != filter
-            {
-                continue;
+            for (win_label, window) in &windows {
+                if let Some(filter) = label.as_deref()
+                    && win_label != filter
+                {
+                    continue;
+                }
+
+                let pos = window.outer_position().unwrap_or_default();
+                let size = window.inner_size().unwrap_or_default();
+
+                states.push(WindowState {
+                    label: win_label.clone(),
+                    title: window.title().unwrap_or_default(),
+                    url: window.url().map(|u| u.to_string()).unwrap_or_default(),
+                    visible: window.is_visible().unwrap_or(false),
+                    focused: window.is_focused().unwrap_or(false),
+                    maximized: window.is_maximized().unwrap_or(false),
+                    minimized: window.is_minimized().unwrap_or(false),
+                    fullscreen: window.is_fullscreen().unwrap_or(false),
+                    position: (pos.x, pos.y),
+                    size: (size.width, size.height),
+                });
             }
 
-            let pos = window.outer_position().unwrap_or_default();
-            let size = window.inner_size().unwrap_or_default();
-
-            states.push(WindowState {
-                label: win_label.clone(),
-                title: window.title().unwrap_or_default(),
-                url: window.url().map(|u| u.to_string()).unwrap_or_default(),
-                visible: window.is_visible().unwrap_or(false),
-                focused: window.is_focused().unwrap_or(false),
-                maximized: window.is_maximized().unwrap_or(false),
-                minimized: window.is_minimized().unwrap_or(false),
-                fullscreen: window.is_fullscreen().unwrap_or(false),
-                position: (pos.x, pos.y),
-                size: (size.width, size.height),
-            });
-        }
-
-        states
+            states
+        })
+        .unwrap_or_default()
     }
 
     fn list_window_labels(&self) -> Vec<String> {
-        self.webview_windows().keys().cloned().collect()
+        on_main(self, "list_window_labels", |app| {
+            app.webview_windows().keys().cloned().collect()
+        })
+        .unwrap_or_default()
     }
 
     fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
-        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        let label = label.map(str::to_string);
+        on_main(self, "get_native_handle", move |app| {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
-        let windows = self.webview_windows();
-        let _webview = find_window(&windows, label)?;
-        let handle = _webview.window_handle().map_err(|e| e.to_string())?;
-        match handle.as_raw() {
-            #[cfg(windows)]
-            RawWindowHandle::Win32(h) => Ok(h.hwnd.get()),
-            #[cfg(target_os = "macos")]
-            RawWindowHandle::AppKit(h) => {
-                // CGWindowListCreateImage needs CGWindowID (the window number),
-                // not the NSView pointer. Extract via Objective-C runtime.
-                macos_window_number(h.ns_view.as_ptr())
+            let windows = app.webview_windows();
+            let _webview = find_window(&windows, label.as_deref())?;
+            let handle = _webview.window_handle().map_err(|e| e.to_string())?;
+            match handle.as_raw() {
+                #[cfg(windows)]
+                RawWindowHandle::Win32(h) => Ok(h.hwnd.get()),
+                #[cfg(target_os = "macos")]
+                RawWindowHandle::AppKit(h) => {
+                    // CGWindowListCreateImage needs CGWindowID (the window number),
+                    // not the NSView pointer. Extract via Objective-C runtime.
+                    macos_window_number(h.ns_view.as_ptr())
+                }
+                #[cfg(target_os = "linux")]
+                RawWindowHandle::Xlib(h) => Ok(h.window as isize),
+                #[cfg(target_os = "linux")]
+                RawWindowHandle::Xcb(h) => Ok(h.window.get() as isize),
+                _ => Err("unsupported window handle type on this platform".to_string()),
             }
-            #[cfg(target_os = "linux")]
-            RawWindowHandle::Xlib(h) => Ok(h.window as isize),
-            #[cfg(target_os = "linux")]
-            RawWindowHandle::Xcb(h) => Ok(h.window.get() as isize),
-            _ => Err("unsupported window handle type on this platform".to_string()),
-        }
+        })?
     }
 
     #[cfg(windows)]
@@ -242,51 +290,67 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     }
 
     fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
-        let windows = self.webview_windows();
-        let window = find_window(&windows, label)?;
+        let label = label.map(str::to_string);
+        let action = action.to_string();
+        on_main(self, "manage_window", move |app| {
+            let windows = app.webview_windows();
+            let window = find_window(&windows, label.as_deref())?;
 
-        match action {
-            "minimize" => window.minimize().map_err(|e| e.to_string())?,
-            "unminimize" => window.unminimize().map_err(|e| e.to_string())?,
-            "maximize" => window.maximize().map_err(|e| e.to_string())?,
-            "unmaximize" => window.unmaximize().map_err(|e| e.to_string())?,
-            "close" => window.close().map_err(|e| e.to_string())?,
-            "focus" => window.set_focus().map_err(|e| e.to_string())?,
-            "show" => window.show().map_err(|e| e.to_string())?,
-            "hide" => window.hide().map_err(|e| e.to_string())?,
-            "fullscreen" => window.set_fullscreen(true).map_err(|e| e.to_string())?,
-            "unfullscreen" => window.set_fullscreen(false).map_err(|e| e.to_string())?,
-            "always_on_top" => window.set_always_on_top(true).map_err(|e| e.to_string())?,
-            "not_always_on_top" => window.set_always_on_top(false).map_err(|e| e.to_string())?,
-            _ => return Err(format!("unknown action: {action}")),
-        }
+            match action.as_str() {
+                "minimize" => window.minimize().map_err(|e| e.to_string())?,
+                "unminimize" => window.unminimize().map_err(|e| e.to_string())?,
+                "maximize" => window.maximize().map_err(|e| e.to_string())?,
+                "unmaximize" => window.unmaximize().map_err(|e| e.to_string())?,
+                "close" => window.close().map_err(|e| e.to_string())?,
+                "focus" => window.set_focus().map_err(|e| e.to_string())?,
+                "show" => window.show().map_err(|e| e.to_string())?,
+                "hide" => window.hide().map_err(|e| e.to_string())?,
+                "fullscreen" => window.set_fullscreen(true).map_err(|e| e.to_string())?,
+                "unfullscreen" => window.set_fullscreen(false).map_err(|e| e.to_string())?,
+                "always_on_top" => window.set_always_on_top(true).map_err(|e| e.to_string())?,
+                "not_always_on_top" => {
+                    window.set_always_on_top(false).map_err(|e| e.to_string())?;
+                }
+                _ => return Err(format!("unknown action: {action}")),
+            }
 
-        Ok(format!("{action} executed"))
+            Ok(format!("{action} executed"))
+        })?
     }
 
     fn resize_window(&self, label: Option<&str>, width: u32, height: u32) -> Result<(), String> {
-        let windows = self.webview_windows();
-        let window = find_window(&windows, label)?;
+        let label = label.map(str::to_string);
+        on_main(self, "resize_window", move |app| {
+            let windows = app.webview_windows();
+            let window = find_window(&windows, label.as_deref())?;
 
-        window
-            .set_size(tauri::LogicalSize::new(width, height))
-            .map_err(|e| e.to_string())
+            window
+                .set_size(tauri::LogicalSize::new(width, height))
+                .map_err(|e| e.to_string())
+        })?
     }
 
     fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
-        let windows = self.webview_windows();
-        let window = find_window(&windows, label)?;
+        let label = label.map(str::to_string);
+        on_main(self, "move_window", move |app| {
+            let windows = app.webview_windows();
+            let window = find_window(&windows, label.as_deref())?;
 
-        window
-            .set_position(tauri::LogicalPosition::new(x, y))
-            .map_err(|e| e.to_string())
+            window
+                .set_position(tauri::LogicalPosition::new(x, y))
+                .map_err(|e| e.to_string())
+        })?
     }
 
     fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
-        let windows = self.webview_windows();
-        let window = find_window(&windows, label)?;
+        let label = label.map(str::to_string);
+        let title = title.to_string();
+        on_main(self, "set_window_title", move |app| {
+            let windows = app.webview_windows();
+            let window = find_window(&windows, label.as_deref())?;
 
-        window.set_title(title).map_err(|e| e.to_string())
+            window.set_title(&title).map_err(|e| e.to_string())
+        })?
     }
 
     fn app_data_dir(&self) -> Result<std::path::PathBuf, String> {

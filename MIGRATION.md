@@ -1,5 +1,22 @@
 # Migration Guide
 
+## v0.8.0 → v0.8.1 (host-crash fix + security/robustness hardening)
+
+No consumer code changes are required, and no dependency-requirement change is needed (0.8.1 is a
+semver-compatible patch — `victauri-plugin = "0.8"` / `victauri-test = "0.8"` pick it up automatically).
+0.8.1 fixes a host-process crash: under concurrent IPC, Victauri's background MCP thread could race
+Tauri's webview handle storage and crash the app — all webview/window access now runs on Tauri's main
+thread. Review these additional behavior changes if you automate the affected tools:
+
+- **Pure Wayland `screenshot` now fails instead of returning a full-desktop image.** X11/XWayland
+  per-window capture is unchanged. Treat the new error as an unsupported per-window capture path.
+- **Database tools are bounded more strictly.** `query_db` can now stop at a CPU, cell-size, or
+  result-byte limit; its output adds `result_bytes` and `max_result_bytes`. `introspect db_health`
+  no longer runs `wal_checkpoint`, can time out on expensive diagnostics, and adds
+  `tables_truncated` when its bounded schema listing is incomplete.
+- **Explicit database paths reject lexical traversal.** Relative paths containing `..`, and paths
+  resolving through symlinks/junctions outside allowed roots, now fail even if the target exists.
+
 ## v0.7.11 → v0.8.0 (Rust public-API cleanup — tool behaviour/output unchanged)
 
 **The only required change for most consumers: bump the dependency requirement.**

@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/runyourempire/victauri"
@@ -46,10 +46,10 @@ use_self = "deny"
 redundant_pub_crate = "deny"
 
 [workspace.dependencies]
-victauri-core = { version = "0.8.0", path = "crates/victauri-core" }
-victauri-macros = { version = "0.8.0", path = "crates/victauri-macros" }
-victauri-plugin = { version = "0.8.0", path = "crates/victauri-plugin" }
-victauri-test = { version = "0.8.0", path = "crates/victauri-test" }
+victauri-core = { version = "0.8.1", path = "crates/victauri-core" }
+victauri-macros = { version = "0.8.1", path = "crates/victauri-macros" }
+victauri-plugin = { version = "0.8.1", path = "crates/victauri-plugin" }
+victauri-test = { version = "0.8.1", path = "crates/victauri-test" }
 
 # Tauri
 tauri = { version = "2", default-features = false }
@@ -77,4 +77,4 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 url = "2"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "limits"] }

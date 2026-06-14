@@ -436,7 +436,7 @@ Coverage gate ──────────────── victauri coverage
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: runyourempire/victauri@main
+- uses: runyourempire/victauri/.github/actions/victauri-test@v0.8.1
   with:
     max-load-ms: 5000
     coverage: true
@@ -468,7 +468,7 @@ Coverage gate ──────────────── victauri coverage
 
 | Platform | Display server | Screenshot method |
 |---|---|---|
-| Linux | `xvfb-run --auto-servernum` | X11 `GetImage` / `grim` |
+| Linux | `xvfb-run --auto-servernum` | X11 `GetImage` (pure Wayland fails safely) |
 | macOS | None needed | `CGWindowListCreateImage` |
 | Windows | None needed | `PrintWindow` + `GetDIBits` |
 

@@ -186,6 +186,38 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-06-14)
 
+### v0.8.1 — host-crash fix (main-thread webview access) + security/robustness hardening
+
+Driven by a live 4DA dogfood of 0.8.0 (GPT-5.5 + Opus developing alongside each other,
+coordinated on Verax's generator/verifier model) and a follow-on GPT-5.5 adversarial audit.
+
+- **Host-process crash fixed (the keystone).** Victauri's embedded MCP server runs on a
+  background (axum/tokio) thread and was touching the Tauri webview directly there —
+  `AppHandle::webview_windows()` clones an `Rc`-backed, non-`Send` handle (guarded only by
+  an `unsafe impl Send` + main-thread-only contract). Under concurrent real IPC
+  (`tauri::ipc::protocol::get` on the main thread) the two threads raced the non-atomic `Rc`
+  refcount → use-after-free (`STATUS_*_BUFFER_OVERRUN`, caught by Rust ≥1.78
+  `assert_unchecked`; deterministic "GTK only from main thread" abort on Linux/WebKitGTK).
+  Latent in every version; 0.8.0's "liveness probe before every eval (incl. the default
+  window)" ~doubled the off-thread access frequency on the hot path, so it fired every
+  analysis cycle under 4DA's load (0.7.11 was clean by luck). **Fix:** an `on_main`
+  dispatcher in `bridge.rs` routes ALL webview/window access (eval, state/list, native
+  handle, manage/resize/move/title) through `app.run_on_main_thread`; the Tauri command
+  path (`tools.rs`) delegates to the same bridge methods. Tauri issue #10001 is the
+  identical class. **Regression test:** `webview_access_main_thread_safe_under_ipc_load`
+  (`examples/demo-app/tests/integration.rs`) floods the page with real IPC while N
+  concurrent clients hammer the webview paths, then asserts the host survived — and the
+  **E2E job now runs on PRs, not just main-push**, so real-process regressions gate before
+  merge (the gap that let the crash ship).
+- **Database introspection bounded + root-contained.** `query_db` runs with a CPU deadline
+  (progress handler), per-cell + total-result byte caps, and an SQL-length cap; `db_health`
+  dropped the side-effecting `wal_checkpoint`, quotes arbitrary table names, and is
+  path-contained (no `../` / symlink/junction escape outside allowed roots). Fixed a real
+  `truncated == max_rows` false-positive.
+- **Pure-Wayland screenshot fallback removed** — fails safely instead of leaking the full
+  desktop via `grim`. X11/XWayland per-window capture unchanged.
+- Consumer CI examples pinned to the `victauri-test@v0.8.1` action tag.
+
 ### v0.8.0 — cross-engine gauntlet + IPC command catalog + robustness
 
 Driven by the scale-gauntlet cross-engine net and an exhaustive live sweep of 4DA

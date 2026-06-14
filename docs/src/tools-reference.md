@@ -662,7 +662,7 @@ Deep backend introspection — command performance profiling, IPC contract testi
 | `contract_clear` | — | Clear all recorded contract baselines |
 | `startup_timing` | — | Victauri plugin initialization phase-by-phase timing breakdown |
 | `capabilities` | — | Tauri v2 capabilities, security config (CSP, freeze_prototype), plugins, and window definitions |
-| `db_health` | `db_path` | `SQLite` database diagnostics (journal mode, WAL, page stats) |
+| `db_health` | `db_path` | Bounded, read-only `SQLite` diagnostics (journal mode, WAL presence, page stats) |
 | `plugin_state` | — | Victauri plugin internal state: event counts, registry, recording, faults, timings, uptime |
 | `processes` | — | Host process + child processes (sidecars, background workers) with PID, name, and memory |
 | `plugin_tasks` | — | Victauri's spawned async tasks (MCP server, event drain) with active/finished counts |

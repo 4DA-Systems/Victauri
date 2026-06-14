@@ -1,10 +1,22 @@
 #[cfg(feature = "sqlite")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "sqlite")]
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "sqlite")]
 const MAX_ROWS_DEFAULT: usize = 100;
 #[cfg(feature = "sqlite")]
 const MAX_ROWS_LIMIT: usize = 10_000;
+#[cfg(feature = "sqlite")]
+const MAX_QUERY_CELL_BYTES: i32 = 1_048_576;
+#[cfg(feature = "sqlite")]
+const MAX_QUERY_RESULT_BYTES: usize = 5_000_000;
+#[cfg(feature = "sqlite")]
+const MAX_QUERY_SQL_BYTES: usize = 1_000_000;
+#[cfg(feature = "sqlite")]
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "sqlite")]
+const QUERY_PROGRESS_OPS: i32 = 10_000;
 
 #[cfg(feature = "sqlite")]
 static READ_ONLY_PREFIXES: &[&str] = &["select", "pragma", "explain", "with"];
@@ -182,18 +194,35 @@ fn is_disallowed_pragma(sql: &str) -> bool {
 #[must_use]
 pub fn discover_databases(dir: &Path) -> Vec<PathBuf> {
     let mut results = Vec::new();
-    discover_recursive(dir, 0, 2, &mut results);
+    let Ok(base) = std::fs::canonicalize(dir) else {
+        return results;
+    };
+    discover_recursive(dir, &base, 0, 2, &mut results);
     results
 }
 
 #[cfg(feature = "sqlite")]
-fn discover_recursive(dir: &Path, depth: u32, max_depth: u32, results: &mut Vec<PathBuf>) {
+fn discover_recursive(
+    dir: &Path,
+    base: &Path,
+    depth: u32,
+    max_depth: u32,
+    results: &mut Vec<PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_symlink() {
+            continue;
+        }
+        // Windows junctions/reparse points are not always reported by
+        // `Path::is_symlink`; canonical containment is the real boundary.
+        let Ok(canonical) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        if !canonical.starts_with(base) {
             continue;
         }
         if path.is_file() {
@@ -203,7 +232,7 @@ fn discover_recursive(dir: &Path, depth: u32, max_depth: u32, results: &mut Vec<
                 results.push(path);
             }
         } else if path.is_dir() && depth < max_depth {
-            discover_recursive(&path, depth + 1, max_depth, results);
+            discover_recursive(&path, base, depth + 1, max_depth, results);
         }
     }
 }
@@ -361,6 +390,30 @@ pub fn query(
     params: &[serde_json::Value],
     max_rows: Option<usize>,
 ) -> Result<serde_json::Value, String> {
+    query_with_limits(
+        db_path,
+        sql,
+        params,
+        max_rows,
+        QUERY_TIMEOUT,
+        MAX_QUERY_RESULT_BYTES,
+    )
+}
+
+#[cfg(feature = "sqlite")]
+fn query_with_limits(
+    db_path: &Path,
+    sql: &str,
+    params: &[serde_json::Value],
+    max_rows: Option<usize>,
+    query_timeout: Duration,
+    max_result_bytes: usize,
+) -> Result<serde_json::Value, String> {
+    if sql.len() > MAX_QUERY_SQL_BYTES {
+        return Err(format!(
+            "query exceeds maximum length ({MAX_QUERY_SQL_BYTES} bytes)"
+        ));
+    }
     if !is_read_only(sql) {
         return Err(
             "only SELECT, PRAGMA, EXPLAIN, and WITH queries are allowed (read-only access)"
@@ -411,13 +464,29 @@ pub fn query(
     )
     .map_err(|e| format!("failed to open database: {e}"))?;
 
-    // 5 second query timeout
+    // Limit lock waits separately from the CPU deadline enforced below.
     conn.busy_timeout(std::time::Duration::from_secs(5))
         .map_err(|e| format!("failed to set timeout: {e}"))?;
 
+    // Bound both SQLite's per-value/row allocation and CPU time. `busy_timeout`
+    // only limits lock waits; it does not stop a CPU-heavy recursive query.
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+        MAX_QUERY_CELL_BYTES,
+    );
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH,
+        MAX_QUERY_SQL_BYTES as i32,
+    );
+    let started = Instant::now();
+    conn.progress_handler(
+        QUERY_PROGRESS_OPS,
+        Some(move || started.elapsed() >= query_timeout),
+    );
+
     let mut stmt = conn
         .prepare(sql)
-        .map_err(|e| format!("failed to prepare query: {e}"))?;
+        .map_err(|e| sqlite_query_error("failed to prepare query", e, query_timeout))?;
 
     let column_names: Vec<String> = stmt
         .column_names()
@@ -433,10 +502,18 @@ pub fn query(
     let mut rows_out: Vec<serde_json::Value> = Vec::new();
     let mut rows = stmt
         .query(param_refs.as_slice())
-        .map_err(|e| format!("query execution failed: {e}"))?;
+        .map_err(|e| sqlite_query_error("query execution failed", e, query_timeout))?;
+    let mut result_bytes = serde_json::to_vec(&column_names)
+        .map_err(|e| format!("failed to size query result columns: {e}"))?
+        .len();
+    let mut truncated = false;
 
-    while let Some(row) = rows.next().map_err(|e| format!("row read failed: {e}"))? {
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| sqlite_query_error("row read failed", e, query_timeout))?
+    {
         if rows_out.len() >= max_rows {
+            truncated = true;
             break;
         }
         let mut obj = serde_json::Map::new();
@@ -444,10 +521,17 @@ pub fn query(
             let value = row_value_to_json(row, i);
             obj.insert(col_name.clone(), value);
         }
-        rows_out.push(serde_json::Value::Object(obj));
+        let row_value = serde_json::Value::Object(obj);
+        let row_bytes = serde_json::to_vec(&row_value)
+            .map_err(|e| format!("failed to size query result row: {e}"))?
+            .len();
+        if result_bytes.saturating_add(row_bytes) > max_result_bytes {
+            truncated = true;
+            break;
+        }
+        result_bytes = result_bytes.saturating_add(row_bytes);
+        rows_out.push(row_value);
     }
-
-    let truncated = rows_out.len() == max_rows;
 
     Ok(serde_json::json!({
         "columns": column_names,
@@ -455,7 +539,21 @@ pub fn query(
         "row_count": rows_out.len(),
         "truncated": truncated,
         "max_rows": max_rows,
+        "result_bytes": result_bytes,
+        "max_result_bytes": max_result_bytes,
     }))
+}
+
+#[cfg(feature = "sqlite")]
+fn sqlite_query_error(context: &str, error: rusqlite::Error, timeout: Duration) -> String {
+    if error.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::OperationInterrupted) {
+        format!(
+            "{context}: query timed out after {} ms",
+            timeout.as_millis()
+        )
+    } else {
+        format!("{context}: {error}")
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -555,6 +653,65 @@ mod tests {
         let result = query(&path, "SELECT * FROM users", &[], Some(2)).unwrap();
         assert_eq!(result["row_count"], 2);
         assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn exact_max_rows_is_not_truncated() {
+        let (_f, path) = create_test_db();
+        let result = query(&path, "SELECT * FROM users", &[], Some(3)).unwrap();
+        assert_eq!(result["row_count"], 3);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn result_byte_limit_truncates_before_unbounded_allocation() {
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let path = file.path().to_path_buf();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE payloads (data TEXT)")
+            .unwrap();
+        let payload = "x".repeat(120_000);
+        for _ in 0..5 {
+            conn.execute("INSERT INTO payloads VALUES (?)", [&payload])
+                .unwrap();
+        }
+
+        let result = query_with_limits(
+            &path,
+            "SELECT data FROM payloads",
+            &[],
+            None,
+            QUERY_TIMEOUT,
+            250_000,
+        )
+        .unwrap();
+        assert_eq!(result["row_count"], 2);
+        assert_eq!(result["truncated"], true);
+        assert!(result["result_bytes"].as_u64().unwrap() <= 250_000);
+    }
+
+    #[test]
+    fn cpu_heavy_query_times_out() {
+        let (_f, path) = create_test_db();
+        let err = query_with_limits(
+            &path,
+            "WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x + 1 FROM cnt) \
+             SELECT sum(x) FROM cnt",
+            &[],
+            None,
+            Duration::from_millis(1),
+            MAX_QUERY_RESULT_BYTES,
+        )
+        .unwrap_err();
+        assert!(err.contains("timed out"), "unexpected timeout error: {err}");
+    }
+
+    #[test]
+    fn oversized_sql_is_rejected_before_prepare() {
+        let (_f, path) = create_test_db();
+        let sql = format!("SELECT 1 /*{}*/", "x".repeat(MAX_QUERY_SQL_BYTES));
+        let err = query(&path, &sql, &[], None).unwrap_err();
+        assert!(err.contains("maximum length"), "unexpected error: {err}");
     }
 
     #[test]
@@ -747,6 +904,19 @@ mod tests {
 
         let dbs = discover_databases(dir.path());
         assert_eq!(dbs.len(), 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_does_not_follow_directory_symlink_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::File::create(outside.path().join("outside.db")).unwrap();
+        symlink(outside.path(), dir.path().join("escape")).unwrap();
+
+        assert!(discover_databases(dir.path()).is_empty());
     }
 
     #[test]

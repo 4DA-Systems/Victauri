@@ -330,7 +330,7 @@ embedded third-party widgets, or user-generated content rendered in the DOM.
   (`safe_within` + symlink skipping), but the *content* is returned verbatim. Enable redaction or use a
   lower profile if this breadth is a concern. (`app_info` never returns secret-looking env vars —
   `*_TOKEN` / `*_KEY` / `*_SECRET` / `*_PASSWORD` / `PRIVATE` are dropped.)
-- **Wayland `screenshot` captures the whole desktop.** Wayland deliberately does not expose a
-  window's screen position to its own client, so Victauri cannot crop the capture to just the app
-  window (unlike X11/Windows/macOS). On Wayland the result is a full-screen image — disable
-  `screenshot` via `Observe` on a shared/multi-user host if other windows may contain sensitive data.
+- **Pure Wayland `screenshot` fails safely.** Wayland deliberately does not expose a window's
+  screen position to its own client, so Victauri cannot capture just the requested app window
+  without compositor-specific integration. Victauri refuses the available full-desktop fallback
+  to avoid disclosing unrelated windows. X11 and XWayland continue to use per-window capture.
