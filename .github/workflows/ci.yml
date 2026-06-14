@@ -484,7 +484,11 @@ jobs:
     name: E2E Integration (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # Run on PRs too, not just push-to-main. The real-app E2E (which drives a live Tauri
+    # app and includes the webview thread-safety stress test) is the ONLY gate that catches
+    # real-process regressions like the 0.8.0 host-crash — running it only after merge meant
+    # such bugs shipped before anyone saw red. Gate before merge.
+    if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     strategy:
       fail-fast: false
       matrix:

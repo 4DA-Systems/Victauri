@@ -98,6 +98,20 @@ const MAX_LOG_FIELD_BYTES: usize = 4096;
 /// listing stops and the response is marked `truncated: true`.
 const MAX_DIR_ENTRIES: usize = 10_000;
 
+/// `db_health` performs integrity checks and table counts against app-owned
+/// databases. Bound the diagnostic so a large or adversarial DB cannot hold a
+/// blocking worker indefinitely or return an unbounded schema listing.
+#[cfg(feature = "sqlite")]
+const DB_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(feature = "sqlite")]
+const DB_HEALTH_PROGRESS_OPS: i32 = 10_000;
+#[cfg(feature = "sqlite")]
+const MAX_DB_HEALTH_TABLES: usize = 1_000;
+#[cfg(feature = "sqlite")]
+const MAX_DB_HEALTH_TABLE_BYTES: usize = 1_000_000;
+#[cfg(feature = "sqlite")]
+const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
+
 const RESOURCE_URI_IPC_LOG: &str = "victauri://ipc-log";
 const RESOURCE_URI_WINDOWS: &str = "victauri://windows";
 const RESOURCE_URI_STATE: &str = "victauri://state";
@@ -426,7 +440,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Capture a screenshot of a Tauri window as a base64-encoded PNG image. Works on Windows (PrintWindow), macOS (CGWindowListCreateImage), and Linux (X11/Wayland).",
+        description = "Capture a screenshot of a Tauri window as a base64-encoded PNG image. Works on Windows (PrintWindow), macOS (CGWindowListCreateImage), and Linux X11/XWayland. Pure Wayland fails safely because its available fallback would capture the full desktop rather than the requested window.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1258,7 +1272,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Execute a read-only SQL query against a SQLite database in the app's data directory. Auto-discovers database files if no path is specified. Only SELECT/PRAGMA/EXPLAIN/WITH queries are allowed. Returns rows as JSON objects with column names as keys. This provides direct backend database access without going through the webview or IPC.",
+        description = "Execute a bounded, read-only SQL query against a SQLite database in the app's data directory. Auto-discovers database files if no path is specified. Only SELECT/PRAGMA/EXPLAIN/WITH queries are allowed. CPU time, cell size, row count, and returned bytes are capped. Returns rows as JSON objects with column names as keys. This provides direct backend database access without going through the webview or IPC.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1310,50 +1324,10 @@ impl VictauriMcpHandler {
         let mut search_dirs: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
         search_dirs.extend(app_dirs);
 
-        let db_path = if let Some(ref rel_path) = params.path {
-            let candidate = std::path::Path::new(rel_path);
-            // Absolute paths are permitted only when they resolve within one of
-            // the allowed roots (app directories or configured db_search_paths).
-            if candidate.is_absolute() {
-                if !candidate.exists() {
-                    return tool_error(format!("database not found: {rel_path}"));
-                }
-                if !search_dirs
-                    .iter()
-                    .any(|d| Self::safe_within(d, candidate).is_ok())
-                {
-                    return tool_error(format!(
-                        "absolute path '{rel_path}' is not within an allowed directory; \
-                         register its parent via VictauriBuilder::db_search_paths"
-                    ));
-                }
-            }
-            let mut found = None;
-            if candidate.is_absolute() {
-                found = Some(candidate.to_path_buf());
-            } else {
-                for dir in &search_dirs {
-                    let resolved = dir.join(rel_path);
-                    if resolved.exists() {
-                        if let Err(e) = Self::safe_within(dir, &resolved) {
-                            return tool_error(e);
-                        }
-                        found = Some(resolved);
-                        break;
-                    }
-                }
-            }
-            if let Some(p) = found {
-                p
-            } else {
-                let dirs_str = search_dirs
-                    .iter()
-                    .map(|d| d.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return tool_error(format!(
-                    "database not found: {rel_path} (searched: {dirs_str})"
-                ));
+        let db_path = if let Some(ref requested_path) = params.path {
+            match Self::resolve_existing_db_path(&search_dirs, requested_path) {
+                Ok(path) => path,
+                Err(e) => return tool_error(e),
             }
         } else {
             // Auto-select the application DB. When db_search_paths is configured it is
@@ -1379,15 +1353,22 @@ impl VictauriMcpHandler {
             .to_string_lossy()
             .into_owned();
         let bind_params = params.params.unwrap_or_default();
+        let query = params.query;
+        let max_rows = params.max_rows;
 
-        match crate::database::query(&db_path, &params.query, &bind_params, params.max_rows) {
-            Ok(mut result) => {
+        match tokio::task::spawn_blocking(move || {
+            crate::database::query(&db_path, &query, &bind_params, max_rows)
+        })
+        .await
+        {
+            Ok(Ok(mut result)) => {
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert("database".to_string(), serde_json::json!(db_display));
                 }
                 json_result(&result)
             }
-            Err(e) => tool_error(e),
+            Ok(Err(e)) => tool_error(e),
+            Err(e) => tool_error(format!("database query task failed: {e}")),
         }
     }
 
@@ -2804,7 +2785,7 @@ impl VictauriMcpHandler {
             - `contract_clear`: Clear all recorded contract baselines.\n\
             - `startup_timing`: Victauri plugin initialization phase-by-phase timing breakdown.\n\
             - `capabilities`: Enumerate Tauri v2 capabilities, security config (CSP, freeze_prototype), configured plugins, and window definitions.\n\
-            - `db_health`: SQLite database diagnostics (journal mode, WAL, page stats).\n\
+            - `db_health`: Read-only SQLite database diagnostics (journal mode, WAL presence, page stats).\n\
             - `plugin_state`: Snapshot of the Victauri plugin's internal state (event log, registry, faults, recording, timings, etc.).\n\
             - `processes`: Enumerate the host process and all child processes (sidecars, background workers) with PID, name, and memory usage.\n\
             - `plugin_tasks`: List Victauri's own spawned async tasks (MCP server, event drain) with status.\n\
@@ -3952,6 +3933,52 @@ impl VictauriMcpHandler {
         Ok(())
     }
 
+    #[cfg(feature = "sqlite")]
+    fn resolve_existing_db_path(
+        roots: &[std::path::PathBuf],
+        requested: &str,
+    ) -> Result<std::path::PathBuf, String> {
+        let candidate = std::path::Path::new(requested);
+        if candidate.is_absolute() {
+            if !candidate.exists() {
+                return Err(format!("database not found: {requested}"));
+            }
+            if roots
+                .iter()
+                .any(|root| Self::safe_within(root, candidate).is_ok())
+            {
+                return Ok(candidate.to_path_buf());
+            }
+            return Err(format!(
+                "absolute path '{requested}' is not within an allowed directory; \
+                 register its parent via VictauriBuilder::db_search_paths"
+            ));
+        }
+
+        Self::lexical_safe(candidate)?;
+        for root in roots {
+            let resolved = root.join(candidate);
+            if resolved.exists() {
+                Self::safe_within(root, &resolved)?;
+                return Ok(resolved);
+            }
+        }
+
+        let roots = roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!(
+            "database not found: {requested} (searched: {roots})"
+        ))
+    }
+
+    #[cfg(feature = "sqlite")]
+    fn quote_sqlite_identifier(identifier: &str) -> String {
+        format!("\"{}\"", identifier.replace('"', "\"\""))
+    }
+
     fn list_dir_recursive(
         dir: &std::path::Path,
         base: &std::path::Path,
@@ -3972,6 +3999,12 @@ impl VictauriMcpHandler {
             }
             let path = entry.path();
             if path.is_symlink() {
+                continue;
+            }
+            // `is_symlink` does not cover every redirecting filesystem object
+            // (notably Windows directory junctions/reparse points). Canonical
+            // containment is the actual boundary before metadata or recursion.
+            if Self::safe_within(base, &path).is_err() {
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -4335,25 +4368,7 @@ impl VictauriMcpHandler {
         }
 
         let path = if let Some(p) = db_path {
-            let candidate = std::path::Path::new(p);
-            if candidate.is_absolute() {
-                if !roots
-                    .iter()
-                    .any(|r| Self::safe_within(r, candidate).is_ok())
-                {
-                    return Err(format!(
-                        "absolute path '{p}' is not within an allowed directory; \
-                         register its parent via VictauriBuilder::db_search_paths"
-                    ));
-                }
-                candidate.to_path_buf()
-            } else {
-                roots
-                    .iter()
-                    .map(|r| r.join(p))
-                    .find(|c| c.exists())
-                    .ok_or_else(|| format!("database not found: {p}"))?
-            }
+            Self::resolve_existing_db_path(&roots, p)?
         } else {
             // Configured db_search_paths are EXCLUSIVE when set (don't fall back to the
             // OS app dirs that hold WebView internals); WebView/engine internal stores are
@@ -4365,11 +4380,6 @@ impl VictauriMcpHandler {
             };
             crate::database::select_app_database(&select_dirs)?
         };
-        // No further containment check needed: the path is either discovered
-        // within an allowed root, an existing relative file joined onto an
-        // allowed root, or an absolute path already verified above. (A
-        // safe_within check against app_data_dir would fail when that directory
-        // does not exist — common for apps that store data elsewhere.)
         let path_str = path
             .to_str()
             .ok_or_else(|| "invalid path encoding".to_string())?
@@ -4381,6 +4391,23 @@ impl VictauriMcpHandler {
                 rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
             )
             .map_err(|e| format!("cannot open database: {e}"))?;
+            conn.set_limit(
+                rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+                MAX_DB_HEALTH_CELL_BYTES,
+            );
+            let started = std::time::Instant::now();
+            let timed_out = Arc::new(AtomicBool::new(false));
+            let timeout_marker = Arc::clone(&timed_out);
+            conn.progress_handler(
+                DB_HEALTH_PROGRESS_OPS,
+                Some(move || {
+                    let expired = started.elapsed() >= DB_HEALTH_TIMEOUT;
+                    if expired {
+                        timeout_marker.store(true, Ordering::Relaxed);
+                    }
+                    expired
+                }),
+            );
 
             let journal_mode: String = conn
                 .pragma_query_value(None, "journal_mode", |r| r.get(0))
@@ -4398,18 +4425,10 @@ impl VictauriMcpHandler {
                 .pragma_query_value(None, "freelist_count", |r| r.get(0))
                 .unwrap_or(0);
 
-            let wal_checkpoint: String = if journal_mode == "wal" {
-                let mut info = String::from("n/a");
-                let _ = conn.pragma_query(None, "wal_checkpoint", |r| {
-                    let busy: i64 = r.get(0)?;
-                    let checkpointed: i64 = r.get(1)?;
-                    let total: i64 = r.get(2)?;
-                    info = format!("busy={busy}, checkpointed={checkpointed}, total={total}");
-                    Ok(())
-                });
-                info
+            let wal_checkpoint: &str = if journal_mode == "wal" {
+                "not run (read-only diagnostics)"
             } else {
-                "n/a (not WAL mode)".to_string()
+                "n/a (not WAL mode)"
             };
 
             let integrity: String = conn
@@ -4420,19 +4439,37 @@ impl VictauriMcpHandler {
             let db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
 
             let mut tables = Vec::new();
+            let mut table_bytes = 0usize;
+            let mut tables_truncated = false;
             if let Ok(mut stmt) =
                 conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
                 && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
             {
                 for name in rows.flatten() {
+                    if tables.len() >= MAX_DB_HEALTH_TABLES
+                        || table_bytes.saturating_add(name.len()) > MAX_DB_HEALTH_TABLE_BYTES
+                    {
+                        tables_truncated = true;
+                        break;
+                    }
+                    table_bytes = table_bytes.saturating_add(name.len());
+                    let identifier = Self::quote_sqlite_identifier(&name);
                     let count: i64 = conn
-                        .query_row(&format!("SELECT count(*) FROM [{name}]"), [], |r| r.get(0))
+                        .query_row(&format!("SELECT count(*) FROM {identifier}"), [], |r| {
+                            r.get(0)
+                        })
                         .unwrap_or(0);
                     tables.push(serde_json::json!({
                         "name": name,
                         "row_count": count,
                     }));
                 }
+            }
+            if timed_out.load(Ordering::Relaxed) {
+                return Err(format!(
+                    "database diagnostics timed out after {} ms",
+                    DB_HEALTH_TIMEOUT.as_millis()
+                ));
             }
 
             Ok(serde_json::json!({
@@ -4445,6 +4482,7 @@ impl VictauriMcpHandler {
                 "wal_checkpoint": wal_checkpoint,
                 "integrity_check": integrity,
                 "tables": tables,
+                "tables_truncated": tables_truncated,
             }))
         })
         .await
@@ -5030,6 +5068,69 @@ mod prop_tests {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn database_path_resolution_rejects_lexical_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("allowed");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::File::create(dir.path().join("outside.db")).unwrap();
+
+        let err =
+            VictauriMcpHandler::resolve_existing_db_path(&[root], "../outside.db").unwrap_err();
+        assert!(err.contains("path traversal"), "unexpected error: {err}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn database_path_resolution_accepts_contained_nested_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("allowed");
+        let nested = root.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let db = nested.join("app.db");
+        std::fs::File::create(&db).unwrap();
+
+        let resolved =
+            VictauriMcpHandler::resolve_existing_db_path(&[root], "nested/app.db").unwrap();
+        assert_eq!(resolved, db);
+    }
+
+    #[cfg(all(feature = "sqlite", unix))]
+    #[test]
+    fn database_path_resolution_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("allowed");
+        std::fs::create_dir(&root).unwrap();
+        let outside = dir.path().join("outside.db");
+        std::fs::File::create(&outside).unwrap();
+        symlink(&outside, root.join("linked.db")).unwrap();
+
+        let err = VictauriMcpHandler::resolve_existing_db_path(&[root], "linked.db").unwrap_err();
+        assert!(err.contains("path traversal"), "unexpected error: {err}");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn sqlite_identifier_quoting_handles_hostile_table_names() {
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        let name = "odd\"] table";
+        let identifier = VictauriMcpHandler::quote_sqlite_identifier(name);
+        conn.execute_batch(&format!(
+            "CREATE TABLE {identifier} (id INTEGER); INSERT INTO {identifier} VALUES (1);"
+        ))
+        .unwrap();
+        let count: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {identifier}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
     #[test]
     fn env_filter_drops_secrets_keeps_safe() {
         // Safe, non-secret vars pass.
@@ -5495,6 +5596,10 @@ mod authz_dispatch_tests {
         let h = handler(crate::privacy::observe_privacy_config());
         let blocked: &[(&str, serde_json::Value)] = &[
             ("eval_js", serde_json::json!({"code": "1"})),
+            (
+                "wait_for",
+                serde_json::json!({"condition": "expression", "value": "true"}),
+            ),
             ("screenshot", serde_json::json!({})),
             ("invoke_command", serde_json::json!({"command": "greet"})),
             ("verify_state", serde_json::json!({"frontend_expr": "1"})),
@@ -5610,6 +5715,10 @@ mod authz_dispatch_tests {
         // Blocked in Test (arbitrary eval, navigation mutation, replay, FullControl tools):
         for (tool, args) in [
             ("eval_js", serde_json::json!({"code": "1"})),
+            (
+                "wait_for",
+                serde_json::json!({"condition": "expression", "value": "true"}),
+            ),
             ("verify_state", serde_json::json!({"frontend_expr": "1"})),
             (
                 "navigate",

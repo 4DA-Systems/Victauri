@@ -153,7 +153,7 @@ if (-not $DryRun) {
 Write-Host "`n--- Version bump complete: $OldVersion -> $NewVersion ---" -ForegroundColor Cyan
 
 if ($DryRun) {
-    Write-Host "(dry run — no files were modified)" -ForegroundColor DarkGray
+    Write-Host "(dry run - no files were modified)" -ForegroundColor DarkGray
 }
 
 Write-Host @"

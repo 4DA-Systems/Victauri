@@ -1,12 +1,11 @@
 //! Native window capture. `capture_window_raw` returns straight RGBA bytes plus
 //! dimensions; `capture_window` wraps that into a PNG. The raw form feeds the
 //! `filmstrip` compositor used by the animation `scrub` tool. Raw capture is
-//! available on Windows, macOS, and Linux/X11; the Linux/Wayland fallback can
-//! only produce a full-screen PNG (via `grim`), so `capture_window_raw` errors
-//! there.
+//! available on Windows, macOS, and Linux/X11. Pure Wayland capture fails
+//! safely because its available fallback is a full-desktop image, not the
+//! requested application window.
 
-/// Capture a window as a PNG (RGBA, 8-bit). Wraps [`capture_window_raw`] except
-/// on Linux, where the Wayland fallback yields a PNG directly.
+/// Capture a window as a PNG (RGBA, 8-bit).
 #[cfg(windows)]
 #[allow(dead_code)]
 pub async fn capture_window(hwnd: isize) -> anyhow::Result<Vec<u8>> {
@@ -394,20 +393,18 @@ pub async fn capture_window_raw(window_id: isize) -> anyhow::Result<(Vec<u8>, u3
 pub async fn capture_window(window_id: isize) -> anyhow::Result<Vec<u8>> {
     // Try X11 first (works on X11 and XWayland)
     match capture_window_x11_raw(window_id).await {
-        Ok((rgba, w, h)) => {
-            return tokio::task::spawn_blocking(move || encode_png(w, h, &rgba)).await?;
-        }
+        Ok((rgba, w, h)) => tokio::task::spawn_blocking(move || encode_png(w, h, &rgba)).await?,
         Err(x11_err) => {
-            tracing::debug!("X11 screenshot failed, trying Wayland fallback: {x11_err}");
+            anyhow::bail!(
+                "window screenshot requires X11/XWayland on Linux ({x11_err}); \
+                 pure Wayland does not expose a safe per-window capture path, and \
+                 Victauri refuses to capture the full desktop"
+            );
         }
     }
-
-    // Wayland fallback: use grim to capture the full screen
-    capture_window_wayland().await
 }
 
-/// Raw RGBA capture (X11 only). The Wayland fallback cannot produce raw bytes,
-/// so callers needing raw (e.g. the filmstrip compositor) get an error there.
+/// Raw RGBA capture (X11 only).
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 pub async fn capture_window_raw(window_id: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
@@ -474,38 +471,6 @@ async fn capture_window_x11_raw(window_id: isize) -> anyhow::Result<(Vec<u8>, u3
         Ok((rgba, width, height))
     })
     .await?
-}
-
-/// Wayland fallback: captures the full screen using `grim`.
-///
-/// On pure Wayland (no `XWayland`), `X11` window IDs cannot be mapped to Wayland
-/// surfaces, so per-window capture is not possible. This function captures the
-/// entire screen instead. The `grim` tool must be installed on the system.
-#[cfg(target_os = "linux")]
-async fn capture_window_wayland() -> anyhow::Result<Vec<u8>> {
-    use tokio::process::Command;
-
-    // grim outputs PNG to stdout when given "-" as the output path
-    let output = Command::new("grim")
-        .arg("-t")
-        .arg("png")
-        .arg("-")
-        .output()
-        .await
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Wayland screenshot failed: grim not found ({e}). \
-                 Screenshot requires X11 or grim (Wayland). \
-                 Install grim: https://github.com/emersion/grim"
-            )
-        })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("grim failed: {stderr}");
-    }
-
-    Ok(output.stdout)
 }
 
 #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]

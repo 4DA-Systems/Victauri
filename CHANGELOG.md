@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.1] - 2026-06-14
 
 ### Fixed
 
@@ -16,6 +16,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   needed CDP. Every webview/window tool now accepts `window`, `window_label`, and `webview_label`
   interchangeably (`#[serde(alias = …)]`, backward-compatible — output schemas unchanged). Found in the
   2026-06-14 live 4DA dogfood of 0.8.0. Regression tests cover `eval_js`, `snapshot`, and `screenshot`.
+- **Database introspection is now bounded and root-contained.** `introspect db_health` no longer
+  accepts relative `../` escapes or redirecting filesystem entries outside configured roots, no
+  longer executes the side-effecting `wal_checkpoint` PRAGMA, and safely quotes arbitrary SQLite
+  table names. `query_db` now runs on a blocking worker with a real CPU deadline plus cell/result
+  byte caps; `db_health` has the same deadline and a bounded table listing. Exact-`max_rows` results
+  are no longer falsely marked truncated.
+- **All MCP and plugin-command webview/window access now stays on Tauri's main thread.** Background
+  access to `AppHandle::webview_windows()` could race Tauri's non-atomic webview handle storage and
+  crash the host process under concurrent real IPC. A shared main-thread dispatcher now covers
+  eval, state/list, native handles, and window-management operations, with a live stress regression.
+- **Pure Wayland screenshots fail safely instead of capturing the full desktop.** Linux X11 and
+  XWayland retain per-window capture; when that path is unavailable Victauri now returns an
+  actionable error rather than leaking unrelated windows through the old `grim` fallback.
+- **Consumer CI examples no longer track mutable `main`.** README/docs now reference
+  `runyourempire/victauri/.github/actions/victauri-test@v0.8.1`, matching the already-pinned
+  generator and composite action.
 
 ## [0.8.0] - 2026-06-14
 
