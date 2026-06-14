@@ -38,5 +38,8 @@ editors/vscode/*.vsix
 SECURITY-AUDIT.md
 AUDIT_WORK.md
 
+# Codex agent instructions (per-terminal local artifact, like CLAUDE.md but tool-generated)
+AGENTS.md
+
 # npm pack artifacts
 extensions/npm/*.tgz
