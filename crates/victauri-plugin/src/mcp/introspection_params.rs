@@ -72,6 +72,7 @@ pub struct IntrospectParams {
 
     /// Target webview for actions that need JS eval.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
     // NB: `event_bus` options (`limit`, `since_ms`) are read from the generic `args` object
     // rather than dedicated fields — adding public fields to this externally-constructible

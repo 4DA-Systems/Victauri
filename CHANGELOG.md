@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Window-target param is no longer silently ignored.** `eval_js`/`snapshot`/etc. accept a
+  `webview_label`; `screenshot`/window-management accept a `window_label`. An agent that passed the
+  intuitive `window` (or the *other* tool's spelling) hit a serde unknown-field drop → `None` → the call
+  always landed on the MAIN window, so multi-window apps (e.g. 4DA's briefing/notification windows) still
+  needed CDP. Every webview/window tool now accepts `window`, `window_label`, and `webview_label`
+  interchangeably (`#[serde(alias = …)]`, backward-compatible — output schemas unchanged). Found in the
+  2026-06-14 live 4DA dogfood of 0.8.0. Regression tests cover `eval_js`, `snapshot`, and `screenshot`.
+
 ## [0.8.0] - 2026-06-14
 
 Driven by the scale-gauntlet cross-engine net and an exhaustive live sweep of 4DA
