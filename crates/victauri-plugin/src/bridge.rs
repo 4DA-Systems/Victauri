@@ -172,21 +172,55 @@ fn find_window<'a, R: Runtime>(
 /// over a oneshot `std::sync::mpsc` channel; the bounded `recv` is a safety net against a
 /// wedged event loop and never blocks the main thread (the closure runs *there*, the wait
 /// happens on the calling background thread).
+///
+/// The closure runs ON the UI/event-loop thread, so a panic in it would unwind into tao/winit
+/// and **abort the whole process** — strictly worse than the use-after-free this dispatcher
+/// exists to prevent — and would skip the result send, hanging the caller the full timeout. So
+/// the closure is run under `catch_unwind` and a panic is converted into an error that is always
+/// sent back. (Today every closure is panic-free by construction, but the helper must not let a
+/// future one take the app down.)
 fn on_main<R, T, F>(app: &tauri::AppHandle<R>, what: &str, f: F) -> Result<T, String>
 where
     R: Runtime,
     T: Send + 'static,
     F: FnOnce(&tauri::AppHandle<R>) -> T + Send + 'static,
 {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let (tx, rx) = std::sync::mpsc::channel();
     let app_for_closure = app.clone();
+    // If the caller times out and gives up, this flag tells the still-queued closure to skip
+    // its work — so a state-mutating op (resize/move/close/set_title) cannot apply long after
+    // the caller already saw a timeout error and moved on (a "spontaneous" window change).
+    let abandoned = std::sync::Arc::new(AtomicBool::new(false));
+    let abandoned_closure = abandoned.clone();
     app.run_on_main_thread(move || {
+        if abandoned_closure.load(Ordering::Acquire) {
+            return;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&app_for_closure)));
         // Send only fails if the caller already timed out and dropped the receiver — ignore.
-        let _ = tx.send(f(&app_for_closure));
+        let _ = tx.send(result);
     })
     .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))?;
-    rx.recv_timeout(std::time::Duration::from_secs(10))
-        .map_err(|e| format!("{what} did not complete on the main thread: {e}"))
+    // Blocking on the reply must not park a tokio runtime worker — under a wedged UI that could
+    // otherwise starve the embedded axum/MCP server. On a multi-threaded runtime, `block_in_place`
+    // tells the scheduler to run other tasks elsewhere while this thread blocks. (It panics on a
+    // current-thread runtime, so guard on the flavor; with no runtime at all, just block.)
+    let timeout = std::time::Duration::from_secs(10);
+    let received = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
+            tokio::task::block_in_place(|| rx.recv_timeout(timeout))
+        }
+        _ => rx.recv_timeout(timeout),
+    };
+    match received {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_panic)) => Err(format!("{what} panicked on the main thread")),
+        Err(e) => {
+            abandoned.store(true, Ordering::Release);
+            Err(format!("{what} did not complete on the main thread: {e}"))
+        }
+    }
 }
 
 impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
@@ -232,14 +266,22 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
 
             states
         })
-        .unwrap_or_default()
+        // An empty Vec here means the main-thread dispatch failed/timed out (a wedged UI), not
+        // "no windows" — log it so that case is diagnosable rather than silently indistinguishable.
+        .unwrap_or_else(|e| {
+            tracing::warn!("get_window_states: {e}");
+            Vec::new()
+        })
     }
 
     fn list_window_labels(&self) -> Vec<String> {
         on_main(self, "list_window_labels", |app| {
             app.webview_windows().keys().cloned().collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_else(|e| {
+            tracing::warn!("list_window_labels: {e}");
+            Vec::new()
+        })
     }
 
     fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {

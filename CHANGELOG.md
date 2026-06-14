@@ -26,12 +26,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access to `AppHandle::webview_windows()` could race Tauri's non-atomic webview handle storage and
   crash the host process under concurrent real IPC. A shared main-thread dispatcher now covers
   eval, state/list, native handles, and window-management operations, with a live stress regression.
+  The dispatcher also runs its closure under `catch_unwind`, so a panic on the UI thread becomes an
+  error instead of aborting the host process (and the caller fails fast rather than waiting out the
+  timeout).
 - **Pure Wayland screenshots fail safely instead of capturing the full desktop.** Linux X11 and
   XWayland retain per-window capture; when that path is unavailable Victauri now returns an
   actionable error rather than leaking unrelated windows through the old `grim` fallback.
 - **Consumer CI examples no longer track mutable `main`.** README/docs now reference
   `runyourempire/victauri/.github/actions/victauri-test@v0.8.1`, matching the already-pinned
   generator and composite action.
+- **Adversarial-audit hardening (concurrency + filesystem).** From a deep pre-publish audit: the
+  main-thread dispatcher uses `block_in_place` so blocking on the UI reply never starves the embedded
+  server's runtime workers, and skips a mutation whose caller already timed out (no "spontaneous"
+  window change after a reported failure). The `query_db`/`db_health` CPU deadline is now a hard
+  wall-clock interrupt (the opcode-sampling progress handler under-counts a single long scan).
+  `read_app_file` does its file IO on a blocking worker and opens the canonical validated path (a
+  swapped FIFO can't stall the executor, and the open matches what containment approved). Trusted
+  (OS-level) native input no longer blocks a runtime worker.
 
 ## [0.8.0] - 2026-06-14
 

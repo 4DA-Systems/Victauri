@@ -1204,70 +1204,83 @@ impl VictauriMcpHandler {
         }
 
         let max_bytes = params.max_bytes.unwrap_or(1_048_576).min(10_485_760);
-        let metadata = std::fs::metadata(&target).map_err(|e| e.to_string());
 
-        // Bounded read (audit B7): pull at most max_bytes+1 instead of slurping the
-        // whole file into memory and then truncating — a multi-GB file must not be
-        // fully allocated just to return a 1 MB window. The +1 detects truncation;
-        // the reported size comes from metadata, not the (capped) read.
-        let read_result = std::fs::File::open(&target).and_then(|f| {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            f.take(max_bytes as u64 + 1).read_to_end(&mut buf)?;
-            Ok(buf)
-        });
-        match read_result {
-            Ok(mut bytes) => {
-                let original_size = metadata
-                    .as_ref()
-                    .map_or_else(|_| bytes.len(), |m| m.len() as usize);
-                let truncated = bytes.len() > max_bytes;
-                if truncated {
-                    bytes.truncate(max_bytes);
-                }
-
-                let file_info = serde_json::json!({
-                    "path": params.path,
-                    "size": original_size,
-                    "truncated": truncated,
-                    "modified": metadata.as_ref().ok()
-                        .and_then(|m| m.modified().ok())
-                        .map(|t| {
-                            let duration = t.duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap_or_default();
-                            duration.as_secs()
-                        }),
+        // Open the CANONICAL validated path, and do the blocking file IO on the blocking pool.
+        // Doing sync `std::fs` IO directly in this async fn could stall the executor thread if a
+        // regular file were swapped (between the `safe_within` check and the open) for a FIFO or
+        // slow device whose `read_to_end` blocks; opening the canonical path also closes the
+        // trivial validate-lexical / open-lexical symlink-swap window.
+        let canonical = match std::fs::canonicalize(&target) {
+            Ok(c) => c,
+            Err(e) => return tool_error(format!("cannot resolve path: {e}")),
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        let read = tokio::task::spawn_blocking(
+            move || -> Result<(Vec<u8>, usize, Option<u64>), String> {
+                use std::io::Read;
+                let metadata = std::fs::metadata(&canonical).ok();
+                let size = metadata.as_ref().map(|m| m.len() as usize);
+                let modified = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
+                    t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
                 });
+                // Bounded read (audit B7): pull at most max_bytes+1 instead of slurping the
+                // whole file. The +1 detects truncation; the reported size comes from metadata.
+                let f = std::fs::File::open(&canonical).map_err(|e| e.to_string())?;
+                let mut buf = Vec::new();
+                f.take(max_bytes as u64 + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|e| e.to_string())?;
+                let reported = size.unwrap_or(buf.len());
+                Ok((buf, reported, modified))
+            },
+        )
+        .await;
+        let (mut bytes, original_size, modified) = match read {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return tool_error(format!("failed to read file: {e}")),
+            Err(e) => return tool_error(format!("file read task failed: {e}")),
+        };
+        let truncated = bytes.len() > max_bytes;
+        if truncated {
+            bytes.truncate(max_bytes);
+        }
 
-                if params.binary == Some(true) {
+        let file_info = serde_json::json!({
+            "path": params.path,
+            "size": original_size,
+            "truncated": truncated,
+            "modified": modified,
+        });
+
+        if params.binary == Some(true) {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            json_result(&serde_json::json!({
+                "file": file_info,
+                "encoding": "base64",
+                "content": b64,
+            }))
+        } else {
+            match String::from_utf8(bytes) {
+                Ok(text) => json_result(&serde_json::json!({
+                    "file": file_info,
+                    "encoding": "utf-8",
+                    "content": text,
+                })),
+                Err(e) => {
                     use base64::Engine;
+                    let bytes = e.into_bytes();
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
                     json_result(&serde_json::json!({
                         "file": file_info,
                         "encoding": "base64",
+                        "note": "file is not valid UTF-8, returning base64",
                         "content": b64,
                     }))
-                } else {
-                    match String::from_utf8(bytes) {
-                        Ok(text) => json_result(&serde_json::json!({
-                            "file": file_info,
-                            "encoding": "utf-8",
-                            "content": text,
-                        })),
-                        Err(e) => {
-                            use base64::Engine;
-                            let bytes = e.into_bytes();
-                            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            json_result(&serde_json::json!({
-                                "file": file_info,
-                                "encoding": "base64",
-                                "note": "file is not valid UTF-8, returning base64",
-                                "content": b64,
-                            }))
-                        }
-                    }
                 }
             }
-            Err(e) => tool_error(format!("failed to read file: {e}")),
         }
     }
 
@@ -1427,10 +1440,14 @@ impl VictauriMcpHandler {
                             RecoveryHint::CheckInput,
                         );
                     };
-                    return match self
-                        .bridge
-                        .native_click(params.webview_label.as_deref(), x, y)
-                    {
+                    let bridge = self.bridge.clone();
+                    let label = params.webview_label.clone();
+                    let native = tokio::task::spawn_blocking(move || {
+                        bridge.native_click(label.as_deref(), x, y)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("native input task failed: {e}")));
+                    return match native {
                         Ok(()) => json_result(
                             &serde_json::json!({"ok": true, "trusted": true, "x": x, "y": y}),
                         ),
@@ -1583,10 +1600,15 @@ impl VictauriMcpHandler {
                             RecoveryHint::CheckInput,
                         );
                     }
-                    return match self
-                        .bridge
-                        .native_type_text(params.webview_label.as_deref(), text)
-                    {
+                    let bridge = self.bridge.clone();
+                    let label = params.webview_label.clone();
+                    let text = text.to_string();
+                    let native = tokio::task::spawn_blocking(move || {
+                        bridge.native_type_text(label.as_deref(), &text)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("native input task failed: {e}")));
+                    return match native {
                         Ok(()) => json_result(&serde_json::json!({"ok": true, "trusted": true})),
                         Err(e) => tool_error(e),
                     };
@@ -1617,7 +1639,15 @@ impl VictauriMcpHandler {
                             .eval_with_return(&focus, params.webview_label.as_deref())
                             .await;
                     }
-                    return match self.bridge.native_key(params.webview_label.as_deref(), key) {
+                    let bridge = self.bridge.clone();
+                    let label = params.webview_label.clone();
+                    let key = key.to_string();
+                    let native = tokio::task::spawn_blocking(move || {
+                        bridge.native_key(label.as_deref(), &key)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("native input task failed: {e}")));
+                    return match native {
                         Ok(()) => json_result(&serde_json::json!({"ok": true, "trusted": true})),
                         Err(e) => tool_error(e),
                     };
@@ -3960,7 +3990,13 @@ impl VictauriMcpHandler {
             let resolved = root.join(candidate);
             if resolved.exists() {
                 Self::safe_within(root, &resolved)?;
-                return Ok(resolved);
+                // Open the CANONICAL validated path, not the lexical join, so the DB is opened
+                // at exactly the path containment approved (closes the trivial validate-lexical
+                // vs open-lexical TOCTOU; a same-privilege local symlink swap between
+                // canonicalize and open is the unavoidable residual, documented in security.md).
+                let canonical = std::fs::canonicalize(&resolved)
+                    .map_err(|e| format!("cannot resolve database path: {e}"))?;
+                return Ok(canonical);
             }
         }
 
@@ -4408,6 +4444,9 @@ impl VictauriMcpHandler {
                     expired
                 }),
             );
+            // Hard wall-clock backstop for single long ops (e.g. integrity_check / per-table
+            // count(*) on a huge DB) that the opcode-sampling progress handler under-counts.
+            let _interrupt = crate::database::InterruptGuard::arm(&conn, DB_HEALTH_TIMEOUT);
 
             let journal_mode: String = conn
                 .pragma_query_value(None, "journal_mode", |r| r.get(0))
@@ -5093,7 +5132,9 @@ mod tests {
 
         let resolved =
             VictauriMcpHandler::resolve_existing_db_path(&[root], "nested/app.db").unwrap();
-        assert_eq!(resolved, db);
+        // Resolution returns the CANONICAL validated path (opened == validated, closing the
+        // lexical-vs-canonical TOCTOU), so compare against the canonical form of the target.
+        assert_eq!(resolved, std::fs::canonicalize(&db).unwrap());
     }
 
     #[cfg(all(feature = "sqlite", unix))]

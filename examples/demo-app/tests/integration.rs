@@ -13,10 +13,13 @@
 //!
 //! # Running
 //!
-//! Start the demo app, then run with `VICTAURI_E2E` set:
+//! Start the demo app, then run with `VICTAURI_E2E` set. Use `--test-threads=1`: these
+//! tests share one running app, and `webview_access_main_thread_safe_under_ipc_load`
+//! installs a global page-wide IPC flood that would destabilize tests running concurrently
+//! against the same app (CI runs serialized for this reason).
 //! ```sh
 //! cd examples/demo-app && cargo tauri dev &
-//! VICTAURI_E2E=1 cargo test -p demo-app --test integration
+//! VICTAURI_E2E=1 cargo test -p demo-app --test integration -- --test-threads=1
 //! ```
 
 use serde_json::json;
