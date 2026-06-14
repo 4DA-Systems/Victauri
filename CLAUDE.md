@@ -184,7 +184,27 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-06-14)
+## Current State (2026-06-15)
+
+### v0.8.2 — host-crash REAL fix (drain-loop amplifier removed); 0.8.1 was only partial
+
+**Honest correction:** 0.8.1's main-thread dispatcher *reduced* the host crash (0.8.0 crashed in
+1-2 cycles → 0.8.1 survived ~7) but did NOT eliminate it. A live-4DA dogfood soak crashed 0.8.1 with
+the identical `Rc<Webview>` UAF. The crash is a **Tauri-runtime race** (not victauri's bug): an IPC
+request hitting `tauri::ipc::protocol::get` **during a webview reload** (HMR; preceded by "app
+reloaded while running async op" warnings) clones a tearing-down Webview → use-after-free. Victauri
+*amplifies* it via eval-callback IPC volume. The dominant amplifier: the background `event_drain_loop`
+eval'd `getEventStream` in EVERY window EVERY second (each eval → a `victauri_eval_callback` IPC
+request), constantly, even idle. 0.7.11 drained only the default window (≈1/s, effectively clean);
+0.8.0 made it per-window (≈N/s, crashed). **0.8.2 fix: gate the drain loop on
+`recorder.is_recording()`** — zero idle eval-callback churn → the reload race can't be amplified by
+background activity. `explain`/`event_bus` JS events now require an active recording (documented
+trade-off; the continuous capture WAS the churn). Regression test now reloads the webview while
+introspecting (the trigger the 0.8.1 test failed to exercise). **The definitive proof is an extended
+4DA dogfood soak with the bridge ENABLED (not `VICTAURI_DISABLE=1`) — handed to the dogfood terminal;
+a short clean window is NOT proof for an intermittent race.** Secondary amplifier not yet touched:
+the probe-before-every-eval doubles on-demand (tool-call) eval churn — left for a follow-up if soak
+still shows residual.
 
 ### v0.8.1 — host-crash fix (main-thread webview access) + security/robustness hardening
 

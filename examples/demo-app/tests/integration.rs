@@ -605,3 +605,74 @@ e2e_test!(
         );
     }
 );
+
+e2e_test!(
+    webview_reload_during_introspection_is_safe,
+    |client| async move {
+        // REGRESSION for the 0.8.1 host-crash MISS. The crash is a Tauri-runtime `Rc<Webview>`
+        // use-after-free that fires when an IPC request hits `tauri::ipc::protocol::get` *during a
+        // webview reload* (HMR / navigation), amplified by Victauri's eval-callback IPC. My 0.8.1
+        // regression test NEVER reloaded the webview, so it passed green while the real crash
+        // persisted — the disconfirmation failure this test exists to prevent. Here we reload the
+        // webview repeatedly WHILE introspecting concurrently (the actual trigger) and assert the
+        // host survives. The 0.8.2 fix gates the background drain loop — the dominant constant
+        // eval-callback amplifier — so idle introspection no longer churns IPC into the reload window.
+        use std::time::{Duration, Instant};
+
+        const SECONDS: u64 = 8;
+
+        // Reloader: hammer `location.reload()` (the persistent bridge re-injects each time).
+        let reloader = tokio::spawn(async move {
+            let mut c = victauri_test::connect().await.expect("reloader connect");
+            let start = Instant::now();
+            let mut n = 0u32;
+            while start.elapsed() < Duration::from_secs(SECONDS) {
+                let _ = c.eval_js("location.reload(); true").await;
+                n += 1;
+                tokio::time::sleep(Duration::from_millis(120)).await;
+            }
+            n
+        });
+
+        // Introspectors: drive IPC concurrently so requests land in the reload window.
+        let mut probers = Vec::new();
+        for _ in 0..3 {
+            probers.push(tokio::spawn(async move {
+                let mut c = victauri_test::connect().await.expect("prober connect");
+                let start = Instant::now();
+                while start.elapsed() < Duration::from_secs(SECONDS) {
+                    let _ = c.eval_js("document.title").await;
+                    let _ = c.get_window_state(None).await;
+                    let _ = c.list_windows().await;
+                }
+            }));
+        }
+
+        let reloads = reloader.await.unwrap_or(0);
+        for p in probers {
+            let _ = p.await;
+        }
+
+        // The host must still be alive (retry-with-grace: a freshly-reloaded bridge needs a beat to
+        // re-inject; a *persistent* connection-refused is the crash).
+        let mut alive = false;
+        let mut last_err = String::new();
+        for _ in 0..15 {
+            match client.eval_js("document.title").await {
+                Ok(v) if v.is_string() => {
+                    alive = true;
+                    break;
+                }
+                Ok(v) => last_err = format!("unexpected: {v:?}"),
+                Err(e) => last_err = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            alive,
+            "host app must survive repeated webview reloads during concurrent introspection — a \
+         persistent failure here is the 0.8.x Rc<Webview> use-after-free. Last error: {last_err}"
+        );
+        assert!(reloads > 0, "reloader should have run at least once");
+    }
+);

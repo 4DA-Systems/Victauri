@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] - 2026-06-15
+
+### Fixed
+
+- **Host-process crash under webview reload — the real fix.** 0.8.1's main-thread dispatcher
+  *reduced* but did **not eliminate** the crash: it is a Tauri-runtime `Rc<Webview>` use-after-free
+  (`STATUS_*_BUFFER_OVERRUN`) that fires when an IPC request hits `tauri::ipc::protocol::get`
+  **during a webview reload** (HMR / navigation, preceded by Tauri's "app reloaded while running an
+  async op" warnings). Victauri does not cause that Tauri race, but it **amplified** it: the
+  background event-drain loop eval'd `getEventStream` in *every window every second* — each eval
+  injects JS that calls back over IPC (`victauri_eval_callback`) — so a multi-window app saw a
+  constant stream of IPC requests, forever, even when idle, every one of which is a chance to land
+  in a reload window. (0.7.11 drained only the default window ≈ 1/sec and was effectively clean;
+  0.8.0 made it per-window ≈ N/sec and crashed every few cycles.) **0.8.2 gates the drain loop on an
+  active time-travel recording**, so idle introspection produces zero background eval-callback churn
+  — removing the dominant amplifier. New regression test reloads the webview while introspecting
+  concurrently (the actual trigger the 0.8.1 test failed to exercise).
+
+### Changed
+
+- **`explain` and the JS-event side of `event_bus` now reflect events only while a recording is
+  active.** Continuous passive event capture was inseparable from the constant IPC churn above, so it
+  is now tied to `recording start` (its natural scope as a session-narration tool). `event_bus`'s
+  native Tauri window/lifecycle events are unaffected and always captured.
+
 ## [0.8.1] - 2026-06-14
 
 ### Fixed

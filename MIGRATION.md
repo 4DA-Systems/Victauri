@@ -1,5 +1,17 @@
 # Migration Guide
 
+## v0.8.1 → v0.8.2 (host-crash amplifier removed)
+
+No consumer code changes are required and no dependency-requirement change is needed (0.8.2 is a
+semver-compatible patch — `victauri-plugin = "0.8"` picks it up). One behavior change to be aware of:
+
+- **`explain` and the JS-event stream of `event_bus` now require an active time-travel recording.**
+  Previously a background loop continuously drained page events into the log; that continuous draining
+  was the dominant amplifier of the host-process crash (it churned IPC every second into webview-reload
+  windows), so it is now gated on `recording start`. To get a narrated event summary, start a
+  recording, exercise the app, then call `explain`. `event_bus`'s native Tauri window/lifecycle events
+  are unaffected. If you used `explain` without recording, wrap the activity in a recording session.
+
 ## v0.8.0 → v0.8.1 (host-crash fix + security/robustness hardening)
 
 No consumer code changes are required, and no dependency-requirement change is needed (0.8.1 is a

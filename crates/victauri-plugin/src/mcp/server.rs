@@ -972,6 +972,20 @@ async fn event_drain_loop(
             _ = shutdown.changed() => break,
         }
 
+        // Only drain while a time-travel recording is active. Draining evals
+        // `getEventStream` in EVERY window every second, and each eval injects JS that
+        // calls back via `victauri_eval_callback` — an IPC request. That constant
+        // background IPC churn (for a 3-window app: ~3 callbacks/sec, forever) AMPLIFIES a
+        // Tauri-runtime `Rc<Webview>` use-after-free that fires when an IPC request hits
+        // `ipc::protocol::get` *during a webview reload* (HMR / navigation). The recorder
+        // is the only consumer that needs the continuous stream; when nothing is recording,
+        // idle draining is pure crash-amplifying churn (it was the dominant amplifier behind
+        // the 0.8.0/0.8.1 host crash). `explain`/`event_bus` drain on demand instead.
+        // See CHANGELOG 0.8.2.
+        if !state.recorder.is_recording() {
+            continue;
+        }
+
         let labels = bridge.list_window_labels();
         if labels.is_empty() {
             continue;
