@@ -2,6 +2,15 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.8.3 (2026-06-16)
+
+- Version-synced with the Victauri 0.8.3 release (server-side DX/safety fixes, GPT-5.5
+  audit-hardened): `screenshot` of a non-visible window now returns a clear error instead of
+  silently capturing the wrong window's pixels (both the explicit-label and the omitted-label
+  cases), and `query_db` accepts `sql` as an alias for the `query` field. The 0.8.1/0.8.2
+  host-crash fixes are also in this line. No extension code changes — the extension talks to the
+  embedded server, which carries the fixes.
+
 ## 0.8.0 (2026-06-14)
 
 - Version-synced with the Victauri 0.8.0 release. Ships the security hardening from
