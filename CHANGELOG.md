@@ -10,18 +10,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 In-the-wild fixes from a live 4DA analysis session driven **entirely through the Victauri
 bridge** (REST `/api/tools`, no CDP/Playwright): a full morning-brief + preemption review on
 the running app. The 0.8.2 host-crash fix held (bridge enabled, no `VICTAURI_DISABLE`, no
-crash). Two genuine, generic friction points surfaced; both fixed here. Additive and
-semver-clean (a new serde alias + a pre-capture visibility check — no output-schema change).
+crash). Two genuine, generic friction points surfaced; both fixed here, then hardened by a
+GPT-5.5 adversarial audit (which confirmed the omitted-label gap below and found no `query_db`
+security regression). Additive and semver-clean (a serde alias + a pre-capture visibility
+resolution — no output-schema change).
 
 ### Fixed
 
-- **`screenshot` of a hidden window no longer returns a stale/wrong image silently.** Capturing
-  a non-visible window (e.g. 4DA's hidden `briefing` panel) returned a PNG that was actually the
-  *main* window's pixels — the OS capture path (PrintWindow / `CGWindowListCreateImage`) has no
-  live surface for an unmapped window, so it yields stale, empty, or foreign content with no
-  error, and an agent cannot tell a wrong image from a right one. `screenshot` now checks the
-  target window's visibility first and returns a clear, actionable error (`window '<label>' is
-  not visible … show it first via window manage_action=show`) instead of a misleading capture.
+- **`screenshot` of a non-visible window no longer returns a stale/wrong image silently.** A
+  native screenshot captures the on-screen surface; a hidden window has none, so the OS capture
+  path (PrintWindow / `CGWindowListCreateImage`) yields stale, empty, or *another window's*
+  pixels with no error — and an agent cannot tell a wrong image from a right one. Two paths are
+  fixed: **(1)** an explicitly-requested hidden window (e.g. 4DA's hidden `briefing` panel
+  returned the *main* window's pixels) now returns a clear, actionable error; **(2, GPT audit
+  P2)** `screenshot {}` with **no label** previously resolved through `find_window(None)`, which
+  prefers `"main"` *unconditionally* — so an app that hides main but leaves a secondary window
+  visible captured hidden main. The tool now resolves its own visible target (prefer a visible
+  `main`, else the first visible window, else a clear "no visible window to capture" error) and
+  passes it explicitly to the OS-handle lookup. `find_window` itself is unchanged — other callers
+  (e.g. `eval_js`) may legitimately target a hidden window.
 
 ### Changed
 

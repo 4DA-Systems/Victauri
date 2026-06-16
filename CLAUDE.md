@@ -194,14 +194,17 @@ result: **the 0.8.2 host-crash fix held** — the session ran with the bridge EN
 `VICTAURI_DISABLE`), `get_diagnostics`/`query_db`/IPC-integrity/ghost-detection all worked, no
 crash. Two genuine, generic frictions surfaced and are fixed here (additive, semver-clean):
 
-- **`screenshot` of a hidden window returned the *wrong* image, silently.** Requesting a
-  non-visible window (4DA's hidden `briefing` panel) returned a PNG that was actually the MAIN
-  window's pixels — the OS capture path (PrintWindow / `CGWindowListCreateImage`) has no live
-  surface for an unmapped window, so it yields stale/empty/foreign content with no error, and an
-  agent can't tell a wrong image from a right one. `screenshot` now checks visibility first and
-  returns a clear, actionable error (show it first via `window` manage_action=show) instead of a
-  misleading capture. (`find_window` itself was already correct — it returns the requested
-  window's handle or errors; the silent fallback was the OS capturing a hidden surface.)
+- **`screenshot` of a non-visible window returned the *wrong* image, silently** — fixed for BOTH
+  the explicit-label and the omitted-label paths. A native screenshot captures the on-screen
+  surface; a hidden window has none, so the OS capture (PrintWindow / `CGWindowListCreateImage`)
+  yields stale/empty/foreign pixels with no error. (1) An explicit hidden label (4DA's `briefing`
+  returned MAIN's pixels) now errors clearly. (2) **GPT-5.5 audit P2:** `screenshot {}` with no
+  label resolved via `find_window(None)`, which prefers `"main"` UNCONDITIONALLY — so a hidden
+  main + visible secondary captured hidden main. The tool now resolves its own VISIBLE target
+  (visible `main` → first visible → else clear error) and passes it explicitly to
+  `get_native_handle`. `find_window` is unchanged (other callers like `eval_js` may target a
+  hidden window). The check-then-capture TOCTOU residual is acknowledged (auditor agreed it is
+  not a security boundary — worst case is the same usability failure).
 - **`query_db` now accepts `sql` as an alias for `query`.** Passing the intuitive `sql` key
   400'd opaquely with no hint that the field is `query`. The alias + a clearer tool description
   remove the paper-cut. (Same class as the #25 `window`/`webview_label` aliases.)
