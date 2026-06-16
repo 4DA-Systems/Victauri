@@ -184,7 +184,38 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-06-15)
+## Current State (2026-06-16)
+
+### v0.8.3 — in-the-wild DX/safety fixes from a live-4DA bridge-only analysis session
+
+Driven by a full morning-brief + preemption review of **live 4DA conducted entirely through the
+Victauri bridge** (REST `/api/tools`, no CDP/Playwright/sqlite). The headline is the negative
+result: **the 0.8.2 host-crash fix held** — the session ran with the bridge ENABLED (no
+`VICTAURI_DISABLE`), `get_diagnostics`/`query_db`/IPC-integrity/ghost-detection all worked, no
+crash. Two genuine, generic frictions surfaced and are fixed here (additive, semver-clean):
+
+- **`screenshot` of a non-visible window returned the *wrong* image, silently** — fixed for BOTH
+  the explicit-label and the omitted-label paths. A native screenshot captures the on-screen
+  surface; a hidden window has none, so the OS capture (PrintWindow / `CGWindowListCreateImage`)
+  yields stale/empty/foreign pixels with no error. (1) An explicit hidden label (4DA's `briefing`
+  returned MAIN's pixels) now errors clearly. (2) **GPT-5.5 audit P2:** `screenshot {}` with no
+  label resolved via `find_window(None)`, which prefers `"main"` UNCONDITIONALLY — so a hidden
+  main + visible secondary captured hidden main. The tool now resolves its own VISIBLE target
+  (visible `main` → first visible → else clear error) and passes it explicitly to
+  `get_native_handle`. `find_window` is unchanged (other callers like `eval_js` may target a
+  hidden window). The check-then-capture TOCTOU residual is acknowledged (auditor agreed it is
+  not a security boundary — worst case is the same usability failure).
+- **`query_db` now accepts `sql` as an alias for `query`.** Passing the intuitive `sql` key
+  400'd opaquely with no hint that the field is `query`. The alias + a clearer tool description
+  remove the paper-cut. (Same class as the #25 `window`/`webview_label` aliases.)
+
+Findings deliberately NOT "fixed" (documented as working-as-intended): the first-call
+`get_diagnostics` cold-start timeout is the webview still loading at launch — already mitigated by
+the 5s bridge-ready wait + ~2s liveness probe, and it self-resolved on re-run. The 1 "confirmed
+ghost" (`get_actionable_signals`) was the agent typing an *MCP tool name* into `invoke_command`:
+Victauri correctly reported a command with no Tauri handler — and by design its invoke path is
+identical to the frontend's (VIC-6), so the IPC log cannot distinguish an agent-typed call from a
+real one. App-side `app_state` probes being empty is a 4DA wiring gap, not a Victauri bug.
 
 ### v0.8.2 — host-crash REAL fix (drain-loop amplifier removed); 0.8.1 was only partial
 

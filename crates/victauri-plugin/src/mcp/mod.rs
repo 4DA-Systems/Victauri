@@ -440,7 +440,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Capture a screenshot of a Tauri window as a base64-encoded PNG image. Works on Windows (PrintWindow), macOS (CGWindowListCreateImage), and Linux X11/XWayland. Pure Wayland fails safely because its available fallback would capture the full desktop rather than the requested window.",
+        description = "Capture a screenshot of a Tauri window as a base64-encoded PNG image. Works on Windows (PrintWindow), macOS (CGWindowListCreateImage), and Linux X11/XWayland. Pure Wayland fails safely because its available fallback would capture the full desktop rather than the requested window. A hidden (non-visible) window has no on-screen surface to capture, so requesting one returns a clear error (show it first via `window` manage_action=show) rather than a stale or wrong-window image.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -452,10 +452,58 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("screenshot") {
             return tool_disabled("screenshot");
         }
-        match self
-            .bridge
-            .get_native_handle(params.window_label.as_deref())
-        {
+        // Resolve the EXACT window to capture and require it to be visible BEFORE touching the
+        // OS handle. A native screenshot captures the on-screen surface; a hidden window has
+        // none, so the OS capture path (PrintWindow / CGWindowListCreateImage) silently returns
+        // stale, empty, or ANOTHER window's pixels with no error — an agent can't tell a wrong
+        // image from a right one, so a silent wrong-window image is worse than a clear failure.
+        // Two failure modes, both closed here:
+        //   1. (live-4DA, 2026-06-16) an explicitly-requested hidden window (label:"briefing")
+        //      returned the MAIN window's pixels.
+        //   2. (GPT audit, P2) `screenshot {}` with no label: the default resolver
+        //      `find_window(None)` prefers "main" UNCONDITIONALLY, so an app that hides main but
+        //      leaves a secondary window visible captured hidden main. We do NOT change
+        //      `find_window` — other callers (e.g. eval) may legitimately target a hidden window
+        //      — instead the screenshot tool resolves its own VISIBLE target and passes it
+        //      explicitly to `get_native_handle`.
+        // Note (acknowledged residual): resolve -> handle -> capture are separate calls, so a
+        // window hidden in the gap is still TOCTOU. The worst case is the same usability failure
+        // (a wrong image), not a security boundary; the guard makes the common, deterministic
+        // case correct.
+        let states = self.bridge.get_window_states(None);
+        let target_label: String = if let Some(label) = params.window_label.as_deref() {
+            // An explicit label that the enumerator reports hidden is rejected; visible or
+            // unknown labels fall through (an unknown one lets get_native_handle produce the
+            // canonical "window not found" rather than inventing an error here).
+            if states.iter().any(|s| s.label == label && !s.visible) {
+                return tool_error(format!(
+                    "window '{label}' is not visible — a native screenshot captures the \
+                     on-screen surface, and a hidden window has none (the OS capture would \
+                     return stale or another window's pixels). Show it first \
+                     (window action=manage manage_action=show label={label}), then capture."
+                ));
+            }
+            label.to_string()
+        } else {
+            // No label: prefer a visible "main", else the first visible window. NEVER silently
+            // fall back to a hidden window (the P2 bug) — error instead.
+            let pick = states
+                .iter()
+                .find(|s| s.label == "main" && s.visible)
+                .or_else(|| states.iter().find(|s| s.visible));
+            match pick {
+                Some(st) => st.label.clone(),
+                None => {
+                    return tool_error(
+                        "no visible window to capture — every window is hidden (or the UI is \
+                         not responding). Show one first (window action=manage \
+                         manage_action=show label=<label>), then capture."
+                            .to_string(),
+                    );
+                }
+            }
+        };
+        match self.bridge.get_native_handle(Some(&target_label)) {
             Ok(hwnd) => match crate::screenshot::capture_window(hwnd).await {
                 Ok(png_bytes) => {
                     use base64::Engine;
@@ -1285,7 +1333,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Execute a bounded, read-only SQL query against a SQLite database in the app's data directory. Auto-discovers database files if no path is specified. Only SELECT/PRAGMA/EXPLAIN/WITH queries are allowed. CPU time, cell size, row count, and returned bytes are capped. Returns rows as JSON objects with column names as keys. This provides direct backend database access without going through the webview or IPC.",
+        description = "Execute a bounded, read-only SQL query against a SQLite database in the app's data directory. The SQL goes in the `query` field (alias: `sql`). Auto-discovers database files if no path is specified. Only SELECT/PRAGMA/EXPLAIN/WITH queries are allowed. CPU time, cell size, row count, and returned bytes are capped. Returns rows as JSON objects with column names as keys. This provides direct backend database access without going through the webview or IPC.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -6384,5 +6432,282 @@ mod command_policy_dispatch_tests {
                 "{safe} should be surfaced by app_info"
             );
         }
+    }
+}
+
+/// `screenshot` must refuse to "capture" a non-visible window.
+///
+/// Live-4DA dogfood (2026-06-16): requesting a hidden window (`label:"briefing"`)
+/// returned a PNG that was actually the MAIN window's pixels — the OS capture path has
+/// no live surface for an unmapped window, so it silently yields stale/foreign content.
+/// The tool now checks visibility first and fails with an actionable message instead.
+#[cfg(test)]
+mod screenshot_visibility_tests {
+    use super::*;
+    use crate::bridge::WebviewBridge;
+    use crate::privacy::PrivacyConfig;
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use victauri_core::{CommandRegistry, EventLog, EventRecorder, WindowState};
+
+    fn window(label: &str, visible: bool) -> WindowState {
+        WindowState {
+            label: label.to_string(),
+            title: label.to_string(),
+            url: "http://localhost/".to_string(),
+            visible,
+            focused: false,
+            maximized: false,
+            minimized: false,
+            fullscreen: false,
+            position: (0, 0),
+            size: (800, 600),
+        }
+    }
+
+    /// A bridge with a configurable window set that RECORDS the label `get_native_handle`
+    /// is asked for, then errs. Recording the label lets a test assert WHICH window the
+    /// screenshot tool resolved to (the audit-P2 case: omitted label must resolve to a
+    /// VISIBLE window, never hidden "main"); the error lets a test prove the visibility gate
+    /// fired *before* the OS-handle path was reached.
+    struct ConfigBridge {
+        windows: Vec<WindowState>,
+        handle_label: Arc<StdMutex<Option<Option<String>>>>,
+    }
+
+    impl ConfigBridge {
+        fn new(windows: Vec<WindowState>) -> Self {
+            Self {
+                windows,
+                handle_label: Arc::new(StdMutex::new(None)),
+            }
+        }
+        /// The label `get_native_handle` was called with, if it was reached.
+        /// `Some(Some(l))` = called with label `l`; `Some(None)` = called with the default;
+        /// `None` = never reached (gate short-circuited).
+        fn requested_handle(&self) -> Option<Option<String>> {
+            self.handle_label
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    impl WebviewBridge for ConfigBridge {
+        fn eval_webview(&self, _l: Option<&str>, _s: &str) -> Result<(), String> {
+            Err("no eval".to_string())
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            match label {
+                Some(l) => self
+                    .windows
+                    .iter()
+                    .filter(|w| w.label == l)
+                    .cloned()
+                    .collect(),
+                None => self.windows.clone(),
+            }
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            self.windows.iter().map(|w| w.label.clone()).collect()
+        }
+        fn get_native_handle(&self, l: Option<&str>) -> Result<isize, String> {
+            *self
+                .handle_label
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(l.map(str::to_string));
+            Err("native handle path reached".to_string())
+        }
+        fn manage_window(&self, _l: Option<&str>, _a: &str) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn resize_window(&self, _l: Option<&str>, _w: u32, _h: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn move_window(&self, _l: Option<&str>, _x: i32, _y: i32) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_window_title(&self, _l: Option<&str>, _t: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn handler_with(bridge: Arc<ConfigBridge>) -> VictauriMcpHandler {
+        let state = Arc::new(VictauriState {
+            event_log: EventLog::new(100),
+            registry: CommandRegistry::new(),
+            port: std::sync::atomic::AtomicU16::new(0),
+            pending_evals: Arc::new(Mutex::new(HashMap::new())),
+            recorder: EventRecorder::new(100),
+            privacy: PrivacyConfig::default(),
+            eval_timeout: std::time::Duration::from_millis(100),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            started_at: std::time::Instant::now(),
+            tool_invocations: std::sync::atomic::AtomicU64::new(0),
+            allow_file_navigation: false,
+            command_timings: crate::introspection::CommandTimings::new(),
+            fault_registry: crate::introspection::FaultRegistry::new(),
+            contract_store: crate::introspection::ContractStore::new(),
+            startup_timeline: crate::introspection::StartupTimeline::new(),
+            event_bus: crate::introspection::EventBusMonitor::default(),
+            task_tracker: crate::introspection::TaskTracker::new(),
+            bridge_ready: std::sync::atomic::AtomicBool::new(true),
+            bridge_notify: tokio::sync::Notify::new(),
+            db_search_paths: Vec::new(),
+            screencast: Arc::new(crate::screencast::Screencast::default()),
+            probes: crate::introspection::AppStateProbes::default(),
+        });
+        VictauriMcpHandler::new(state, bridge)
+    }
+
+    fn error_text(r: &CallToolResult) -> String {
+        r.content
+            .iter()
+            .filter_map(|c| match &c.raw {
+                RawContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn hidden_window_screenshot_errors_clearly() {
+        let bridge = Arc::new(ConfigBridge::new(vec![
+            window("main", true),
+            window("briefing", false),
+        ]));
+        let h = handler_with(bridge.clone());
+        let r = h
+            .screenshot(Parameters(ScreenshotParams {
+                window_label: Some("briefing".to_string()),
+            }))
+            .await;
+        assert_eq!(r.is_error, Some(true), "hidden window must error");
+        let text = error_text(&r);
+        assert!(
+            text.contains("not visible"),
+            "error must explain the window is not visible, got: {text}"
+        );
+        assert!(
+            bridge.requested_handle().is_none(),
+            "must short-circuit BEFORE the OS-handle/capture path"
+        );
+    }
+
+    #[tokio::test]
+    async fn visible_window_screenshot_proceeds_to_capture() {
+        let bridge = Arc::new(ConfigBridge::new(vec![
+            window("main", true),
+            window("briefing", false),
+        ]));
+        let h = handler_with(bridge.clone());
+        let r = h
+            .screenshot(Parameters(ScreenshotParams {
+                window_label: Some("main".to_string()),
+            }))
+            .await;
+        // The gate must let a visible window THROUGH to the OS-handle path (which this mock
+        // fails) — proving the gate only blocks hidden windows.
+        let text = error_text(&r);
+        assert!(
+            text.contains("native handle path reached")
+                || text.contains("cannot get window handle"),
+            "a visible window must reach the capture path, got: {text}"
+        );
+        assert_eq!(
+            bridge.requested_handle(),
+            Some(Some("main".to_string())),
+            "must capture the explicitly requested visible window"
+        );
+    }
+
+    // GPT audit (P2): `screenshot {}` with NO label previously resolved through
+    // find_window(None), which prefers "main" UNCONDITIONALLY — so an app that hides main but
+    // keeps a secondary window visible captured hidden main (the wrong-pixels class the PR
+    // exists to prevent). The tool must now resolve its own VISIBLE target.
+    #[tokio::test]
+    async fn omitted_label_skips_hidden_main_for_visible_secondary() {
+        let bridge = Arc::new(ConfigBridge::new(vec![
+            window("main", false),     // main hidden
+            window("secondary", true), // a different window is visible
+        ]));
+        let h = handler_with(bridge.clone());
+        let r = h
+            .screenshot(Parameters(ScreenshotParams { window_label: None }))
+            .await;
+        let text = error_text(&r);
+        assert!(
+            !text.contains("not visible") && !text.contains("no visible window"),
+            "a visible secondary window exists — must NOT error, got: {text}"
+        );
+        assert_eq!(
+            bridge.requested_handle(),
+            Some(Some("secondary".to_string())),
+            "omitted label must resolve to the VISIBLE secondary, never hidden main"
+        );
+    }
+
+    // Omitted label with a visible main present must still prefer "main".
+    #[tokio::test]
+    async fn omitted_label_prefers_visible_main() {
+        let bridge = Arc::new(ConfigBridge::new(vec![
+            window("main", true),
+            window("secondary", true),
+        ]));
+        let h = handler_with(bridge.clone());
+        let _ = h
+            .screenshot(Parameters(ScreenshotParams { window_label: None }))
+            .await;
+        assert_eq!(
+            bridge.requested_handle(),
+            Some(Some("main".to_string())),
+            "with a visible main present, omitted label must resolve to main"
+        );
+    }
+
+    // Every window hidden + omitted label: error clearly, never capture a hidden window.
+    #[tokio::test]
+    async fn all_hidden_omitted_label_errors() {
+        let bridge = Arc::new(ConfigBridge::new(vec![
+            window("main", false),
+            window("briefing", false),
+        ]));
+        let h = handler_with(bridge.clone());
+        let r = h
+            .screenshot(Parameters(ScreenshotParams { window_label: None }))
+            .await;
+        assert_eq!(r.is_error, Some(true), "all-hidden must error");
+        assert!(
+            error_text(&r).contains("no visible window"),
+            "error must say there is no visible window, got: {}",
+            error_text(&r)
+        );
+        assert!(
+            bridge.requested_handle().is_none(),
+            "must NOT reach the OS-handle path when every window is hidden"
+        );
+    }
+
+    // An unknown explicit label is passed THROUGH to get_native_handle (which produces the
+    // canonical "window not found"), not rejected as "not visible".
+    #[tokio::test]
+    async fn unknown_label_falls_through_to_handle_resolution() {
+        let bridge = Arc::new(ConfigBridge::new(vec![window("main", true)]));
+        let h = handler_with(bridge.clone());
+        let r = h
+            .screenshot(Parameters(ScreenshotParams {
+                window_label: Some("ghost".to_string()),
+            }))
+            .await;
+        assert!(
+            !error_text(&r).contains("not visible"),
+            "unknown label must not be reported as 'not visible'"
+        );
+        assert_eq!(
+            bridge.requested_handle(),
+            Some(Some("ghost".to_string())),
+            "unknown label must be forwarded verbatim to get_native_handle"
+        );
     }
 }

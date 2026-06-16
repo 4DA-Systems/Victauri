@@ -97,9 +97,34 @@ pub struct QueryDbParams {
     /// If omitted, Victauri auto-discovers `SQLite` databases in the app data directory.
     pub path: Option<String>,
     /// SQL query to execute. Must be a SELECT/PRAGMA/EXPLAIN statement (read-only).
+    ///
+    /// Accepts `sql` as an alias — the intuitive name an agent reaches for first.
+    /// Live-4DA dogfood (2026-06-16): passing `sql` returned an opaque HTTP 400 with
+    /// no hint that the field is `query`; the alias removes that paper-cut.
+    #[serde(alias = "sql")]
     pub query: String,
     /// Positional bind parameters for the query (e.g. `["value1", 42]`).
     pub params: Option<Vec<serde_json::Value>>,
     /// Maximum number of rows to return. Default: 100.
     pub max_rows: Option<usize>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Live-4DA dogfood (2026-06-16): `query_db` accepted only `query`; passing the intuitive
+    // `sql` key 400'd with no hint. The `sql` alias removes that paper-cut.
+    #[test]
+    fn query_db_accepts_sql_alias() {
+        for key in ["query", "sql"] {
+            let json = format!(r#"{{"{key}":"SELECT 1"}}"#);
+            let p: QueryDbParams = serde_json::from_str(&json)
+                .unwrap_or_else(|e| panic!("key `{key}` must deserialize: {e}"));
+            assert_eq!(
+                p.query, "SELECT 1",
+                "key `{key}` must populate the query field"
+            );
+        }
+    }
 }

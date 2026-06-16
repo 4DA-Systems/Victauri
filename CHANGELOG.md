@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-06-16
+
+In-the-wild fixes from a live 4DA analysis session driven **entirely through the Victauri
+bridge** (REST `/api/tools`, no CDP/Playwright): a full morning-brief + preemption review on
+the running app. The 0.8.2 host-crash fix held (bridge enabled, no `VICTAURI_DISABLE`, no
+crash). Two genuine, generic friction points surfaced; both fixed here, then hardened by a
+GPT-5.5 adversarial audit (which confirmed the omitted-label gap below and found no `query_db`
+security regression). Additive and semver-clean (a serde alias + a pre-capture visibility
+resolution — no output-schema change).
+
+### Fixed
+
+- **`screenshot` of a non-visible window no longer returns a stale/wrong image silently.** A
+  native screenshot captures the on-screen surface; a hidden window has none, so the OS capture
+  path (PrintWindow / `CGWindowListCreateImage`) yields stale, empty, or *another window's*
+  pixels with no error — and an agent cannot tell a wrong image from a right one. Two paths are
+  fixed: **(1)** an explicitly-requested hidden window (e.g. 4DA's hidden `briefing` panel
+  returned the *main* window's pixels) now returns a clear, actionable error; **(2, GPT audit
+  P2)** `screenshot {}` with **no label** previously resolved through `find_window(None)`, which
+  prefers `"main"` *unconditionally* — so an app that hides main but leaves a secondary window
+  visible captured hidden main. The tool now resolves its own visible target (prefer a visible
+  `main`, else the first visible window, else a clear "no visible window to capture" error) and
+  passes it explicitly to the OS-handle lookup. `find_window` itself is unchanged — other callers
+  (e.g. `eval_js`) may legitimately target a hidden window.
+
+### Changed
+
+- **`query_db` accepts `sql` as an alias for the `query` field.** Passing the intuitive `sql`
+  key previously failed with an opaque HTTP 400 and no hint that the field is named `query`. The
+  alias removes the paper-cut; the tool description now states the field name explicitly.
+
 ## [0.8.2] - 2026-06-15
 
 ### Fixed
