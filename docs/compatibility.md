@@ -2,6 +2,26 @@
 
 Victauri works with any Tauri 2.x application. This page documents compatibility considerations discovered through research against real-world open-source Tauri apps and platform-level investigation.
 
+## Will Victauri work on your app?
+
+Victauri is a **build-time dev dependency** — you add it to your app's source and rebuild. It is **not** an attach-to-anything tool: there is no way to point it at an already-running, shipped, or third-party binary you didn't build. It works when **all four** conditions hold:
+
+| # | Requirement | Why / what happens otherwise |
+|---|---|---|
+| 1 | **Tauri 2** | A Tauri 1.x app's `webkit2gtk-sys 0.18` and Victauri's `2.x` both link the native `web_kit2` library — cargo cannot link two packages to the same native lib, so the plugin won't compile in. Hard, per-app-unfixable. |
+| 2 | **Built from source, plugin wired in** | One line in `Cargo.toml` (`victauri-plugin`), `.plugin(victauri_plugin::init())` on the builder, and a `victauri:default` capability. No inject-into-a-foreign-binary path exists. |
+| 3 | **Debug build** | The server is `#[cfg(debug_assertions)]`-gated; `init()` is a no-op and nothing listens in release. A dev/test-time tool by design. |
+| 4 | **Per-window `victauri:default` capability** | Tauri's per-window permission ACL silently blocks the bridge's callback IPC without it — the window comes up blind (`introspectable:false`). The `window introspectability` tool detects this and names the exact fix. This is the #1 adoption footgun. |
+
+**Not constraints:** the frontend framework (React 18/19, Vue/Nuxt, Svelte, vanilla) and the OS/webview engine (WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux) are all supported and cross-checked.
+
+| ✅ Works on | ❌ Won't work on |
+|---|---|
+| Your own Tauri 2 app during development | Tauri 1.x apps (wrong major) |
+| Any Tauri 2 app you can build from source in debug | Release / production builds (gated to no-op) |
+| Any frontend framework, any of the three OSes | A binary you didn't build (no source to add a dev dep) |
+| | Non-Tauri apps — Electron, native, plain web |
+
 ## Content Security Policy (CSP)
 
 **Short answer: CSP does not block Victauri on any platform.**

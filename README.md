@@ -44,6 +44,26 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 
 **Bonus — for AI agents:** the same server speaks MCP, so Claude Code, Cursor, Windsurf, and any MCP client get this full-stack access for interactive debugging — no extra setup.
 
+## Will Victauri work on your app?
+
+Victauri is a **build-time dev dependency you add to your own app's source and rebuild** — not a tool you attach to an already-running or shipped app. It works when **all four** hold:
+
+1. **Tauri 2.** Tauri 1.x apps can't host it — their `webkit2gtk-sys 0.18` and Victauri's `2.x` both link the native `web_kit2` library, an unresolvable cargo conflict. (Tauri 2 is the current major; Tauri 1 is legacy.)
+2. **Built from source** with the plugin wired in — one line in `Cargo.toml`, `.plugin(victauri_plugin::init())`, and a `victauri:default` capability. There is no inject-into-a-foreign-binary path.
+3. **A debug build.** The server is `#[cfg(debug_assertions)]`-gated, so `init()` is a no-op and nothing listens in release. It's a dev/test-time tool by design.
+4. **Each window grants `victauri:default`.** Tauri's per-window permission ACL silently blinds the bridge without it; the `window introspectability` tool detects and explains this.
+
+**Framework** (React, Vue/Nuxt, Svelte, vanilla) and **OS/webview engine** (WebView2 / WKWebView / WebKitGTK) do **not** matter — all supported and cross-checked on Windows, macOS, and Linux.
+
+| ✅ Works on | ❌ Won't work on |
+|---|---|
+| Your own Tauri 2 app during development | Tauri 1.x apps |
+| Any Tauri 2 app you can build from source (debug) | Release / production builds |
+| Any frontend framework, any of the 3 OSes | A binary you didn't build (no source) |
+| | Non-Tauri apps (Electron, native, plain web) |
+
+Full details, edge cases, and a tested-apps list: [**Compatibility**](docs/src/compatibility.md).
+
 ## Quick Start
 
 ### Install the CLI
