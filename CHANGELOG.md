@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] - 2026-06-16
+
+In-the-wild fixes from a live 4DA analysis session driven **entirely through the Victauri
+bridge** (REST `/api/tools`, no CDP/Playwright): a full morning-brief + preemption review on
+the running app. The 0.8.2 host-crash fix held (bridge enabled, no `VICTAURI_DISABLE`, no
+crash). Two genuine, generic friction points surfaced; both fixed here. Additive and
+semver-clean (a new serde alias + a pre-capture visibility check — no output-schema change).
+
+### Fixed
+
+- **`screenshot` of a hidden window no longer returns a stale/wrong image silently.** Capturing
+  a non-visible window (e.g. 4DA's hidden `briefing` panel) returned a PNG that was actually the
+  *main* window's pixels — the OS capture path (PrintWindow / `CGWindowListCreateImage`) has no
+  live surface for an unmapped window, so it yields stale, empty, or foreign content with no
+  error, and an agent cannot tell a wrong image from a right one. `screenshot` now checks the
+  target window's visibility first and returns a clear, actionable error (`window '<label>' is
+  not visible … show it first via window manage_action=show`) instead of a misleading capture.
+
+### Changed
+
+- **`query_db` accepts `sql` as an alias for the `query` field.** Passing the intuitive `sql`
+  key previously failed with an opaque HTTP 400 and no hint that the field is named `query`. The
+  alias removes the paper-cut; the tool description now states the field name explicitly.
+
 ## [0.8.2] - 2026-06-15
 
 ### Fixed
