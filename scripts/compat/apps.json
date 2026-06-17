@@ -1,9 +1,11 @@
 {
   "_comment": [
     "Real-world Tauri apps used to re-verify Victauri compatibility against the CURRENT Victauri version.",
-    "Each app is pinned to a STABLE RELEASE TAG (tag + its commit SHA), captured 2026-06-03 -- not the default-branch HEAD. HEADs of these apps run bleeding-edge, hard-to-build frontends (e.g. En Croissant HEAD uses tsgo + Vite 8 + a pnpm workspace); release tags are what real users run and what builds reproducibly.",
-    "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: the pnpm apps pin pnpm 10.15.0 with --config.dangerouslyAllowAllBuilds=true -- pnpm >=10 accepts these apps' settings-only pnpm-workspace.yaml but skips native build scripts (esbuild/swc) unless builds are explicitly allowed, while pnpm 9 runs the scripts but rejects the workspace file.",
-    "These build commands are validated against the pinned tag; bump tag+ref+commands together."
+    "EVERY app here MUST be Tauri 2.x. Victauri is Tauri-2-only: a Tauri-1 app's webkit2gtk-sys 0.18 (links=web_kit2) conflicts irreconcilably with victauri-plugin's Tauri-2 webkit2gtk-sys 2.x, so the plugin will not compile in. Verify src-tauri/Cargo.toml has tauri = \"2\" before adding/pinning an app.",
+    "Each app is pinned to a stable release tag where one exists (tag + commit SHA), captured 2026-06-03 -- not a moving default-branch HEAD, since HEADs run bleeding-edge, hard-to-build frontends. Exception: an app whose ONLY Tauri-2 code is on its default branch (no Tauri-2 tag yet) is pinned to a specific default-branch COMMIT, noted in 'tag'.",
+    "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: the pnpm apps pin pnpm 10.15.0 via corepack. NOTE (2026-06-17): do NOT pass pnpm's dangerouslyAllowAllBuilds config flag -- current pnpm rejects it with ERR_PNPM_CONFIG_CONFLICT_BUILT_DEPENDENCIES when the app also sets neverBuiltDependencies. It is unnecessary for these vite frontends (esbuild ships prebuilt binaries with no build script), so it was removed from all commands.",
+    "These build commands are validated against the pinned ref; bump tag+ref+commands together.",
+    "REMOVED 2026-06-17: 'surrealist' and 'lettura' were pinned at Tauri-1 release tags (v1.11.8 / v0.1.22) and could never host Victauri. Lettura migrated to Tauri 2 on its master branch (apps/desktop monorepo) and is repinned to a master commit below. Surrealist is Tauri 2 on main but its frontend requires a bespoke Rust->wasm embed toolchain (wasm32 target + wasm-bindgen CLI + clang) the routine compat harness/CI does not provision -- it is a manual-verification special case, intentionally not in the automated suite."
   ],
   "apps": [
     {
@@ -24,20 +26,9 @@
       "repo": "https://github.com/franciscoBSalgueiro/en-croissant.git",
       "ref": "3a3dbc5911dd0cd4997c30ea3e8932045e314830",
       "package_manager": "pnpm",
-      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile --config.dangerouslyAllowAllBuilds=true && pnpm build-vite",
+      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile && pnpm build-vite",
       "tauri_dir": "src-tauri",
       "tag": "v0.15.0"
-    },
-    {
-      "key": "surrealist",
-      "name": "Surrealist",
-      "framework": "React 19 / Mantine / CodeMirror",
-      "repo": "https://github.com/surrealdb/surrealist.git",
-      "ref": "011b9371fb9f9ecad0d04b67e6840e40ed6f4420",
-      "package_manager": "bun",
-      "frontend_build": "bun install && bun run build",
-      "tauri_dir": "src-tauri",
-      "tag": "v1.11.8"
     },
     {
       "key": "duckling",
@@ -46,7 +37,7 @@
       "repo": "https://github.com/l1xnan/Duckling.git",
       "ref": "edb6c1b4af9b01818634c1e179c72820b86a3782",
       "package_manager": "pnpm",
-      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile --config.dangerouslyAllowAllBuilds=true && pnpm build",
+      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile && pnpm build",
       "tauri_dir": "src-tauri",
       "tag": "v0.0.50"
     },
@@ -55,11 +46,11 @@
       "name": "Lettura",
       "framework": "React / TailwindCSS (pnpm monorepo)",
       "repo": "https://github.com/zhanglun/lettura.git",
-      "ref": "f4d08c6f5312189a9bbe06331c17fde9ad9419d7",
+      "ref": "34c6cecdba373459de082e73212287a402a38a79",
       "package_manager": "pnpm",
-      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile --config.dangerouslyAllowAllBuilds=true && pnpm -C apps/desktop build",
+      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile && pnpm -C apps/desktop build",
       "tauri_dir": "apps/desktop/src-tauri",
-      "tag": "v0.1.22"
+      "tag": "master@34c6cec (no Tauri-2 release tag yet; latest tag v0.1.22 is Tauri 1)"
     }
   ]
 }
