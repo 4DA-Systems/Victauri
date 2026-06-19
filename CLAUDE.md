@@ -215,7 +215,11 @@ diagnostics — no API or output-schema change); stays in `^0.8`.
   version-skew handshake failure both used to surface as the generic "is your app running?";
   `victauri check` now classifies the error → auth guidance (discovery token / `VICTAURI_AUTH_TOKEN` /
   `auth_disabled()`) or a CLI-upgrade hint. Shared `connect_failure_message` helper across all 5 CLI
-  connect sites.
+  connect sites; tightened after review so unrelated generic "session" errors no longer get mislabeled
+  as version skew.
+- **`victauri doctor` counts version-skew warnings in its summary.** The warning already printed, but
+  the final pass/warn/fail counts under-reported it; the release now has focused unit coverage for both
+  the warning count signal and the tighter handshake-error classifier.
 - **`bridge not responding` errors now name the page-not-loaded case** (dev-server
   connection-refused / blank error page → no JS bridge) and point at the `screenshot` tool, which
   works regardless of page JS — the in-the-wild white-screen diagnosis.
@@ -229,7 +233,6 @@ was corrected to assert the shared constant id. The CLI `bridge.rs` stateless-de
 with `-D warnings`; `cargo test --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
 --no-deps`; `scripts/preflight.ps1` (sqlite-feature clippy/tests + doc-count lint);
 `cargo semver-checks check-release --workspace`; and `cargo package` for all six publishable crates.
-**Publish + push to main are operator-gated.**
 
 ### v0.8.3 — in-the-wild DX/safety fixes from a live-4DA bridge-only analysis session
 

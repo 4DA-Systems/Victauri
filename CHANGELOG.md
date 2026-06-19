@@ -25,6 +25,10 @@ client-side and old binaries cannot be patched, so the fix is server-side. Addit
   never go stale → the `422 "expected initialize request"` wedge that stateless mode exists to prevent
   cannot return. Clients may ignore or echo the extra header; both paths are supported. Scoped to
   `/mcp` via a per-route layer, so `/api/tools`, `/info`, and `/health` are unaffected.
+- **`victauri doctor` now counts CLI↔plugin version-skew warnings in its summary.** The warning already
+  printed, but the final pass/warn/fail counts under-reported it. The connection helper also avoids
+  classifying unrelated generic "session" errors as version skew unless the error names the MCP
+  handshake symptoms (`Mcp-Session-Id`, `expected initialize request`, or an initialize-time 422).
 
 ### Added
 

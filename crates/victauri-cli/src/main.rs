@@ -362,14 +362,16 @@ fn major_minor(v: &str) -> Option<(u64, u64)> {
 /// differ in `major.minor`. A mismatched CLI can fail in cryptic ways — the canonical example is a
 /// pre-stateless CLI aborting the MCP handshake with "no mcp-session-id header" against a newer
 /// stateless plugin. Naming the symptom + the one-line fix turns a baffling failure into a 30s fix.
-fn warn_on_version_skew(plugin_version: &str) {
+///
+/// Returns `true` when a warning was emitted.
+fn warn_on_version_skew(plugin_version: &str) -> bool {
     let cli_version = env!("CARGO_PKG_VERSION");
     let (Some(plugin_mm), Some(cli_mm)) = (major_minor(plugin_version), major_minor(cli_version))
     else {
-        return;
+        return false;
     };
     if plugin_mm == cli_mm {
-        return;
+        return false;
     }
     eprintln!();
     eprintln!(
@@ -392,6 +394,7 @@ fn warn_on_version_skew(plugin_version: &str) {
              binary first:  pkill -f 'victauri bridge')"
         );
     }
+    true
 }
 
 /// Build a connection-failure message whose remedy matches the real cause. Reported in the wild: a
@@ -405,8 +408,9 @@ fn connect_failure_message(detail: &str) -> String {
          CLI (cargo install victauri-cli --force); set VICTAURI_AUTH_TOKEN to the app's token; or \
          wire `.auth_disabled()` into VictauriBuilder for local debug."
     } else if lower.contains("mcp-session-id")
-        || lower.contains("session")
-        || lower.contains("422")
+        || lower.contains("expected initialize request")
+        || lower.contains("no mcp-session-id header")
+        || (lower.contains("422") && lower.contains("initialize"))
         || lower.contains("handshake")
     {
         "This looks like a CLI/plugin version skew: an older CLI cannot complete the newer stateless \
@@ -741,7 +745,9 @@ async fn cmd_doctor() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
                 eprintln!("  [PASS] Plugin responding (v{version})");
-                warn_on_version_skew(version);
+                if warn_on_version_skew(version) {
+                    warn_count += 1;
+                }
                 pass_count += 1;
             } else {
                 eprintln!("  [FAIL] Plugin info unavailable");
@@ -2199,6 +2205,32 @@ mod tests {
         assert!(!content.contains("victauri-test@main"));
         assert!(content.contains("xvfb"));
         assert!(content.contains("VICTAURI_E2E"));
+    }
+
+    #[test]
+    fn version_skew_warning_reports_whether_it_warned() {
+        assert!(warn_on_version_skew("0.0.0"));
+        assert!(!warn_on_version_skew(env!("CARGO_PKG_VERSION")));
+        assert!(!warn_on_version_skew("unknown"));
+    }
+
+    #[test]
+    fn connect_failure_message_classifies_specific_handshake_skew() {
+        let missing_header = connect_failure_message("no mcp-session-id header");
+        assert!(missing_header.contains("version skew"));
+        assert!(missing_header.contains("cargo install victauri-cli --force"));
+
+        let expected_initialize = connect_failure_message(
+            "HTTP 422: expected initialize request with an mcp-session-id header",
+        );
+        assert!(expected_initialize.contains("version skew"));
+    }
+
+    #[test]
+    fn connect_failure_message_does_not_overclassify_generic_sessions() {
+        let message = connect_failure_message("session expired after idle timeout");
+        assert!(!message.contains("version skew"));
+        assert!(message.contains("Is your Tauri app running?"));
     }
 
     #[test]
