@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.4] - 2026-06-20
+
 CLI↔plugin **version-skew** compatibility fix, driven by an in-the-wild session that drove a live
 Tauri app through Victauri. An **old `victauri` CLI (0.5.6)** built for the pre-stateless *stateful*
 server aborted the MCP handshake against a **0.8.x stateless** plugin with the cryptic
@@ -21,8 +23,8 @@ client-side and old binaries cannot be patched, so the fix is server-side. Addit
   server treats its absence as a fatal handshake error. The `/mcp` route (stateless mode only) now
   emits a fixed sentinel `Mcp-Session-Id: stateless`. It is never validated server-side, so it can
   never go stale → the `422 "expected initialize request"` wedge that stateless mode exists to prevent
-  cannot return. Current clients ignore the extra header. Scoped to `/mcp` via a per-route layer, so
-  `/api/tools`, `/info`, and `/health` are unaffected.
+  cannot return. Clients may ignore or echo the extra header; both paths are supported. Scoped to
+  `/mcp` via a per-route layer, so `/api/tools`, `/info`, and `/health` are unaffected.
 
 ### Added
 
@@ -35,6 +37,10 @@ client-side and old binaries cannot be patched, so the fix is server-side. Addit
   default) and a version-skew handshake failure previously both surfaced as the generic "is your app
   running?" while the app *was* running. `victauri check` now classifies the failure and points at auth
   (discovery token / `VICTAURI_AUTH_TOKEN` / `auth_disabled()`) or a CLI upgrade accordingly.
+- **Compatibility guard tests now cover the strict-client path directly.** The stateless transport
+  tests prove the `initialize` response carries `Mcp-Session-Id: stateless`, an echoed compat id works
+  through `notifications/initialized` and a later tool call, bogus session ids still never 422, auth
+  remains enforced, and the compat header does not leak to `/api/tools`, `/info`, or `/health`.
 
 ### Changed
 
@@ -1178,7 +1184,12 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.8.4...HEAD
+[0.8.4]: https://github.com/runyourempire/victauri/compare/v0.8.3...v0.8.4
+[0.8.3]: https://github.com/runyourempire/victauri/compare/v0.8.2...v0.8.3
+[0.8.2]: https://github.com/runyourempire/victauri/compare/v0.8.1...v0.8.2
+[0.8.1]: https://github.com/runyourempire/victauri/compare/v0.8.0...v0.8.1
+[0.8.0]: https://github.com/runyourempire/victauri/compare/v0.7.11...v0.8.0
 [0.5.3]: https://github.com/runyourempire/victauri/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/runyourempire/victauri/compare/v0.5.0...v0.5.2
 [0.5.0]: https://github.com/runyourempire/victauri/compare/v0.4.0...v0.5.0

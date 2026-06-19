@@ -50,8 +50,9 @@ fn normalize_auth_token(auth_token: Option<String>) -> Option<String> {
 /// at `initialize` and aborts with "no mcp-session-id header" when it is missing. We emit a fixed
 /// sentinel value so those clients proceed. The value is never validated server-side, so it can
 /// never go stale → the `422 "expected initialize request"` wedge (the reason stateless mode exists)
-/// cannot return. Current clients ignore the extra header. Layered onto the `/mcp` route only, and
-/// only in stateless mode (see [`build_app_full_inner`]).
+/// cannot return. Current clients either tolerate or echo the extra header; both are valid because
+/// stateless mode never validates it. Layered onto the `/mcp` route only, and only in stateless mode
+/// (see [`build_app_full_inner`]).
 async fn backfill_stateless_session_id(
     req: axum::extract::Request,
     next: axum::middleware::Next,

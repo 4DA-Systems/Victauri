@@ -215,9 +215,9 @@ impl VictauriClient {
     /// [`Self::reinitialize`] so a fresh session can be established without rebuilding the
     /// whole client.
     ///
-    /// Returns `Ok(None)` when the server is in **stateless** mode (no `mcp-session-id` header on
-    /// the initialize response) — that is valid, not an error, and means subsequent requests carry
-    /// no session id. Returns `Ok(Some(id))` in stateful mode.
+    /// Returns `Ok(Some(id))` when the server emits an `mcp-session-id` header. Stateful mode mints
+    /// a unique id; current Victauri stateless mode backfills the constant compat id `"stateless"`.
+    /// Returns `Ok(None)` only for servers that emit no session header at all.
     async fn perform_handshake(
         http: &reqwest::Client,
         base_url: &str,
@@ -277,8 +277,9 @@ impl VictauriClient {
             });
         }
 
-        // Stateful mode returns an `mcp-session-id` header to echo on later calls; stateless mode
-        // returns none. Absence is NOT an error here — it just means there is no session to track.
+        // Echo a returned `mcp-session-id` on later calls. In stateful mode it is the actual
+        // per-client session id; in Victauri's stateless default it is the constant compat id
+        // "stateless", which the server deliberately ignores.
         let session_id = init_resp
             .headers()
             .get("mcp-session-id")
@@ -430,7 +431,9 @@ impl VictauriClient {
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json, text/event-stream")
                 .json(&call_body);
-            // Only carry a session id in stateful mode; stateless mode has none.
+            // Echo the server's session header if one was returned. In Victauri's stateless default
+            // this is the constant compat id "stateless"; the server ignores it, so it cannot go
+            // stale.
             if let Some(ref sid) = self.session_id {
                 req = req.header("mcp-session-id", sid);
             }

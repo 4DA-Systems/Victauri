@@ -478,9 +478,9 @@ async fn mcp_initialize_returns_session() {
 }
 
 // ── Stateless transport (production default) ────────────────────────────────
-// These guard the P0 fix: the default server runs stateless, so there is no
-// `Mcp-Session-Id` and a tool call without a session must NOT 422 — the wedge that
-// previously forced the REST fallback for the whole run.
+// These guard the P0 fix: the default server runs stateless, so the compat
+// `Mcp-Session-Id` is never validated and tool calls must NOT 422 on stale or
+// unknown sessions — the wedge that previously forced the REST fallback for the whole run.
 
 #[tokio::test]
 async fn stateless_initialize_returns_compat_session_id() {
@@ -524,6 +524,102 @@ async fn stateless_initialize_returns_compat_session_id() {
 }
 
 #[tokio::test]
+async fn stateless_compat_session_survives_initialized_notification_and_tool_call() {
+    // This is the exact old/strict-client compatibility path: initialize, require a session header,
+    // echo it on notifications/initialized, then echo it again on a normal tool request. The
+    // stateless server must accept all three steps because the header is only a compatibility
+    // sentinel, never a validated session.
+    let base = start_stateless_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let init_resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "strict-client", "version": "0.1.0"}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        init_resp.status().is_success(),
+        "initialize returned {}",
+        init_resp.status()
+    );
+    let session_id = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(session_id, "stateless");
+
+    let initialized_resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        initialized_resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "initialized notification with compat session id must never 422"
+    );
+    assert!(
+        initialized_resp.status().is_success(),
+        "initialized notification returned {}",
+        initialized_resp.status()
+    );
+
+    let tool_resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", &session_id)
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        tool_resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "tool call with compat session id must never 422"
+    );
+    assert!(
+        tool_resp.status().is_success(),
+        "tools/list returned {}",
+        tool_resp.status()
+    );
+    let body = tool_resp.text().await.unwrap();
+    assert!(
+        body.contains("eval_js"),
+        "tools/list should return the tool catalog"
+    );
+}
+
+#[tokio::test]
 async fn stateless_ignores_unknown_session_id() {
     // Preserves the original P0 intent: even when a client sends a session id the server never
     // minted, the stateless transport must NOT 422 — nothing validates the id, so it cannot go
@@ -556,6 +652,25 @@ async fn stateless_ignores_unknown_session_id() {
         "tools/list with a bogus session id returned {}",
         resp.status()
     );
+}
+
+#[tokio::test]
+async fn stateless_session_backfill_is_scoped_to_mcp_route() {
+    let base = start_stateless_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+
+    for path in ["/info", "/health", "/api/tools"] {
+        let resp = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert!(
+            resp.status().is_success(),
+            "{path} returned {}",
+            resp.status()
+        );
+        assert!(
+            resp.headers().get("mcp-session-id").is_none(),
+            "{path} must not receive the stateless MCP compat session header"
+        );
+    }
 }
 
 #[tokio::test]
