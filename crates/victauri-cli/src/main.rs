@@ -423,6 +423,20 @@ fn connect_failure_message(detail: &str) -> String {
     format!("Could not connect to Victauri server: {detail}\n\n{hint}")
 }
 
+/// Extract the tool count from a `get_plugin_info` response for the `victauri check` summary.
+///
+/// The server reports it nested under `tools.total` (the shape since 0.7.x); older/odd shapes
+/// might use a flat `tool_count` or a bare numeric `tools`. Try all three before giving up, so the
+/// summary shows a real number instead of `?`. Returns `"?"` only when none are present/numeric.
+fn parse_tool_count(info: &serde_json::Value) -> String {
+    info.get("tools")
+        .and_then(|t| t.get("total"))
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| info.get("tool_count").and_then(serde_json::Value::as_u64))
+        .or_else(|| info.get("tools").and_then(serde_json::Value::as_u64))
+        .map_or_else(|| "?".to_string(), |n| n.to_string())
+}
+
 async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
     eprintln!("Connecting to running Victauri server...\n");
 
@@ -442,11 +456,7 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
         .get("version")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    let tool_count = info
-        .get("tool_count")
-        .and_then(serde_json::Value::as_u64)
-        .or_else(|| info.get("tools").and_then(serde_json::Value::as_u64))
-        .map_or("?".to_string(), |n| n.to_string());
+    let tool_count = parse_tool_count(&info);
     let uptime = info
         .get("uptime_secs")
         .and_then(serde_json::Value::as_u64)
@@ -2212,6 +2222,31 @@ mod tests {
         assert!(warn_on_version_skew("0.0.0"));
         assert!(!warn_on_version_skew(env!("CARGO_PKG_VERSION")));
         assert!(!warn_on_version_skew("unknown"));
+    }
+
+    #[test]
+    fn parse_tool_count_reads_nested_total() {
+        // The live `get_plugin_info` shape: tools is an OBJECT with `total` (regression for the
+        // `Tools: ?` bug — the old code read `tools` as a bare number and always missed).
+        let info = serde_json::json!({"tools": {"total": 36, "enabled": 36}});
+        assert_eq!(parse_tool_count(&info), "36");
+    }
+
+    #[test]
+    fn parse_tool_count_falls_back_and_degrades() {
+        // Flat `tool_count` fallback.
+        assert_eq!(
+            parse_tool_count(&serde_json::json!({"tool_count": 12})),
+            "12"
+        );
+        // Bare numeric `tools` fallback (legacy shape).
+        assert_eq!(parse_tool_count(&serde_json::json!({"tools": 7})), "7");
+        // Nothing usable → "?" (never panics).
+        assert_eq!(parse_tool_count(&serde_json::json!({})), "?");
+        assert_eq!(
+            parse_tool_count(&serde_json::json!({"tools": {"enabled": 3}})),
+            "?"
+        );
     }
 
     #[test]
