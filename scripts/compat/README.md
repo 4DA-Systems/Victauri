@@ -39,13 +39,15 @@ scripts/compat/retest-app.sh duckling --keep
 
 Requires: `git`, `jq`, `curl`, `xvfb`, a Rust toolchain with the Tauri Linux system
 deps (`.github/actions/linux-deps`), Node, and the JS package managers the targets
-use — **pnpm** (most), **Yarn** via Corepack (Kanri), and **Bun** (Surrealist). The
-`compat.yml` workflow provisions all three; install them locally before running the
-matching app.
+use — **pnpm** (En Croissant, Duckling, Lettura) and **Yarn** via Corepack (Kanri).
+The `compat.yml` workflow provisions both via Corepack; install them locally before
+running the matching app.
 
 In CI, the **Compatibility Retest** workflow (`.github/workflows/compat.yml`) runs
 this on demand (`workflow_dispatch`, optionally a single app) and weekly. It is kept
-out of the main CI because full frontend + Tauri builds for five apps are slow.
+out of the main CI because full frontend + Tauri builds are slow, and because
+third-party apps drift on their own schedules — this harness is a best-effort net,
+not a release gate.
 
 ## Maintaining `apps.json`
 
@@ -54,13 +56,13 @@ Each entry pins `repo`, `ref` (commit SHA), `package_manager`, `frontend_build`
 deliberately so a retest is reproducible against a known app version.
 
 **These apps move, and the moving part is the frontend, not Victauri.** Verified
-2026-06-03: the five targets have drifted since Victauri's original 2026-05 run, so
-entries are pinned to **stable release tags** (not HEAD) and the build recipes are
-app-specific:
+2026-06-03 (re-pinned 2026-06-17, dropping Surrealist): the targets have drifted
+since Victauri's original 2026-05 run, so entries are pinned to **stable release
+tags** (not HEAD) and the build recipes are app-specific:
 
 - **Lettura** restructured into a pnpm **monorepo** (`apps/desktop/src-tauri`).
 - Package managers differ: **Kanri → yarn** (Nuxt, `.output/public`),
-  **Surrealist → bun**, En Croissant / Duckling / Lettura → **pnpm**.
+  En Croissant / Duckling / Lettura → **pnpm**.
 - The pnpm apps are pnpm-version-sensitive: pnpm ≥10 accepts their settings-only
   `pnpm-workspace.yaml` but **skips native build scripts** (esbuild/swc) unless
   `--config.dangerouslyAllowAllBuilds=true` is passed, while pnpm 9 runs the scripts
