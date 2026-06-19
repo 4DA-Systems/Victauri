@@ -2,8 +2,23 @@
 
 Re-verifies Victauri against real-world third-party Tauri apps using the **current**
 code in this repo — not a published version. The README/docs headline of "96.9%
-across 5 apps" was measured on an older Victauri; this harness is what keeps that
-claim honest and reproducible.
+across 5 apps" was measured on an older Victauri; this harness is the best-effort net
+that catches drift between releases. It is **not** a release gate — third-party apps
+move on their own schedules, so a red run usually means an app needs re-pinning, not a
+Victauri regression.
+
+## Current status (Victauri 0.8.4, 2026-06-19)
+
+App-agnostic smoke battery (15 checks), four pinned Tauri-2 apps:
+
+| App | Result | Notes |
+|-----|--------|-------|
+| **Kanri** | **15 / 15** ✅ | Nuxt / yarn |
+| **En Croissant** | **15 / 15** ✅ | React / pnpm |
+| **Lettura** | **15 / 15** ✅ | React monorepo / pnpm |
+| **Duckling** | 4 / 15 ⚠️ | Webview never becomes bridge-ready at the pinned ref (`bridge not responding on window 'default'` — a blank/unloaded page has no JS bridge); needs a re-pin to a commit that loads headless. Not a Victauri regression. |
+
+Re-run anytime with the workflow below; bump `apps.json` refs when an app drifts.
 
 ## What it does (per app)
 
@@ -39,13 +54,15 @@ scripts/compat/retest-app.sh duckling --keep
 
 Requires: `git`, `jq`, `curl`, `xvfb`, a Rust toolchain with the Tauri Linux system
 deps (`.github/actions/linux-deps`), Node, and the JS package managers the targets
-use — **pnpm** (most), **Yarn** via Corepack (Kanri), and **Bun** (Surrealist). The
-`compat.yml` workflow provisions all three; install them locally before running the
-matching app.
+use — **pnpm** (En Croissant, Duckling, Lettura) and **Yarn** via Corepack (Kanri).
+The `compat.yml` workflow provisions both via Corepack; install them locally before
+running the matching app.
 
 In CI, the **Compatibility Retest** workflow (`.github/workflows/compat.yml`) runs
 this on demand (`workflow_dispatch`, optionally a single app) and weekly. It is kept
-out of the main CI because full frontend + Tauri builds for five apps are slow.
+out of the main CI because full frontend + Tauri builds are slow, and because
+third-party apps drift on their own schedules — this harness is a best-effort net,
+not a release gate.
 
 ## Maintaining `apps.json`
 
@@ -54,13 +71,13 @@ Each entry pins `repo`, `ref` (commit SHA), `package_manager`, `frontend_build`
 deliberately so a retest is reproducible against a known app version.
 
 **These apps move, and the moving part is the frontend, not Victauri.** Verified
-2026-06-03: the five targets have drifted since Victauri's original 2026-05 run, so
-entries are pinned to **stable release tags** (not HEAD) and the build recipes are
-app-specific:
+2026-06-03 (re-pinned 2026-06-17, dropping Surrealist): the targets have drifted
+since Victauri's original 2026-05 run, so entries are pinned to **stable release
+tags** (not HEAD) and the build recipes are app-specific:
 
 - **Lettura** restructured into a pnpm **monorepo** (`apps/desktop/src-tauri`).
 - Package managers differ: **Kanri → yarn** (Nuxt, `.output/public`),
-  **Surrealist → bun**, En Croissant / Duckling / Lettura → **pnpm**.
+  En Croissant / Duckling / Lettura → **pnpm**.
 - The pnpm apps are pnpm-version-sensitive: pnpm ≥10 accepts their settings-only
   `pnpm-workspace.yaml` but **skips native build scripts** (esbuild/swc) unless
   `--config.dangerouslyAllowAllBuilds=true` is passed, while pnpm 9 runs the scripts
