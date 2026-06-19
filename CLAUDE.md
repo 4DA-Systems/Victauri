@@ -186,7 +186,7 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-06-20)
 
-### v0.8.4 (unreleased) — CLI↔plugin version-skew compat + in-the-wild DX fixes
+### v0.8.4 — CLI↔plugin version-skew compat + in-the-wild DX fixes
 
 Driven by a live session that drove the **verax-bridge** Tauri app entirely through Victauri. The
 headline failure: an **old `victauri` CLI (0.5.6)**, built for the pre-stateless *stateful* server,
@@ -202,11 +202,11 @@ diagnostics — no API or output-schema change); stays in `^0.8`.
   `.or_insert`s the sentinel only if absent. It is never validated, so it can never go stale → the
   `422 "expected initialize request"` wedge that stateless mode exists to avoid cannot return. Scoped
   to `/mcp` by building it as its own router and layering *before* merging `/api/tools` + `/info` +
-  `/health` (axum applies a `.layer` only to routes already registered). Guard test
-  `stateless_initialize_returns_no_session_id` was upgraded (it asserted the header was *absent*) →
-  `stateless_initialize_returns_compat_session_id` (header present == `stateless`) +
-  `stateless_ignores_unknown_session_id` (a bogus client-supplied id still never 422s — preserves the
-  original P0 intent).
+  `/health` (axum applies a `.layer` only to routes already registered). Guard tests now prove:
+  `initialize` backfills `stateless`; an old/strict client can echo that id through
+  `notifications/initialized` and a later tool call; a bogus client-supplied id still never 422s
+  (preserving the original P0 intent); auth is still enforced; and `/api/tools`, `/info`, and
+  `/health` do not receive the compat header.
 - **`victauri check` / `doctor` warn loudly on CLI↔plugin `major.minor` skew** — naming the cryptic
   symptom + the one-line fix (`cargo install victauri-cli --force`) with the OS-specific command to
   kill stale `victauri bridge` proxies that lock the on-PATH binary during reinstall ("Access is
@@ -224,9 +224,12 @@ Compat sweep: the stateless backfill makes `VictauriClient::session_id()` return
 `""`); the pre-existing `two_concurrent_sessions` e2e assertion (`assert_ne!` on two clients' session
 ids — written before stateless became the default, so already latent-broken against a stateless app)
 was corrected to assert the shared constant id. The CLI `bridge.rs` stateless-detection and the
-`bridge_e2e.rs` mock (stateful restart-recovery) are unaffected. Gate green: `cargo build/test
---workspace`, `clippy --workspace --all-targets -Dwarnings`, `fmt --check`. **Publish + push to main
-are operator-gated.**
+`bridge_e2e.rs` mock (stateful restart-recovery) are unaffected. Local gate green: bridge-test
+`npm ci`; `cargo build --workspace`; `cargo fmt --all -- --check`; clippy default/no-default/release
+with `-D warnings`; `cargo test --workspace`; `RUSTDOCFLAGS="-D warnings" cargo doc --workspace
+--no-deps`; `scripts/preflight.ps1` (sqlite-feature clippy/tests + doc-count lint);
+`cargo semver-checks check-release --workspace`; and `cargo package` for all six publishable crates.
+**Publish + push to main are operator-gated.**
 
 ### v0.8.3 — in-the-wild DX/safety fixes from a live-4DA bridge-only analysis session
 
