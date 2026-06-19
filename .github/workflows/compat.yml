@@ -97,6 +97,9 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: compat-${{ matrix.app }}
+          # retest-app.sh writes app.log under $RUNNER_TEMP; glob only there. Globbing
+          # `/tmp/**` previously failed with EACCES on the root-owned /tmp/snap-private-tmp,
+          # turning every job red even when the smoke battery passed.
           path: |
-            /tmp/**/app.log
+            ${{ runner.temp }}/**/app.log
           if-no-files-found: ignore

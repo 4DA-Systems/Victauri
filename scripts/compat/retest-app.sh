@@ -42,7 +42,12 @@ emit() { # emit <checks> <passed> <failed>
 }
 die() { echo "::error::[$key] $1"; emit 0 0 0; exit 1; }
 
-work="$(mktemp -d)"
+# Create the work dir (which holds app.log) under $RUNNER_TEMP in CI so the
+# `upload-artifact` glob never has to scan all of /tmp — globbing `/tmp/**` trips over
+# the root-owned `/tmp/snap-private-tmp` (EACCES) and fails the whole job even when the
+# smoke battery passed. $RUNNER_TEMP is runner-owned and snap-free; falls back to /tmp
+# for local runs (which have no upload step).
+work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/victauri-compat.XXXXXX")"
 cleanup() {
   [ -n "${APP_PID:-}" ] && kill "$APP_PID" 2>/dev/null || true
   [ "$keep" = "--keep" ] || rm -rf "$work"

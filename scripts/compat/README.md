@@ -2,8 +2,23 @@
 
 Re-verifies Victauri against real-world third-party Tauri apps using the **current**
 code in this repo — not a published version. The README/docs headline of "96.9%
-across 5 apps" was measured on an older Victauri; this harness is what keeps that
-claim honest and reproducible.
+across 5 apps" was measured on an older Victauri; this harness is the best-effort net
+that catches drift between releases. It is **not** a release gate — third-party apps
+move on their own schedules, so a red run usually means an app needs re-pinning, not a
+Victauri regression.
+
+## Current status (Victauri 0.8.4, 2026-06-19)
+
+App-agnostic smoke battery (15 checks), four pinned Tauri-2 apps:
+
+| App | Result | Notes |
+|-----|--------|-------|
+| **Kanri** | **15 / 15** ✅ | Nuxt / yarn |
+| **En Croissant** | **15 / 15** ✅ | React / pnpm |
+| **Lettura** | **15 / 15** ✅ | React monorepo / pnpm |
+| **Duckling** | 4 / 15 ⚠️ | Webview never becomes bridge-ready at the pinned ref (`bridge not responding on window 'default'` — a blank/unloaded page has no JS bridge); needs a re-pin to a commit that loads headless. Not a Victauri regression. |
+
+Re-run anytime with the workflow below; bump `apps.json` refs when an app drifts.
 
 ## What it does (per app)
 
