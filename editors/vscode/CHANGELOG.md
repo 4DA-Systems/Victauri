@@ -2,6 +2,15 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.8.4 (2026-06-20)
+
+- Version-synced with the Victauri 0.8.4 release (CLI↔plugin version-skew compatibility + in-the-wild
+  DX fixes). The stateless MCP transport now backfills a constant `Mcp-Session-Id: stateless` so
+  old/strict clients no longer abort the handshake with "no mcp-session-id header"; `victauri check`
+  and `doctor` warn on CLI↔plugin version skew; connection-failure diagnostics distinguish auth (401)
+  from version skew; and "bridge not responding" errors now name the page-not-loaded case. No extension
+  code changes — the extension talks to the embedded server, which carries the fixes.
+
 ## 0.8.3 (2026-06-16)
 
 - Version-synced with the Victauri 0.8.3 release (server-side DX/safety fixes, GPT-5.5
