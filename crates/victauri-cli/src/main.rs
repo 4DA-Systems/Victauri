@@ -347,17 +347,85 @@ fn cmd_init(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Parse the `major.minor` prefix of a semver string (e.g. `"0.8.3"` → `Some((0, 8))`).
+///
+/// Returns `None` for non-numeric / `"unknown"` versions so the skew check never warns on a
+/// version it could not parse.
+fn major_minor(v: &str) -> Option<(u64, u64)> {
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
+}
+
+/// Print a loud, non-fatal warning when the CLI's own version and the running plugin's version
+/// differ in `major.minor`. A mismatched CLI can fail in cryptic ways — the canonical example is a
+/// pre-stateless CLI aborting the MCP handshake with "no mcp-session-id header" against a newer
+/// stateless plugin. Naming the symptom + the one-line fix turns a baffling failure into a 30s fix.
+fn warn_on_version_skew(plugin_version: &str) {
+    let cli_version = env!("CARGO_PKG_VERSION");
+    let (Some(plugin_mm), Some(cli_mm)) = (major_minor(plugin_version), major_minor(cli_version))
+    else {
+        return;
+    };
+    if plugin_mm == cli_mm {
+        return;
+    }
+    eprintln!();
+    eprintln!(
+        "  ⚠ Version skew: this CLI is v{cli_version} but the running plugin is v{plugin_version}."
+    );
+    eprintln!("    A mismatched CLI can fail in cryptic ways — e.g. an old CLI aborts the MCP");
+    eprintln!("    handshake with \"no mcp-session-id header\" against a newer stateless plugin.");
+    eprintln!("    Update the CLI to match:  cargo install victauri-cli --force");
+    // Stale `victauri bridge` proxy processes keep the on-PATH binary open, so `cargo install`
+    // fails with "Access is denied" / "Text file busy" until they are killed. Name the exact
+    // command for the host OS so the fix is copy-pasteable.
+    if cfg!(windows) {
+        eprintln!(
+            "    (if that fails with \"Access is denied\", kill stale bridge proxies that lock the \
+             binary first:  taskkill /IM victauri.exe /F)"
+        );
+    } else {
+        eprintln!(
+            "    (if that fails with \"Text file busy\", kill stale bridge proxies that lock the \
+             binary first:  pkill -f 'victauri bridge')"
+        );
+    }
+}
+
+/// Build a connection-failure message whose remedy matches the real cause. Reported in the wild: a
+/// 401 (auth on by default) and a version-skew handshake failure both surfaced as the generic "is
+/// your app running?" while the app WAS running — so the operator chased the wrong fix.
+fn connect_failure_message(detail: &str) -> String {
+    let lower = detail.to_lowercase();
+    let hint = if lower.contains("401") || lower.contains("unauthorized") {
+        "Auth is ON by default. `discover()` auto-reads the per-pid discovery token, so a 401 usually \
+         means a stale/old CLI that predates token discovery, or a token mismatch. Fix: update this \
+         CLI (cargo install victauri-cli --force); set VICTAURI_AUTH_TOKEN to the app's token; or \
+         wire `.auth_disabled()` into VictauriBuilder for local debug."
+    } else if lower.contains("mcp-session-id")
+        || lower.contains("session")
+        || lower.contains("422")
+        || lower.contains("handshake")
+    {
+        "This looks like a CLI/plugin version skew: an older CLI cannot complete the newer stateless \
+         MCP handshake (symptom: \"no mcp-session-id header\"). Update the CLI to match the plugin:  \
+         cargo install victauri-cli --force"
+    } else {
+        "Is your Tauri app running? Try:  pnpm run tauri dev\n\
+         The app must have victauri-plugin wired into its builder."
+    };
+    format!("Could not connect to Victauri server: {detail}\n\n{hint}")
+}
+
 async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
     eprintln!("Connecting to running Victauri server...\n");
 
     let mut client = match victauri_test::VictauriClient::discover().await {
         Ok(c) => c,
         Err(e) => {
-            bail!(
-                "Could not connect to Victauri server: {e}\n\n\
-                 Is your Tauri app running? Try:  pnpm run tauri dev\n\
-                 The app must have victauri-plugin wired into its builder."
-            );
+            bail!("{}", connect_failure_message(&e.to_string()));
         }
     };
 
@@ -383,6 +451,8 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
     eprintln!("  Victauri v{version}");
     eprintln!("  Tools:  {tool_count}");
     eprintln!("  Uptime: {uptime}");
+
+    warn_on_version_skew(version);
 
     let registry = client
         .get_registry()
@@ -671,6 +741,7 @@ async fn cmd_doctor() -> Result<()> {
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
                 eprintln!("  [PASS] Plugin responding (v{version})");
+                warn_on_version_skew(version);
                 pass_count += 1;
             } else {
                 eprintln!("  [FAIL] Plugin info unavailable");
@@ -771,11 +842,7 @@ async fn cmd_test(max_load_ms: u64, max_heap_mb: f64, junit_path: Option<&Path>)
     let mut client = match victauri_test::VictauriClient::discover().await {
         Ok(c) => c,
         Err(e) => {
-            bail!(
-                "Could not connect to Victauri server: {e}\n\n\
-                 Is your Tauri app running? Try:  pnpm run tauri dev\n\
-                 The app must have victauri-plugin wired into its builder."
-            );
+            bail!("{}", connect_failure_message(&e.to_string()));
         }
     };
 
@@ -823,11 +890,7 @@ async fn cmd_invoke(command: &str, args_json: Option<&str>, raw: bool) -> Result
     let mut client = match victauri_test::VictauriClient::discover().await {
         Ok(c) => c,
         Err(e) => {
-            bail!(
-                "Could not connect to Victauri server: {e}\n\n\
-                 Is your Tauri app running? Try:  pnpm run tauri dev\n\
-                 The app must have victauri-plugin wired into its builder."
-            );
+            bail!("{}", connect_failure_message(&e.to_string()));
         }
     };
 
@@ -865,11 +928,7 @@ async fn cmd_coverage(
     let mut client = match victauri_test::VictauriClient::discover().await {
         Ok(c) => c,
         Err(e) => {
-            bail!(
-                "Could not connect to Victauri server: {e}\n\n\
-                 Is your Tauri app running? Try:  pnpm run tauri dev\n\
-                 The app must have victauri-plugin wired into its builder."
-            );
+            bail!("{}", connect_failure_message(&e.to_string()));
         }
     };
 
@@ -938,11 +997,7 @@ async fn cmd_record(output: &Path, test_name: &str, locator: bool, assert_ipc: b
     let mut client = match victauri_test::VictauriClient::discover().await {
         Ok(c) => c,
         Err(e) => {
-            bail!(
-                "Could not connect to Victauri server: {e}\n\n\
-                 Is your Tauri app running? Try:  pnpm run tauri dev\n\
-                 The app must have victauri-plugin wired into its builder."
-            );
+            bail!("{}", connect_failure_message(&e.to_string()));
         }
     };
 

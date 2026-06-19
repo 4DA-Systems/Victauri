@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+CLI↔plugin **version-skew** compatibility fix, driven by an in-the-wild session that drove a live
+Tauri app through Victauri. An **old `victauri` CLI (0.5.6)** built for the pre-stateless *stateful*
+server aborted the MCP handshake against a **0.8.x stateless** plugin with the cryptic
+`no mcp-session-id header` — while wrongly blaming a not-running app (it was running). The cliff is
+client-side and old binaries cannot be patched, so the fix is server-side. Additive and semver-clean
+(a backfilled response header + clearer diagnostics — no API or output-schema change).
+
+### Fixed
+
+- **Stateless MCP now backfills a constant `Mcp-Session-Id` for old/strict clients.** rmcp's stateless
+  Streamable-HTTP transport never emits an `Mcp-Session-Id`; a strict client built for the stateful
+  server treats its absence as a fatal handshake error. The `/mcp` route (stateless mode only) now
+  emits a fixed sentinel `Mcp-Session-Id: stateless`. It is never validated server-side, so it can
+  never go stale → the `422 "expected initialize request"` wedge that stateless mode exists to prevent
+  cannot return. Current clients ignore the extra header. Scoped to `/mcp` via a per-route layer, so
+  `/api/tools`, `/info`, and `/health` are unaffected.
+
+### Added
+
+- **`victauri check` / `doctor` warn loudly on CLI↔plugin version skew.** When the CLI's own
+  `major.minor` differs from the running plugin's, both commands print a non-fatal warning naming the
+  cryptic symptom (`no mcp-session-id header`) and the one-line fix (`cargo install victauri-cli
+  --force`), including the OS-specific command to kill the stale `victauri bridge` proxy processes that
+  hold the on-PATH binary locked during reinstall ("Access is denied" / "Text file busy").
+- **Connection-failure diagnostics now match the real cause.** A `401`/`Unauthorized` (auth is on by
+  default) and a version-skew handshake failure previously both surfaced as the generic "is your app
+  running?" while the app *was* running. `victauri check` now classifies the failure and points at auth
+  (discovery token / `VICTAURI_AUTH_TOKEN` / `auth_disabled()`) or a CLI upgrade accordingly.
+
+### Changed
+
+- **`bridge not responding` errors now name the page-not-loaded case.** A dev-server
+  connection-refused or a blank error page has no JS bridge, so `dom_snapshot` / `eval_js` / console
+  tools correctly fail — the message now says exactly that and points at the `screenshot` tool, which
+  works regardless of page JS (it is what cracked the in-the-wild white-screen diagnosis).
+
 ## [0.8.3] - 2026-06-16
 
 In-the-wild fixes from a live 4DA analysis session driven **entirely through the Victauri

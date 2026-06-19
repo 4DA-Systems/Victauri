@@ -4248,7 +4248,9 @@ impl VictauriMcpHandler {
             let label = webview_label.unwrap_or("default");
             Err(format!(
                 "bridge not responding on window '{label}' — the window may be hidden, \
-                 missing the victauri capability, or the JS bridge is not loaded"
+                 missing the victauri capability, or the JS bridge is not loaded (e.g. the page \
+                 failed to load: a dev-server connection-refused or blank error page has no JS \
+                 bridge — check the window with the `screenshot` tool, which works regardless)"
             ))
         }
     }

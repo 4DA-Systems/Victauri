@@ -483,7 +483,11 @@ async fn mcp_initialize_returns_session() {
 // previously forced the REST fallback for the whole run.
 
 #[tokio::test]
-async fn stateless_initialize_returns_no_session_id() {
+async fn stateless_initialize_returns_compat_session_id() {
+    // After the version-skew fix the stateless server backfills a CONSTANT, never-validated
+    // `Mcp-Session-Id: stateless` so old/strict clients (which abort on a missing header with
+    // "no mcp-session-id header") proceed. The value is fixed and never checked, so it cannot go
+    // stale → the 422 wedge cannot return (see `stateless_ignores_unknown_session_id`).
     let base = start_stateless_test_server(test_state(), &["main"]).await;
     let client = reqwest::Client::new();
 
@@ -510,9 +514,47 @@ async fn stateless_initialize_returns_no_session_id() {
         "initialize returned {}",
         resp.status()
     );
+    assert_eq!(
+        resp.headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok()),
+        Some("stateless"),
+        "stateless mode must backfill the compat `Mcp-Session-Id: stateless` header"
+    );
+}
+
+#[tokio::test]
+async fn stateless_ignores_unknown_session_id() {
+    // Preserves the original P0 intent: even when a client sends a session id the server never
+    // minted, the stateless transport must NOT 422 — nothing validates the id, so it cannot go
+    // stale. (In stateful mode a bogus/expired session id is exactly what triggers the wedge.)
+    let base = start_stateless_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("mcp-session-id", "totally-bogus-never-minted")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        resp.status(),
+        reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        "stateless mode must ignore an unknown session id, never 422"
+    );
     assert!(
-        resp.headers().get("mcp-session-id").is_none(),
-        "stateless mode must NOT mint a session id"
+        resp.status().is_success(),
+        "tools/list with a bogus session id returned {}",
+        resp.status()
     );
 }
 

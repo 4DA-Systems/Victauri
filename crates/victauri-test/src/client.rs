@@ -152,9 +152,11 @@ pub struct VictauriClient {
     base_url: String,
     host: String,
     port: u16,
-    /// MCP session id, minted by `initialize` in *stateful* mode. `None` when the server runs in
-    /// *stateless* mode (the Victauri default since the 422-wedge fix) — then no session header is
-    /// sent and the stale-session 422 recovery path simply never triggers.
+    /// MCP session id echoed on later calls. In *stateful* mode `initialize` mints a unique id. In
+    /// *stateless* mode (the Victauri default since the 422-wedge fix) the server backfills a
+    /// constant compat id (`"stateless"`) so old/strict clients don't abort on a missing header;
+    /// since it is never validated, echoing it can never trigger the stale-session 422 path. `None`
+    /// only if a non-default server emits no header at all.
     session_id: Option<String>,
     next_id: u64,
     auth_token: Option<String>,
@@ -1268,8 +1270,8 @@ impl VictauriClient {
         self.port
     }
 
-    /// Get the MCP session ID. Empty string when the server runs in stateless mode
-    /// (no session is minted), so the `&str` signature is preserved.
+    /// Get the MCP session ID. In stateless mode (the default) this is the constant compat id
+    /// `"stateless"` the server backfills; empty string only if a server emits no header at all.
     #[must_use]
     pub fn session_id(&self) -> &str {
         self.session_id.as_deref().unwrap_or("")
