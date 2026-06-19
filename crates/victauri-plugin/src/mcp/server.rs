@@ -43,6 +43,26 @@ fn normalize_auth_token(auth_token: Option<String>) -> Option<String> {
     }
 }
 
+/// Backfill a constant `Mcp-Session-Id` on stateless-MCP responses for old/strict clients.
+///
+/// The stateless Streamable-HTTP transport (rmcp 1.5.0) never emits an `Mcp-Session-Id`. A stale
+/// strict client — e.g. a `victauri` CLI built against the *stateful* server — requires that header
+/// at `initialize` and aborts with "no mcp-session-id header" when it is missing. We emit a fixed
+/// sentinel value so those clients proceed. The value is never validated server-side, so it can
+/// never go stale → the `422 "expected initialize request"` wedge (the reason stateless mode exists)
+/// cannot return. Current clients ignore the extra header. Layered onto the `/mcp` route only, and
+/// only in stateless mode (see [`build_app_full_inner`]).
+async fn backfill_stateless_session_id(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut()
+        .entry(axum::http::HeaderName::from_static("mcp-session-id"))
+        .or_insert(axum::http::HeaderValue::from_static("stateless"));
+    resp
+}
+
 /// Build an Axum router for the MCP server with an optional auth token and rate limiter.
 pub fn build_app_with_options(
     state: Arc<VictauriState>,
@@ -156,8 +176,15 @@ fn build_app_full_inner(
         || !state.privacy.command_blocklist.is_empty()
         || state.privacy.redaction_enabled;
 
-    let mut router = axum::Router::new()
-        .route_service("/mcp", mcp_service)
+    // Build `/mcp` as its own router so the stateless session-id backfill layer applies ONLY to
+    // that route. Axum applies a `.layer(...)` to the routes already registered on the router at
+    // the call site; routes chained on afterwards (`/api/tools`, `/info`, `/health`) are excluded.
+    let mut mcp_router = axum::Router::new().route_service("/mcp", mcp_service);
+    if !stateful {
+        mcp_router = mcp_router.layer(axum::middleware::from_fn(backfill_stateless_session_id));
+    }
+
+    let mut router = mcp_router
         .nest("/api/tools", rest)
         .route(
             "/info",

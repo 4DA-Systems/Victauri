@@ -866,7 +866,12 @@ e2e_test!(two_concurrent_sessions, {
     let mut client1 = VictauriClient::discover().await.unwrap();
     let mut client2 = VictauriClient::discover().await.unwrap();
 
-    assert_ne!(client1.session_id(), client2.session_id());
+    // The production default is the STATELESS transport, which has no per-client session — every
+    // response carries the same constant compat `Mcp-Session-Id: stateless` (so old/strict clients
+    // don't abort on a missing header). So the two clients legitimately share that id; uniqueness is
+    // a stateful-only property. What matters is that two concurrent clients each work independently,
+    // which the eval assertions below prove.
+    assert_eq!(client1.session_id(), client2.session_id());
 
     let r1 = client1.eval_js("1 + 1").await.unwrap();
     let r2 = client2.eval_js("2 + 2").await.unwrap();

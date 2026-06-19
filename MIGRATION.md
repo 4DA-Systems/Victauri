@@ -1,5 +1,20 @@
 # Migration Guide
 
+## v0.8.3 → v0.8.4 (stateless MCP backfills a compat session id)
+
+No consumer code changes are required and no dependency-requirement change is needed (semver-compatible
+patch — `victauri-plugin = "0.8"` / `victauri-test = "0.8"` pick it up automatically). One behavior
+change to be aware of:
+
+- **The stateless MCP transport (the default) now sets a constant `Mcp-Session-Id: stateless` response
+  header on `/mcp`.** Previously stateless responses carried no such header, which broke old/strict MCP
+  clients that abort on its absence with `no mcp-session-id header`. The value is fixed and never
+  validated server-side, so nothing can go stale and the `422` stale-session wedge cannot return.
+  Clients that echo the header on later calls are unaffected (the server ignores it). If you have
+  tooling that asserted the header was *absent* in stateless mode, update it to expect the constant
+  `stateless` value. `VictauriClient::session_id()` now returns `"stateless"` in stateless mode instead
+  of an empty string.
+
 ## v0.8.1 → v0.8.2 (host-crash amplifier removed)
 
 No consumer code changes are required and no dependency-requirement change is needed (0.8.2 is a

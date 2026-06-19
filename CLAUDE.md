@@ -184,7 +184,49 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-06-16)
+## Current State (2026-06-20)
+
+### v0.8.4 (unreleased) — CLI↔plugin version-skew compat + in-the-wild DX fixes
+
+Driven by a live session that drove the **verax-bridge** Tauri app entirely through Victauri. The
+headline failure: an **old `victauri` CLI (0.5.6)**, built for the pre-stateless *stateful* server,
+aborted the MCP handshake against the **0.8.x stateless** plugin with the cryptic
+`no mcp-session-id header` — while the generic error wrongly blamed a not-running app (it WAS running).
+**Disconfirmation settled the direction:** rmcp 1.5.0's stateless `handle_post` never emits *or*
+validates an `Mcp-Session-Id`, so the cliff is **client-side** and old binaries can't be patched → the
+fix must be **server-side**. All changes additive/semver-clean (a backfilled response header + clearer
+diagnostics — no API or output-schema change); stays in `^0.8`.
+
+- **Stateless MCP backfills a constant `Mcp-Session-Id: stateless` (server-side keystone).** A
+  per-route axum layer on `/mcp` (stateless mode only — `build_app_full_inner`'s `!stateful` branch)
+  `.or_insert`s the sentinel only if absent. It is never validated, so it can never go stale → the
+  `422 "expected initialize request"` wedge that stateless mode exists to avoid cannot return. Scoped
+  to `/mcp` by building it as its own router and layering *before* merging `/api/tools` + `/info` +
+  `/health` (axum applies a `.layer` only to routes already registered). Guard test
+  `stateless_initialize_returns_no_session_id` was upgraded (it asserted the header was *absent*) →
+  `stateless_initialize_returns_compat_session_id` (header present == `stateless`) +
+  `stateless_ignores_unknown_session_id` (a bogus client-supplied id still never 422s — preserves the
+  original P0 intent).
+- **`victauri check` / `doctor` warn loudly on CLI↔plugin `major.minor` skew** — naming the cryptic
+  symptom + the one-line fix (`cargo install victauri-cli --force`) with the OS-specific command to
+  kill stale `victauri bridge` proxies that lock the on-PATH binary during reinstall ("Access is
+  denied" / "Text file busy").
+- **Connection-failure diagnostics match the real cause.** A `401` (auth on by default) and a
+  version-skew handshake failure both used to surface as the generic "is your app running?";
+  `victauri check` now classifies the error → auth guidance (discovery token / `VICTAURI_AUTH_TOKEN` /
+  `auth_disabled()`) or a CLI-upgrade hint. Shared `connect_failure_message` helper across all 5 CLI
+  connect sites.
+- **`bridge not responding` errors now name the page-not-loaded case** (dev-server
+  connection-refused / blank error page → no JS bridge) and point at the `screenshot` tool, which
+  works regardless of page JS — the in-the-wild white-screen diagnosis.
+
+Compat sweep: the stateless backfill makes `VictauriClient::session_id()` return `"stateless"` (not
+`""`); the pre-existing `two_concurrent_sessions` e2e assertion (`assert_ne!` on two clients' session
+ids — written before stateless became the default, so already latent-broken against a stateless app)
+was corrected to assert the shared constant id. The CLI `bridge.rs` stateless-detection and the
+`bridge_e2e.rs` mock (stateful restart-recovery) are unaffected. Gate green: `cargo build/test
+--workspace`, `clippy --workspace --all-targets -Dwarnings`, `fmt --check`. **Publish + push to main
+are operator-gated.**
 
 ### v0.8.3 — in-the-wild DX/safety fixes from a live-4DA bridge-only analysis session
 
