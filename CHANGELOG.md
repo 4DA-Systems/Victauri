@@ -29,6 +29,10 @@ client-side and old binaries cannot be patched, so the fix is server-side. Addit
   printed, but the final pass/warn/fail counts under-reported it. The connection helper also avoids
   classifying unrelated generic "session" errors as version skew unless the error names the MCP
   handshake symptoms (`Mcp-Session-Id`, `expected initialize request`, or an initialize-time 422).
+- **The `victauri-test` GitHub Action now tolerates cold webview startup.** Its `check: true`
+  diagnostics retry only while `victauri check` reports the known JS-bridge-not-ready class, so Linux
+  WebKit can finish loading after `/health` is already green without masking unrelated failures. The
+  action's default `victauri-version` is also version-synced to `0.8.4`.
 
 ### Added
 

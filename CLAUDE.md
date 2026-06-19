@@ -220,6 +220,9 @@ diagnostics — no API or output-schema change); stays in `^0.8`.
 - **`victauri doctor` counts version-skew warnings in its summary.** The warning already printed, but
   the final pass/warn/fail counts under-reported it; the release now has focused unit coverage for both
   the warning count signal and the tighter handshake-error classifier.
+- **The `victauri-test` GitHub Action no longer races cold WebKit startup.** `check: true` diagnostics
+  now retry only while `victauri check` reports the known JS-bridge-not-ready/page-not-loaded class
+  after `/health` is already green, and the action default `victauri-version` is synced to `0.8.4`.
 - **`bridge not responding` errors now name the page-not-loaded case** (dev-server
   connection-refused / blank error page → no JS bridge) and point at the `screenshot` tool, which
   works regardless of page JS — the in-the-wild white-screen diagnosis.

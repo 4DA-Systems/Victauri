@@ -34,7 +34,7 @@ inputs:
   victauri-version:
     description: Version of victauri-cli to install
     required: false
-    default: "0.8.0"
+    default: "0.8.4"
   cli-source-path:
     description: >-
       Build & install victauri-cli from this local repo path instead of
@@ -47,6 +47,10 @@ inputs:
     description: Seconds to wait for the Victauri server to become healthy
     required: false
     default: "30"
+  bridge-timeout:
+    description: Seconds to retry diagnostics while the webview JS bridge finishes loading
+    required: false
+    default: "60"
   check:
     description: Run victauri check (diagnostics report) before tests
     required: false
@@ -116,7 +120,39 @@ runs:
       shell: bash
       env:
         VICTAURI_PORT: ${{ inputs.port }}
-      run: victauri check
+        BRIDGE_TIMEOUT: ${{ inputs.bridge-timeout }}
+      run: |
+        if ! [[ "$BRIDGE_TIMEOUT" =~ ^[0-9]+$ ]]; then
+          echo "::error::bridge-timeout must be a non-negative integer"
+          exit 1
+        fi
+
+        deadline=$((SECONDS + BRIDGE_TIMEOUT))
+        attempt=1
+        while true; do
+          set +e
+          output=$(victauri check 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+
+          if ! echo "$output" | grep -qiE 'bridge not responding|JS bridge not loaded|page failed to load'; then
+            exit "$status"
+          fi
+
+          if [ "$SECONDS" -ge "$deadline" ]; then
+            echo "::error::Victauri diagnostics did not pass within ${BRIDGE_TIMEOUT}s after health; JS bridge stayed unavailable"
+            exit "$status"
+          fi
+
+          echo "Victauri server is healthy but the webview JS bridge is not ready yet; retrying diagnostics (attempt ${attempt})..."
+          attempt=$((attempt + 1))
+          sleep 2
+        done
 
     - name: Run Victauri tests
       id: test
