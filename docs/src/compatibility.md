@@ -167,8 +167,12 @@ Warning IDs: `service-worker-active`, `closed-shadow-dom`, `iframes-present`, `l
 Victauri handles multi-window apps automatically. Default window selection: `"main"` → first visible → any. Use `webview_label` to target specific windows:
 
 ```rust
-client.eval_js_in("settings", "document.title").await?;
+// Introspect a specific window by label:
 client.dom_snapshot_for("notification").await?;
+
+// `eval_js` targets the default window; to eval against a specific window,
+// call the tool with a `webview_label` field (e.g. over the REST API):
+// POST /api/tools/eval_js  {"code": "document.title", "webview_label": "settings"}
 ```
 
 Apps with many dynamic windows (Spacedrive's 15+ types, Seelen-UI's desktop environment) should target windows by label explicitly.

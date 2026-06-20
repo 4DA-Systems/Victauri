@@ -29,7 +29,7 @@ tauri::Builder::default()
         VictauriBuilder::new()
             .port(8080)
             .auth_token("my-fixed-token")
-            .build(),
+            .build().unwrap(),
     )
     .run(tauri::generate_context!())
     .unwrap();
@@ -40,7 +40,7 @@ tauri::Builder::default()
 ```rust
 VictauriBuilder::new()
     .port(9000)  // Preferred port
-    .build()
+    .build().unwrap()
 ```
 
 If the preferred port is busy, Victauri tries the next 10 ports (9001-9010). The actual port is:
@@ -60,17 +60,17 @@ the plugin is `#[cfg(debug_assertions)]`-gated.
 
 ```rust
 // 1. Auth on by default (auto-generated UUID token, auto-discovered by clients)
-VictauriBuilder::new().build()
+VictauriBuilder::new().build().unwrap()
 
 // 2. Fixed token (e.g. for CI where you want a known value)
 VictauriBuilder::new()
     .auth_token("my-secret-token")
-    .build()
+    .build().unwrap()
 
 // 3. Opt OUT of auth (local-only, you accept that any local process can connect)
 VictauriBuilder::new()
     .auth_disabled()
-    .build()
+    .build().unwrap()
 ```
 
 The `VICTAURI_AUTH_TOKEN` environment variable overrides the auto-generated token with a
@@ -88,17 +88,17 @@ use victauri_plugin::PrivacyProfile;
 // Read-only: snapshots, logs, registry only. No mutations.
 VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::Observe)
-    .build()
+    .build().unwrap()
 
 // Testing: observe + interactions + input + storage + recording
 VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::Test)
-    .build()
+    .build().unwrap()
 
 // Full control: everything enabled (default)
 VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::FullControl)
-    .build()
+    .build().unwrap()
 ```
 
 `Observe` and `Test` profiles automatically enable output redaction.
@@ -110,7 +110,7 @@ Shorthand for `Observe` profile:
 ```rust
 VictauriBuilder::new()
     .strict_privacy_mode()
-    .build()
+    .build().unwrap()
 ```
 
 #### Tool Disabling
@@ -120,7 +120,7 @@ Disable specific tools by name:
 ```rust
 VictauriBuilder::new()
     .disable_tools(&["eval_js", "screenshot", "invoke_command"])
-    .build()
+    .build().unwrap()
 ```
 
 Disabled tools return an error when called and are not listed in tool discovery.
@@ -133,12 +133,12 @@ Control which Tauri commands can be invoked via MCP:
 // Only allow these commands (positive allowlist)
 VictauriBuilder::new()
     .command_allowlist(&["get_settings", "get_status", "search"])
-    .build()
+    .build().unwrap()
 
 // Block specific commands (negative blocklist)
 VictauriBuilder::new()
     .command_blocklist(&["delete_user", "reset_database", "admin_override"])
-    .build()
+    .build().unwrap()
 ```
 
 The allowlist takes priority: if set, only listed commands are permitted regardless of the blocklist.
@@ -152,7 +152,7 @@ VictauriBuilder::new()
     .enable_redaction()  // Built-in patterns: API keys, emails, tokens
     .add_redaction_pattern(r"SECRET_\w+")  // Custom regex
     .add_redaction_pattern(r"sk-[a-zA-Z0-9]+")  // OpenAI keys
-    .build()
+    .build().unwrap()
 ```
 
 Built-in patterns match:
@@ -171,7 +171,7 @@ VictauriBuilder::new()
     .console_log_capacity(2000)   // JS bridge console buffer
     .network_log_capacity(2000)   // JS bridge network buffer
     .navigation_log_capacity(500) // JS bridge navigation buffer
-    .build()
+    .build().unwrap()
 ```
 
 ### Event Bus Capture
@@ -181,7 +181,7 @@ Window lifecycle events (resize, move, focus, close, theme change, drag-drop) ar
 ```rust
 VictauriBuilder::new()
     .listen_events(&["notification-added", "settings-changed", "sync-complete"])
-    .build()
+    .build().unwrap()
 ```
 
 All captured events appear in `introspect.event_bus`.
@@ -193,7 +193,7 @@ By default, the `navigate` tool only allows `http://` and `https://` URLs. To al
 ```rust
 VictauriBuilder::new()
     .allow_file_navigation()
-    .build()
+    .build().unwrap()
 ```
 
 ### Ready Callback
@@ -205,7 +205,7 @@ VictauriBuilder::new()
     .on_ready(|port| {
         println!("Victauri ready on port {}", port);
     })
-    .build()
+    .build().unwrap()
 ```
 
 ### Pre-registering Commands
@@ -214,9 +214,8 @@ Register `#[inspectable]` command schemas at build time:
 
 ```rust
 VictauriBuilder::new()
-    .register_command(greet__schema())
-    .register_command(increment__schema())
-    .build()
+    .commands(&[greet__schema(), increment__schema()])
+    .build().unwrap()
 ```
 
 ## Environment Variables
@@ -270,13 +269,12 @@ tauri::Builder::default()
             .recorder_capacity(100_000)
             .console_log_capacity(2000)
             // Commands
-            .register_command(greet__schema())
-            .register_command(increment__schema())
+            .commands(&[greet__schema(), increment__schema()])
             // Event bus
             .listen_events(&["app-event", "sync-complete"])
             // Callback
             .on_ready(|port| println!("MCP server on :{}", port))
-            .build(),
+            .build().unwrap(),
     )
     .invoke_handler(tauri::generate_handler![greet, increment])
     .run(tauri::generate_context!())

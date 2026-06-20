@@ -155,7 +155,7 @@ curl http://127.0.0.1:7373/api/tools
 # Execute a tool directly
 curl -X POST http://127.0.0.1:7373/api/tools/eval_js \
   -H "Content-Type: application/json" \
-  -d '{"expression": "document.title"}'
+  -d '{"code": "document.title"}'
 ```
 
 ## Next Steps

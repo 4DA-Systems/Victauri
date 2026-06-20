@@ -35,11 +35,11 @@ Two ways that matter, and we'll be precise because the naive "it sees the DOM, w
 **2. Even where a browser tool *can* attach (Windows), it can poke the backend but can't read it safely.** Tauri exposes `window.__TAURI_INTERNALS__.invoke` in the webview, so any tool with JS evaluation can *invoke* a registered command — Victauri does not have a monopoly on "reaching the backend." But to learn what the backend is actually doing, a browser tool has to *mutate live state* (call write commands, submit forms, click-storm). And several things have **no JavaScript equivalent at all**:
 
 - **The database** — browser JS can't open a local SQLite file. Victauri's `query_db` reads it **read-only** through direct `AppHandle` access (verified against a live 339 MB / 150-table production DB in 2 calls).
-- **The command registry** — you can *invoke* a command from JS, but you can't *enumerate* what commands exist or detect a ghost (frontend-invoked but unregistered) call. Victauri can.
-- **The IPC history, with response bodies** — the browser Performance API reports HTTP 200 even when a command returned `Err`, and exposes no bodies. Victauri's IPC log retains both request and response.
+- **The command registry** — you can *invoke* a command from JS, but you can't *enumerate* it. Apps that adopt the `#[inspectable]` macro get a full enumerable command catalog with schemas; for apps that don't, Victauri recovers real call/return shapes by mining its own IPC log (`introspect command_catalog`) and flags ghost (frontend-invoked but unregistered) calls by outcome — more than a browser tool surfaces.
+- **The IPC history, with response bodies** — the browser Performance API reports HTTP 200 even when a command returned `Err`, and exposes no bodies. Victauri's IPC log retains both request and response (it derives this from the page's own `fetch` traffic, so it shares the webview's fate).
 - **The native process** — `performance.memory` is the JS heap; it can't see the OS process RSS or the child-process table. Victauri reads both.
 
-Because those backend tools go through `AppHandle` and not the webview, they keep working even when the webview's JS bridge is down — exactly when an `eval_js`-dependent tool gets nothing.
+Because the database, registry, and native-process tools go through `AppHandle` and not the webview, they keep working even when the webview's JS bridge is down — exactly when an `eval_js`-dependent tool gets nothing. (The IPC log is the exception: it is bridge-derived, so it needs a live webview.)
 
 **The honest one-liner:** browser tools can *poke* a Tauri backend; only Victauri can *read* it safely — read-only, cross-platform, and independent of the webview.
 

@@ -109,12 +109,11 @@ For direct MCP tool access using ref handles:
 | `verify_state(frontend, backend)` | Cross-boundary check |
 | `detect_ghost_commands()` | Unregistered commands |
 | `check_ipc_integrity()` | IPC health |
-| `assert_semantic(expr, cond, expected)` | Semantic assertion |
+| `assert_semantic(expr, label, cond, expected)` | Semantic assertion |
 | `wait_for(condition, value, timeout)` | Wait for condition |
-| `start_recording()` | Begin time-travel |
+| `start_recording(session_id)` | Begin time-travel |
 | `stop_recording()` | End recording |
-| `checkpoint(label)` | Create checkpoint |
-| `get_console_logs(since)` | Console entries |
+| `logs("console", limit)` | Console / network / IPC entries |
 | `audit_accessibility()` | WCAG audit |
 | `get_performance_metrics()` | Navigation timing, heap, resources |
 | `query_db(sql, db_path, params)` | SQLite query |
@@ -338,7 +337,7 @@ Find orphaned commands — called in the frontend but missing from the backend:
 
 ```rust
 let ghosts = client.detect_ghost_commands().await?;
-assert!(ghosts["ghost_commands"].as_array().unwrap().is_empty(),
+assert!(ghosts["confirmed_ghosts"].as_array().unwrap().is_empty(),
     "Found ghost commands: {ghosts}");
 ```
 
@@ -573,14 +572,15 @@ victauri record --output tests/login_flow.rs --test-name login_flow
 ```rust
 client.start_recording(Some("my-session")).await?;
 
-client.checkpoint("before-login").await?;
 client.fill_by_id("email", "user@example.com").await?;
 client.click_by_id("login-btn").await?;
-client.checkpoint("after-login").await?;
 
-let events = client.events_between("before-login", "after-login").await?;
-
+// `stop_recording` returns the full session (events + any checkpoints).
 let session = client.stop_recording().await?;
+
+// Mid-session checkpoints and events-between-checkpoints are available through the
+// `recording` tool's actions (checkpoint / events / events_between) via call_tool,
+// or through the core `EventRecorder` API when embedding directly.
 ```
 
 ## Command Instrumentation
@@ -631,28 +631,33 @@ use victauri_test::{
     assert_state_matches,
 };
 
-assert_json_eq(&client, "document.title", "My App").await;
-assert_json_truthy(&client, "document.querySelector('nav')").await;
-assert_no_a11y_violations(&client).await;
-assert_performance_budget(&client, 100.0, 50.0).await;
-assert_ipc_healthy(&client).await;
-assert_state_matches(&client, "document.title", json!({"title": "My App"})).await;
+// These helpers are SYNCHRONOUS and take a `&Value` you already fetched (plus a
+// JSON pointer for the *_json_ helpers), not the client. Fetch first, then assert:
+let title = client.eval_js("document.title").await?;
+assert_json_eq(&title, "", &json!("My App")); // pointer "" = the whole value
+
+let integrity = client.check_ipc_integrity().await?;
+assert_ipc_healthy(&integrity);
 ```
 
 ### Client Assertion Methods
 
+Each returns `Result<(), TestError>` — propagate with `?` (or `.unwrap()` in a test):
+
 ```rust
-client.assert_eval_works().await;
-client.assert_dom_snapshot_valid().await;
-client.assert_screenshot_ok().await;
-client.assert_windows_exist(&["main"]).await;
-client.assert_ipc_integrity_ok().await;
-client.assert_accessible().await;
-client.assert_dom_complete_under(5000).await;
-client.assert_heap_under_mb(200.0).await;
-client.assert_no_uncaught_errors().await;
-client.assert_recording_lifecycle().await;
-client.assert_health_hardened().await;
+use std::time::Duration;
+
+client.assert_eval_works().await?;
+client.assert_dom_snapshot_valid().await?;
+client.assert_screenshot_ok().await?;
+client.assert_windows_exist().await?;
+client.assert_ipc_integrity_ok().await?;
+client.assert_accessible().await?;
+client.assert_dom_complete_under(Duration::from_millis(5000)).await?;
+client.assert_heap_under_mb(200.0).await?;
+client.assert_no_uncaught_errors().await?;
+client.assert_recording_lifecycle().await?;
+client.assert_health_hardened().await?;
 ```
 
 ## Smoke Test Suite
@@ -666,17 +671,17 @@ use victauri_test::{VictauriClient, SmokeConfig};
 async fn smoke() {
     let client = VictauriClient::connect(7373).await.unwrap();
 
-    let report = client.smoke_test(SmokeConfig::default()).await;
-    println!("Passed: {}/{}", report.passed, report.total);
+    let report = client.smoke_test().await.unwrap();
+    println!("Passed: {}/{}", report.passed_count(), report.total_count());
     assert!(report.all_passed());
 
     // Custom thresholds
     let config = SmokeConfig {
-        max_load_ms: 3000,
+        max_dom_complete_ms: 3000,
         max_heap_mb: 150.0,
-        ..Default::default()
     };
-    let report = client.smoke_test(config).await;
+    let report = client.smoke_test_with_config(config).await.unwrap();
+    assert!(report.all_passed());
 }
 ```
 
