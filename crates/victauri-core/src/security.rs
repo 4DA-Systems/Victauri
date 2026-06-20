@@ -142,9 +142,14 @@ pub const DEFAULT_RATE_LIMIT: u64 = 1000;
 /// suffix (e.g. `localhost:7373`, `[::1]:7373`).
 #[must_use]
 pub fn is_localhost_host(host: &str) -> bool {
-    let host_name = if host.starts_with('[') {
-        // Bracketed IPv6: [::1] or [::1]:7373
-        host.split(']').next().map_or(host, |s| &s[1..])
+    let host_name = if let Some(rest) = host.strip_prefix('[') {
+        // Bracketed IPv6: [::1] or [::1]:7373. The bytes after `]` MUST be empty or a
+        // `:port` suffix — anything else (e.g. `[::1].evil.com`, `[::1]@x`) is rejected so a
+        // bracket-prefixed host can't smuggle a non-localhost authority past the guard.
+        match rest.split_once(']') {
+            Some((inner, after)) if after.is_empty() || after.starts_with(':') => inner,
+            _ => return false,
+        }
     } else if host.contains("::") {
         // Bare IPv6 (no brackets): ::1
         host
@@ -344,6 +349,22 @@ mod tests {
         assert!(!is_localhost_host("localhost.evil.com"));
         assert!(!is_localhost_host("127.0.0.1.evil.com"));
         assert!(!is_localhost_host(""));
+    }
+
+    #[test]
+    fn host_blocks_bracketed_ipv6_smuggling() {
+        // Bytes after `]` must be empty or a :port — a bracket-prefixed host cannot smuggle a
+        // non-localhost authority past the guard (regression for the audit-prep A-F1 finding).
+        assert!(!is_localhost_host("[::1].evil.com"));
+        assert!(!is_localhost_host("[::1]@evil.com"));
+        assert!(!is_localhost_host("[::1]evil"));
+        assert!(!is_localhost_host("[2001:db8::1]")); // bracketed but not loopback
+        assert!(!is_localhost_host("[::1].evil.com:7373")); // trailing-garbage-then-port
+        // Valid bracketed loopback forms still pass (incl. a bracketed IPv4 loopback, which
+        // still resolves to 127.0.0.1 — harmless, it's localhost either way).
+        assert!(is_localhost_host("[::1]"));
+        assert!(is_localhost_host("[::1]:7373"));
+        assert!(is_localhost_host("[127.0.0.1]"));
     }
 
     // is_allowed_origin

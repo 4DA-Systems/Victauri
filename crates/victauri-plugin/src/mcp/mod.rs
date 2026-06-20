@@ -4025,7 +4025,14 @@ impl VictauriMcpHandler {
                 .iter()
                 .any(|root| Self::safe_within(root, candidate).is_ok())
             {
-                return Ok(candidate.to_path_buf());
+                // Open the CANONICAL validated path, not the caller's literal absolute path,
+                // so the DB is opened at exactly the containment-approved location — symmetric
+                // with the relative branch below and closing the validate-canonical/open-lexical
+                // TOCTOU on this branch (a same-privilege symlink swap between canonicalize and
+                // open is the unavoidable residual, documented in security.md).
+                let canonical = std::fs::canonicalize(candidate)
+                    .map_err(|e| format!("cannot resolve database path: {e}"))?;
+                return Ok(canonical);
             }
             return Err(format!(
                 "absolute path '{requested}' is not within an allowed directory; \
@@ -4930,7 +4937,11 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
             };
         }
     }
-    // Fallback for results too deeply nested for the recursion-limited parser.
+    // Fallback for results too deeply nested for the recursion-limited parser. `rfind` is
+    // correct here: the wrapper appends `,"__victauri_type":"<type>"}` AFTER the entire payload,
+    // so the real delimiter is structurally the LAST occurrence — a nested object key of the same
+    // name appears earlier, and inside a string payload the quotes are escaped (`\"`), so neither
+    // can be the last match. A hostile page therefore can't shift the slice boundary.
     if let Some(after) = raw.strip_prefix(r#"{"__victauri_ok":"#)
         && let Some(idx) = after.rfind(r#","__victauri_type":"#)
     {

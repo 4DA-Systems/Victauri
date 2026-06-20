@@ -36,7 +36,7 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 
 - **Full-stack verification** — click a button, verify the IPC call, query the database to confirm the write, check the UI updated — in one test
 - **Direct backend access** — query SQLite databases, browse app files, read config, inspect process memory — no webview proxy
-- **Ghost command detection** — find frontend calls with no backend handler, and backend commands the frontend never calls
+- **Ghost command detection** — find high-confidence orphaned frontend calls (`confirmed_ghosts`: invoked but only ever errored "not found"), and backend commands the frontend never calls
 - **Cross-boundary state checking** — compare DOM state against Rust backend state and catch the drift between them
 - **Time-travel recording** — record interactions, checkpoint state, replay sequences, generate test files
 - **Cross-platform, no WebDriver** — identical behavior on macOS, Windows, and Linux; runs headless in CI under `xvfb`
@@ -275,7 +275,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | Tool | What it does |
 |---|---|
 | `get_registry` | List all `#[inspectable]` command schemas |
-| `detect_ghost_commands` | Find orphaned frontend IPC calls with no backend handler |
+| `detect_ghost_commands` | Find orphaned frontend IPC calls (high-confidence `confirmed_ghosts`) |
 | `check_ipc_integrity` | Detect stuck/stale/errored IPC calls |
 | `verify_state` | Compare frontend DOM against backend state |
 | `resolve_command` | Natural language to matching Tauri command |

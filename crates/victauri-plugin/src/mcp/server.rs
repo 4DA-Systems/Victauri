@@ -220,6 +220,15 @@ fn build_app_full_inner(
         ));
     }
 
+    // `/health` is registered AFTER the auth layer (so liveness probes stay unauthenticated)
+    // but BEFORE the rate limiter below, so it is still throttled. Axum applies a `.layer` only
+    // to routes registered before it: /mcp,/api/tools,/info are auth-gated above; /health is not;
+    // the rate limiter + outer guards then cover everything registered so far.
+    router = router.route(
+        "/health",
+        axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
+    );
+
     let limiter = rate_limiter.unwrap_or_else(crate::auth::default_rate_limiter);
     router = router.layer(axum::middleware::from_fn_with_state(
         limiter,
@@ -227,10 +236,6 @@ fn build_app_full_inner(
     ));
 
     router
-        .route(
-            "/health",
-            axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
-        )
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
         .layer(ConcurrencyLimitLayer::new(64))
         .layer(axum::middleware::from_fn(crate::auth::security_headers))

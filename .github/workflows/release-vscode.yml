@@ -31,6 +31,10 @@ jobs:
     environment: release
     permissions:
       contents: write # required: attach .vsix to the GitHub Release
+    env:
+      # Job-level so the Open VSX step's `if:` can read `env.OVSX_TOKEN` — a step-level `env:`
+      # is NOT in scope for that same step's `if:` expression, which silently skipped the publish.
+      OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
     defaults:
       run:
         working-directory: editors/vscode
@@ -73,10 +77,10 @@ jobs:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
       - name: Publish to Open VSX (Cursor / VSCodium / agent IDEs)
+        # `env.OVSX_TOKEN` resolves from the job-level `env:` above (a step-level env is not in
+        # scope for its own `if:`), so the step now actually runs when the secret is configured.
         if: ${{ (startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false') && env.OVSX_TOKEN != '' }}
         run: npx --no-install ovsx publish victauri.vsix -p "$OVSX_TOKEN"
-        env:
-          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
 
       - name: Attach .vsix to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')

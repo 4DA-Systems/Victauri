@@ -176,6 +176,10 @@ Capture a PNG screenshot of the application window.
 
 **Returns:** Base64-encoded PNG image data.
 
+> **Linux:** capture requires X11 or XWayland (the common case, including CI under `xvfb`). A
+> pure-Wayland session exposes no safe per-window capture path, so `screenshot` returns a clear
+> error there rather than a wrong or blank image. Windows and macOS capture natively.
+
 ---
 
 ### verify_state
