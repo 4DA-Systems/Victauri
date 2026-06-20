@@ -7,16 +7,38 @@ that catches drift between releases. It is **not** a release gate — third-part
 move on their own schedules, so a red run usually means an app needs re-pinning, not a
 Victauri regression.
 
-## Current status (Victauri 0.8.4, 2026-06-19)
+## Current status (Victauri 0.8.4, 2026-06-20)
 
-App-agnostic smoke battery (15 checks), four pinned Tauri-2 apps:
+App-agnostic smoke battery (15 checks), three pinned Tauri-2 apps:
 
 | App | Result | Notes |
 |-----|--------|-------|
-| **Kanri** | **15 / 15** ✅ | Nuxt / yarn |
-| **En Croissant** | **15 / 15** ✅ | React / pnpm |
+| **Kanri** | **15 / 15** ✅ | Nuxt / Vue / yarn |
+| **En Croissant** | **15 / 15** ✅ | React / Mantine / pnpm |
 | **Lettura** | **15 / 15** ✅ | React monorepo / pnpm |
-| **Duckling** | 4 / 15 ⚠️ | Webview never becomes bridge-ready at the pinned ref (`bridge not responding on window 'default'` — a blank/unloaded page has no JS bridge); needs a re-pin to a commit that loads headless. Not a Victauri regression. |
+
+These three share the profile that works headless: a **light Vite/Nuxt SPA**, **no
+isolation pattern**, and **no screen-capture/audio/editor native crates** (a `visible:false`
+window is fine — Kanri and En Croissant are both `visible:false` and pass).
+
+**Why only three (Duckling removed, no drop-in 4th).** Duckling was removed because its
+~6.5 MB JS bundle + ~2.4 MB tree-sitter SQL WASM never becomes responsive under the
+headless **software-GL WebKitGTK** CI environment (it works on Windows WebView2/Chromium —
+a CI-environment limit, not a Victauri bug). An exhaustive 2026-06-20 search for a
+replacement hit a **distinct wall per candidate**, none a Victauri bug:
+
+- **NoteGen** — heavy screen-capture app; needed `libpipewire`/`gbm`/`drm`/`egl` dev
+  headers just to compile, then its embedded server would not come up headless.
+- **EcoPaste** — tray clipboard manager; its webview never became eval-able even when
+  force-shown via `window manage show`.
+- **Open Video Downloader** — uses Tauri's **isolation pattern**, which sandboxes the
+  content frame so the injected Victauri bridge cannot reach it (`bridge not responding`).
+- **HuLa** (Monaco editor + runtime windows), **Readest** (Next.js + foliate ebook engine).
+
+To add a 4th later, vet up front: Tauri 2, **no** isolation pattern, **no**
+`xcap`/`pipewire`/`cpal`/`monaco`/`codemirror`/`tree-sitter` crates, a Vite/Nuxt SPA. For
+heavy/complex apps (Duckling, NoteGen), the right home is a **Windows WebView2 (Chromium)
+compat job** — that engine renders them fine.
 
 Re-run anytime with the workflow below; bump `apps.json` refs when an app drifts.
 
@@ -49,12 +71,12 @@ scripts/compat/retest-app.sh kanri
 scripts/compat/retest-all.sh
 
 # Keep the clone for debugging:
-scripts/compat/retest-app.sh duckling --keep
+scripts/compat/retest-app.sh en-croissant --keep
 ```
 
 Requires: `git`, `jq`, `curl`, `xvfb`, a Rust toolchain with the Tauri Linux system
 deps (`.github/actions/linux-deps`), Node, and the JS package managers the targets
-use — **pnpm** (En Croissant, Duckling, Lettura) and **Yarn** via Corepack (Kanri).
+use — **pnpm** (En Croissant, Lettura) and **Yarn** via Corepack (Kanri).
 The `compat.yml` workflow provisions both via Corepack; install them locally before
 running the matching app.
 
@@ -77,7 +99,7 @@ tags** (not HEAD) and the build recipes are app-specific:
 
 - **Lettura** restructured into a pnpm **monorepo** (`apps/desktop/src-tauri`).
 - Package managers differ: **Kanri → yarn** (Nuxt, `.output/public`),
-  En Croissant / Duckling / Lettura → **pnpm**.
+  En Croissant / Lettura → **pnpm**.
 - The pnpm apps are pnpm-version-sensitive: pnpm ≥10 accepts their settings-only
   `pnpm-workspace.yaml` but **skips native build scripts** (esbuild/swc) unless
   `--config.dangerouslyAllowAllBuilds=true` is passed, while pnpm 9 runs the scripts

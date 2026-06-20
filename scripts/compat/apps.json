@@ -5,7 +5,9 @@
     "Each app is pinned to a stable release tag where one exists (tag + commit SHA), captured 2026-06-03 -- not a moving default-branch HEAD, since HEADs run bleeding-edge, hard-to-build frontends. Exception: an app whose ONLY Tauri-2 code is on its default branch (no Tauri-2 tag yet) is pinned to a specific default-branch COMMIT, noted in 'tag'.",
     "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: the pnpm apps pin pnpm 10.15.0 via corepack. NOTE (2026-06-17): do NOT pass pnpm's dangerouslyAllowAllBuilds config flag -- current pnpm rejects it with ERR_PNPM_CONFIG_CONFLICT_BUILT_DEPENDENCIES when the app also sets neverBuiltDependencies. It is unnecessary for these vite frontends (esbuild ships prebuilt binaries with no build script), so it was removed from all commands.",
     "These build commands are validated against the pinned ref; bump tag+ref+commands together.",
-    "REMOVED 2026-06-17: 'surrealist' and 'lettura' were pinned at Tauri-1 release tags (v1.11.8 / v0.1.22) and could never host Victauri. Lettura migrated to Tauri 2 on its master branch (apps/desktop monorepo) and is repinned to a master commit below. Surrealist is Tauri 2 on main but its frontend requires a bespoke Rust->wasm embed toolchain (wasm32 target + wasm-bindgen CLI + clang) the routine compat harness/CI does not provision -- it is a manual-verification special case, intentionally not in the automated suite."
+    "REMOVED 2026-06-17: 'surrealist' and 'lettura' were pinned at Tauri-1 release tags (v1.11.8 / v0.1.22) and could never host Victauri. Lettura migrated to Tauri 2 on its master branch (apps/desktop monorepo) and is repinned to a master commit below. Surrealist is Tauri 2 on main but its frontend requires a bespoke Rust->wasm embed toolchain (wasm32 target + wasm-bindgen CLI + clang) the routine compat harness/CI does not provision -- it is a manual-verification special case, intentionally not in the automated suite.",
+    "REMOVED 2026-06-20: 'duckling' (l1xnan/Duckling v0.0.50). Duckling builds and launches but its webview never becomes eval-able under the headless software-GL WebKitGTK CI environment -- it ships a ~6.5 MB JS bundle + a ~2.4 MB tree-sitter SQL WASM that the software renderer cannot bring to a responsive state (the smoke battery's bridge-dependent checks all time out with 'bridge not responding'; no load error is logged, the page is simply wedged). This is a CI-environment limitation, not a Victauri incompatibility -- Duckling works under Windows WebView2 (Chromium). It is already pinned to its latest tag, so re-pinning cannot help.",
+    "REPLACEMENT SEARCH 2026-06-20 (no automated 4th app found; the suite is intentionally 3 apps): an exhaustive search for a drop-in 4th app hit a distinct wall per candidate, none a Victauri bug -- NoteGen (codexu/note-gen): heavy screen-capture app, needed pipewire/gbm/drm/egl just to compile, then its embedded server would not come up headless. EcoPaste (ayangweb/EcoPaste): tray clipboard manager; its webview never became eval-able even when force-shown via `window manage show`. Open Video Downloader (jely2002/youtube-dl-gui): uses Tauri's ISOLATION pattern (app.security.pattern.use = isolation), which sandboxes the content frame so Victauri's injected bridge cannot reach it -> bridge not responding. HuLa: Monaco editor + runtime windows. Readest: Next.js + foliate ebook engine + env-file build. The three retained apps work because they are LIGHT Vite/Nuxt SPAs with NO isolation pattern and NO screen-capture/audio/editor native deps (window visible:false is fine -- Kanri and En Croissant are both visible:false and pass). To add a 4th later, vet up front: Tauri 2, no isolation pattern, no xcap/pipewire/cpal/monaco/codemirror/tree-sitter deps, a Vite/Nuxt SPA. Heavy/complex apps (Duckling, NoteGen) would need a Windows WebView2 (Chromium) compat job, which is where they actually run."
   ],
   "apps": [
     {
@@ -29,17 +31,6 @@
       "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile && pnpm build-vite",
       "tauri_dir": "src-tauri",
       "tag": "v0.15.0"
-    },
-    {
-      "key": "duckling",
-      "name": "Duckling",
-      "framework": "React 19 / Jotai / Vite",
-      "repo": "https://github.com/l1xnan/Duckling.git",
-      "ref": "edb6c1b4af9b01818634c1e179c72820b86a3782",
-      "package_manager": "pnpm",
-      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile && pnpm build",
-      "tauri_dir": "src-tauri",
-      "tag": "v0.0.50"
     },
     {
       "key": "lettura",
