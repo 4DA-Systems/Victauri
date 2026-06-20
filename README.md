@@ -246,7 +246,7 @@ Find orphaned commands — called in the frontend but missing from the backend:
 
 ```rust
 let ghosts = client.detect_ghost_commands().await?;
-assert!(ghosts["ghost_commands"].as_array().unwrap().is_empty(),
+assert!(ghosts["confirmed_ghosts"].as_array().unwrap().is_empty(),
     "Found ghost commands: {ghosts}");
 ```
 

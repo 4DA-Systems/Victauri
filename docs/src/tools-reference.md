@@ -68,7 +68,7 @@ Execute a read-only SQL query against a SQLite database in the app's data direct
 {"query": "SELECT count(*) FROM items", "path": "app.db"}
 ```
 
-**Returns:** `{columns, rows, row_count, truncated, database}`
+**Returns:** `{columns, rows, row_count, truncated, max_rows}`
 
 Read-only and path-traversal-guarded: writes (`INSERT`/`UPDATE`/…), stacked
 queries, `ATTACH`, and the write form of `PRAGMA` (`PRAGMA x = y`) are rejected.
@@ -214,7 +214,7 @@ Verify the health of IPC communication.
 
 **Parameters:** None required.
 
-**Returns:** `{healthy, total_calls, pending, stale, errored}`
+**Returns:** `{healthy, total_calls, pending_count, stale_count, error_count, stale_calls, errored_calls, warning}`
 
 ---
 

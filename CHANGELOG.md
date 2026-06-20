@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.5] - 2026-06-20
+
+A "fix all known issues before release" pass: ships the `victauri check` tool-count fix that landed
+after 0.8.4 was cut, plus a thorough documentation correctness + honesty sweep (two audit agents,
+every finding verified against the live code). No public Rust API change.
+
+### Fixed
+
+- **`victauri check` no longer prints `Tools:  ?`.** `get_plugin_info` reports the tool count nested
+  at `tools.total`, but `cmd_check` read a flat `tool_count` / bare-numeric `tools` — both miss, so it
+  always showed `?`. Extracted a tested `parse_tool_count` (reads `tools.total`, with the legacy shapes
+  as fallbacks); 2 unit tests. (Crates: `victauri-cli`.)
+- **Documentation code examples that would panic or not compile.** mdbook examples aren't doctested, so
+  several had drifted from the API:
+  - **Panicking:** `detect_ghost_commands` results were indexed by non-existent keys (`ghost_commands`,
+    `ghosts`) then `.as_array().unwrap()` — corrected to `confirmed_ghosts` (README, `testing.md`,
+    `testing-tauri-apps.md`).
+  - **Won't compile:** `eval_js` REST param `expression` → `code`; the standalone `assert_json_*`
+    helpers are synchronous and take `&Value` (were shown as awaited client methods);
+    `assert_windows_exist()` takes no args; `assert_dom_complete_under` takes a `Duration`;
+    `smoke_test()` / `smoke_test_with_config(cfg)` arity, `SmokeConfig.max_dom_complete_ms` (not
+    `max_load_ms`), `SmokeReport::passed_count()/total_count()` (not `.passed`/`.total`);
+    `client.checkpoint` / `events_between` / `eval_js_in` / `register_command` don't exist (use the
+    `recording` tool / `dom_snapshot_for` / a `webview_label` field / `.commands(&[…])`); every
+    `.build()` returns a `Result` (config snippets now `.unwrap()`).
+  - **Reference-table fixes:** `query_db` and `check_ipc_integrity` return-key lists corrected to match
+    the real output shapes.
+
+### Changed
+
+- **Honest public claims.** "the IPC history has no `eval_js` equivalent" was false (the IPC log is
+  derived from the page's own `fetch` traffic) — reframed so the database and command registry are the
+  AppHandle-only items, and the IPC log is noted as sharing the webview's fate. "a CDP-class tool can't
+  attach at all" on WKWebView/WebKitGTK softened to the accurate "no Chrome DevTools Protocol surface"
+  (those engines have their own, separate remote-inspector protocols). The registry-enumeration claim
+  now notes it covers the `#[inspectable]` subset plus IPC-log mining. (Supersedes PR #17.)
+
 ## [0.8.4] - 2026-06-20
 
 CLI↔plugin **version-skew** compatibility fix, driven by an in-the-wild session that drove a live

@@ -4,7 +4,7 @@
 
 **Victauri — Verified Introspection & Control for Tauri Applications.**
 
-X-ray vision and hands for AI agents inside Tauri apps. A browser tool with JS eval can *poke* a Tauri backend (Tauri exposes `window.__TAURI_INTERNALS__.invoke`, so it can invoke commands) — but only Victauri can *read* it safely. The database, the command registry, and the IPC history (with response bodies) have no `eval_js` equivalent; the backend tools run read-only through direct `AppHandle` access, independent of the webview; and on macOS WKWebView / Linux WebKitGTK a CDP-class tool can't attach at all. Victauri gives agents simultaneous, read-only access to the webview DOM, the Rust backend, the IPC layer, the database, and native window state — all through a single MCP interface.
+X-ray vision and hands for AI agents inside Tauri apps. A browser tool with JS eval can *poke* a Tauri backend (Tauri exposes `window.__TAURI_INTERNALS__.invoke`, so it can invoke commands) — but only Victauri can *read* it safely. The database and the command registry have no `eval_js` equivalent — the backend tools read them through direct `AppHandle` access, independent of the webview; the IPC history is captured with request **and** response bodies (a browser's Performance API reports only HTTP 200 and exposes no bodies). And on macOS WKWebView / Linux WebKitGTK there is no Chrome DevTools Protocol surface for a CDP-based tool to attach to (those engines have their own, separate remote-inspector protocols; only WebView2 on Windows exposes a CDP-class surface). Victauri is one integration that sits inside the process on both sides of the boundary, giving agents simultaneous read-only access to the webview DOM, the Rust backend, the IPC layer, the database, and native window state — through a single MCP interface.
 
 **Stack:** Pure Rust workspace (6 crates) | **Target:** Tauri 2.0 applications
 
@@ -185,6 +185,35 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
 ## Current State (2026-06-20)
+
+### v0.8.5 — docs-honesty/correctness pass + `victauri check` tool-count fix
+
+A "fix all known issues before release" pass. No public Rust API change; ships the unreleased
+`victauri check` tool-count fix from the 0.8.4 cycle plus a thorough documentation correctness +
+honesty sweep (two audit agents, every finding verified against the live code).
+
+- **`victauri check` no longer prints `Tools:  ?`** (on main since the 0.8.4 cycle, first *published*
+  in 0.8.5). `get_plugin_info` reports the count nested at `tools.total`, but `cmd_check` read a flat
+  `tool_count` / bare-numeric `tools` — both miss. Extracted a tested `parse_tool_count` (reads
+  `tools.total`, legacy shapes as fallbacks); 2 unit tests.
+- **Documentation correctness (mdbook examples aren't doctested, so they had drifted).** Fixed
+  copy-paste-**panicking** examples (`detect_ghost_commands` results indexed by non-existent keys
+  `ghost_commands`/`ghosts` → `as_array().unwrap()` panics; corrected to `confirmed_ghosts` in README +
+  `testing.md` + `testing-tauri-apps.md`) and **won't-compile** examples: `eval_js` REST param
+  `expression`→`code`; the standalone `assert_json_*` helpers are SYNC and take `&Value` (were shown as
+  awaited client methods); `assert_windows_exist()` takes no args; `assert_dom_complete_under` takes a
+  `Duration`; `smoke_test()`/`smoke_test_with_config(cfg)` arity + `SmokeConfig.max_dom_complete_ms`
+  (not `max_load_ms`) + `SmokeReport::passed_count()/total_count()` (not `.passed/.total`);
+  `client.checkpoint`/`events_between`/`eval_js_in`/`register_command` don't exist (use the `recording`
+  tool / `dom_snapshot_for` / `webview_label` / `.commands(&[…])`); every `.build()` returns a `Result`
+  (snippets now `.unwrap()`); `tools-reference` `query_db`/`check_ipc_integrity` return-key lists
+  corrected.
+- **Public-claim honesty.** "the IPC history has no `eval_js` equivalent" was false (the IPC log is
+  derived from the page's `fetch` traffic) → reframed (db + registry are the AppHandle-only items; the
+  IPC log shares the webview's fate). "a CDP-class tool can't attach at all" softened to the accurate
+  "no Chrome DevTools Protocol surface" (WKWebView/WebKitGTK have their own inspector protocols). The
+  registry-enumeration claim now notes it covers the `#[inspectable]` subset + IPC-log mining.
+  (Supersedes the stale PR #17 honesty pass.)
 
 ### v0.8.4 — CLI↔plugin version-skew compat + in-the-wild DX fixes
 

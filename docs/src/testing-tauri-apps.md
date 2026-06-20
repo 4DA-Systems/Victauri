@@ -254,7 +254,7 @@ e2e_test!(ipc_verification, |client| async move {
 
     // Find ghost commands — frontend calls with no backend handler
     let ghosts = client.detect_ghost_commands().await.unwrap();
-    assert!(ghosts["ghosts"].as_array().unwrap().is_empty(),
+    assert!(ghosts["confirmed_ghosts"].as_array().unwrap().is_empty(),
         "found ghost commands: {:?}", ghosts);
 
     // Check command registry
