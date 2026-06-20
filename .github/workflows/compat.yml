@@ -63,14 +63,16 @@ jobs:
           xvfb: "true"
 
       # Some third-party apps pull native crates beyond the base Tauri/WebKit set.
-      # NoteGen depends on PipeWire bindings (`libspa-sys`, built via pkg-config +
-      # bindgen) for audio capture; provide the dev headers + libclang so it compiles.
+      # NoteGen depends on a screen-capture stack (xcap -> pipewire/gbm/drm/egl/wayland)
+      # plus PipeWire bindings (libspa-sys, built via pkg-config + bindgen). Provide the
+      # dev headers + libclang so it compiles and links.
       - name: Install extra per-app native deps
         if: steps.gate.outputs.run == 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libpipewire-0.3-dev libclang-dev clang
+            libpipewire-0.3-dev libclang-dev clang \
+            libgbm-dev libdrm-dev libegl1-mesa-dev libwayland-dev libxcb1-dev
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
         if: steps.gate.outputs.run == 'true'
