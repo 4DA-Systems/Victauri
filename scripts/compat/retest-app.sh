@@ -178,7 +178,11 @@ emit "$checks" "$passed" "$failed"
 # WebKit warnings) so a "bridge not responding" failure is diagnosable from the job log
 # alone — the app.log artifact is only uploaded on a clean exit.
 if [ "${failed:-1}" -ne 0 ] || [ "${checks:-0}" -eq 0 ]; then
-  echo "--- app.log (last 80 lines — why the webview/page misbehaved) ---"
-  tail -80 "$work/app.log" 2>/dev/null || echo "(no app.log)"
+  echo "--- app.log: load-phase errors (webview console / WebKit / WASM / 404) ---"
+  grep -aiE "error|fail|load|webkit|console|wasm|exception|refused|404|unable|cannot|undefined is not|module" \
+    "$work/app.log" 2>/dev/null | grep -avE "victauri_plugin|axum::serve|REST tool|connection .* accepted" \
+    | head -40 || echo "(no matching lines)"
+  echo "--- app.log (last 60 lines) ---"
+  tail -60 "$work/app.log" 2>/dev/null || echo "(no app.log)"
   exit 1
 fi
