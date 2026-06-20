@@ -2,6 +2,12 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.8.5 (2026-06-20)
+
+- Version-synced with the Victauri 0.8.5 release (pre-publish adversarial audit hardening
+  and release metadata fixes). No extension runtime code changes; the extension talks to
+  the embedded server, which carries the fixes.
+
 ## 0.8.4 (2026-06-20)
 
 - Version-synced with the Victauri 0.8.4 release (CLI↔plugin version-skew compatibility + in-the-wild
