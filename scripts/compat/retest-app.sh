@@ -77,10 +77,19 @@ if ! grep -q 'victauri-plugin' "$td/Cargo.toml"; then
 fi
 
 # 2b. .plugin(victauri_plugin::init()) right after the Tauri builder is created.
-builder_file=$(grep -rlE 'tauri::Builder::(default|new)\(\)' "$td/src" | head -1)
-[ -n "$builder_file" ] || die "could not find 'tauri::Builder::default()' under $tauri_dir/src to inject the plugin"
+# Match BOTH the fully-qualified `tauri::Builder::default()` and the very common bare
+# `Builder::default()` (after `use tauri::Builder;`), while NOT matching plugin builders
+# like `tauri_plugin_sql::Builder::default()` — the negative look-behind `(?<![\w:])`
+# excludes anything preceded by a module path (`x::Builder`), and the first alternative
+# re-allows the explicit `tauri::Builder`.
+builder_re='(\btauri::Builder::(?:default|new)\(\)|(?<![\w:])Builder::(?:default|new)\(\))'
+builder_file=""
+while IFS= read -r f; do
+  if perl -0ne 'exit(/'"$builder_re"'/ ? 0 : 1)' "$f"; then builder_file="$f"; break; fi
+done < <(grep -rlE 'Builder::(default|new)\(\)' "$td/src" 2>/dev/null)
+[ -n "$builder_file" ] || die "could not find the Tauri builder (tauri::Builder::default() or a bare Builder::default()) under $tauri_dir/src to inject the plugin"
 if ! grep -q 'victauri_plugin::init' "$builder_file"; then
-  perl -0pi -e 's/(tauri::Builder::(?:default|new)\(\))/$1\n        .plugin(victauri_plugin::init())/' "$builder_file"
+  perl -0pi -e 's/'"$builder_re"'/$1\n        .plugin(victauri_plugin::init())/' "$builder_file"
 fi
 echo "injected into: ${builder_file#"$app_dir/"}"
 
