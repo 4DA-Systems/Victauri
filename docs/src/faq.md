@@ -41,7 +41,7 @@ Two ways that matter, and we'll be precise because the naive "it sees the DOM, w
 
 Because the database, registry, and native-process tools go through `AppHandle` and not the webview, they keep working even when the webview's JS bridge is down — exactly when an `eval_js`-dependent tool gets nothing. (The IPC log is the exception: it is bridge-derived, so it needs a live webview.)
 
-**The honest one-liner:** browser tools can *poke* a Tauri backend; only Victauri can *read* it safely — read-only, cross-platform, and independent of the webview.
+**The honest one-liner:** browser tools can *poke* a Tauri backend; only Victauri can *read* it safely — read-only introspection, cross-platform, and independent of the webview. (Driving *writes* is `invoke_command`, which any JS-eval tool can also reach — that's not the differentiator; safe reading is.)
 
 ### How is this different from Tauri's built-in testing?
 

@@ -96,17 +96,17 @@ pre-planted file or symlink at its path is rejected rather than written through.
 
 ```rust
 // Auth ON by default (auto-generated UUID token, auto-discovered by clients)
-VictauriBuilder::new().build()
+VictauriBuilder::new().build().unwrap()
 
 // Fixed token
 VictauriBuilder::new()
     .auth_token("my-secret-token")
-    .build()
+    .build().unwrap()
 
 // Opt OUT of auth (you accept that any local process can connect)
 VictauriBuilder::new()
     .auth_disabled()
-    .build()
+    .build().unwrap()
 
 // Environment variable (overrides the auto-generated token with a fixed value)
 // VICTAURI_AUTH_TOKEN=my-token
@@ -147,17 +147,17 @@ use victauri_plugin::PrivacyProfile;
 // Read-only: agent can observe but not mutate
 VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::Observe)
-    .build()
+    .build().unwrap()
 
 // Testing: can interact and record, but no arbitrary code execution
 VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::Test)
-    .build()
+    .build().unwrap()
 
 // Full control (default)
 VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::FullControl)
-    .build()
+    .build().unwrap()
 ```
 
 #### Observe Profile Disables:
@@ -183,12 +183,12 @@ Control which Tauri commands can be invoked:
 // Allowlist: only these commands can be called
 VictauriBuilder::new()
     .command_allowlist(&["get_settings", "get_status"])
-    .build()
+    .build().unwrap()
 
 // Blocklist: these commands are forbidden
 VictauriBuilder::new()
     .command_blocklist(&["delete_data", "admin_reset"])
-    .build()
+    .build().unwrap()
 ```
 
 ### Tool Disabling
@@ -198,7 +198,7 @@ Disable individual MCP tools:
 ```rust
 VictauriBuilder::new()
     .disable_tools(&["eval_js", "invoke_command", "screenshot"])
-    .build()
+    .build().unwrap()
 ```
 
 Disabled tools:
@@ -215,7 +215,7 @@ VictauriBuilder::new()
     .enable_redaction()
     .add_redaction_pattern(r"sk-[a-zA-Z0-9]{32,}")  // OpenAI keys
     .add_redaction_pattern(r"ghp_[a-zA-Z0-9]{36}")   // GitHub tokens
-    .build()
+    .build().unwrap()
 ```
 
 Built-in patterns (when redaction is enabled):
@@ -225,6 +225,14 @@ Built-in patterns (when redaction is enabled):
 - Common secret key formats
 
 Redaction is applied as a post-processing step to all tool output, regardless of which tool generated it.
+
+> **Redaction is a best-effort lint, not a security boundary.** It runs regex/JSON-key passes over
+> the *serialized* output, so a determined caller can defeat it: splitting a secret across
+> `query_db` cells/rows (`SELECT substr(secret,1,20), substr(secret,21)`), storing it as a BLOB
+> (returned base64-encoded) or an integer, or any encoding the patterns don't anticipate. Treat it
+> as a guard against *accidental* disclosure in shared transcripts — not as a control that contains
+> a hostile or prompt-injected client. The real boundary is auth + the privacy profile + not
+> pointing the tools at secrets you don't want an authorized local client to read.
 
 ## Origin Guard
 
@@ -268,7 +276,7 @@ All HTTP responses include security headers:
 
 For typical development (auth on by default — token auto-generated and auto-discovered):
 ```rust
-VictauriBuilder::new().build()
+VictauriBuilder::new().build().unwrap()
 ```
 
 For CI/automated testing:
@@ -276,7 +284,7 @@ For CI/automated testing:
 // Fixed token from environment
 VictauriBuilder::new()
     .auth_token(std::env::var("CI_VICTAURI_TOKEN").unwrap())
-    .build()
+    .build().unwrap()
 ```
 
 For shared development environments:
@@ -288,7 +296,7 @@ VictauriBuilder::new()
     .command_blocklist(&["dangerous_admin_command"])
     // Protect localStorage keys your app trusts for auth/role/tier decisions
     .storage_key_blocklist(&["auth", "role", "license_tier"])
-    .build()
+    .build().unwrap()
 ```
 
 ## Untrusted Content & Prompt Injection
