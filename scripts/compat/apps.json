@@ -6,7 +6,7 @@
     "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: the pnpm apps pin pnpm 10.15.0 via corepack. NOTE (2026-06-17): do NOT pass pnpm's dangerouslyAllowAllBuilds config flag -- current pnpm rejects it with ERR_PNPM_CONFIG_CONFLICT_BUILT_DEPENDENCIES when the app also sets neverBuiltDependencies. It is unnecessary for these vite frontends (esbuild ships prebuilt binaries with no build script), so it was removed from all commands.",
     "These build commands are validated against the pinned ref; bump tag+ref+commands together.",
     "REMOVED 2026-06-17: 'surrealist' and 'lettura' were pinned at Tauri-1 release tags (v1.11.8 / v0.1.22) and could never host Victauri. Lettura migrated to Tauri 2 on its master branch (apps/desktop monorepo) and is repinned to a master commit below. Surrealist is Tauri 2 on main but its frontend requires a bespoke Rust->wasm embed toolchain (wasm32 target + wasm-bindgen CLI + clang) the routine compat harness/CI does not provision -- it is a manual-verification special case, intentionally not in the automated suite.",
-    "REPLACED 2026-06-20: 'duckling' (l1xnan/Duckling v0.0.50) was swapped for 'note-gen' (codexu/note-gen note-gen-v0.29.2). Duckling builds and launches but its webview never becomes eval-able under the headless software-GL WebKitGTK CI environment -- it ships a ~6.5 MB JS bundle + a ~2.4 MB tree-sitter SQL WASM that the software renderer cannot bring to a responsive state (the smoke battery's bridge-dependent checks all time out with 'bridge not responding'; no load error is logged, the page is simply wedged). This is a CI-environment limitation, not a Victauri incompatibility -- Duckling works under Windows WebView2 (Chromium). A replacement candidate must render a light-enough shell headless. EcoPaste (ayangweb/EcoPaste) is a popular React/Vite clipboard manager; its windows start `visible:false` (tray-first), so the retest harness now SHOWS every window via Victauri's backend `window manage show` before introspecting (works even before the webview bridge responds). Avoid heavy WASM editors (Duckling) and native screen-capture/audio stacks (NoteGen pulled pipewire/gbm/drm/egl and still would not bring up its embedded server under headless software-GL WebKitGTK)."
+    "REPLACED 2026-06-20: 'duckling' (l1xnan/Duckling v0.0.50) was swapped for 'note-gen' (codexu/note-gen note-gen-v0.29.2). Duckling builds and launches but its webview never becomes eval-able under the headless software-GL WebKitGTK CI environment -- it ships a ~6.5 MB JS bundle + a ~2.4 MB tree-sitter SQL WASM that the software renderer cannot bring to a responsive state (the smoke battery's bridge-dependent checks all time out with 'bridge not responding'; no load error is logged, the page is simply wedged). This is a CI-environment limitation, not a Victauri incompatibility -- Duckling works under Windows WebView2 (Chromium). A replacement candidate must render a light-enough shell headless. Open Video Downloader (jely2002/youtube-dl-gui) is a popular Vue 3 / Vite app with no heavy native crates and no sidecars; like many Tauri apps it creates its window `visible:false` and shows it once the frontend mounts, so the retest harness SHOWS every window via Victauri's backend `window manage show` before introspecting (works even before the webview bridge responds; harmless for already-visible apps). REJECTED candidates and why (all headless-CI limits, not Victauri bugs): Duckling (6.5 MB JS + 2.4 MB tree-sitter WASM never goes responsive under software-GL WebKitGTK); NoteGen (heavy screen-capture app -- needed pipewire/gbm/drm/egl to even build, then its embedded server would not come up headless); EcoPaste (tray clipboard manager whose hidden webview did not become eval-able even when force-shown). The viable profile is a LIGHT, visible-or-shown-on-ready Vite/Nuxt SPA with no screen-capture/audio/editor native deps."
   ],
   "apps": [
     {
@@ -32,15 +32,15 @@
       "tag": "v0.15.0"
     },
     {
-      "key": "ecopaste",
-      "name": "EcoPaste",
-      "framework": "React / Vite",
-      "repo": "https://github.com/ayangweb/EcoPaste.git",
-      "ref": "bed14faecace4ea452132cd09928ea974778d4a1",
-      "package_manager": "pnpm",
-      "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile && pnpm build",
+      "key": "youtube-dl-gui",
+      "name": "Open Video Downloader",
+      "framework": "Vue 3 / Vite",
+      "repo": "https://github.com/jely2002/youtube-dl-gui.git",
+      "ref": "c7b06e1e7d17f9bcae2e050aa8494623bee04241",
+      "package_manager": "npm",
+      "frontend_build": "npm install && npm run build",
       "tauri_dir": "src-tauri",
-      "tag": "v0.5.0"
+      "tag": "app-v3.2.0"
     },
     {
       "key": "lettura",
