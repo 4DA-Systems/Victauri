@@ -115,7 +115,14 @@ echo "--- cargo build (debug) ---"
 stage="build"
 build_log="$work/build.json"
 ( cd "$td" && cargo build --message-format=json ) > "$build_log" 2>"$work/build.err" || {
-  tail -40 "$work/build.err"; die "cargo build failed"
+  # The actual rustc errors are JSON compiler-messages on stdout (build_log); stderr
+  # (build.err) only carries the terse "could not compile" summary. Render the real
+  # errors so a compile failure is diagnosable from the job log.
+  echo "--- cargo errors (rendered) ---"
+  jq -rs '.[] | select(.reason=="compiler-message" and .message.level=="error") | .message.rendered' "$build_log" 2>/dev/null | head -80
+  echo "--- cargo stderr (tail) ---"
+  tail -20 "$work/build.err"
+  die "cargo build failed"
 }
 bin=$(jq -rs '[.[] | select(.reason=="compiler-artifact" and .executable!=null) | .executable] | last' "$build_log")
 [ -n "$bin" ] && [ -x "$bin" ] || die "no executable produced by cargo build"
