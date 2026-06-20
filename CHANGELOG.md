@@ -44,6 +44,27 @@ every finding verified against the live code). No public Rust API change.
   (those engines have their own, separate remote-inspector protocols). The registry-enumeration claim
   now notes it covers the `#[inspectable]` subset plus IPC-log mining. (Supersedes PR #17.)
 
+### Security
+
+Pre-publish adversarial-audit hardening (four red-team passes; no Critical/High found; all changes
+internal, no public API or behavior change for normal callers):
+
+- **DNS-rebinding `Host` guard tightened.** `is_localhost_host` rejected a bracketed-IPv6 prefix that
+  smuggled a non-localhost authority (`[::1].evil.com`), and accepted any `:`-suffix without validating
+  it (`localhost:notaport`, `[::1]:garbage`). It now requires the port to parse as a `u16` and matches
+  `localhost` case-insensitively. (Defense-in-depth: the Origin guard already blocked the browser path.)
+- **`/health` is now rate-limited.** It was registered after the rate-limit layer (axum applies a layer
+  only to routes registered before it), so it was un-throttled; it is now covered while staying
+  auth-exempt for liveness probes.
+- **`query_db` absolute-path branch opens the canonical validated path** (it previously opened the
+  caller's literal path — an asymmetry with the relative branch — narrowing a validate/open TOCTOU).
+- **Windows discovery directory: the shared root is ownership-checked before the per-PID directory is
+  created**, mirroring the Unix parent-ownership check — defeating a pre-planted/owned shared-root swap
+  on a multi-user `TEMP`.
+- **Docs/CI honesty + correctness:** redaction reframed as a best-effort lint (not a security boundary);
+  "backend tools are read-only" scoped to the introspection tools (`invoke_command` can mutate); the
+  Open VSX publish step's always-false `if:` fixed; a drifted CI toolchain pin aligned.
+
 ## [0.8.4] - 2026-06-20
 
 CLI↔plugin **version-skew** compatibility fix, driven by an in-the-wild session that drove a live
@@ -1229,7 +1250,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.8.4...HEAD
+[Unreleased]: https://github.com/runyourempire/victauri/compare/v0.8.5...HEAD
+[0.8.5]: https://github.com/runyourempire/victauri/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/runyourempire/victauri/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/runyourempire/victauri/compare/v0.8.2...v0.8.3
 [0.8.2]: https://github.com/runyourempire/victauri/compare/v0.8.1...v0.8.2
