@@ -35,7 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         # Keep in sync with scripts/compat/apps.json (4 Tauri-2 apps). Surrealist was
-        # dropped on the 2026-06-17 re-pin; Duckling was replaced by EcoPaste on
+        # dropped on the 2026-06-17 re-pin; Duckling was replaced by NoteGen on
         # 2026-06-20 (Duckling's heavy WASM editor never loads under headless WebKitGTK).
         # A matrix key not present in apps.json fails by construction.
         app: [kanri, en-croissant, note-gen, lettura]
