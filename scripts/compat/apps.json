@@ -5,7 +5,8 @@
     "Each app is pinned to a stable release tag where one exists (tag + commit SHA), captured 2026-06-03 -- not a moving default-branch HEAD, since HEADs run bleeding-edge, hard-to-build frontends. Exception: an app whose ONLY Tauri-2 code is on its default branch (no Tauri-2 tag yet) is pinned to a specific default-branch COMMIT, noted in 'tag'.",
     "frontend_build runs from the repo root and MUST populate the tauri.conf frontendDist dir BEFORE the debug cargo build (debug binaries embed frontendDist; no dev server). package_manager: the pnpm apps pin pnpm 10.15.0 via corepack. NOTE (2026-06-17): do NOT pass pnpm's dangerouslyAllowAllBuilds config flag -- current pnpm rejects it with ERR_PNPM_CONFIG_CONFLICT_BUILT_DEPENDENCIES when the app also sets neverBuiltDependencies. It is unnecessary for these vite frontends (esbuild ships prebuilt binaries with no build script), so it was removed from all commands.",
     "These build commands are validated against the pinned ref; bump tag+ref+commands together.",
-    "REMOVED 2026-06-17: 'surrealist' and 'lettura' were pinned at Tauri-1 release tags (v1.11.8 / v0.1.22) and could never host Victauri. Lettura migrated to Tauri 2 on its master branch (apps/desktop monorepo) and is repinned to a master commit below. Surrealist is Tauri 2 on main but its frontend requires a bespoke Rust->wasm embed toolchain (wasm32 target + wasm-bindgen CLI + clang) the routine compat harness/CI does not provision -- it is a manual-verification special case, intentionally not in the automated suite."
+    "REMOVED 2026-06-17: 'surrealist' and 'lettura' were pinned at Tauri-1 release tags (v1.11.8 / v0.1.22) and could never host Victauri. Lettura migrated to Tauri 2 on its master branch (apps/desktop monorepo) and is repinned to a master commit below. Surrealist is Tauri 2 on main but its frontend requires a bespoke Rust->wasm embed toolchain (wasm32 target + wasm-bindgen CLI + clang) the routine compat harness/CI does not provision -- it is a manual-verification special case, intentionally not in the automated suite.",
+    "REPLACED 2026-06-20: 'duckling' (l1xnan/Duckling v0.0.50) was swapped for 'ecopaste' (ayangweb/EcoPaste v0.5.0). Duckling builds and launches but its webview never becomes eval-able under the headless software-GL WebKitGTK CI environment -- it ships a ~6.5 MB JS bundle + a ~2.4 MB tree-sitter SQL WASM that the software renderer cannot bring to a responsive state (the smoke battery's bridge-dependent checks all time out with 'bridge not responding'; no load error is logged, the page is simply wedged). This is a CI-environment limitation, not a Victauri incompatibility -- Duckling works under Windows WebView2 (Chromium). EcoPaste is a lighter React/Vite clipboard manager that loads cleanly headless."
   ],
   "apps": [
     {
@@ -31,15 +32,15 @@
       "tag": "v0.15.0"
     },
     {
-      "key": "duckling",
-      "name": "Duckling",
-      "framework": "React 19 / Jotai / Vite",
-      "repo": "https://github.com/l1xnan/Duckling.git",
-      "ref": "edb6c1b4af9b01818634c1e179c72820b86a3782",
+      "key": "ecopaste",
+      "name": "EcoPaste",
+      "framework": "React / Vite",
+      "repo": "https://github.com/ayangweb/EcoPaste.git",
+      "ref": "bed14faecace4ea452132cd09928ea974778d4a1",
       "package_manager": "pnpm",
       "frontend_build": "corepack prepare pnpm@10.15.0 --activate && pnpm install --no-frozen-lockfile && pnpm build",
       "tauri_dir": "src-tauri",
-      "tag": "v0.0.50"
+      "tag": "v0.5.0"
     },
     {
       "key": "lettura",
