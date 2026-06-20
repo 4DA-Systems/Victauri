@@ -35,10 +35,10 @@ jobs:
       fail-fast: false
       matrix:
         # Keep in sync with scripts/compat/apps.json (4 Tauri-2 apps). Surrealist was
-        # dropped on the 2026-06-17 re-pin; Duckling was replaced by NoteGen on
+        # dropped on the 2026-06-17 re-pin; Duckling was replaced by EcoPaste on
         # 2026-06-20 (Duckling's heavy WASM editor never loads under headless WebKitGTK).
         # A matrix key not present in apps.json fails by construction.
-        app: [kanri, en-croissant, note-gen, lettura]
+        app: [kanri, en-croissant, ecopaste, lettura]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -61,18 +61,6 @@ jobs:
         uses: ./.github/actions/linux-deps
         with:
           xvfb: "true"
-
-      # Some third-party apps pull native crates beyond the base Tauri/WebKit set.
-      # NoteGen depends on a screen-capture stack (xcap -> pipewire/gbm/drm/egl/wayland)
-      # plus PipeWire bindings (libspa-sys, built via pkg-config + bindgen). Provide the
-      # dev headers + libclang so it compiles and links.
-      - name: Install extra per-app native deps
-        if: steps.gate.outputs.run == 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libpipewire-0.3-dev libclang-dev clang \
-            libgbm-dev libdrm-dev libegl1-mesa-dev libwayland-dev libxcb1-dev
 
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
         if: steps.gate.outputs.run == 'true'

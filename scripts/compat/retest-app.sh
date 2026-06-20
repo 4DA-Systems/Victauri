@@ -162,6 +162,22 @@ VICTAURI_TOKEN="$(cat "$(ls -t "${TMPDIR:-/tmp}"/victauri/*/token /tmp/victauri/
 export VICTAURI_TOKEN
 if [ -n "$VICTAURI_TOKEN" ]; then echo "discovered auth token (${#VICTAURI_TOKEN} chars)"; else echo "WARNING: no auth token found — tool calls may 401"; fi
 
+# Show every window before introspecting. Tray-first apps (clipboard managers, menubar
+# utilities) declare their window with `visible: false` and only show it on a hotkey, so
+# the smoke battery would otherwise find no visible, eval-able webview. Victauri's
+# `window manage show` runs through the backend AppHandle (`window.show()`), so it works
+# even before the webview bridge is responding. Harmless for already-visible apps.
+echo "--- show windows (unhide tray-first apps) ---"
+win_labels=$(curl -sf -X POST "$BASE/api/tools/window" \
+  -H 'content-type: application/json' -H "Authorization: Bearer $VICTAURI_TOKEN" \
+  --data-binary '{"action":"list"}' 2>/dev/null | grep -oE '"label":"[^"]+"' | sed 's/.*:"//; s/"$//' | sort -u)
+for L in $win_labels main; do
+  curl -sf -X POST "$BASE/api/tools/window" \
+    -H 'content-type: application/json' -H "Authorization: Bearer $VICTAURI_TOKEN" \
+    --data-binary "{\"action\":\"manage\",\"manage_action\":\"show\",\"label\":\"$L\"}" >/dev/null 2>&1 || true
+done
+echo "requested show for: ${win_labels:-<none listed>} main"
+
 # Wait for the webview to be eval-able (cold WebView/WebKit init can lag the server).
 webview_ready=0
 for _ in $(seq 1 45); do
