@@ -34,10 +34,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Keep in sync with scripts/compat/apps.json (4 Tauri-2 apps; Surrealist was
-        # dropped on the 2026-06-17 re-pin — it is no longer in apps.json, so a matrix
-        # entry for it would fail by construction).
-        app: [kanri, en-croissant, duckling, lettura]
+        # Keep in sync with scripts/compat/apps.json (3 Tauri-2 apps). Surrealist was
+        # dropped on the 2026-06-17 re-pin; Duckling was removed 2026-06-20 (its heavy WASM
+        # editor never becomes responsive under headless software-GL WebKitGTK). See the
+        # apps.json _comment for the exhaustive 4th-app search and per-candidate walls.
+        # A matrix key not present in apps.json fails by construction.
+        app: [kanri, en-croissant, lettura]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 

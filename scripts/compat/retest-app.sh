@@ -77,10 +77,19 @@ if ! grep -q 'victauri-plugin' "$td/Cargo.toml"; then
 fi
 
 # 2b. .plugin(victauri_plugin::init()) right after the Tauri builder is created.
-builder_file=$(grep -rlE 'tauri::Builder::(default|new)\(\)' "$td/src" | head -1)
-[ -n "$builder_file" ] || die "could not find 'tauri::Builder::default()' under $tauri_dir/src to inject the plugin"
+# Match BOTH the fully-qualified `tauri::Builder::default()` and the very common bare
+# `Builder::default()` (after `use tauri::Builder;`), while NOT matching plugin builders
+# like `tauri_plugin_sql::Builder::default()` — the negative look-behind `(?<![\w:])`
+# excludes anything preceded by a module path (`x::Builder`), and the first alternative
+# re-allows the explicit `tauri::Builder`.
+builder_re='(\btauri::Builder::(?:default|new)\(\)|(?<![\w:])Builder::(?:default|new)\(\))'
+builder_file=""
+while IFS= read -r f; do
+  if perl -0ne 'exit(/'"$builder_re"'/ ? 0 : 1)' "$f"; then builder_file="$f"; break; fi
+done < <(grep -rlE 'Builder::(default|new)\(\)' "$td/src" 2>/dev/null)
+[ -n "$builder_file" ] || die "could not find the Tauri builder (tauri::Builder::default() or a bare Builder::default()) under $tauri_dir/src to inject the plugin"
 if ! grep -q 'victauri_plugin::init' "$builder_file"; then
-  perl -0pi -e 's/(tauri::Builder::(?:default|new)\(\))/$1\n        .plugin(victauri_plugin::init())/' "$builder_file"
+  perl -0pi -e 's/'"$builder_re"'/$1\n        .plugin(victauri_plugin::init())/' "$builder_file"
 fi
 echo "injected into: ${builder_file#"$app_dir/"}"
 
@@ -106,7 +115,14 @@ echo "--- cargo build (debug) ---"
 stage="build"
 build_log="$work/build.json"
 ( cd "$td" && cargo build --message-format=json ) > "$build_log" 2>"$work/build.err" || {
-  tail -40 "$work/build.err"; die "cargo build failed"
+  # The actual rustc errors are JSON compiler-messages on stdout (build_log); stderr
+  # (build.err) only carries the terse "could not compile" summary. Render the real
+  # errors so a compile failure is diagnosable from the job log.
+  echo "--- cargo errors (rendered) ---"
+  jq -rs '.[] | select(.reason=="compiler-message" and .message.level=="error") | .message.rendered' "$build_log" 2>/dev/null | head -80
+  echo "--- cargo stderr (tail) ---"
+  tail -20 "$work/build.err"
+  die "cargo build failed"
 }
 bin=$(jq -rs '[.[] | select(.reason=="compiler-artifact" and .executable!=null) | .executable] | last' "$build_log")
 [ -n "$bin" ] && [ -x "$bin" ] || die "no executable produced by cargo build"
@@ -146,13 +162,38 @@ VICTAURI_TOKEN="$(cat "$(ls -t "${TMPDIR:-/tmp}"/victauri/*/token /tmp/victauri/
 export VICTAURI_TOKEN
 if [ -n "$VICTAURI_TOKEN" ]; then echo "discovered auth token (${#VICTAURI_TOKEN} chars)"; else echo "WARNING: no auth token found — tool calls may 401"; fi
 
-# Wait for the webview to be eval-able (cold WebView/WebKit init can lag the server).
-for _ in $(seq 1 45); do
-  curl -sf -X POST "$BASE/api/tools/eval_js" \
+# Show every window before introspecting. Tray-first apps (clipboard managers, menubar
+# utilities) declare their window with `visible: false` and only show it on a hotkey, so
+# the smoke battery would otherwise find no visible, eval-able webview. Victauri's
+# `window manage show` runs through the backend AppHandle (`window.show()`), so it works
+# even before the webview bridge is responding. Harmless for already-visible apps.
+echo "--- show windows (unhide tray-first apps) ---"
+win_labels=$(curl -sf -X POST "$BASE/api/tools/window" \
+  -H 'content-type: application/json' -H "Authorization: Bearer $VICTAURI_TOKEN" \
+  --data-binary '{"action":"list"}' 2>/dev/null | grep -oE '"label":"[^"]+"' | sed 's/.*:"//; s/"$//' | sort -u)
+for L in $win_labels main; do
+  curl -sf -X POST "$BASE/api/tools/window" \
     -H 'content-type: application/json' -H "Authorization: Bearer $VICTAURI_TOKEN" \
-    --data-binary '{"code":"return 1"}' 2>/dev/null | grep -q '"result"' && break
+    --data-binary "{\"action\":\"manage\",\"manage_action\":\"show\",\"label\":\"$L\"}" >/dev/null 2>&1 || true
+done
+echo "requested show for: ${win_labels:-<none listed>} main"
+
+# Wait for the webview to be eval-able (cold WebView/WebKit init can lag the server).
+webview_ready=0
+for _ in $(seq 1 45); do
+  if curl -sf -X POST "$BASE/api/tools/eval_js" \
+    -H 'content-type: application/json' -H "Authorization: Bearer $VICTAURI_TOKEN" \
+    --data-binary '{"code":"return 1"}' 2>/dev/null | grep -q '"result"'; then
+    webview_ready=1
+    break
+  fi
   sleep 2
 done
+if [ "$webview_ready" = 1 ]; then
+  echo "webview eval-able"
+else
+  echo "WARNING: webview never became eval-able in ~90s — the page likely failed to load"
+fi
 
 # ── 6. Run the app-agnostic smoke battery ────────────────────────────────────
 echo "--- smoke battery ---"
@@ -165,4 +206,15 @@ passed=$(jq -r '.passed' <<<"$summary" 2>/dev/null || echo 0)
 failed=$(jq -r '.failed' <<<"$summary" 2>/dev/null || echo 0)
 
 emit "$checks" "$passed" "$failed"
-[ "${failed:-1}" -eq 0 ] && [ "${checks:-0}" -gt 0 ]
+# On any smoke failure dump the app's own stdout/stderr (webview console, load errors,
+# WebKit warnings) so a "bridge not responding" failure is diagnosable from the job log
+# alone — the app.log artifact is only uploaded on a clean exit.
+if [ "${failed:-1}" -ne 0 ] || [ "${checks:-0}" -eq 0 ]; then
+  echo "--- app.log: load-phase errors (webview console / WebKit / WASM / 404) ---"
+  grep -aiE "error|fail|load|webkit|console|wasm|exception|refused|404|unable|cannot|undefined is not|module" \
+    "$work/app.log" 2>/dev/null | grep -avE "victauri_plugin|axum::serve|REST tool|connection .* accepted" \
+    | head -40 || echo "(no matching lines)"
+  echo "--- app.log (last 60 lines) ---"
+  tail -60 "$work/app.log" 2>/dev/null || echo "(no app.log)"
+  exit 1
+fi
