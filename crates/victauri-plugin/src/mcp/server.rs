@@ -741,6 +741,45 @@ fn restrict_to_current_user(path: &std::path::Path) -> bool {
     icacls_restrict_to_current_user(path)
 }
 
+#[cfg(windows)]
+fn ensure_windows_private_dir(path: &std::path::Path, remove_on_acl_failure: bool) -> bool {
+    let mut created = false;
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if !meta.file_type().is_dir() {
+                return false;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if std::fs::create_dir(path).is_err() {
+                return false;
+            }
+            created = true;
+        }
+        Err(_) => return false,
+    }
+
+    if !dir_owned_by_current_user(path) {
+        tracing::warn!(
+            "refusing discovery directory not owned by current user: {}",
+            path.display()
+        );
+        if created || remove_on_acl_failure {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        return false;
+    }
+
+    if !restrict_to_current_user(path) {
+        if created || remove_on_acl_failure {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        return false;
+    }
+
+    true
+}
+
 /// Trust the discovery path only when both the shared root and PID directory are owned
 /// by this process's effective user. Refuse planted paths instead of deleting them.
 fn ensure_private_dir(dir: &std::path::Path) -> bool {
@@ -754,30 +793,29 @@ fn ensure_private_dir(dir: &std::path::Path) -> bool {
             return false;
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        if std::fs::create_dir_all(dir).is_err() {
+        let Some(root) = dir.parent() else {
+            return false;
+        };
+        // Refuse an untrusted shared root BEFORE creating the PID directory. Otherwise an
+        // attacker-controlled root could rename/swap the child directory between our checks.
+        if !ensure_windows_private_dir(root, false) {
+            tracing::warn!("refusing untrusted discovery root {}", root.display());
             return false;
         }
-        #[cfg(windows)]
-        {
-            // Refuse a directory we don't own — on a shared TEMP an attacker who pre-created
-            // our PID dir would be its owner. Mirrors the Unix uid check; defeats PID-preplant
-            // before any token is written/trusted. (A dir WE just created we own, so this
-            // passes for the normal path.)
-            if !dir_owned_by_current_user(dir) {
-                tracing::warn!(
-                    "refusing discovery dir not owned by current user: {}",
-                    dir.display()
-                );
-                let _ = std::fs::remove_dir_all(dir);
-                return false;
-            }
-            if !restrict_to_current_user(dir) {
-                let _ = std::fs::remove_dir_all(dir);
-                return false;
-            }
+        // Refuse a directory we don't own — on a shared TEMP an attacker who pre-created
+        // our PID dir would be its owner. Mirrors the Unix uid check; defeats PID-preplant
+        // before any token is written/trusted. (A dir WE just created we own, so this
+        // passes for the normal path.)
+        if !ensure_windows_private_dir(dir, true) {
+            tracing::warn!("refusing untrusted discovery path {}", dir.display());
+            return false;
         }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
     }
     true
 }
@@ -1245,6 +1283,32 @@ mod tests {
         assert_eq!(meta["product_name"], "Example");
         remove_port_file();
         assert!(!dir.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_dir_restricts_shared_root_and_pid_dir() {
+        let base = std::env::temp_dir()
+            .join("victauri_private_root_test")
+            .join(format!("p{}", std::process::id()));
+        let dir = base.join("victauri").join("12345");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).expect("create parent test dir");
+
+        assert!(
+            ensure_private_dir(&dir),
+            "a fresh discovery root and pid dir owned by this user should be accepted"
+        );
+        assert!(
+            dir_owned_by_current_user(&base.join("victauri")),
+            "shared discovery root must be owned by this process user"
+        );
+        assert!(
+            dir_owned_by_current_user(&dir),
+            "pid discovery dir must be owned by this process user"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

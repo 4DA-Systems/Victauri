@@ -147,17 +147,26 @@ pub fn is_localhost_host(host: &str) -> bool {
         // `:port` suffix — anything else (e.g. `[::1].evil.com`, `[::1]@x`) is rejected so a
         // bracket-prefixed host can't smuggle a non-localhost authority past the guard.
         match rest.split_once(']') {
-            Some((inner, after)) if after.is_empty() || after.starts_with(':') => inner,
+            Some((inner, "")) => inner,
+            Some((inner, after)) if after.strip_prefix(':').is_some_and(valid_port) => inner,
             _ => return false,
         }
     } else if host.contains("::") {
         // Bare IPv6 (no brackets): ::1
         host
     } else {
-        // IPv4 or hostname, strip port: 127.0.0.1:7373 → 127.0.0.1
-        host.split(':').next().unwrap_or(host)
+        // IPv4 or hostname, strip a valid port: 127.0.0.1:7373 → 127.0.0.1.
+        match host.split_once(':') {
+            Some((name, port)) if valid_port(port) => name,
+            Some(_) => return false,
+            None => host,
+        }
     };
-    matches!(host_name, "localhost" | "127.0.0.1" | "::1")
+    host_name.eq_ignore_ascii_case("localhost") || matches!(host_name, "127.0.0.1" | "::1")
+}
+
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.parse::<u16>().is_ok()
 }
 
 // ── Origin validation (cross-origin guard) ───────────────────────────────
@@ -327,7 +336,9 @@ mod tests {
     #[test]
     fn host_allows_localhost() {
         assert!(is_localhost_host("localhost"));
+        assert!(is_localhost_host("LOCALHOST"));
         assert!(is_localhost_host("localhost:7373"));
+        assert!(is_localhost_host("LocalHost:7373"));
     }
 
     #[test]
@@ -365,6 +376,18 @@ mod tests {
         assert!(is_localhost_host("[::1]"));
         assert!(is_localhost_host("[::1]:7373"));
         assert!(is_localhost_host("[127.0.0.1]"));
+    }
+
+    #[test]
+    fn host_blocks_malformed_port_suffixes() {
+        assert!(!is_localhost_host("localhost:notaport"));
+        assert!(!is_localhost_host("localhost:"));
+        assert!(!is_localhost_host("localhost:7373:extra"));
+        assert!(!is_localhost_host("127.0.0.1:notaport"));
+        assert!(!is_localhost_host("[::1]:notaport"));
+        assert!(!is_localhost_host("[::1]:"));
+        assert!(!is_localhost_host("[::1]:7373:extra"));
+        assert!(!is_localhost_host("[::1] :7373"));
     }
 
     // is_allowed_origin
