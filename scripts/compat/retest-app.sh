@@ -147,12 +147,21 @@ export VICTAURI_TOKEN
 if [ -n "$VICTAURI_TOKEN" ]; then echo "discovered auth token (${#VICTAURI_TOKEN} chars)"; else echo "WARNING: no auth token found — tool calls may 401"; fi
 
 # Wait for the webview to be eval-able (cold WebView/WebKit init can lag the server).
+webview_ready=0
 for _ in $(seq 1 45); do
-  curl -sf -X POST "$BASE/api/tools/eval_js" \
+  if curl -sf -X POST "$BASE/api/tools/eval_js" \
     -H 'content-type: application/json' -H "Authorization: Bearer $VICTAURI_TOKEN" \
-    --data-binary '{"code":"return 1"}' 2>/dev/null | grep -q '"result"' && break
+    --data-binary '{"code":"return 1"}' 2>/dev/null | grep -q '"result"'; then
+    webview_ready=1
+    break
+  fi
   sleep 2
 done
+if [ "$webview_ready" = 1 ]; then
+  echo "webview eval-able"
+else
+  echo "WARNING: webview never became eval-able in ~90s — the page likely failed to load"
+fi
 
 # ── 6. Run the app-agnostic smoke battery ────────────────────────────────────
 echo "--- smoke battery ---"
@@ -165,4 +174,11 @@ passed=$(jq -r '.passed' <<<"$summary" 2>/dev/null || echo 0)
 failed=$(jq -r '.failed' <<<"$summary" 2>/dev/null || echo 0)
 
 emit "$checks" "$passed" "$failed"
-[ "${failed:-1}" -eq 0 ] && [ "${checks:-0}" -gt 0 ]
+# On any smoke failure dump the app's own stdout/stderr (webview console, load errors,
+# WebKit warnings) so a "bridge not responding" failure is diagnosable from the job log
+# alone — the app.log artifact is only uploaded on a clean exit.
+if [ "${failed:-1}" -ne 0 ] || [ "${checks:-0}" -eq 0 ]; then
+  echo "--- app.log (last 80 lines — why the webview/page misbehaved) ---"
+  tail -80 "$work/app.log" 2>/dev/null || echo "(no app.log)"
+  exit 1
+fi
