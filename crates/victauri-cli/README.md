@@ -1,6 +1,6 @@
 # victauri-cli
 
-CLI toolkit for [Victauri](https://github.com/runyourempire/victauri) — scaffold tests, diagnose setup, check running apps, record sessions, measure coverage.
+CLI toolkit for [Victauri](https://github.com/4DA-Systems/victauri) — scaffold tests, diagnose setup, check running apps, record sessions, measure coverage.
 
 ## Install
 
@@ -98,4 +98,4 @@ Full API docs: [docs.rs/victauri-cli](https://docs.rs/victauri-cli)
 
 Apache-2.0 -- see [LICENSE](../../LICENSE)
 
-Part of [Victauri](https://github.com/runyourempire/victauri). Built by [4DA Systems](https://4da.ai).
+Part of [Victauri](https://github.com/4DA-Systems/victauri). Built by [4DA Systems](https://4da.ai).

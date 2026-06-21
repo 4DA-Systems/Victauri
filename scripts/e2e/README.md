@@ -5,7 +5,7 @@ app** with the `victauri-plugin` embedded. They hit the dual-protocol REST API
 (`POST /api/tools/{name}`) on `http://127.0.0.1:7373`, so no MCP handshake is
 needed and the scripts stay dependency-light (`curl` + `jq`).
 
-These were built and validated against [4DA](https://github.com/runyourempire)
+These were built and validated against [4DA](https://github.com/4DA-Systems)
 — a real, complex Tauri 2 app (3 windows, 383 IPC commands, a 300 MB SQLite DB,
 heavy network traffic) — which surfaces edge cases that synthetic demo apps do not.
 

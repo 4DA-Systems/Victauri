@@ -72,7 +72,7 @@ same-process introspection that *is* the wedge needs none of that.
 
 **Result: PROVEN GREEN on a real 3-platform matrix** — the `fullstack-proof` job
 runs on `macos-latest`, `ubuntu-latest`, and `windows-latest`. All three green
-(run [26701699830](https://github.com/runyourempire/victauri/actions/runs/26701699830);
+(run [26701699830](https://github.com/4DA-Systems/victauri/actions/runs/26701699830);
 macOS first proven solo on run 26690831417 and green on every run since). The step
 runs under `set -euo pipefail` with a `fail()` that exits non-zero on any missed
 assertion, so green deterministically means: the Tauri app launched, the embedded

@@ -7,7 +7,7 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "https://github.com/runyourempire/victauri"
+    "url": "https://github.com/4DA-Systems/victauri"
   },
   "engines": {
     "vscode": "^1.85.0"
@@ -29,10 +29,10 @@
     "e2e"
   ],
   "bugs": {
-    "url": "https://github.com/runyourempire/victauri/issues"
+    "url": "https://github.com/4DA-Systems/victauri/issues"
   },
-  "homepage": "https://github.com/runyourempire/victauri",
-  "qna": "https://github.com/runyourempire/victauri/discussions",
+  "homepage": "https://github.com/4DA-Systems/victauri",
+  "qna": "https://github.com/4DA-Systems/victauri/discussions",
   "activationEvents": [
     "workspaceContains:**/tauri.conf.json"
   ],

@@ -1,6 +1,6 @@
 # victauri-plugin
 
-The main [Victauri](https://github.com/runyourempire/victauri) crate -- an embedded MCP server that gives AI agents full-stack control of Tauri 2.0 applications.
+The main [Victauri](https://github.com/4DA-Systems/victauri) crate -- an embedded MCP server that gives AI agents full-stack control of Tauri 2.0 applications.
 
 ## Quick Start
 
@@ -110,7 +110,7 @@ victauri_plugin::VictauriBuilder::new()
 - **Rate limiting** -- Token-bucket at 1000 req/sec (default)
 - **Privacy layer** -- Command allowlists/blocklists, tool disabling, regex redaction
 
-See the full [project README](https://github.com/runyourempire/victauri) for architecture details and live test results.
+See the full [project README](https://github.com/4DA-Systems/victauri) for architecture details and live test results.
 
 ## Documentation
 
@@ -120,4 +120,4 @@ Full API docs: [docs.rs/victauri-plugin](https://docs.rs/victauri-plugin)
 
 Apache-2.0 -- see [LICENSE](../../LICENSE)
 
-Part of [Victauri](https://github.com/runyourempire/victauri). Built by [4DA Systems](https://4da.ai).
+Part of [Victauri](https://github.com/4DA-Systems/victauri). Built by [4DA Systems](https://4da.ai).

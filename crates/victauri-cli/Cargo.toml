@@ -9,7 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 keywords = ["tauri", "mcp", "testing", "cli", "scaffold"]
 categories = ["development-tools::testing", "command-line-utilities"]
-homepage = "https://github.com/runyourempire/victauri"
+homepage = "https://github.com/4DA-Systems/victauri"
 documentation = "https://docs.rs/victauri-cli"
 readme = "README.md"
 

@@ -3,7 +3,7 @@
 ## Getting Started
 
 ```bash
-git clone https://github.com/runyourempire/victauri.git
+git clone https://github.com/4DA-Systems/victauri.git
 cd victauri
 cargo build --workspace
 cargo test --workspace

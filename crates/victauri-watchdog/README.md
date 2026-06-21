@@ -1,6 +1,6 @@
 # victauri-watchdog
 
-Lightweight crash-recovery sidecar for the [Victauri](https://github.com/runyourempire/victauri) MCP server.
+Lightweight crash-recovery sidecar for the [Victauri](https://github.com/4DA-Systems/victauri) MCP server.
 
 Since Victauri's MCP server runs inside the Tauri app process, a crash kills the server too. The watchdog runs as a separate process, detects failures, and can trigger recovery.
 
@@ -49,4 +49,4 @@ Full API docs: [docs.rs/victauri-watchdog](https://docs.rs/victauri-watchdog)
 
 Apache-2.0 -- see [LICENSE](../../LICENSE)
 
-Part of [Victauri](https://github.com/runyourempire/victauri). Built by [4DA Systems](https://4da.ai).
+Part of [Victauri](https://github.com/4DA-Systems/victauri). Built by [4DA Systems](https://4da.ai).

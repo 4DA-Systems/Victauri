@@ -1886,7 +1886,7 @@ jobs:
           echo "APP_PID=$!" >> "$GITHUB_ENV"
 
       - name: Victauri smoke tests
-        uses: runyourempire/victauri/.github/actions/victauri-test@v__VICTAURI_VERSION__
+        uses: 4DA-Systems/victauri/.github/actions/victauri-test@v__VICTAURI_VERSION__
         with:
           check: "true"
           victauri-version: "__VICTAURI_VERSION__"
