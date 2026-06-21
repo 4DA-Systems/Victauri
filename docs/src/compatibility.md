@@ -194,7 +194,7 @@ for all windows), builds the frontend and a debug Tauri binary, launches it head
 and runs an app-agnostic smoke battery (webview eval, DOM refs, native memory, window
 list, a11y/perf audits, storage round-trip — 15 checks, validated 15/15 against the
 demo-app). The **Compatibility Retest** GitHub workflow (`.github/workflows/compat.yml`)
-runs it on demand and weekly. See [`scripts/compat/README.md`](https://github.com/runyourempire/victauri/blob/main/scripts/compat/README.md).
+runs it on demand and weekly. See [`scripts/compat/README.md`](https://github.com/4DA-Systems/victauri/blob/main/scripts/compat/README.md).
 
 Note: these third-party apps move fast — pinned tags and per-app build recipes
 (three different package managers; pnpm-version-sensitive workspaces) are maintained

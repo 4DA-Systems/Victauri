@@ -9,7 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 keywords = ["tauri", "mcp", "watchdog", "health-check", "monitoring"]
 categories = ["development-tools::testing"]
-homepage = "https://github.com/runyourempire/victauri"
+homepage = "https://github.com/4DA-Systems/victauri"
 documentation = "https://docs.rs/victauri-watchdog"
 readme = "README.md"
 

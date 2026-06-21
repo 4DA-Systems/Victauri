@@ -1,6 +1,6 @@
 # victauri-macros
 
-Proc macros for [Victauri](https://github.com/runyourempire/victauri) -- auto-instrumentation of Tauri commands for AI agent introspection.
+Proc macros for [Victauri](https://github.com/4DA-Systems/victauri) -- auto-instrumentation of Tauri commands for AI agent introspection.
 
 ## The `#[inspectable]` Macro
 
@@ -42,4 +42,4 @@ Full API docs: [docs.rs/victauri-macros](https://docs.rs/victauri-macros)
 
 Apache-2.0 -- see [LICENSE](../../LICENSE)
 
-Part of [Victauri](https://github.com/runyourempire/victauri). Built by [4DA Systems](https://4da.ai).
+Part of [Victauri](https://github.com/4DA-Systems/victauri). Built by [4DA Systems](https://4da.ai).

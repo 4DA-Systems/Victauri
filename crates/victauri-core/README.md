@@ -1,6 +1,6 @@
 # victauri-core
 
-Shared types and data structures for [Victauri](https://github.com/runyourempire/victauri) -- Verified Introspection & Control for Tauri Applications.
+Shared types and data structures for [Victauri](https://github.com/4DA-Systems/victauri) -- Verified Introspection & Control for Tauri Applications.
 
 This crate has **no Tauri dependency** and can be used standalone for building tools that interact with Victauri's data model.
 
@@ -53,4 +53,4 @@ Full API docs: [docs.rs/victauri-core](https://docs.rs/victauri-core)
 
 Apache-2.0 -- see [LICENSE](../../LICENSE)
 
-Part of [Victauri](https://github.com/runyourempire/victauri). Built by [4DA Systems](https://4da.ai).
+Part of [Victauri](https://github.com/4DA-Systems/victauri). Built by [4DA Systems](https://4da.ai).

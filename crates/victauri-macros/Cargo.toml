@@ -9,7 +9,7 @@ authors.workspace = true
 rust-version.workspace = true
 keywords = ["tauri", "mcp", "proc-macro", "introspection", "instrumentation"]
 categories = ["development-tools::testing", "development-tools::procedural-macro-helpers"]
-homepage = "https://github.com/runyourempire/victauri"
+homepage = "https://github.com/4DA-Systems/victauri"
 documentation = "https://docs.rs/victauri-macros"
 readme = "README.md"
 

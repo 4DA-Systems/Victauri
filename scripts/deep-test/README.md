@@ -11,7 +11,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 source "$HOME/.cargo/env"
 # macOS:  brew install jq sqlite git
 # Linux:  sudo apt-get install -y jq sqlite3 git libwebkit2gtk-4.1-dev xvfb
-git clone https://github.com/runyourempire/victauri.git
+git clone https://github.com/4DA-Systems/victauri.git
 cd victauri
 ```
 

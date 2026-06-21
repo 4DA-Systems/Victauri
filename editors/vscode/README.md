@@ -2,7 +2,7 @@
 
 [![Version](https://img.shields.io/visual-studio-marketplace/v/4da-systems.victauri)](https://marketplace.visualstudio.com/items?itemName=4da-systems.victauri)
 [![Installs](https://img.shields.io/visual-studio-marketplace/i/4da-systems.victauri)](https://marketplace.visualstudio.com/items?itemName=4da-systems.victauri)
-[![License](https://img.shields.io/github/license/runyourempire/victauri)](https://github.com/runyourempire/victauri/blob/main/LICENSE)
+[![License](https://img.shields.io/github/license/4DA-Systems/victauri)](https://github.com/4DA-Systems/victauri/blob/main/LICENSE)
 
 **X-ray vision for Tauri apps.** See your app's DOM tree, IPC traffic, window state, memory usage, and performance metrics — all live inside VS Code. Click elements, take screenshots, run accessibility audits, and generate tests without leaving your editor.
 
@@ -11,7 +11,7 @@
 
 ## Quick Start
 
-1. Add `victauri-plugin` to your Tauri app ([one-line setup](https://github.com/runyourempire/victauri#quick-start))
+1. Add `victauri-plugin` to your Tauri app ([one-line setup](https://github.com/4DA-Systems/victauri#quick-start))
 2. Run your app in debug mode
 3. The extension auto-connects when it detects `tauri.conf.json` in your workspace
 

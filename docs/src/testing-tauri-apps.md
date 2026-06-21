@@ -133,7 +133,7 @@ import { _electron as electron } from 'playwright';
 
 **Best for:** Testing all three layers together — frontend, IPC, and backend — from one test.
 
-[Victauri](https://github.com/runyourempire/victauri) embeds an MCP server inside your Tauri process, giving tests direct access to the DOM, IPC layer, Rust backend, and native windows simultaneously.
+[Victauri](https://github.com/4DA-Systems/victauri) embeds an MCP server inside your Tauri process, giving tests direct access to the DOM, IPC layer, Rust backend, and native windows simultaneously.
 
 ### Setup
 
@@ -436,7 +436,7 @@ Coverage gate ──────────────── victauri coverage
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: runyourempire/victauri/.github/actions/victauri-test@v0.8.1
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.1
   with:
     max-load-ms: 5000
     coverage: true
@@ -498,8 +498,8 @@ curl -X POST http://127.0.0.1:7373/api/tools/screenshot -d '{}'
 
 ## Further Reading
 
-- [Victauri README](https://github.com/runyourempire/victauri) — full tool reference, architecture, quick start
-- [Demo app tests](https://github.com/runyourempire/victauri/tree/main/examples/demo-app/tests) — 20 integration tests demonstrating every pattern
-- [Agent session example](https://github.com/runyourempire/victauri/blob/main/examples/agent-session.md) — real AI agent session transcript
+- [Victauri README](https://github.com/4DA-Systems/victauri) — full tool reference, architecture, quick start
+- [Demo app tests](https://github.com/4DA-Systems/victauri/tree/main/examples/demo-app/tests) — 20 integration tests demonstrating every pattern
+- [Agent session example](https://github.com/4DA-Systems/victauri/blob/main/examples/agent-session.md) — real AI agent session transcript
 - [Tauri testing docs](https://v2.tauri.app/develop/tests/) — official Tauri testing guidance
 - [MCP protocol](https://modelcontextprotocol.io) — the protocol Victauri speaks

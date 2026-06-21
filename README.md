@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/runyourempire/victauri/actions/workflows/ci.yml"><img src="https://github.com/runyourempire/victauri/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/4DA-Systems/victauri/actions/workflows/ci.yml"><img src="https://github.com/4DA-Systems/victauri/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://crates.io/crates/victauri-plugin"><img src="https://img.shields.io/crates/v/victauri-plugin.svg" alt="crates.io"></a>
   <a href="https://docs.rs/victauri-plugin"><img src="https://docs.rs/victauri-plugin/badge.svg" alt="docs.rs"></a>
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache_2.0-blue.svg" alt="License: Apache-2.0"></a>
@@ -28,7 +28,7 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 
 > **Tested against real-world Tauri apps.** In a one-time deep evaluation (May 2026) across 5 open-source apps (Kanri, En Croissant, Surrealist, Duckling, Lettura), **867 / 895 checks passed (96.9%)** with zero Victauri bugs and zero changes to the apps. A **reproducible compat harness** ([`scripts/compat`](scripts/compat)) re-runs an app-agnostic smoke battery against the *current* code **on demand** (and weekly), pinned to three Tauri-2 apps (Kanri, En Croissant, Lettura). It is a best-effort net for upstream drift, not a release gate — third-party apps move on their own schedules and periodically need re-pinning. See the [compat README](scripts/compat/README.md) for what it covers and current per-app status.
 
-> **Note — browser mode removed (2026-06-09).** The experimental `victauri-browser` extension + `@4da/victauri-browser` npm package (MCP for *any website*) have been removed so Victauri can focus on its strength: full-stack introspection *inside* Tauri apps. For browser automation, use [Playwright](https://playwright.dev/) or the Chrome DevTools Protocol. The Tauri plugin is unaffected. Details & migration: [#15](https://github.com/runyourempire/victauri/issues/15).
+> **Note — browser mode removed (2026-06-09).** The experimental `victauri-browser` extension + `@4da/victauri-browser` npm package (MCP for *any website*) have been removed so Victauri can focus on its strength: full-stack introspection *inside* Tauri apps. For browser automation, use [Playwright](https://playwright.dev/) or the Chrome DevTools Protocol. The Tauri plugin is unaffected. Details & migration: [#15](https://github.com/4DA-Systems/victauri/issues/15).
 
 ## What You Get
 
@@ -408,7 +408,7 @@ Use the built-in composite action to run Victauri smoke tests in CI:
     xvfb-run -a ./target/debug/my-app &
     sleep 3
 
-- uses: runyourempire/victauri/.github/actions/victauri-test@v0.8.1
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.1
   with:
     max-load-ms: 10000
     max-heap-mb: 512
@@ -479,7 +479,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps  # Docs (zero warning
 
 Victauri is open source and built by [4DA Systems](https://4da.ai), which uses it to test its own Tauri app. We want it to become the default way to test Tauri apps full-stack — and that needs more than one company.
 
-- **Using it on a Tauri app?** Tell us — open a [discussion](https://github.com/runyourempire/victauri/discussions) or issue. We'd love to add you to a "used by" list and learn what broke.
+- **Using it on a Tauri app?** Tell us — open a [discussion](https://github.com/4DA-Systems/victauri/discussions) or issue. We'd love to add you to a "used by" list and learn what broke.
 - **Want to contribute?** See [CONTRIBUTING.md](CONTRIBUTING.md). Good first areas: more `victauri-test` assertion helpers, framework-specific testing guides, and CI recipes.
 - **Found a bug or a Tauri app it doesn't work on?** File an issue with the app and the failing tool call — those reports are the most valuable thing you can send us.
 

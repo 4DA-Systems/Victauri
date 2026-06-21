@@ -1,6 +1,6 @@
 # victauri-test
 
-Playwright-style testing for Tauri apps via [Victauri](https://github.com/runyourempire/victauri).
+Playwright-style testing for Tauri apps via [Victauri](https://github.com/4DA-Systems/victauri).
 
 ## What It Does
 
@@ -141,4 +141,4 @@ Full API docs: [docs.rs/victauri-test](https://docs.rs/victauri-test)
 
 Apache-2.0 -- see [LICENSE](../../LICENSE)
 
-Part of [Victauri](https://github.com/runyourempire/victauri). Built by [4DA Systems](https://4da.ai).
+Part of [Victauri](https://github.com/4DA-Systems/victauri). Built by [4DA Systems](https://4da.ai).
