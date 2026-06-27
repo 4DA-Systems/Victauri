@@ -1,0 +1,50 @@
+#!/bin/bash
+# Verax FLEET local pre-push gate (generalized — works for cargo, node, or mixed repos).
+# Replaces reliance on hosted GitHub Actions for private-repo pushes: runs the repo's real gate locally at $0.
+#   GATE 1 — committed-tree coherence (cargo repos only): the tree you are PUSHING resolves as a cargo workspace
+#            (catches the "green locally, garbage in the commit" corruption class). Skipped for non-cargo repos.
+#   GATE 2 — functional gate: `verax pipeline .verax/gate.json` (skip-cached, bounded-parallel; stack-agnostic).
+# FAIL-CLOSED on a real gate failure; FAIL-OPEN (allow push, loud notice) on missing infra so a moved binary
+# never blocks every push. BYPASS: `git push --no-verify` or VERAX_SKIP_GATE=1.
+set -u
+[ "${VERAX_SKIP_GATE:-0}" = "1" ] && { echo "[verax-gate] bypassed (VERAX_SKIP_GATE=1)"; exit 0; }
+PUSH_REFS="$(cat 2>/dev/null || true)"   # stdin is consumable once — capture before anything reads it
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
+
+# ---- GATE 1: committed-tree coherence (cargo repos only) ----
+if [ -f "$ROOT/Cargo.toml" ] && command -v cargo >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 && [ -n "$PUSH_REFS" ]; then
+  ZERO="0000000000000000000000000000000000000000"
+  while read -r lref lsha rref rsha; do
+    [ -n "${lsha:-}" ] || continue
+    [ "$lsha" = "$ZERO" ] && continue
+    work="$(mktemp -d 2>/dev/null)" || continue
+    if git archive "$lsha" 2>/dev/null | tar -x -C "$work" 2>/dev/null; then
+      if ! ( cd "$work" && cargo metadata --no-deps --format-version 1 >/dev/null 2>&1 ); then
+        rm -rf "$work"
+        echo "[verax-gate] GATE 1 FAIL — committed tree $lsha is NOT a coherent cargo workspace (corruption guard)."
+        echo "[verax-gate]   Inspect: git ls-tree -r $lsha | head   ·   Bypass: git push --no-verify"
+        exit 1
+      fi
+    fi
+    rm -rf "$work"
+  done <<< "$PUSH_REFS"
+  echo "[verax-gate] GATE 1: committed-tree coherence OK"
+fi
+
+# ---- GATE 2: functional gate via verax pipeline ----
+SPEC="$ROOT/.verax/gate.json"
+[ -f "$SPEC" ] || { echo "[verax-gate] no .verax/gate.json — functional gate not configured (push allowed)"; exit 0; }
+VERAX=""
+for cand in "${VERAX_BIN:-}" "$(command -v verax 2>/dev/null || true)" \
+            "/d/dev-cache/.cargo/bin/verax-pipeline.exe" "/d/dev-cache/.cargo/bin/verax.exe" \
+            "$ROOT/target/release/verax.exe" "$ROOT/target/debug/verax.exe"; do
+  [ -n "$cand" ] || continue
+  if "$cand" pipeline --help >/dev/null 2>&1; then VERAX="$cand"; break; fi
+done
+[ -z "$VERAX" ] && { echo "[verax-gate] no pipeline-capable verax found — functional gate did NOT run (push allowed). Build/stage verax to enforce."; exit 0; }
+echo "[verax-gate] GATE 2: local functional gate ($VERAX; skip-cached; bypass: git push --no-verify) ..."
+if "$VERAX" pipeline --spec "$SPEC" --cwd "$ROOT"; then
+  echo "[verax-gate] PASS — push allowed"; exit 0
+fi
+echo "[verax-gate] FAIL — push BLOCKED. Fix the gate, or bypass with: git push --no-verify"
+exit 1

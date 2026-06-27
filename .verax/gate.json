@@ -1,0 +1,8 @@
+{
+  "_comment": "Verax Tier-0 local pre-push gate for victauri (Rust workspace). Runs the FAST core of .github/workflows/ci.yml (Check&Lint + Test) locally at $0, no GitHub dependency: workspace clippy -D warnings, fmt --check, workspace tests. The heavier CI legs (no-default-features / release clippy, the cross-OS live-app E2E matrix) belong to a merge-time Tier-1 gate. Heavy cargo jobs are cost=8 (each saturates the 8 physical cores) so the scheduler serializes them. Run via the .githooks/pre-push hook (install: tools/install-gate.sh) or `verax pipeline --spec .verax/gate.json`.",
+  "jobs": [
+    {"id": "fmt",    "cmd": "cargo fmt --all -- --check",                          "cost": 1, "inputs": ["crates", "examples"]},
+    {"id": "clippy", "cmd": "cargo clippy --workspace --all-targets -- -D warnings", "cost": 8, "inputs": ["crates", "examples", "Cargo.toml", "Cargo.lock"]},
+    {"id": "test",   "cmd": "cargo test --workspace",                               "cost": 8, "inputs": ["crates", "examples", "Cargo.toml", "Cargo.lock"]}
+  ]
+}
