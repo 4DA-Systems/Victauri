@@ -214,6 +214,12 @@ pub fn diagnose_discovery() -> DiscoveryStatus {
             continue;
         };
         any_dir = true;
+        // A dead owner process is stale even if the advertised (shared default) port is
+        // reachable — that reachability is a different live app, not this one.
+        if !is_process_alive(pid) {
+            stale.push((pid, port));
+            continue;
+        }
         if std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             std::time::Duration::from_millis(100),
@@ -255,11 +261,28 @@ fn unique_token_for_port(servers: &[DiscoveredServer], port: u16) -> Option<Stri
 }
 
 fn find_live_servers() -> Vec<DiscoveredServer> {
-    let base = victauri_base_dir();
-    if !dir_is_trusted(&base) {
+    find_live_servers_in(&victauri_base_dir(), is_process_alive, port_is_reachable)
+}
+
+/// Testable core of [`find_live_servers`]: scan `base`, keep only entries whose OWNING
+/// PROCESS is alive and whose advertised port is reachable, and prune the rest.
+///
+/// Liveness is gated on the owning **pid**, not just port reachability — because every
+/// Victauri app registers on the SAME default port (7373). A crashed app's stale entry
+/// still advertises 7373, and a *different* live app now holding 7373 makes that port
+/// probe succeed, so a reachability-only check keeps the dead entry and pairs its stale
+/// token with the live server → 401. Checking the pid distinguishes them: a dead owner
+/// means the entry is stale even when the shared port answers. (The MCP-bridge discovery
+/// path already did this; this brings the test/CLI path in line.)
+fn find_live_servers_in(
+    base: &std::path::Path,
+    is_alive: impl Fn(u32) -> bool,
+    is_reachable: impl Fn(u16) -> bool,
+) -> Vec<DiscoveredServer> {
+    if !dir_is_trusted(base) {
         return Vec::new();
     }
-    let Ok(entries) = std::fs::read_dir(&base) else {
+    let Ok(entries) = std::fs::read_dir(base) else {
         return Vec::new();
     };
 
@@ -280,6 +303,13 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
         if !dir_is_trusted(&path) {
             continue;
         }
+        // A dead owner process means this entry is stale — even if its advertised port is
+        // reachable, that is a DIFFERENT live app now holding the shared default port, not
+        // this one. Reachability can't tell them apart, so gate on the pid.
+        if !is_alive(pid) {
+            let _ = std::fs::remove_dir_all(&path);
+            continue;
+        }
         let port_path = path.join("port");
         let Ok(port_str) = std::fs::read_to_string(&port_path) else {
             continue;
@@ -287,13 +317,8 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
         let Ok(port) = port_str.trim().parse::<u16>() else {
             continue;
         };
-        // Check if the port is reachable — if not, the server is dead
-        if std::net::TcpStream::connect_timeout(
-            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
-            std::time::Duration::from_millis(100),
-        )
-        .is_err()
-        {
+        // Live owner but unreachable port = mid-rebuild / not listening yet — not usable now.
+        if !is_reachable(port) {
             let _ = std::fs::remove_dir_all(&path);
             continue;
         }
@@ -304,6 +329,36 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
         servers.push(DiscoveredServer { pid, port, token });
     }
     servers
+}
+
+fn port_is_reachable(port: u16) -> bool {
+    std::net::TcpStream::connect_timeout(
+        &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+        std::time::Duration::from_millis(100),
+    )
+    .is_ok()
+}
+
+/// Cross-platform "is this pid a live process?" — mirrors the audited helper in the
+/// MCP-bridge discovery path (`victauri-cli::bridge`). Used to prune discovery entries
+/// whose owning app has exited even when a different app holds the same shared port.
+#[cfg(windows)]
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+}
+
+#[cfg(not(windows))]
+fn is_process_alive(pid: u32) -> bool {
+    // `kill -0` sends no signal but succeeds iff the process exists and is signalable by us
+    // (discovery entries are our own user's processes). Portable across Linux and macOS.
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]
@@ -398,5 +453,64 @@ mod tests {
             },
         ];
         assert_eq!(unique_token_for_port(&duplicate, 7373), None);
+    }
+
+    #[test]
+    fn dead_pid_sharing_a_live_port_is_pruned_so_selection_stays_unambiguous() {
+        // The shared-default-port collision (the real 401 cause): a crashed app (pid 1) and a
+        // live app (pid 2) both advertise 7373. Reachability alone can't tell them apart — the
+        // live app answers for both — so a reachability-only scan keeps BOTH and pairs the stale
+        // token with the live server => `unique_token_for_port` returns None => 401. Gating on
+        // the owning pid prunes the dead entry so selection is unambiguous again.
+        let base = tempfile::tempdir().unwrap();
+        for (pid, token) in [("1", "STALE-TOKEN"), ("2", "LIVE-TOKEN")] {
+            let dir = base.path().join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("port"), "7373").unwrap();
+            std::fs::write(dir.join("token"), token).unwrap();
+        }
+        // pid 2 alive, pid 1 dead; the shared port answers for both.
+        let servers = find_live_servers_in(base.path(), |pid| pid == 2, |_port| true);
+
+        assert_eq!(
+            servers.len(),
+            1,
+            "the dead-pid entry must be pruned despite the shared port answering"
+        );
+        assert_eq!(servers[0].pid, 2);
+        assert_eq!(servers[0].token.as_deref(), Some("LIVE-TOKEN"));
+        assert!(
+            !base.path().join("1").exists(),
+            "the dead-pid discovery dir should be cleaned up"
+        );
+        assert!(base.path().join("2").exists(), "the live dir stays");
+        // Selection is unambiguous now — the exact fix for the 401.
+        assert_eq!(
+            unique_connection(&servers),
+            Some((7373, Some("LIVE-TOKEN".to_string())))
+        );
+        assert_eq!(
+            unique_token_for_port(&servers, 7373).as_deref(),
+            Some("LIVE-TOKEN")
+        );
+    }
+
+    #[test]
+    fn live_owner_with_unreachable_port_is_pruned() {
+        // A live owning process whose port isn't listening yet (mid-rebuild) is not usable now.
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("4242");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("port"), "7373").unwrap();
+        std::fs::write(dir.join("token"), "tok").unwrap();
+        let servers = find_live_servers_in(base.path(), |_pid| true, |_port| false);
+        assert!(
+            servers.is_empty(),
+            "unreachable port => not a usable server"
+        );
+        assert!(
+            !base.path().join("4242").exists(),
+            "the unreachable dir is pruned"
+        );
     }
 }
