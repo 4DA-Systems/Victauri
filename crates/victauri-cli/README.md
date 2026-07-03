@@ -94,6 +94,8 @@ victauri watch --filter greet            # Only run matching tests
 
 Full API docs: [docs.rs/victauri-cli](https://docs.rs/victauri-cli)
 
+MCP Registry name: `mcp-name: io.github.4da-systems/victauri`
+
 ## License
 
 Apache-2.0 -- see [LICENSE](../../LICENSE)
