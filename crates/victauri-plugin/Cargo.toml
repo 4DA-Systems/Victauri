@@ -64,6 +64,17 @@ x11rb = { version = "0.13", features = ["composite"] }
 windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",
+    # Windows.Graphics.Capture screenshot path (WGC/DXGI — captures transparent
+    # and GPU-composited windows that PrintWindow/BitBlt return blank for).
+    "Foundation",
+    "Graphics_Capture",
+    "Graphics_DirectX_Direct3D11",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Com",
+    "Win32_System_WinRT_Direct3D11",
+    "Win32_System_WinRT_Graphics_Capture",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_HiDpi",
     "Win32_Storage_Xps",
