@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.4da-systems/victauri",
+  "title": "Victauri",
+  "description": "Full-stack introspection and control for Tauri apps: DOM, IPC with bodies, Rust backend state, and SQLite through one in-process server. Debug builds only.",
+  "version": "0.8.6",
+  "repository": {
+    "url": "https://github.com/4DA-Systems/victauri",
+    "source": "github"
+  },
+  "websiteUrl": "https://4da-systems.github.io/Victauri/",
+  "packages": [
+    {
+      "registryType": "cargo",
+      "identifier": "victauri-cli",
+      "version": "0.8.6",
+      "runtimeHint": "victauri",
+      "transport": { "type": "stdio" },
+      "packageArguments": [
+        {
+          "type": "positional",
+          "value": "bridge",
+          "description": "Run the stdio MCP bridge that auto-discovers the running Tauri app"
+        }
+      ]
+    }
+  ]
+}
