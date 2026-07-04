@@ -2,7 +2,14 @@
 # Vulnerabilities are denied by default in cargo-deny; these tighten the rest (audit #10).
 unmaintained = "workspace"
 yanked = "deny"
-ignore = []
+ignore = [
+    # 2026-07-04: quick-xml 0.38.4 DoS advisories — transitive via tauri -> plist; patched
+    # quick-xml is >=0.41.0 but the newest plist (1.9.0) pins ^0.39.2, so no upgrade path
+    # exists today. Build/dev-time parsing of the app's own plists, not attacker input.
+    # Mirror of .cargo/audit.toml (both files must agree to unblock a release).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 allow = [

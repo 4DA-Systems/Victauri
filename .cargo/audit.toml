@@ -10,4 +10,12 @@
 [advisories]
 ignore = [
     # "RUSTSEC-0000-0000", # 2026-01-01: not exploitable — affected API unused; fix tracked at <url>
+    # 2026-07-04: quick-xml 0.38.4 DoS advisories (quadratic dup-attr check / unbounded ns alloc).
+    # Transitive via tauri/tauri-plugin/tauri-codegen → plist → quick-xml; patched quick-xml is
+    # >=0.41.0 but the newest plist (1.9.0) still pins ^0.39.2, so NO upgrade path exists today.
+    # Not exploitable here: plist parses the app's own Apple property-list config at build/dev
+    # time, never attacker-controlled input, and Victauri is a debug-builds-only dev tool.
+    # Remove both ids when plist releases quick-xml>=0.41 support and tauri picks it up.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
