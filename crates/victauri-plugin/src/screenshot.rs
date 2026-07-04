@@ -4,6 +4,11 @@
 //! available on Windows, macOS, and Linux/X11. Pure Wayland capture fails
 //! safely because its available fallback is a full-desktop image, not the
 //! requested application window.
+//!
+//! On Windows the primary path is Windows.Graphics.Capture (WGC): it reads the
+//! DWM-composited surface, so transparent (`WS_EX_LAYERED`) and GPU-composited
+//! windows — which GDI `PrintWindow`/`BitBlt` copy as blank — capture correctly.
+//! GDI remains the fallback for builds without WGC or a failed capture session.
 
 /// Capture a window as a PNG (RGBA, 8-bit).
 #[cfg(windows)]
@@ -14,9 +19,39 @@ pub async fn capture_window(hwnd: isize) -> anyhow::Result<Vec<u8>> {
 }
 
 /// Capture a window as straight RGBA bytes + (width, height).
+///
+/// Tries Windows.Graphics.Capture first, falling back to the GDI
+/// (`PrintWindow`/`BitBlt`) path if WGC is unavailable, produces no frame
+/// (e.g. minimized window, pre-1803 Windows), or returns a uniform blank frame.
+/// The GDI path keeps its loud blank-frame error, so a window neither engine
+/// can see still fails clearly instead of returning a silent blank image.
+#[cfg(windows)]
+#[allow(dead_code)]
+pub async fn capture_window_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let wgc_failure = match capture_window_wgc_raw(hwnd).await {
+        Ok((rgba, w, h)) => {
+            if blank_frame_reason(&rgba).is_none() {
+                tracing::debug!("window captured via WGC ({w}x{h})");
+                return Ok((rgba, w, h));
+            }
+            // A uniform white/empty WGC frame is not proof of failure (the
+            // window may genuinely render nothing yet) — let GDI have a try
+            // and reuse its loud blank-frame diagnosis if it agrees.
+            "WGC returned a uniform blank frame".to_string()
+        }
+        Err(e) => e.to_string(),
+    };
+    tracing::debug!("WGC capture unavailable, falling back to GDI: {wgc_failure}");
+    capture_window_gdi_raw(hwnd).await.map_err(|e| {
+        anyhow::anyhow!("{e} (Windows.Graphics.Capture was tried first: {wgc_failure})")
+    })
+}
+
+/// Legacy GDI capture (`PrintWindow` + `GetDIBits`) — the fallback when WGC is
+/// unavailable. Blank frames from transparent/composited windows error loudly.
 #[cfg(windows)]
 #[allow(dead_code, unsafe_code)]
-pub async fn capture_window_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+async fn capture_window_gdi_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
@@ -159,8 +194,9 @@ pub async fn capture_window_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u3
                 anyhow::bail!(
                     "window capture returned a {reason} {width}x{height} frame; {hint}. \
                      GDI capture (PrintWindow/BitBlt) cannot see transparent/composited \
-                     windows — use an OS desktop-composite grab (e.g. ffmpeg gdigrab) \
-                     for this window."
+                     windows and the Windows.Graphics.Capture path did not produce \
+                     content either — the window may be genuinely blank, minimized, or \
+                     this Windows build may lack capture support."
                 );
             }
 
@@ -187,6 +223,264 @@ fn blank_frame_reason(pixels: &[u8]) -> Option<&'static str> {
         (0x00, 0x00, 0x00) => Some("blank (empty)"),
         _ => None,
     }
+}
+
+/// How long to wait for the first WGC frame before giving up and falling back
+/// to GDI. The pool is seeded with the current composited content on
+/// `StartCapture`, so a healthy window delivers well under this; a minimized
+/// window (which DWM stops composing) times out here instead of hanging.
+#[cfg(windows)]
+const WGC_FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Poll cadence for `TryGetNextFrame` while waiting for the first frame.
+#[cfg(windows)]
+const WGC_FRAME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Capture a window via Windows.Graphics.Capture (WGC) as straight RGBA +
+/// (width, height). Unlike GDI, WGC reads the DWM-composited surface, so
+/// transparent (`WS_EX_LAYERED`) and GPU-composited windows capture correctly.
+#[cfg(windows)]
+async fn capture_window_wgc_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    tokio::task::spawn_blocking(move || capture_window_wgc_blocking(hwnd)).await?
+}
+
+/// Blocking WGC capture: D3D11 device → `GraphicsCaptureItem` from the HWND →
+/// free-threaded `Direct3D11CaptureFramePool` (we are on a tokio blocking
+/// thread, not a `DispatcherQueue` thread) → one frame → CPU staging texture →
+/// map → BGRA rows (respecting `RowPitch`) → straight RGBA, cropped to the
+/// client area so output dimensions match the GDI path (`PW_CLIENTONLY`).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn capture_window_wgc_blocking(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    use windows::Graphics::Capture::{
+        Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
+    };
+    use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
+    use windows::Graphics::DirectX::DirectXPixelFormat;
+    use windows::Win32::Foundation::{HMODULE, HWND, POINT, RECT};
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAP_READ,
+        D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+        D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
+    };
+    use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+    use windows::Win32::Graphics::Gdi::ClientToScreen;
+    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
+    use windows::Win32::System::WinRT::Direct3D11::{
+        CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
+    };
+    use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
+    use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect};
+    use windows::core::Interface;
+
+    use anyhow::Context as _;
+
+    // SAFETY: All Win32/WinRT calls operate on the provided window handle and
+    // on COM objects owned by this function. The mapped staging texture is
+    // read only while mapped and unmapped before the objects drop.
+    unsafe {
+        // WinRT activation (the GraphicsCaptureItem factory) requires an
+        // initialized apartment on this thread. Tokio blocking threads are
+        // reused, so an "already initialized" result is fine — ignore it.
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+
+        if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
+            anyhow::bail!("Windows.Graphics.Capture is not supported on this Windows build");
+        }
+
+        let hwnd = HWND(hwnd as *mut _);
+
+        // Compute the client-area crop BEFORE capturing: the WGC frame covers
+        // the full window rect (title bar + borders), but this module's
+        // contract — shared with the GDI path — is the client area only.
+        let mut window_rect = RECT::default();
+        GetWindowRect(hwnd, &mut window_rect).context("GetWindowRect failed")?;
+        let mut client_rect = RECT::default();
+        GetClientRect(hwnd, &mut client_rect).context("GetClientRect failed")?;
+        let mut client_origin = POINT::default();
+        if !ClientToScreen(hwnd, &mut client_origin).as_bool() {
+            anyhow::bail!("ClientToScreen failed for window handle");
+        }
+        let crop_x = u32::try_from(client_origin.x - window_rect.left).unwrap_or(0);
+        let crop_y = u32::try_from(client_origin.y - window_rect.top).unwrap_or(0);
+        let crop_w = u32::try_from(client_rect.right).unwrap_or(0);
+        let crop_h = u32::try_from(client_rect.bottom).unwrap_or(0);
+        if crop_w == 0 || crop_h == 0 {
+            anyhow::bail!("window has zero client area ({crop_w}x{crop_h})");
+        }
+
+        // D3D11 device (hardware, falling back to WARP so headless/RDP works).
+        let mut device: Option<ID3D11Device> = None;
+        for driver_type in [D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP] {
+            if D3D11CreateDevice(
+                None,
+                driver_type,
+                HMODULE::default(),
+                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                None,
+                D3D11_SDK_VERSION,
+                Some(&mut device),
+                None,
+                None,
+            )
+            .is_ok()
+            {
+                break;
+            }
+        }
+        let device = device
+            .ok_or_else(|| anyhow::anyhow!("D3D11CreateDevice failed (hardware and WARP)"))?;
+        let dxgi_device: IDXGIDevice = device.cast()?;
+        let d3d_device: IDirect3DDevice =
+            CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)?.cast()?;
+
+        // Capture item from the raw HWND via the WinRT interop factory.
+        let interop = windows::core::factory::<GraphicsCaptureItem, IGraphicsCaptureItemInterop>()
+            .context("GraphicsCaptureItem interop factory unavailable")?;
+        let item: GraphicsCaptureItem = interop.CreateForWindow(hwnd).context(
+            "CreateForWindow rejected this window (WGC cannot capture system/shell windows, \
+             and the window must be a visible top-level window)",
+        )?;
+        let item_size = item.Size()?;
+        if item_size.Width <= 0 || item_size.Height <= 0 {
+            anyhow::bail!(
+                "capture item has zero area ({}x{})",
+                item_size.Width,
+                item_size.Height
+            );
+        }
+
+        // Free-threaded pool: frame delivery does not need a DispatcherQueue.
+        let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+            &d3d_device,
+            DirectXPixelFormat::B8G8R8A8UIntNormalized,
+            2,
+            item_size,
+        )
+        .context("Direct3D11CaptureFramePool::CreateFreeThreaded failed")?;
+        let session = frame_pool
+            .CreateCaptureSession(&item)
+            .context("CreateCaptureSession failed")?;
+        // Best-effort cosmetics: these setters need newer Windows builds and
+        // may also be denied without borderless-capture access — a yellow
+        // border or captured cursor is acceptable, a failed capture is not.
+        let _ = session.SetIsCursorCaptureEnabled(false);
+        let _ = session.SetIsBorderRequired(false);
+        session.StartCapture().context("StartCapture failed")?;
+
+        // Wait (bounded) for the first frame instead of hanging forever.
+        let deadline = std::time::Instant::now() + WGC_FIRST_FRAME_TIMEOUT;
+        let frame = loop {
+            if let Ok(frame) = frame_pool.TryGetNextFrame() {
+                break frame;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = session.Close();
+                let _ = frame_pool.Close();
+                anyhow::bail!(
+                    "WGC produced no frame within {}s (the window may be minimized — \
+                     DWM stops composing minimized windows)",
+                    WGC_FIRST_FRAME_TIMEOUT.as_secs()
+                );
+            }
+            std::thread::sleep(WGC_FRAME_POLL_INTERVAL);
+        };
+
+        // GPU texture behind the frame → CPU staging copy → mapped read.
+        let surface = frame.Surface()?;
+        let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
+        let source_texture: ID3D11Texture2D = access.GetInterface()?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        source_texture.GetDesc(&mut desc);
+        let frame_w = desc.Width;
+        let frame_h = desc.Height;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        let mut staging: Option<ID3D11Texture2D> = None;
+        device.CreateTexture2D(&desc, None, Some(&mut staging))?;
+        let staging = staging
+            .ok_or_else(|| anyhow::anyhow!("CreateTexture2D returned no staging texture"))?;
+        let context = device.GetImmediateContext()?;
+        context.CopyResource(&staging, &source_texture);
+
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+        let row_pitch = mapped.RowPitch as usize;
+        let mapped_len = row_pitch
+            .checked_mul(frame_h as usize)
+            .ok_or_else(|| anyhow::anyhow!("screenshot buffer overflow: {frame_w}x{frame_h}"))?;
+        let data = std::slice::from_raw_parts(mapped.pData.cast::<u8>(), mapped_len);
+        let result = convert_bgra_frame(
+            data,
+            row_pitch,
+            frame_w,
+            frame_h,
+            (crop_x, crop_y, crop_w, crop_h),
+        );
+        context.Unmap(&staging, 0);
+        let _ = session.Close();
+        let _ = frame_pool.Close();
+        result
+    }
+}
+
+/// Convert a mapped BGRA frame (row stride `row_pitch`, which may exceed
+/// `frame_w * 4`) into straight RGBA, cropped to `(x, y, w, h)`. The crop is
+/// clamped to the frame bounds. DWM-composited surfaces carry premultiplied
+/// alpha; PNG requires straight alpha, so partially-transparent pixels are
+/// un-premultiplied (same treatment as the macOS path).
+#[cfg(windows)]
+fn convert_bgra_frame(
+    data: &[u8],
+    row_pitch: usize,
+    frame_w: u32,
+    frame_h: u32,
+    crop: (u32, u32, u32, u32),
+) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    let (x, y, w, h) = crop;
+    if w == 0 || h == 0 {
+        anyhow::bail!("crop region has zero area ({w}x{h})");
+    }
+    if x >= frame_w || y >= frame_h {
+        anyhow::bail!("crop origin ({x},{y}) lies outside the {frame_w}x{frame_h} frame");
+    }
+    let w = w.min(frame_w - x);
+    let h = h.min(frame_h - y);
+
+    let out_len = (w as usize)
+        .checked_mul(4)
+        .and_then(|row| row.checked_mul(h as usize))
+        .ok_or_else(|| anyhow::anyhow!("screenshot buffer overflow: {w}x{h}"))?;
+    let mut out = Vec::with_capacity(out_len);
+    for row in y..y + h {
+        let start = (row as usize)
+            .checked_mul(row_pitch)
+            .and_then(|offset| offset.checked_add(x as usize * 4))
+            .ok_or_else(|| anyhow::anyhow!("screenshot buffer overflow: row {row}"))?;
+        let end = start + w as usize * 4;
+        let src = data
+            .get(start..end)
+            .ok_or_else(|| anyhow::anyhow!("mapped frame smaller than RowPitch implies"))?;
+        for px in src.chunks_exact(4) {
+            let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
+            if a > 0 && a < 255 {
+                // Un-premultiply (round-to-nearest), matching the macOS path.
+                let a16 = u16::from(a);
+                out.push(((u16::from(r) * 255 + a16 / 2) / a16).min(255) as u8);
+                out.push(((u16::from(g) * 255 + a16 / 2) / a16).min(255) as u8);
+                out.push(((u16::from(b) * 255 + a16 / 2) / a16).min(255) as u8);
+            } else {
+                out.push(r);
+                out.push(g);
+                out.push(b);
+            }
+            out.push(a);
+        }
+    }
+    Ok((out, w, h))
 }
 
 #[cfg(target_os = "macos")]
@@ -734,5 +1028,129 @@ mod tests {
         px[3] = 0x00;
         px[7] = 0x12;
         assert_eq!(blank_frame_reason(&px), Some("blank white"));
+    }
+
+    // --- convert_bgra_frame (WGC mapped-texture → RGBA) -------------------
+    // Pure-function coverage for the WGC pixel pipeline: BGRA→RGBA swap,
+    // RowPitch padding, client-area crop + clamping, and un-premultiply.
+
+    /// Build a BGRA frame where each pixel encodes its own (col, row) so a
+    /// crop's provenance is checkable: B=col, G=row, R=0xAB, A=0xFF.
+    #[cfg(windows)]
+    fn synthetic_bgra(frame_w: u32, frame_h: u32, row_pitch: usize) -> Vec<u8> {
+        let mut data = vec![0xEEu8; row_pitch * frame_h as usize]; // 0xEE = padding sentinel
+        for row in 0..frame_h {
+            for col in 0..frame_w {
+                let o = row as usize * row_pitch + col as usize * 4;
+                data[o] = col as u8; // B
+                data[o + 1] = row as u8; // G
+                data[o + 2] = 0xAB; // R
+                data[o + 3] = 0xFF; // A
+            }
+        }
+        data
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn convert_swaps_bgra_to_rgba_and_skips_row_pitch_padding() {
+        // 4x2 frame, 32-byte pitch (16 bytes of padding per row).
+        let data = synthetic_bgra(4, 2, 32);
+        let (rgba, w, h) = convert_bgra_frame(&data, 32, 4, 2, (0, 0, 4, 2)).unwrap();
+        assert_eq!((w, h), (4, 2));
+        assert_eq!(rgba.len(), 4 * 2 * 4);
+        // Pixel (col=2, row=1): R=0xAB, G=row=1, B=col=2, A=0xFF.
+        let px = &rgba[(4 + 2) * 4..(4 + 2) * 4 + 4];
+        assert_eq!(px, &[0xAB, 1, 2, 0xFF]);
+        // No padding sentinel may leak into the output.
+        assert!(!rgba.contains(&0xEE));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn convert_crops_client_area_out_of_full_window_frame() {
+        // 8x8 "window" frame; crop a 4x3 "client area" at offset (2, 1).
+        let data = synthetic_bgra(8, 8, 8 * 4);
+        let (rgba, w, h) = convert_bgra_frame(&data, 8 * 4, 8, 8, (2, 1, 4, 3)).unwrap();
+        assert_eq!((w, h), (4, 3));
+        // First output pixel is source (col=2, row=1) → RGBA [0xAB, 1, 2, 0xFF].
+        assert_eq!(&rgba[0..4], &[0xAB, 1, 2, 0xFF]);
+        // Last output pixel is source (col=5, row=3) → RGBA [0xAB, 3, 5, 0xFF].
+        let last = &rgba[rgba.len() - 4..];
+        assert_eq!(last, &[0xAB, 3, 5, 0xFF]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn convert_clamps_oversized_crop_to_frame_bounds() {
+        let data = synthetic_bgra(4, 4, 4 * 4);
+        // Crop claims 10x10 at (1, 1) — clamps to the remaining 3x3.
+        let (rgba, w, h) = convert_bgra_frame(&data, 4 * 4, 4, 4, (1, 1, 10, 10)).unwrap();
+        assert_eq!((w, h), (3, 3));
+        assert_eq!(rgba.len(), 3 * 3 * 4);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn convert_rejects_zero_area_and_out_of_frame_crops() {
+        let data = synthetic_bgra(4, 4, 4 * 4);
+        assert!(convert_bgra_frame(&data, 4 * 4, 4, 4, (0, 0, 0, 4)).is_err());
+        assert!(convert_bgra_frame(&data, 4 * 4, 4, 4, (4, 0, 1, 1)).is_err());
+        assert!(convert_bgra_frame(&data, 4 * 4, 4, 4, (0, 4, 1, 1)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn convert_rejects_undersized_buffer() {
+        // Buffer one row short of what row_pitch * frame_h implies.
+        let data = vec![0u8; 4 * 4 * 3];
+        assert!(convert_bgra_frame(&data, 4 * 4, 4, 4, (0, 0, 4, 4)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn convert_unpremultiplies_partial_alpha() {
+        // Premultiplied half-transparent red: B=0, G=0, R=64, A=128 → R≈127.
+        let data = vec![0u8, 0, 64, 128];
+        let (rgba, _, _) = convert_bgra_frame(&data, 4, 1, 1, (0, 0, 1, 1)).unwrap();
+        assert_eq!(rgba[3], 128);
+        assert_eq!(rgba[0], 128); // (64*255 + 64) / 128 = 128
+        // Opaque pixels pass through untouched.
+        let data = vec![10u8, 20, 30, 255];
+        let (rgba, _, _) = convert_bgra_frame(&data, 4, 1, 1, (0, 0, 1, 1)).unwrap();
+        assert_eq!(&rgba[..], &[30, 20, 10, 255]);
+        // Fully transparent pixels are not divided by zero.
+        let data = vec![0u8, 0, 0, 0];
+        let (rgba, _, _) = convert_bgra_frame(&data, 4, 1, 1, (0, 0, 1, 1)).unwrap();
+        assert_eq!(&rgba[..], &[0, 0, 0, 0]);
+    }
+
+    /// Live WGC capture against a real on-screen window — whatever is in the
+    /// foreground. (WGC's `CreateForWindow` rejects the shell/desktop windows
+    /// by design, so a normal application window is required.) Needs an
+    /// interactive desktop session, so it is `#[ignore]`d for CI — run
+    /// manually with `cargo test -p victauri-plugin -- --ignored`.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires an interactive desktop session (real window + DWM)"]
+    #[allow(unsafe_code)]
+    async fn wgc_captures_live_foreground_window() {
+        use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+        // SAFETY: GetForegroundWindow takes no arguments and returns an HWND.
+        let hwnd = unsafe { GetForegroundWindow() };
+        assert!(
+            !hwnd.0.is_null(),
+            "no foreground window — not an interactive desktop session"
+        );
+        let (rgba, w, h) = capture_window_wgc_raw(hwnd.0 as isize)
+            .await
+            .expect("WGC capture of the foreground window failed");
+        assert!(w > 0 && h > 0);
+        assert_eq!(rgba.len(), w as usize * h as usize * 4);
+        assert!(
+            blank_frame_reason(&rgba).is_none(),
+            "WGC frame of a live window should have pixel variance"
+        );
     }
 }
