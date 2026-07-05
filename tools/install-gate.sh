@@ -43,16 +43,24 @@ PIN="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || git 
 } > "$PIN"
 echo "[local-gate] pinned gate integrity → $PIN"
 
-# Pick the ACTIVE hook directory (do NOT change it).
+# Resolve the ACTIVE hook directory the way GIT ITSELF does — respecting core.hooksPath — as an
+# absolute, FORWARD-SLASH path. We must write exactly where git reads: hand-parsing a Windows-native
+# `core.hooksPath` (backslashes) is not portable across bash-on-Windows variants (Git Bash vs WSL vs
+# pathconv-disabled) and could land the hardened hook somewhere git never reads while the OLD vulnerable
+# hook stays active — a false "installed" that leaves the RCE open (GPT-5.5 audit 2e-02). `git rev-parse
+# --git-path hooks` honors core.hooksPath; `--path-format=absolute` normalizes slashes for the shell.
 cur="$(git config --get core.hooksPath || true)"
-if [ -d "$ROOT/.husky" ]; then
-  HOOKDIR="$ROOT/.husky"; KIND="husky"
-elif [ -n "$cur" ]; then
-  case "$cur" in /*|[A-Za-z]:*) HOOKDIR="$cur" ;; *) HOOKDIR="$ROOT/$cur" ;; esac  # relative → repo-rooted
-  KIND="custom ($cur)"
-else
-  HOOKDIR="$ROOT/.git/hooks"; KIND="default"
+HOOKDIR="$(git rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
+if [ -z "$HOOKDIR" ]; then
+  # Fallback for git < 2.31 (no --path-format): normalize the raw value deterministically.
+  if [ -n "$cur" ]; then
+    HOOKDIR="$(cygpath -u "$cur" 2>/dev/null || printf '%s' "$cur" | tr '\\' '/')"
+    case "$HOOKDIR" in /*|[A-Za-z]:/*) ;; *) HOOKDIR="$ROOT/$HOOKDIR" ;; esac  # relative → repo-rooted
+  else
+    HOOKDIR="$ROOT/.git/hooks"
+  fi
 fi
+[ -n "$cur" ] && KIND="custom ($cur)" || KIND="default"
 mkdir -p "$HOOKDIR"
 HOOK="$HOOKDIR/pre-push"
 MARK="# >>> local gate >>>"
@@ -101,21 +109,29 @@ if [ -f "$HOOK" ] && grep -qF "$MARK" "$HOOK"; then
   # Re-pin (done above) but refresh the block too, so upgrades to this installer take effect.
   tmp="$(mktemp)"; awk -v m="$MARK" -v e="$END" '$0==m{s=1} !s{print} $0==e{s=0}' "$HOOK" > "$tmp" && mv "$tmp" "$HOOK"
   { echo ""; echo "$MARK"; echo "$DELEGATE"; echo "$END"; } >> "$HOOK"
-  chmod +x "$HOOK" 2>/dev/null || true
-  echo "[local-gate] refreshed the gate block in the $KIND hook ($HOOK)."
-  echo "  gate spec: .gate/gate.json (integrity-pinned)   ·   bypass: git push --no-verify (or LOCAL_GATE_SKIP=1)"
-  exit 0
-fi
-
-if [ -f "$HOOK" ]; then
+  ACTION="refreshed the gate block in"
+elif [ -f "$HOOK" ]; then
   # CHAIN: keep the existing pre-push, append our verified-delegate block.
   { echo ""; echo "$MARK"; echo "$DELEGATE"; echo "$END"; } >> "$HOOK"
-  echo "[local-gate] CHAINED the gate onto the existing $KIND pre-push ($HOOK)."
+  ACTION="CHAINED the gate onto the existing"
 else
-  # No existing pre-push: create one (with a shebang for non-husky dirs).
-  { [ "$KIND" = husky ] || echo "#!/bin/bash"; echo "$MARK"; echo "$DELEGATE"; echo "$END"; } > "$HOOK"
-  echo "[local-gate] installed a new $KIND pre-push ($HOOK)."
+  # No existing pre-push: create one. Husky sources its hooks, so it needs no shebang; others do.
+  case "$HOOKDIR" in *.husky*) : ;; *) printf '#!/bin/bash\n' > "$HOOK" ;; esac
+  { echo "$MARK"; echo "$DELEGATE"; echo "$END"; } >> "$HOOK"
+  ACTION="installed a new"
 fi
 chmod +x "$HOOK" 2>/dev/null || true
+
+# POST-INSTALL ASSERTION: confirm the gate is present at the hook path GIT WILL ACTUALLY USE. Because
+# HOOKDIR is git's own resolved hooks path, this holds by construction — but we verify rather than assume,
+# so a path-resolution quirk can never leave a false "installed" while the OLD (ungated) hook stays active.
+ACTIVE="$(git rev-parse --path-format=absolute --git-path hooks 2>/dev/null || printf '%s' "$HOOKDIR")/pre-push"
+if ! grep -qF "$MARK" "$ACTIVE" 2>/dev/null; then
+  echo "[local-gate] ERROR: post-install check FAILED — the gate is NOT at the active hook path git will run:"
+  echo "[local-gate]   $ACTIVE"
+  echo "[local-gate]   Your pushes are NOT gated. Refusing to report success. (core.hooksPath=${cur:-<unset>})"
+  exit 1
+fi
+echo "[local-gate] $ACTION $KIND hook ($HOOK)."
 echo "  gate spec: .gate/gate.json (integrity-pinned)   ·   bypass: git push --no-verify (or LOCAL_GATE_SKIP=1)"
 echo "  remove:    delete the '$MARK ... $END' block from $HOOK (and $PIN)"
