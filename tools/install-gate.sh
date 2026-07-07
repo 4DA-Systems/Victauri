@@ -39,7 +39,13 @@ _vg_hash() {
 PIN="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || git rev-parse --git-common-dir)/verax-gate.pin"
 {
   echo "pre-push $(_vg_hash "$ROOT/$GATE_REL")"
-  [ -f "$ROOT/$SPEC_REL" ] && echo "gate.json $(_vg_hash "$ROOT/$SPEC_REL")"
+  # Pin gate.json UNCONDITIONALLY — even when absent (_vg_hash prints the "absent" sentinel). If we skipped
+  # the line for a missing file, the delegate's verify loop (which checks only pinned lines) would not cover
+  # gate.json, and a branch that ADDS a gate.json after install would run un-pinned via .githooks/pre-push's
+  # `verax pipeline --spec .verax/gate.json`. Pinning "absent" makes an add-after-install read as drift
+  # (real hash != "absent") → the fail-closed refuse fires. A repo that legitimately never has gate.json
+  # stays green (absent == absent).
+  echo "gate.json $(_vg_hash "$ROOT/$SPEC_REL")"
 } > "$PIN"
 echo "[verax-gate] pinned gate integrity → $PIN"
 
