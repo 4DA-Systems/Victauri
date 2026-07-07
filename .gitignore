@@ -22,6 +22,12 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# the gate local self-gate scratch — HMAC key + rebuildable caches. Never commit (the key is a local trust
+# input; §177 bridge audit flagged it committable here — gate's own repo already ignores these).
+.gate/*.key
+.gate/pipeline-cache.json
+.gate/cache-hmac.key
+
 # Data artifacts
 data/
 
