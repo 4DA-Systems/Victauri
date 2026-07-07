@@ -22,6 +22,12 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# Verax local self-gate scratch — HMAC key + rebuildable caches. Never commit (the key is a local trust
+# input; §177 bridge audit flagged it committable here — verax's own repo already ignores these).
+.verax/*.key
+.verax/pipeline-cache.json
+.verax/cache-hmac.key
+
 # Data artifacts
 data/
 
