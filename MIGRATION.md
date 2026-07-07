@@ -1,5 +1,19 @@
 # Migration Guide
 
+## v0.8.5 -> v0.8.6 (repo self-gate hardening)
+
+No Victauri consumer code changes are required and no dependency-requirement change is needed
+(`victauri-plugin = "0.8"` / `victauri-test = "0.8"` pick it up automatically). The runtime plugin
+and public Rust API are unchanged.
+
+Maintainers using this repo's local local pre-push gate should note one developer-tooling behavior
+change:
+
+- **`tools/install-gate.sh` now refuses tracked active hook files.** If your local
+  `core.hooksPath` points at a tracked hook such as `.githooks/pre-push`, move it to untracked hook
+  storage (`.git/hooks`, or Husky-v9's `.husky/_`) and rerun `tools/install-gate.sh`. This is
+  intentional: the integrity verifier must live outside branch-controlled content.
+
 ## v0.8.3 → v0.8.4 (stateless MCP backfills a compat session id)
 
 No consumer code changes are required and no dependency-requirement change is needed (semver-compatible

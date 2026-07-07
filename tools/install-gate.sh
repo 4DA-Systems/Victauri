@@ -8,18 +8,71 @@
 # "gate local gate" block from the active pre-push (printed below).
 #
 # SECURITY — integrity pinning (why the delegate is not a bare `bash .githooks/pre-push`):
-#   `.githooks/pre-push` and `.gate/gate.json` are TRACKED, so their content is branch-controlled, and the gate
-#   executes `.gate/gate.json`'s `cmd` fields via `gate-runner pipeline`. A bare delegate would let a checked-out
-#   malicious branch run arbitrary commands on the developer's box the next time they `git push` (contributor-
-#   workflow RCE). To close that: at install time we record a hash of both files under `.git/` (UNtracked, so a
-#   branch cannot alter it), and the installed hook REFUSES to run (fail-closed) if either tracked file no longer
-#   matches its pin. Legitimate gate changes surface as a loud "re-run tools/install-gate.sh to re-pin" prompt
-#   after you have reviewed the diff — an attacker's silent swap cannot execute.
+#   `.githooks/pre-push`, `.gate/gate.json`, and the gate installer/test helpers are TRACKED, so their content is
+#   branch-controlled, and the gate executes `.gate/gate.json`'s `cmd` fields via `gate-runner pipeline`. A bare delegate
+#   would let a checked-out malicious branch run arbitrary commands on the developer's box the next time they
+#   `git push` (contributor-workflow RCE). To close that: at install time we record a hash of the gate tooling under
+#   `.git/` (UNtracked, so a branch cannot alter it), and the installed hook REFUSES to run (fail-closed) if any
+#   tracked gate file no longer matches its pin. Legitimate gate changes surface as a loud "re-run
+#   tools/install-gate.sh to re-pin" prompt after you have reviewed the diff — an attacker's silent swap cannot
+#   execute.
 set -e
 ROOT="$(git rev-parse --show-toplevel)"
 GATE_REL=".githooks/pre-push"
 SPEC_REL=".gate/gate.json"
+INSTALL_REL="tools/install-gate.sh"
+TEST_REL="tools/test-install-gate.sh"
 [ -f "$ROOT/$GATE_REL" ] || { echo "[local-gate] no $GATE_REL in this repo — nothing to install"; exit 1; }
+
+_vg_clean_path() {
+  printf '%s' "$1" | tr -d '\r' | tr '\\' '/'
+}
+
+_vg_shell_path() {
+  local p drive rest
+  p="$(_vg_clean_path "$1")"
+  case "$p" in
+    [A-Za-z]:/*)
+      if command -v cygpath >/dev/null 2>&1; then cygpath -u "$p"; return; fi
+      drive="$(printf '%s' "$p" | cut -c1 | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+      rest="$(printf '%s' "${p#?:}" | sed 's#^/*##')"
+      if [ -d "/mnt/$drive" ]; then printf '/mnt/%s/%s\n' "$drive" "$rest"; else printf '%s\n' "$p"; fi
+      ;;
+    *)
+      printf '%s\n' "$p"
+      ;;
+  esac
+}
+
+_vg_config_hookdir() {
+  local cfg p
+  cfg="$1"
+  if [ -n "$cfg" ]; then
+    p="$(_vg_shell_path "$cfg")"
+    case "$p" in /*|[A-Za-z]:/*) printf '%s\n' "$p" ;; *) printf '%s/%s\n' "$ROOT" "$p" ;; esac
+  else
+    printf '%s/.git/hooks\n' "$ROOT"
+  fi
+}
+
+_vg_resolve_hookdir() {
+  local cfg raw
+  cfg="$1"
+  raw="$(git rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
+  raw="$(_vg_clean_path "$raw")"
+  if [ -n "$raw" ]; then
+    case "$raw" in
+      *[A-Za-z]:/*)
+        # Linux/WSL git treats a Windows-native core.hooksPath (D:\...) as repo-relative.
+        # Convert the config value directly instead of accepting a repo-prefixed nonsense path.
+        [ -n "$cfg" ] && { _vg_config_hookdir "$cfg"; return; }
+        ;;
+    esac
+    printf '%s\n' "$raw"
+    return
+  fi
+  _vg_config_hookdir "$cfg"
+}
 
 # Portable content hash: prefer sha256, fall back to git's blob hash (always present in a git hook).
 # Prints "<algo>:<hex>" so the installed hook verifies with the SAME algorithm. Never prints an empty hash.
@@ -32,6 +85,29 @@ _vg_hash() {
   h="$(git hash-object "$f" 2>/dev/null)"; [ -n "$h" ] && { echo "githash:$h"; return; }
   echo "unhashable"
 }
+
+# Resolve the ACTIVE hook directory the way GIT ITSELF does — respecting core.hooksPath — as an
+# absolute, FORWARD-SLASH path. We must write exactly where git reads: hand-parsing a Windows-native
+# `core.hooksPath` (backslashes) is not portable across bash-on-Windows variants (Git Bash vs WSL vs
+# pathconv-disabled) and could land the hardened hook somewhere git never reads while the OLD vulnerable
+# hook stays active — a false "installed" that leaves the RCE open (GPT-5.5 audit 2e-02). `git rev-parse
+# --git-path hooks` honors core.hooksPath; `--path-format=absolute` normalizes slashes for the shell.
+cur="$(git config --get core.hooksPath || true)"
+HOOKDIR="$(_vg_resolve_hookdir "$cur")"
+[ -n "$cur" ] && KIND="custom ($cur)" || KIND="default"
+mkdir -p "$HOOKDIR"
+HOOK="$HOOKDIR/pre-push"
+MARK="# >>> local gate >>>"
+END="# <<< local gate <<<"
+
+HOOK_REL=""
+case "$HOOK" in "$ROOT"/*) HOOK_REL="${HOOK#"$ROOT"/}" ;; esac
+if [ -n "$HOOK_REL" ] && git -C "$ROOT" ls-files --error-unmatch -- "$HOOK_REL" >/dev/null 2>&1; then
+  echo "[local-gate] ERROR: active pre-push hook is tracked by this repo: $HOOK_REL"
+  echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
+  echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
+  exit 1
+fi
 
 # Write the integrity pins to an UNtracked path inside the COMMON git dir — the same dir the shared hooks
 # live in, so one install covers every linked worktree (a per-worktree `--git-path` would not be found by a
@@ -46,31 +122,10 @@ PIN="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || git 
   # (real hash != "absent") → the fail-closed refuse fires. A repo that legitimately never has gate.json
   # stays green (absent == absent).
   echo "gate.json $(_vg_hash "$ROOT/$SPEC_REL")"
+  echo "install-gate.sh $(_vg_hash "$ROOT/$INSTALL_REL")"
+  echo "test-install-gate.sh $(_vg_hash "$ROOT/$TEST_REL")"
 } > "$PIN"
 echo "[local-gate] pinned gate integrity → $PIN"
-
-# Resolve the ACTIVE hook directory the way GIT ITSELF does — respecting core.hooksPath — as an
-# absolute, FORWARD-SLASH path. We must write exactly where git reads: hand-parsing a Windows-native
-# `core.hooksPath` (backslashes) is not portable across bash-on-Windows variants (Git Bash vs WSL vs
-# pathconv-disabled) and could land the hardened hook somewhere git never reads while the OLD vulnerable
-# hook stays active — a false "installed" that leaves the RCE open (GPT-5.5 audit 2e-02). `git rev-parse
-# --git-path hooks` honors core.hooksPath; `--path-format=absolute` normalizes slashes for the shell.
-cur="$(git config --get core.hooksPath || true)"
-HOOKDIR="$(git rev-parse --path-format=absolute --git-path hooks 2>/dev/null || true)"
-if [ -z "$HOOKDIR" ]; then
-  # Fallback for git < 2.31 (no --path-format): normalize the raw value deterministically.
-  if [ -n "$cur" ]; then
-    HOOKDIR="$(cygpath -u "$cur" 2>/dev/null || printf '%s' "$cur" | tr '\\' '/')"
-    case "$HOOKDIR" in /*|[A-Za-z]:/*) ;; *) HOOKDIR="$ROOT/$HOOKDIR" ;; esac  # relative → repo-rooted
-  else
-    HOOKDIR="$ROOT/.git/hooks"
-  fi
-fi
-[ -n "$cur" ] && KIND="custom ($cur)" || KIND="default"
-mkdir -p "$HOOKDIR"
-HOOK="$HOOKDIR/pre-push"
-MARK="# >>> local gate >>>"
-END="# <<< local gate <<<"
 
 # The verified delegate: check the tracked gate files against the install-time pins BEFORE running them.
 # This block is written into the UNtracked hook, so a branch cannot remove or weaken the check. Fail-closed:
@@ -97,6 +152,8 @@ while read -r __vg_name __vg_expect; do
   case "$__vg_name" in
     pre-push)  __vg_file="$__vg_root/.githooks/pre-push" ;;
     gate.json) __vg_file="$__vg_root/.gate/gate.json" ;;
+    install-gate.sh) __vg_file="$__vg_root/tools/install-gate.sh" ;;
+    test-install-gate.sh) __vg_file="$__vg_root/tools/test-install-gate.sh" ;;
     *) continue ;;
   esac
   __vg_got="$(__vg_hash "$__vg_file")"
@@ -131,7 +188,7 @@ chmod +x "$HOOK" 2>/dev/null || true
 # POST-INSTALL ASSERTION: confirm the gate is present at the hook path GIT WILL ACTUALLY USE. Because
 # HOOKDIR is git's own resolved hooks path, this holds by construction — but we verify rather than assume,
 # so a path-resolution quirk can never leave a false "installed" while the OLD (ungated) hook stays active.
-ACTIVE="$(git rev-parse --path-format=absolute --git-path hooks 2>/dev/null || printf '%s' "$HOOKDIR")/pre-push"
+ACTIVE="$(_vg_resolve_hookdir "$(git config --get core.hooksPath || true)")/pre-push"
 if ! grep -qF "$MARK" "$ACTIVE" 2>/dev/null; then
   echo "[local-gate] ERROR: post-install check FAILED — the gate is NOT at the active hook path git will run:"
   echo "[local-gate]   $ACTIVE"
