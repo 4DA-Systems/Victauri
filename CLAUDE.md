@@ -184,36 +184,32 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-06-20)
+## Current State (2026-07-08)
 
-### v0.8.5 — docs-honesty/correctness pass + `victauri check` tool-count fix
+### v0.8.6 — repo self-gate security hardening + advisory cleanup
 
-A "fix all known issues before release" pass. No public Rust API change; ships the unreleased
-`victauri check` tool-count fix from the 0.8.4 cycle plus a thorough documentation correctness +
-honesty sweep (two audit agents, every finding verified against the live code).
+Security-focused release prep for the repo-local Verax pre-push gate. No public Rust API change and no
+runtime plugin behavior change for Victauri users; the hardened files are developer tooling and are not
+included in the published crates.
 
-- **`victauri check` no longer prints `Tools:  ?`** (on main since the 0.8.4 cycle, first *published*
-  in 0.8.5). `get_plugin_info` reports the count nested at `tools.total`, but `cmd_check` read a flat
-  `tool_count` / bare-numeric `tools` — both miss. Extracted a tested `parse_tool_count` (reads
-  `tools.total`, legacy shapes as fallbacks); 2 unit tests.
-- **Documentation correctness (mdbook examples aren't doctested, so they had drifted).** Fixed
-  copy-paste-**panicking** examples (`detect_ghost_commands` results indexed by non-existent keys
-  `ghost_commands`/`ghosts` → `as_array().unwrap()` panics; corrected to `confirmed_ghosts` in README +
-  `testing.md` + `testing-tauri-apps.md`) and **won't-compile** examples: `eval_js` REST param
-  `expression`→`code`; the standalone `assert_json_*` helpers are SYNC and take `&Value` (were shown as
-  awaited client methods); `assert_windows_exist()` takes no args; `assert_dom_complete_under` takes a
-  `Duration`; `smoke_test()`/`smoke_test_with_config(cfg)` arity + `SmokeConfig.max_dom_complete_ms`
-  (not `max_load_ms`) + `SmokeReport::passed_count()/total_count()` (not `.passed/.total`);
-  `client.checkpoint`/`events_between`/`eval_js_in`/`register_command` don't exist (use the `recording`
-  tool / `dom_snapshot_for` / `webview_label` / `.commands(&[…])`); every `.build()` returns a `Result`
-  (snippets now `.unwrap()`); `tools-reference` `query_db`/`check_ipc_integrity` return-key lists
-  corrected.
-- **Public-claim honesty.** "the IPC history has no `eval_js` equivalent" was false (the IPC log is
-  derived from the page's `fetch` traffic) → reframed (db + registry are the AppHandle-only items; the
-  IPC log shares the webview's fate). "a CDP-class tool can't attach at all" softened to the accurate
-  "no Chrome DevTools Protocol surface" (WKWebView/WebKitGTK have their own inspector protocols). The
-  registry-enumeration claim now notes it covers the `#[inspectable]` subset + IPC-log mining.
-  (Supersedes the stale PR #17 honesty pass.)
+- **Integrity-pinned pre-push gate hardened after the 0.8.6 round-2 audit.** The release candidate
+  already pinned `.githooks/pre-push` and `.verax/gate.json` under `.git/verax-gate.pin`, including an
+  unconditional `gate.json absent` sentinel so add-after-install attacks fail closed. The audit pass found
+  one surviving bypass: if a maintainer had `core.hooksPath=.githooks`, the verifier was appended to the
+  tracked `.githooks/pre-push` file itself, so a hostile branch could replace that tracked hook and execute
+  on `git push` before any pin check. `tools/install-gate.sh` now refuses tracked active hook files and
+  tells maintainers to use untracked hook storage (`.git/hooks` or Husky-v9 `.husky/_`).
+- **Windows-native hook paths now normalize before install/assert.** Under Linux/WSL-style bash, Git can
+  read a configured `D:\...\hooks` path as a repo-prefixed pseudo-path. The installer now converts
+  Windows drive paths for the active shell before writing the hook and before the post-install assertion,
+  preventing false-success installs into paths Git will not execute.
+- **Pin coverage now includes gate helper scripts.** The installed verifier pins `.githooks/pre-push`,
+  `.verax/gate.json`, `tools/install-gate.sh`, and `tools/test-install-gate.sh`, so a fixed `gate.json`
+  command cannot run a branch-modified helper script. `tools/test-install-gate.sh` is now part of the
+  local Verax gate and covers default drift, add-after-install `gate.json`, tracked-hook refusal,
+  Windows-native path normalization, relative custom hooks, and Husky-v9 `.husky/_` hooks.
+- **Dependency advisory cleanup.** `Cargo.lock` bumps `crossbeam-epoch` 0.9.18 -> 0.9.20, clearing
+  RUSTSEC-2026-0204 on the Criterion/dev-dependency path. No Victauri runtime dependency path is added.
 
 ### v0.8.4 — CLI↔plugin version-skew compat + in-the-wild DX fixes
 
