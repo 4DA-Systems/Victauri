@@ -2,6 +2,12 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.8.6 (2026-07-08)
+
+- Version-synced with the Victauri 0.8.6 release (repo-local pre-push gate hardening across seven
+  adversarial audit rounds + RUSTSEC-2026-0204 cleared). No extension runtime code changes; the
+  extension talks to the embedded server, which carries the release.
+
 ## 0.8.5 (2026-06-20)
 
 - Version-synced with the Victauri 0.8.5 release (pre-publish adversarial audit hardening
