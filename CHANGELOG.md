@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.6] - 2026-07-08
+
+Security-focused release prep for the repo-local local pre-push gate. No public Rust API change and
+no runtime plugin behavior change for Victauri users; the hardened files are repo developer tooling and
+are not included in the published crates.
+
+### Security
+
+- **Closed a tracked `core.hooksPath` bypass in the gate installer.** If a maintainer had configured
+  `core.hooksPath=.githooks`, the installer wrote its verifier into the tracked `.githooks/pre-push`
+  file itself. A hostile branch could then replace that tracked hook and execute on `git push` before
+  any integrity check ran. The installer now refuses to install when Git's active `pre-push` hook path
+  is tracked by the repo, preserving the invariant that the verifier lives only in untracked hook
+  storage.
+- **Fixed Windows-native `core.hooksPath` normalization under Linux/WSL-style bash.** Git can report
+  a configured `D:\...\hooks` path as a repo-prefixed pseudo-path when that config is read by Linux Git
+  from a mounted Windows checkout. The installer now normalizes Windows drive paths for the active shell
+  before writing or asserting the hook location, preventing false-success installs into a path Git will
+  not execute.
+- **Expanded the integrity pin set for gate tooling.** The installed verifier now pins
+  `.githooks/pre-push`, `.gate/gate.json`, `tools/install-gate.sh`, and
+  `tools/test-install-gate.sh`, so the local gate cannot run a branch-modified helper script through a
+  fixed `gate.json` command.
+- **Retained the unconditional `.gate/gate.json` absent sentinel from the round-2 release candidate.**
+  A branch that adds `gate.json` after install still reads as drift and fails closed.
+
+### Added
+
+- **`tools/test-install-gate.sh` regression harness.** Covers default-hook drift, add-after-install
+  `gate.json`, tracked `.githooks` refusal, Windows-native hook path normalization, relative custom
+  hooks, and Husky-v9 `.husky/_` hooks. The local gate now includes this cheap installer harness
+  before the Rust fmt/clippy/test jobs.
+
+### Fixed
+
+- **Cleared `RUSTSEC-2026-0204` in the lockfile** by bumping `crossbeam-epoch` from `0.9.18` to
+  `0.9.20`. The dependency is reached through Criterion benchmarks/dev-dependencies, not Victauri
+  runtime code.
+
 ## [0.8.5] - 2026-06-20
 
 A "fix all known issues before release" pass: ships the `victauri check` tool-count fix that landed
@@ -1250,7 +1289,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.8.5...HEAD
+[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.8.6...HEAD
+[0.8.6]: https://github.com/4DA-Systems/victauri/compare/v0.8.5...v0.8.6
 [0.8.5]: https://github.com/4DA-Systems/victauri/compare/v0.8.4...v0.8.5
 [0.8.4]: https://github.com/4DA-Systems/victauri/compare/v0.8.3...v0.8.4
 [0.8.3]: https://github.com/4DA-Systems/victauri/compare/v0.8.2...v0.8.3
