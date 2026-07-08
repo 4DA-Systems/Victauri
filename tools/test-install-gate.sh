@@ -103,7 +103,7 @@ if bash tools/install-gate.sh > "$BASE/logs/tracked-install.out" 2>&1; then
   echo '[install-gate-test] tracked hooksPath install unexpectedly passed'
   exit 14
 fi
-assert_contains "$BASE/logs/tracked-install.out" 'active pre-push hook is tracked by this repo: .githooks/pre-push'
+assert_contains "$BASE/logs/tracked-install.out" 'tracked by this repo'
 ! grep -qF '# >>> local gate >>>' .githooks/pre-push || { echo '[install-gate-test] tracked hook was modified'; exit 15; }
 [ -z "$(git status --short)" ] || { echo '[install-gate-test] tracked hooksPath dirtied worktree'; git status --short; exit 16; }
 printf '[install-gate-test] tracked hooksPath refused\n'
@@ -117,7 +117,7 @@ if [ -d .GITHOOKS ]; then
     echo '[install-gate-test] case-folded tracked hooksPath install unexpectedly passed'
     exit 26
   fi
-  assert_contains "$BASE/logs/tracked-case-install.out" 'active pre-push hook is tracked by this repo:'
+  assert_contains "$BASE/logs/tracked-case-install.out" 'tracked by this repo'
   ! grep -qF '# >>> local gate >>>' .githooks/pre-push || { echo '[install-gate-test] case-folded tracked hook was modified'; exit 27; }
   [ -z "$(git status --short)" ] || { echo '[install-gate-test] case-folded tracked hooksPath dirtied worktree'; git status --short; exit 28; }
   printf '[install-gate-test] case-folded tracked hooksPath refused\n'
@@ -188,11 +188,42 @@ if git worktree add -q "$wt_dir" wt-branch 2>/dev/null; then
     if bash tools/install-gate.sh > "$BASE/logs/wt-install.out" 2>&1; then
       echo '[install-gate-test] linked-worktree case-fold install unexpectedly passed'; exit 30
     fi
-    assert_contains "$BASE/logs/wt-install.out" 'active pre-push hook is tracked by this repo:'
+    assert_contains "$BASE/logs/wt-install.out" 'tracked by this repo'
     printf '[install-gate-test] linked-worktree case-fold tracked hooksPath refused\n'
   else
     printf '[install-gate-test] linked-worktree case-fold skipped on case-sensitive filesystem\n'
   fi
 else
   printf '[install-gate-test] linked-worktree add unsupported — skipped\n'
+fi
+
+# R5-01: a repo-root path segment differing only by NON-ASCII case (Ü vs ü) defeated the ASCII-only
+# string matching in _vg_rel_under_root — an absolute core.hooksPath spelled with the case-variant aliased
+# the tracked .githooks/pre-push while the relative-path derivation returned empty, so the refusal was
+# skipped and install dirtied the tracked hook. The filesystem-identity check (git resolves the real dir)
+# is immune. Only meaningful on a filesystem that folds non-ASCII case (macOS/APFS, Windows/NTFS).
+uc_base="$BASE/uc"
+mkdir -p "$uc_base"
+if ( cd "$uc_base" && mkdir -p "ÜRepo" 2>/dev/null && [ -e "üRepo" ] ) 2>/dev/null; then
+  uc_repo="$uc_base/ÜRepo"; uc_alt="$uc_base/üRepo"
+  (
+    cd "$uc_repo" || exit 1
+    git init -q; git config user.email audit@example.test; git config user.name audit
+    mkdir -p tools .githooks .gate
+    cp "$ROOT/tools/install-gate.sh" tools/install-gate.sh
+    cp "$ROOT/tools/test-install-gate.sh" tools/test-install-gate.sh
+    cp "$ROOT/.githooks/pre-push" .githooks/pre-push
+    cp "$ROOT/.gate/gate.json" .gate/gate.json
+    chmod +x tools/install-gate.sh tools/test-install-gate.sh .githooks/pre-push
+    git add -A; git commit -qm init
+  ) >/dev/null 2>&1
+  cd "$uc_repo"
+  git config core.hooksPath "$uc_alt/.GITHOOKS"
+  if bash tools/install-gate.sh > "$BASE/logs/uc-install.out" 2>&1; then
+    echo '[install-gate-test] non-ASCII-case root install unexpectedly passed'; exit 32
+  fi
+  assert_contains "$BASE/logs/uc-install.out" 'tracked by this repo'
+  printf '[install-gate-test] non-ASCII-case root (R5-01) refused\n'
+else
+  printf '[install-gate-test] non-ASCII-case root (R5-01) skipped (FS does not fold non-ASCII case)\n'
 fi

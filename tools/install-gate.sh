@@ -163,6 +163,40 @@ HOOK="$HOOKDIR/pre-push"
 MARK="# >>> local gate >>>"
 END="# <<< local gate <<<"
 
+# Filesystem-IDENTITY tracked-hook check (PRIMARY) — immune to case/Unicode/symlink/path-spelling.
+# String matching on the hook path repeatedly missed aliases (R2/R3/R4/R5: ASCII-lowercase prefix, the
+# `--path-format` `[A-Za-z]:/` quirk, non-ASCII root case). Instead ask GIT, from INSIDE the resolved hook
+# dir, whether that dir is inside THIS repo and holds tracked content: git + the filesystem resolve the REAL
+# directory no matter how `core.hooksPath` spelled it (case, Unicode, symlink), and `-ef` compares
+# device+inode, not strings. A tracked hook dir is branch-controlled (a branch can add/replace its pre-push)
+# → refuse (GPT-5.5 audit R5-01).
+if [ -d "$HOOKDIR" ]; then
+  _vg_hd_top="$(git -C "$HOOKDIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  if [ -n "$_vg_hd_top" ] && [ "$_vg_hd_top" -ef "$ROOT" ] \
+     && [ -n "$(git -C "$HOOKDIR" ls-files 2>/dev/null | head -n 1)" ]; then
+    echo "[local-gate] ERROR: active pre-push hook directory is tracked by this repo (branch-controlled)."
+    echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
+    echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
+    exit 1
+  fi
+fi
+# FILE identity: the active hook FILE itself resolves (by device+inode) to a tracked file — e.g. an
+# untracked dir holding a `pre-push` symlinked to the tracked hook. Only tracked paths named `pre-push` can
+# match, so this is a tiny, spelling-proof set.
+if [ -e "$HOOK" ]; then
+  while IFS= read -r _vg_tf; do
+    [ -n "$_vg_tf" ] && [ -e "$ROOT/$_vg_tf" ] || continue
+    if [ "$HOOK" -ef "$ROOT/$_vg_tf" ]; then
+      echo "[local-gate] ERROR: active pre-push hook resolves to a tracked file ($_vg_tf) — tracked by this repo (branch-controlled)."
+      echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
+      echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
+      exit 1
+    fi
+  done < <(git -C "$ROOT" ls-files -- '*pre-push' 2>/dev/null)
+fi
+
+# Secondary net (index-only / not-yet-checked-out tracked hook, where the dir identity check above cannot
+# see a filesystem object): the original literal + icase pathspec check on the string-resolved relative path.
 HOOK_REL="$(_vg_rel_under_root "$HOOK" || true)"
 HOOKDIR_PHYS="$(cd "$HOOKDIR" 2>/dev/null && pwd -P || true)"
 HOOK_PHYS_REL=""
