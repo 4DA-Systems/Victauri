@@ -164,35 +164,54 @@ MARK="# >>> local gate >>>"
 END="# <<< local gate <<<"
 
 # Filesystem-IDENTITY tracked-hook check (PRIMARY) — immune to case/Unicode/symlink/path-spelling.
-# String matching on the hook path repeatedly missed aliases (R2/R3/R4/R5: ASCII-lowercase prefix, the
-# `--path-format` `[A-Za-z]:/` quirk, non-ASCII root case). Instead ask GIT, from INSIDE the resolved hook
-# dir, whether that dir is inside THIS repo and holds tracked content: git + the filesystem resolve the REAL
-# directory no matter how `core.hooksPath` spelled it (case, Unicode, symlink), and `-ef` compares
-# device+inode, not strings. A tracked hook dir is branch-controlled (a branch can add/replace its pre-push)
-# → refuse (GPT-5.5 audit R5-01).
+# String matching on the hook path repeatedly missed aliases (R2/R3/R4/R5). We use FILESYSTEM IDENTITY
+# (`-ef` = device+inode) + git's own resolution: git + the filesystem resolve the REAL object no matter how
+# `core.hooksPath` spelled it (case, Unicode, symlink, `./`, `//`). Branch-controlled = a tracked dir/file in
+# THIS repo, a SUBMODULE of this repo, or a tracked GITLINK (GPT-5.5 audits R5-01, R6-01, R6-02). Refuse all.
+_vg_refuse_hook() {
+  echo "[local-gate] ERROR: $1"
+  echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
+  echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
+  exit 1
+}
 if [ -d "$HOOKDIR" ]; then
+  # (a) hook dir is inside THIS repo's working tree and git tracks content in it
   _vg_hd_top="$(git -C "$HOOKDIR" rev-parse --show-toplevel 2>/dev/null || true)"
   if [ -n "$_vg_hd_top" ] && [ "$_vg_hd_top" -ef "$ROOT" ] \
      && [ -n "$(git -C "$HOOKDIR" ls-files 2>/dev/null | head -n 1)" ]; then
-    echo "[local-gate] ERROR: active pre-push hook directory is tracked by this repo (branch-controlled)."
-    echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
-    echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
-    exit 1
+    _vg_refuse_hook "active pre-push hook directory is tracked by this repo (branch-controlled)."
+  fi
+  # (b) hook dir is inside a SUBMODULE of this repo — its own --show-toplevel is the submodule (so (a) misses
+  # it), but its --show-superproject-working-tree is $ROOT. The gitlink + submodule content are
+  # branch-controlled (R6-01).
+  _vg_super="$(git -C "$HOOKDIR" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+  if [ -n "$_vg_super" ] && [ "$_vg_super" -ef "$ROOT" ]; then
+    _vg_refuse_hook "active pre-push hook directory is inside a submodule tracked by this repo (branch-controlled)."
   fi
 fi
-# FILE identity: the active hook FILE itself resolves (by device+inode) to a tracked file — e.g. an
-# untracked dir holding a `pre-push` symlinked to the tracked hook. Only tracked paths named `pre-push` can
-# match, so this is a tiny, spelling-proof set.
+# (c) hook dir IS a tracked gitlink (mode 160000) of this repo — a submodule that may not be checked out yet;
+# a later `git submodule update` makes it branch-controlled, so fail closed now (R6-01). Fast-skipped when
+# the repo declares no submodules. `--stage -z` gives raw (unquoted) paths.
+if [ -f "$ROOT/.gitmodules" ]; then
+  while IFS= read -r -d '' _vg_rec; do
+    case "$_vg_rec" in 160000\ *) ;; *) continue ;; esac
+    _vg_gl="${_vg_rec#*$'\t'}"
+    [ -n "$_vg_gl" ] && [ -e "$ROOT/$_vg_gl" ] || continue
+    if [ "$HOOKDIR" -ef "$ROOT/$_vg_gl" ]; then
+      _vg_refuse_hook "active pre-push hook directory is a tracked submodule (gitlink) of this repo (branch-controlled)."
+    fi
+  done < <(git -C "$ROOT" ls-files --stage -z 2>/dev/null)
+fi
+# (d) FILE identity: the active hook FILE resolves (by device+inode) to a tracked file — e.g. an untracked
+# dir holding a `pre-push` symlinked to a tracked hook. `-z` yields RAW paths: git QUOTES non-ASCII paths by
+# default (core.quotePath), which made `[ -e ]` miss the target (R6-02).
 if [ -e "$HOOK" ]; then
-  while IFS= read -r _vg_tf; do
+  while IFS= read -r -d '' _vg_tf; do
     [ -n "$_vg_tf" ] && [ -e "$ROOT/$_vg_tf" ] || continue
     if [ "$HOOK" -ef "$ROOT/$_vg_tf" ]; then
-      echo "[local-gate] ERROR: active pre-push hook resolves to a tracked file ($_vg_tf) — tracked by this repo (branch-controlled)."
-      echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
-      echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
-      exit 1
+      _vg_refuse_hook "active pre-push hook resolves to a tracked file ($_vg_tf) — tracked by this repo (branch-controlled)."
     fi
-  done < <(git -C "$ROOT" ls-files -- '*pre-push' 2>/dev/null)
+  done < <(git -C "$ROOT" ls-files -z -- '*pre-push' 2>/dev/null)
 fi
 
 # Secondary net (index-only / not-yet-checked-out tracked hook, where the dir identity check above cannot

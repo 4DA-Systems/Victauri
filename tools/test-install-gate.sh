@@ -103,7 +103,7 @@ if bash tools/install-gate.sh > "$BASE/logs/tracked-install.out" 2>&1; then
   echo '[install-gate-test] tracked hooksPath install unexpectedly passed'
   exit 14
 fi
-assert_contains "$BASE/logs/tracked-install.out" 'tracked by this repo'
+assert_contains "$BASE/logs/tracked-install.out" 'Refusing to install the verifier'
 ! grep -qF '# >>> local gate >>>' .githooks/pre-push || { echo '[install-gate-test] tracked hook was modified'; exit 15; }
 [ -z "$(git status --short)" ] || { echo '[install-gate-test] tracked hooksPath dirtied worktree'; git status --short; exit 16; }
 printf '[install-gate-test] tracked hooksPath refused\n'
@@ -117,7 +117,7 @@ if [ -d .GITHOOKS ]; then
     echo '[install-gate-test] case-folded tracked hooksPath install unexpectedly passed'
     exit 26
   fi
-  assert_contains "$BASE/logs/tracked-case-install.out" 'tracked by this repo'
+  assert_contains "$BASE/logs/tracked-case-install.out" 'Refusing to install the verifier'
   ! grep -qF '# >>> local gate >>>' .githooks/pre-push || { echo '[install-gate-test] case-folded tracked hook was modified'; exit 27; }
   [ -z "$(git status --short)" ] || { echo '[install-gate-test] case-folded tracked hooksPath dirtied worktree'; git status --short; exit 28; }
   printf '[install-gate-test] case-folded tracked hooksPath refused\n'
@@ -188,7 +188,7 @@ if git worktree add -q "$wt_dir" wt-branch 2>/dev/null; then
     if bash tools/install-gate.sh > "$BASE/logs/wt-install.out" 2>&1; then
       echo '[install-gate-test] linked-worktree case-fold install unexpectedly passed'; exit 30
     fi
-    assert_contains "$BASE/logs/wt-install.out" 'tracked by this repo'
+    assert_contains "$BASE/logs/wt-install.out" 'Refusing to install the verifier'
     printf '[install-gate-test] linked-worktree case-fold tracked hooksPath refused\n'
   else
     printf '[install-gate-test] linked-worktree case-fold skipped on case-sensitive filesystem\n'
@@ -222,8 +222,32 @@ if ( cd "$uc_base" && mkdir -p "ÜRepo" 2>/dev/null && [ -e "üRepo" ] ) 2>/dev/
   if bash tools/install-gate.sh > "$BASE/logs/uc-install.out" 2>&1; then
     echo '[install-gate-test] non-ASCII-case root install unexpectedly passed'; exit 32
   fi
-  assert_contains "$BASE/logs/uc-install.out" 'tracked by this repo'
+  assert_contains "$BASE/logs/uc-install.out" 'Refusing to install the verifier'
   printf '[install-gate-test] non-ASCII-case root (R5-01) refused\n'
 else
   printf '[install-gate-test] non-ASCII-case root (R5-01) skipped (FS does not fold non-ASCII case)\n'
+fi
+
+# R6-01: `.githooks` as a tracked SUBMODULE. The submodule's own git toplevel is NOT $ROOT, so the plain
+# dir-identity check misses it, but its content is branch-controlled via the gitlink. Must refuse.
+sub_src="$BASE/subhooks-src"
+mkdir -p "$sub_src"
+(
+  cd "$sub_src" || exit 1
+  git init -q; git config user.email audit@example.test; git config user.name audit
+  printf '#!/bin/bash\necho PWNED\nexit 0\n' > pre-push; chmod +x pre-push
+  git add -A; git commit -qm subinit
+) >/dev/null 2>&1
+make_repo "$BASE/submod" yes
+cd "$BASE/submod"
+if git -c protocol.file.allow=always submodule add -q "$sub_src" .subhooks >/dev/null 2>&1; then
+  git -c protocol.file.allow=always commit -qm "add submodule hooks" >/dev/null 2>&1
+  git config core.hooksPath .subhooks
+  if bash tools/install-gate.sh > "$BASE/logs/submod-install.out" 2>&1; then
+    echo '[install-gate-test] submodule hook dir install unexpectedly passed'; exit 34
+  fi
+  assert_contains "$BASE/logs/submod-install.out" 'Refusing to install the verifier'
+  printf '[install-gate-test] submodule hook dir (R6-01) refused\n'
+else
+  printf '[install-gate-test] submodule hook dir (R6-01) skipped (submodule add unsupported)\n'
 fi
