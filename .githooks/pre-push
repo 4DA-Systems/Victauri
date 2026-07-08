@@ -12,6 +12,11 @@
 # so a missing binary can never silently let an UN-GATED push through. Pick fail-open for convenience, REQUIRE
 # for guaranteed enforcement.
 #   BYPASS: `git push --no-verify` (git-native) or `LOCAL_GATE_SKIP=1`.
+#
+# SECURITY SCOPE: GATE 2 runs `cargo clippy`/`cargo test` on the WORKING TREE, which COMPILES it (build.rs +
+# proc-macros + test code execute). The install-time integrity pin protects THIS script + gate.json from
+# branch tampering, but running the gate on a hostile checked-out branch is still arbitrary code execution by
+# construction. This gate is for pushing code you authored/trust — not a sandbox for untrusted branches.
 set -u
 REQUIRE="${LOCAL_GATE_REQUIRE:-0}"
 [ "${LOCAL_GATE_SKIP:-0}" = "1" ] && { echo "[local-gate] bypassed (LOCAL_GATE_SKIP=1)"; exit 0; }
