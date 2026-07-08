@@ -170,3 +170,29 @@ bash tools/install-gate.sh > "$BASE/logs/husky-install.out"
 [ -f .husky/_/pre-push ] || { echo '[install-gate-test] Husky hook not installed'; exit 20; }
 assert_contains .husky/_/pre-push '# >>> local gate >>>'
 printf '[install-gate-test] Husky-v9 hooksPath installed\n'
+
+# R4-01: in a LINKED worktree the git common dir can live on a DIFFERENT filesystem than the worktree.
+# Case-sensitivity must be decided on the WORKTREE's FS (which hosts the tracked .githooks), not the common
+# dir — otherwise a case-insensitive worktree whose common dir is case-sensitive mis-detects "sensitive",
+# drops the icase check, and `.GITHOOKS` aliases the tracked hook. We can't portably force the cross-FS split
+# here, but the fix tests the tracked hook directly (never the common dir), so the linked-worktree STRUCTURE
+# is the regression: a case-folded tracked hooksPath inside a linked worktree must still refuse.
+make_repo "$BASE/wt-base" yes
+cd "$BASE/wt-base"
+git branch -q wt-branch
+wt_dir="$BASE/wt-linked"
+if git worktree add -q "$wt_dir" wt-branch 2>/dev/null; then
+  cd "$wt_dir"
+  if [ -d .GITHOOKS ]; then
+    git config core.hooksPath .GITHOOKS
+    if bash tools/install-gate.sh > "$BASE/logs/wt-install.out" 2>&1; then
+      echo '[install-gate-test] linked-worktree case-fold install unexpectedly passed'; exit 30
+    fi
+    assert_contains "$BASE/logs/wt-install.out" 'active pre-push hook is tracked by this repo:'
+    printf '[install-gate-test] linked-worktree case-fold tracked hooksPath refused\n'
+  else
+    printf '[install-gate-test] linked-worktree case-fold skipped on case-sensitive filesystem\n'
+  fi
+else
+  printf '[install-gate-test] linked-worktree add unsupported — skipped\n'
+fi

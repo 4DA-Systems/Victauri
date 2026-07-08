@@ -65,31 +65,29 @@ _vg_lower() {
 }
 
 _vg_case_insensitive_paths() {
-  local configured probe_dir probe_name probe_upper
+  local up
   if [ -n "${VG_CASE_INSENSITIVE:-}" ]; then
     [ "$VG_CASE_INSENSITIVE" = 1 ] && return 0 || return 1
   fi
 
-  configured="$(git -C "$ROOT" config --bool core.ignorecase 2>/dev/null || true)"
-  [ "$configured" = "true" ] && { VG_CASE_INSENSITIVE=1; return 0; }
-
-  probe_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || printf '%s/.git' "$ROOT")"
-  probe_dir="$(_vg_clean_path "$probe_dir")"
-  probe_name="vg-case-probe-$$"
-  probe_upper="$(printf '%s' "$probe_name" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
-  rm -f "$probe_dir/$probe_name" "$probe_dir/$probe_upper" 2>/dev/null || true
-  # FAIL-CLOSED on uncertainty: if we cannot write the probe we cannot RULE OUT a case-insensitive FS,
-  # so assume insensitive (run the icase tracked-hook check) rather than assume sensitive and DROP it —
-  # otherwise a probe-write failure on a case-insensitive FS silently reopens the R3-01 case-fold bypass.
-  : > "$probe_dir/$probe_name" 2>/dev/null || { VG_CASE_INSENSITIVE=1; return 0; }
-  if [ -e "$probe_dir/$probe_upper" ]; then
-    rm -f "$probe_dir/$probe_name" "$probe_dir/$probe_upper" 2>/dev/null || true
-    VG_CASE_INSENSITIVE=1
-    return 0
+  # Decide case-folding on the WORKTREE filesystem that hosts the protected tracked hook — NOT on
+  # `--git-common-dir`. A LINKED worktree can place `.githooks` on a case-INsensitive volume while the git
+  # common dir lives on a case-SENSITIVE one; probing the common dir then mis-detects "case-sensitive",
+  # drops the `:(icase)` tracked-hook check, and `.GITHOOKS` aliases the tracked `.githooks/pre-push`
+  # (GPT-5.5 audit R4-01, repro: common dir on /tmp, worktree on /mnt/d). The tracked hook ($GATE_REL) is
+  # GUARANTEED to exist here (checked at the top of the script), so whether an alternate-case spelling of it
+  # ALSO resolves is a definitive, write-free test of THIS volume's case behavior — no probe, no wrong-FS.
+  up="$(printf '%s' "$GATE_REL" | tr 'a-z' 'A-Z')"
+  if [ -e "$ROOT/$GATE_REL" ] && [ "$up" != "$GATE_REL" ]; then
+    if [ -e "$ROOT/$up" ]; then VG_CASE_INSENSITIVE=1; return 0; fi
+    VG_CASE_INSENSITIVE=0; return 1
   fi
-  rm -f "$probe_dir/$probe_name" "$probe_dir/$probe_upper" 2>/dev/null || true
-  VG_CASE_INSENSITIVE=0
-  return 1
+
+  # Defensive fallback (only reachable if the protected path is unexpectedly absent): git's own view, else
+  # FAIL-CLOSED to insensitive (run the icase check) so uncertainty never DROPS protection.
+  [ "$(git -C "$ROOT" config --bool core.ignorecase 2>/dev/null || true)" = "true" ] && { VG_CASE_INSENSITIVE=1; return 0; }
+  VG_CASE_INSENSITIVE=1
+  return 0
 }
 
 _vg_rel_under_root() {
