@@ -251,3 +251,51 @@ if git -c protocol.file.allow=always submodule add -q "$sub_src" .subhooks >/dev
 else
   printf '[install-gate-test] submodule hook dir (R6-01) skipped (submodule add unsupported)\n'
 fi
+
+# R7: nested submodule hook dirs must walk the full superproject chain. Git reports the immediate parent
+# submodule first, not the root repo, but the root gitlink still controls the reachable hook content.
+outer_src="$BASE/nested-outer-src"
+mkdir -p "$outer_src"
+(
+  cd "$outer_src" || exit 1
+  git init -q; git config user.email audit@example.test; git config user.name audit
+  git -c protocol.file.allow=always submodule add -q "$sub_src" nested
+  git commit -qm outerinit
+) >/dev/null 2>&1
+make_repo "$BASE/nested-submod" yes
+cd "$BASE/nested-submod"
+if git -c protocol.file.allow=always submodule add -q "$outer_src" outer >/dev/null 2>&1 \
+   && git -c protocol.file.allow=always commit -qm "add outer submodule" >/dev/null 2>&1 \
+   && git -c protocol.file.allow=always submodule update --init --recursive >/dev/null 2>&1; then
+  git config core.hooksPath outer/nested
+  if bash tools/install-gate.sh > "$BASE/logs/nested-submod-install.out" 2>&1; then
+    echo '[install-gate-test] nested submodule hook dir install unexpectedly passed'; exit 36
+  fi
+  assert_contains "$BASE/logs/nested-submod-install.out" 'Refusing to install the verifier'
+  ! grep -qF '# >>> verax local gate >>>' outer/nested/pre-push || { echo '[install-gate-test] nested submodule hook was modified'; exit 37; }
+  printf '[install-gate-test] nested submodule hook dir (R7) refused\n'
+else
+  printf '[install-gate-test] nested submodule hook dir (R7) skipped (recursive submodule unsupported)\n'
+fi
+
+# R7: the active hook is always named pre-push, but it may be a symlink to a tracked file with another
+# basename. The identity check must scan all tracked files, not only tracked paths matching *pre-push.
+make_repo "$BASE/symlink-target" yes
+cd "$BASE/symlink-target"
+printf '#!/bin/bash\necho TRACKED_PAYLOAD\n' > .githooks/payload
+chmod +x .githooks/payload
+git add .githooks/payload
+git commit -qm "add tracked hook payload"
+git config core.hooksPath custom-hooks
+mkdir -p custom-hooks
+if ln -s ../.githooks/payload custom-hooks/pre-push 2>/dev/null && [ -L custom-hooks/pre-push ]; then
+  if bash tools/install-gate.sh > "$BASE/logs/symlink-target-install.out" 2>&1; then
+    echo '[install-gate-test] symlinked tracked hook target install unexpectedly passed'; exit 38
+  fi
+  assert_contains "$BASE/logs/symlink-target-install.out" 'Refusing to install the verifier'
+  ! grep -qF '# >>> verax local gate >>>' .githooks/payload || { echo '[install-gate-test] symlink target was modified'; exit 39; }
+  git diff --quiet -- .githooks/payload || { echo '[install-gate-test] symlink target dirtied worktree'; exit 40; }
+  printf '[install-gate-test] symlinked tracked hook target (R7) refused\n'
+else
+  printf '[install-gate-test] symlinked tracked hook target (R7) skipped (symlink unsupported)\n'
+fi
