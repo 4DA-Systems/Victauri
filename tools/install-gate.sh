@@ -16,6 +16,11 @@
 #   tracked gate file no longer matches its pin. Legitimate gate changes surface as a loud "re-run
 #   tools/install-gate.sh to re-pin" prompt after you have reviewed the diff — an attacker's silent swap cannot
 #   execute.
+#   SCOPE (do not overclaim): the pin closes the gate-SCRIPT-tampering vector (a branch making `git push`
+#   run its OWN command with no build). It does NOT — and cannot — make it safe to push a HOSTILE branch,
+#   because the gate's own trusted job runs `cargo clippy`/`cargo test` on the working tree, which COMPILES
+#   it (build.rs + proc-macros + test code = arbitrary execution). This gate protects a developer pushing
+#   code they authored/trust; it is not a sandbox for pushing a branch you would not already build/run.
 set -e
 ROOT="$(git rev-parse --show-toplevel)"
 GATE_REL=".githooks/pre-push"
