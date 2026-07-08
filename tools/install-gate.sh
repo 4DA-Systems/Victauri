@@ -182,36 +182,44 @@ if [ -d "$HOOKDIR" ]; then
     _vg_refuse_hook "active pre-push hook directory is tracked by this repo (branch-controlled)."
   fi
   # (b) hook dir is inside a SUBMODULE of this repo — its own --show-toplevel is the submodule (so (a) misses
-  # it), but its --show-superproject-working-tree is $ROOT. The gitlink + submodule content are
-  # branch-controlled (R6-01).
-  _vg_super="$(git -C "$HOOKDIR" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
-  if [ -n "$_vg_super" ] && [ "$_vg_super" -ef "$ROOT" ]; then
-    _vg_refuse_hook "active pre-push hook directory is inside a submodule tracked by this repo (branch-controlled)."
-  fi
+  # it). Walk the whole superproject chain: a nested submodule reports its immediate parent first, not $ROOT,
+  # but the root gitlink still branch-controls the reachable hook content.
+  _vg_subdir="$HOOKDIR"
+  _vg_depth=0
+  while :; do
+    _vg_super="$(git -C "$_vg_subdir" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+    [ -n "$_vg_super" ] || break
+    if [ "$_vg_super" -ef "$ROOT" ]; then
+      _vg_refuse_hook "active pre-push hook directory is inside a submodule tracked by this repo (branch-controlled)."
+    fi
+    [ "$_vg_super" -ef "$_vg_subdir" ] && break
+    _vg_subdir="$_vg_super"
+    _vg_depth=$((_vg_depth + 1))
+    [ "$_vg_depth" -le 32 ] || _vg_refuse_hook "active pre-push hook directory is inside an unusually deep submodule chain; refusing to avoid missing branch-controlled content."
+  done
 fi
 # (c) hook dir IS a tracked gitlink (mode 160000) of this repo — a submodule that may not be checked out yet;
-# a later `git submodule update` makes it branch-controlled, so fail closed now (R6-01). Fast-skipped when
-# the repo declares no submodules. `--stage -z` gives raw (unquoted) paths.
-if [ -f "$ROOT/.gitmodules" ]; then
-  while IFS= read -r -d '' _vg_rec; do
-    case "$_vg_rec" in 160000\ *) ;; *) continue ;; esac
-    _vg_gl="${_vg_rec#*$'\t'}"
-    [ -n "$_vg_gl" ] && [ -e "$ROOT/$_vg_gl" ] || continue
-    if [ "$HOOKDIR" -ef "$ROOT/$_vg_gl" ]; then
-      _vg_refuse_hook "active pre-push hook directory is a tracked submodule (gitlink) of this repo (branch-controlled)."
-    fi
-  done < <(git -C "$ROOT" ls-files --stage -z 2>/dev/null)
-fi
+# a later `git submodule update` makes it branch-controlled, so fail closed now (R6-01). Do not trust
+# `.gitmodules` as the enumerator: a branch can create a bare gitlink or omit the module entry. `--stage -z`
+# gives raw (unquoted) paths.
+while IFS= read -r -d '' _vg_rec; do
+  case "$_vg_rec" in 160000\ *) ;; *) continue ;; esac
+  _vg_gl="${_vg_rec#*$'\t'}"
+  [ -n "$_vg_gl" ] && [ -e "$ROOT/$_vg_gl" ] || continue
+  if [ "$HOOKDIR" -ef "$ROOT/$_vg_gl" ]; then
+    _vg_refuse_hook "active pre-push hook directory is a tracked submodule (gitlink) of this repo (branch-controlled)."
+  fi
+done < <(git -C "$ROOT" ls-files --stage -z 2>/dev/null)
 # (d) FILE identity: the active hook FILE resolves (by device+inode) to a tracked file — e.g. an untracked
-# dir holding a `pre-push` symlinked to a tracked hook. `-z` yields RAW paths: git QUOTES non-ASCII paths by
-# default (core.quotePath), which made `[ -e ]` miss the target (R6-02).
+# dir holding a `pre-push` symlinked to a tracked hook with any basename. `-z` yields RAW paths: git QUOTES
+# non-ASCII paths by default (core.quotePath), which made `[ -e ]` miss the target (R6-02).
 if [ -e "$HOOK" ]; then
   while IFS= read -r -d '' _vg_tf; do
     [ -n "$_vg_tf" ] && [ -e "$ROOT/$_vg_tf" ] || continue
     if [ "$HOOK" -ef "$ROOT/$_vg_tf" ]; then
       _vg_refuse_hook "active pre-push hook resolves to a tracked file ($_vg_tf) — tracked by this repo (branch-controlled)."
     fi
-  done < <(git -C "$ROOT" ls-files -z -- '*pre-push' 2>/dev/null)
+  done < <(git -C "$ROOT" ls-files -z 2>/dev/null)
 fi
 
 # Secondary net (index-only / not-yet-checked-out tracked hook, where the dir identity check above cannot
