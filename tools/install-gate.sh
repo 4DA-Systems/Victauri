@@ -55,6 +55,66 @@ _vg_config_hookdir() {
   fi
 }
 
+_vg_lower() {
+  printf '%s' "$1" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz'
+}
+
+_vg_case_insensitive_paths() {
+  local configured probe_dir probe_name probe_upper
+  if [ -n "${VG_CASE_INSENSITIVE:-}" ]; then
+    [ "$VG_CASE_INSENSITIVE" = 1 ] && return 0 || return 1
+  fi
+
+  configured="$(git -C "$ROOT" config --bool core.ignorecase 2>/dev/null || true)"
+  [ "$configured" = "true" ] && { VG_CASE_INSENSITIVE=1; return 0; }
+
+  probe_dir="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || printf '%s/.git' "$ROOT")"
+  probe_dir="$(_vg_clean_path "$probe_dir")"
+  probe_name="vg-case-probe-$$"
+  probe_upper="$(printf '%s' "$probe_name" | tr 'abcdefghijklmnopqrstuvwxyz' 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')"
+  rm -f "$probe_dir/$probe_name" "$probe_dir/$probe_upper" 2>/dev/null || true
+  # FAIL-CLOSED on uncertainty: if we cannot write the probe we cannot RULE OUT a case-insensitive FS,
+  # so assume insensitive (run the icase tracked-hook check) rather than assume sensitive and DROP it —
+  # otherwise a probe-write failure on a case-insensitive FS silently reopens the R3-01 case-fold bypass.
+  : > "$probe_dir/$probe_name" 2>/dev/null || { VG_CASE_INSENSITIVE=1; return 0; }
+  if [ -e "$probe_dir/$probe_upper" ]; then
+    rm -f "$probe_dir/$probe_name" "$probe_dir/$probe_upper" 2>/dev/null || true
+    VG_CASE_INSENSITIVE=1
+    return 0
+  fi
+  rm -f "$probe_dir/$probe_name" "$probe_dir/$probe_upper" 2>/dev/null || true
+  VG_CASE_INSENSITIVE=0
+  return 1
+}
+
+_vg_rel_under_root() {
+  local path root path_l root_l root_len
+  path="$(_vg_clean_path "$1")"
+  root="$(_vg_clean_path "$ROOT")"
+  case "$path" in
+    "$root"/*) printf '%s\n' "${path#"$root"/}"; return 0 ;;
+  esac
+  if _vg_case_insensitive_paths; then
+    path_l="$(_vg_lower "$path")"
+    root_l="$(_vg_lower "$root")"
+    case "$path_l" in
+      "$root_l"/*)
+        root_len=${#root}
+        printf '%s\n' "${path:$((root_len + 1))}"
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
+_vg_tracked_path() {
+  local rel="$1"
+  git -C "$ROOT" ls-files --error-unmatch -- ":(literal)$rel" >/dev/null 2>&1 && return 0
+  _vg_case_insensitive_paths && git -C "$ROOT" ls-files --error-unmatch -- ":(icase,literal)$rel" >/dev/null 2>&1 && return 0
+  return 1
+}
+
 _vg_resolve_hookdir() {
   local cfg raw
   cfg="$1"
@@ -100,14 +160,19 @@ HOOK="$HOOKDIR/pre-push"
 MARK="# >>> local gate >>>"
 END="# <<< local gate <<<"
 
-HOOK_REL=""
-case "$HOOK" in "$ROOT"/*) HOOK_REL="${HOOK#"$ROOT"/}" ;; esac
-if [ -n "$HOOK_REL" ] && git -C "$ROOT" ls-files --error-unmatch -- "$HOOK_REL" >/dev/null 2>&1; then
-  echo "[local-gate] ERROR: active pre-push hook is tracked by this repo: $HOOK_REL"
-  echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
-  echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
-  exit 1
-fi
+HOOK_REL="$(_vg_rel_under_root "$HOOK" || true)"
+HOOKDIR_PHYS="$(cd "$HOOKDIR" 2>/dev/null && pwd -P || true)"
+HOOK_PHYS_REL=""
+[ -n "$HOOKDIR_PHYS" ] && HOOK_PHYS_REL="$(_vg_rel_under_root "$HOOKDIR_PHYS/pre-push" || true)"
+for __vg_hook_rel in "$HOOK_REL" "$HOOK_PHYS_REL"; do
+  [ -n "$__vg_hook_rel" ] || continue
+  if _vg_tracked_path "$__vg_hook_rel"; then
+    echo "[local-gate] ERROR: active pre-push hook is tracked by this repo: $__vg_hook_rel"
+    echo "[local-gate]   Refusing to install the verifier into branch-controlled hook content."
+    echo "[local-gate]   Set core.hooksPath to an untracked hook directory (for example .git/hooks or .husky/_), then re-run this script."
+    exit 1
+  fi
+done
 
 # Write the integrity pins to an UNtracked path inside the COMMON git dir — the same dir the shared hooks
 # live in, so one install covers every linked worktree (a per-worktree `--git-path` would not be found by a

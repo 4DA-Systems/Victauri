@@ -81,6 +81,20 @@ fi
 assert_contains "$BASE/logs/absent-hook.out" 'REFUSING: gate.json changed since install'
 printf '[install-gate-test] add-after-install blocked\n'
 
+# Gate helper drift must block before .githooks/pre-push can run branch-controlled helper code.
+make_repo "$BASE/helper-drift" yes
+cd "$BASE/helper-drift"
+bash tools/install-gate.sh > "$BASE/logs/helper-install.out"
+printf '#!/bin/bash\necho PWNED > "$PWD/pwned"\nexit 0\n' > tools/test-install-gate.sh
+chmod +x tools/test-install-gate.sh
+if bash .git/hooks/pre-push > "$BASE/logs/helper-hook.out" 2>&1; then
+  echo '[install-gate-test] helper drift unexpectedly passed'
+  exit 24
+fi
+[ ! -f pwned ] || { echo '[install-gate-test] helper drift executed malicious helper'; exit 25; }
+assert_contains "$BASE/logs/helper-hook.out" 'REFUSING: test-install-gate.sh changed since install'
+printf '[install-gate-test] helper drift blocked\n'
+
 # A tracked active hook path cannot host the verifier; Git would execute branch-controlled content first.
 make_repo "$BASE/tracked-hooks" yes
 cd "$BASE/tracked-hooks"
@@ -93,6 +107,23 @@ assert_contains "$BASE/logs/tracked-install.out" 'active pre-push hook is tracke
 ! grep -qF '# >>> local gate >>>' .githooks/pre-push || { echo '[install-gate-test] tracked hook was modified'; exit 15; }
 [ -z "$(git status --short)" ] || { echo '[install-gate-test] tracked hooksPath dirtied worktree'; git status --short; exit 16; }
 printf '[install-gate-test] tracked hooksPath refused\n'
+
+# A case-folded spelling of a tracked hook path is still tracked on case-insensitive filesystems.
+make_repo "$BASE/tracked-hooks-case" yes
+cd "$BASE/tracked-hooks-case"
+git config core.hooksPath .GITHOOKS
+if [ -d .GITHOOKS ]; then
+  if bash tools/install-gate.sh > "$BASE/logs/tracked-case-install.out" 2>&1; then
+    echo '[install-gate-test] case-folded tracked hooksPath install unexpectedly passed'
+    exit 26
+  fi
+  assert_contains "$BASE/logs/tracked-case-install.out" 'active pre-push hook is tracked by this repo:'
+  ! grep -qF '# >>> local gate >>>' .githooks/pre-push || { echo '[install-gate-test] case-folded tracked hook was modified'; exit 27; }
+  [ -z "$(git status --short)" ] || { echo '[install-gate-test] case-folded tracked hooksPath dirtied worktree'; git status --short; exit 28; }
+  printf '[install-gate-test] case-folded tracked hooksPath refused\n'
+else
+  printf '[install-gate-test] case-folded tracked hooksPath skipped on case-sensitive filesystem\n'
+fi
 
 # Windows-native absolute core.hooksPath should resolve to the real shell path when the platform exposes one.
 make_repo "$BASE/winpath" yes
