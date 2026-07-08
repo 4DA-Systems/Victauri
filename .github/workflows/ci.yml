@@ -73,6 +73,14 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/check-doc-counts.sh
 
+      # Enforce the pre-push gate installer's security regressions in CI (not just the local hook). Runs on
+      # all 3 OSes so the platform-gated cases actually execute somewhere: macOS exercises real symlinks +
+      # case-insensitive folding (R6-02/R7-02, R3/R4/R5 case-fold), Linux exercises real symlinks on a
+      # case-sensitive FS, Windows exercises case-insensitive NTFS. Seven adversarial rounds hardened this
+      # file; this keeps the bypasses (R2..R7) from silently regressing.
+      - name: Gate installer integrity tests
+        run: bash tools/test-install-gate.sh
+
   test:
     name: Test
     runs-on: ${{ matrix.os }}
