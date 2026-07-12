@@ -892,20 +892,27 @@ fn token_for_port(servers: &[ServerInfo], port: u16) -> Option<String> {
         .and_then(|server| server.token.clone())
 }
 
+/// Shared, warm HTTP client for `/health` probes. Built ONCE (rebuilding per call incurred
+/// cold-start latency that made the FIRST probe against a live server intermittently exceed a
+/// tight timeout — so discovery missed a running app on first contact). The CONNECT is bounded
+/// tightly so a closed/filtered local port fast-fails (Windows does not always send a prompt
+/// RST for a closed loopback port), while the total timeout stays generous: a live /health
+/// answers in <50ms, so the larger budget only ever applies to the rare connected-but-
+/// unresponsive reused port.
+fn health_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(1200))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
 async fn health_ok(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
-    // A live local Victauri answers /health in well under 50ms. Bound the CONNECT tightly:
-    // a closed/filtered local port does not always fast-refuse on Windows (it can sit until
-    // the total timeout), and a PID recycled onto a stale discovery entry can drag a
-    // down-state scan out to seconds if each dead-port probe waits the full request timeout.
-    let Ok(client) = reqwest::Client::builder()
-        .connect_timeout(Duration::from_millis(600))
-        .timeout(Duration::from_secs(1))
-        .build()
-    else {
-        return false;
-    };
-    client
+    health_client()
         .get(&url)
         .send()
         .await
