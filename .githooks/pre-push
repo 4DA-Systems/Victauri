@@ -23,6 +23,32 @@ REQUIRE="${LOCAL_GATE_REQUIRE:-0}"
 PUSH_REFS="$(cat 2>/dev/null || true)"   # stdin consumable once — capture before anything reads it
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || exit 0
 
+# ---- GATE 0: private-asset leak scan ----
+# Block pushing any outgoing commit (message OR content) that names the private external verifier. Backstops
+# the 2026-07-13 public scrub: this repo is UNPROTECTED, so a local hook is the only re-leak defense, and a
+# branch based on PRE-SCRUB history would otherwise re-upload the old commits. Detection is HASHED inline (no
+# literal name lives in this file). FAIL-OPEN on any tool error — never brick pushes; block ONLY on a positive
+# detection. Here-string (not a pipe) so `exit` propagates out of the loop. Bypass: git push --no-verify.
+if command -v node >/dev/null 2>&1 && [ -n "$PUSH_REFS" ]; then
+  Z0="0000000000000000000000000000000000000000"
+  while read -r g_lref g_lsha g_rref g_rsha; do
+    [ -n "${g_lsha:-}" ] || continue
+    [ "$g_lsha" = "$Z0" ] && continue
+    if [ "${g_rsha:-$Z0}" = "$Z0" ]; then
+      g_om="$(git rev-parse -q --verify origin/main 2>/dev/null)" && g_ar="$g_om..$g_lsha" || g_ar="$g_lsha"
+    else
+      g_ar="$g_rsha..$g_lsha"
+    fi
+    if git log -p -n 2000 --no-color "$g_ar" 2>/dev/null | node -e 'const c=require("crypto");const H=new Set(["3b01fbd96a4eb7b550f483723ce5db19970af945b91930a224f78717a7023ad2","344ceb6cff3675fc2ce7e5f83158d83ca9d8f45567f6313d8b9ae34aefdaae01"]);let s="";process.stdin.on("data",d=>s+=d);process.stdin.on("end",()=>{try{for(const t of s.split(/[^A-Za-z0-9]+/)){const x=t.toLowerCase();if(x.length>=4&&H.has(c.createHash("sha256").update(x).digest("hex"))){process.exit(1)}}process.exit(0)}catch(e){process.exit(0)}})'; then :; else
+      echo ""
+      echo "[local-gate] PUSH BLOCKED — outgoing commits on ${g_lref:-?} name the private external verifier."
+      echo "[local-gate]   Likely a branch based on PRE-SCRUB history. Rebase onto origin/main, then re-push:"
+      echo "[local-gate]   git fetch origin && git rebase --onto origin/main \$(git merge-base HEAD <old-base>) HEAD"
+      exit 1
+    fi
+  done <<< "$PUSH_REFS"
+fi
+
 # ---- GATE 1: committed-tree coherence (stack-aware) ----
 have_cargo=0; have_node=0
 [ -f "$ROOT/Cargo.toml" ] && have_cargo=1
