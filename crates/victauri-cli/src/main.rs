@@ -85,7 +85,9 @@ enum Commands {
     },
     /// Run as a stdio-to-HTTP MCP bridge for Claude Code and other MCP hosts
     Bridge {
-        /// Wait up to 30 seconds for the Victauri server to become available
+        /// Deprecated no-op. The bridge answers the MCP handshake locally and connects to the
+        /// app lazily, so it never blocks startup — there is nothing to wait for. Retained so
+        /// existing `.mcp.json` files keep working.
         #[arg(long)]
         wait: bool,
         /// Select which app to bind when several Victauri apps are running — matches the
@@ -209,7 +211,7 @@ fn cmd_init(root: &Path) -> Result<()> {
             eprintln!("      Add this to your mcpServers (the bridge auto-discovers the port —");
             eprintln!("      prefer it over a fixed url so agents never bind the wrong app):\n");
             eprintln!(
-                "        \"victauri\": {{ \"command\": \"victauri\", \"args\": [\"bridge\", \"--wait\"] }}\n"
+                "        \"victauri\": {{ \"command\": \"victauri\", \"args\": [\"bridge\"] }}\n"
             );
         }
     } else {
@@ -1264,10 +1266,13 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
 /// proxy (NOT a fixed `url:`) so the agent is connected by *discovery* — the bridge resolves
 /// the live backend port at connect time and re-resolves on restart, and `--app <identifier>`
 /// guarantees it binds the RIGHT app even when several Victauri apps are running.
+///
+/// No `--wait`: the bridge answers the MCP handshake locally and connects to the app lazily,
+/// so it never blocks startup whether or not the app is running yet (`--wait` is now a no-op).
 fn generate_mcp_json(app: Option<&str>) -> String {
     let args = match app {
-        Some(id) => format!("[\"bridge\", \"--wait\", \"--app\", \"{id}\"]"),
-        None => "[\"bridge\", \"--wait\"]".to_string(),
+        Some(id) => format!("[\"bridge\", \"--app\", \"{id}\"]"),
+        None => "[\"bridge\"]".to_string(),
     };
     format!(
         r#"{{
@@ -1332,11 +1337,18 @@ or wrong port. Do **not** replace it with a fixed `"url": "http://127.0.0.1:7373
 hardcoded port can point at a *different* Victauri app (e.g. a leftover demo) and every call
 then fails with `422`/`404`. The bridge avoids that by design.
 
+- **The server connects even before the app is running.** The bridge answers the MCP
+  handshake itself, so `victauri` shows up connected in a fresh terminal whether or not the
+  app is up. While the app is down the tool list is a static fallback and a tool *call*
+  returns a clear "backend not reachable — start the app" error (not a hang). Start the app
+  (`npm run tauri dev` / `pnpm tauri dev`) and the bridge connects automatically — tools go
+  live with **no `/mcp` reconnect**. So if a call reports the backend unreachable, the fix is
+  to start/await the app, not to switch to CDP.
 - **First contact:** call `get_plugin_info` once and check `app.identifier` — confirm you
   reached the intended app, not another Victauri instance.
 - **Multiple apps running?** Pin the bridge with `--app <bundle-identifier>` in `.mcp.json`
-  (`"args": ["bridge", "--wait", "--app", "com.your.app"]`), or set `VICTAURI_APP`. `init`
-  bakes this in automatically when it can read your identifier.
+  (`"args": ["bridge", "--app", "com.your.app"]`), or set `VICTAURI_APP`. `init` bakes this in
+  automatically when it can read your identifier.
 - **If a tool call fails after an app rebuild/restart:** the bridge re-establishes the
   session automatically — just retry. If the MCP path is genuinely wedged, the **sessionless
   REST API is the fallback, NOT CDP**: `POST http://127.0.0.1:<port>/api/tools/<tool>` with

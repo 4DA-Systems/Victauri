@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`victauri bridge` no longer fails to connect in a fresh terminal when the app isn't running
+  yet (the cold-start guarantee).** Victauri's MCP server is embedded inside the Tauri app, so it
+  only exists while the app runs. The bridge used to discover the backend *before* answering the
+  MCP `initialize` handshake, so with no app running it blocked — and the host (Claude Code) aborts
+  at its 30s connection timeout. The result: **every fresh terminal opened before the app started
+  reported `MCP server "victauri" connection timed out after 30000ms`.** The bridge now answers
+  `initialize` (and `tools/list`) **locally**, so the MCP server always appears connected with its
+  full tool surface, whether or not an app is running. Only actual tool *calls* require a live
+  backend; when none is running they return a clear, actionable "backend not reachable — start the
+  app" error instead of hanging.
+
+### Added
+
+- **The bridge auto-connects the moment the app comes up — no `/mcp` reconnect.** A background
+  availability poller watches for the backend and, on a down→up transition, emits
+  `notifications/tools/list_changed` (+ `resources/list_changed`), so the client refreshes from the
+  baked fallback tool list to the live, version-accurate one automatically. While the app is down,
+  `tools/list` serves a baked fallback (all tool names + descriptions, extracted from the plugin's
+  `#[tool]` annotations) so an agent still sees the full surface.
+
+### Changed
+
+- **Discovery is now cheap even with many stale discovery directories.** Liveness is snapshotted in
+  ONE OS call (`tasklist`/`ps`) per scan instead of one process spawn per directory, and dead-PID
+  entries are filtered before any HTTP `/health` probe; the probe itself now has a tight connect
+  timeout so a closed/filtered stale port can't stall a scan. A cold-start scan with dozens of stale
+  dirs completes in well under a second (previously seconds).
+- **`victauri init` no longer writes `--wait` into `.mcp.json`.** The flag is now a no-op (the
+  handshake never blocks) and is still accepted so existing configs keep working. The generated
+  `CLAUDE.md` guidance now tells agents the server connects even before the app is running, and that
+  a "backend unreachable" tool error means "start the app", not "switch to CDP".
+
 ## [0.8.6] - 2026-07-08
 
 Security-focused release prep for the repo-local local pre-push gate. No public Rust API change and

@@ -1,0 +1,142 @@
+[
+  {
+    "name": "eval_js",
+    "description": "Evaluate JavaScript in the Tauri webview and return the result. Async expressions are wrapped automatically."
+  },
+  {
+    "name": "dom_snapshot",
+    "description": "Get the DOM snapshot with stable ref handles. Default: compact accessible text (70-80% fewer tokens). Set format=\"json\" for full tree. Returns tree + stale_refs (refs invalidated since last snapshot)."
+  },
+  {
+    "name": "find_elements",
+    "description": "Search for elements by text, role, test_id, CSS selector (via `css` or `selector` param), or accessible name without a full snapshot. Returns lightweight matches with ref handles."
+  },
+  {
+    "name": "invoke_command",
+    "description": "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Subject to privacy command filtering."
+  },
+  {
+    "name": "screenshot",
+    "description": "Capture a screenshot of a Tauri window as a base64-encoded PNG image. Works on Windows (PrintWindow), macOS (CGWindowListCreateImage), and Linux X11/XWayland. Pure Wayland fails safely because its available fallback would capture the full desktop rather than the requested window. A hidden (non-visible) window has no on-screen surface to capture, so requesting one returns a clear error (show it first via `window` manage_action=show) rather than a stale or wrong-window image."
+  },
+  {
+    "name": "verify_state",
+    "description": "Compare frontend state (evaluated via JS expression) against backend state to detect divergences. Returns a VerificationResult with any mismatches."
+  },
+  {
+    "name": "detect_ghost_commands",
+    "description": "Detect ghost commands (frontend calls with no backend handler) by IPC OUTCOME, not by guessing from Victauri's registry. Returns: `confirmed_ghosts` = commands invoked that NEVER returned success and errored 'not found' — real missing-handler bugs, HIGH confidence and independent of whether the app uses #[inspectable]; `verified_handlers` = count of commands that returned success at least once (they provably HAVE a handler, so they are never flagged — this is why a real command like `set_language` is no longer a false positive); `frontend_only` = the WEAKER candidate tier (invoked, never observed succeeding, NOT a Tauri/plugin framework builtin, and absent from the introspection registry) — confirm against the app's `tauri::generate_handler!` before filing; `excluded_builtins` = framework `plugin:*` commands (never app ghosts); `registry_only` = registered commands never invoked (informational). The `reliability` field describes only `frontend_only`; `confirmed_ghosts` is high-confidence regardless. Reads the JS-side IPC interception log (ACCUMULATES all session traffic). For a clean signal scope with `since_ms` (e.g. 5000) — invoke the suspect action, then call this with `since_ms` — or `logs {action:'clear'}` then exercise the app."
+  },
+  {
+    "name": "check_ipc_integrity",
+    "description": "Check IPC round-trip integrity: find stale (stuck) pending calls and errored calls. Returns health status and lists of problematic IPC calls."
+  },
+  {
+    "name": "wait_for",
+    "description": "Wait for a condition to be met. Polls at regular intervals until satisfied or timeout. Conditions: text (text appears), text_gone (text disappears), selector (CSS selector matches), selector_gone, url (URL contains value), ipc_idle (no pending IPC calls), network_idle (no pending network requests), expression (poll a JS expression in `value` until truthy or until it equals `expected` — may `await`, e.g. await a fire-and-forget command's status), event (block until the Tauri event named in `value` fires, with `since_ms` look-back). Use expression/event to await async backend work to true completion instead of guessing with a fixed sleep."
+  },
+  {
+    "name": "assert_semantic",
+    "description": "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is."
+  },
+  {
+    "name": "resolve_command",
+    "description": "Resolve a natural language query to matching Tauri commands. Returns scored results ranked by relevance, using command names, descriptions, intents, categories, and examples."
+  },
+  {
+    "name": "get_registry",
+    "description": "List or search all registered Tauri commands with their argument schemas. Pass query to filter by name/description substring. Commands are registered via the #[inspectable] macro — apps that don't use it return names with null schemas; for those, use `introspect command_catalog` to recover real argument/result shapes from the live IPC log."
+  },
+  {
+    "name": "app_state",
+    "description": "Read application-defined backend state via a registered probe. With no `probe`, lists available probe names. With a `probe` name, runs it and returns its JSON snapshot. Probes give first-class, discoverable access to domain state (e.g. a scoring pipeline's version + stale-item count, a queue's depth, cache stats) that would otherwise need query_db + log-grepping. Probes run in the Rust process with no IPC round-trip. Apps register them via VictauriBuilder::probe(name, closure)."
+  },
+  {
+    "name": "get_memory_stats",
+    "description": "Get real-time process memory statistics from the OS (working set, page file usage). On Windows returns detailed metrics; on Linux returns virtual/resident size."
+  },
+  {
+    "name": "get_plugin_info",
+    "description": "Inspect the Victauri plugin's own configuration: port, enabled/disabled tools, command filters, privacy settings, capacities, and version. Useful for agents to understand their capabilities before acting."
+  },
+  {
+    "name": "get_diagnostics",
+    "description": "Run environment diagnostics: detect service workers (break IPC interception), closed shadow DOM (invisible to snapshots), iframes (bridge absent), large DOM warnings, and CSP status. Call this first when connecting to an unfamiliar app."
+  },
+  {
+    "name": "app_info",
+    "description": "Get comprehensive app info: Tauri config (identifier, product name, version), app directory paths (data, config, log, local_data), process environment variables, and database files found in app directories. Provides direct backend context without going through the webview."
+  },
+  {
+    "name": "list_app_dir",
+    "description": "List files in the app's data, config, log, or local_data directories. Useful for discovering databases, config files, logs, and cached data on the backend — without going through the webview."
+  },
+  {
+    "name": "read_app_file",
+    "description": "Read a file from the app's data, config, log, or local_data directory. Returns UTF-8 text by default, or base64 for binary files. Directly reads backend files without going through the webview."
+  },
+  {
+    "name": "query_db",
+    "description": "Execute a bounded, read-only SQL query against a SQLite database in the app's data directory. The SQL goes in the `query` field (alias: `sql`). Auto-discovers database files if no path is specified. Only SELECT/PRAGMA/EXPLAIN/WITH queries are allowed. CPU time, cell size, row count, and returned bytes are capped. Returns rows as JSON objects with column names as keys. This provides direct backend database access without going through the webview or IPC."
+  },
+  {
+    "name": "interact",
+    "description": "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions."
+  },
+  {
+    "name": "input",
+    "description": "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls."
+  },
+  {
+    "name": "window",
+    "description": "Window management. Actions: get_state (window positions/sizes/visibility), list (all window labels), manage (minimize/maximize/close/focus/show/hide/fullscreen/always_on_top), resize, move_to, set_title, introspectability (probe every window and report which Victauri can actually see — a visible window that comes back introspectable:false is almost always missing the \"victauri:default\" capability; run this FIRST when eval_js/dom_snapshot/animation return nothing for a multi-window app)."
+  },
+  {
+    "name": "storage",
+    "description": "Browser storage operations. Actions: get (read localStorage/sessionStorage), set (write), delete (remove key), get_cookies. Subject to privacy controls for set and delete."
+  },
+  {
+    "name": "navigate",
+    "description": "Navigation and dialog control. Actions: go_to (navigate to URL), go_back (browser back), get_history (navigation log), set_dialog_response (auto-respond to alert/confirm/prompt), get_dialog_log (captured dialog events). Subject to privacy controls for go_to and set_dialog_response."
+  },
+  {
+    "name": "recording",
+    "description": "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load session from JSON), replay (re-execute recorded IPC commands and compare responses), flush (immediately drain pending events into recording without waiting for the 1-second poll)."
+  },
+  {
+    "name": "inspect",
+    "description": "CSS and visual inspection. Actions: get_styles (computed CSS for element), get_bounding_boxes (layout rects), highlight (debug overlay), clear_highlights, audit_accessibility (a11y audit), get_performance (timing/heap/DOM metrics)."
+  },
+  {
+    "name": "css",
+    "description": "CSS injection. Actions: inject (add custom CSS to page), remove (remove previously injected CSS). Subject to privacy controls."
+  },
+  {
+    "name": "route",
+    "description": "Network request interception (Playwright route() equivalent, no CDP). Matches webview fetch/XHR by URL and blocks, mocks, or delays them. Actions: - `add`: add a rule. `pattern` (+ optional `match_type`: substring/glob/regex/exact, and `method`) selects requests; `behavior` is `block` (abort), `fulfill` (return a mock `status`/`headers`/`body`/`content_type`), or `delay` (proceed after `delay_ms`). `times` limits how often it fires. Rules are page-scoped (cleared on reload). - `list`: list active rules. - `clear` (by `id`) / `clear_all`: remove rules. - `matches`: log of intercepted requests. Note: fetch supports all behaviors; XHR supports block/delay (fulfill is fetch-only). Top-level navigation, sub-resource (img/css), and WebSocket traffic are not intercepted. Tauri IPC (ipc.localhost) is OBSERVE-ONLY: such calls appear in `matches`, but block/fulfill/delay do NOT take effect on them — Tauri serves IPC below the JS fetch layer, so it cannot be controlled cross-platform without CDP. There is no IPC-control tool; the `fault` tool only affects commands you drive via `invoke_command`, not real user IPC."
+  },
+  {
+    "name": "trace",
+    "description": "Screencast / visual trace (no CDP). Captures the window at a fixed interval into a ring buffer, forming a visual timeline that pairs with `recording` (events) and `logs` (network/console). Actions: - `start`: begin capturing (`interval_ms` default 500, `max_frames` default 60). Set `with_events=true` to also start the event recorder. - `stop`: stop and return a summary (frame count, duration, timestamps). - `status`: active flag + buffered frame count. - `frames`: return captured frames as base64 PNGs (`limit` caps how many)."
+  },
+  {
+    "name": "animation",
+    "description": "Animation introspection (no CDP). Reads the Web Animations API to reveal what the webview's animation engine is actually running — duration, delay, easing, iterations, keyframes, current progress, and the animating element. Standard DOM, so it works identically on WebView2/WKWebView/WebKitGTK. Actions: - `list`: return all running CSS animations/transitions (optionally scoped by `selector`), each with declared `timing`, `computed` progress, `keyframes`, and `target`. - `scrub`: deterministically pause the target's animation and seek it to `points` evenly-spaced steps (default 20), returning the exact geometry curve (rect + transform + opacity per step). With `capture=true`, also returns a single contact-sheet filmstrip PNG (one image of the whole arc) plus a `manifest` mapping each cell to its progress/time. Frozen frames are jank-free, so this beats real-time capture for fast sweeps. CSS-driven animations only (JS/rAF animations are not seekable — use `list`/`sample`). - `sample`: real-time motion recorder. `record=true` arms a requestAnimationFrame watcher on `selector` (or the first animating element); then trigger the animation; then call with `record=false` to read the measured per-frame curve plus jank stats (dropped frames, max frame gap) and declared-vs-measured duration. Works for ANY animation including JS/rAF-driven ones. `clear=true` resets recorded sessions. NOTE: an animation only appears while it is running or pending — trigger it (e.g. show the notification) just before calling `list`/`scrub`, or arm `sample` before triggering."
+  },
+  {
+    "name": "logs",
+    "description": "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls)."
+  },
+  {
+    "name": "introspect",
+    "description": "Deep backend introspection — command profiling, IPC contract testing, coverage, startup timing, capability auditing, database diagnostics, process enumeration, and event bus monitoring. These features exploit Victauri's position inside the Rust process. Actions: - `command_timings`: Per-command execution timing stats (min/max/avg/p95). Set `slow_threshold_ms` to filter. - `coverage`: Which registered commands have been called during this session. - `command_catalog`: Per-command argument + result SHAPES mined from the live IPC log, merged with the registry — real call/return schemas even for apps that don't use #[inspectable] (where get_registry is names-only). The highest-signal way to learn how to drive an app's commands. - `contract_record`: Record a command's response shape as a baseline (requires `command`). - `contract_check`: Check all recorded contracts for schema drift. - `contract_list`: List all recorded contract baselines. - `contract_clear`: Clear all recorded contract baselines. - `startup_timing`: Victauri plugin initialization phase-by-phase timing breakdown. - `capabilities`: Enumerate Tauri v2 capabilities, security config (CSP, freeze_prototype), configured plugins, and window definitions. - `db_health`: Read-only SQLite database diagnostics (journal mode, WAL presence, page stats). - `plugin_state`: Snapshot of the Victauri plugin's internal state (event log, registry, faults, recording, timings, etc.). - `processes`: Enumerate the host process and all child processes (sidecars, background workers) with PID, name, and memory usage. - `plugin_tasks`: List Victauri's own spawned async tasks (MCP server, event drain) with status. - `event_bus`: List captured Tauri events + app events (auto-intercepted via listen_any — no app opt-in needed). Returns the newest events per category (default 100) so the full buffers (up to ~11k events / megabytes) never overflow the result; `count` is the true total and `truncated` flags a capped slice. Scope via the `args` object: `{\"action\":\"event_bus\",\"args\":{\"limit\":500,\"since_ms\":5000}}`. - `event_bus_clear`: Clear the event bus capture buffer."
+  },
+  {
+    "name": "fault",
+    "description": "Probe a backend command handler under failure by faulting it for chaos engineering. Simulate slow commands, backend errors, dropped responses, and corrupted data. SCOPE: faults apply ONLY to commands you run via this server's `invoke_command` tool — they do NOT intercept the app's real user-driven IPC (window.__TAURI_INTERNALS__.invoke), which runs below the layer Victauri can reach. Use this to test a handler's error path when YOU drive it; it does not reproduce a failure a user clicking the UI would see. Actions: - `inject`: Add a fault rule (requires `command`, `fault_type`). Optional: `delay_ms`, `error_message`, `max_triggers`. - `list`: List all active fault injection rules. - `clear`: Remove a specific fault rule (requires `command`). - `clear_all`: Remove all fault rules."
+  },
+  {
+    "name": "explain",
+    "description": "Correlate recent activity across all layers into a coherent narrative. CDP shows raw events per layer; Victauri correlates IPC + DOM + console + network + window events across the Rust backend and webview simultaneously. Actions: - `summary`: High-level activity summary for the last N seconds (default 30). Counts IPC calls, DOM mutations, console entries, network requests, errors. - `last_action`: Correlate the most recent burst of events into a causal timeline (e.g. 'IPC call → DOM update → console.log'). - `diff`: What changed in the last N seconds — event counts, errors, new IPC commands."
+  }
+]
