@@ -184,6 +184,48 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
+## Current State (2026-07-13)
+
+### bridge cold-start fix — `victauri` MCP connects in a fresh terminal even with the app down (branch `worktree-fix-bridge-cold-start`)
+
+Driven by an in-the-wild failure: opening a fresh Claude Code terminal in a Victauri-consuming app
+(4DA) showed `Failed to reconnect to victauri: MCP server "victauri" connection timed out after
+30000ms`. Root cause was **architectural, not the app**: Victauri's MCP server is embedded *inside*
+the Tauri process, so it only exists while the app runs — and `victauri bridge` discovered the
+backend *before* answering the MCP `initialize` handshake (worse under `--wait`, which blocked ~30s).
+Claude Code aborts at its 30s connection ceiling, so **every fresh terminal opened before the app was
+started failed to connect**. All changes are in `crates/victauri-cli/src/bridge.rs` (+ scaffold text);
+the bridge's public API (`run(wait, app)`) is unchanged and `--wait` is still accepted, so it stays
+semver-clean within `^0.8`.
+
+- **Local handshake (the keystone).** The bridge now answers `initialize`, `tools/list`, `ping`, and
+  the `*/list` methods **itself**, so the MCP server always shows up connected with its full tool
+  surface whether or not an app is running. `initialize` echoes the client's protocol version and
+  advertises `tools`/`resources` `listChanged`. Only real tool *calls* need a live backend.
+- **Baked fallback tool list.** While the app is down, `tools/list` serves a 35-tool fallback
+  (names + descriptions extracted from the plugin's `#[tool]` annotations, committed as
+  `crates/victauri-cli/src/tools_fallback.json` and `include_str!`-embedded). Tool *calls* while down
+  return a clear, actionable "backend not reachable — start the app (`npm run tauri dev`)" error, not
+  a hang.
+- **Auto-go-live, no reconnect.** A background availability poller detects the backend coming up and
+  emits `notifications/tools/list_changed` (+ `resources/list_changed`), so the client refreshes to
+  the live, version-accurate tool list automatically. Lazy backend session handshake + the existing
+  transparent restart-recovery are preserved.
+- **Discovery made cheap.** Liveness is snapshotted in ONE `tasklist`/`ps` call per scan (not one
+  process spawn per stale discovery dir), dead-PID entries are filtered before any `/health` probe,
+  and the probe has a tight 600ms connect timeout so a closed/filtered stale port can't stall a scan.
+  A cold-start scan with ~25 stale dirs completes in <1s (was ~9s, then a 20s hang during iteration —
+  both fixed).
+- **Verified end-to-end** against the compiled binary: a new e2e test
+  (`bridge_cold_start_serves_handshake_then_goes_live_when_app_appears`) proves instant handshake with
+  no app, the 35-tool fallback, an actionable down-call error, the auto-emitted `list_changed` when a
+  mock backend appears, then the live tool list + a working tool call — with no reconnect. The
+  pre-existing restart-recovery e2e test still passes. `victauri init` now writes `["bridge"]` (no
+  `--wait`) and the generated CLAUDE.md documents the connect-before-app-up behavior. Gate green:
+  `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -D warnings`,
+  `cargo build --workspace`, and `cargo test -p victauri-cli` (46 unit + 2 e2e). NOT yet released
+  (operator's release gate).
+
 ## Current State (2026-07-08)
 
 ### v0.8.6 — repo self-gate security hardening + advisory cleanup
