@@ -49,3 +49,6 @@ AGENTS.md
 
 # npm pack artifacts
 extensions/npm/*.tgz
+
+# Verax runtime scratch (cache HMAC key + pipeline cache) - operator-local, never committable.
+/.verax/
