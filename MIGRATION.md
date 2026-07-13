@@ -1,5 +1,25 @@
 # Migration Guide
 
+## v0.8.6 → v0.8.7 (bridge connects in a fresh terminal; `--wait` is now a no-op)
+
+No consumer code changes are required and no dependency-requirement change is needed (a
+`victauri-cli`-only, semver-compatible release — the plugin and public Rust API are unchanged).
+Behavior changes to be aware of, all in the `victauri bridge` stdio proxy:
+
+- **The bridge now answers the MCP handshake locally**, so `victauri` shows up **connected in a fresh
+  terminal whether or not the app is running** (previously it hung and the host aborted at a 30s
+  timeout). While the app is down, `tools/list` returns a static fallback and a tool *call* returns a
+  clear "backend not reachable — start the app" error instead of hanging; when the app comes up the
+  bridge connects automatically and refreshes the tool list with no `/mcp` reconnect. If your tooling
+  asserted that `victauri bridge` *failed* to start when no app was running, it now starts and serves
+  the handshake regardless.
+- **`victauri bridge --wait` is now a no-op** (the handshake never blocks, so there is nothing to wait
+  for). The flag is still accepted, so existing `.mcp.json` files keep working; `victauri init` no
+  longer writes it into new `.mcp.json` files.
+- **Security:** the bridge re-resolves the trusted backend (`dir_is_trusted` + liveness + `--app`
+  identity) on **every** forwarded request rather than reusing a cached connection, so a Bearer token
+  is only ever sent to a currently-live, trust-checked, identity-matched app. No action required.
+
 ## v0.8.5 -> v0.8.6 (repo self-gate hardening)
 
 No Victauri consumer code changes are required and no dependency-requirement change is needed

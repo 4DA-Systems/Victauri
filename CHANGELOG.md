@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-07-13
+
+A `victauri-cli`-only release (the plugin and other crates are unchanged): the `victauri bridge`
+stdio proxy now connects in a fresh terminal even when the app isn't running yet, and the change was
+hardened through an internal three-lens red-team, an external GPT adversarial audit, and a two-lens
+round-2 verification before shipping.
+
 ### Security (external GPT adversarial audit round)
 
 - **The bridge re-resolves the trusted backend on every forwarded request** instead of reusing a

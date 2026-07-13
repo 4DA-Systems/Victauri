@@ -186,7 +186,18 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-07-13)
 
-### bridge cold-start fix — `victauri` MCP connects in a fresh terminal even with the app down (branch `worktree-fix-bridge-cold-start`)
+### v0.8.7 — bridge cold-start fix + adversarial-audit hardening (`victauri-cli`-only)
+
+Ships the bridge cold-start fix below (merged via PR #55) plus two rounds of adversarial hardening:
+an internal three-lens red-team + pre-emptive fixes (PR #56), an **external GPT adversarial audit**
+(3 findings — including a real token-leak the internal pass had wrongly deferred — all remediated,
+with a regression test), and a two-lens **round-2 verification** that confirmed the fixes complete and
+closed two residual Low items (PR #57). Security net: the bridge re-resolves the trusted backend
+(`dir_is_trusted` + liveness + `--app` identity) on **every** forwarded request, so a Bearer token is
+only ever sent to a currently-live, trust-checked, identity-matched app — never a cached/stale port.
+`victauri-cli`-only and semver-clean within `^0.8`; the plugin and public Rust API are unchanged.
+
+### bridge cold-start fix — `victauri` MCP connects in a fresh terminal even with the app down
 
 Driven by an in-the-wild failure: opening a fresh Claude Code terminal in a Victauri-consuming app
 (4DA) showed `Failed to reconnect to victauri: MCP server "victauri" connection timed out after
@@ -228,7 +239,7 @@ semver-clean within `^0.8`.
 
 ## Current State (2026-07-08)
 
-### v0.8.6 — repo self-gate security hardening + advisory cleanup
+### v0.8.7 — repo self-gate security hardening + advisory cleanup
 
 Security-focused release prep for the repo-local local pre-push gate. No public Rust API change and no
 runtime plugin behavior change for Victauri users; the hardened files are developer tooling and are not
