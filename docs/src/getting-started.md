@@ -61,7 +61,7 @@ Create a `.mcp.json` file in your project root (`victauri init` writes this for 
   "mcpServers": {
     "victauri": {
       "command": "victauri",
-      "args": ["bridge", "--wait"]
+      "args": ["bridge"]
     }
   }
 }
@@ -83,7 +83,7 @@ in automatically when it can read your `tauri.conf.json`:
   "mcpServers": {
     "victauri": {
       "command": "victauri",
-      "args": ["bridge", "--wait", "--app", "com.your.app"]
+      "args": ["bridge", "--app", "com.your.app"]
     }
   }
 }

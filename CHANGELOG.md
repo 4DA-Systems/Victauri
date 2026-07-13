@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Hardened (pre-release adversarial audit of the bridge cold-start change)
+
+- **The availability poller is now the sole owner of the "backend up" state**, so a tool call
+  that reconnects inside the 1.5s poll window can no longer silently consume the down→up edge and
+  leave the client stuck on the baked fallback tool list — `tools/list_changed` always fires on the
+  real transition.
+- **stdin is read on a dedicated OS thread** feeding an async channel, so the blocking read never
+  parks a tokio worker; the poller (and thus auto-go-live) now works even on a single-vCPU host.
+- **The poller no longer emits notifications before the client's `initialize`**, and backs off to a
+  slower cadence once the backend is up (no needless `tasklist`/`ps` probe every 1.5s all session).
+- **The local `initialize` no longer advertises `resources.subscribe`** — mirroring the plugin,
+  which deliberately omits it (no server-initiated push exists), so a client can't subscribe and
+  wait forever.
+- **The backend MCP lifecycle is completed for stateful servers**: after the bridge's backend
+  handshake it replays `notifications/initialized` to the backend.
+- **`ps`/`tasklist`/`kill` are invoked by absolute path** (System32 / `/bin` / `/usr/bin`), not via
+  `PATH`, closing a PATH-hijack surface the poller would otherwise exercise continuously.
+- **Mutex locks recover from poisoning** instead of cascading a single panic into the death of the
+  bridge (or, silently, the reconnect poller); a `202` response to a request no longer leaves the
+  client's id hanging.
+- Swept the vestigial `--wait` from README / MIGRATION / getting-started examples.
+
 ### Fixed
 
 - **`victauri bridge` no longer fails to connect in a fresh terminal when the app isn't running

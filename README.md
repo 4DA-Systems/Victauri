@@ -125,7 +125,7 @@ Add `.mcp.json` to your project root (created automatically by `victauri init`):
   "mcpServers": {
     "my-app": {
       "command": "victauri",
-      "args": ["bridge", "--wait"]
+      "args": ["bridge"]
     }
   }
 }

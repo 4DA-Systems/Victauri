@@ -37,6 +37,9 @@ struct Mock {
     restarted: Arc<AtomicBool>,
     init_count: Arc<AtomicU64>,
     toolcall_ok: Arc<AtomicU64>,
+    /// Counts `notifications/initialized` the bridge forwards to the BACKEND after its
+    /// handshake — proves the MCP lifecycle is completed for a stateful backend (audit M2).
+    initialized_count: Arc<AtomicU64>,
 }
 
 struct ChildGuard {
@@ -78,7 +81,10 @@ async fn mcp(State(s): State<Mock>, headers: HeaderMap, body: String) -> Respons
                 .insert("mcp-session-id", sid.parse().unwrap());
             resp
         }
-        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+        "notifications/initialized" => {
+            s.initialized_count.fetch_add(1, Ordering::SeqCst);
+            StatusCode::ACCEPTED.into_response()
+        }
         // A distinguishable LIVE tool list, so a test can prove the bridge served the real
         // backend list (not its baked fallback) once the app came up.
         "tools/list" => Json(json!({
@@ -115,6 +121,7 @@ async fn bridge_selects_by_identity_forwards_and_survives_restart() {
         restarted: Arc::new(AtomicBool::new(false)),
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
+        initialized_count: Arc::new(AtomicU64::new(0)),
     };
 
     // Start the mock backend on an ephemeral port.
@@ -252,6 +259,12 @@ async fn bridge_selects_by_identity_forwards_and_survives_restart() {
         mock.toolcall_ok.load(Ordering::SeqCst),
         2,
         "both tool calls should have executed on the backend"
+    );
+    // M2: after each backend handshake the bridge replays notifications/initialized to the
+    // backend (the client's was answered locally), completing the stateful MCP lifecycle.
+    assert!(
+        mock.initialized_count.load(Ordering::SeqCst) >= 1,
+        "bridge must forward notifications/initialized to the backend after its handshake"
     );
 
     drop(stdin);
@@ -402,6 +415,7 @@ async fn bridge_cold_start_serves_handshake_then_goes_live_when_app_appears() {
         restarted: Arc::new(AtomicBool::new(false)),
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
+        initialized_count: Arc::new(AtomicU64::new(0)),
     };
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
