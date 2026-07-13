@@ -115,9 +115,11 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     // Last-known backend availability — SOLELY owned by the poller (see H1 in the audit): the
     // request path never writes it, so the down→up edge is detected in exactly one place.
     let backend_up = Arc::new(AtomicBool::new(false));
-    // Set once the client completes `initialize`, so the poller never emits a notification
-    // before the MCP handshake.
-    let initialized = Arc::new(AtomicBool::new(false));
+    // Set once the client sends `notifications/initialized` (its OWN handshake completion), so
+    // the poller never emits a server notification before the client has finished initializing —
+    // not merely before we answered `initialize` (audit #3). Gating on the client's ack, not on
+    // our local reply, closes the window where `list_changed` could precede the init response.
+    let client_ready = Arc::new(AtomicBool::new(false));
     // stdout is shared with the background poller (which writes `list_changed`); every write
     // locks, emits one line, and flushes, so responses and notifications never interleave.
     let stdout = Arc::new(Mutex::new(std::io::stdout()));
@@ -125,8 +127,10 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     spawn_availability_poller(
         app.clone(),
         Arc::clone(&connection),
+        Arc::clone(&session_id),
+        Arc::clone(&stateless),
         Arc::clone(&backend_up),
-        Arc::clone(&initialized),
+        Arc::clone(&client_ready),
         Arc::clone(&stdout),
     );
 
@@ -168,12 +172,15 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
             "initialize" => {
                 // Cache for the lazy backend handshake, then reply immediately.
                 *locked(&cached_init) = Some(msg.clone());
-                initialized.store(true, Ordering::Release);
                 write_value(&stdout, &local_initialize_response(&msg));
             }
             // The client's ack of OUR local initialize. It must never reach a backend (we
-            // handshake the backend separately) and needs no response.
-            "notifications/initialized" => {}
+            // handshake the backend separately) and needs no response — but it is the point at
+            // which the client is ready to receive server notifications, so mark it here (NOT on
+            // `initialize`) so the poller can't emit `list_changed` before the client is ready.
+            "notifications/initialized" => {
+                client_ready.store(true, Ordering::Release);
+            }
             "ping" => {
                 write_value(&stdout, &json!({"jsonrpc": "2.0", "id": id, "result": {}}));
             }
@@ -349,6 +356,17 @@ fn write_notification(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
     write_value(stdout, &json!({ "jsonrpc": "2.0", "method": method }));
 }
 
+/// Build one JSON-RPC error-response line for `msg`'s id — used when a forwarded REQUEST gets
+/// no relayable payload (an empty/non-JSON 2xx body, or a 202), so the client's id never hangs.
+fn error_for_request(msg: &Value, code: i64, message: &str) -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": msg.get("id"),
+        "error": { "code": code, "message": message }
+    })
+    .to_string()
+}
+
 /// Actionable message returned when a tool call can't reach a backend.
 fn unreachable_message() -> String {
     "Victauri backend not reachable: no running Tauri app with the Victauri plugin (debug \
@@ -361,11 +379,14 @@ fn unreachable_message() -> String {
 /// Background task that watches for the backend becoming reachable and, on a down→up
 /// transition, tells the client to refresh its tool/resource lists — so the baked fallback
 /// is replaced by the live, version-accurate set with no `/mcp` reconnect.
+#[allow(clippy::too_many_arguments)]
 fn spawn_availability_poller(
     app: Option<String>,
     connection: Arc<Mutex<Option<ServerInfo>>>,
+    session_id: Arc<Mutex<Option<String>>>,
+    stateless: Arc<Mutex<bool>>,
     backend_up: Arc<AtomicBool>,
-    initialized: Arc<AtomicBool>,
+    client_ready: Arc<AtomicBool>,
     stdout: Arc<Mutex<std::io::Stdout>>,
 ) {
     tokio::spawn(async move {
@@ -382,14 +403,22 @@ fn spawn_availability_poller(
             let up = found.is_some();
             if let Some(info) = found {
                 *locked(&connection) = Some(info);
+            } else {
+                // Backend gone — drop the cached connection/session so nothing can reuse a stale
+                // (port, token) pair (defense-in-depth for audit #1; the request path also
+                // re-resolves the trusted entry on every call).
+                *locked(&connection) = None;
+                *locked(&session_id) = None;
+                *locked(&stateless) = false;
             }
             // The poller is the SOLE owner of `backend_up`: the request path no longer writes it,
             // so the down→up edge is detected here exactly once and can never be silently consumed
             // by a tool call that happened to reconnect first.
             let was = backend_up.swap(up, Ordering::AcqRel);
-            // Only announce a refresh once the client has completed `initialize` — a notification
-            // before the handshake is a lifecycle violation a strict client may reject.
-            if up && !was && initialized.load(Ordering::Acquire) {
+            // Only announce a refresh once the CLIENT has finished initializing (sent
+            // `notifications/initialized`) — a server notification before that is a lifecycle
+            // violation a strict client may reject.
+            if up && !was && client_ready.load(Ordering::Acquire) {
                 write_notification(&stdout, "notifications/tools/list_changed");
                 write_notification(&stdout, "notifications/resources/list_changed");
             }
@@ -407,9 +436,10 @@ enum ForwardResult {
     Unreachable(String),
 }
 
-/// Forward a list-style request ONLY if a backend is currently reachable, returning its
-/// payloads. Returns `None` when the app is down (the caller then serves a local placeholder)
-/// — so a cold-start `tools/list` never pays a discovery/retry penalty before falling back.
+/// Forward a list-style request, returning its payloads only if a backend is currently
+/// reachable; `None` when the app is down (the caller then serves a local placeholder). Delegates
+/// to `forward_with_retries`, which re-resolves the trusted backend itself — so a live `tools/list`
+/// pays exactly one discovery pass and a down one fails fast to the fallback.
 #[allow(clippy::too_many_arguments)]
 async fn forward_when_up(
     http: &reqwest::Client,
@@ -420,12 +450,6 @@ async fn forward_when_up(
     app: Option<&str>,
     msg: &Value,
 ) -> Option<Vec<String>> {
-    // Single fast discovery pass. When the app is running this is one health check; when it
-    // is down there are no live processes to probe, so it returns immediately (None → caller
-    // serves the local placeholder). (`backend_up` is deliberately NOT written here — the poller
-    // owns it; see H1 in the audit.)
-    let info = discover_one(app).await?;
-    *locked(connection) = Some(info);
     match forward_with_retries(
         http,
         connection,
@@ -456,27 +480,28 @@ async fn forward_with_retries(
 ) -> ForwardResult {
     let is_notification = msg.get("id").is_none();
 
-    // Ensure we have a backend. Short patience (no `--wait`-style 30s hang on a tool call):
-    // a live app is found in one pass; a down app fails fast with a clear message. (`backend_up`
-    // is owned by the poller — the request path never writes it; see H1 in the audit.)
-    if conn_parts(connection).is_none() {
-        // A SINGLE discovery pass (no 1s-sleep retries): when the app is down a tool call must
-        // fail fast with an actionable message, not stall for seconds — the poller handles a
-        // later app-appearance. Preserve the specific multi-app diagnosis, though.
-        match scan_once(app).await {
-            Selection::One(info) => {
-                *locked(connection) = Some(info);
-            }
-            Selection::Ambiguous(labels) => {
-                return ForwardResult::Unreachable(format!(
-                    "Multiple Victauri apps are running:\n  {}\nSelect one with \
-                     `--app <bundle-identifier>` or the VICTAURI_APP env var.",
-                    labels.join("\n  ")
-                ));
-            }
-            Selection::None => {
-                return ForwardResult::Unreachable(unreachable_message());
-            }
+    // SECURITY (audit #1): re-resolve the trusted backend on EVERY forward — never reuse a cached
+    // `(port, token)` without re-confirming, right now, that the port still belongs to a live,
+    // trusted, identity-matched app. `scan_once` re-applies `dir_is_trusted` + liveness + `--app`
+    // identity and yields the port and token together. Without this, after the app shut down (its
+    // discovery entry gone) an attacker who bound the freed port would receive the cached Bearer
+    // token and could relay forged tool results. This is ONE discovery pass (no 1s-sleep retries):
+    // a live app resolves fast; a down app fails fast to the actionable message / fallback.
+    match scan_once(app).await {
+        Selection::One(info) => {
+            *locked(connection) = Some(info);
+        }
+        Selection::Ambiguous(labels) => {
+            *locked(connection) = None;
+            return ForwardResult::Unreachable(format!(
+                "Multiple Victauri apps are running:\n  {}\nSelect one with \
+                 `--app <bundle-identifier>` or the VICTAURI_APP env var.",
+                labels.join("\n  ")
+            ));
+        }
+        Selection::None => {
+            *locked(connection) = None;
+            return ForwardResult::Unreachable(unreachable_message());
         }
     }
 
@@ -554,20 +579,24 @@ async fn forward_with_retries(
                     if is_notification {
                         return ForwardResult::Accepted;
                     }
-                    // A 202 to a REQUEST leaves no body to relay — Victauri never does this, but
-                    // a proxy must not leave the client's id hanging forever if a backend ever
-                    // does. Synthesize an error for that id instead of returning empty payloads.
-                    return ForwardResult::Payloads(vec![
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": msg.get("id"),
-                            "error": {
-                                "code": -32603,
-                                "message": "backend accepted the request with no response (HTTP 202)"
-                            }
-                        })
-                        .to_string(),
-                    ]);
+                    // A 202 to a REQUEST leaves no body to relay — Victauri never does this, but a
+                    // proxy must not leave the client's id hanging if a backend ever does.
+                    return ForwardResult::Payloads(vec![error_for_request(
+                        msg,
+                        -32603,
+                        "backend accepted the request with no response (HTTP 202)",
+                    )]);
+                }
+
+                // A successful response that yields NO relayable payload for a REQUEST (an empty
+                // or non-JSON 2xx body — see `post_message`) must likewise not hang the client's
+                // id: synthesize an error rather than returning empty payloads (audit #2).
+                if !is_notification && out.payloads.is_empty() {
+                    return ForwardResult::Payloads(vec![error_for_request(
+                        msg,
+                        -32603,
+                        "backend returned an empty or non-JSON response",
+                    )]);
                 }
 
                 return ForwardResult::Payloads(out.payloads);
@@ -694,7 +723,10 @@ async fn post_message(
             }
         } else {
             let body = body.trim();
-            if !body.is_empty() {
+            // Relay a non-SSE body ONLY if it is valid JSON — never write non-JSON onto the
+            // client's JSON-RPC stream. An empty or non-JSON 2xx body yields no payload; the
+            // caller then synthesizes an error for a request so the client's id can't hang.
+            if !body.is_empty() && serde_json::from_str::<serde_json::Value>(body).is_ok() {
                 payloads.push(body.to_string());
             }
         }

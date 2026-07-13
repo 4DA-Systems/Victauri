@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security (external GPT adversarial audit round)
+
+- **The bridge re-resolves the trusted backend on every forwarded request** instead of reusing a
+  cached `(port, token)`. Previously, after the app shut down (its discovery entry gone), a
+  subsequent tool call could POST the cached Bearer token to whatever process had since bound the
+  freed port — an attacker could receive the token and relay forged tool results. The token is now
+  only ever sent to a currently-live, trust-checked, identity-matched discovery entry; the poller
+  also drops the cached connection/session when the backend goes away. Regression test added.
+- **Malformed/empty successful backend responses can no longer corrupt the stream or hang the
+  client.** A non-SSE `2xx` body is relayed only if it is valid JSON, and a request that yields no
+  payload (empty/non-JSON `2xx`, or `202`) gets a synthesized JSON-RPC error for its id instead of
+  hanging.
+- **`tools/list_changed` can no longer precede the initialize response.** The "ready for
+  notifications" flag is now set on the client's `notifications/initialized` ack, not when the bridge
+  answers `initialize`.
+
 ### Hardened (pre-release adversarial audit of the bridge cold-start change)
 
 - **The availability poller is now the sole owner of the "backend up" state**, so a tool call

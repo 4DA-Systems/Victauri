@@ -486,3 +486,147 @@ async fn bridge_cold_start_serves_handshake_then_goes_live_when_app_appears() {
 
     drop(stdin);
 }
+
+/// Audit #1 regression: after a successful tool call the bridge holds a cached `(port, token)`.
+/// When the app shuts down (its trusted discovery entry is removed), the bridge MUST re-resolve
+/// and REFUSE to reuse that cache — otherwise it would send the cached Bearer token to whatever
+/// process now holds the port (an attacker who bound the freed port). The next tool call must
+/// error as unreachable, and the backend on that port must receive NO further request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bridge_reresolves_and_wont_reuse_a_stale_cached_backend() {
+    let _serial = E2E_SERIAL.lock().await;
+    let mock = Mock {
+        valid_session: Arc::new(std::sync::Mutex::new(None)),
+        restarted: Arc::new(AtomicBool::new(false)),
+        init_count: Arc::new(AtomicU64::new(0)),
+        toolcall_ok: Arc::new(AtomicU64::new(0)),
+        initialized_count: Arc::new(AtomicU64::new(0)),
+    };
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/mcp", post(mcp))
+        .with_state(mock.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let ident = format!("com.test.reresolve.{unique}");
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join("victauri").join(pid.to_string());
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _dir_guard = DirGuard(dir.clone());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(dir.join("port"), port.to_string()).unwrap();
+    std::fs::write(dir.join("token"), "legit-secret-token").unwrap();
+    std::fs::write(
+        dir.join("metadata.json"),
+        json!({"pid": pid, "port": port, "identifier": ident, "product_name": "ReResolve"})
+            .to_string(),
+    )
+    .unwrap();
+
+    let mut child = ChildGuard {
+        child: Command::new(env!("CARGO_BIN_EXE_victauri"))
+            .args(["bridge", "--app", ident.as_str()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn victauri bridge"),
+    };
+    let mut stdin = child.child.stdin.take().unwrap();
+    let stdout = child.child.stdout.take().unwrap();
+    let stderr = child.child.stderr.take().unwrap();
+    let stderr_lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let stderr_capture = Arc::clone(&stderr_lines);
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            stderr_capture.lock().unwrap().push(line);
+        }
+    });
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let recv_id = |rx: &mpsc::Receiver<String>, want: i64| -> Value {
+        loop {
+            let line = match rx.recv_timeout(Duration::from_secs(15)) {
+                Ok(l) => l,
+                Err(e) => {
+                    let s = stderr_lines.lock().unwrap().join("\n");
+                    panic!("no response in time: {e}; stderr:\n{s}");
+                }
+            };
+            let v: Value = serde_json::from_str(&line).expect("bridge stdout is JSON");
+            if v.get("id").and_then(Value::as_i64) == Some(want) {
+                return v;
+            }
+        }
+    };
+    let send = |stdin: &mut std::process::ChildStdin, v: Value| {
+        writeln!(stdin, "{v}").unwrap();
+        stdin.flush().unwrap();
+    };
+
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+    );
+    let _ = recv_id(&rx, 1);
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+    );
+
+    // 1. A first tool call succeeds against the legit backend — the bridge now has a cached
+    //    (port, token).
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"eval_js","arguments":{"code":"1"}}}),
+    );
+    let r2 = recv_id(&rx, 2);
+    assert!(r2.get("result").is_some(), "first tool call succeeds: {r2}");
+    assert_eq!(mock.toolcall_ok.load(Ordering::SeqCst), 1);
+
+    // 2. The app "shuts down": remove its trusted discovery entry. The backend on `port` is
+    //    still listening (stands in for an attacker who bound the freed port), but there is no
+    //    longer a trusted entry pointing at it.
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    // 3. The next tool call MUST re-resolve, find no trusted entry, and error — NOT reuse the
+    //    cached connection. The still-listening backend must receive NO further request (the
+    //    cached Bearer token is never re-sent to the now-untrusted port).
+    send(
+        &mut stdin,
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"eval_js","arguments":{"code":"2"}}}),
+    );
+    let r3 = recv_id(&rx, 3);
+    assert!(
+        r3.get("error").is_some() && r3.get("result").is_none(),
+        "after the trusted entry is gone the cached connection must NOT be reused: {r3}"
+    );
+    assert_eq!(
+        mock.toolcall_ok.load(Ordering::SeqCst),
+        1,
+        "the post-shutdown tool call must NOT reach the (now-untrusted) backend"
+    );
+
+    drop(stdin);
+}
