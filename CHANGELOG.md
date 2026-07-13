@@ -21,7 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hanging.
 - **`tools/list_changed` can no longer precede the initialize response.** The "ready for
   notifications" flag is now set on the client's `notifications/initialized` ack, not when the bridge
-  answers `initialize`.
+  answers `initialize`. A round-2 pass found the ack could then miss a backend-up edge that occurred
+  during the handshake window, so the ack handler now emits the refresh once if the backend is
+  already up.
+- **A non-SSE `2xx` body is relayed as compact single-line JSON**, not verbatim — a valid but
+  pretty-printed body can no longer be split across stdout lines and break a newline-delimited client
+  (round-2 follow-up; the SSE path already had this rigor).
 
 ### Hardened (pre-release adversarial audit of the bridge cold-start change)
 

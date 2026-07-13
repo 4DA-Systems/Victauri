@@ -180,6 +180,16 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
             // `initialize`) so the poller can't emit `list_changed` before the client is ready.
             "notifications/initialized" => {
                 client_ready.store(true, Ordering::Release);
+                // If the backend already came up during the init-handshake window, the poller
+                // saw that down→up edge but skipped the emit (the client wasn't ready yet), and
+                // there is no fresh edge to emit on later. Emit once now so the client still
+                // refreshes to the live tool list — idempotent and cheap. (A compliant client's
+                // first `tools/list` after this ack already returns the live list directly; this
+                // just covers a client that relies solely on the notification.)
+                if backend_up.load(Ordering::Acquire) {
+                    write_notification(&stdout, "notifications/tools/list_changed");
+                    write_notification(&stdout, "notifications/resources/list_changed");
+                }
             }
             "ping" => {
                 write_value(&stdout, &json!({"jsonrpc": "2.0", "id": id, "result": {}}));
@@ -501,6 +511,11 @@ async fn forward_with_retries(
         }
         Selection::None => {
             *locked(connection) = None;
+            // Fail-fast by design: a tool call issued in the sub-second window where a restarting
+            // app has removed its old discovery entry but not yet written the new one gets the
+            // actionable "unreachable" message rather than waiting. This is the price of the audit
+            // #1 rule (never reuse a cached connection); the retry loop's restart patience still
+            // applies once a live trusted backend is found, and the next call ~1s later succeeds.
             return ForwardResult::Unreachable(unreachable_message());
         }
     }
@@ -723,11 +738,14 @@ async fn post_message(
             }
         } else {
             let body = body.trim();
-            // Relay a non-SSE body ONLY if it is valid JSON — never write non-JSON onto the
-            // client's JSON-RPC stream. An empty or non-JSON 2xx body yields no payload; the
-            // caller then synthesizes an error for a request so the client's id can't hang.
-            if !body.is_empty() && serde_json::from_str::<serde_json::Value>(body).is_ok() {
-                payloads.push(body.to_string());
+            // Relay a non-SSE body ONLY if it is valid JSON, and relay its COMPACT single-line
+            // form. Never write non-JSON onto the client's JSON-RPC stream, and never split one
+            // message across stdout lines: a valid but pretty-printed body would otherwise be
+            // broken into several frames by `writeln!`. Re-serializing the parsed value guarantees
+            // exactly one line, matching the SSE path's per-line rigor. An empty or non-JSON body
+            // yields no payload; the caller then synthesizes an error for a request (no hang).
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+                payloads.push(parsed.to_string());
             }
         }
     }
@@ -769,6 +787,14 @@ async fn scan_once(app: Option<&str>) -> Selection {
     // never probed (that mis-order made a down-state scan hang on an unresponsive reused port).
     // When the app is down there are zero live entries, so zero health probes — the poller
     // stays cheap. `None` (enumeration unavailable) falls back to the per-pid check.
+    //
+    // HONEST LIMITATION (documented residual, not closed here): liveness is PID-based, and PIDs
+    // are reused. `/health` returns a static `ok` and carries no token, so it proves *something*
+    // is bound but does not authenticate the listener as the real app. A stale `<pid>` dir whose
+    // recorded PID has been recycled onto another of our live processes, combined with an attacker
+    // binding the freed port, could still pass liveness+health+identity and receive the token.
+    // Re-resolving on every forward (audit #1) shrinks this to a per-call coincidence rather than
+    // a cache-lifetime one; fully closing it needs mutual auth on `/health` (a plugin-side change).
     let alive = alive_pids();
     let is_alive = |pid: u32| {
         alive
@@ -1160,8 +1186,15 @@ fn uid_from_exclusive_probe(probe: &std::path::Path) -> Option<u32> {
     uid
 }
 
-/// On Windows the per-user temp dir is not world-writable, so the shared-temp planting
-/// attack does not apply; trust the directory.
+/// On Windows the default per-user temp dir (`%LOCALAPPDATA%\Temp`) is not world-writable, so the
+/// shared-temp planting attack that `dir_is_trusted` defends against on Unix does not apply; trust
+/// the directory.
+///
+/// HONEST CAVEAT (documented residual): this is an ASSUMPTION, not a verified ACL check. If a
+/// machine redirects `TEMP`/`TMP` to a shared location (e.g. `C:\Windows\Temp` or a multi-user
+/// spool), a cross-user discovery-dir planting attack is unguarded on Windows. Closing it would
+/// require a Windows ownership/ACL check here (non-trivial under `#![forbid(unsafe_code)]`);
+/// deferred as a non-default-config, Windows-only residual.
 #[cfg(not(unix))]
 fn dir_is_trusted(_path: &std::path::Path) -> bool {
     true
