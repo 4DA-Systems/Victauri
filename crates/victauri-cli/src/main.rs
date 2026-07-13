@@ -1784,11 +1784,8 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
 }
 
 fn extract_fn_name(line: &str) -> Option<String> {
-    let rest = if let Some(i) = line.find("fn ") {
-        &line[i + 3..]
-    } else {
-        return None;
-    };
+    let i = line.find("fn ")?;
+    let rest = &line[i + 3..];
     let name: String = rest
         .chars()
         .take_while(|c| c.is_alphanumeric() || *c == '_')
