@@ -259,7 +259,7 @@ automatically. Update `.mcp.json` to:
 
 ```json
 { "mcpServers": { "victauri": { "command": "victauri",
-  "args": ["bridge", "--wait", "--app", "<your.bundle.identifier>"] } } }
+  "args": ["bridge", "--app", "<your.bundle.identifier>"] } } }
 ```
 
 `--app` is only needed when several Victauri apps run at once (it pins the right one); with a
