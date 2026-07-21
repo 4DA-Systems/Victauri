@@ -5,18 +5,30 @@ use serde::Deserialize;
 /// contract is that `args` is an object of `{parameter_name: value}`; forwarding a scalar or
 /// array to `__TAURI_INTERNALS__.invoke` would break the handler's argument expectations, so we
 /// reject it with a clear error at the boundary instead of letting it slip through.
+///
+/// One liberal-in exception (same paper-cut class as the `sql` alias below): a STRING whose
+/// content parses to a JSON object is accepted as that object. Several MCP clients stringify
+/// structured tool parameters — live 2026-07-21, Claude Code sent
+/// `args: "{\"days\":7,\"maxNodes\":150}"` and every `invoke_command` call bounced with this
+/// error, forcing agents to fall back to `eval_js` + `__TAURI_INTERNALS__.invoke`. The intent
+/// of a stringified object is unambiguous; anything else (scalar, array, non-object string)
+/// stays rejected.
 fn deserialize_optional_object<'de, D>(
     deserializer: D,
 ) -> Result<Option<serde_json::Value>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
+    const CONTRACT: &str = "`args` must be a JSON object of {parameter_name: value} — or that \
+         object as a JSON string — (got a scalar, array, or non-object string)";
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     match value {
         None | Some(serde_json::Value::Object(_)) => Ok(value),
-        Some(_) => Err(serde::de::Error::custom(
-            "`args` must be a JSON object of {parameter_name: value} (got a scalar or array)",
-        )),
+        Some(serde_json::Value::String(s)) => match serde_json::from_str::<serde_json::Value>(&s) {
+            Ok(obj @ serde_json::Value::Object(_)) => Ok(Some(obj)),
+            _ => Err(serde::de::Error::custom(CONTRACT)),
+        },
+        Some(_) => Err(serde::de::Error::custom(CONTRACT)),
     }
 }
 
@@ -36,8 +48,9 @@ pub struct InvokeCommandParams {
     /// command's parameter names, e.g. `{"command":"get_item","args":{"itemId":42}}`. Do NOT
     /// put parameters at the top level next to `command` (a flat `{"command":...,"itemId":42}`
     /// leaves `args` empty and the handler sees a missing argument). Omit for no-arg commands.
-    /// Forwarded verbatim to `__TAURI_INTERNALS__.invoke(command, args)` — identical via the
-    /// MCP tool and the REST `POST /api/tools/invoke_command` endpoint.
+    /// A JSON STRING containing that object is also accepted (some MCP clients stringify
+    /// structured params). Forwarded to `__TAURI_INTERNALS__.invoke(command, args)` —
+    /// identical via the MCP tool and the REST `POST /api/tools/invoke_command` endpoint.
     #[serde(default, deserialize_with = "deserialize_optional_object")]
     pub args: Option<serde_json::Value>,
     /// Target webview label.
@@ -112,6 +125,49 @@ pub struct QueryDbParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Live-4DA dogfood (2026-07-21): Claude Code's MCP layer stringified the `args` object and
+    // every invoke_command call bounced, forcing an eval_js fallback. A stringified object is
+    // accepted; genuinely wrong shapes stay rejected.
+    #[test]
+    fn invoke_args_accepts_object_and_stringified_object() {
+        let direct: InvokeCommandParams =
+            serde_json::from_str(r#"{"command":"c","args":{"days":7,"maxNodes":150}}"#)
+                .expect("object args must deserialize");
+        let stringified: InvokeCommandParams =
+            serde_json::from_str(r#"{"command":"c","args":"{\"days\":7,\"maxNodes\":150}"}"#)
+                .expect("stringified object args must deserialize");
+        assert_eq!(
+            direct.args, stringified.args,
+            "both forms yield the same object"
+        );
+        assert_eq!(
+            direct
+                .args
+                .as_ref()
+                .and_then(|v| v.get("days"))
+                .and_then(serde_json::Value::as_i64),
+            Some(7)
+        );
+        // Absent args stays None.
+        let none: InvokeCommandParams =
+            serde_json::from_str(r#"{"command":"c"}"#).expect("absent args ok");
+        assert!(none.args.is_none());
+    }
+
+    #[test]
+    fn invoke_args_still_rejects_non_object_shapes() {
+        for bad in [
+            r#"{"command":"c","args":42}"#,
+            r#"{"command":"c","args":[1,2]}"#,
+            r#"{"command":"c","args":"not json"}"#,
+            r#"{"command":"c","args":"[1,2]"}"#,
+            r#"{"command":"c","args":"\"scalar\""}"#,
+        ] {
+            let r: Result<InvokeCommandParams, _> = serde_json::from_str(bad);
+            assert!(r.is_err(), "must reject: {bad}");
+        }
+    }
 
     // Live-4DA dogfood (2026-06-16): `query_db` accepted only `query`; passing the intuitive
     // `sql` key 400'd with no hint. The `sql` alias removes that paper-cut.
