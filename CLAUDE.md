@@ -184,9 +184,26 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-08-11)
+## Current State (2026-08-12)
 
-### MCP infrastructure upgraded to rmcp 3.1.2 / MCP `2026-07-28` (unreleased, post-0.8.7)
+### v0.8.8 — MCP infrastructure on rmcp 3.1.2 / MCP `2026-07-28`, live-verified on 4DA
+
+Released 2026-08-12 (PRs #62 rmcp upgrade, #63 tauri 2.11.5 lock, #64 victauri-test checkpoint
+fix, plus the release-prep docs/version sweep). **Live-verified inside 4DA before release** (via
+the documented TEST-ONLY path-dep, then reverted): protocol probes 8/8 (legacy initialize echo +
+`stateless` backfill header; no-handshake tools/list = no 422 + SEP-2549 cache hints with
+`resultType` stripped for legacy; `server/discover` advertising all 5 protocol versions;
+2026-07-28 negotiation; 400 on unknown versions; auth/host-guard intact); **all 35 tools live
+82/82** (incl. db_health on the real 303MB DB, command_catalog mining live schemas, fault/route/
+recording/trace lifecycles); old CLI 0.8.6 `check`/`doctor`/`bridge` (stdio e2e, identity
+selection across 2 running apps) all pass vs the new server; **soak: 156 webview reloads + 1,404
+concurrent probes, 0 errors, host stable**; 4DA dogfood suite 153/165 (all remaining fails =
+4DA-branch drift, triaged). **Bug found by the verification, fixed + proven live (PR #64):**
+victauri-test's length-based IPC checkpoint silently returned nothing once a busy app exceeded
+the log tools' newest-100 sliding window (latent since 0.7.10) — checkpoints are now the newest
+entry timestamp. Release-prep adversarial sweep also fixed stale session-era docs claims, two
+"31 tools" counts, a "subscribable resources" claim, and `server.json` still pinned at 0.8.6
+(missed by the 0.8.7 release; the bump script does not cover it — remember it manually).
 
 The embedded MCP server jumped **two SDK major versions (rmcp 1.5.0 → 3.1.2)** and now speaks the
 sessionless MCP `2026-07-28` protocol revision natively while staying fully backward compatible with
@@ -219,7 +236,7 @@ legacy stateful sessions, bridge e2e), `cargo doc -D warnings`, `scripts/preflig
 
 ## Current State (2026-07-13)
 
-### v0.8.7 — bridge cold-start fix + adversarial-audit hardening (`victauri-cli`-only)
+### v0.8.8 — bridge cold-start fix + adversarial-audit hardening (`victauri-cli`-only)
 
 Ships the bridge cold-start fix below (merged via PR #55) plus two rounds of adversarial hardening:
 an internal three-lens red-team + pre-emptive fixes (PR #56), an **external GPT adversarial audit**
@@ -272,7 +289,7 @@ semver-clean within `^0.8`.
 
 ## Current State (2026-07-08)
 
-### v0.8.7 — repo self-gate security hardening + advisory cleanup
+### v0.8.8 — repo self-gate security hardening + advisory cleanup
 
 Security-focused release prep for the repo-local local pre-push gate. No public Rust API change and no
 runtime plugin behavior change for Victauri users; the hardened files are developer tooling and are not

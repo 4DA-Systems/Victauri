@@ -49,7 +49,7 @@ victauri_plugin::VictauriBuilder::new()
 
 ## Tools
 
-31 MCP tools across three layers -- webview, IPC, and Rust backend:
+35 MCP tools across three layers -- webview, IPC, and Rust backend (full catalog in the [tools reference](https://4da-systems.github.io/victauri/tools-reference.html)):
 
 ### Backend (direct Rust access, no webview needed)
 

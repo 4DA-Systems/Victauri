@@ -138,7 +138,7 @@ The `rmcp` crate's `#[tool_router]` and `#[tool_handler]` macros require all too
 
 ### Can multiple agents connect simultaneously?
 
-Yes. The MCP server handles concurrent connections. Each connection gets its own MCP session. State (event log, recorder, bridge) is shared across sessions via `Arc` and thread-safe primitives.
+Yes. The MCP server handles concurrent connections. The `/mcp` transport is stateless by default (and MCP `2026-07-28` removes protocol-level sessions entirely), so concurrent clients need no per-connection session; shared state (event log, recorder, bridge) is guarded by `Arc` and thread-safe primitives.
 
 ## Troubleshooting
 

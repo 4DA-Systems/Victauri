@@ -94,7 +94,8 @@ pub fn build_app_full(
 /// The production default ([`build_app_full`]) is *stateless* because stateful mode mints an
 /// in-memory `Mcp-Session-Id` that dies on app restart / idle / SSE drop, after which rmcp answers
 /// `422` and generic MCP clients wedge for the whole run. Opt into stateful only if your client
-/// needs the session protocol. (Note: Victauri does not currently implement server-initiated
+/// needs the session protocol. Note that an MCP `2026-07-28` client is ALWAYS served
+/// sessionlessly even here — per SEP-2567 sessions only exist for legacy protocol versions. (Note: Victauri does not currently implement server-initiated
 /// resource-update push, so neither transport delivers MCP resource *subscription* notifications;
 /// the `subscribe` capability is intentionally not advertised — read resources on demand.)
 #[doc(hidden)]

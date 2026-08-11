@@ -3,7 +3,7 @@
   "name": "io.github.4da-systems/victauri",
   "title": "Victauri",
   "description": "Full-stack introspection and control for Tauri apps: DOM, IPC with bodies, Rust backend state, and SQLite through one in-process server. Debug builds only.",
-  "version": "0.8.6",
+  "version": "0.8.8",
   "repository": {
     "url": "https://github.com/4DA-Systems/victauri",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "cargo",
       "identifier": "victauri-cli",
-      "version": "0.8.6",
+      "version": "0.8.8",
       "runtimeHint": "victauri",
       "transport": { "type": "stdio" },
       "packageArguments": [

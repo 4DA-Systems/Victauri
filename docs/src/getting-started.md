@@ -108,7 +108,7 @@ curl http://127.0.0.1:7373/health
 # Returns: ok
 
 curl http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.7.8",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.8.8",...}
 ```
 
 Or use the Victauri CLI:
@@ -146,7 +146,7 @@ fn main() {
 
 ## Optional: REST API
 
-All 35 tools are also available via a REST API without MCP session overhead:
+All 35 tools are also available via a REST API with no MCP handshake at all:
 
 ```bash
 # List available tools
