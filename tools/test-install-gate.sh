@@ -3,7 +3,23 @@
 # against branch-controlled hook/gate drift and path-resolution edge cases.
 set -euo pipefail
 
-ROOT="$(git rev-parse --show-toplevel)"
+# Hooks run with git's per-repo environment exported (GIT_DIR & friends). In the
+# MAIN tree GIT_DIR is the relative ".git", which happens to re-resolve correctly
+# inside each scratch repo below — but in a LINKED WORKTREE it names the
+# worktree-specific gitdir (.git/worktrees/<name>), which would poison every git
+# call inside the scratch repos. Scrub the inherited env so this script behaves
+# identically under a hook and when run by hand.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY
+
+# Derive ROOT from this script's own location (tools/..), NOT from
+# `git rev-parse --show-toplevel`: under a WSL-style bash, a Windows-created
+# linked worktree's `.git` FILE points at a Windows-native `D:/...` gitdir that
+# WSL git treats as a relative path and dies with "not a git repository" — so
+# the git-based lookup made this gate fail closed on every push from a linked
+# worktree while passing in the main tree (same Windows-native-path class the
+# 0.8.7 audit fixed in install-gate.sh). ROOT is only used as a source file
+# tree and scratch-space anchor, never as a git repo, so no git is needed.
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
 case "$ROOT" in
   /mnt/[A-Za-z]/*)
