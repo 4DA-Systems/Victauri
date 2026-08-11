@@ -1,4 +1,4 @@
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 
 /// Produce a properly escaped JavaScript string literal (with double quotes).
 ///
@@ -490,13 +490,13 @@ fn attach_registry_metadata(
 
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
-        Ok(json) => CallToolResult::success(vec![Content::text(json)]),
+        Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
         Err(e) => tool_error(e.to_string()),
     }
 }
 
 pub fn tool_error(msg: impl Into<String>) -> CallToolResult {
-    let mut result = CallToolResult::success(vec![Content::text(msg)]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(msg)]);
     result.is_error = Some(true);
     result
 }
@@ -531,7 +531,7 @@ pub fn tool_error_with_hint(msg: impl Into<String>, hint: RecoveryHint) -> CallT
 [hint: {}]",
         hint.as_str()
     );
-    let mut result = CallToolResult::success(vec![Content::text(text)]);
+    let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.is_error = Some(true);
     result
 }

@@ -2,7 +2,7 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use rmcp::model::{CallToolResult, RawContent};
+use rmcp::model::{CallToolResult, ContentBlock};
 use serde::Serialize;
 
 use super::VictauriMcpHandler;
@@ -81,8 +81,8 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
         let msg = result
             .content
             .iter()
-            .find_map(|c| match &c.raw {
-                RawContent::Text(tc) => Some(tc.text.clone()),
+            .find_map(|c| match c {
+                ContentBlock::Text(tc) => Some(tc.text.clone()),
                 _ => None,
             })
             .unwrap_or_else(|| "unknown error".to_string());
@@ -90,8 +90,8 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
     }
 
     if result.content.len() == 1 {
-        return match &result.content[0].raw {
-            RawContent::Text(tc) => {
+        return match &result.content[0] {
+            ContentBlock::Text(tc) => {
                 // Parse with the default (stack-safe) recursion limit. Extremely
                 // deep results fall back to a JSON-encoded string rather than
                 // risking a stack overflow from an unbounded recursive parse.
@@ -99,7 +99,7 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
                     .unwrap_or_else(|_| serde_json::Value::String(tc.text.clone()));
                 serde_json::json!({ "result": parsed })
             }
-            RawContent::Image(ic) => serde_json::json!({
+            ContentBlock::Image(ic) => serde_json::json!({
                 "result": {
                     "type": "image",
                     "data": ic.data,
@@ -113,9 +113,9 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
     let items: Vec<serde_json::Value> = result
         .content
         .iter()
-        .filter_map(|c| match &c.raw {
-            RawContent::Text(tc) => Some(serde_json::json!({ "type": "text", "text": tc.text })),
-            RawContent::Image(ic) => Some(serde_json::json!({
+        .filter_map(|c| match c {
+            ContentBlock::Text(tc) => Some(serde_json::json!({ "type": "text", "text": tc.text })),
+            ContentBlock::Image(ic) => Some(serde_json::json!({
                 "type": "image",
                 "data": ic.data,
                 "mimeType": ic.mime_type,
@@ -129,12 +129,12 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::Content;
 
     #[test]
     fn text_result_parsed_as_json() {
-        let result =
-            CallToolResult::success(vec![Content::text(r#"{"title":"4DA","version":"1.0"}"#)]);
+        let result = CallToolResult::success(vec![ContentBlock::text(
+            r#"{"title":"4DA","version":"1.0"}"#,
+        )]);
         let json = to_rest_json(result);
         assert_eq!(json["result"]["title"], "4DA");
         assert_eq!(json["result"]["version"], "1.0");
@@ -142,14 +142,15 @@ mod tests {
 
     #[test]
     fn text_result_plain_string() {
-        let result = CallToolResult::success(vec![Content::text("hello world")]);
+        let result = CallToolResult::success(vec![ContentBlock::text("hello world")]);
         let json = to_rest_json(result);
         assert_eq!(json["result"], "hello world");
     }
 
     #[test]
     fn error_result() {
-        let mut result = CallToolResult::success(vec![Content::text("eval timed out after 30s")]);
+        let mut result =
+            CallToolResult::success(vec![ContentBlock::text("eval timed out after 30s")]);
         result.is_error = Some(true);
         let json = to_rest_json(result);
         assert_eq!(json["error"], "eval timed out after 30s");
@@ -158,7 +159,8 @@ mod tests {
 
     #[test]
     fn image_result() {
-        let result = CallToolResult::success(vec![Content::image("aWJhc2U2NA==", "image/png")]);
+        let result =
+            CallToolResult::success(vec![ContentBlock::image("aWJhc2U2NA==", "image/png")]);
         let json = to_rest_json(result);
         assert_eq!(json["result"]["type"], "image");
         assert_eq!(json["result"]["data"], "aWJhc2U2NA==");

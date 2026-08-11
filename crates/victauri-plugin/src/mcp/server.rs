@@ -45,7 +45,8 @@ fn normalize_auth_token(auth_token: Option<String>) -> Option<String> {
 
 /// Backfill a constant `Mcp-Session-Id` on stateless-MCP responses for old/strict clients.
 ///
-/// The stateless Streamable-HTTP transport (rmcp 1.5.0) never emits an `Mcp-Session-Id`. A stale
+/// The stateless Streamable-HTTP transport (rmcp ≥ 1.5, `legacy_session_mode: false` on 3.x) never
+/// emits an `Mcp-Session-Id` — and MCP 2026-07-28 removes protocol-level sessions entirely. A stale
 /// strict client — e.g. a `victauri` CLI built against the *stateful* server — requires that header
 /// at `initialize` and aborts with "no mcp-session-id header" when it is missing. We emit a fixed
 /// sentinel value so those clients proceed. The value is never validated server-side, so it can
@@ -131,7 +132,11 @@ fn build_app_full_inner(
     let handler = VictauriMcpHandler::new(state.clone(), bridge);
     let rest = super::rest::router(handler.clone());
 
-    // Run the Streamable-HTTP MCP transport STATELESS by default (rmcp's default is stateful).
+    // Run the Streamable-HTTP MCP transport STATELESS by default (rmcp's default is
+    // legacy-session mode). On rmcp 3.x, sessions only ever apply to legacy protocol
+    // versions (< 2026-07-28) anyway — per SEP-2567 a 2026-07-28 client is ALWAYS served
+    // statelessly regardless of this setting, so `build_app_stateful` only changes
+    // behavior for legacy-protocol clients.
     //
     // Why: stateful mode mints an in-memory `Mcp-Session-Id` at `initialize` that every later
     // request must echo. That session dies on app restart (the in-memory store is gone — and a
@@ -157,7 +162,7 @@ fn build_app_full_inner(
         StreamableHttpServerConfig::default()
     } else {
         StreamableHttpServerConfig::default()
-            .with_stateful_mode(false)
+            .with_legacy_session_mode(false)
             .with_json_response(true)
     };
     let mcp_service = StreamableHttpService::new(

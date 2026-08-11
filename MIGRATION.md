@@ -1,5 +1,30 @@
 # Migration Guide
 
+## v0.8.7 → Unreleased (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
+
+No consumer code changes are required and no dependency-requirement change is needed
+(`victauri-plugin = "0.8"` / `victauri-test = "0.8"` pick it up automatically; `cargo semver-checks`
+against the published 0.8.7 baseline reports no semver update required). Behavior notes:
+
+- **Every existing client keeps working unchanged.** `initialize`-based clients (the `victauri`
+  CLI/bridge, `victauri-test`, Claude Code, any legacy MCP client) negotiate their own protocol
+  version exactly as before; an absent `MCP-Protocol-Version` header is still treated as
+  `2025-03-26`. The constant `Mcp-Session-Id: stateless` compat backfill and the sessionless REST
+  API (`/api/tools`) are unchanged.
+- **New-protocol (`2026-07-28`) clients are always served sessionlessly**, even by
+  `build_app_stateful` — MCP `2026-07-28` removes protocol-level sessions (SEP-2567), so
+  `build_app_stateful` now only changes behavior for legacy-protocol clients (which still get real
+  sessions).
+- **`tools/list` / `resources/list` responses now include `ttlMs` and `cacheScope` cache hints**
+  (SEP-2549). The `2026-07-28` `resultType` discriminator is stripped for legacy peers by rmcp, but
+  `ttlMs`/`cacheScope` appear for all peers as extra result fields. MCP result schemas are
+  extra-field tolerant and every known client ignores them; if you maintain a strict-schema client
+  that rejects unknown result fields, account for `resultType`, `ttlMs`, and `cacheScope`.
+- `resources/subscribe` / `resources/unsubscribe` remain available to legacy clients with the same
+  recorded-intent behavior as before (the subscribe capability was never advertised); the
+  `2026-07-28` replacement (`subscriptions/listen`) is not implemented since Victauri has no
+  server-initiated resource push.
+
 ## v0.8.6 → v0.8.7 (bridge connects in a fresh terminal; `--wait` is now a no-op)
 
 No consumer code changes are required and no dependency-requirement change is needed (a

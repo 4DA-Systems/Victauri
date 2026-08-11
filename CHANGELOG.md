@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **MCP infrastructure upgraded to rmcp 3.1.2 (MCP protocol `2026-07-28`).** The embedded MCP
+  server jumps two SDK major versions (1.5.0 → 3.1.2) and now speaks the sessionless MCP
+  `2026-07-28` revision natively while remaining fully backward compatible with every legacy
+  protocol version (`2025-06-18`, `2025-03-26`, `2024-11-05`): `initialize`-based clients keep
+  negotiating their own version, the constant `Mcp-Session-Id: stateless` backfill for old strict
+  CLIs is unchanged, the stateful legacy-session transport (`build_app_stateful`) still mints real
+  sessions for legacy clients, and the sessionless REST API is untouched. All 0.8.4 stateless-422
+  guard tests pass unchanged on the new SDK. New-protocol (`2026-07-28`) clients are always served
+  statelessly per SEP-2567 — the wedge class the stateless default was built to avoid is now
+  removed at the protocol level itself.
+- **`tools/list` / `resources/list` now carry SEP-2549 cache hints** (`ttlMs: 300000`,
+  `cacheScope: "private"`), letting clients cache the static tool/resource lists instead of
+  re-fetching. rmcp strips the `2026-07-28` `resultType` discriminator when answering legacy peers;
+  the `ttlMs`/`cacheScope` fields do reach legacy clients as extra result fields, which MCP result
+  schemas (and every known client, including our own CLI/test clients) ignore. A regression test
+  pins this exact wire behavior.
+- Internal content-model migration (`Content`/`RawContent` → `ContentBlock`, `RawResource` →
+  `Resource`, MRTR-aware `CallToolResponse`/`ReadResourceResponse` handler returns). No public
+  Rust API change — `cargo semver-checks` against the published 0.8.7 baseline reports no semver
+  update required, so consumers on `victauri-plugin = "0.8"` pick this up automatically.
+
 ## [0.8.7] - 2026-07-13
 
 A `victauri-cli`-only release (the plugin and other crates are unchanged): the `victauri bridge`

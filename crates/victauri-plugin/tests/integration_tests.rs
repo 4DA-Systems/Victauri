@@ -712,6 +712,56 @@ async fn stateless_tool_call_without_session_does_not_422() {
 }
 
 #[tokio::test]
+async fn stateless_list_results_carry_cache_hints_and_strip_result_type_for_legacy() {
+    // Pins the rmcp 3.x wire behavior for a LEGACY peer (no `MCP-Protocol-Version`
+    // header ⇒ treated as 2025-03-26): the 2026-07-28 `resultType` discriminator is
+    // stripped by rmcp's `strip_result_type_for_legacy_peer`, while the SEP-2549
+    // cache hints we stamp (`ttlMs`/`cacheScope`) DO ride along as extra result
+    // fields — which MCP result schemas (and all known clients) ignore. If a future
+    // rmcp starts stripping the cache hints too, or stops stripping `resultType`,
+    // this test catches the documented-behavior drift.
+    let base = start_stateless_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/list",
+            "params": {}
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "tools/list: {}", resp.status());
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let result = &body["result"];
+    assert!(
+        result["tools"].as_array().is_some_and(|t| !t.is_empty()),
+        "tools/list should return a non-empty catalog"
+    );
+    assert!(
+        result.get("resultType").is_none(),
+        "resultType must be stripped for a legacy peer, got: {:?}",
+        result.get("resultType")
+    );
+    assert_eq!(
+        result["ttlMs"].as_u64(),
+        Some(300_000),
+        "SEP-2549 ttlMs cache hint should be stamped on tools/list"
+    );
+    assert_eq!(
+        result["cacheScope"].as_str(),
+        Some("private"),
+        "SEP-2549 cacheScope should be private (list depends on this instance's privacy profile)"
+    );
+}
+
+#[tokio::test]
 async fn stateless_returns_plain_json_response() {
     // `json_response = true` returns application/json directly instead of an SSE frame.
     let base = start_stateless_test_server(test_state(), &["main"]).await;
