@@ -1320,15 +1320,34 @@ impl VictauriClient {
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to get_ipc_calls_since")]
     pub async fn ipc_calls_since(&mut self, checkpoint: usize) -> Result<Vec<Value>, TestError> {
-        let log = self.get_ipc_log(None).await?;
-        let entries = if let Some(arr) = log.as_array() {
-            arr.clone()
+        // Timestamp filter, NOT positional skip: the server's log tools return a
+        // capped sliding window of the NEWEST entries (default 100), so
+        // `skip(checkpoint_length)` silently yields nothing the moment a busy app
+        // exceeds the cap (found live on 4DA, 2026-08-11). Entries without a
+        // timestamp are included only for the zero checkpoint (nothing to order by).
+        let entries = self.ipc_log_entries().await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| {
+                e.get("timestamp")
+                    .and_then(Value::as_u64)
+                    .map_or(checkpoint == 0, |t| t > checkpoint as u64)
+            })
+            .collect())
+    }
+
+    /// Fetch the IPC log with the checkpoint read limit and normalize its shape.
+    async fn ipc_log_entries(&mut self) -> Result<Vec<Value>, TestError> {
+        // Explicit high limit: the tool's default window (100) is too small for a
+        // busy app's checkpoint arithmetic; 1000 matches the JS-side log capacity.
+        let log = self.get_ipc_log(Some(1000)).await?;
+        if let Some(arr) = log.as_array() {
+            Ok(arr.clone())
         } else if let Some(entries) = log.get("entries").and_then(Value::as_array) {
-            entries.clone()
+            Ok(entries.clone())
         } else {
-            return Ok(Vec::new());
-        };
-        Ok(entries.into_iter().skip(checkpoint).collect())
+            Ok(Vec::new())
+        }
     }
 
     /// Filter the IPC log for calls to a specific command.
@@ -1383,7 +1402,7 @@ impl VictauriClient {
 
     // ── Deprecated Aliases (Phase 4C) ────────────────────────────────────────
 
-    /// Snapshot the current IPC log length, for use with `ipc_calls_since`.
+    /// Snapshot the newest IPC-log timestamp, for use with `ipc_calls_since`.
     ///
     /// Prefer [`VictauriClient::create_ipc_checkpoint`] — this alias exists
     /// for backwards compatibility.
@@ -1396,25 +1415,30 @@ impl VictauriClient {
         self.create_ipc_checkpoint().await
     }
 
-    /// Snapshot the current IPC log length, for use with `ipc_calls_since`.
+    /// Snapshot the newest IPC-log timestamp, for use with `ipc_calls_since`.
     ///
-    /// Returns the number of IPC calls recorded so far. Pass this value to
+    /// Returns the maximum entry `timestamp` (epoch milliseconds) currently
+    /// visible in the IPC log, or `0` when the log is empty. Pass this value to
     /// [`VictauriClient::ipc_calls_since`] to get only the calls that occurred
-    /// after the checkpoint.
+    /// after the checkpoint. Timestamp-based rather than length-based because
+    /// the server's log tools return a capped sliding window of the newest
+    /// entries — a positional checkpoint stops working once a busy app exceeds
+    /// the cap.
     ///
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     pub async fn create_ipc_checkpoint(&mut self) -> Result<usize, TestError> {
-        let log = self.get_ipc_log(None).await?;
-        let len = if let Some(arr) = log.as_array() {
-            arr.len()
-        } else if let Some(entries) = log.get("entries").and_then(Value::as_array) {
-            entries.len()
-        } else {
-            0
-        };
-        Ok(len)
+        // The checkpoint is the NEWEST entry timestamp (epoch ms), not the log
+        // length: the log tools serve a capped sliding window, so a length
+        // snapshot breaks (always-empty `calls_since`) once the app has logged
+        // more calls than the cap. Timestamps are window-position-independent.
+        let entries = self.ipc_log_entries().await?;
+        Ok(entries
+            .iter()
+            .filter_map(|e| e.get("timestamp").and_then(Value::as_u64))
+            .max()
+            .unwrap_or(0) as usize)
     }
 
     // ── Typed Response Methods (Phase 4E) ────────────────────────────────────
