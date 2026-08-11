@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`victauri-test`: IPC checkpoints survive the log's sliding-window cap.** `create_ipc_checkpoint`
+  snapshotted the IPC log *length* and `ipc_calls_since` did `skip(length)` — but the server's log
+  tools return a capped sliding window of the newest entries (default 100), so on any app with more
+  than ~100 logged IPC calls the checkpoint equalled the window size and `calls_since` was silently
+  ALWAYS empty (found live on 4DA during the rmcp 3.1.2 verification: every canary assertion in its
+  dogfood suite failed). The checkpoint is now the newest entry `timestamp` (epoch ms) and
+  `calls_since` filters by it with a 1000-entry read — immune to the window's position. Method
+  signatures unchanged; verified live (the two failing 4DA dogfood tests pass with the fix, plus two
+  new mock-server regression tests).
+
 ### Changed
 
 - **MCP infrastructure upgraded to rmcp 3.1.2 (MCP protocol `2026-07-28`).** The embedded MCP

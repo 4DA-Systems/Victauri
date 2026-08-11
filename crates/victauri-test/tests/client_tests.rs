@@ -1110,3 +1110,84 @@ async fn call_tool_recovery_is_bounded_and_reports_rest_fallback() {
     // Bounded: exactly one re-initialization (2 handshakes), no infinite loop.
     assert_eq!(state.initialize_count.load(Ordering::Relaxed), 2);
 }
+
+// ── IPC Checkpoint vs Sliding-Window Log Cap ──────────────────────────────
+
+#[tokio::test]
+async fn ipc_checkpoint_survives_sliding_window_cap() {
+    // The server's `logs ipc` tool returns a capped sliding WINDOW of the
+    // NEWEST entries (default 100). The old length-based checkpoint did
+    // `skip(len)` over that window, so once a busy app logged more calls than
+    // the cap, `calls_since` was ALWAYS empty and every canary assertion
+    // failed (found live on 4DA, 2026-08-11: log ≥200 entries, checkpoint=100,
+    // window stays 100 → skip(100) = []). The checkpoint is now the newest
+    // timestamp and `calls_since` filters by it, which is immune to the
+    // window's position.
+    let state = MockState::new();
+    let port = start_mock_server(state.clone()).await;
+    let mut client = VictauriClient::connect(port).await.unwrap();
+
+    // Window BEFORE: the log is already AT the cap — 100 entries, ts 1..=100.
+    let w1: Vec<Value> = (1..=100u64)
+        .map(|t| json!({"command": "noise", "timestamp": t}))
+        .collect();
+    *state.response_override.lock().await = Some(json!({
+        "content": [{"type": "text", "text": serde_json::to_string(&w1).unwrap()}]
+    }));
+    let cp = client.create_ipc_checkpoint().await.unwrap();
+    assert_eq!(
+        cp, 100,
+        "checkpoint must be the newest timestamp, not the window length"
+    );
+
+    // Window AFTER: 5 new calls landed, the window slid — ts 6..=105, canary last.
+    let w2: Vec<Value> = (6..=104u64)
+        .map(|t| json!({"command": "noise", "timestamp": t}))
+        .chain(std::iter::once(
+            json!({"command": "canary", "timestamp": 105u64}),
+        ))
+        .collect();
+    *state.response_override.lock().await = Some(json!({
+        "content": [{"type": "text", "text": serde_json::to_string(&w2).unwrap()}]
+    }));
+    let since = client.get_ipc_calls_since(cp).await.unwrap();
+    assert_eq!(
+        since.len(),
+        5,
+        "exactly the 5 post-checkpoint entries must be returned, got: {since:?}"
+    );
+    assert!(
+        since.iter().any(|c| c["command"] == "canary"),
+        "the canary call landed after the checkpoint and must be visible"
+    );
+}
+
+#[tokio::test]
+async fn ipc_checkpoint_empty_log_returns_all_later_entries() {
+    // Zero checkpoint (empty log at checkpoint time): everything that appears
+    // later is "since" — including entries that carry no timestamp field.
+    let state = MockState::new();
+    let port = start_mock_server(state.clone()).await;
+    let mut client = VictauriClient::connect(port).await.unwrap();
+
+    *state.response_override.lock().await = Some(json!({
+        "content": [{"type": "text", "text": "[]"}]
+    }));
+    let cp = client.create_ipc_checkpoint().await.unwrap();
+    assert_eq!(cp, 0, "empty log must produce the zero checkpoint");
+
+    *state.response_override.lock().await = Some(json!({
+        "content": [{"type": "text", "text":
+            serde_json::to_string(&vec![
+                json!({"command": "first", "timestamp": 10u64}),
+                json!({"command": "no_ts_entry"}),
+            ]).unwrap()
+        }]
+    }));
+    let since = client.get_ipc_calls_since(cp).await.unwrap();
+    assert_eq!(
+        since.len(),
+        2,
+        "zero checkpoint returns every entry, incl. timestamp-less ones: {since:?}"
+    );
+}
