@@ -35,7 +35,7 @@ VICTAURI_E2E=1 cargo test --test smoke           # run tests
 
 ### VictauriClient
 
-The `VictauriClient` is a typed HTTP client that handles MCP session lifecycle automatically:
+The `VictauriClient` is a typed HTTP client that handles the MCP handshake automatically (the server is stateless by default — there is no session to manage):
 
 ```rust
 use victauri_test::VictauriClient;

@@ -127,11 +127,11 @@ Victauri serves both protocols on the same port:
 | `/health` | GET (no auth) | Health checks, watchdog |
 | `/info` | GET | Server metadata |
 
-The REST API uses the same tool dispatch, auth, rate limiting, and privacy enforcement as MCP. It simply removes the session/handshake overhead.
+The REST API uses the same tool dispatch, auth, rate limiting, and privacy enforcement as MCP. It simply removes the MCP handshake overhead (the `/mcp` transport itself is already sessionless by default). `tools/list` and `resources/list` responses to MCP `2026-07-28` peers carry SEP-2549 cache hints (`ttlMs`, `cacheScope: private`) so clients can cache the static catalogs.
 
 ### MCP Resources
 
-Three subscribable resources provide real-time state:
+Three read-on-demand resources expose live state (the `subscribe` capability is deliberately not advertised — `resources/subscribe` is legacy-protocol-only under MCP `2026-07-28`, and Victauri has no server-initiated update push; read resources when you need them):
 
 - `victauri://state` — Plugin state (commands registered, events captured, memory, port)
 - `victauri://windows` — All window states (position, size, visibility, URL)

@@ -1349,8 +1349,9 @@ then fails with `422`/`404`. The bridge avoids that by design.
 - **Multiple apps running?** Pin the bridge with `--app <bundle-identifier>` in `.mcp.json`
   (`"args": ["bridge", "--app", "com.your.app"]`), or set `VICTAURI_APP`. `init` bakes this in
   automatically when it can read your identifier.
-- **If a tool call fails after an app rebuild/restart:** the bridge re-establishes the
-  session automatically — just retry. If the MCP path is genuinely wedged, the **sessionless
+- **If a tool call fails after an app rebuild/restart:** the bridge re-resolves the backend
+  automatically — just retry (the transport is stateless by default, so there is usually no
+  session to lose). If the MCP path is genuinely wedged, the **sessionless
   REST API is the fallback, NOT CDP**: `POST http://127.0.0.1:<port>/api/tools/<tool>` with
   the Bearer token from `<temp>/victauri/<pid>/token` (same capabilities, no session).
 

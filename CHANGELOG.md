@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-08-12
+
+The MCP-infrastructure release: the embedded server jumps two SDK major versions
+(rmcp 1.5.0 → 3.1.2) and speaks the sessionless MCP `2026-07-28` protocol natively while staying
+fully backward compatible with every legacy revision (`2024-11-05` … `2025-06-18`). Verified
+end-to-end inside live 4DA (protocol probes 8/8, all 35 tools live, 156-reload soak with zero
+errors, 165-test dogfood suite) and adversarially re-swept before release. `cargo semver-checks`
+vs 0.8.7: no semver update required — `^0.8` consumers pick it up automatically.
+
 ### Fixed
 
 - **`victauri-test`: IPC checkpoints survive the log's sliding-window cap.** `create_ipc_checkpoint`

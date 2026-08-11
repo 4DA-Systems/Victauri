@@ -134,8 +134,9 @@ impl<'a> WaitForBuilder<'a> {
 
 /// Typed HTTP client for the Victauri MCP server.
 ///
-/// Manages session lifecycle (initialize → tool calls → cleanup) and provides
-/// convenient methods for common test operations.
+/// Runs the MCP handshake (initialize → tool calls) and provides convenient
+/// methods for common test operations. The server's default transport is
+/// stateless, so no session is minted or tracked.
 ///
 /// # Example
 ///

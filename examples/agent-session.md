@@ -156,11 +156,11 @@ Result: 2 violations
 | **Natural language** | `resolve_command("save the key")` → finds `save_api_key` |
 | **Window inspection** | `window(list)` → `window(get_state, label: "main")` |
 
-## Tool Reference (31 tools)
+## Tool Reference (35 tools)
 
-**19 standalone:** `eval_js`, `dom_snapshot`, `find_elements`, `invoke_command`, `screenshot`, `verify_state`, `detect_ghost_commands`, `check_ipc_integrity`, `wait_for`, `assert_semantic`, `resolve_command`, `get_registry`, `get_memory_stats`, `get_plugin_info`, `get_diagnostics`, `app_info`, `list_app_dir`, `read_app_file`, `query_db`
+**20 standalone:** `eval_js`, `dom_snapshot`, `find_elements`, `invoke_command`, `screenshot`, `verify_state`, `detect_ghost_commands`, `check_ipc_integrity`, `wait_for`, `assert_semantic`, `resolve_command`, `get_registry`, `app_state`, `get_memory_stats`, `get_plugin_info`, `get_diagnostics`, `app_info`, `list_app_dir`, `read_app_file`, `query_db`
 
-**12 compound** (pass `action` to select behavior):
+**15 compound** (pass `action` to select behavior — incl. `animation`, `route`, `trace`):
 - `interact` — click, double_click, hover, focus, scroll_into_view, select_option
 - `input` — fill, type_text, press_key
 - `window` — get_state, list, manage, resize, move_to, set_title

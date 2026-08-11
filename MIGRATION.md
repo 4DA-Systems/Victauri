@@ -1,6 +1,6 @@
 # Migration Guide
 
-## v0.8.7 → Unreleased (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
+## v0.8.7 → v0.8.8 (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
 
 No consumer code changes are required and no dependency-requirement change is needed
 (`victauri-plugin = "0.8"` / `victauri-test = "0.8"` pick it up automatically; `cargo semver-checks`
