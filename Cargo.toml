@@ -55,7 +55,7 @@ victauri-test = { version = "0.8.7", path = "crates/victauri-test" }
 tauri = { version = "2", default-features = false }
 
 # MCP / Server
-rmcp = { version = "1.5", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.1", features = ["server", "macros", "transport-streamable-http-server"] }
 axum = "0.8"
 tokio = { version = "1", features = ["full"] }
 

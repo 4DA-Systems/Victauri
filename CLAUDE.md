@@ -184,6 +184,39 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
+## Current State (2026-08-11)
+
+### MCP infrastructure upgraded to rmcp 3.1.2 / MCP `2026-07-28` (unreleased, post-0.8.7)
+
+The embedded MCP server jumped **two SDK major versions (rmcp 1.5.0 → 3.1.2)** and now speaks the
+sessionless MCP `2026-07-28` protocol revision natively while staying fully backward compatible with
+every legacy version (`2024-11-05` … `2025-06-18`). Verified: `cargo semver-checks` vs the published
+0.8.7 baseline says **no semver update required** (the 0.8.0 decision to make MCP param types
+`pub(crate)` is exactly why) → stays in `^0.8`, consumers pick it up automatically. Full local gate
+green: fmt, clippy `--all-targets` (default / no-default / release) zero warnings, workspace build,
+**1,634 tests / 0 failures** (incl. all 0.8.4 stateless-422 + `Mcp-Session-Id` backfill guards,
+legacy stateful sessions, bridge e2e), `cargo doc -D warnings`, `scripts/preflight.ps1`.
+
+- **Transport:** `with_stateful_mode(false)` → `with_legacy_session_mode(false)` (rename; semantics
+  preserved). On rmcp 3.x, sessions only ever apply to legacy protocol clients — a `2026-07-28`
+  client is ALWAYS served statelessly (SEP-2567), even by `build_app_stateful`. The 422 wedge class
+  is now removed at the protocol level itself. `stateless_protocol_metadata_required` stays `false`
+  (default): absent version header ⇒ `2025-03-26`, so old clients keep working.
+- **Handler:** MRTR-aware returns (`call_tool` → `CallToolResponse`, `read_resource` →
+  `ReadResourceResponse`; Victauri tools always return `Complete`, redaction matches that variant).
+  `subscribe`/`unsubscribe` kept for legacy clients under `#[allow(deprecated)]` (capability still
+  not advertised). Content model migrated: `Content`/`RawContent` → flat `ContentBlock`,
+  `RawResource` → `Resource` builder (no `.no_annotation()`).
+- **Optimization (SEP-2549):** `tools/list` / `resources/list` now stamp `ttl_ms: 300_000` +
+  `CacheScope::Private` — both lists are fixed for the process lifetime, so clients can cache
+  instead of re-fetching. Disconfirmation note: rmcp's `strip_result_type_for_legacy_peer` strips
+  ONLY `resultType` — `ttlMs`/`cacheScope` DO reach legacy peers as extra fields (harmless: MCP
+  result schemas are extra-field tolerant; a regression test pins the exact wire behavior).
+- **Unchanged surfaces:** REST `/api/tools` (sessionless, no rmcp exposure), auth/rate-limit/origin/
+  DNS-rebinding middleware ordering, the CLI bridge (no rmcp dep; local handshake + fallback list
+  untouched), `victauri-test` client. rmcp 3.x also brings its own localhost-only Host allowlist in
+  the transport — defense-in-depth behind our existing `dns_rebinding_guard`.
+
 ## Current State (2026-07-13)
 
 ### v0.8.7 — bridge cold-start fix + adversarial-audit hardening (`victauri-cli`-only)
@@ -767,7 +800,7 @@ Tested HEAD exhaustively against live 4DA (real app: 3 windows, 383 commands, 30
 
 ## Current State (2026-05-28)
 
-**All 8 phases complete + production hardening + adversarial audit + comprehensive security hardening + REST API + VS Code extension + ultimate compatibility testing (5 third-party apps, 867/895 pass across 179 tests each = 96.9%). v0.7.8. Full browser extension ecosystem (Chrome + Firefox + npm package). CI/CD with release workflow + cross-platform E2E. Documentation site.** 1862+ Rust tests (workspace) + 163 JavaScript tests (Chrome extension vitest). All 7 crates compile cleanly (`RUSTFLAGS="-Dwarnings" cargo clippy` passes). Zero clippy warnings (`-D warnings`, 20 enforced lints). 26 runnable doc-test examples. 16 Criterion benchmarks. CI green on Linux/Windows/macOS + Chrome extension test job + cross-platform E2E job. Tauri 2.10.3 + rmcp 1.5.0. All 7 crates published to crates.io. `cargo install victauri-cli` provides standalone `victauri` binary. Dual-protocol: MCP on `/mcp` + REST on `/api/tools`. VS Code extension in `editors/vscode/`. Chrome extension in `extensions/chrome/` with MV3, 20 MCP tools, native messaging host on :7474. Firefox extension in `extensions/firefox/` (full MV3 port). npm package in `extensions/npm/` with postinstall binary download. mdbook documentation site in `docs/`. GitHub Actions release workflow (cross-platform matrix builds → GitHub Release + crates.io publish + Chrome extension zip). `invoke_command` surfaces Tauri errors (no longer swallows). `find_elements` accepts `selector` as alias for `css` param, returns error for invalid selectors. `eval_js` returns MCP isError for JS exceptions via `__victauri_ok`/`__victauri_err` envelope protocol. Hidden window eval fails fast (2s probe) with bridge ready signal on init. Recording replay/export works after stop. Explain narrative filters Victauri internal traffic via `AppEvent::is_internal()`. `AppEvent::Console` variant for typed console log events. Discovery directory always contains session token for zero-config auth. Soak test (120s) and concurrent stress test (10 clients, 60s) available. 8 regression E2E tests validate all v0.5.3/v0.5.4 fixes. **Security hardening (v0.7.8):** auth-on-by-default with auto-generated UUID v4 tokens, DNS rebinding guard, origin guard with URL-parsed validation, security response headers (nosniff/no-store/DENY/CSP), rate limiter Retry-After, SQL comment stripping + stacked query blocking, discovery file ACLs (icacls/chmod), env var prefix trimming, eval output size limit (5 MB).
+**All 8 phases complete + production hardening + adversarial audit + comprehensive security hardening + REST API + VS Code extension + ultimate compatibility testing (5 third-party apps, 867/895 pass across 179 tests each = 96.9%). v0.7.8. Full browser extension ecosystem (Chrome + Firefox + npm package). CI/CD with release workflow + cross-platform E2E. Documentation site.** 1862+ Rust tests (workspace) + 163 JavaScript tests (Chrome extension vitest). All 7 crates compile cleanly (`RUSTFLAGS="-Dwarnings" cargo clippy` passes). Zero clippy warnings (`-D warnings`, 20 enforced lints). 26 runnable doc-test examples. 16 Criterion benchmarks. CI green on Linux/Windows/macOS + Chrome extension test job + cross-platform E2E job. Tauri 2.10.3 + rmcp 3.1.2 (upgraded 2026-08-11; was rmcp 1.5.0 at this entry's writing). All 7 crates published to crates.io. `cargo install victauri-cli` provides standalone `victauri` binary. Dual-protocol: MCP on `/mcp` + REST on `/api/tools`. VS Code extension in `editors/vscode/`. Chrome extension in `extensions/chrome/` with MV3, 20 MCP tools, native messaging host on :7474. Firefox extension in `extensions/firefox/` (full MV3 port). npm package in `extensions/npm/` with postinstall binary download. mdbook documentation site in `docs/`. GitHub Actions release workflow (cross-platform matrix builds → GitHub Release + crates.io publish + Chrome extension zip). `invoke_command` surfaces Tauri errors (no longer swallows). `find_elements` accepts `selector` as alias for `css` param, returns error for invalid selectors. `eval_js` returns MCP isError for JS exceptions via `__victauri_ok`/`__victauri_err` envelope protocol. Hidden window eval fails fast (2s probe) with bridge ready signal on init. Recording replay/export works after stop. Explain narrative filters Victauri internal traffic via `AppEvent::is_internal()`. `AppEvent::Console` variant for typed console log events. Discovery directory always contains session token for zero-config auth. Soak test (120s) and concurrent stress test (10 clients, 60s) available. 8 regression E2E tests validate all v0.5.3/v0.5.4 fixes. **Security hardening (v0.7.8):** auth-on-by-default with auto-generated UUID v4 tokens, DNS rebinding guard, origin guard with URL-parsed validation, security response headers (nosniff/no-store/DENY/CSP), rate limiter Retry-After, SQL comment stripping + stacked query blocking, discovery file ACLs (icacls/chmod), env var prefix trimming, eval output size limit (5 MB).
 
 ### Live test results (4DA, 2026-04-26):
 Tested against 4DA (3 windows: main 1200×800, notification 440×160, briefing 560×780; 135 DOM elements; 11 buttons; React/Vite frontend on :4444). **99/99 tests pass — all 23 tools + 3 resources + tool registration checks.**

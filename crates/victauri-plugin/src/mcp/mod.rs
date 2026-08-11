@@ -23,10 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    AnnotateAble, CallToolRequestParams, CallToolResult, Content, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, RawContent, RawResource, ReadResourceRequestParams,
-    ReadResourceResult, ResourceContents, ServerCapabilities, ServerInfo, SubscribeRequestParams,
-    Tool, UnsubscribeRequestParams,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerInfo, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_router};
@@ -115,6 +115,13 @@ const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
 const RESOURCE_URI_IPC_LOG: &str = "victauri://ipc-log";
 const RESOURCE_URI_WINDOWS: &str = "victauri://windows";
 const RESOURCE_URI_STATE: &str = "victauri://state";
+
+/// SEP-2549 freshness hint for `tools/list` / `resources/list` results (5 minutes).
+/// Both lists are fixed for the process lifetime, so clients may cache them; a
+/// `notifications/tools/list_changed` (emitted by the CLI bridge on backend swap)
+/// still invalidates earlier. Conservative rather than "forever" so a client that
+/// only honors TTLs re-syncs within minutes of an app rebuild on the same port.
+const LIST_RESULT_TTL_MS: u64 = 300_000;
 
 /// Map an MCP resource URI to the privacy capability that gates its
 /// tool-equivalent read. Resources are served outside the tool dispatcher, so
@@ -226,7 +233,7 @@ impl VictauriMcpHandler {
             .eval_with_return(&params.code, params.webview_label.as_deref())
             .await
         {
-            Ok(result) => CallToolResult::success(vec![Content::text(result)]),
+            Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
             Err(e) => tool_error(e),
         }
     }
@@ -321,7 +328,7 @@ impl VictauriMcpHandler {
                 {
                     return tool_error(err);
                 }
-                CallToolResult::success(vec![Content::text(result)])
+                CallToolResult::success(vec![ContentBlock::text(result)])
             }
             Err(e) => tool_error(e),
         }
@@ -377,7 +384,7 @@ impl VictauriMcpHandler {
                         command = %params.command,
                         "fault injection: dropping response"
                     );
-                    return CallToolResult::success(vec![Content::text("{}")]);
+                    return CallToolResult::success(vec![ContentBlock::text("{}")]);
                 }
                 crate::introspection::FaultType::Corrupt => {
                     tracing::info!(
@@ -400,9 +407,9 @@ impl VictauriMcpHandler {
                             "{{\"__corrupted\":true,\"original_length\":{},\"fault\":\"corrupt\"}}",
                             result.len()
                         );
-                        return CallToolResult::success(vec![Content::text(corrupted)]);
+                        return CallToolResult::success(vec![ContentBlock::text(corrupted)]);
                     }
-                    return CallToolResult::success(vec![Content::text(
+                    return CallToolResult::success(vec![ContentBlock::text(
                         "{\"__corrupted\":true,\"fault\":\"corrupt\",\"note\":\"original invocation also failed\"}",
                     )]);
                 }
@@ -433,7 +440,7 @@ impl VictauriMcpHandler {
                         params.command
                     ));
                 }
-                CallToolResult::success(vec![Content::text(result)])
+                CallToolResult::success(vec![ContentBlock::text(result)])
             }
             Err(e) => tool_error(format!("invoke_command failed: {e}")),
         }
@@ -508,7 +515,7 @@ impl VictauriMcpHandler {
                 Ok(png_bytes) => {
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-                    CallToolResult::success(vec![Content::image(b64, "image/png")])
+                    CallToolResult::success(vec![ContentBlock::image(b64, "image/png")])
                 }
                 Err(e) => tool_error(format!("screenshot capture failed: {e}")),
             },
@@ -715,7 +722,7 @@ impl VictauriMcpHandler {
             .eval_with_return_timeout(&code, params.webview_label.as_deref(), eval_timeout)
             .await
         {
-            Ok(result) => CallToolResult::success(vec![Content::text(result)]),
+            Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
             Err(e) => tool_error(e),
         }
     }
@@ -1747,7 +1754,7 @@ impl VictauriMcpHandler {
                     .bridge
                     .manage_window(params.label.as_deref(), manage_action.as_str())
                 {
-                    Ok(msg) => CallToolResult::success(vec![Content::text(msg)]),
+                    Ok(msg) => CallToolResult::success(vec![ContentBlock::text(msg)]),
                     Err(e) => tool_error(e),
                 }
             }
@@ -1776,7 +1783,7 @@ impl VictauriMcpHandler {
                     Ok(()) => {
                         let result =
                             serde_json::json!({"ok": true, "width": width, "height": height});
-                        CallToolResult::success(vec![Content::text(result.to_string())])
+                        CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e),
                 }
@@ -1794,7 +1801,7 @@ impl VictauriMcpHandler {
                 match self.bridge.move_window(params.label.as_deref(), x, y) {
                     Ok(()) => {
                         let result = serde_json::json!({"ok": true, "x": x, "y": y});
-                        CallToolResult::success(vec![Content::text(result.to_string())])
+                        CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e),
                 }
@@ -1809,7 +1816,7 @@ impl VictauriMcpHandler {
                 match self.bridge.set_window_title(params.label.as_deref(), title) {
                     Ok(()) => {
                         let result = serde_json::json!({"ok": true, "title": title});
-                        CallToolResult::success(vec![Content::text(result.to_string())])
+                        CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e),
                 }
@@ -1995,7 +2002,7 @@ impl VictauriMcpHandler {
                             "started": true,
                             "session_id": session_id,
                         });
-                        CallToolResult::success(vec![Content::text(result.to_string())])
+                        CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e.to_string()),
                 }
@@ -2024,7 +2031,7 @@ impl VictauriMcpHandler {
                             "checkpoint_id": id,
                             "event_index": self.state.recorder.event_count(),
                         });
-                        CallToolResult::success(vec![Content::text(result.to_string())])
+                        CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e.to_string()),
                 }
@@ -2060,7 +2067,7 @@ impl VictauriMcpHandler {
                 Some(s) => {
                     let json = serde_json::to_string_pretty(&s)
                         .unwrap_or_else(|e| format!("{{\"error\": \"{e}\"}}"));
-                    CallToolResult::success(vec![Content::text(json)])
+                    CallToolResult::success(vec![ContentBlock::text(json)])
                 }
                 None => tool_error("no recording is active — start one first"),
             },
@@ -2085,7 +2092,7 @@ impl VictauriMcpHandler {
                     "started_at": session.started_at.to_rfc3339(),
                 });
                 self.state.recorder.import(session);
-                CallToolResult::success(vec![Content::text(result.to_string())])
+                CallToolResult::success(vec![ContentBlock::text(result.to_string())])
             }
             RecordingAction::Flush => {
                 if !self.state.recorder.is_recording() {
@@ -2518,9 +2525,9 @@ impl VictauriMcpHandler {
             TraceAction::Frames => {
                 let limit = params.limit.unwrap_or(0);
                 let frames = self.state.screencast.frames(limit);
-                let items: Vec<Content> = frames
+                let items: Vec<ContentBlock> = frames
                     .into_iter()
-                    .map(|f| Content::image(f.data_b64, "image/png"))
+                    .map(|f| ContentBlock::image(f.data_b64, "image/png"))
                     .collect();
                 if items.is_empty() {
                     return json_result(&serde_json::json!({ "frames": 0 }));
@@ -2577,7 +2584,7 @@ impl VictauriMcpHandler {
                     Ok(result_str) => {
                         match serde_json::from_str::<serde_json::Value>(&result_str) {
                             Ok(v) => json_result(&v),
-                            Err(_) => CallToolResult::success(vec![Content::text(result_str)]),
+                            Err(_) => CallToolResult::success(vec![ContentBlock::text(result_str)]),
                         }
                     }
                     Err(e) => tool_error(format!("animation list failed: {e}")),
@@ -2600,7 +2607,7 @@ impl VictauriMcpHandler {
                     Ok(result_str) => {
                         match serde_json::from_str::<serde_json::Value>(&result_str) {
                             Ok(v) => json_result(&v),
-                            Err(_) => CallToolResult::success(vec![Content::text(result_str)]),
+                            Err(_) => CallToolResult::success(vec![ContentBlock::text(result_str)]),
                         }
                     }
                     Err(e) => tool_error(format!("animation sample failed: {e}")),
@@ -2700,8 +2707,8 @@ impl VictauriMcpHandler {
                             "manifest": manifest,
                         });
                         return CallToolResult::success(vec![
-                            Content::image(b64, "image/png"),
-                            Content::text(meta.to_string()),
+                            ContentBlock::image(b64, "image/png"),
+                            ContentBlock::text(meta.to_string()),
                         ]);
                     }
                     Err(e) => return tool_error(format!("filmstrip encode failed: {e}")),
@@ -2765,7 +2772,7 @@ impl VictauriMcpHandler {
                         .eval_with_return_timeout(&code, params.webview_label.as_deref(), timeout)
                         .await
                     {
-                        Ok(result) => CallToolResult::success(vec![Content::text(result)]),
+                        Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
                         Err(e) => tool_error(e),
                     }
                 } else {
@@ -3956,7 +3963,7 @@ impl VictauriMcpHandler {
         privacy: &crate::privacy::PrivacyConfig,
     ) -> CallToolResult {
         for item in &mut result.content {
-            if let RawContent::Text(ref mut tc) = item.raw {
+            if let ContentBlock::Text(tc) = item {
                 tc.text = privacy.redact_output(&tc.text);
             }
         }
@@ -4201,7 +4208,7 @@ impl VictauriMcpHandler {
 
     async fn eval_bridge(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
         match self.eval_with_return(code, webview_label).await {
-            Ok(result) => CallToolResult::success(vec![Content::text(result)]),
+            Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
             Err(e) => tool_error(e),
         }
     }
@@ -4676,17 +4683,21 @@ impl ServerHandler for VictauriMcpHandler {
             .into_iter()
             .filter(|t| self.state.privacy.is_tool_enabled(t.name.as_ref()))
             .collect();
-        Ok(ListToolsResult {
-            tools: filtered,
-            ..Default::default()
-        })
+        // SEP-2549 cache hints: the tool list is fixed for the process lifetime (the
+        // privacy config that filters it is set at plugin init), so clients may cache
+        // it. `Private` because the list depends on this instance's privacy profile.
+        // Legacy (< 2026-07-28) peers never see these fields — rmcp strips them.
+        let mut result = ListToolsResult::with_all_items(filtered);
+        result.ttl_ms = Some(LIST_RESULT_TTL_MS);
+        result.cache_scope = Some(CacheScope::Private);
+        Ok(result)
     }
 
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
         let tool_name: String = request.name.as_ref().to_owned();
         // Centralized authorization: gate on the canonical `tool.action` capability
         // resolved from the call arguments, matching the REST path in `execute_tool`.
@@ -4694,7 +4705,7 @@ impl ServerHandler for VictauriMcpHandler {
         let capability = authz::canonical_capability(&tool_name, &args_value);
         if !self.state.privacy.is_call_allowed(&tool_name, &capability) {
             tracing::debug!(tool = %tool_name, capability = %capability, "tool call blocked by privacy config");
-            return Ok(tool_disabled(&capability));
+            return Ok(tool_disabled(&capability).into());
         }
         self.state
             .tool_invocations
@@ -4702,28 +4713,36 @@ impl ServerHandler for VictauriMcpHandler {
         let start = std::time::Instant::now();
         tracing::debug!(tool = %tool_name, "tool invocation started");
         let ctx = ToolCallContext::new(self, request, context);
-        let result = Self::tool_router().call(ctx).await;
+        let response = Self::tool_router().call(ctx).await;
         let elapsed = start.elapsed();
         tracing::debug!(
             tool = %tool_name,
             elapsed_ms = elapsed.as_millis() as u64,
-            is_error = result.as_ref().map_or(true, |r| r.is_error.unwrap_or(false)),
+            is_error = response.as_ref().map_or(true, |r| match r {
+                CallToolResponse::Complete(r) => r.is_error.unwrap_or(false),
+                _ => false,
+            }),
             "tool invocation completed"
         );
 
         // Centralized output redaction: apply to all text content so no
-        // individual tool can accidentally leak secrets.
+        // individual tool can accidentally leak secrets. Victauri tools always
+        // complete in one round trip, so only the `Complete` variant carries
+        // output; MRTR intermediates (input-required / task) pass through.
         if self.state.privacy.redaction_enabled {
-            result.map(|mut r| {
-                for item in &mut r.content {
-                    if let RawContent::Text(ref mut tc) = item.raw {
-                        tc.text = self.state.privacy.redact_output(&tc.text);
+            response.map(|resp| match resp {
+                CallToolResponse::Complete(mut r) => {
+                    for item in &mut r.content {
+                        if let ContentBlock::Text(tc) = item {
+                            tc.text = self.state.privacy.redact_output(&tc.text);
+                        }
                     }
+                    CallToolResponse::Complete(r)
                 }
-                r
+                other => other,
             })
         } else {
-            result
+            response
         }
     }
 
@@ -4739,36 +4758,35 @@ impl ServerHandler for VictauriMcpHandler {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult {
-            resources: vec![
-                RawResource::new(RESOURCE_URI_IPC_LOG, "ipc-log")
-                    .with_description(
-                        "Live IPC call log — all commands invoked between frontend and backend",
-                    )
-                    .with_mime_type("application/json")
-                    .no_annotation(),
-                RawResource::new(RESOURCE_URI_WINDOWS, "windows")
-                    .with_description(
-                        "Current state of all Tauri windows — position, size, visibility, focus",
-                    )
-                    .with_mime_type("application/json")
-                    .no_annotation(),
-                RawResource::new(RESOURCE_URI_STATE, "state")
-                    .with_description(
-                        "Victauri plugin state — event count, registered commands, memory stats",
-                    )
-                    .with_mime_type("application/json")
-                    .no_annotation(),
-            ],
-            ..Default::default()
-        })
+        // SEP-2549 cache hints: the resource *list* (not the contents) is static for
+        // the process lifetime, so clients may cache it (same rationale as list_tools).
+        let mut result = ListResourcesResult::with_all_items(vec![
+            Resource::new(RESOURCE_URI_IPC_LOG, "ipc-log")
+                .with_description(
+                    "Live IPC call log — all commands invoked between frontend and backend",
+                )
+                .with_mime_type("application/json"),
+            Resource::new(RESOURCE_URI_WINDOWS, "windows")
+                .with_description(
+                    "Current state of all Tauri windows — position, size, visibility, focus",
+                )
+                .with_mime_type("application/json"),
+            Resource::new(RESOURCE_URI_STATE, "state")
+                .with_description(
+                    "Victauri plugin state — event count, registered commands, memory stats",
+                )
+                .with_mime_type("application/json"),
+        ]);
+        result.ttl_ms = Some(LIST_RESULT_TTL_MS);
+        result.cache_scope = Some(CacheScope::Private);
+        Ok(result)
     }
 
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, ErrorData> {
+    ) -> Result<ReadResourceResponse, ErrorData> {
         let uri = &request.uri;
         // Resources bypass the tool dispatcher, so they must apply the same privacy
         // gate themselves (audit B1): a strict profile that blocks log/window reads
@@ -4827,11 +4845,15 @@ impl ServerHandler for VictauriMcpHandler {
             json
         };
 
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(
-            json, uri,
-        )]))
+        Ok(ReadResourceResult::new(vec![ResourceContents::text(json, uri)]).into())
     }
 
+    // `resources/subscribe` is legacy-protocol-only under MCP 2026-07-28 (replaced by
+    // `subscriptions/listen`). Victauri intentionally keeps the legacy handlers: the
+    // subscribe capability is not advertised (see `get_info`), no update push exists,
+    // and legacy clients that call anyway get the same recorded-intent behavior as
+    // before. `allow(deprecated)` because rmcp 3.x marks the trait methods deprecated.
+    #[allow(deprecated)]
     async fn subscribe(
         &self,
         request: SubscribeRequestParams,
@@ -4861,6 +4883,7 @@ impl ServerHandler for VictauriMcpHandler {
         }
     }
 
+    #[allow(deprecated)]
     async fn unsubscribe(
         &self,
         request: UnsubscribeRequestParams,
@@ -5679,7 +5702,7 @@ mod authz_dispatch_tests {
     fn is_privacy_blocked(r: &CallToolResult) -> bool {
         r.is_error == Some(true)
             && r.content.iter().any(|c| {
-                matches!(&c.raw, RawContent::Text(t)
+                matches!(c, ContentBlock::Text(t)
                     if t.text.contains("disabled by privacy configuration"))
             })
     }
@@ -6086,8 +6109,8 @@ mod command_policy_dispatch_tests {
     fn result_text(r: &CallToolResult) -> String {
         r.content
             .iter()
-            .filter_map(|c| match &c.raw {
-                RawContent::Text(t) => Some(t.text.clone()),
+            .filter_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -6576,8 +6599,8 @@ mod screenshot_visibility_tests {
     fn error_text(r: &CallToolResult) -> String {
         r.content
             .iter()
-            .filter_map(|c| match &c.raw {
-                RawContent::Text(t) => Some(t.text.clone()),
+            .filter_map(|c| match c {
+                ContentBlock::Text(t) => Some(t.text.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>()
