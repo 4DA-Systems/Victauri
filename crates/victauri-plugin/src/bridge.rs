@@ -223,9 +223,22 @@ where
         // N * timeout when the UI wedges: each caller still gives up after `timeout` total,
         // exactly as it did before this lock existed.
         let deadline = std::time::Instant::now() + timeout;
-        let _serialize = MAIN_DISPATCH_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _serialize = loop {
+            match MAIN_DISPATCH_LOCK.try_lock() {
+                Ok(guard) => break guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(format!(
+                            "{what} did not complete on the main thread: timed out waiting for the \
+                             main-thread dispatch lock"
+                        ));
+                    }
+                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+                }
+            }
+        };
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(format!(
