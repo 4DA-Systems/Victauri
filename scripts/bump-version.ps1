@@ -10,15 +10,14 @@
 #   - Cargo.toml [workspace.dependencies] victauri-* pins
 #   - Cargo.lock (via cargo check)
 #   - .github/actions/victauri-test/action.yml (pinned CLI install default)
-#   - crates/victauri-plugin/src/js_bridge.rs (bridge version constant)
-#   - crates/victauri-plugin/tests/bridge_tests.rs (version assertions)
+#   - server.json (MCP Registry manifest versions)
 #   - docs/src/getting-started.md (example output)
 #   - docs/src/compatibility.md (example output)
-#   - CLAUDE.md (Current State header and version ref)
 #
 # Does NOT update:
 #   - CHANGELOG.md (requires human-written release notes)
 #   - MIGRATION.md (requires human-written migration guide)
+#   - CLAUDE.md (requires human-written Current State entry)
 #   - README.md (intentionally version-free)
 #   - Test counts (require running tests to get actual numbers)
 
@@ -127,24 +126,7 @@ Update-File "docs\src\getting-started.md" "`"version`":`"$OldVersion`"" "`"versi
 # 12. docs/src/compatibility.md bridge_version
 Update-File "docs\src\compatibility.md" "`"bridge_version`": `"$OldVersion`"" "`"bridge_version`": `"$NewVersion`"" "docs compatibility.md bridge_version"
 
-# 13. CLAUDE.md Current State version ref
-$claudeMd = Join-Path $root "CLAUDE.md"
-if (Test-Path $claudeMd) {
-    $content = Get-Content $claudeMd -Raw
-    $updated = $content -replace [regex]::Escape("v$OldVersion"), "v$NewVersion"
-    if ($updated -ne $content) {
-        if ($DryRun) {
-            Write-Host "  WOULD CLAUDE.md version references" -ForegroundColor DarkGray
-        } else {
-            Set-Content $claudeMd $updated -NoNewline
-            Write-Host "  OK    CLAUDE.md version references" -ForegroundColor Green
-        }
-    } else {
-        Write-Host "  SKIP  CLAUDE.md (no v$OldVersion references)" -ForegroundColor Yellow
-    }
-}
-
-# 14. Update Cargo.lock via cargo check
+# 13. Update Cargo.lock via cargo check
 if (-not $DryRun) {
     Write-Host "`nUpdating Cargo.lock..." -ForegroundColor Cyan
     Push-Location $root

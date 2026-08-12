@@ -244,7 +244,7 @@ victauri-test's length-based IPC checkpoint silently returned nothing once a bus
 the log tools' newest-100 sliding window (latent since 0.7.10) — checkpoints are now the newest
 entry timestamp. Release-prep adversarial sweep also fixed stale session-era docs claims, two
 "31 tools" counts, a "subscribable resources" claim, and `server.json` still pinned at 0.8.6
-(missed by the 0.8.7 release; the bump script does not cover it — remember it manually).
+(missed by the 0.8.7 release; the 0.8.8 bump now automates it in both bump scripts).
 
 The embedded MCP server jumped **two SDK major versions (rmcp 1.5.0 → 3.1.2)** and now speaks the
 sessionless MCP `2026-07-28` protocol revision natively while staying fully backward compatible with
@@ -277,7 +277,7 @@ legacy stateful sessions, bridge e2e), `cargo doc -D warnings`, `scripts/preflig
 
 ## Current State (2026-07-13)
 
-### v0.8.8 — bridge cold-start fix + adversarial-audit hardening (`victauri-cli`-only)
+### v0.8.7 — bridge cold-start fix + adversarial-audit hardening (`victauri-cli`-only)
 
 Ships the bridge cold-start fix below (merged via PR #55) plus two rounds of adversarial hardening:
 an internal three-lens red-team + pre-emptive fixes (PR #56), an **external GPT adversarial audit**
@@ -330,7 +330,7 @@ semver-clean within `^0.8`.
 
 ## Current State (2026-07-08)
 
-### v0.8.8 — repo self-gate security hardening + advisory cleanup
+### v0.8.6 — repo self-gate security hardening + advisory cleanup
 
 Security-focused release prep for the repo-local local pre-push gate. No public Rust API change and no
 runtime plugin behavior change for Victauri users; the hardened files are developer tooling and are not
