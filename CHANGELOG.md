@@ -18,6 +18,39 @@ vs 0.8.7: no semver update required — `^0.8` consumers pick it up automaticall
 
 ### Fixed
 
+- **Host-process heap corruption on Linux/WebKitGTK under concurrent introspection.** Several of
+  Victauri's main-thread round trips in flight at once corrupt the process heap, and glibc aborts
+  the host app (`malloc(): unaligned tcache chunk detected` / `corrupted double-linked list`).
+  `bridge.rs` now serializes the round trip through a single dispatch lock. The deadline covers the
+  wait for that lock, so serializing cannot stack N callers into N × the timeout when the UI wedges
+  — each caller still gives up after the same 10s total as before.
+
+  This is a **long-standing bug, not new in 0.8.8**: the pre-rmcp-3.1.2 tree reproduces it at the
+  same rate, so every earlier 0.8.x is affected. It was found while investigating an intermittent
+  CI failure of the `webview_reload_during_introspection_is_safe` E2E test, and the investigation
+  overturned the assumed cause on every point:
+
+  | Hypothesis | Measured |
+  |---|---|
+  | Caused by webview reloads | **No** — reload-hammering alone: 0/4 deaths; introspection with no reload at all: 4/4 |
+  | Caused by request volume | **No** — one unthrottled loop, same total calls: 0/4; three concurrent loops: 5/8 |
+  | Caused by the HTTP/tokio layer | **No** — a tool touching no webview (`get_memory_stats`) at the same concurrency: 0/5 |
+  | Caused by rmcp 3.1.2 | **No** — the pre-rmcp tree died 6/8 vs 5/8 for the current tree |
+  | Fixed by locking the dispatch alone | **No** — still 4/8; what matters is round trips *in flight*, not how the message is posted |
+  | Fixed by serializing the whole round trip | **Yes** — 0/28 |
+
+  Serializing costs effectively nothing: the closures already execute one at a time on the single
+  main thread, so this only stops several round trips being in flight around it.
+
+- **A regression test that actually reproduces it** (`concurrent_window_introspection_is_heap_safe`).
+  The two existing host-crash tests both call `eval_js` inside their hot loop; an eval is a full JS
+  round trip (~10-30ms), which paced them to ~100 ops/sec and never built up enough concurrent
+  round trips to trip the corruption. The new test calls only the fast window ops, with nothing to
+  throttle it. Tuned by measurement rather than guessed: at 4 concurrent tasks the unfixed build
+  survived 4/4, at 12 it died 2/4 with `SIGABRT` while the fixed build passed 6/6.
+- **CI now captures the demo app's stderr and prints it when the E2E job fails.** The app's output
+  was previously discarded, so a dead host surfaced only as "connection refused" with the actual
+  glibc abort message lost — the direct reason this crash went undiagnosed across several releases.
 - **`victauri-test`: IPC checkpoints survive the log's sliding-window cap.** `create_ipc_checkpoint`
   snapshotted the IPC log *length* and `ipc_calls_since` did `skip(length)` — but the server's log
   tools return a capped sliding window of the newest entries (default 100), so on any app with more

@@ -607,6 +607,82 @@ e2e_test!(
 );
 
 e2e_test!(
+    concurrent_window_introspection_is_heap_safe,
+    |client| async move {
+        // REGRESSION for the Linux/WebKitGTK heap corruption: several main-thread round trips in
+        // flight at once corrupt the process heap, and glibc aborts the app (`malloc():
+        // unaligned tcache chunk detected` / `corrupted double-linked list`). Fixed by
+        // serializing the round trip in `bridge.rs` (MAIN_DISPATCH_LOCK).
+        //
+        // WHY THIS TEST EXISTS SEPARATELY from the two above, which did NOT catch it:
+        // both of those call `eval_js` inside their hot loop, and an eval is a full JS round
+        // trip (~10-30ms). That paces the loop to ~100 ops/sec and never builds up enough
+        // concurrent main-thread round trips to trip the corruption. This loop deliberately
+        // calls ONLY the fast window ops — no eval, nothing to throttle it — which is what
+        // actually reproduces: measured 5/8 host deaths pre-fix, 0/28 post-fix.
+        //
+        // Note the bug is NOT about page reloads (reload-hammering alone never crashed) and NOT
+        // about volume (one unthrottled loop issuing the same number of calls never crashed).
+        // Concurrency is the variable, so TASKS > 1 is the whole point of this test.
+        use std::time::{Duration, Instant};
+
+        // Tuned by measurement, not guessed: at 4 tasks the unfixed build survived 4/4 (too weak
+        // to gate anything), at 12 it died 2/4 with SIGABRT while the fixed build passed 6/6.
+        const TASKS: usize = 12;
+        const LOAD: Duration = Duration::from_secs(10);
+
+        let mut handles = Vec::with_capacity(TASKS);
+        for _ in 0..TASKS {
+            handles.push(tokio::spawn(async move {
+                let mut c = victauri_test::connect()
+                    .await
+                    .expect("stress task should connect to the running app");
+                let start = Instant::now();
+                let mut ops: u64 = 0;
+                while start.elapsed() < LOAD {
+                    // Fast webview-touching paths ONLY — each is a main-thread round trip and
+                    // returns in microseconds, so these stack up concurrently.
+                    let _ = c.list_windows().await;
+                    let _ = c.get_window_state(None).await;
+                    ops += 1;
+                }
+                ops
+            }));
+        }
+        let mut ops = 0u64;
+        for h in handles {
+            ops += h.await.unwrap_or(0);
+        }
+
+        // The host must still be alive. A dead app here means the serialization regressed and
+        // the heap corruption is back.
+        let mut alive = false;
+        let mut last_err = String::new();
+        for _ in 0..10 {
+            match client.list_windows().await {
+                Ok(w) if w.as_array().is_some_and(|labels| !labels.is_empty()) => {
+                    alive = true;
+                    break;
+                }
+                Ok(w) => last_err = format!("unexpected window list: {w:?}"),
+                Err(e) => last_err = e.to_string(),
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        assert!(
+            alive,
+            "host app must survive concurrent window introspection — a failure here is the \
+             Linux/WebKitGTK heap corruption from unserialized main-thread round trips \
+             (glibc aborts the process). Last error: {last_err}"
+        );
+        assert!(
+            ops > 0,
+            "concurrent introspection loop should have executed at least one cycle"
+        );
+    }
+);
+
+e2e_test!(
     webview_reload_during_introspection_is_safe,
     |client| async move {
         // REGRESSION for the 0.8.1 host-crash MISS. The crash is a Tauri-runtime `Rc<Webview>`

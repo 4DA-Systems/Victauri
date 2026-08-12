@@ -525,16 +525,20 @@ jobs:
       - name: Build demo app
         run: cargo build -p demo-app
 
+      # The app's stderr is CAPTURED, not discarded. When the host dies mid-suite, the test only
+      # reports "connection refused" — the actual cause (e.g. glibc's `malloc(): unaligned tcache
+      # chunk detected` for the WebKitGTK main-thread-round-trip corruption) is printed by the app
+      # itself and was previously lost, which is why that crash went undiagnosed for so long.
       - name: Start demo app (Linux)
         if: runner.os == 'Linux'
         run: |
-          xvfb-run -a ./target/debug/demo-app &
+          xvfb-run -a ./target/debug/demo-app >/tmp/demo-app.out 2>/tmp/demo-app.err &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
 
       - name: Start demo app (macOS)
         if: runner.os == 'macOS'
         run: |
-          ./target/debug/demo-app &
+          ./target/debug/demo-app >/tmp/demo-app.out 2>/tmp/demo-app.err &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
 
       - name: Start demo app (Windows)
@@ -561,6 +565,21 @@ jobs:
         run: cargo test -p demo-app --test integration -- --test-threads=1
         env:
           VICTAURI_E2E: "1"
+
+      # Only on failure, and only where we captured it. If the host died, its own output names
+      # the cause; without this the log shows nothing but "connection refused".
+      - name: Show demo app output on failure (Unix)
+        if: failure() && runner.os != 'Windows'
+        run: |
+          echo "::group::demo-app stderr"
+          tail -n 200 /tmp/demo-app.err 2>/dev/null || echo "(no stderr captured)"
+          echo "::endgroup::"
+          echo "::group::demo-app stdout"
+          tail -n 100 /tmp/demo-app.out 2>/dev/null || echo "(no stdout captured)"
+          echo "::endgroup::"
+          if [ -n "$APP_PID" ] && ! kill -0 "$APP_PID" 2>/dev/null; then
+            echo "::warning::demo-app (PID $APP_PID) is NOT running — the host process died during the suite."
+          fi
 
       - name: Cleanup (Unix)
         if: always() && runner.os != 'Windows'
