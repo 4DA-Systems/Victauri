@@ -80,6 +80,11 @@ fi
 # top-level "version" field in editors/vscode/package.json only when it changes.
 
 # 8. Composite action default CLI version
+# server.json — the MCP Registry manifest. Covers BOTH the manifest `version` and the cargo
+# package `version` (replace_in_file substitutes every occurrence). Missed by the 0.8.7 release
+# and caught by hand, so it is automated here.
+replace_in_file "server.json" "\"version\": \"$OLD_VERSION\"" "\"version\": \"$NEW_VERSION\"" "server.json versions"
+
 replace_in_file ".github/actions/victauri-test/action.yml" "default: \"$OLD_VERSION\"" "default: \"$NEW_VERSION\"" "victauri-test action CLI pin"
 
 # 9. JS bridge version — NO LONGER bumped here. init_script() injects the crate version
