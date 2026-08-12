@@ -108,6 +108,11 @@ if ($cargoContent -match $pinPattern) {
 # on its own cadence (`vscode-v*` tag) and is versioned independently — bump the
 # top-level "version" field in editors/vscode/package.json only when it actually changes.
 
+# 7. server.json — the MCP Registry manifest. Covers BOTH the manifest `version` and the
+#    cargo package `version` (Update-File replaces every occurrence). This was missed by the
+#    0.8.7 release and had to be caught by hand, so it is automated here.
+Update-File "server.json" "`"version`": `"$OldVersion`"" "`"version`": `"$NewVersion`"" "server.json versions"
+
 # 8. Composite action default CLI version
 Update-File ".github\actions\victauri-test\action.yml" "default: `"$OldVersion`"" "default: `"$NewVersion`"" "victauri-test action CLI pin"
 

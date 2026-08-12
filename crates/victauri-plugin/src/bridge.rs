@@ -155,6 +155,32 @@ fn find_window<'a, R: Runtime>(
     }
 }
 
+/// Serializes Victauri's main-thread round trips.
+///
+/// Concurrent `run_on_main_thread` round trips corrupt the process heap on Linux/WebKitGTK —
+/// glibc aborts the app with `malloc(): unaligned tcache chunk detected` or `corrupted
+/// double-linked list`. Measured on Ubuntu 24.04 + `WebKitGTK` 2.52, three concurrent
+/// introspection loops for 8s: **5/8 runs died** unserialized, **8/8** with the tokio
+/// `block_in_place` hand-off removed, and **0/28** once the whole round trip is serialized here.
+///
+/// The bisect that pinned it down, so a future reader does not re-do it:
+/// * Not the reload. Reload-hammering with no introspection never died (0/4); introspection
+///   with no reload at all died every time (4/4). The crash is unrelated to page reloads.
+/// * Not the dispatch alone. Locking only around `run_on_main_thread` still died 4/8 — what
+///   matters is how many round trips are in flight at once, not how the message is posted.
+/// * Not load. One unthrottled loop issuing the same total number of calls never died (0/4);
+///   three concurrent loops died. Concurrency is the variable, not volume.
+/// * Not our HTTP/tokio layer. A tool that touches no webview (`get_memory_stats`) at the same
+///   concurrency never died (0/5).
+/// * Not new. The pre-rmcp-3.1.2 tree died at the same rate (6/8), so this long predates 0.8.8.
+///
+/// Serializing costs effectively nothing: the closures already execute one at a time on the
+/// single main thread, so this only stops several round trips being in flight *around* it.
+///
+/// NOTE: the lock is not reentrant. No `on_main` closure may itself call `on_main` — on the main
+/// thread `run_on_main_thread` runs inline, so that would self-deadlock.
+static MAIN_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Run `f` on the Tauri **main (UI) thread** and return its result.
 ///
 /// Every webview/window access MUST happen on the main thread. Tauri's window/webview
@@ -179,6 +205,9 @@ fn find_window<'a, R: Runtime>(
 /// the closure is run under `catch_unwind` and a panic is converted into an error that is always
 /// sent back. (Today every closure is panic-free by construction, but the helper must not let a
 /// future one take the app down.)
+///
+/// Round trips are additionally serialized through [`MAIN_DISPATCH_LOCK`] — see there for the
+/// heap corruption that requires it and the bisect that established it.
 fn on_main<R, T, F>(app: &tauri::AppHandle<R>, what: &str, f: F) -> Result<T, String>
 where
     R: Runtime,
@@ -186,40 +215,60 @@ where
     F: FnOnce(&tauri::AppHandle<R>) -> T + Send + 'static,
 {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let (tx, rx) = std::sync::mpsc::channel();
-    let app_for_closure = app.clone();
-    // If the caller times out and gives up, this flag tells the still-queued closure to skip
-    // its work — so a state-mutating op (resize/move/close/set_title) cannot apply long after
-    // the caller already saw a timeout error and moved on (a "spontaneous" window change).
-    let abandoned = std::sync::Arc::new(AtomicBool::new(false));
-    let abandoned_closure = abandoned.clone();
-    app.run_on_main_thread(move || {
-        if abandoned_closure.load(Ordering::Acquire) {
-            return;
+    let timeout = std::time::Duration::from_secs(10);
+
+    let round_trip = move || -> Result<T, String> {
+        // One round trip at a time (see MAIN_DISPATCH_LOCK). The deadline covers the WAIT FOR
+        // THE LOCK as well as the round trip itself, so serializing cannot stack N callers into
+        // N * timeout when the UI wedges: each caller still gives up after `timeout` total,
+        // exactly as it did before this lock existed.
+        let deadline = std::time::Instant::now() + timeout;
+        let _serialize = MAIN_DISPATCH_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "{what} did not complete on the main thread: timed out waiting for the \
+                 main-thread dispatch lock"
+            ));
         }
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&app_for_closure)));
-        // Send only fails if the caller already timed out and dropped the receiver — ignore.
-        let _ = tx.send(result);
-    })
-    .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))?;
-    // Blocking on the reply must not park a tokio runtime worker — under a wedged UI that could
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let app_for_closure = app.clone();
+        // If the caller times out and gives up, this flag tells the still-queued closure to skip
+        // its work — so a state-mutating op (resize/move/close/set_title) cannot apply long after
+        // the caller already saw a timeout error and moved on (a "spontaneous" window change).
+        let abandoned = std::sync::Arc::new(AtomicBool::new(false));
+        let abandoned_closure = abandoned.clone();
+        app.run_on_main_thread(move || {
+            if abandoned_closure.load(Ordering::Acquire) {
+                return;
+            }
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&app_for_closure)));
+            // Send only fails if the caller already timed out and dropped the receiver — ignore.
+            let _ = tx.send(result);
+        })
+        .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))?;
+
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(_panic)) => Err(format!("{what} panicked on the main thread")),
+            Err(e) => {
+                abandoned.store(true, Ordering::Release);
+                Err(format!("{what} did not complete on the main thread: {e}"))
+            }
+        }
+    };
+
+    // Blocking here must not park a tokio runtime worker — under a wedged UI that could
     // otherwise starve the embedded axum/MCP server. On a multi-threaded runtime, `block_in_place`
     // tells the scheduler to run other tasks elsewhere while this thread blocks. (It panics on a
     // current-thread runtime, so guard on the flavor; with no runtime at all, just block.)
-    let timeout = std::time::Duration::from_secs(10);
-    let received = match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
-        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => {
-            tokio::task::block_in_place(|| rx.recv_timeout(timeout))
-        }
-        _ => rx.recv_timeout(timeout),
-    };
-    match received {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_panic)) => Err(format!("{what} panicked on the main thread")),
-        Err(e) => {
-            abandoned.store(true, Ordering::Release);
-            Err(format!("{what} did not complete on the main thread: {e}"))
-        }
+    match tokio::runtime::Handle::try_current().map(|h| h.runtime_flavor()) {
+        Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(round_trip),
+        _ => round_trip(),
     }
 }
 

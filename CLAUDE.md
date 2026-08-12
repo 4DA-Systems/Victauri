@@ -186,6 +186,47 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-08-12)
 
+### v0.8.8 — host-crash fix (Linux/WebKitGTK heap corruption), found during release prep
+
+**The last host crash. Present in released 0.8.7 and every earlier 0.8.x — not a 0.8.8 regression.**
+Several of Victauri's main-thread round trips in flight at once corrupt the process heap and glibc
+aborts the host app (`malloc(): unaligned tcache chunk detected` / `corrupted double-linked list`,
+SIGABRT). `bridge.rs` now serializes the round trip through one `MAIN_DISPATCH_LOCK`; the deadline
+covers the wait for the lock, so serializing cannot stack N callers into N × the timeout on a wedged
+UI. It costs effectively nothing — the closures already execute one at a time on the single main
+thread. **0 crashes in 28 local runs, vs 5/8 before.**
+
+It surfaced as an intermittent ubuntu E2E failure that *looked* like an rmcp 3.1.2 regression. It is
+not, and every part of that first theory was wrong — measured, not assumed:
+
+| Hypothesis | Measured |
+|---|---|
+| caused by webview reloads | **No** — reload-only 0/4; introspection with *no reload* 4/4 |
+| caused by volume | **No** — 1 loop, same total calls 0/4; 3 concurrent loops 5/8 |
+| caused by the HTTP/tokio layer | **No** — `get_memory_stats` (no webview) same concurrency 0/5 |
+| caused by rmcp 3.1.2 | **No** — pre-rmcp tree 6/8 vs current 5/8 |
+| fixed by locking the dispatch only | **No** — still 4/8 |
+| fixed by dropping `block_in_place` | **No** — 8/8, worse |
+| **fixed by serializing the whole round trip** | **Yes — 0/28** |
+
+Corroborated independently in CI: a control branch running the *pre-rmcp* commit on today's runner
+fails the same two E2E tests. What actually changed on 2026-08-11 was the `ubuntu-latest` runner
+**image** (20260714 → 20260810), whose timing made the pre-existing race fire far more often;
+webkit2gtk is identical (2.52.3) either side.
+
+Two process fixes shipped with it, both of which are why this hid for so long:
+- **CI discarded the demo app's stderr**, so a dead host looked like "connection refused" and the
+  glibc abort message was never seen. CI now captures it and prints it when E2E fails.
+- **The two existing host-crash tests call `eval_js` in their hot loop** — a full JS round trip
+  (~10-30ms) that paced them to ~100 ops/sec, never enough concurrent round trips to trip the
+  corruption. New test `concurrent_window_introspection_is_heap_safe` uses only the fast window ops,
+  tuned by measurement (4 tasks survived 4/4 → useless; 12 tasks died 2/4 unfixed, 6/6 fixed).
+
+**Debugging note for next time:** `gh run list` HIDES failed attempts (a rerun overwrites the run
+conclusion) — query `gh api .../runs/<id>/attempts/<n>/jobs`. And WSL Ubuntu on this box is a fast
+local Linux/WebKitGTK repro environment (all Tauri deps present, WSLg `DISPLAY=:0`); clone into the
+WSL native FS, and drive load over the REST API to vary the mix with no rebuild.
+
 ### v0.8.8 — MCP infrastructure on rmcp 3.1.2 / MCP `2026-07-28`, live-verified on 4DA
 
 Released 2026-08-12 (PRs #62 rmcp upgrade, #63 tauri 2.11.5 lock, #64 victauri-test checkpoint
@@ -417,6 +458,12 @@ with full bridge introspection — no `VICTAURI_DISABLE=1`.** (A short clean win
 intermittent race — use the reliable crash signal: the `tauri dev` PARENT process liveness via
 `Get-Process`, not the bare child / WER / `tasklist /FI`.) The secondary probe-before-every-eval
 amplifier was NOT needed and is left untouched.
+
+> **Scope correction (2026-08-12).** That "VERIFIED FIXED" evidence was **Windows/WebView2 only**
+> (a 4DA soak on this box). It did NOT cover Linux/WebKitGTK, where a *different* host-crash bug
+> was still live the whole time — concurrent main-thread round trips corrupting the process heap
+> (glibc `malloc(): unaligned tcache chunk detected`), fixed only in 0.8.8. The 0.8.2 fix above is
+> real and still stands for what it addressed; it simply was not the last host crash.
 
 ### v0.8.1 — host-crash fix (main-thread webview access) + security/robustness hardening
 
