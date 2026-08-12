@@ -27,6 +27,14 @@ vs 0.8.7: no semver update required — `^0.8` consumers pick it up automaticall
   `calls_since` filters by it with a 1000-entry read — immune to the window's position. Method
   signatures unchanged; verified live (the two failing 4DA dogfood tests pass with the fix, plus two
   new mock-server regression tests).
+- **`victauri-test`: IPC checkpoints can no longer miss a call sharing the checkpoint's
+  millisecond** (found by the pre-release GPT-5.5 adversarial audit). `ipc_calls_since` filters
+  with a strict `timestamp > checkpoint`, so a call logged in the same millisecond immediately
+  after `create_ipc_checkpoint` returned was silently invisible. The checkpoint now waits until
+  the local clock has advanced past the checkpoint millisecond before returning (bounded at 5 ms
+  against clock skew), so calls made after the checkpoint cannot share the boundary timestamp.
+  Regression test pins the same-ms boundary; a second new test pins Bearer-auth enforcement on
+  the `2026-07-28` `server/discover` lifecycle method for stateless MCP.
 
 ### Changed
 

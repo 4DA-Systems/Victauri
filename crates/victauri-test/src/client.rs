@@ -1,9 +1,32 @@
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::assertions::VerifyBuilder;
 use crate::error::TestError;
 use crate::visual::{VisualDiff, VisualOptions};
+
+const IPC_CHECKPOINT_CLOCK_ADVANCE_CAP: Duration = Duration::from_millis(5);
+
+fn current_epoch_ms() -> Option<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+}
+
+async fn wait_past_ipc_checkpoint_ms(checkpoint_ms: u64) {
+    let Some(now_ms) = current_epoch_ms() else {
+        return;
+    };
+    if checkpoint_ms == 0 || checkpoint_ms < now_ms {
+        return;
+    }
+
+    let sleep_ms = checkpoint_ms.saturating_sub(now_ms).saturating_add(1);
+    let cap_ms = u64::try_from(IPC_CHECKPOINT_CLOCK_ADVANCE_CAP.as_millis()).unwrap_or(u64::MAX);
+    tokio::time::sleep(Duration::from_millis(sleep_ms.min(cap_ms))).await;
+}
 
 // ── Typed Response Structs (Phase 4E) ───────────────────────────────────────
 
@@ -1421,10 +1444,13 @@ impl VictauriClient {
     /// Returns the maximum entry `timestamp` (epoch milliseconds) currently
     /// visible in the IPC log, or `0` when the log is empty. Pass this value to
     /// [`VictauriClient::ipc_calls_since`] to get only the calls that occurred
-    /// after the checkpoint. Timestamp-based rather than length-based because
-    /// the server's log tools return a capped sliding window of the newest
-    /// entries — a positional checkpoint stops working once a busy app exceeds
-    /// the cap.
+    /// after the checkpoint. For non-empty logs this method waits until the
+    /// local clock has advanced past the checkpoint millisecond before it
+    /// returns, so calls made immediately after the checkpoint cannot share the
+    /// boundary timestamp and be filtered out by the strict `>` comparison.
+    /// Timestamp-based rather than length-based because the server's log tools
+    /// return a capped sliding window of the newest entries — a positional
+    /// checkpoint stops working once a busy app exceeds the cap.
     ///
     /// # Errors
     ///
@@ -1435,11 +1461,13 @@ impl VictauriClient {
         // snapshot breaks (always-empty `calls_since`) once the app has logged
         // more calls than the cap. Timestamps are window-position-independent.
         let entries = self.ipc_log_entries().await?;
-        Ok(entries
+        let checkpoint_ms = entries
             .iter()
             .filter_map(|e| e.get("timestamp").and_then(Value::as_u64))
             .max()
-            .unwrap_or(0) as usize)
+            .unwrap_or(0);
+        wait_past_ipc_checkpoint_ms(checkpoint_ms).await;
+        Ok(checkpoint_ms as usize)
     }
 
     // ── Typed Response Methods (Phase 4E) ────────────────────────────────────

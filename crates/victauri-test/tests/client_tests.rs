@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
@@ -14,6 +15,16 @@ use victauri_test::{
     VictauriClient, assert_ipc_healthy, assert_json_eq, assert_json_truthy,
     assert_no_a11y_violations, assert_performance_budget, assert_state_matches,
 };
+
+fn test_epoch_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after Unix epoch")
+            .as_millis(),
+    )
+    .expect("epoch milliseconds must fit in u64")
+}
 
 // ── Mock MCP Server ───────────────────────────────────────────────────────
 
@@ -1159,6 +1170,43 @@ async fn ipc_checkpoint_survives_sliding_window_cap() {
     assert!(
         since.iter().any(|c| c["command"] == "canary"),
         "the canary call landed after the checkpoint and must be visible"
+    );
+}
+
+#[tokio::test]
+async fn ipc_checkpoint_waits_past_current_millisecond_boundary() {
+    let state = MockState::new();
+    let port = start_mock_server(state.clone()).await;
+    let mut client = VictauriClient::connect(port).await.unwrap();
+
+    let boundary = test_epoch_ms().saturating_add(2);
+    let before = vec![json!({"command": "before", "timestamp": boundary})];
+    *state.response_override.lock().await = Some(json!({
+        "content": [{"type": "text", "text": serde_json::to_string(&before).unwrap()}]
+    }));
+
+    let cp = client.create_ipc_checkpoint().await.unwrap();
+    assert_eq!(cp, boundary as usize);
+
+    let after_ts = test_epoch_ms();
+    assert!(
+        after_ts > boundary,
+        "checkpoint should not return until the next observable IPC timestamp is greater \
+         than the checkpoint boundary: after_ts={after_ts}, boundary={boundary}"
+    );
+
+    let after = vec![
+        json!({"command": "before", "timestamp": boundary}),
+        json!({"command": "after", "timestamp": after_ts}),
+    ];
+    *state.response_override.lock().await = Some(json!({
+        "content": [{"type": "text", "text": serde_json::to_string(&after).unwrap()}]
+    }));
+
+    let since = client.get_ipc_calls_since(cp).await.unwrap();
+    assert_eq!(
+        since,
+        vec![json!({"command": "after", "timestamp": after_ts})]
     );
 }
 

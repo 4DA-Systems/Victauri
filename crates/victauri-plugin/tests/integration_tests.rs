@@ -841,6 +841,62 @@ async fn stateless_still_enforces_auth() {
 }
 
 #[tokio::test]
+async fn stateless_auth_gates_discover_lifecycle() {
+    let base = start_stateless_auth_test_server(test_state(), &["main"], "secret-token").await;
+    let client = reqwest::Client::new();
+
+    let discover = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "server/discover",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    });
+
+    let unauth = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "server/discover")
+        .json(&discover)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        unauth.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "server/discover must be rejected before rmcp dispatch without Bearer auth"
+    );
+
+    let authed = client
+        .post(format!("{base}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("MCP-Protocol-Version", "2026-07-28")
+        .header("Mcp-Method", "server/discover")
+        .header("Authorization", "Bearer secret-token")
+        .json(&discover)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        authed.status().is_success(),
+        "authenticated server/discover should reach the MCP handler, got {}",
+        authed.status()
+    );
+    let body: serde_json::Value = authed.json().await.unwrap();
+    assert!(
+        body["result"]["supportedVersions"].is_array(),
+        "authenticated response should be a DiscoverResult: {body}"
+    );
+}
+
+#[tokio::test]
 async fn mcp_full_session_lists_tools() {
     let base = start_test_server(test_state(), &["main"]).await;
     let client = reqwest::Client::new();
