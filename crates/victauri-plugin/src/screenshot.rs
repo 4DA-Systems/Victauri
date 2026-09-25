@@ -170,7 +170,7 @@ async fn capture_window_gdi_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u3
             }
 
             // BGRA → RGBA
-            for chunk in pixels.chunks_exact_mut(4) {
+            for chunk in pixels.as_chunks_mut::<4>().0.iter_mut() {
                 chunk.swap(0, 2);
             }
 
@@ -214,8 +214,13 @@ async fn capture_window_gdi_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u3
 /// `BI_RGB` 32-bpp capture is undefined.
 #[cfg(windows)]
 fn blank_frame_reason(pixels: &[u8]) -> Option<&'static str> {
-    let first = pixels.chunks_exact(4).next()?;
-    if pixels.chunks_exact(4).any(|p| p[..3] != first[..3]) {
+    let first = pixels.as_chunks::<4>().0.iter().next()?;
+    if pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .any(|p| p[..3] != first[..3])
+    {
         return None; // colour variation => real content captured
     }
     match (first[0], first[1], first[2]) {
@@ -464,7 +469,7 @@ fn convert_bgra_frame(
         let src = data
             .get(start..end)
             .ok_or_else(|| anyhow::anyhow!("mapped frame smaller than RowPitch implies"))?;
-        for px in src.chunks_exact(4) {
+        for px in src.as_chunks::<4>().0.iter() {
             let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
             if a > 0 && a < 255 {
                 // Un-premultiply (round-to-nearest), matching the macOS path.
@@ -668,7 +673,7 @@ pub async fn capture_window_raw(window_id: isize) -> anyhow::Result<(Vec<u8>, u3
         // Un-premultiply alpha.
         // CoreGraphics gives us premultiplied RGBA. The PNG spec requires
         // straight (non-premultiplied) alpha, so we reverse the operation.
-        for chunk in rgba_pixels.chunks_exact_mut(4) {
+        for chunk in rgba_pixels.as_chunks_mut::<4>().0.iter_mut() {
             let a = u16::from(chunk[3]);
             if a > 0 && a < 255 {
                 chunk[0] = ((u16::from(chunk[0]) * 255 + a / 2) / a).min(255) as u8;
@@ -751,7 +756,7 @@ async fn capture_window_x11_raw(window_id: isize) -> anyhow::Result<(Vec<u8>, u3
         let rgba = if depth == 32 || depth == 24 {
             // X11 ZPixmap with depth 24/32 is typically BGRA or BGRx
             let mut pixels = Vec::with_capacity(data.len());
-            for chunk in data.chunks_exact(4) {
+            for chunk in data.as_chunks::<4>().0.iter() {
                 pixels.push(chunk[2]); // R
                 pixels.push(chunk[1]); // G
                 pixels.push(chunk[0]); // B
