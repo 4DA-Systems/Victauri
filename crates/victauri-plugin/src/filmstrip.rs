@@ -69,7 +69,7 @@ pub fn compose(
 
     // Fill background.
     let mut out = vec![0u8; total];
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0.iter_mut() {
         px.copy_from_slice(&bg);
     }
 
