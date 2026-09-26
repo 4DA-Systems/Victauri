@@ -210,6 +210,14 @@ impl EventRecorder {
         }
     }
 
+    /// When the active recording started, or `None` if not recording.
+    #[must_use]
+    pub fn started_at(&self) -> Option<DateTime<Utc>> {
+        crate::acquire_lock(&self.recording, "EventRecorder")
+            .as_ref()
+            .map(|r| r.started_at)
+    }
+
     /// Returns the number of events recorded so far, or 0 if not recording.
     #[must_use]
     pub fn event_count(&self) -> usize {

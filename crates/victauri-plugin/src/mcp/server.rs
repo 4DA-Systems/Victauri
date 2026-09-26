@@ -226,6 +226,13 @@ fn build_app_full_inner(
         ));
     }
 
+    // The concurrency cap and body limit wrap only the API routes registered so far — NOT
+    // `/health`. A liveness probe must never queue behind 64 slow tool calls (long `wait_for`s,
+    // injected fault delays): the watchdog would then report a live app as dead.
+    router = router
+        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(ConcurrencyLimitLayer::new(64));
+
     // `/health` is registered AFTER the auth layer (so liveness probes stay unauthenticated)
     // but BEFORE the rate limiter below, so it is still throttled. Axum applies a `.layer` only
     // to routes registered before it: /mcp,/api/tools,/info are auth-gated above; /health is not;
@@ -242,8 +249,6 @@ fn build_app_full_inner(
     ));
 
     router
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
-        .layer(ConcurrencyLimitLayer::new(64))
         .layer(axum::middleware::from_fn(crate::auth::security_headers))
         .layer(axum::middleware::from_fn(crate::auth::origin_guard))
         .layer(axum::middleware::from_fn(crate::auth::dns_rebinding_guard))
@@ -927,11 +932,27 @@ fn remove_port_file() {
 /// Returns `None` for unrecognised event types, allowing callers to skip them.
 #[must_use]
 pub fn parse_bridge_event(ev: &serde_json::Value) -> Option<victauri_core::AppEvent> {
-    use chrono::Utc;
+    parse_bridge_event_from(ev, DEFAULT_WEBVIEW_LABEL)
+}
+
+/// [`parse_bridge_event`] for an event drained from the webview `label`. Uses the event's own
+/// JS timestamp (epoch ms) when present — not the drain time, which lags by up to the drain
+/// interval and collapses a burst of events onto one instant.
+pub fn parse_bridge_event_from(
+    ev: &serde_json::Value,
+    label: &str,
+) -> Option<victauri_core::AppEvent> {
+    use chrono::{TimeZone, Utc};
     use victauri_core::AppEvent;
 
     let event_type = ev.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    let now = Utc::now();
+    #[allow(clippy::cast_possible_truncation)]
+    let now = ev
+        .get("timestamp")
+        .and_then(serde_json::Value::as_f64)
+        .filter(|ms| ms.is_finite() && *ms > 0.0)
+        .and_then(|ms| Utc.timestamp_millis_opt(ms as i64).single())
+        .unwrap_or_else(Utc::now);
 
     let app_event = match event_type {
         "console" => AppEvent::Console {
@@ -948,7 +969,7 @@ pub fn parse_bridge_event(ev: &serde_json::Value) -> Option<victauri_core::AppEv
             timestamp: now,
         },
         "dom_mutation" => AppEvent::DomMutation {
-            webview_label: DEFAULT_WEBVIEW_LABEL.to_string(),
+            webview_label: label.to_string(),
             timestamp: now,
             mutation_count: ev
                 .get("count")
@@ -973,8 +994,11 @@ pub fn parse_bridge_event(ev: &serde_json::Value) -> Option<victauri_core::AppEv
                     .get("duration_ms")
                     .and_then(serde_json::Value::as_f64)
                     .map(|d| d as u64),
-                arg_size_bytes: 0,
-                webview_label: DEFAULT_WEBVIEW_LABEL.to_string(),
+                arg_size_bytes: ev
+                    .get("arg_size_bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+                webview_label: label.to_string(),
             })
         }
         "network" => AppEvent::StateChange {
@@ -989,7 +1013,7 @@ pub fn parse_bridge_event(ev: &serde_json::Value) -> Option<victauri_core::AppEv
                 .map(std::string::ToString::to_string),
         },
         "navigation" => AppEvent::WindowEvent {
-            label: DEFAULT_WEBVIEW_LABEL.to_string(),
+            label: label.to_string(),
             event: format!(
                 "navigation.{}",
                 ev.get("nav_type")
@@ -1022,7 +1046,7 @@ pub fn parse_bridge_event(ev: &serde_json::Value) -> Option<victauri_core::AppEv
                     .and_then(|v| v.as_str())
                     .map(std::string::ToString::to_string),
                 timestamp: now,
-                webview_label: DEFAULT_WEBVIEW_LABEL.to_string(),
+                webview_label: label.to_string(),
             }
         }
         _ => return None,
@@ -1159,7 +1183,7 @@ async fn drain_window(
             newest = ts;
         }
 
-        if let Some(app_event) = parse_bridge_event(ev) {
+        if let Some(app_event) = parse_bridge_event_from(ev, label) {
             state.event_log.push(app_event.clone());
             if state.recorder.is_recording() {
                 state.recorder.record_event(app_event);

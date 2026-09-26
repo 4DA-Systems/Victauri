@@ -13,7 +13,19 @@ pub async fn victauri_eval_js<R: Runtime>(
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    state.pending_evals.lock().await.insert(id.clone(), tx);
+    {
+        // Same ceiling the MCP eval path enforces: page JS can reach these commands, and
+        // never-resolving evals must not be able to fill the shared map and starve every
+        // agent eval with "too many concurrent" errors.
+        let mut pending = state.pending_evals.lock().await;
+        if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
+            return Err(format!(
+                "too many concurrent evals (limit {})",
+                crate::mcp::MAX_PENDING_EVALS
+            ));
+        }
+        pending.insert(id.clone(), tx);
+    }
 
     let inject = format!(
         r"
@@ -79,7 +91,19 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    state.pending_evals.lock().await.insert(id.clone(), tx);
+    {
+        // Same ceiling the MCP eval path enforces: page JS can reach these commands, and
+        // never-resolving evals must not be able to fill the shared map and starve every
+        // agent eval with "too many concurrent" errors.
+        let mut pending = state.pending_evals.lock().await;
+        if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
+            return Err(format!(
+                "too many concurrent evals (limit {})",
+                crate::mcp::MAX_PENDING_EVALS
+            ));
+        }
+        pending.insert(id.clone(), tx);
+    }
 
     let inject = format!(
         r"

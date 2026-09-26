@@ -5,6 +5,11 @@
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+/// Cap on the total base64 bytes buffered across all frames. `max_frames` alone does not bound
+/// memory: 600 frames of a 4K window is well over a gigabyte. The oldest frames are evicted
+/// first once this is exceeded.
+pub const MAX_TRACE_BYTES: usize = 256 * 1024 * 1024;
+
 /// A single captured frame: milliseconds since trace start + base64 PNG.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TraceFrame {
@@ -24,6 +29,9 @@ pub struct Screencast {
     generation: AtomicU64,
     frames: Mutex<Vec<TraceFrame>>,
     label: Mutex<Option<String>>,
+    /// Whether this trace started the event recorder (`with_events`), so `stop` can stop it —
+    /// otherwise the recorder (and the per-second drain loop it enables) outlives the trace.
+    owns_recording: AtomicBool,
 }
 
 impl Default for Screencast {
@@ -35,6 +43,7 @@ impl Default for Screencast {
             generation: AtomicU64::new(0),
             frames: Mutex::new(Vec::new()),
             label: Mutex::new(None),
+            owns_recording: AtomicBool::new(false),
         }
     }
 }
@@ -101,8 +110,12 @@ impl Screencast {
             .clone()
     }
 
-    /// Append a frame, enforcing the `max_frames` ring-buffer cap.
+    /// Append a frame, enforcing the `max_frames` ring-buffer cap and [`MAX_TRACE_BYTES`].
     pub fn push_frame(&self, t_ms: u64, data_b64: String) {
+        self.push_frame_capped(t_ms, data_b64, MAX_TRACE_BYTES);
+    }
+
+    fn push_frame_capped(&self, t_ms: u64, data_b64: String, max_bytes: usize) {
         let max = self.max_frames.load(Ordering::Relaxed);
         let mut f = self
             .frames
@@ -113,6 +126,35 @@ impl Screencast {
         if len > max {
             f.drain(0..len - max);
         }
+        let mut total: usize = f.iter().map(|fr| fr.data_b64.len()).sum();
+        let mut evict = 0;
+        // Always keep the newest frame, even if it alone exceeds the cap.
+        while total > max_bytes && evict + 1 < f.len() {
+            total -= f[evict].data_b64.len();
+            evict += 1;
+        }
+        f.drain(0..evict);
+    }
+
+    /// Append a frame only if `generation` is still current. The capture task checks the
+    /// generation before a (slow) capture; re-checking at push time stops a stale task from
+    /// inserting a frame into a trace started after it.
+    pub fn push_frame_if_current(&self, generation: u64, t_ms: u64, data_b64: String) -> bool {
+        if !self.is_active() || self.generation() != generation {
+            return false;
+        }
+        self.push_frame(t_ms, data_b64);
+        true
+    }
+
+    /// Record whether the current trace started the event recorder.
+    pub fn set_owns_recording(&self, owns: bool) {
+        self.owns_recording.store(owns, Ordering::SeqCst);
+    }
+
+    /// Clear and return whether the finished trace owned the event recorder.
+    pub fn take_owns_recording(&self) -> bool {
+        self.owns_recording.swap(false, Ordering::SeqCst)
     }
 
     /// Number of frames currently buffered.
@@ -187,6 +229,41 @@ mod tests {
         sc.stop();
         assert!(!sc.is_active());
         assert!(sc.generation() > g, "stop invalidates the task generation");
+    }
+
+    #[test]
+    fn stale_generation_push_is_rejected() {
+        let sc = Screencast::default();
+        let old = sc.start(100, 10, None);
+        let new = sc.start(100, 10, None);
+        assert!(!sc.push_frame_if_current(old, 0, "stale".into()));
+        assert!(sc.push_frame_if_current(new, 0, "fresh".into()));
+        assert_eq!(sc.frames(0)[0].data_b64, "fresh");
+        sc.stop();
+        assert!(!sc.push_frame_if_current(new, 1, "after-stop".into()));
+    }
+
+    #[test]
+    fn byte_cap_evicts_oldest_but_keeps_newest() {
+        let sc = Screencast::default();
+        sc.start(100, 600, None);
+        let cap = 100;
+        sc.push_frame_capped(0, "x".repeat(51), cap);
+        sc.push_frame_capped(1, "y".repeat(51), cap);
+        sc.push_frame_capped(2, "tail".into(), cap);
+        let frames = sc.frames(0);
+        let total: usize = frames.iter().map(|f| f.data_b64.len()).sum();
+        assert!(total <= cap, "total {total} exceeds the cap");
+        assert_eq!(frames.len(), 2, "only the oldest frame should be evicted");
+        assert_eq!(frames.last().unwrap().data_b64, "tail");
+    }
+
+    #[test]
+    fn owns_recording_is_taken_once() {
+        let sc = Screencast::default();
+        sc.set_owns_recording(true);
+        assert!(sc.take_owns_recording());
+        assert!(!sc.take_owns_recording());
     }
 
     #[test]

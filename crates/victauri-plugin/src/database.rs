@@ -53,7 +53,7 @@ impl Drop for InterruptGuard {
     }
 }
 
-/// Outcome of one budgeted SQLite phase (see [`run_bounded`]).
+/// Outcome of one budgeted `SQLite` phase (see [`run_bounded`]).
 #[cfg(feature = "sqlite")]
 pub(crate) enum Bounded<T> {
     Done(T),
@@ -110,7 +110,7 @@ const MAX_DB_HEALTH_TABLE_BYTES: usize = 1_000_000;
 #[cfg(feature = "sqlite")]
 const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
 
-/// Read-only health report for one SQLite database, in budgeted phases.
+/// Read-only health report for one `SQLite` database, in budgeted phases.
 ///
 /// The cheap metadata PRAGMAs always run. The two phases that scale with database size —
 /// per-table `count(*)` and `quick_check` — each get their own budget; a phase that runs out
@@ -225,7 +225,7 @@ pub(crate) fn db_health_report(
     }))
 }
 
-/// Quote an arbitrary table name as a SQLite identifier (`"…"`, embedded quotes doubled).
+/// Quote an arbitrary table name as a `SQLite` identifier (`"…"`, embedded quotes doubled).
 #[cfg(feature = "sqlite")]
 pub(crate) fn quote_sqlite_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -893,6 +893,18 @@ mod tests {
         // The cheap metadata survives.
         assert!(r["page_count"].as_i64().unwrap() > 0);
         assert!(r["journal_mode"].is_string());
+    }
+
+    /// Manual check against a REAL database (read-only):
+    /// `VICTAURI_DB_HEALTH_PATH=/path/app.db cargo test -p victauri-plugin --lib db_health_real -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs VICTAURI_DB_HEALTH_PATH pointing at a real database"]
+    fn db_health_real_database() {
+        let path = std::env::var("VICTAURI_DB_HEALTH_PATH").expect("set VICTAURI_DB_HEALTH_PATH");
+        let started = Instant::now();
+        let r = db_health_report(&path, Duration::from_secs(5), Duration::from_secs(5)).unwrap();
+        println!("elapsed: {:?}", started.elapsed());
+        println!("{}", serde_json::to_string_pretty(&r).unwrap());
     }
 
     #[test]
