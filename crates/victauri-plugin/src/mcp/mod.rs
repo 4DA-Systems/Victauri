@@ -2071,14 +2071,16 @@ impl VictauriMcpHandler {
                 if !self.state.recorder.is_recording() {
                     return tool_error("no active recording — start a recording first");
                 }
-                // Only events since the recording began — `getEventStream(0)` re-ingested
-                // everything since page load, including pre-recording history.
+                // Only events NEWER than what the recording already holds (exclusive):
+                // `getEventStream(0)` re-ingested everything since page load, and reading from
+                // the recording start re-recorded whatever the background drain had already
+                // captured. Drained events carry their JS timestamp, so this watermark lines up.
                 let since_ms = self
                     .state
                     .recorder
-                    .started_at()
+                    .latest_event_timestamp()
                     .map_or(0, |t| t.timestamp_millis());
-                let code = format!("return window.__VICTAURI__?.getEventStream({since_ms})");
+                let code = format!("return window.__VICTAURI__?.getEventStream({since_ms}, true)");
                 let label = params.webview_label.as_deref().unwrap_or("main");
                 match self
                     .eval_with_return(&code, params.webview_label.as_deref())
@@ -6481,6 +6483,69 @@ mod command_policy_dispatch_tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["skipped"], 2, "{text}");
         assert_eq!(v["replayed"], 1, "{text}");
+    }
+
+    /// A state whose eval timeout is long enough that only the window/shutdown watch can end
+    /// an unanswered eval quickly.
+    fn slow_eval_state() -> Arc<VictauriState> {
+        let Ok(mut s) = Arc::try_unwrap(state_with(PrivacyConfig::default())) else {
+            unreachable!("fresh Arc has one owner")
+        };
+        s.eval_timeout = std::time::Duration::from_secs(20);
+        Arc::new(s)
+    }
+
+    #[tokio::test]
+    async fn eval_reports_a_window_closed_mid_call_instead_of_timing_out() {
+        // The RecordingBridge answers the liveness probe, never the user code, and lists NO
+        // windows — i.e. the target window is gone while the call is in flight (what a
+        // command that closes its own window produces).
+        let state = slow_eval_state();
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let started = std::time::Instant::now();
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "popup"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(
+            text.contains("was closed while the call was in flight"),
+            "{text}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must not wait out the 20s eval timeout (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_reports_app_shutdown_instead_of_timing_out() {
+        let state = slow_eval_state();
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let shutdown = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = shutdown.shutdown_tx.send(true);
+        });
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("shutting down"), "{text}");
+        assert!(
+            state.pending_evals.lock().await.is_empty(),
+            "pending entry removed"
+        );
     }
 
     #[tokio::test]

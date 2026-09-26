@@ -218,6 +218,22 @@ impl EventRecorder {
             .map(|r| r.started_at)
     }
 
+    /// Timestamp of the newest event in the active recording (or its start time if it has no
+    /// events yet); `None` if not recording. A caller pulling more events can read strictly
+    /// after this to avoid re-recording what is already there.
+    #[must_use]
+    pub fn latest_event_timestamp(&self) -> Option<DateTime<Utc>> {
+        crate::acquire_lock(&self.recording, "EventRecorder")
+            .as_ref()
+            .map(|r| {
+                r.events
+                    .iter()
+                    .map(|e| e.timestamp)
+                    .max()
+                    .unwrap_or(r.started_at)
+            })
+    }
+
     /// Returns the number of events recorded so far, or 0 if not recording.
     #[must_use]
     pub fn event_count(&self) -> usize {

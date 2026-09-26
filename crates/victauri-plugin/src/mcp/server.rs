@@ -1099,9 +1099,17 @@ async fn event_drain_loop(
         // `victauri:default` capability) hangs until the 5s eval timeout; draining
         // sequentially would let it stall every other window's drain. Concurrency
         // keeps a healthy window's events flowing regardless of a blind sibling.
+        // Never read earlier than the recording's start: an initial watermark of 0 pulled the
+        // page's whole pre-recording history (e.g. app-startup IPC) into the new recording,
+        // and a watermark left from an earlier recording is older than this one's start.
+        #[allow(clippy::cast_precision_loss)]
+        let floor = state
+            .recorder
+            .started_at()
+            .map_or(0.0, |t| t.timestamp_millis() as f64);
         let mut set = tokio::task::JoinSet::new();
         for label in &labels {
-            let since = watermarks.get(label).copied().unwrap_or(0.0);
+            let since = watermarks.get(label).copied().unwrap_or(0.0).max(floor);
             let state = Arc::clone(&state);
             let bridge = Arc::clone(&bridge);
             let label = label.clone();
