@@ -82,18 +82,37 @@ const INIT_SCRIPT_BODY: &str = r#"
     }
 
     var REF_MAP_LIMIT = 10000;
+    var HAS_WEAKREF = typeof WeakRef !== 'undefined';
+    // node -> ref id. Re-snapshotting the same DOM reuses ids instead of minting a
+    // fresh id per node per snapshot (which grew weakRefMap by the whole DOM on
+    // every snapshot). A WeakMap never keeps a detached node alive.
+    var nodeIds = new WeakMap();
+    // Ids registered by the snapshot currently being built (null outside one).
+    var buildingRefs = null;
 
     function registerRef(node) {
-        var ref_id = 'e' + (refCounter++);
+        var ref_id = nodeIds.get(node);
+        if (ref_id === undefined) {
+            ref_id = 'e' + (refCounter++);
+            nodeIds.set(node, ref_id);
+        }
+        if (refMap.has(ref_id)) refMap.delete(ref_id); // re-insert as newest
         if (refMap.size >= REF_MAP_LIMIT) {
+            // Drop the oldest STRONG reference only. With WeakRef support the ref
+            // stays resolvable through weakRefMap while its node is alive, so a
+            // snapshot larger than the limit never invalidates its own early refs.
             var oldest = refMap.keys().next().value;
             refMap.delete(oldest);
-            weakRefMap.delete(oldest);
+            if (!HAS_WEAKREF) weakRefMap.delete(oldest);
         }
         refMap.set(ref_id, node);
-        if (typeof WeakRef !== 'undefined') {
-            weakRefMap.set(ref_id, new WeakRef(node));
+        if (HAS_WEAKREF) {
+            var existing = weakRefMap.get(ref_id);
+            if (!existing || existing.deref() !== node) {
+                weakRefMap.set(ref_id, new WeakRef(node));
+            }
         }
+        if (buildingRefs) buildingRefs.add(ref_id);
         return ref_id;
     }
 
@@ -227,6 +246,14 @@ const INIT_SCRIPT_BODY: &str = r#"
         return new Promise(function(resolve) {
             var deadline = Date.now() + (timeoutMs || 5000);
             function attempt() {
+                // A throw from resolveRef/checkActionable (e.g. getComputedStyle on
+                // an element in a torn-down frame) must resolve with an error, not
+                // escape into a setTimeout and leave the caller hanging until the
+                // eval timeout.
+                try { attemptInner(); }
+                catch (e) { resolve({ ok: false, error: 'actionability check threw: ' + (e && e.message), hint: 'CHECK_INPUT' }); }
+            }
+            function attemptInner() {
                 var el = resolveRef(refId);
                 if (!el) {
                     if (Date.now() >= deadline) { resolve({ ok: false, error: 'ref not found: ' + refId, hint: 'CHECK_INPUT' }); return; }
@@ -260,31 +287,45 @@ const INIT_SCRIPT_BODY: &str = r#"
             refMap.clear();
             var fmt = format || 'compact';
             var tree;
-            if (fmt === 'json') {
-                tree = walkDom(document.body);
-            } else {
-                tree = walkDomCompact(document.body, 0);
+            var currentRefs = new Set();
+            buildingRefs = currentRefs;
+            try {
+                if (fmt === 'json') {
+                    tree = walkDom(document.body);
+                } else {
+                    tree = walkDomCompact(document.body, 0);
+                }
+            } finally {
+                buildingRefs = null;
             }
-            var currentRefs = new Set(refMap.keys());
             var stale = [];
+            var staleSet = new Set();
+            function markStale(rid) {
+                if (!staleSet.has(rid)) { staleSet.add(rid); stale.push(rid); }
+            }
             previousRefs.forEach(function(refId) {
                 if (!currentRefs.has(refId)) {
                     var weak = weakRefMap.get(refId);
                     if (weak) {
                         var el = weak.deref();
                         if (!el || !el.isConnected) {
-                            stale.push(refId);
+                            markStale(refId);
                             weakRefMap.delete(refId);
                         }
                     } else {
-                        stale.push(refId);
+                        markStale(refId);
                     }
                 }
             });
+            // Prune dead or detached entries so weakRefMap stays bounded by the
+            // live DOM (refs of the snapshot just built are never pruned).
             weakRefMap.forEach(function(weak, rid) {
-                if (!weak.deref()) {
+                if (currentRefs.has(rid)) return;
+                var el = weak.deref();
+                if (!el || !el.isConnected) {
                     weakRefMap.delete(rid);
-                    stale.push(rid);
+                    refMap.delete(rid);
+                    markStale(rid);
                 }
             });
             return { tree: tree, stale_refs: stale, format: fmt };
@@ -351,11 +392,8 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
 
             function buildResult(node, style) {
-                var existingRef = null;
-                refMap.forEach(function(el, refId) {
-                    if (el === node) existingRef = refId;
-                });
-                var ref_id = existingRef || registerRef(node);
+                // registerRef reuses the node's existing id (if any).
+                var ref_id = registerRef(node);
                 var role = node.getAttribute('role') || inferRole(node);
                 var rect = node.getBoundingClientRect();
                 var vis = true;
@@ -371,7 +409,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     bounds: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
                     visible: vis,
                     enabled: !node.disabled,
-                    value: node.value || null
+                    value: (node.tagName === 'INPUT' && (node.getAttribute('type') || '').toLowerCase() === 'password') ? '[REDACTED]' : (node.value || null)
                 };
             }
 
@@ -455,6 +493,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             return withAutoWait(refId, timeoutMs, function(el) {
                 if (!el.matches('input, textarea, [contenteditable="true"]')) {
                     return { ok: false, error: 'element is not fillable (not input, textarea, or contenteditable): ' + (el.tagName || '').toLowerCase(), hint: 'CHECK_INPUT' };
+                }
+                if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') {
+                    // contenteditable: there is no `value` — the HTMLInputElement
+                    // value setter would throw "Illegal invocation" here.
+                    el.textContent = value;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    return { ok: true };
                 }
                 var proto = el instanceof HTMLTextAreaElement
                     ? HTMLTextAreaElement.prototype
@@ -604,7 +649,8 @@ const INIT_SCRIPT_BODY: &str = r#"
                     timestamp: n.timestamp,
                     status: st,
                     duration_ms: n.duration_ms,
-                    result: n.response_body || null,
+                    // Nullish, not falsy: a command returning 0 / false / '' is a real result.
+                    result: (n.response_body === undefined || n.response_body === null) ? null : n.response_body,
                     error: errText,
                 });
             }
@@ -684,6 +730,10 @@ const INIT_SCRIPT_BODY: &str = r#"
         addRoute: function(rule) {
             if (typeof rule === 'string') { try { rule = JSON.parse(rule); } catch (e) { return { ok: false, error: 'invalid rule JSON' }; } }
             if (!rule || !rule.pattern) return { ok: false, error: 'route rule requires a pattern' };
+            if ((rule.action || 'fulfill') === 'fulfill' && typeof rule.status === 'number'
+                && (rule.status !== Math.floor(rule.status) || rule.status < 200 || rule.status > 599)) {
+                return { ok: false, error: 'fulfill status must be an integer in 200-599 (a Response cannot carry ' + rule.status + ')' };
+            }
             var r = {
                 id: ++routeCounter,
                 pattern: String(rule.pattern),
@@ -812,45 +862,58 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         // ── Combined Event Stream ────────────────────────────────────────────
 
-        getEventStream: function(since) {
+        // `since` is INCLUSIVE by default (events with timestamp >= since), which is
+        // what a user-supplied "since" means. A caller that passes its own watermark
+        // (the newest timestamp it already ingested) should pass `exclusive = true`
+        // so the newest event is not re-emitted on every poll.
+        getEventStream: function(since, exclusive) {
             var events = [];
             var ts = since || 0;
+            var excl = exclusive === true;
+            function inRange(t) { return excl ? t > ts : t >= ts; }
 
             consoleLogs.forEach(function(l) {
-                if (l.timestamp >= ts) {
+                if (inRange(l.timestamp)) {
                     events.push({ type: 'console', level: l.level, message: l.message, timestamp: l.timestamp });
                 }
             });
 
             mutationLog.forEach(function(m) {
-                if (m.timestamp >= ts) {
+                if (inRange(m.timestamp)) {
                     events.push({ type: 'dom_mutation', count: m.count, timestamp: m.timestamp });
                 }
             });
 
             var victauriPrefix = 'plugin%3Avictauri%7C';
             networkLog.forEach(function(n) {
-                if (n.timestamp < ts) return;
+                if (!inRange(n.timestamp)) return;
                 var raw = ipcCommandPath(n.url);
-                if (raw === null || raw.indexOf(victauriPrefix) === 0) return;
-                var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
-                events.push({ type: 'ipc', command: cmd, status: n.status === 200 ? 'ok' : (n.status === 'pending' ? 'pending' : 'error'), duration_ms: n.duration_ms, timestamp: n.timestamp });
-            });
-
-            networkLog.forEach(function(n) {
-                if (n.timestamp >= ts) {
+                if (raw === null) {
+                    // Plain network traffic. IPC requests are emitted once, as `ipc`
+                    // events above/below — not a second time as `network`.
                     events.push({ type: 'network', method: n.method, url: n.url, status: n.status, duration_ms: n.duration_ms, timestamp: n.timestamp });
+                    return;
                 }
+                if (raw.indexOf(victauriPrefix) === 0) return;
+                var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
+                // Same classification as getIpcLog: HTTP 200 with a
+                // `Tauri-Response: error` header is a failed command.
+                var st;
+                if (n.status === 'pending') st = 'pending';
+                else if (n.status !== 200 && n.status !== 'ok') st = 'error';
+                else if (n.ipc_response === 'error') st = 'error';
+                else st = 'ok';
+                events.push({ type: 'ipc', command: cmd, status: st, duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp });
             });
 
             navigationLog.forEach(function(n) {
-                if (n.timestamp >= ts) {
+                if (inRange(n.timestamp)) {
                     events.push({ type: 'navigation', url: n.url, nav_type: n.type, timestamp: n.timestamp });
                 }
             });
 
             interactionLog.forEach(function(i) {
-                if (i.timestamp >= ts) {
+                if (inRange(i.timestamp)) {
                     events.push({ type: 'dom_interaction', action: i.action, selector: i.selector, value: i.value, timestamp: i.timestamp });
                 }
             });
@@ -875,7 +938,8 @@ const INIT_SCRIPT_BODY: &str = r#"
                     }
 
                     function getFullText(root) {
-                        var text = root.innerText || '';
+                        // ShadowRoot has no innerText — fall back to textContent.
+                        var text = (typeof root.innerText === 'string' ? root.innerText : root.textContent) || '';
                         var els = root.querySelectorAll('*');
                         for (var j = 0; j < els.length; j++) {
                             if (els[j].shadowRoot) text += ' ' + getFullText(els[j].shadowRoot);
@@ -1488,7 +1552,9 @@ const INIT_SCRIPT_BODY: &str = r#"
                     var el = S.el, b = el.getBoundingClientRect(), cs = window.getComputedStyle(el);
                     var tf = (function(s) {
                         if (!s || s.indexOf('matrix') !== 0) return { tx: 0, ty: 0, sx: 1, sy: 1 };
-                        var m = s.match(/-?[\d.eE+]+/g);
+                        // Strip the `matrix3d(` / `matrix(` prefix first — otherwise the
+                        // '3' of "matrix3d" is parsed as the first number.
+                        var m = s.replace(/^matrix(3d)?\(/, '').match(/-?[\d.eE+-]+/g);
                         if (!m) return { tx: 0, ty: 0, sx: 1, sy: 1 };
                         m = m.map(Number);
                         return m.length === 6
@@ -1517,12 +1583,17 @@ const INIT_SCRIPT_BODY: &str = r#"
         // so event-triggered sweeps are catchable: arm it, trigger the sweep,
         // then read back the measured curve + dropped-frame (jank) stats.
         installSweepRecorder: function(selector) {
+            // The rAF loop stops itself once nobody has armed or read the recorder
+            // for SWEEP_IDLE_STOP_MS, so an armed-and-forgotten recorder does not
+            // run getComputedStyle every frame for the life of the page.
+            var SWEEP_IDLE_STOP_MS = 60000;
             var R = (window.__VICTAURI_SWEEP__ = { sel: selector || null,
-                sessions: [], cur: null });
+                sessions: [], cur: null, touched: performance.now(), stopped: false,
+                idle_stop_ms: SWEEP_IDLE_STOP_MS });
             var matrix = function(el) {
                 var s = getComputedStyle(el).transform;
                 if (!s || s.indexOf('matrix') !== 0) return { tx: 0, ty: 0, sx: 1 };
-                var m = s.match(/-?[\d.eE+]+/g);
+                var m = s.replace(/^matrix(3d)?\(/, '').match(/-?[\d.eE+-]+/g);
                 if (!m) return { tx: 0, ty: 0, sx: 1 };
                 m = m.map(Number);
                 return m.length === 6 ? { tx: m[4], ty: m[5], sx: m[0] }
@@ -1541,6 +1612,15 @@ const INIT_SCRIPT_BODY: &str = r#"
             var tick = function() {
                 // Stop if a newer recorder superseded this one.
                 if (window.__VICTAURI_SWEEP__ !== R) return;
+                if (performance.now() - R.touched > SWEEP_IDLE_STOP_MS) {
+                    if (R.cur) {
+                        R.sessions.push(R.cur);
+                        if (R.sessions.length > 10) R.sessions.shift();
+                        R.cur = null;
+                    }
+                    R.stopped = true;
+                    return;
+                }
                 var el = pick();
                 var anims = (el && el.getAnimations) ? el.getAnimations() : [];
                 var running = anims.some(function(a) { return a.playState === 'running'; });
@@ -1578,6 +1658,8 @@ const INIT_SCRIPT_BODY: &str = r#"
                 return { error: 'no recorder armed — call sample with record=true first, then '
                     + 'trigger the animation' };
             }
+            // A read counts as activity: it keeps a live recorder from idling out.
+            R.touched = performance.now();
             var r2 = function(n) { return Math.round(n * 100) / 100; };
             var out = R.sessions.map(function(s) {
                 var f = s.samples, gaps = [];
@@ -1600,8 +1682,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             });
             var active = !!R.cur;
             if (clear) R.sessions = [];
-            return { armed: true, selector: R.sel, recording_active: active,
+            var res = { armed: !R.stopped, selector: R.sel, recording_active: active,
                      session_count: out.length, sessions: out };
+            if (R.stopped) {
+                res.note = 'recorder stopped after ' + (R.idle_stop_ms / 1000) + 's with no arm/read — '
+                    + 'sessions captured before that are above; re-arm with record=true to record again';
+            }
+            return res;
         },
     };
 
@@ -1877,13 +1964,37 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     var CTRL_RE = /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F\x1B]/g;
 
+    var MAX_CONSOLE_MSG = 4096;
+
+    // String(a) throws for Object.create(null), module namespace objects, and
+    // objects with a throwing toString/Symbol.toPrimitive — never let that
+    // escape into the app's console call.
+    function safeArgString(a) {
+        try { return String(a); } catch (e) {
+            try { return Object.prototype.toString.call(a); } catch (e2) { return '[unprintable]'; }
+        }
+    }
+
     function hookConsole(level) {
         console[level] = function() {
-            var args = Array.prototype.slice.call(arguments);
-            var msg = args.map(String).join(' ').replace(CTRL_RE, '');
-            consoleLogs.push({ level: level, message: msg, timestamp: Date.now() });
-            if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
-            originalConsole[level].apply(console, args);
+            try {
+                var msg = '';
+                var skippedArgs = 0;
+                for (var i = 0; i < arguments.length; i++) {
+                    if (msg.length > MAX_CONSOLE_MSG) { skippedArgs = arguments.length - i; break; }
+                    if (i) msg += ' ';
+                    msg += safeArgString(arguments[i]);
+                }
+                msg = msg.replace(CTRL_RE, '');
+                if (msg.length > MAX_CONSOLE_MSG) {
+                    msg = msg.slice(0, MAX_CONSOLE_MSG) + '…[+' + (msg.length - MAX_CONSOLE_MSG) + ' bytes truncated'
+                        + (skippedArgs ? ', ' + skippedArgs + ' more args' : '') + ']';
+                }
+                consoleLogs.push({ level: level, message: msg, timestamp: Date.now() });
+                if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+            } catch (e) {}
+            // Always forward to the original method, whatever capture did.
+            return originalConsole[level].apply(console, arguments);
         };
     }
 
@@ -2007,6 +2118,31 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // ── Network Interception ─────────────────────────────────────────────────
 
+    // IPC bodies are retained in networkLog (up to CAP_NETWORK entries), so bound
+    // what one entry may hold: bodies over MAX_IPC_BODY chars, and non-JSON/binary
+    // payloads (a raw `tauri::ipc::Response` is application/octet-stream), are
+    // replaced by a size marker instead of being read and parsed.
+    var MAX_IPC_BODY = 65536;
+    function bodyOmitted(size, contentType) {
+        return '[body omitted: ' + (size >= 0 ? size + ' bytes' : 'unknown size')
+            + (contentType ? ', ' + contentType : '') + ']';
+    }
+    function ipcArgSize(body) {
+        if (body === undefined || body === null) return 0;
+        if (typeof body === 'string') {
+            var t = body.trim();
+            return (t === '' || t === '{}') ? 0 : body.length;
+        }
+        if (typeof body.byteLength === 'number') return body.byteLength; // ArrayBuffer / typed array
+        if (typeof body.size === 'number') return body.size; // Blob
+        return 1; // present but unmeasurable (FormData, stream): non-zero = "has args"
+    }
+    function isTextualContentType(ct) {
+        if (!ct) return true; // unknown: let the size bound decide
+        ct = ct.toLowerCase();
+        return ct.indexOf('json') !== -1 || ct.indexOf('text/') === 0;
+    }
+
     (function interceptNetwork() {
         // fetch
         var origFetch = window.fetch;
@@ -2014,19 +2150,28 @@ const INIT_SCRIPT_BODY: &str = r#"
             window.fetch = function(input, init) {
                 var id = ++networkCounter;
                 var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
-                var method = (init && init.method) || (input && input.method) || 'GET';
+                var method = String((init && init.method) || (input && input.method) || 'GET');
                 var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isIpc && url.indexOf('plugin%3Avictauri%7C') !== -1;
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
 
-                if (isIpc && !isVictauriInternal && init && init.body && window.__VICTAURI__._captureIpcBodies !== false) {
-                    try {
-                        var bodyStr = typeof init.body === 'string' ? init.body : null;
-                        if (bodyStr) {
-                            var parsed = JSON.parse(bodyStr);
-                            entry.request_args = parsed;
-                        }
-                    } catch(e) {}
+                if (isIpc && !isVictauriInternal) {
+                    var reqBody = init ? init.body : null;
+                    // Size of the IPC request body as sent (0 for none / `{}`), so a
+                    // consumer can tell whether a call carried arguments even when they
+                    // were not captured (oversized or non-JSON/binary body).
+                    try { entry.arg_size_bytes = ipcArgSize(reqBody); } catch (e) { entry.arg_size_bytes = 0; }
+                    if (reqBody && window.__VICTAURI__._captureIpcBodies !== false) {
+                        try {
+                            if (typeof reqBody === 'string') {
+                                if (reqBody.length > MAX_IPC_BODY) {
+                                    entry.request_args = bodyOmitted(reqBody.length, null);
+                                } else {
+                                    entry.request_args = JSON.parse(reqBody);
+                                }
+                            }
+                        } catch(e) {}
+                    }
                 }
 
                 if (!isVictauriInternal) {
@@ -2053,22 +2198,42 @@ const INIT_SCRIPT_BODY: &str = r#"
                     }
                     if (route.action === 'fulfill') {
                         var makeResp = function() {
-                            var bodyStr = (typeof route.body === 'string') ? route.body : JSON.stringify(route.body);
+                            var status = route.status;
+                            if (typeof status !== 'number' || status !== Math.floor(status) || status < 200 || status > 599) {
+                                throw new RangeError('victauri: route #' + route.id + ' fulfill status must be an integer in 200-599, got ' + status);
+                            }
+                            // The Response constructor throws if a null-body status carries a body.
+                            var nullBody = status === 204 || status === 205 || status === 304;
+                            var bodyStr = nullBody ? null
+                                : ((typeof route.body === 'string') ? route.body : JSON.stringify(route.body));
                             var hdrs = { 'content-type': route.content_type };
                             for (var k in route.headers) { if (Object.prototype.hasOwnProperty.call(route.headers, k)) hdrs[k] = route.headers[k]; }
-                            entry.status = route.status;
+                            var resp = new Response(bodyStr, { status: status, statusText: route.status_text, headers: hdrs });
+                            entry.status = status;
                             entry.status_text = route.status_text;
                             entry.mocked = true;
                             entry.duration_ms = Date.now() - entry.timestamp;
                             if (isIpc) {
-                                try { entry.response_body = JSON.parse(bodyStr); } catch (e) { entry.response_body = bodyStr; }
+                                if (bodyStr === null) entry.response_body = null;
+                                else if (bodyStr.length > MAX_IPC_BODY) entry.response_body = bodyOmitted(bodyStr.length, null);
+                                else { try { entry.response_body = JSON.parse(bodyStr); } catch (e) { entry.response_body = bodyStr; } }
                                 flushIpcWaiters();
                             }
-                            return new Response(bodyStr, { status: route.status, statusText: route.status_text, headers: hdrs });
+                            return resp;
                         };
-                        return route.delay_ms > 0
-                            ? new Promise(function(res) { setTimeout(function() { res(makeResp()); }, route.delay_ms); })
-                            : Promise.resolve(makeResp());
+                        // Build the Response inside the promise chain so a construction
+                        // error becomes a rejection (as a real fetch failure would), never
+                        // a synchronous throw out of fetch().
+                        var waitP = route.delay_ms > 0
+                            ? new Promise(function(res) { setTimeout(res, route.delay_ms); })
+                            : Promise.resolve();
+                        return waitP.then(makeResp).catch(function(err) {
+                            entry.status = 'error';
+                            entry.error = String(err);
+                            entry.duration_ms = Date.now() - entry.timestamp;
+                            if (isIpc) flushIpcWaiters();
+                            throw err;
+                        });
                     }
                     if (route.action === 'delay' && route.delay_ms > 0) {
                         return new Promise(function(resolve, reject) {
@@ -2092,9 +2257,26 @@ const INIT_SCRIPT_BODY: &str = r#"
                             // which blinds ghost detection (an unregistered command looks like
                             // a verified handler). 'ok' | 'error' | null (older Tauri / no hdr).
                             try { entry.ipc_response = response.headers.get('Tauri-Response'); } catch (e) {}
-                            if (window.__VICTAURI__._captureIpcBodies !== false) {
+                            var ct = null, clen = -1;
+                            try {
+                                ct = response.headers.get('Content-Type');
+                                var cl = response.headers.get('Content-Length');
+                                if (cl !== null && cl !== '' && isFinite(Number(cl))) clen = Number(cl);
+                            } catch (e) {}
+                            if (window.__VICTAURI__._captureIpcBodies !== false && !isTextualContentType(ct)) {
+                                // Binary (e.g. raw tauri::ipc::Response bytes): never read it.
+                                entry.response_body = bodyOmitted(clen, ct);
+                                flushIpcWaiters();
+                            } else if (window.__VICTAURI__._captureIpcBodies !== false && clen > MAX_IPC_BODY) {
+                                entry.response_body = bodyOmitted(clen, null);
+                                flushIpcWaiters();
+                            } else if (window.__VICTAURI__._captureIpcBodies !== false) {
                                 var cloned = response.clone();
                                 cloned.text().then(function(text) {
+                                    if (text.length > MAX_IPC_BODY) {
+                                        entry.response_body = bodyOmitted(text.length, null);
+                                        return;
+                                    }
                                     try { entry.response_body = JSON.parse(text); } catch(e) { entry.response_body = text; }
                                 }).catch(function() {}).then(function() {
                                     flushIpcWaiters();
@@ -2120,7 +2302,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         var origOpen = XMLHttpRequest.prototype.open;
         var origSend = XMLHttpRequest.prototype.send;
         XMLHttpRequest.prototype.open = function(method, url) {
-            this.__victauri_net = { method: method, url: url };
+            // `url` may be a URL object (or anything with toString); coerce once
+            // here so send() can treat it as a string. Never throw into the app.
+            try {
+                this.__victauri_net = { method: String(method || 'GET'), url: String(url) };
+            } catch (e) {
+                this.__victauri_net = null;
+            }
             return origOpen.apply(this, arguments);
         };
         XMLHttpRequest.prototype.send = function() {
@@ -2148,8 +2336,25 @@ const INIT_SCRIPT_BODY: &str = r#"
                     entry.duration_ms = Date.now() - entry.timestamp;
                 });
                 this.addEventListener('error', function() {
+                    if (entry.blocked) return; // keep 'blocked' for route-blocked requests
                     entry.status = 'error';
                     entry.duration_ms = Date.now() - entry.timestamp;
+                });
+                this.addEventListener('abort', function() {
+                    entry.status = 'aborted';
+                    entry.duration_ms = Date.now() - entry.timestamp;
+                });
+                this.addEventListener('timeout', function() {
+                    entry.status = 'timeout';
+                    entry.duration_ms = Date.now() - entry.timestamp;
+                });
+                // Backstop: whatever ended the request, it must not stay 'pending'
+                // forever (that would wedge wait_for network_idle / ipc_idle).
+                this.addEventListener('loadend', function() {
+                    if (entry.status === 'pending') {
+                        entry.status = 'error';
+                        entry.duration_ms = Date.now() - entry.timestamp;
+                    }
                 });
 
                 // Phase 1 routing for XHR: block + delay are supported here.
@@ -2200,9 +2405,11 @@ const INIT_SCRIPT_BODY: &str = r#"
         };
         window.addEventListener('popstate', function() {
             navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'popstate' });
+            if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
         });
         window.addEventListener('hashchange', function(e) {
             navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'hashchange', old_url: e.oldURL });
+            if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
         });
     })();
 
@@ -2231,6 +2438,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         interactionLog.length = 0;
         refMap.clear();
         weakRefMap.clear();
+        nodeIds = new WeakMap();
         refCounter = 0;
     });
 

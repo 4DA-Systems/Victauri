@@ -230,6 +230,12 @@ async function run() {
         var tauriResp = reqHeaders["x-vtest-tauri-response"] || "ok";
         var respBody =
           reqHeaders["x-vtest-body"] != null ? reqHeaders["x-vtest-body"] : "";
+        // Optional response Content-Type (e.g. application/octet-stream for a
+        // raw tauri::ipc::Response) to exercise the bridge's body-capture bounds.
+        var respHeaders = [["Tauri-Response", tauriResp]];
+        if (reqHeaders["x-vtest-content-type"] != null) {
+          respHeaders.push(["Content-Type", reqHeaders["x-vtest-content-type"]]);
+        }
         // Return a resolved promise with a fake Response that supports clone()
         function makeResponse() {
           return {
@@ -237,7 +243,7 @@ async function run() {
             status: 200,
             statusText: "OK",
             url: url,
-            headers: new Map([["Tauri-Response", tauriResp]]),
+            headers: new Map(respHeaders),
             text: function () {
               return Promise.resolve(respBody);
             },
