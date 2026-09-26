@@ -13,12 +13,15 @@
 #   - server.json (MCP Registry manifest versions)
 #   - docs/src/getting-started.md (example output)
 #   - docs/src/compatibility.md (example output)
+#   - `victauri-<crate> = "X.Y"` install pins in README.md, docs/src/{getting-started,testing,
+#     testing-tauri-apps}.md and crates/victauri-{plugin,test,macros}/README.md (set to the
+#     new major.minor)
+#   - `victauri-test@vX.Y.Z` GitHub Action refs in README.md and docs/src/testing*.md
 #
 # Does NOT update:
 #   - CHANGELOG.md (requires human-written release notes)
 #   - MIGRATION.md (requires human-written migration guide)
 #   - CLAUDE.md (requires human-written Current State entry)
-#   - README.md (intentionally version-free)
 #   - Test counts (require running tests to get actual numbers)
 
 param(
@@ -119,6 +122,42 @@ Update-File ".github\actions\victauri-test\action.yml" "default: `"$OldVersion`"
 #    (env!("CARGO_PKG_VERSION")) into the `__VICTAURI_BRIDGE_VERSION__` placeholder, so the JS
 #    bridge version can never drift from the crate version (VIC-2). The bridge tests assert
 #    against CARGO_PKG_VERSION, so they need no per-release edit either.
+
+# 10. Version-pinned doc lines, set structurally (like 1b) so they can never lag:
+#   - `victauri-<crate> = "X.Y"` install pins (and `{ version = "X.Y", ... }`) -> new major.minor
+#   - `victauri-test@vX.Y.Z` GitHub Action refs -> new full version
+$newMajorMinor = ($NewVersion -split '\.')[0..1] -join '.'
+$pinDocs = @('README.md', 'docs\src\getting-started.md', 'docs\src\testing.md',
+    'docs\src\testing-tauri-apps.md', 'crates\victauri-plugin\README.md',
+    'crates\victauri-test\README.md', 'crates\victauri-macros\README.md')
+$actionDocs = @('README.md', 'docs\src\testing.md', 'docs\src\testing-tauri-apps.md')
+$installPin = '(victauri-(?:core|macros|plugin|test)\s*=\s*(?:\{\s*version\s*=\s*)?")\d+\.\d+(")'
+$actionRef = '(victauri-test@v)\d+\.\d+\.\d+'
+foreach ($doc in ($pinDocs + $actionDocs | Select-Object -Unique)) {
+    $docPath = Join-Path $root $doc
+    if (-not (Test-Path $docPath)) {
+        Write-Host "  SKIP $doc (not found)" -ForegroundColor Yellow
+        continue
+    }
+    $docContent = Get-Content $docPath -Raw
+    $updated = $docContent
+    if ($pinDocs -contains $doc) {
+        $updated = [regex]::Replace($updated, $installPin, "`${1}$newMajorMinor`${2}")
+    }
+    if ($actionDocs -contains $doc) {
+        $updated = [regex]::Replace($updated, $actionRef, "`${1}$NewVersion")
+    }
+    if ($updated -ne $docContent) {
+        if ($DryRun) {
+            Write-Host "  WOULD $doc version pins / action refs" -ForegroundColor DarkGray
+        } else {
+            Set-Content $docPath $updated -NoNewline
+            Write-Host "  OK    $doc version pins / action refs" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "  SKIP  $doc version pins / action refs (already current)" -ForegroundColor Yellow
+    }
+}
 
 # 11. docs/src/getting-started.md version in example output
 Update-File "docs\src\getting-started.md" "`"version`":`"$OldVersion`"" "`"version`":`"$NewVersion`"" "docs getting-started.md example"

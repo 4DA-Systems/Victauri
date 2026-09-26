@@ -180,7 +180,9 @@ fn cmd_init(root: &Path) -> Result<()> {
     // Step 1: Add dependencies to Cargo.toml
     let added = add_dependencies(&cargo_toml_path)?;
     if added {
-        eprintln!("  [+] Added victauri-plugin and victauri-test to Cargo.toml");
+        eprintln!(
+            "  [+] Added Victauri dependencies to Cargo.toml (victauri-plugin, victauri-core; dev: victauri-test, tokio)"
+        );
     } else {
         eprintln!("  [=] Dependencies already present in Cargo.toml");
     }
@@ -299,7 +301,15 @@ fn cmd_init(root: &Path) -> Result<()> {
     } else {
         std::fs::create_dir_all(&workflows_dir)
             .with_context(|| format!("failed to create {}", workflows_dir.display()))?;
-        std::fs::write(&ci_path, generate_ci_workflow())
+        // The Rust crate's directory relative to the repo root (`src-tauri` for the
+        // standard create-tauri-app layout, `.` when Cargo.toml is at the root).
+        let app_dir = cargo_toml_path
+            .parent()
+            .and_then(|p| p.strip_prefix(&root).ok())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| ".".to_string());
+        std::fs::write(&ci_path, generate_ci_workflow(&app_dir))
             .with_context(|| format!("failed to write {}", ci_path.display()))?;
         eprintln!("  [+] Created .github/workflows/victauri.yml (CI pipeline)");
     }
@@ -495,9 +505,17 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
         .get("healthy")
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
+    // `stale_calls` is an ARRAY of (up to 20) stale call records; the count is
+    // `stale_count`. Fall back to the array length for older plugins.
     let stale = health
-        .get("stale_calls")
+        .get("stale_count")
         .and_then(serde_json::Value::as_u64)
+        .or_else(|| {
+            health
+                .get("stale_calls")
+                .and_then(serde_json::Value::as_array)
+                .map(|a| a.len() as u64)
+        })
         .unwrap_or(0);
     let errors = health
         .get("error_count")
@@ -792,16 +810,7 @@ async fn cmd_doctor() -> Result<()> {
 
             // Check 12: DOM snapshot
             if let Ok(snap) = client.dom_snapshot().await {
-                let element_count = snap
-                    .get("element_count")
-                    .and_then(serde_json::Value::as_u64)
-                    .or_else(|| {
-                        snap.get("tree")
-                            .and_then(|t| t.get("children"))
-                            .and_then(|c| c.as_array())
-                            .map(|a| a.len() as u64)
-                    })
-                    .unwrap_or(0);
+                let element_count = snapshot_element_count(&snap);
                 eprintln!("  [PASS] DOM snapshot works ({element_count} elements)");
                 pass_count += 1;
             } else {
@@ -1085,8 +1094,14 @@ async fn cmd_record(output: &Path, test_name: &str, locator: bool, assert_ipc: b
         "  Captured {event_count} events ({interaction_count} interactions, {ipc_count} IPC calls)"
     );
     eprintln!("  Generated test: {}", output.display());
+    // `--test` selects the test TARGET (the file stem under tests/), not the function;
+    // the function name is the trailing name filter.
+    let target = output.file_stem().map_or_else(
+        || test_name.to_string(),
+        |s| s.to_string_lossy().into_owned(),
+    );
     eprintln!("\nRun your test:");
-    eprintln!("  VICTAURI_E2E=1 cargo test --test {test_name}");
+    eprintln!("  VICTAURI_E2E=1 cargo test --test {target} {test_name}");
     Ok(())
 }
 
@@ -1159,8 +1174,11 @@ fn run_tests_with_output(filter: Option<&str>, changed_file: Option<&str>) {
     cmd.arg("test");
     cmd.env("VICTAURI_E2E", "1");
 
+    // `--filter` is a test-NAME filter ("only run tests matching this filter"), passed as
+    // cargo test's positional filter. `--test <f>` would instead demand a test target
+    // named exactly `f` and fail for any other substring.
     if let Some(f) = filter {
-        cmd.arg("--test").arg(f);
+        cmd.arg(f);
     }
 
     let status = cmd.status();
@@ -1322,12 +1340,15 @@ equivalent — and on macOS/Linux CDP can't attach to a Tauri webview at all):
 - `verify_state` — cross-boundary frontend/backend state verification
 - `detect_ghost_commands` — find frontend calls absent from the introspection registry (read the `reliability` field: only a real "no backend handler" bug when the registry mirrors the app's full command set; with no/partial `#[inspectable]` it lists real, uninstrumented commands)
 - `check_ipc_integrity` — verify IPC pipeline health
-- `introspect` — command timings, IPC contract testing, coverage, startup timing, capabilities
-- `fault` — inject IPC faults (delay, error, drop, corrupt) for chaos engineering
+- `introspect` — command timings, IPC command catalog (real arg/result shapes), contract
+  testing, coverage, startup timing, capabilities, DB health, event bus
+- `fault` — inject faults (delay, error, drop, corrupt) into commands **driven through
+  Victauri's own `invoke_command`** — it tests a handler's error path when *you* call it; it
+  does NOT intercept the app's real frontend IPC (a user clicking the UI is unaffected)
 - `explain` — natural-language narration of what happened in the app
 - `get_memory_stats` — real OS process memory stats
-- `audit_accessibility` — WCAG accessibility checks
-- `get_performance` — navigation timing, JS heap, resource loading
+- `inspect` — `audit_accessibility` (WCAG checks), `get_performance` (navigation timing, JS
+  heap, resource loading), `get_styles`, `get_bounding_boxes`, `highlight`
 
 ### Connecting reliably (read this before reaching for CDP)
 
@@ -1393,6 +1414,43 @@ Prefer Victauri over Playwright or CDP for any Tauri-app task it handles; fall b
 Playwright only for browser-only work unrelated to this app.
 <!-- VICTAURI:END -->
 "#
+}
+
+/// Count the elements in a `dom_snapshot` result (`{tree, stale_refs, format}`).
+///
+/// The default "compact" format makes `tree` an indented text string with one
+/// `[eN] ...` line per element; the "json" format makes it a nested element
+/// object. Counting `tree.children` (the old approach) always read 0 for compact.
+fn snapshot_element_count(snap: &serde_json::Value) -> u64 {
+    fn count_json(node: &serde_json::Value) -> u64 {
+        if !node.is_object() {
+            return 0;
+        }
+        1 + node
+            .get("children")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, |c| c.iter().map(count_json).sum())
+    }
+    if let Some(n) = snap
+        .get("element_count")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return n;
+    }
+    match snap.get("tree") {
+        Some(serde_json::Value::String(text)) => text
+            .lines()
+            .filter(|line| {
+                let t = line.trim_start();
+                t.strip_prefix("[e").is_some_and(|rest| {
+                    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                    digits > 0 && rest[digits..].starts_with(']')
+                })
+            })
+            .count() as u64,
+        Some(tree @ serde_json::Value::Object(_)) => count_json(tree),
+        _ => 0,
+    }
 }
 
 /// Indents every line of `text` by 9 spaces so it lines up under a doctor advisory.
@@ -1621,9 +1679,34 @@ fn add_dependencies(cargo_toml_path: &Path) -> Result<bool> {
         changed = true;
     }
 
+    // `#[inspectable]` (re-exported as `victauri_plugin::inspectable`) expands to code that
+    // names `victauri_core::...` by path, so the app crate must depend on victauri-core
+    // directly or every annotated command fails with E0433. It is already in the build
+    // graph via victauri-plugin, so this adds no compile cost.
+    if !has_dep(&doc, "dependencies", "victauri-core") {
+        ensure_table(&mut doc, "dependencies");
+        doc["dependencies"]["victauri-core"] = toml_edit::value(env!("CARGO_PKG_VERSION"));
+        changed = true;
+    }
+
     if !has_dep(&doc, "dev-dependencies", "victauri-test") {
         ensure_table(&mut doc, "dev-dependencies");
         doc["dev-dependencies"]["victauri-test"] = toml_edit::value(env!("CARGO_PKG_VERSION"));
+        changed = true;
+    }
+
+    // The generated tests use `#[tokio::test]`; a stock Tauri app has no direct tokio
+    // dependency, so without this the scaffolded tests do not compile. Skip if tokio is
+    // already a regular dependency with the needed features left to the user.
+    if !has_dep(&doc, "dev-dependencies", "tokio") && !has_dep(&doc, "dependencies", "tokio") {
+        ensure_table(&mut doc, "dev-dependencies");
+        let mut tokio = toml_edit::InlineTable::new();
+        tokio.insert("version", "1".into());
+        let mut features = toml_edit::Array::new();
+        features.push("macros");
+        features.push("rt-multi-thread");
+        tokio.insert("features", toml_edit::Value::Array(features));
+        doc["dev-dependencies"]["tokio"] = toml_edit::value(tokio);
         changed = true;
     }
 
@@ -1858,9 +1941,19 @@ async fn command_{cmd}() {{
     out
 }
 
-fn generate_ci_workflow() -> String {
+/// Generate the E2E CI workflow. `app_dir` is the Rust crate's directory relative to the
+/// repo root (`src-tauri` for the standard create-tauri-app layout, `.` otherwise).
+///
+/// The app is built with `tauri build --debug --no-bundle`: that runs the project's
+/// `beforeBuildCommand` (the frontend build) first and embeds the built frontend, so the
+/// binary does not need a dev server — while a debug build keeps Victauri enabled (it is a
+/// no-op in release builds).
+fn generate_ci_workflow(app_dir: &str) -> String {
     r#"# Victauri E2E tests — runs smoke + integration tests against your Tauri app.
 # Generated by `victauri init`. Customize as needed.
+#
+# Assumes the create-tauri-app layout: frontend (package.json + @tauri-apps/cli) at the repo
+# root, Rust crate in __APP_DIR__/.
 
 name: Victauri E2E
 
@@ -1886,13 +1979,31 @@ jobs:
           toolchain: stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          workspaces: "__APP_DIR__ -> target"
 
-      - name: Build app
-        run: cargo build
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      - name: Install frontend dependencies
+        run: |
+          if [ -f pnpm-lock.yaml ]; then corepack enable && pnpm install --frozen-lockfile
+          elif [ -f yarn.lock ]; then corepack enable && yarn install --frozen-lockfile
+          else npm ci; fi
+
+      # `tauri build --debug` runs your beforeBuildCommand (frontend build) first and embeds
+      # the built frontend, so no dev server is needed. A debug build keeps Victauri enabled.
+      - name: Build app (debug, frontend embedded)
+        run: npx tauri build --debug --no-bundle
 
       - name: Start app under xvfb
+        working-directory: __APP_DIR__
         run: |
-          xvfb-run -a ./target/debug/$(cargo metadata --format-version=1 --no-deps | jq -r '.packages[0].name') &
+          META=$(cargo metadata --format-version=1 --no-deps)
+          BIN=$(echo "$META" | jq -r '[.packages[].targets[] | select(.kind | index("bin"))][0].name')
+          TARGET_DIR=$(echo "$META" | jq -r '.target_directory')
+          xvfb-run -a "$TARGET_DIR/debug/$BIN" &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
 
       - name: Victauri smoke tests
@@ -1902,6 +2013,7 @@ jobs:
           victauri-version: "__VICTAURI_VERSION__"
 
       - name: Run integration tests
+        working-directory: __APP_DIR__
         run: cargo test --test integration -- --test-threads=1
         env:
           VICTAURI_E2E: "1"
@@ -1914,6 +2026,7 @@ jobs:
           fi
 "#
     .replace("__VICTAURI_VERSION__", env!("CARGO_PKG_VERSION"))
+    .replace("__APP_DIR__", app_dir)
 }
 
 #[cfg(test)]
@@ -2215,7 +2328,7 @@ mod tests {
 
     #[test]
     fn ci_workflow_is_valid_yaml() {
-        let content = generate_ci_workflow();
+        let content = generate_ci_workflow("src-tauri");
         let version = env!("CARGO_PKG_VERSION");
         assert!(content.contains(&format!("victauri-test@v{version}")));
         assert!(content.contains(&format!("victauri-version: \"{version}\"")));
@@ -2225,6 +2338,56 @@ mod tests {
         assert!(!content.contains("victauri-test@main"));
         assert!(content.contains("xvfb"));
         assert!(content.contains("VICTAURI_E2E"));
+        // create-tauri-app layout: the frontend is built (via `tauri build`) before the
+        // binary, and cargo steps run in the crate dir so target/ paths resolve.
+        assert!(content.contains("npx tauri build --debug --no-bundle"));
+        assert!(content.contains("working-directory: src-tauri"));
+        assert!(content.contains("\"src-tauri -> target\""));
+        assert!(!content.contains("__APP_DIR__"));
+    }
+
+    #[test]
+    fn add_deps_includes_tokio_and_core() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo,
+            "[package]\nname = \"test-app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        add_dependencies(&cargo).unwrap();
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&cargo).unwrap().parse().unwrap();
+        assert!(doc["dependencies"].get("victauri-core").is_some());
+        let tokio = doc["dev-dependencies"]["tokio"].as_inline_table().unwrap();
+        let features: Vec<_> = tokio["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(features.contains(&"macros") && features.contains(&"rt-multi-thread"));
+    }
+
+    #[test]
+    fn snapshot_element_count_handles_compact_and_json() {
+        let compact = serde_json::json!({
+            "tree": "[e1] body\n  [e2] button \"Save\"\n  [e3] input value=\"[e9] not a ref\"\n  text [x]",
+            "stale_refs": [],
+            "format": "compact"
+        });
+        assert_eq!(snapshot_element_count(&compact), 3);
+        let json_tree = serde_json::json!({
+            "tree": {"ref_id": "e1", "children": [
+                {"ref_id": "e2", "children": []},
+                {"ref_id": "e3", "children": [{"ref_id": "e4", "children": []}]}
+            ]},
+            "format": "json"
+        });
+        assert_eq!(snapshot_element_count(&json_tree), 4);
+        assert_eq!(
+            snapshot_element_count(&serde_json::json!({"tree": null})),
+            0
+        );
     }
 
     #[test]

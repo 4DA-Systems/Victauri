@@ -297,7 +297,7 @@ jobs:
         id: changelog
         run: |
           # Get the previous tag
-          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep '^v' | sed -n '2p')
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
           CURRENT_TAG=${GITHUB_REF#refs/tags/}
 
           if [ -z "$PREVIOUS_TAG" ]; then

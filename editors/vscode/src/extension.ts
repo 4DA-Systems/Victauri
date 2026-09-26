@@ -85,7 +85,11 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
 
     vscode.commands.registerCommand("victauri.refreshAll", () => {
-      client.refreshAll();
+      client.refreshAll().catch((e: unknown) => {
+        vscode.window.showErrorMessage(
+          `Victauri: Refresh failed — ${e instanceof Error ? e.message : String(e)}`
+        );
+      });
     }),
 
     vscode.commands.registerCommand("victauri.screenshot", async () => {
@@ -366,6 +370,18 @@ async function dirIsTrusted(dir: string): Promise<boolean> {
   }
 }
 
+// `process.kill(pid, 0)` sends no signal; it only checks that the process
+// exists. ESRCH = gone; EPERM = exists but owned by another user (alive).
+function pidIsAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 async function discoverServer(
   defaultPort: number
 ): Promise<DiscoveredServer> {
@@ -388,10 +404,15 @@ async function discoverServer(
       // Only trust a discovery dir we own — never read a token from a dir a local
       // attacker could have planted in the world-writable temp root (audit #9).
       if (!(await dirIsTrusted(dir))) continue;
+      // Skip dirs left behind by an exited app (a crash / kill leaves them on
+      // disk). Otherwise one stale dir next to the live one makes discovery
+      // ambiguous, and a lone stale dir hands us a dead port + stale token.
+      if (!pidIsAlive(parseInt(entry.name, 10))) continue;
       try {
         const portStr = (await fs.readFile(path.join(dir, "port"), "utf-8")).trim();
+        if (!/^\d+$/.test(portStr)) continue;
         const port = parseInt(portStr, 10);
-        if (port <= 0 || port >= 65536) continue;
+        if (!Number.isInteger(port) || port <= 0 || port >= 65536) continue;
 
         let token: string | undefined;
         try {

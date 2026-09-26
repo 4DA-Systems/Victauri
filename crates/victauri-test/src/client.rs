@@ -28,6 +28,73 @@ async fn wait_past_ipc_checkpoint_ms(checkpoint_ms: u64) {
     tokio::time::sleep(Duration::from_millis(sleep_ms.min(cap_ms))).await;
 }
 
+/// Default whole-request HTTP timeout for MCP calls.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Headroom added on top of a tool's own `timeout_ms` so the HTTP request never
+/// times out before the server-side wait it is waiting on has finished.
+const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(10);
+
+/// Per-request HTTP timeout for a tool call. Tools that block server-side for a
+/// caller-chosen `timeout_ms` (e.g. `wait_for`, which accepts up to 120 000 ms)
+/// need the HTTP timeout to outlast that wait; otherwise the client gives up at
+/// the fixed 60 s default while the server is still legitimately waiting.
+fn request_timeout_for(arguments: &Value) -> Duration {
+    arguments
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_REQUEST_TIMEOUT, |ms| {
+            DEFAULT_REQUEST_TIMEOUT
+                .max(Duration::from_millis(ms).saturating_add(TOOL_TIMEOUT_HEADROOM))
+        })
+}
+
+/// Truncate `text` to at most `max_chars` characters without splitting a UTF-8
+/// code point (byte slicing like `&text[..200]` panics on non-ASCII bodies).
+pub fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((byte_idx, _)) => &text[..byte_idx],
+        None => text,
+    }
+}
+
+/// Split an SSE body into event payloads (the `data:` lines of each event joined
+/// with `\n`, per the SSE spec), skipping events with no data (e.g. priming events).
+fn sse_event_payloads(text: &str) -> Vec<String> {
+    let mut events = Vec::new();
+    let mut current: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.is_empty() {
+            if !current.is_empty() {
+                events.push(current.join("\n"));
+                current.clear();
+            }
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            current.push(data.strip_prefix(' ').unwrap_or(data));
+        }
+    }
+    if !current.is_empty() {
+        events.push(current.join("\n"));
+    }
+    events
+}
+
+/// Pick the JSON-RPC response whose `id` matches `expected_id` out of an SSE
+/// body. A stream may carry server notifications/requests (no matching `id`)
+/// before the response, so "first data line" is not a safe choice.
+fn find_sse_response(text: &str, expected_id: u64) -> Option<Value> {
+    sse_event_payloads(text)
+        .into_iter()
+        .filter_map(|payload| serde_json::from_str::<Value>(payload.trim()).ok())
+        .find(|msg| {
+            msg.get("id").and_then(Value::as_u64) == Some(expected_id)
+                && (msg.get("result").is_some() || msg.get("error").is_some())
+        })
+}
+
 // ── Typed Response Structs (Phase 4E) ───────────────────────────────────────
 
 /// Structured plugin information returned by [`VictauriClient::plugin_info`].
@@ -184,6 +251,12 @@ pub struct VictauriClient {
     session_id: Option<String>,
     next_id: u64,
     auth_token: Option<String>,
+    /// `true` when the endpoint came from discovery ([`Self::discover`]). The plugin
+    /// mints a fresh auth token on every launch and may land on a different port, so
+    /// such a client re-resolves port + token from discovery when it has to
+    /// re-handshake instead of replaying stale credentials. `false` for explicit
+    /// [`Self::connect_with_token`] clients, whose endpoint is the caller's choice.
+    discovered: bool,
 }
 
 impl VictauriClient {
@@ -212,7 +285,7 @@ impl VictauriClient {
         let host = "127.0.0.1";
         let base_url = format!("http://{host}:{port}");
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(60))
+            .timeout(DEFAULT_REQUEST_TIMEOUT)
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| TestError::Connection {
@@ -231,6 +304,7 @@ impl VictauriClient {
             session_id,
             next_id: 10,
             auth_token: token.map(String::from),
+            discovered: false,
         })
     }
 
@@ -337,6 +411,9 @@ impl VictauriClient {
     /// "expected initialized request" — the session went stale because the in-app server
     /// restarted, the client reconnected, or the `notifications/initialized` was missed.
     async fn reinitialize(&mut self) -> Result<(), TestError> {
+        if self.discovered {
+            self.rediscover();
+        }
         let token = self.auth_token.clone();
         let session_id = Self::perform_handshake(
             &self.http,
@@ -348,6 +425,18 @@ impl VictauriClient {
         .await?;
         self.session_id = session_id;
         Ok(())
+    }
+
+    /// Re-resolve the endpoint (port + auth token) from discovery, exactly as
+    /// [`Self::discover`] did. Only meaningful for discovered clients: after an app
+    /// restart the plugin has a fresh token and possibly a different port.
+    fn rediscover(&mut self) {
+        let (port, token) = crate::discovery::resolve_connection();
+        if port != self.port {
+            self.port = port;
+            self.base_url = format!("http://{}:{port}", self.host);
+        }
+        self.auth_token = token;
     }
 
     /// Auto-discover a running Victauri server via temp files.
@@ -369,7 +458,10 @@ impl VictauriClient {
         let diagnosis = crate::discovery::diagnose_discovery();
         let (port, token) = crate::discovery::resolve_connection();
         match Self::connect_with_token(port, token.as_deref()).await {
-            Ok(client) => Ok(client),
+            Ok(mut client) => {
+                client.discovered = true;
+                Ok(client)
+            }
             Err(TestError::Connection { host, port, reason }) => {
                 let reason = match diagnosis.hint() {
                     Some(hint) => format!("{reason}\n\n  Discovery diagnosis: {hint}"),
@@ -399,6 +491,12 @@ impl VictauriClient {
     /// initialize/initialized handshake. The returned client has a fresh
     /// session ID; the old client should be dropped.
     ///
+    /// A client created via [`Self::discover`] re-resolves the port and auth
+    /// token from discovery on every poll — the restarted app mints a new token
+    /// and may bind a different port, so replaying the old ones would 401 (or
+    /// wait on a dead port). A [`Self::connect_with_token`] client keeps its
+    /// explicit port and token.
+    ///
     /// # Errors
     ///
     /// Returns [`TestError::Connection`] if the server doesn't come back
@@ -406,8 +504,21 @@ impl VictauriClient {
     pub async fn reconnect(&self, max_wait: std::time::Duration) -> Result<Self, TestError> {
         let start = std::time::Instant::now();
         loop {
-            if self.is_alive().await {
-                return Self::connect_with_token(self.port, self.auth_token.as_deref()).await;
+            let (port, token) = if self.discovered {
+                crate::discovery::resolve_connection()
+            } else {
+                (self.port, self.auth_token.clone())
+            };
+            let alive = self
+                .http
+                .get(format!("http://{}:{port}/health", self.host))
+                .send()
+                .await
+                .is_ok_and(|r| r.status().is_success());
+            if alive {
+                let mut client = Self::connect_with_token(port, token.as_deref()).await?;
+                client.discovered = self.discovered;
+                return Ok(client);
             }
             if start.elapsed() > max_wait {
                 return Err(TestError::Connection {
@@ -446,12 +557,15 @@ impl VictauriClient {
             }
         });
 
+        let timeout = request_timeout_for(&arguments);
         let mut resp = None;
         let mut reinitialized = false;
+        let mut reauthed = false;
         for attempt in 0..4 {
             let mut req = self
                 .http
                 .post(format!("{}/mcp", self.base_url))
+                .timeout(timeout)
                 .header("Content-Type", "application/json")
                 .header("Accept", "application/json, text/event-stream")
                 .json(&call_body);
@@ -482,6 +596,15 @@ impl VictauriClient {
                 self.reinitialize().await?;
                 continue;
             }
+            // HTTP 401 on a discovered client: the app most likely restarted and minted
+            // a fresh token. Re-resolve discovery (new token, maybe new port) and
+            // re-handshake once. Explicit-token clients surface the 401 as-is.
+            if status == 401 && self.discovered && !reauthed && attempt < 3 {
+                drop(r);
+                reauthed = true;
+                self.reinitialize().await?;
+                continue;
+            }
             resp = Some(r);
             break;
         }
@@ -508,7 +631,7 @@ impl VictauriClient {
                 ),
             });
         }
-        let body = Self::parse_response(resp, &self.host, self.port).await?;
+        let body = Self::parse_response(resp, &self.host, self.port, id).await?;
 
         if let Some(error) = body.get("error") {
             return Err(TestError::Mcp {
@@ -562,13 +685,17 @@ impl VictauriClient {
 
     /// Parse a response that may be JSON or SSE (text/event-stream).
     ///
-    /// rmcp's Streamable HTTP transport always returns SSE format with the
-    /// JSON-RPC payload in a `data:` line. This method handles both formats.
+    /// rmcp's Streamable HTTP transport returns SSE with the JSON-RPC payload in
+    /// `data:` lines; the response is matched by its JSON-RPC `id` (a stream may
+    /// carry notifications first). Non-2xx statuses are reported as such — a 401
+    /// or 500 is never misreported as a "JSON parse error".
     async fn parse_response(
         resp: reqwest::Response,
         host: &str,
         port: u16,
+        expected_id: u64,
     ) -> Result<Value, TestError> {
+        let status = resp.status();
         let content_type = resp
             .headers()
             .get("content-type")
@@ -578,24 +705,38 @@ impl VictauriClient {
 
         let text = resp.text().await?;
 
-        if content_type.contains("text/event-stream") {
-            for line in text.lines() {
-                let data = line
-                    .strip_prefix("data: ")
-                    .or_else(|| line.strip_prefix("data:"));
-                let Some(data) = data else { continue };
-                let trimmed = data.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-                    return Ok(parsed);
-                }
+        if !status.is_success() {
+            // A JSON-RPC error body on a non-2xx status is still the most precise report.
+            if let Ok(parsed) = serde_json::from_str::<Value>(&text)
+                && parsed.get("error").is_some()
+            {
+                return Ok(parsed);
             }
-            Err(TestError::Connection {
+            let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
+                " — auth token missing or wrong (auth is on by default; the token is in \
+                 <temp>/victauri/<pid>/token, or set VICTAURI_AUTH_TOKEN)"
+            } else {
+                ""
+            };
+            return Err(TestError::Connection {
                 host: host.to_string(),
                 port,
-                reason: "SSE stream contained no JSON-RPC data".into(),
+                reason: format!(
+                    "tool call returned HTTP {status}{hint}; body: {}",
+                    truncate_chars(&text, 200)
+                ),
+            });
+        }
+
+        if content_type.contains("text/event-stream") {
+            find_sse_response(&text, expected_id).ok_or_else(|| TestError::Connection {
+                host: host.to_string(),
+                port,
+                reason: format!(
+                    "SSE stream contained no JSON-RPC response for request id {expected_id}; \
+                     body: {}",
+                    truncate_chars(&text, 200)
+                ),
             })
         } else {
             serde_json::from_str(&text).map_err(|e| TestError::Connection {
@@ -603,7 +744,7 @@ impl VictauriClient {
                 port,
                 reason: format!(
                     "JSON parse error: {e}, body: {}",
-                    &text[..200.min(text.len())]
+                    truncate_chars(&text, 200)
                 ),
             })
         }
@@ -2217,4 +2358,50 @@ pub fn assert_state_matches(verification: &Value) {
         "state verification failed: {}",
         serde_json::to_string_pretty(verification).unwrap_or_default()
     );
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn truncate_chars_never_splits_a_code_point() {
+        // "a" + 2-byte chars: byte 200 falls mid-"é", where `&odd[..200]` panics.
+        let odd = format!("a{}", "é".repeat(300));
+        assert!(!odd.is_char_boundary(200));
+        assert_eq!(truncate_chars(&odd, 200).chars().count(), 200);
+        assert_eq!(truncate_chars("short", 200), "short");
+        assert_eq!(truncate_chars("日本語テキスト", 3), "日本語");
+    }
+
+    #[test]
+    fn request_timeout_outlasts_tool_wait() {
+        assert_eq!(request_timeout_for(&json!({})), DEFAULT_REQUEST_TIMEOUT);
+        assert_eq!(
+            request_timeout_for(&json!({"timeout_ms": 5_000})),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&json!({"timeout_ms": 120_000})),
+            Duration::from_secs(130)
+        );
+    }
+
+    #[test]
+    fn sse_response_is_matched_by_id_not_position() {
+        let body = "id: 0\ndata:\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"stale\":true}}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"id\":42,\"result\":{\"ok\":true}}\n\n";
+        let msg = find_sse_response(body, 42).expect("response for id 42");
+        assert_eq!(msg["result"]["ok"], json!(true));
+        assert!(find_sse_response(body, 99).is_none());
+    }
+
+    #[test]
+    fn sse_multi_line_data_is_joined() {
+        let body = "event: message\r\ndata: {\"jsonrpc\":\"2.0\",\r\ndata: \"id\":3,\"error\":{\"code\":-1}}\r\n\r\n";
+        let msg = find_sse_response(body, 3).expect("joined multi-line event");
+        assert_eq!(msg["error"]["code"], json!(-1));
+    }
 }

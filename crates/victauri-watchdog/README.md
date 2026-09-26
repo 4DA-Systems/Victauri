@@ -6,6 +6,10 @@ Since Victauri's MCP server runs inside the Tauri app process, a crash kills the
 
 ## What It Does
 
+- Discovers the app's port from `<temp>/victauri/<pid>/port` (live processes only; the plugin
+  may bind 7374+ when 7373 is taken), optionally selecting an app by identity with
+  `--app <identifier>` / `VICTAURI_APP`, and follows the app if it restarts on a new port.
+  An explicit `VICTAURI_PORT` (or positional `PORT`) skips discovery entirely.
 - Polls `GET /health` on the Victauri MCP server at a configurable interval
 - Logs warnings on first failure, errors after consecutive misses
 - Executes a configurable recovery command after threshold failures
@@ -20,8 +24,11 @@ cargo install victauri-watchdog
 ## Usage
 
 ```bash
-# Default: poll localhost:7373 every 5 seconds
+# Default: discover the running app's port (fallback 7373), poll every 5 seconds
 victauri-watchdog
+
+# Several Victauri apps running? Pick one by bundle identifier (or product name)
+victauri-watchdog --app com.your.app
 
 # Custom port and interval
 VICTAURI_PORT=8080 VICTAURI_INTERVAL=10 victauri-watchdog
@@ -34,7 +41,8 @@ VICTAURI_ON_FAILURE="systemctl restart my-tauri-app" victauri-watchdog
 
 | Variable | Default | Description |
 |---|---|---|
-| `VICTAURI_PORT` | `7373` | Port to poll for health checks |
+| `VICTAURI_PORT` | _(discovered, else `7373`)_ | Port to poll; setting it skips discovery |
+| `VICTAURI_APP` | _(none)_ | Discovery selector: app bundle identifier or product name (same as `--app`) |
 | `VICTAURI_INTERVAL` | `5` | Seconds between health checks |
 | `VICTAURI_MAX_FAILURES` | `3` | Consecutive failures before recovery action |
 | `VICTAURI_ON_FAILURE` | _(none)_ | Shell command to execute on failure threshold |

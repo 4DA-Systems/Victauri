@@ -443,7 +443,7 @@ impl VictauriClient {
         let json: Value = serde_json::from_str(&text).map_err(|_| {
             TestError::Assertion(format!(
                 "/health returned non-JSON: {}",
-                &text[..text.len().min(200)]
+                crate::client::truncate_chars(&text, 200)
             ))
         })?;
         let obj = json.as_object().ok_or_else(|| {

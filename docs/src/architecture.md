@@ -163,4 +163,6 @@ In release builds:
 
 Note: the crate still **compiles into** your build. The `#[cfg(debug_assertions)]`
 gate removes the runtime behaviour, not the dependency. To also keep its compiled
-code out of release binaries, add `victauri-plugin` as a `[dev-dependencies]` entry.
+code out of release binaries, make `victauri-plugin` an optional dependency behind a
+Cargo feature and gate the `.plugin(...)` call on that feature. (Not `[dev-dependencies]`:
+those are invisible to the app binary, which would then fail to compile.)

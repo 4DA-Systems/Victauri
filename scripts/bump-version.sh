@@ -71,7 +71,8 @@ replace_in_file "Cargo.toml" "version = \"$OLD_VERSION\"" "version = \"$NEW_VERS
 if [[ "$DRY_RUN" == true ]]; then
     echo "  WOULD update Cargo.toml [workspace.dependencies] victauri-* pins"
 else
-    sed -i -E "s|(victauri-(core|macros|plugin|test) = \{ version = \")[^\"]+(\")|\1$NEW_VERSION\3|g" "$ROOT/Cargo.toml"
+    # `#` delimiter: the pattern's `(core|macros|...)` alternation contains `|`.
+    sed -i -E "s#(victauri-(core|macros|plugin|test) = \{ version = \")[^\"]+(\")#\1$NEW_VERSION\3#g" "$ROOT/Cargo.toml"
     echo "  OK    Cargo.toml [workspace.dependencies] victauri-* pins"
 fi
 
@@ -90,6 +91,32 @@ replace_in_file ".github/actions/victauri-test/action.yml" "default: \"$OLD_VERS
 # 9. JS bridge version — NO LONGER bumped here. init_script() injects the crate version
 #    (env!("CARGO_PKG_VERSION")) into the __VICTAURI_BRIDGE_VERSION__ placeholder, so the JS
 #    bridge version can never drift (VIC-2); the bridge tests assert against CARGO_PKG_VERSION.
+
+# 10. Version-pinned doc lines, set structurally (like 1b) so they can never lag:
+#   - `victauri-<crate> = "X.Y"` install pins (and `{ version = "X.Y", ... }`) -> new major.minor
+#   - `victauri-test@vX.Y.Z` GitHub Action refs -> new full version
+NEW_MM="${NEW_VERSION%.*}"
+PIN_DOCS=(README.md docs/src/getting-started.md docs/src/testing.md docs/src/testing-tauri-apps.md
+          crates/victauri-plugin/README.md crates/victauri-test/README.md crates/victauri-macros/README.md)
+ACTION_DOCS=(README.md docs/src/testing.md docs/src/testing-tauri-apps.md)
+for f in "${PIN_DOCS[@]}"; do
+    [[ -f "$ROOT/$f" ]] || { echo "  SKIP  $f install pins (not found)"; continue; }
+    if $DRY_RUN; then
+        echo "  WOULD $f install pins -> \"$NEW_MM\""
+    else
+        sed -i -E "s#(victauri-(core|macros|plugin|test) *= *(\{ *version *= *)?\")[0-9]+\.[0-9]+(\")#\1$NEW_MM\4#g" "$ROOT/$f"
+        echo "  OK    $f install pins -> \"$NEW_MM\""
+    fi
+done
+for f in "${ACTION_DOCS[@]}"; do
+    [[ -f "$ROOT/$f" ]] || { echo "  SKIP  $f action refs (not found)"; continue; }
+    if $DRY_RUN; then
+        echo "  WOULD $f victauri-test@v$NEW_VERSION"
+    else
+        sed -i -E "s|(victauri-test@v)[0-9]+\.[0-9]+\.[0-9]+|\1$NEW_VERSION|g" "$ROOT/$f"
+        echo "  OK    $f victauri-test@v$NEW_VERSION"
+    fi
+done
 
 # 11-12. Docs
 replace_in_file "docs/src/getting-started.md" "\"version\":\"$OLD_VERSION\"" "\"version\":\"$NEW_VERSION\"" "docs getting-started"

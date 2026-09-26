@@ -14,14 +14,14 @@ Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.5"
+victauri-plugin = "0.8"
 ```
 
-The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary, so for a zero compiled-footprint release, add it under `[dev-dependencies]` instead and gate your `init()` call with `#[cfg(debug_assertions)]`.
+The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary (inert in release). For a zero compiled-footprint release, make it an optional dependency behind a Cargo feature (`victauri-plugin = { version = "0.8", optional = true }` + `[features] victauri = ["dep:victauri-plugin"]`) and gate the `.plugin(...)` call with `#[cfg(feature = "victauri")]`. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
 
 ## Step 2: Initialize the Plugin
 
-Add `victauri::init()` to your Tauri builder in `src-tauri/src/main.rs`:
+Add `victauri_plugin::init()` to your Tauri builder in `src-tauri/src/main.rs`:
 
 ```rust
 fn main() {
@@ -103,11 +103,17 @@ builder with `.auth_token("…")` (or the `VICTAURI_AUTH_TOKEN` env var).
 
 With your app running, check the health endpoint:
 
+Auth is on by default, so every endpoint except `/health` needs the Bearer token. The plugin
+writes it (and the bound port) to a per-process discovery directory:
+`<temp>/victauri/<pid>/token` (and `.../port`), where `<temp>` is your OS temp dir (`$TMPDIR`
+or `/tmp` on macOS/Linux, `%TEMP%` on Windows) and `<pid>` is the app's process id.
+
 ```bash
 curl http://127.0.0.1:7373/health
-# Returns: ok
+# Returns: ok  (unauthenticated liveness probe)
 
-curl http://127.0.0.1:7373/info
+TOKEN=$(cat "${TMPDIR:-/tmp}"/victauri/*/token | head -n1)   # single running app
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
 # Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.8.8",...}
 ```
 
@@ -120,7 +126,18 @@ victauri check
 
 ## Optional: Register Commands
 
-To enable command discovery and ghost command detection, annotate your Tauri commands with `#[inspectable]` and register them:
+To enable command discovery and ghost command detection, annotate your Tauri commands with `#[inspectable]` and register them.
+
+The code `#[inspectable]` generates refers to `victauri_core::...` by path, so your app crate
+must also depend on `victauri-core` directly (`victauri init` adds it for you) — otherwise
+every annotated command fails to compile with `E0433: failed to resolve: use of undeclared
+crate victauri_core`:
+
+```toml
+[dependencies]
+victauri-plugin = "0.8"
+victauri-core = "0.8"
+```
 
 ```rust
 use victauri_plugin::inspectable;
@@ -150,10 +167,11 @@ All 35 tools are also available via a REST API with no MCP handshake at all:
 
 ```bash
 # List available tools
-curl http://127.0.0.1:7373/api/tools
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/api/tools
 
 # Execute a tool directly
 curl -X POST http://127.0.0.1:7373/api/tools/eval_js \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"code": "document.title"}'
 ```
