@@ -386,6 +386,47 @@ fn unreachable_message() -> String {
         .to_string()
 }
 
+/// Whether a message whose forward failed with `err` may be safely re-sent.
+///
+/// Always true when the connection failed BEFORE the request was written (`is_connect`) — the
+/// backend never saw it. Otherwise the request may already have been delivered and executed, so
+/// only side-effect-free protocol methods are replayed; `tools/call` is not.
+fn may_replay(msg: &Value, err: &anyhow::Error) -> bool {
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    if method != "tools/call" {
+        return true;
+    }
+    err.downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_connect)
+}
+
+/// Error text for a tool call that was (probably) delivered but got no response.
+fn undelivered_response_message(err: &anyhow::Error, app_still_up: bool) -> String {
+    let timed_out = err
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(reqwest::Error::is_timeout);
+    let what = if timed_out {
+        "the tool call was sent to the app but no response arrived before the bridge's \
+         120s timeout"
+            .to_string()
+    } else if app_still_up {
+        "the tool call was sent to the app but the connection closed before a response \
+         arrived (the app is still running — it may have restarted or reloaded while handling \
+         the call)"
+            .to_string()
+    } else {
+        "the tool call was sent to the app, and the app exited before responding. This is the \
+         expected outcome for a command that quits or restarts the app (e.g. a `quit_app` \
+         command) — it most likely ran"
+            .to_string()
+    };
+    format!(
+        "{what}. It was NOT retried, because it may already have taken effect and replaying \
+         it could run it twice. Check the app's state (or its log) before calling it again. \
+         (transport error: {err})"
+    )
+}
+
 /// Background task that watches for the backend becoming reachable and, on a down→up
 /// transition, tells the client to refresh its tool/resource lists — so the baked fallback
 /// is replaced by the live, version-accurate set with no `/mcp` reconnect.
@@ -623,6 +664,19 @@ async fn forward_with_retries(
                     MAX_RETRIES
                 );
                 *locked(session_id) = None;
+                // A tool call that may already have REACHED the app must not be replayed: it
+                // can have side effects (invoke_command, input, interact…), and the commonest
+                // way to get here is a call that itself quit or restarted the app (`quit_app`)
+                // — replaying it after a relaunch would run it twice, and reporting "backend not
+                // reachable" (the old behavior) told the agent the call never happened.
+                if !may_replay(msg, &e) {
+                    let still_up = matches!(scan_once(app).await, Selection::One(_));
+                    return ForwardResult::Payloads(vec![error_for_request(
+                        msg,
+                        -32000,
+                        &undelivered_response_message(&e, still_up),
+                    )]);
+                }
                 if attempt + 1 < MAX_RETRIES {
                     tokio::time::sleep(Duration::from_millis(
                         RETRY_DELAY_MS * (attempt as u64 + 1),
@@ -1304,6 +1358,46 @@ mod tests {
         // Names the cause and the one-line fix so an agent doesn't fall back to CDP.
         assert!(m.contains("tauri dev"), "must name how to start the app");
         assert!(m.to_lowercase().contains("not reachable") || m.contains("no running"));
+    }
+
+    // ── Replay safety: a tool call that may have reached the app is never re-sent ──
+
+    fn call(method: &str) -> Value {
+        json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": {}})
+    }
+
+    #[tokio::test]
+    async fn connect_failure_is_replayable_even_for_tool_calls() {
+        // Port 9 (discard) on loopback is closed on every CI host → a pre-send connect error.
+        let err = reqwest::Client::new()
+            .post("http://127.0.0.1:9/mcp")
+            .send()
+            .await
+            .expect_err("nothing listens on :9");
+        assert!(err.is_connect());
+        assert!(may_replay(&call("tools/call"), &anyhow::Error::new(err)));
+    }
+
+    #[test]
+    fn post_send_failure_is_not_replayed_for_tool_calls_only() {
+        let err = anyhow::anyhow!("connection closed before message completed");
+        assert!(!may_replay(&call("tools/call"), &err));
+        assert!(may_replay(&call("tools/list"), &err));
+        assert!(may_replay(&call("resources/read"), &err));
+    }
+
+    #[test]
+    fn undelivered_message_says_the_call_likely_ran_when_the_app_exited() {
+        let err = anyhow::anyhow!("connection reset");
+        let gone = undelivered_response_message(&err, false);
+        assert!(gone.contains("exited before responding"), "{gone}");
+        assert!(gone.contains("NOT retried"));
+        assert!(
+            !gone.contains("not reachable"),
+            "must not claim the app was never reached"
+        );
+        let up = undelivered_response_message(&err, true);
+        assert!(up.contains("still running"), "{up}");
     }
 
     #[test]

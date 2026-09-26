@@ -7,6 +7,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Full-surface audit (three review lenses + a live sweep of 4DA), every finding verified against
+the code before fixing. Additive/bugfix only — no public API removed or changed.
+
+### Fixed — agent-visible correctness
+
+- **`victauri bridge` no longer replays a tool call that already reached the app.** A call whose
+  connection dropped after it was sent (the textbook case: `invoke_command quit_app` — the app exits
+  mid-call) was re-sent up to 4× and then reported *"backend not reachable"*, telling the agent the
+  call never happened. Only pre-send connect failures are retried now; a possibly-delivered call
+  gets an accurate error (app exited / still running / timed out) and is never replayed.
+- **`eval_js` / `invoke_command` report a closed window or a shutting-down app** within ~1s,
+  as the expected outcome of a close/quit command — instead of hanging 30s and blaming "an
+  unresolved promise, an infinite loop…".
+- **`introspect db_health` degrades instead of failing on large databases.** On 4DA's 1.4 GB DB
+  `quick_check` exhausted a single 5s deadline and the call returned only "timed out", discarding
+  every cheap stat. Row counts and `quick_check` now run on separate budgets; a phase that runs out
+  is reported (`row_count: null`, `row_counts_complete: false`, `integrity_check: "not completed…"`).
+- **`recording.replay` no longer re-runs calls it cannot reproduce.** Recordings do not capture
+  arguments, so a call that had arguments (now detected via `arg_size_bytes`), failed, or never
+  completed is skipped and reported instead of re-invoked with no arguments.
+- **`recording.import` refuses to silently discard an in-progress recording.**
+- **`trace` stops the recording it started** (`with_events`) — it previously left the recorder and
+  its per-second drain loop running forever. Traces also auto-stop after 30 min, cap the frame
+  buffer at 256 MB and `frames` responses at 25 MB, and skip hidden windows (same rule as
+  `screenshot`).
+- **`eval_js` auto-return is ASI-aware.** `foo()\nbar()` was wrapped as `return foo()…`, so
+  `bar()` silently never ran; leading comments no longer hide statement keywords.
+- **`explain` reports real activity when no recording is running** (it always said "0 IPC calls").
+- Command errors that are objects no longer collapse to `"[object Object]"`; the recording drain
+  no longer re-ingests its newest event every second; drained events keep their own timestamp and
+  window label; `p95` was the max for ≤ 20 samples; `/health` is no longer queued behind the
+  64-request concurrency cap; `fault` `delay_ms` is capped at 120 s.
+
+### Fixed — injected JS bridge (host-app safety)
+
+- IPC response/request bodies are bounded (binary and > 64 KB bodies are recorded as a size marker
+  instead of being decoded, parsed, and retained for 1,000 entries).
+- The `console.*` hook can no longer throw into app code (`console.log(Object.create(null))`).
+- XHR with a `URL` object no longer throws from `send()`; aborted/timed-out XHRs no longer stay
+  pending forever (which wedged `wait_for network_idle`).
+- `find_elements` redacts password input values (as snapshots already did).
+- `route` fulfill with 204/205/304 no longer throws synchronously out of `fetch()`.
+- Ref ids are stable across snapshots and the ref maps are pruned (they grew by the full DOM on
+  every snapshot); the animation sampler's rAF loop stops after 60 s idle; plus `fill` on
+  contenteditable, `matrix3d` parsing, shadow-root text in `wait_for`, and falsy IPC results.
+
+### Fixed — CLI, test client, watchdog, VS Code, CI, docs
+
+- `victauri-test`: discovered clients re-resolve port + token after an app restart (reconnect
+  always 401'd with auth on); per-request timeout outlasts long `wait_for`s; no panic on non-ASCII
+  error bodies; HTTP errors reported as such; SSE responses matched by id.
+- `victauri check` / `doctor` read the right fields; `init` adds `victauri-core` + `tokio` and
+  writes a CI workflow that works for the standard `src-tauri/` layout; the generated CLAUDE.md
+  names real tools.
+- `victauri-watchdog` discovers the app's actual port (and follows restarts) instead of assuming
+  7373.
+- VS Code extension: DOM Explorer and Windows view showed nothing / junk; disconnection is now
+  detected.
+- Surface Audit workflow had false-failed every week since July (crates.io 403s without a
+  User-Agent); docs install pins, action refs and tool counts corrected.
+
 ## [0.8.8] - 2026-08-12
 
 The MCP-infrastructure release: the embedded server jumps two SDK major versions

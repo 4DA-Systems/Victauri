@@ -597,9 +597,19 @@ e2e_test!(plugin_info_version, {
 e2e_test!(plugin_info_tool_count, {
     let mut client = VictauriClient::discover().await.unwrap();
     let result = client.get_plugin_info().await.unwrap();
-    let text = serde_json::to_string(&result).unwrap();
-    // Should report 31 tools (19 standalone + 12 compound)
-    assert!(text.contains("31") || text.contains("tools") || text.contains("tool_count"));
+    // 35 MCP tools (20 standalone + 15 compound) — keep in sync with the `#[tool(`
+    // count in crates/victauri-plugin/src/mcp/mod.rs (scripts/check-doc-counts.sh).
+    assert_eq!(
+        result["tools"]["total"].as_u64(),
+        Some(35),
+        "unexpected tool total in plugin info: {result}"
+    );
+    let enabled = result["tools"]["enabled"].as_u64().expect("tools.enabled");
+    let enabled_list = result["tools"]["enabled_list"]
+        .as_array()
+        .expect("tools.enabled_list");
+    assert_eq!(enabled_list.len() as u64, enabled);
+    assert!(enabled <= 35);
 });
 
 // ── Logs ────────────────────────────────────────────────────────────────────

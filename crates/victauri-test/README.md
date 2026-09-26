@@ -20,7 +20,7 @@ Typed HTTP client for the Victauri MCP server with high-level convenience method
 
 ```toml
 [dev-dependencies]
-victauri-test = "0.5"
+victauri-test = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 

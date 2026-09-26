@@ -2,6 +2,25 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## Unreleased
+
+- **DOM Explorer now shows the tree.** It read a `body` key that `dom_snapshot` never
+  returns (the tool returns `{ tree, stale_refs, format }`), so the view was always empty.
+  It now reads `tree` from the `format: "json"` snapshot.
+- **Window state targets the right window.** `window get_state` was sent `webview_label`,
+  which the `window` tool ignores (its field is `label`), so every entry showed the default
+  window's state.
+- **Connect verifies the auth token.** `/health` is unauthenticated, so a wrong or missing
+  token used to "connect" and then fail every refresh silently. Connect now also probes the
+  auth-gated `/info` and reports a 401 clearly.
+- **Disconnection is detected.** Per-view refresh errors were swallowed, so a dead or
+  restarted app never flipped the status to disconnected. Each poll now runs an
+  authenticated liveness probe first.
+- **Auto-discovery ignores stale discovery dirs** whose app process has exited, and rejects
+  malformed port files.
+- REST tool errors now report the real HTTP status (e.g. 401/500) instead of a JSON parse
+  error on non-JSON bodies.
+
 ## 0.8.5 (2026-06-20)
 
 - Version-synced with the Victauri 0.8.5 release (pre-publish adversarial audit hardening

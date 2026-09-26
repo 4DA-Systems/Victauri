@@ -152,7 +152,7 @@ tauri::Builder::default()
     .expect("error while running tauri application");
 ```
 
-Instrument your commands for full introspection:
+Instrument your commands for full introspection (the crate needs `victauri-core` — and `victauri-macros` for this import — in its own `[dependencies]`, because the generated code names `victauri_core::...` by path; `victauri init` adds `victauri-core`):
 
 ```rust
 use victauri_macros::inspectable;
@@ -436,7 +436,7 @@ Coverage gate ──────────────── victauri coverage
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.1
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.8
   with:
     max-load-ms: 5000
     coverage: true

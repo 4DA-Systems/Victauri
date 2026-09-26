@@ -99,7 +99,9 @@ impl TimingSamples {
         let p95 = if sorted.is_empty() {
             0.0
         } else {
-            let idx = ((sorted.len() as f64) * 0.95).ceil() as usize;
+            // Nearest-rank: the ceil(0.95·n)-th value, i.e. 0-based index ceil(0.95·n) − 1.
+            // Without the −1 this returned the MAX for every n ≤ 20.
+            let idx = (((sorted.len() as f64) * 0.95).ceil() as usize).saturating_sub(1);
             sorted[idx.min(sorted.len() - 1)]
         };
 
@@ -1188,6 +1190,21 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p95_is_nearest_rank_not_max_for_small_samples() {
+        let t = CommandTimings::new();
+        for ms in 1..=20 {
+            t.record("cmd", Duration::from_millis(ms));
+        }
+        let s = t.stats_for("cmd").unwrap();
+        assert!(
+            (s.p95_ms - 19.0).abs() < 1e-9,
+            "p95 of 1..=20 is 19, got {}",
+            s.p95_ms
+        );
+        assert!((s.max_ms - 20.0).abs() < 1e-9);
+    }
 
     #[test]
     fn app_state_probes_register_run_list() {

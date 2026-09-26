@@ -18,7 +18,7 @@ jobs:
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
-          node-version: 20
+          node-version: 22
 
       - name: Compare repo versions vs published registries
         id: versions
@@ -33,22 +33,27 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
           newer() { dpkg --compare-versions "$1" gt "$2"; }   # repo > published ?
+          # crates.io 403s any request without a User-Agent (crawler policy); an
+          # empty curl body makes jq print NOTHING (not the "unknown" fallback), so
+          # treat empty as unknown too — otherwise `repo gt ""` is a false DRIFT.
+          UA='victauri-surface-audit (+https://github.com/4DA-Systems/Victauri)'
+          is_unknown() { [ -z "$1" ] || [ "$1" = unknown ] || [ "$1" = null ]; }
 
           # --- crates.io (core; workspace version) ---
           REPO_CRATE=$(grep -m1 -E '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          PUB_CRATE=$(curl -fsSL "https://crates.io/api/v1/crates/victauri-plugin" 2>/dev/null | jq -r '.crate.max_stable_version // .crate.max_version // "unknown"')
-          if [ "$PUB_CRATE" = "unknown" ]; then ST="⚠️ query failed";
+          PUB_CRATE=$(curl -fsSL -A "$UA" "https://crates.io/api/v1/crates/victauri-plugin" 2>/dev/null | jq -r '.crate.max_stable_version // .crate.max_version // "unknown"')
+          if is_unknown "$PUB_CRATE"; then PUB_CRATE=unknown; ST="⚠️ query failed";
           elif newer "$REPO_CRATE" "$PUB_CRATE"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
           else ST="✅ in sync"; fi
           echo "| crates.io (victauri-plugin) | $REPO_CRATE | $PUB_CRATE | $ST |" >> "$GITHUB_STEP_SUMMARY"
 
           # --- VS Code Marketplace ---
           REPO_VSC=$(node -p "require('./editors/vscode/package.json').version")
-          PUB_VSC=$(curl -fsSL -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \
+          PUB_VSC=$(curl -fsSL -A "$UA" -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \
             -H "Accept: application/json;api-version=3.0-preview.1" -H "Content-Type: application/json" \
             -d '{"filters":[{"criteria":[{"filterType":7,"value":"4da-systems.victauri"}]}],"flags":914}' 2>/dev/null \
             | jq -r '.results[0].extensions[0].versions[0].version // "unknown"')
-          if [ "$PUB_VSC" = "unknown" ]; then ST="⚠️ not found / query failed";
+          if is_unknown "$PUB_VSC"; then PUB_VSC=unknown; ST="⚠️ not found / query failed";
           elif newer "$REPO_VSC" "$PUB_VSC"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
           else ST="✅ in sync"; fi
           echo "| VS Code Marketplace (4da-systems.victauri) | $REPO_VSC | $PUB_VSC | $ST |" >> "$GITHUB_STEP_SUMMARY"

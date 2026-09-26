@@ -8,7 +8,7 @@ Add the test crate to your dev dependencies:
 
 ```toml
 [dev-dependencies]
-victauri-test = "0.5"
+victauri-test = "0.8"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -585,7 +585,7 @@ let session = client.stop_recording().await?;
 
 ## Command Instrumentation
 
-Mark your Tauri commands with `#[inspectable]` for coverage tracking, ghost detection, and natural language resolution:
+Mark your Tauri commands with `#[inspectable]` for coverage tracking, ghost detection, and natural language resolution. The generated code names `victauri_core::...` by path, so the crate also needs `victauri-core` (and `victauri-macros` for this import) in its own `[dependencies]`:
 
 ```rust
 use victauri_macros::inspectable;
@@ -843,7 +843,7 @@ Victauri tests run in CI without special infrastructure. Pick the approach that 
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.1
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.8
   with:
     max-load-ms: 5000
     max-heap-mb: 256

@@ -4,7 +4,18 @@ Proc macros for [Victauri](https://github.com/4DA-Systems/victauri) -- auto-inst
 
 ## The `#[inspectable]` Macro
 
-Annotate any `#[tauri::command]` to make it discoverable by Victauri's MCP server:
+Annotate any `#[tauri::command]` to make it discoverable by Victauri's MCP server.
+
+The generated code refers to `victauri_core::...` by path, so the crate using the macro must
+depend on `victauri-core` directly (whether you import the macro as
+`victauri_macros::inspectable` or via the `victauri_plugin::inspectable` re-export) —
+`victauri init` adds it for you:
+
+```toml
+[dependencies]
+victauri-plugin = "0.8"
+victauri-core = "0.8"
+```
 
 ```rust
 use victauri_macros::inspectable;

@@ -3940,13 +3940,9 @@ fn ref_map_limit_enforcement() {
 
 #[test]
 fn fill_contenteditable() {
-    // Note: In real browsers, fill on contenteditable works because the
-    // HTMLInputElement.prototype.value setter is more permissive. In jsdom,
-    // calling the setter on a non-input element throws. The bridge's fill
-    // function passes the matches check for [contenteditable="true"] but
-    // then the value setter call fails. This test verifies the bridge
-    // correctly passes through the actionability check and attempts the fill,
-    // even though jsdom rejects the setter call.
+    // fill on contenteditable sets textContent (the HTMLInputElement value
+    // setter throws "Illegal invocation" on a non-input in every engine).
+    // See bridge_hardening_regressions for the textContent assertion.
     let def = TestDef {
         bridge_script: bridge_script(),
         setup_html: r#"<html lang="en"><head><title>CE</title></head><body>
@@ -4309,13 +4305,14 @@ fn get_ref_after_multiple_snapshots() {
         setup_html: default_html(),
         setup_js: None,
         tests: vec![TestCase {
-            name: "refs from latest snapshot work, old refs cleared".into(),
+            name: "refs are stable across snapshots of the same node".into(),
             code: r"
                     var s1 = window.__VICTAURI__.snapshot('json');
                     var firstRef = s1.tree.ref_id;
                     var s2 = window.__VICTAURI__.snapshot('json');
                     var secondRef = s2.tree.ref_id;
-                    // Second snapshot should have different ref counter
+                    // The same (still-connected) node keeps its ref id, so the
+                    // ref maps don't grow by the whole DOM on every snapshot.
                     var el1 = window.__VICTAURI__.getRef(firstRef);
                     var el2 = window.__VICTAURI__.getRef(secondRef);
                     return {
@@ -4334,9 +4331,11 @@ fn get_ref_after_multiple_snapshots() {
     };
     assert_all_pass(&results);
     let r = results[0].result.as_ref().unwrap();
-    assert_eq!(r["refs_different"], true);
-    // Old refs may still resolve via WeakRef if element is still connected
-    // The important thing is the new ref is valid
+    assert_eq!(
+        r["refs_different"], false,
+        "an unchanged node must keep its ref id across snapshots"
+    );
+    assert_eq!(r["old_ref_null"], false);
     assert_eq!(r["new_ref_valid"], true);
 }
 
@@ -4986,4 +4985,212 @@ fn ipc_encoded_command_names() {
         results[0].result.as_ref().unwrap()["command"],
         "my command:with special"
     );
+}
+
+// ── Hardening regressions (bounded capture, never-throw hooks, ref reuse) ────
+
+fn case(name: &str, code: &str) -> TestCase {
+    TestCase {
+        name: name.into(),
+        code: code.into(),
+        setup_html: None,
+        setup_js: None,
+    }
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn bridge_hardening_regressions() {
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: r#"<html lang="en"><head><title>Hard</title></head><body>
+            <input id="pw" type="password" value="hunter2" />
+            <div id="ce" contenteditable="true">old</div>
+            <button id="b1">One</button>
+        </body></html>"#
+            .to_string(),
+        setup_js: None,
+        tests: vec![
+            case(
+                "console.log never throws on unstringifiable args and caps length",
+                r"
+                    var threw = false;
+                    try {
+                        console.log(Object.create(null));
+                        console.log('x'.repeat(10000), 'tail');
+                    } catch (e) { threw = true; }
+                    var logs = window.__VICTAURI__.getConsoleLogs();
+                    return {
+                        threw: threw,
+                        first: logs[0] && logs[0].message,
+                        capped: logs[1] && logs[1].message.length < 4200,
+                        marker: logs[1] && logs[1].message.indexOf('bytes truncated') !== -1,
+                    };
+                ",
+            ),
+            case(
+                "findElements redacts password values",
+                r"
+                    var r = window.__VICTAURI__.findElements({ css: '#pw' });
+                    return { value: r[0] && r[0].value };
+                ",
+            ),
+            case(
+                "fill on contenteditable sets textContent",
+                r"
+                    var r = window.__VICTAURI__.findElements({ css: '#ce' });
+                    var res = await window.__VICTAURI__.fill(r[0].ref_id, 'new text');
+                    return { ok: res.ok, text: document.getElementById('ce').textContent };
+                ",
+            ),
+            case(
+                "snapshot reuses ref ids and does not grow the ref maps",
+                r"
+                    var s1 = window.__VICTAURI__.snapshot('compact');
+                    var s2 = window.__VICTAURI__.snapshot('compact');
+                    var f = window.__VICTAURI__.findElements({ css: '#b1' });
+                    var s3 = window.__VICTAURI__.snapshot('compact');
+                    return { same: s1.tree === s2.tree && s2.tree === s3.tree,
+                             found_ref_in_tree: s3.tree.indexOf('[' + f[0].ref_id + ']') !== -1,
+                             stale: s2.stale_refs.length };
+                ",
+            ),
+            case(
+                "binary and oversized IPC bodies are replaced by a size marker",
+                r"
+                    await fetch('http://ipc.localhost/bin_cmd', { method: 'POST', body: '{}',
+                        headers: { 'x-vtest-content-type': 'application/octet-stream', 'x-vtest-body': 'RAW' } });
+                    await fetch('http://ipc.localhost/big_cmd', { method: 'POST', body: '{\x22a\x22:1}',
+                        headers: { 'x-vtest-body': JSON.stringify({ s: 'y'.repeat(70000) }) } });
+                    await fetch('http://ipc.localhost/zero_cmd', { method: 'POST', body: '{}',
+                        headers: { 'x-vtest-body': '0' } });
+                    await new Promise(function(r) { setTimeout(r, 20); });
+                    var log = window.__VICTAURI__.getIpcLog();
+                    function by(c) { return log.find(function(e) { return e.command === c; }); }
+                    var stream = window.__VICTAURI__.getEventStream();
+                    var ev = stream.filter(function(e) { return e.type === 'ipc'; });
+                    var net = stream.filter(function(e) { return e.type === 'network'; });
+                    return {
+                        bin: by('bin_cmd').result,
+                        big: by('big_cmd').result,
+                        zero: by('zero_cmd').result,
+                        ipc_events: ev.length,
+                        ipc_as_network: net.length,
+                        big_arg_size: ev.filter(function(e) { return e.command === 'big_cmd'; })[0].arg_size_bytes,
+                        empty_arg_size: ev.filter(function(e) { return e.command === 'zero_cmd'; })[0].arg_size_bytes,
+                    };
+                ",
+            ),
+            case(
+                "getEventStream exclusive since skips the watermark event; ipc status honors Tauri-Response",
+                r"
+                    await fetch('http://ipc.localhost/bad_cmd', { method: 'POST', body: '{}',
+                        headers: { 'x-vtest-tauri-response': 'error' } });
+                    var all = window.__VICTAURI__.getEventStream();
+                    var last = all[all.length - 1].timestamp;
+                    var incl = window.__VICTAURI__.getEventStream(last).length;
+                    var excl = window.__VICTAURI__.getEventStream(last, true).length;
+                    var ipc = all.filter(function(e) { return e.type === 'ipc'; })[0];
+                    return { incl_nonzero: incl > 0, excl: excl, ipc_status: ipc && ipc.status };
+                ",
+            ),
+            TestCase {
+                name: "route fulfill with a null-body status resolves; bad status rejected".into(),
+                code: r"
+                    var bad = window.__VICTAURI__.addRoute({ pattern: 'x', status: 1000 });
+                    window.__VICTAURI__.addRoute({ pattern: '/nc', action: 'fulfill', status: 204, body: 'ignored' });
+                    var r = await fetch('http://test.com/nc');
+                    return { bad_ok: bad.ok, status: r.status, body: r.body };
+                "
+                .into(),
+                setup_html: None,
+                // jsdom has no Response; stub one that enforces the null-body rule.
+                setup_js: Some(
+                    r"window.Response = function(body, init) {
+                        if ((init.status === 204 || init.status === 205 || init.status === 304) && body !== null) {
+                            throw new TypeError('Response with null body status cannot have body');
+                        }
+                        this.status = init.status; this.body = body;
+                    };"
+                    .into(),
+                ),
+            },
+            case(
+                "XHR open accepts a URL object and abort does not leave the entry pending",
+                r"
+                    var threw = null;
+                    var xhr = new XMLHttpRequest();
+                    try {
+                        xhr.open('GET', new URL('http://127.0.0.1:1/x'));
+                        xhr.send();
+                        xhr.abort();
+                    } catch (e) { threw = String(e); }
+                    await new Promise(function(r) { setTimeout(r, 20); });
+                    var n = window.__VICTAURI__.getNetworkLog('127.0.0.1:1');
+                    return { threw: threw, url_is_string: typeof (n[0] && n[0].url), status: n[0] && n[0].status };
+                ",
+            ),
+        ],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = |i: usize| results[i].result.clone().unwrap();
+
+    let c = r(0);
+    assert_eq!(c["threw"], false);
+    assert_eq!(c["first"], "[object Object]");
+    assert_eq!(c["capped"], true);
+    assert_eq!(c["marker"], true);
+
+    assert_eq!(r(1)["value"], "[REDACTED]");
+
+    let f = r(2);
+    assert_eq!(f["ok"], true);
+    assert_eq!(f["text"], "new text");
+
+    let s = r(3);
+    assert_eq!(
+        s["same"], true,
+        "re-snapshotting an unchanged DOM must reuse ids"
+    );
+    assert_eq!(s["found_ref_in_tree"], true);
+    assert_eq!(s["stale"], 0);
+
+    let b = r(4);
+    assert!(
+        b["bin"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("[body omitted: unknown size, application/octet-stream"),
+        "binary body must not be retained: {b}"
+    );
+    assert!(
+        b["big"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("[body omitted: "),
+        "oversized body must be replaced: {b}"
+    );
+    assert_eq!(b["zero"], 0, "a falsy result (0) must not become null");
+    assert_eq!(b["ipc_events"], 3);
+    assert_eq!(b["ipc_as_network"], 0, "IPC must not be emitted twice");
+    assert_eq!(b["big_arg_size"], 7);
+    assert_eq!(b["empty_arg_size"], 0);
+
+    let e = r(5);
+    assert_eq!(e["incl_nonzero"], true);
+    assert_eq!(e["excl"], 0);
+    assert_eq!(e["ipc_status"], "error");
+
+    let rt = r(6);
+    assert_eq!(rt["bad_ok"], false);
+    assert_eq!(rt["status"], 204);
+    assert_eq!(rt["body"], serde_json::Value::Null);
+
+    let x = r(7);
+    assert_eq!(x["threw"], serde_json::Value::Null);
+    assert_eq!(x["url_is_string"], "string");
+    assert_ne!(x["status"], "pending");
 }

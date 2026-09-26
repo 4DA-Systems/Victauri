@@ -1,6 +1,6 @@
 #!/bin/bash
 # Exhaustive Victauri test against running 4DA app
-# Tests ALL 34 tools + 3 resources + server endpoints
+# Tests ALL 35 tools + 3 resources + server endpoints
 set -euo pipefail
 
 BASE="http://127.0.0.1:7373"
@@ -70,9 +70,9 @@ echo "  (commands: $CMDS)"
 
 TOOLS=$(curl -s "$BASE/api/tools")
 TOOL_COUNT=$(echo "$TOOLS" | jq 'length')
-aj "34 tools listed" "$TOOLS" 'length == 34'
+aj "35 tools listed" "$TOOLS" 'length == 35'
 
-for t in eval_js dom_snapshot find_elements invoke_command screenshot verify_state detect_ghost_commands check_ipc_integrity wait_for assert_semantic resolve_command get_registry get_memory_stats get_plugin_info get_diagnostics app_info list_app_dir read_app_file query_db interact input window storage navigate recording inspect css logs introspect fault explain route trace animation; do
+for t in eval_js dom_snapshot find_elements invoke_command screenshot verify_state detect_ghost_commands check_ipc_integrity wait_for assert_semantic resolve_command get_registry app_state get_memory_stats get_plugin_info get_diagnostics app_info list_app_dir read_app_file query_db interact input window storage navigate recording inspect css logs introspect fault explain route trace animation; do
   TOTAL=$((TOTAL + 1))
   if echo "$TOOLS" | jq -e ".[] | select(.name == \"$t\")" >/dev/null 2>&1; then
     PASS=$((PASS + 1))
@@ -80,7 +80,7 @@ for t in eval_js dom_snapshot find_elements invoke_command screenshot verify_sta
     FAIL=$((FAIL + 1)); FAILURES="$FAILURES\n  FAIL: tool '$t' missing"; echo "  FAIL: tool '$t' missing"
   fi
 done
-echo "  PASS: all 34 tools registered"
+echo "  PASS: all 35 tools registered"
 echo ""
 
 # ===== 2. EVAL_JS =====

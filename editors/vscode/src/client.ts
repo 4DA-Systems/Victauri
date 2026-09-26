@@ -82,6 +82,11 @@ export class VictauriClient {
       if (!resp.ok) {
         throw new Error(`Health check failed: ${resp.status}`);
       }
+      // `/health` is deliberately unauthenticated, so a green health check says
+      // nothing about whether our token works. Probe an auth-gated endpoint too,
+      // so a wrong/missing token fails here instead of every refresh 401-ing
+      // silently afterwards.
+      await this.probeAuthenticated();
       this.setState("connected");
       await this.refreshAll();
       this.startPolling();
@@ -104,8 +109,30 @@ export class VictauriClient {
     this.toolCount = 0;
   }
 
+  /**
+   * Authenticated liveness probe (`GET /info` sits behind the auth layer).
+   * Throws on a network error, a 401, or any non-2xx status.
+   */
+  async probeAuthenticated(): Promise<void> {
+    const resp = await this.fetch("/info");
+    if (resp.status === 401) {
+      throw new Error(
+        "Unauthorized (401): the auth token is missing or wrong. Auth is on by " +
+          "default — the token is in <temp>/victauri/<pid>/token, or set " +
+          "`victauri.authToken`."
+      );
+    }
+    if (!resp.ok) {
+      throw new Error(`Authenticated probe (/info) failed: HTTP ${resp.status}`);
+    }
+  }
+
   async refreshAll(): Promise<void> {
     if (this.state !== "connected") return;
+    // Each per-view refresh below swallows its own errors (keeping stale data
+    // for a flaky tool), so they can't signal a dead server. Probe first and
+    // let that failure propagate so the poller detects the disconnection.
+    await this.probeAuthenticated();
     await Promise.allSettled([
       this.refreshWindows(),
       this.refreshIpcLog(),
@@ -127,12 +154,21 @@ export class VictauriClient {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(args),
     });
-    const body = (await resp.json()) as {
-      result?: unknown;
-      error?: string;
-    };
-    if (!resp.ok || body.error) {
-      throw new Error(body.error ?? `HTTP ${resp.status}`);
+    const text = await resp.text();
+    let body: { result?: unknown; error?: string } | undefined;
+    try {
+      body = JSON.parse(text) as { result?: unknown; error?: string };
+    } catch {
+      body = undefined;
+    }
+    if (resp.status === 401) {
+      throw new Error("Unauthorized (401): auth token missing or wrong");
+    }
+    if (!resp.ok || body === undefined || body.error) {
+      throw new Error(
+        body?.error ??
+          `HTTP ${resp.status}: ${text.slice(0, 200) || resp.statusText}`
+      );
     }
     return body.result;
   }
@@ -193,7 +229,7 @@ export class VictauriClient {
           try {
             const s = (await this.callTool("window", {
               action: "get_state",
-              webview_label: label,
+              label,
             })) as WindowState;
             states.push(s);
           } catch {
@@ -275,11 +311,17 @@ export class VictauriClient {
 
   private async refreshDom(): Promise<void> {
     try {
+      // dom_snapshot returns `{ tree, stale_refs, format }`. The default
+      // "compact" format makes `tree` an indented text string; the explorer
+      // needs the structured element tree, so request `format: "json"`, where
+      // `tree` is the root DomNode (document.body) — or null if body is hidden.
       const result = (await this.callTool("dom_snapshot", {
         format: "json",
-      })) as { body?: DomNode } | null;
-      if (result && typeof result === "object" && "body" in result) {
-        this.domSnapshot = result.body as DomNode;
+      })) as { tree?: DomNode | string | null } | null;
+      if (result && typeof result === "object" && "tree" in result) {
+        const tree = result.tree;
+        this.domSnapshot =
+          tree && typeof tree === "object" ? (tree as DomNode) : null;
       }
     } catch {
       // keep stale
@@ -292,11 +334,14 @@ export class VictauriClient {
       .getConfiguration("victauri")
       .get<number>("pollInterval", 2000);
     this.pollTimer = setInterval(() => {
-      this.refreshAll().catch(() => {
-        // if server went down, disconnect
+      this.refreshAll().catch((e: unknown) => {
+        // Server went down (or the token stopped working, e.g. the app was
+        // restarted and minted a fresh one): disconnect so the UI says so.
+        if (this.state !== "connected") return;
         this.disconnect();
+        this.onDataUpdate.fire();
         vscode.window.showWarningMessage(
-          "Victauri: Lost connection to Tauri app"
+          `Victauri: Lost connection to Tauri app — ${e instanceof Error ? e.message : String(e)}`
         );
       });
     }, interval);

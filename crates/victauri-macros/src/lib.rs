@@ -14,6 +14,15 @@ use syn::{ItemFn, parse_macro_input};
 /// Call the schema function at setup time to register the command in the
 /// Victauri `CommandRegistry`.
 ///
+/// # Dependency requirement
+///
+/// The generated code names `victauri_core::...` by absolute path, so the crate
+/// using this attribute must list `victauri-core` in its own `[dependencies]`
+/// (this holds whether the macro is imported from `victauri_macros` or via the
+/// `victauri_plugin::inspectable` re-export). Without it, compilation fails with
+/// `E0433: failed to resolve: use of undeclared crate victauri_core`.
+/// `victauri init` adds the dependency automatically.
+///
 /// # Example
 ///
 /// ```rust,ignore

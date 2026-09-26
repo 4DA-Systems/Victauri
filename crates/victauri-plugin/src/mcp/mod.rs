@@ -99,18 +99,24 @@ const MAX_LOG_FIELD_BYTES: usize = 4096;
 const MAX_DIR_ENTRIES: usize = 10_000;
 
 /// `db_health` performs integrity checks and table counts against app-owned
-/// databases. Bound the diagnostic so a large or adversarial DB cannot hold a
-/// blocking worker indefinitely or return an unbounded schema listing.
+/// databases. Each size-dependent phase is bounded separately (see
+/// `database::db_health_report`) so a large or adversarial DB cannot hold a blocking
+/// worker indefinitely — and a slow phase degrades to a reported partial result instead
+/// of discarding the cheap ones.
 #[cfg(feature = "sqlite")]
-const DB_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DB_HEALTH_COUNT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "sqlite")]
-const DB_HEALTH_PROGRESS_OPS: i32 = 10_000;
-#[cfg(feature = "sqlite")]
-const MAX_DB_HEALTH_TABLES: usize = 1_000;
-#[cfg(feature = "sqlite")]
-const MAX_DB_HEALTH_TABLE_BYTES: usize = 1_000_000;
-#[cfg(feature = "sqlite")]
-const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
+const DB_HEALTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
+const MAX_FAULT_DELAY_MS: u64 = 120_000;
+/// How often a slow eval re-checks that its target window still exists (first check after
+/// one interval, so fast evals never pay for it).
+const EVAL_WINDOW_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// An abandoned `trace` auto-stops after this long (it captures a window every interval).
+const MAX_TRACE_DURATION: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// Cap on the base64 bytes returned by one `trace frames` call.
+const MAX_TRACE_FRAMES_RESPONSE_BYTES: usize = 25 * 1024 * 1024;
 
 const RESOURCE_URI_IPC_LOG: &str = "victauri://ipc-log";
 const RESOURCE_URI_WINDOWS: &str = "victauri://windows";
@@ -459,56 +465,12 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("screenshot") {
             return tool_disabled("screenshot");
         }
-        // Resolve the EXACT window to capture and require it to be visible BEFORE touching the
-        // OS handle. A native screenshot captures the on-screen surface; a hidden window has
-        // none, so the OS capture path (PrintWindow / CGWindowListCreateImage) silently returns
-        // stale, empty, or ANOTHER window's pixels with no error — an agent can't tell a wrong
-        // image from a right one, so a silent wrong-window image is worse than a clear failure.
-        // Two failure modes, both closed here:
-        //   1. (live-4DA, 2026-06-16) an explicitly-requested hidden window (label:"briefing")
-        //      returned the MAIN window's pixels.
-        //   2. (GPT audit, P2) `screenshot {}` with no label: the default resolver
-        //      `find_window(None)` prefers "main" UNCONDITIONALLY, so an app that hides main but
-        //      leaves a secondary window visible captured hidden main. We do NOT change
-        //      `find_window` — other callers (e.g. eval) may legitimately target a hidden window
-        //      — instead the screenshot tool resolves its own VISIBLE target and passes it
-        //      explicitly to `get_native_handle`.
-        // Note (acknowledged residual): resolve -> handle -> capture are separate calls, so a
-        // window hidden in the gap is still TOCTOU. The worst case is the same usability failure
-        // (a wrong image), not a security boundary; the guard makes the common, deterministic
-        // case correct.
-        let states = self.bridge.get_window_states(None);
-        let target_label: String = if let Some(label) = params.window_label.as_deref() {
-            // An explicit label that the enumerator reports hidden is rejected; visible or
-            // unknown labels fall through (an unknown one lets get_native_handle produce the
-            // canonical "window not found" rather than inventing an error here).
-            if states.iter().any(|s| s.label == label && !s.visible) {
-                return tool_error(format!(
-                    "window '{label}' is not visible — a native screenshot captures the \
-                     on-screen surface, and a hidden window has none (the OS capture would \
-                     return stale or another window's pixels). Show it first \
-                     (window action=manage manage_action=show label={label}), then capture."
-                ));
-            }
-            label.to_string()
-        } else {
-            // No label: prefer a visible "main", else the first visible window. NEVER silently
-            // fall back to a hidden window (the P2 bug) — error instead.
-            let pick = states
-                .iter()
-                .find(|s| s.label == "main" && s.visible)
-                .or_else(|| states.iter().find(|s| s.visible));
-            match pick {
-                Some(st) => st.label.clone(),
-                None => {
-                    return tool_error(
-                        "no visible window to capture — every window is hidden (or the UI is \
-                         not responding). Show one first (window action=manage \
-                         manage_action=show label=<label>), then capture."
-                            .to_string(),
-                    );
-                }
-            }
+        // Resolve the EXACT visible window BEFORE touching the OS handle — a silent
+        // wrong-window image is worse than a clear failure (see the helper for the history).
+        let target_label = match self.resolve_visible_capture_target(params.window_label.as_deref())
+        {
+            Ok(label) => label,
+            Err(e) => return tool_error(e),
         };
         match self.bridge.get_native_handle(Some(&target_label)) {
             Ok(hwnd) => match crate::screenshot::capture_window(hwnd).await {
@@ -1978,7 +1940,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load session from JSON), replay (re-execute recorded IPC commands and compare responses), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
+        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments — their side effects happen again; calls that had arguments, failed, or never completed are skipped because recordings do not capture arguments), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2084,12 +2046,23 @@ impl VictauriMcpHandler {
                         Err(e) => return tool_error(format!("invalid session JSON: {e}")),
                     };
 
+                // Import REPLACES the active recording. Doing that silently threw away an
+                // in-progress recording, so require it to be stopped (and saved) first.
+                if self.state.recorder.is_recording() {
+                    return tool_error(
+                        "a recording is in progress — import would discard it. Stop it first \
+                         (recording action=stop, or export it), then import.",
+                    );
+                }
                 let result = serde_json::json!({
                     "imported": true,
                     "session_id": session.id,
                     "event_count": session.events.len(),
                     "checkpoint_count": session.checkpoints.len(),
                     "started_at": session.started_at.to_rfc3339(),
+                    "recording_active": true,
+                    "note": "the imported session is now the ACTIVE recording: live events are \
+                             appended to it until you call recording action=stop",
                 });
                 self.state.recorder.import(session);
                 CallToolResult::success(vec![ContentBlock::text(result.to_string())])
@@ -2098,9 +2071,19 @@ impl VictauriMcpHandler {
                 if !self.state.recorder.is_recording() {
                     return tool_error("no active recording — start a recording first");
                 }
-                let code = "return window.__VICTAURI__?.getEventStream(0)";
+                // Only events NEWER than what the recording already holds (exclusive):
+                // `getEventStream(0)` re-ingested everything since page load, and reading from
+                // the recording start re-recorded whatever the background drain had already
+                // captured. Drained events carry their JS timestamp, so this watermark lines up.
+                let since_ms = self
+                    .state
+                    .recorder
+                    .latest_event_timestamp()
+                    .map_or(0, |t| t.timestamp_millis());
+                let code = format!("return window.__VICTAURI__?.getEventStream({since_ms}, true)");
+                let label = params.webview_label.as_deref().unwrap_or("main");
                 match self
-                    .eval_with_return(code, params.webview_label.as_deref())
+                    .eval_with_return(&code, params.webview_label.as_deref())
                     .await
                 {
                     Ok(result_str) => {
@@ -2108,7 +2091,9 @@ impl VictauriMcpHandler {
                             serde_json::from_str(&result_str).unwrap_or_default();
                         let mut count = 0u64;
                         for ev in &events {
-                            if let Some(app_event) = crate::mcp::server::parse_bridge_event(ev) {
+                            if let Some(app_event) =
+                                crate::mcp::server::parse_bridge_event_from(ev, label)
+                            {
                                 self.state.event_log.push(app_event.clone());
                                 self.state.recorder.record_event(app_event);
                                 count += 1;
@@ -2129,6 +2114,26 @@ impl VictauriMcpHandler {
                 }
                 let mut replay_results = Vec::new();
                 for call in &calls {
+                    // Recordings do not capture call ARGUMENTS, so a replay re-invokes each
+                    // command with none. Re-running a call that took arguments is guaranteed
+                    // wrong (it fails, or worse, runs with defaults), and re-running a call
+                    // that failed or never completed reproduces nothing — skip both, loudly.
+                    let skip_reason = match &call.result {
+                        victauri_core::IpcResult::Ok(_) if call.arg_size_bytes > 0 => {
+                            Some("the original call had arguments, which recordings do not capture")
+                        }
+                        victauri_core::IpcResult::Ok(_) => None,
+                        victauri_core::IpcResult::Err(_) => Some("the original call failed"),
+                        _ => Some("the original call never completed"),
+                    };
+                    if let Some(reason) = skip_reason {
+                        replay_results.push(serde_json::json!({
+                            "command": call.command,
+                            "status": "skipped",
+                            "reason": reason,
+                        }));
+                        continue;
+                    }
                     // Enforce the same command allow/blocklist as invoke_command
                     // (audit #30/#31): a recorded/imported session must not be able to
                     // invoke a command an operator blocked.
@@ -2170,14 +2175,22 @@ impl VictauriMcpHandler {
                     };
                     replay_results.push(outcome);
                 }
-                let passed = replay_results
-                    .iter()
-                    .filter(|r| r.get("status").and_then(|s| s.as_str()) == Some("ok"))
-                    .count();
+                let count = |status: &str| {
+                    replay_results
+                        .iter()
+                        .filter(|r| r.get("status").and_then(|s| s.as_str()) == Some(status))
+                        .count()
+                };
+                let (passed, skipped) = (count("ok"), count("skipped"));
+                let replayed = replay_results.len() - skipped;
                 let result = serde_json::json!({
-                    "replayed": replay_results.len(),
+                    "replayed": replayed,
                     "passed": passed,
-                    "failed": replay_results.len() - passed,
+                    "failed": replayed - passed,
+                    "skipped": skipped,
+                    "note": "commands are re-invoked WITHOUT arguments (recordings do not capture \
+                             them) and their side effects happen again; calls that had arguments, \
+                             failed, or never completed are skipped",
                     "results": replay_results,
                 });
                 json_result(&result)
@@ -2473,21 +2486,41 @@ impl VictauriMcpHandler {
                         events_started = true;
                     }
                 }
+                // Only a recording THIS trace started is stopped with it; a recording the
+                // agent started separately is left alone.
+                self.state.screencast.set_owns_recording(events_started);
 
-                // Background capture task: snapshot the window each interval until
-                // the screencast is stopped (or superseded by a newer start).
-                let bridge = self.bridge.clone();
+                // Background capture task: snapshot the window each interval until the
+                // screencast is stopped, superseded by a newer start, or hits the max duration.
+                let handler = self.clone();
                 let screencast = self.state.screencast.clone();
                 tokio::spawn(async move {
                     let t0 = std::time::Instant::now();
                     while screencast.is_active() && screencast.generation() == generation {
-                        if let Ok(handle) = bridge.get_native_handle(label.as_deref())
+                        if t0.elapsed() >= MAX_TRACE_DURATION {
+                            // An abandoned trace must not capture (and burn CPU) forever.
+                            if screencast.generation() == generation {
+                                screencast.stop();
+                                if screencast.take_owns_recording() {
+                                    let _ = handler.state.recorder.stop();
+                                }
+                            }
+                            break;
+                        }
+                        // Same visible-target rule as `screenshot`: a hidden window yields
+                        // stale or another window's pixels, so skip the frame instead.
+                        if let Ok(target) = handler.resolve_visible_capture_target(label.as_deref())
+                            && let Ok(handle) = handler.bridge.get_native_handle(Some(&target))
                             && let Ok(png) = crate::screenshot::capture_window(handle).await
                         {
                             use base64::Engine;
                             let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
                             #[allow(clippy::cast_possible_truncation)]
-                            screencast.push_frame(t0.elapsed().as_millis() as u64, b64);
+                            screencast.push_frame_if_current(
+                                generation,
+                                t0.elapsed().as_millis() as u64,
+                                b64,
+                            );
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(
                             screencast.interval_ms(),
@@ -2507,7 +2540,17 @@ impl VictauriMcpHandler {
                 let frame_count = self.state.screencast.stop();
                 let timestamps = self.state.screencast.frame_timestamps();
                 let duration_ms = timestamps.last().copied().unwrap_or(0);
-                let event_count = self.state.recorder.event_count();
+                // Stop the recording `with_events` started, so the recorder (and the
+                // per-second drain loop it enables) does not outlive the trace. The session
+                // stays readable via recording get_events/export (last stopped session).
+                let event_count = if self.state.screencast.take_owns_recording() {
+                    self.state
+                        .recorder
+                        .stop()
+                        .map_or(0, |session| session.events.len())
+                } else {
+                    self.state.recorder.event_count()
+                };
                 json_result(&serde_json::json!({
                     "stopped": true,
                     "frame_count": frame_count,
@@ -2525,14 +2568,33 @@ impl VictauriMcpHandler {
             TraceAction::Frames => {
                 let limit = params.limit.unwrap_or(0);
                 let frames = self.state.screencast.frames(limit);
-                let items: Vec<ContentBlock> = frames
-                    .into_iter()
-                    .map(|f| ContentBlock::image(f.data_b64, "image/png"))
-                    .collect();
-                if items.is_empty() {
+                if frames.is_empty() {
                     return json_result(&serde_json::json!({ "frames": 0 }));
                 }
-                CallToolResult::success(items)
+                // Bound the response: keep the NEWEST frames that fit the byte budget.
+                let available = frames.len();
+                let mut budget = MAX_TRACE_FRAMES_RESPONSE_BYTES;
+                let mut kept: Vec<ContentBlock> = Vec::new();
+                for f in frames.into_iter().rev() {
+                    if f.data_b64.len() > budget && !kept.is_empty() {
+                        break;
+                    }
+                    budget = budget.saturating_sub(f.data_b64.len());
+                    kept.push(ContentBlock::image(f.data_b64, "image/png"));
+                }
+                kept.reverse();
+                if kept.len() < available {
+                    kept.insert(
+                        0,
+                        ContentBlock::text(format!(
+                            "returned the newest {} of {available} frames (response capped at \
+                             {} MB); pass a smaller `limit` to page",
+                            kept.len(),
+                            MAX_TRACE_FRAMES_RESPONSE_BYTES / (1024 * 1024)
+                        )),
+                    );
+                }
+                CallToolResult::success(kept)
             }
         }
     }
@@ -3424,6 +3486,13 @@ impl VictauriMcpHandler {
                 let fault_type = match fault_kind {
                     FaultKind::Delay => {
                         let delay_ms = params.delay_ms.unwrap_or(1000);
+                        // Each delayed call holds a server concurrency slot for its duration;
+                        // an unbounded delay (u64 ms) would pin slots effectively forever.
+                        if delay_ms > MAX_FAULT_DELAY_MS {
+                            return tool_error(format!(
+                                "delay_ms {delay_ms} exceeds the maximum of {MAX_FAULT_DELAY_MS} ms"
+                            ));
+                        }
                         crate::introspection::FaultType::Delay { delay_ms }
                     }
                     FaultKind::Error => {
@@ -3512,7 +3581,9 @@ impl VictauriMcpHandler {
                 let secs = params.seconds.unwrap_or(30);
                 let since = chrono::Utc::now()
                     - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
-                let events = self.state.event_log.since(since);
+                let events = self
+                    .explain_events(since, params.webview_label.as_deref())
+                    .await;
 
                 let mut ipc_count = 0u64;
                 let mut dom_mutations = 0u64;
@@ -3604,7 +3675,9 @@ impl VictauriMcpHandler {
                 let secs = params.seconds.unwrap_or(5);
                 let since = chrono::Utc::now()
                     - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
-                let events = self.state.event_log.since(since);
+                let events = self
+                    .explain_events(since, params.webview_label.as_deref())
+                    .await;
 
                 let timeline: Vec<serde_json::Value> = events
                     .iter()
@@ -3717,7 +3790,9 @@ impl VictauriMcpHandler {
                 let secs = params.seconds.unwrap_or(10);
                 let since = chrono::Utc::now()
                     - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
-                let events = self.state.event_log.since(since);
+                let events = self
+                    .explain_events(since, params.webview_label.as_deref())
+                    .await;
 
                 let mut ipc_commands: Vec<String> = Vec::new();
                 let mut dom_changes = 0u64;
@@ -4072,9 +4147,93 @@ impl VictauriMcpHandler {
         ))
     }
 
-    #[cfg(feature = "sqlite")]
-    fn quote_sqlite_identifier(identifier: &str) -> String {
-        format!("\"{}\"", identifier.replace('"', "\"\""))
+    /// Events for `explain` since `since`. While a recording is active the background drain
+    /// keeps `event_log` current, so read it. Otherwise nothing drains (idle draining was the
+    /// 0.8.x host-crash amplifier), so read the bridge's own event stream ON DEMAND — without
+    /// writing it into `event_log`, so a later recording never double-counts it. Before this,
+    /// `explain` silently reported "0 IPC calls, 0 DOM mutations…" for any app not recording.
+    async fn explain_events(
+        &self,
+        since: chrono::DateTime<chrono::Utc>,
+        webview_label: Option<&str>,
+    ) -> Vec<victauri_core::AppEvent> {
+        if self.state.recorder.is_recording() {
+            return self.state.event_log.since(since);
+        }
+        let code = format!(
+            "return window.__VICTAURI__?.getEventStream({})",
+            since.timestamp_millis()
+        );
+        let Ok(raw) = self.eval_with_return(&code, webview_label).await else {
+            return self.state.event_log.since(since);
+        };
+        let label = webview_label.unwrap_or("main");
+        let mut events: Vec<victauri_core::AppEvent> =
+            serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|ev| crate::mcp::server::parse_bridge_event_from(ev, label))
+                .filter(|ev| !ev.is_internal() && ev.timestamp() >= since)
+                .collect();
+        events.sort_by_key(victauri_core::AppEvent::timestamp);
+        events
+    }
+
+    /// The window an unlabeled eval lands on, mirroring the bridge's default selection
+    /// (`main` → first visible → any). Used only to detect the window disappearing mid-call.
+    fn default_window_label(&self) -> Option<String> {
+        let states = self.bridge.get_window_states(None);
+        states
+            .iter()
+            .find(|s| s.label == "main")
+            .or_else(|| states.iter().find(|s| s.visible))
+            .or_else(|| states.first())
+            .map(|s| s.label.clone())
+    }
+
+    /// Resolve the EXACT window a native capture (`screenshot`, `trace`) should target, and
+    /// require it to be visible. A native capture reads the on-screen surface; a hidden window
+    /// has none, so the OS path (`PrintWindow` / `CGWindowListCreateImage`) silently returns
+    /// stale, empty, or ANOTHER window's pixels with no error. Two failure modes are closed:
+    ///   1. (live-4DA, 2026-06-16) an explicitly-requested hidden window (label:"briefing")
+    ///      returned the MAIN window's pixels.
+    ///   2. (GPT audit, P2) with no label, `find_window(None)` prefers "main" UNCONDITIONALLY,
+    ///      so an app that hides main but leaves a secondary window visible captured hidden
+    ///      main. `find_window` is left alone — other callers (e.g. eval) may legitimately
+    ///      target a hidden window — so capture tools resolve their own VISIBLE target.
+    ///
+    /// Acknowledged residual: resolve -> handle -> capture are separate calls, so a window
+    /// hidden in the gap is still TOCTOU; the worst case is a wrong image, not a security
+    /// boundary.
+    fn resolve_visible_capture_target(&self, label: Option<&str>) -> Result<String, String> {
+        let states = self.bridge.get_window_states(None);
+        if let Some(label) = label {
+            // An explicit label that the enumerator reports hidden is rejected; visible or
+            // unknown labels fall through (an unknown one lets get_native_handle produce the
+            // canonical "window not found" rather than inventing an error here).
+            if states.iter().any(|s| s.label == label && !s.visible) {
+                return Err(format!(
+                    "window '{label}' is not visible — a native screenshot captures the \
+                     on-screen surface, and a hidden window has none (the OS capture would \
+                     return stale or another window's pixels). Show it first \
+                     (window action=manage manage_action=show label={label}), then capture."
+                ));
+            }
+            return Ok(label.to_string());
+        }
+        // No label: prefer a visible "main", else the first visible window. NEVER silently
+        // fall back to a hidden window (the P2 bug) — error instead.
+        states
+            .iter()
+            .find(|s| s.label == "main" && s.visible)
+            .or_else(|| states.iter().find(|s| s.visible))
+            .map(|st| st.label.clone())
+            .ok_or_else(|| {
+                "no visible window to capture — every window is hidden (or the UI is \
+                 not responding). Show one first (window action=manage \
+                 manage_action=show label=<label>), then capture."
+                    .to_string()
+            })
     }
 
     fn list_dir_recursive(
@@ -4340,8 +4499,11 @@ impl VictauriMcpHandler {
         // block like `foo(); return bar()` would parse as `return foo();` and
         // silently discard everything after the first statement (issue: core
         // primitive returned wrong/undefined values for "do X, then return Y").
-        let code = if should_prepend_return(code) {
-            format!("return {}", code.trim())
+        // Prepend to the code with its LEADING comments stripped: `return // note\nexpr`
+        // parses (ASI) as `return;` and silently yields undefined.
+        let body = strip_leading_js_comments(code.trim());
+        let code = if should_prepend_return(body) {
+            format!("return {body}")
         } else {
             code.trim().to_string()
         };
@@ -4401,7 +4563,14 @@ impl VictauriMcpHandler {
                     if (__s) {{ if (__s.done) return; __s.done = true; delete window.__VIC_EVAL__[{id_js}]; }}
                     await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
                         id: {id_js},
-                        result: JSON.stringify({{ __victauri_err: String(e && e.message || e) }})
+                        result: JSON.stringify({{ __victauri_err: (function (x) {{
+                            // A Tauri command's `Err(serde struct)` rejects with a plain object:
+                            // `String(obj)` would collapse it to '[object Object]'.
+                            if (x && typeof x.message === 'string') return x.message;
+                            if (typeof x === 'string') return x;
+                            try {{ var s = JSON.stringify(x); if (s !== undefined) return s; }} catch (_) {{}}
+                            try {{ return String(x); }} catch (_) {{ return Object.prototype.toString.call(x); }}
+                        }})(e) }})
                     }});
                 }}
             }})();
@@ -4420,7 +4589,64 @@ impl VictauriMcpHandler {
             return Err(format!("eval injection failed: {e}"));
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        // While waiting, watch for the two ways a call ends with NO callback ever coming: the
+        // target window was destroyed, or the app began shutting down. Both are the EXPECTED
+        // outcome of code that closes its own window or quits the app (e.g. invoking a
+        // `quit_app` command) — reporting them after the full timeout as "an unresolved
+        // promise, an infinite loop…" misled agents into thinking the call never ran.
+        // Resolved lazily on the first liveness tick, so a fast eval never pays for it.
+        let mut watched: Option<Option<String>> = None;
+        let mut shutdown = self.state.shutdown_tx.subscribe();
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut liveness = tokio::time::interval_at(
+            tokio::time::Instant::now() + EVAL_WINDOW_WATCH_INTERVAL,
+            EVAL_WINDOW_WATCH_INTERVAL,
+        );
+        let mut rx = rx;
+        let outcome = loop {
+            tokio::select! {
+                r = &mut rx => break Ok(r),
+                () = tokio::time::sleep_until(deadline) => break Err(None),
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break Err(Some(
+                            "the app began shutting down while the call was in flight, so no \
+                             result will arrive. If the code/command quits or restarts the app, \
+                             this is the expected outcome and it most likely ran — do not \
+                             re-run it blindly."
+                                .to_string(),
+                        ));
+                    }
+                }
+                _ = liveness.tick() => {
+                    let watched = watched.get_or_insert_with(|| {
+                        webview_label
+                            .map(str::to_string)
+                            .or_else(|| self.default_window_label())
+                    });
+                    if let Some(label) = watched.as_deref()
+                        && !self.bridge.list_window_labels().iter().any(|l| l == label)
+                    {
+                        break Err(Some(format!(
+                            "window '{label}' was closed while the call was in flight, so no \
+                             result will arrive. If the code/command closes this window (or \
+                             quits the app), this is the expected outcome and it most likely \
+                             ran — do not re-run it blindly."
+                        )));
+                    }
+                }
+            }
+        };
+
+        let early = match outcome {
+            Ok(r) => Ok(r),
+            Err(Some(msg)) => {
+                self.state.pending_evals.lock().await.remove(&id);
+                return Err(msg);
+            }
+            Err(None) => Err(()),
+        };
+        match early {
             Ok(Ok(raw)) => {
                 self.check_bridge_version_once();
                 if raw.len() > MAX_EVAL_RESULT_LEN {
@@ -4486,107 +4712,11 @@ impl VictauriMcpHandler {
             .to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open_with_flags(
+            crate::database::db_health_report(
                 &path_str,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                DB_HEALTH_COUNT_BUDGET,
+                DB_HEALTH_CHECK_BUDGET,
             )
-            .map_err(|e| format!("cannot open database: {e}"))?;
-            conn.set_limit(
-                rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
-                MAX_DB_HEALTH_CELL_BYTES,
-            );
-            let started = std::time::Instant::now();
-            let timed_out = Arc::new(AtomicBool::new(false));
-            let timeout_marker = Arc::clone(&timed_out);
-            conn.progress_handler(
-                DB_HEALTH_PROGRESS_OPS,
-                Some(move || {
-                    let expired = started.elapsed() >= DB_HEALTH_TIMEOUT;
-                    if expired {
-                        timeout_marker.store(true, Ordering::Relaxed);
-                    }
-                    expired
-                }),
-            );
-            // Hard wall-clock backstop for single long ops (e.g. integrity_check / per-table
-            // count(*) on a huge DB) that the opcode-sampling progress handler under-counts.
-            let _interrupt = crate::database::InterruptGuard::arm(&conn, DB_HEALTH_TIMEOUT);
-
-            let journal_mode: String = conn
-                .pragma_query_value(None, "journal_mode", |r| r.get(0))
-                .unwrap_or_else(|_| "unknown".to_string());
-
-            let page_count: i64 = conn
-                .pragma_query_value(None, "page_count", |r| r.get(0))
-                .unwrap_or(0);
-
-            let page_size: i64 = conn
-                .pragma_query_value(None, "page_size", |r| r.get(0))
-                .unwrap_or(0);
-
-            let freelist_count: i64 = conn
-                .pragma_query_value(None, "freelist_count", |r| r.get(0))
-                .unwrap_or(0);
-
-            let wal_checkpoint: &str = if journal_mode == "wal" {
-                "not run (read-only diagnostics)"
-            } else {
-                "n/a (not WAL mode)"
-            };
-
-            let integrity: String = conn
-                .pragma_query_value(None, "quick_check", |r| r.get(0))
-                .unwrap_or_else(|_| "failed".to_string());
-
-            let db_size_bytes = page_count * page_size;
-            let db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
-
-            let mut tables = Vec::new();
-            let mut table_bytes = 0usize;
-            let mut tables_truncated = false;
-            if let Ok(mut stmt) =
-                conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
-            {
-                for name in rows.flatten() {
-                    if tables.len() >= MAX_DB_HEALTH_TABLES
-                        || table_bytes.saturating_add(name.len()) > MAX_DB_HEALTH_TABLE_BYTES
-                    {
-                        tables_truncated = true;
-                        break;
-                    }
-                    table_bytes = table_bytes.saturating_add(name.len());
-                    let identifier = Self::quote_sqlite_identifier(&name);
-                    let count: i64 = conn
-                        .query_row(&format!("SELECT count(*) FROM {identifier}"), [], |r| {
-                            r.get(0)
-                        })
-                        .unwrap_or(0);
-                    tables.push(serde_json::json!({
-                        "name": name,
-                        "row_count": count,
-                    }));
-                }
-            }
-            if timed_out.load(Ordering::Relaxed) {
-                return Err(format!(
-                    "database diagnostics timed out after {} ms",
-                    DB_HEALTH_TIMEOUT.as_millis()
-                ));
-            }
-
-            Ok(serde_json::json!({
-                "database": path_str,
-                "journal_mode": journal_mode,
-                "page_count": page_count,
-                "page_size": page_size,
-                "db_size_mb": (db_size_mb * 100.0).round() / 100.0,
-                "freelist_count": freelist_count,
-                "wal_checkpoint": wal_checkpoint,
-                "integrity_check": integrity,
-                "tables": tables,
-                "tables_truncated": tables_truncated,
-            }))
         })
         .await
         .map_err(|e| format!("db health task failed: {e}"))?
@@ -5008,6 +5138,26 @@ const STMT_STARTS: &[&str] = &[
     "debugger",
 ];
 
+/// A line ending in one of these continues onto the next line (no ASI).
+const ASI_CONTINUES_AFTER: &[u8] = b"+-*/%&|^!=<>?:,.([{~";
+/// A line starting with one of these continues the previous line (no ASI) — including `(`,
+/// `[` and a template literal, which JavaScript itself treats as a continuation.
+const ASI_CONTINUES_BEFORE: &[u8] = b".?)]}+-*/%&|^=<>,:([`";
+
+/// Strip leading whitespace and `//` / `/* */` comments.
+fn strip_leading_js_comments(mut code: &str) -> &str {
+    loop {
+        code = code.trim_start();
+        if let Some(rest) = code.strip_prefix("//") {
+            code = rest.find('\n').map_or("", |n| &rest[n + 1..]);
+        } else if let Some(rest) = code.strip_prefix("/*") {
+            code = rest.find("*/").map_or("", |n| &rest[n + 2..]);
+        } else {
+            return code;
+        }
+    }
+}
+
 /// String/template/comment scan state for [`should_prepend_return`].
 #[derive(PartialEq, Clone, Copy)]
 enum ScanState {
@@ -5030,7 +5180,7 @@ enum ScanState {
 fn should_prepend_return(code: &str) -> bool {
     use ScanState::{Code, DoubleQuote, SingleQuote, Template};
 
-    let code = code.trim();
+    let code = strip_leading_js_comments(code.trim());
     if code.is_empty() {
         return false;
     }
@@ -5053,10 +5203,31 @@ fn should_prepend_return(code: &str) -> bool {
             && bytes.get(i + 6).copied().is_none_or(|b| !is_ident(b))
     };
 
+    // Last significant (non-whitespace, non-comment) byte seen in code — for the ASI check.
+    let mut last_sig: Option<u8> = None;
+
     while i < bytes.len() {
         let c = bytes[i];
+        if state == Code && !c.is_ascii_whitespace() && c != b'/' {
+            last_sig = Some(c);
+        }
         match state {
             Code => match c {
+                // A top-level newline ends the statement (ASI) unless the expression visibly
+                // continues across it. `foo()\nbar()` with `return` prepended would return
+                // `foo()` and silently never run `bar()`.
+                b'\n' if depth <= 0 => {
+                    let rest = strip_leading_js_comments(&code[i + 1..]);
+                    if let Some(&next) = rest.as_bytes().first()
+                        && !last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p))
+                        && !ASI_CONTINUES_BEFORE.contains(&next)
+                    {
+                        return false;
+                    }
+                }
+                b'/' if !(i + 1 < bytes.len() && matches!(bytes[i + 1], b'/' | b'*')) => {
+                    last_sig = Some(b'/');
+                }
                 b'\'' => state = SingleQuote,
                 b'"' => state = DoubleQuote,
                 b'`' => state = Template,
@@ -5243,7 +5414,7 @@ mod tests {
         let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
         let conn = rusqlite::Connection::open(file.path()).unwrap();
         let name = "odd\"] table";
-        let identifier = VictauriMcpHandler::quote_sqlite_identifier(name);
+        let identifier = crate::database::quote_sqlite_identifier(name);
         conn.execute_batch(&format!(
             "CREATE TABLE {identifier} (id INTEGER); INSERT INTO {identifier} VALUES (1);"
         ))
@@ -5281,6 +5452,35 @@ mod tests {
         assert!(!is_safe_env_key("VICTAURI_GH_PAT"));
         assert!(!is_safe_env_key("VICTAURI_JWT"));
         assert!(!is_safe_env_key("VICTAURI_SESSION_ID"));
+    }
+
+    #[test]
+    fn prepend_return_newline_separated_statements_are_not_wrapped() {
+        // ASI: `return foo()\nbar()` returns foo() and never runs bar().
+        assert!(!should_prepend_return("foo()\nbar()"));
+        assert!(!should_prepend_return("window.x = 1\nwindow.x + 1"));
+        assert!(!should_prepend_return("foo() // note\nbar()"));
+        // …but an expression that visibly continues across lines is still one expression.
+        assert!(should_prepend_return(
+            "document\n  .querySelector('x')\n  .textContent"
+        ));
+        assert!(should_prepend_return("a +\n  b"));
+        assert!(should_prepend_return("cond\n  ? a\n  : b"));
+        assert!(should_prepend_return("[1, 2].map(x =>\n  x * 2)"));
+        assert!(should_prepend_return("`line1\nline2`"));
+        assert!(should_prepend_return("document.title\n"));
+    }
+
+    #[test]
+    fn prepend_return_sees_past_leading_comments() {
+        assert!(!should_prepend_return("// setup\nconst x = 1; x"));
+        assert!(!should_prepend_return("/* c */ if (a) b()"));
+        assert!(should_prepend_return("// read it\ndocument.title"));
+        assert_eq!(
+            strip_leading_js_comments("// a\n/* b */  document.title"),
+            "document.title"
+        );
+        assert_eq!(strip_leading_js_comments("// only a comment"), "");
     }
 
     #[test]
@@ -6243,6 +6443,134 @@ mod command_policy_dispatch_tests {
             "SIDE-EFFECT LEAK: an imported session replayed a blocklisted command (audit #31)"
         );
         assert!(result_text(&r).contains("blocked"));
+    }
+
+    #[tokio::test]
+    async fn replay_skips_calls_it_cannot_reproduce_faithfully() {
+        // Recordings do not capture arguments: re-invoking `delete_todo({id:3})` as
+        // `delete_todo()` is guaranteed wrong, and re-running a failed/pending call reproduces
+        // nothing. Only successful no-arg calls are replayed.
+        let state = state_with(PrivacyConfig::default());
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        state.recorder.start("s".to_string()).unwrap();
+        let AppEvent::Ipc(mut with_args) = ipc_event("delete_todo") else {
+            unreachable!()
+        };
+        with_args.arg_size_bytes = 8;
+        state.recorder.record_event(AppEvent::Ipc(with_args));
+        let AppEvent::Ipc(mut failed) = ipc_event("flaky") else {
+            unreachable!()
+        };
+        failed.result = IpcResult::Err("boom".to_string());
+        state.recorder.record_event(AppEvent::Ipc(failed));
+        state.recorder.record_event(ipc_event("get_counter"));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+
+        let r = call(&h, "recording", json!({"action": "replay"})).await;
+        let text = result_text(&r);
+        assert!(
+            !bridge.invoked("delete_todo"),
+            "a call with args must not be replayed"
+        );
+        assert!(
+            !bridge.invoked("flaky"),
+            "a failed call must not be replayed"
+        );
+        assert!(
+            bridge.invoked("get_counter"),
+            "a successful no-arg call is replayed"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["skipped"], 2, "{text}");
+        assert_eq!(v["replayed"], 1, "{text}");
+    }
+
+    /// A state whose eval timeout is long enough that only the window/shutdown watch can end
+    /// an unanswered eval quickly.
+    fn slow_eval_state() -> Arc<VictauriState> {
+        let Ok(mut s) = Arc::try_unwrap(state_with(PrivacyConfig::default())) else {
+            unreachable!("fresh Arc has one owner")
+        };
+        s.eval_timeout = std::time::Duration::from_secs(20);
+        Arc::new(s)
+    }
+
+    #[tokio::test]
+    async fn eval_reports_a_window_closed_mid_call_instead_of_timing_out() {
+        // The RecordingBridge answers the liveness probe, never the user code, and lists NO
+        // windows — i.e. the target window is gone while the call is in flight (what a
+        // command that closes its own window produces).
+        let state = slow_eval_state();
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let started = std::time::Instant::now();
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "popup"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(
+            text.contains("was closed while the call was in flight"),
+            "{text}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "must not wait out the 20s eval timeout (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_reports_app_shutdown_instead_of_timing_out() {
+        let state = slow_eval_state();
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let shutdown = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let _ = shutdown.shutdown_tx.send(true);
+        });
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("shutting down"), "{text}");
+        assert!(
+            state.pending_evals.lock().await.is_empty(),
+            "pending entry removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_refuses_to_discard_an_active_recording() {
+        let state = state_with(PrivacyConfig::default());
+        state.recorder.start("live".to_string()).unwrap();
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
+        let session = RecordedSession {
+            id: "other".to_string(),
+            started_at: chrono::Utc::now(),
+            events: Vec::new(),
+            checkpoints: Vec::new(),
+        };
+        let r = call(
+            &h,
+            "recording",
+            json!({"action": "import", "session_json": serde_json::to_string(&session).unwrap()}),
+        )
+        .await;
+        assert_eq!(r.is_error, Some(true), "{}", result_text(&r));
+        assert_eq!(
+            state.recorder.export().unwrap().id,
+            "live",
+            "active recording kept"
+        );
     }
 
     // ── introspect.contract_record / contract_check (audit #30, A2) ───────────

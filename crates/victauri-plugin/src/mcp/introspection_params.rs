@@ -164,4 +164,8 @@ pub struct ExplainParams {
     /// How many seconds to look back (default: 30 for summary, 5 for `last_action`, 10 for diff).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seconds: Option<u64>,
+
+    /// Window to read activity from when no recording is active (default: the main window).
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "window")]
+    pub webview_label: Option<String>,
 }
