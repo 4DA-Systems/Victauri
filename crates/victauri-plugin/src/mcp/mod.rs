@@ -99,18 +99,14 @@ const MAX_LOG_FIELD_BYTES: usize = 4096;
 const MAX_DIR_ENTRIES: usize = 10_000;
 
 /// `db_health` performs integrity checks and table counts against app-owned
-/// databases. Bound the diagnostic so a large or adversarial DB cannot hold a
-/// blocking worker indefinitely or return an unbounded schema listing.
+/// databases. Each size-dependent phase is bounded separately (see
+/// `database::db_health_report`) so a large or adversarial DB cannot hold a blocking
+/// worker indefinitely — and a slow phase degrades to a reported partial result instead
+/// of discarding the cheap ones.
 #[cfg(feature = "sqlite")]
-const DB_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const DB_HEALTH_COUNT_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 #[cfg(feature = "sqlite")]
-const DB_HEALTH_PROGRESS_OPS: i32 = 10_000;
-#[cfg(feature = "sqlite")]
-const MAX_DB_HEALTH_TABLES: usize = 1_000;
-#[cfg(feature = "sqlite")]
-const MAX_DB_HEALTH_TABLE_BYTES: usize = 1_000_000;
-#[cfg(feature = "sqlite")]
-const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
+const DB_HEALTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
 const RESOURCE_URI_IPC_LOG: &str = "victauri://ipc-log";
 const RESOURCE_URI_WINDOWS: &str = "victauri://windows";
@@ -4074,7 +4070,7 @@ impl VictauriMcpHandler {
 
     #[cfg(feature = "sqlite")]
     fn quote_sqlite_identifier(identifier: &str) -> String {
-        format!("\"{}\"", identifier.replace('"', "\"\""))
+        crate::database::quote_sqlite_identifier(identifier)
     }
 
     fn list_dir_recursive(
@@ -4486,107 +4482,11 @@ impl VictauriMcpHandler {
             .to_string();
 
         tokio::task::spawn_blocking(move || {
-            let conn = rusqlite::Connection::open_with_flags(
+            crate::database::db_health_report(
                 &path_str,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                DB_HEALTH_COUNT_BUDGET,
+                DB_HEALTH_CHECK_BUDGET,
             )
-            .map_err(|e| format!("cannot open database: {e}"))?;
-            conn.set_limit(
-                rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
-                MAX_DB_HEALTH_CELL_BYTES,
-            );
-            let started = std::time::Instant::now();
-            let timed_out = Arc::new(AtomicBool::new(false));
-            let timeout_marker = Arc::clone(&timed_out);
-            conn.progress_handler(
-                DB_HEALTH_PROGRESS_OPS,
-                Some(move || {
-                    let expired = started.elapsed() >= DB_HEALTH_TIMEOUT;
-                    if expired {
-                        timeout_marker.store(true, Ordering::Relaxed);
-                    }
-                    expired
-                }),
-            );
-            // Hard wall-clock backstop for single long ops (e.g. integrity_check / per-table
-            // count(*) on a huge DB) that the opcode-sampling progress handler under-counts.
-            let _interrupt = crate::database::InterruptGuard::arm(&conn, DB_HEALTH_TIMEOUT);
-
-            let journal_mode: String = conn
-                .pragma_query_value(None, "journal_mode", |r| r.get(0))
-                .unwrap_or_else(|_| "unknown".to_string());
-
-            let page_count: i64 = conn
-                .pragma_query_value(None, "page_count", |r| r.get(0))
-                .unwrap_or(0);
-
-            let page_size: i64 = conn
-                .pragma_query_value(None, "page_size", |r| r.get(0))
-                .unwrap_or(0);
-
-            let freelist_count: i64 = conn
-                .pragma_query_value(None, "freelist_count", |r| r.get(0))
-                .unwrap_or(0);
-
-            let wal_checkpoint: &str = if journal_mode == "wal" {
-                "not run (read-only diagnostics)"
-            } else {
-                "n/a (not WAL mode)"
-            };
-
-            let integrity: String = conn
-                .pragma_query_value(None, "quick_check", |r| r.get(0))
-                .unwrap_or_else(|_| "failed".to_string());
-
-            let db_size_bytes = page_count * page_size;
-            let db_size_mb = db_size_bytes as f64 / (1024.0 * 1024.0);
-
-            let mut tables = Vec::new();
-            let mut table_bytes = 0usize;
-            let mut tables_truncated = false;
-            if let Ok(mut stmt) =
-                conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-                && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
-            {
-                for name in rows.flatten() {
-                    if tables.len() >= MAX_DB_HEALTH_TABLES
-                        || table_bytes.saturating_add(name.len()) > MAX_DB_HEALTH_TABLE_BYTES
-                    {
-                        tables_truncated = true;
-                        break;
-                    }
-                    table_bytes = table_bytes.saturating_add(name.len());
-                    let identifier = Self::quote_sqlite_identifier(&name);
-                    let count: i64 = conn
-                        .query_row(&format!("SELECT count(*) FROM {identifier}"), [], |r| {
-                            r.get(0)
-                        })
-                        .unwrap_or(0);
-                    tables.push(serde_json::json!({
-                        "name": name,
-                        "row_count": count,
-                    }));
-                }
-            }
-            if timed_out.load(Ordering::Relaxed) {
-                return Err(format!(
-                    "database diagnostics timed out after {} ms",
-                    DB_HEALTH_TIMEOUT.as_millis()
-                ));
-            }
-
-            Ok(serde_json::json!({
-                "database": path_str,
-                "journal_mode": journal_mode,
-                "page_count": page_count,
-                "page_size": page_size,
-                "db_size_mb": (db_size_mb * 100.0).round() / 100.0,
-                "freelist_count": freelist_count,
-                "wal_checkpoint": wal_checkpoint,
-                "integrity_check": integrity,
-                "tables": tables,
-                "tables_truncated": tables_truncated,
-            }))
         })
         .await
         .map_err(|e| format!("db health task failed: {e}"))?

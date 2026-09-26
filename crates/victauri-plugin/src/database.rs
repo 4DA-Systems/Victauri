@@ -53,6 +53,184 @@ impl Drop for InterruptGuard {
     }
 }
 
+/// Outcome of one budgeted SQLite phase (see [`run_bounded`]).
+#[cfg(feature = "sqlite")]
+pub(crate) enum Bounded<T> {
+    Done(T),
+    TimedOut,
+    Failed(String),
+}
+
+/// Run `f` under its OWN wall-clock budget: a progress handler plus a hard [`InterruptGuard`],
+/// both scoped to this call and removed afterwards, so one slow phase cannot poison the phases
+/// that follow it on the same connection.
+#[cfg(feature = "sqlite")]
+pub(crate) fn run_bounded<T>(
+    conn: &rusqlite::Connection,
+    budget: Duration,
+    f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+) -> Bounded<T> {
+    let started = Instant::now();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let marker = Arc::clone(&timed_out);
+    conn.progress_handler(
+        DB_HEALTH_PROGRESS_OPS,
+        Some(move || {
+            let expired = started.elapsed() >= budget;
+            if expired {
+                marker.store(true, Ordering::Relaxed);
+            }
+            expired
+        }),
+    );
+    let result = {
+        let _interrupt = InterruptGuard::arm(conn, budget);
+        f(conn)
+    };
+    conn.progress_handler(DB_HEALTH_PROGRESS_OPS, None::<fn() -> bool>);
+    match result {
+        Ok(v) => Bounded::Done(v),
+        Err(e)
+            if timed_out.load(Ordering::Relaxed)
+                || e.sqlite_error_code()
+                    == Some(rusqlite::ffi::ErrorCode::OperationInterrupted) =>
+        {
+            Bounded::TimedOut
+        }
+        Err(e) => Bounded::Failed(e.to_string()),
+    }
+}
+
+#[cfg(feature = "sqlite")]
+const DB_HEALTH_PROGRESS_OPS: i32 = 10_000;
+#[cfg(feature = "sqlite")]
+const MAX_DB_HEALTH_TABLES: usize = 1_000;
+#[cfg(feature = "sqlite")]
+const MAX_DB_HEALTH_TABLE_BYTES: usize = 1_000_000;
+#[cfg(feature = "sqlite")]
+const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
+
+/// Read-only health report for one SQLite database, in budgeted phases.
+///
+/// The cheap metadata PRAGMAs always run. The two phases that scale with database size —
+/// per-table `count(*)` and `quick_check` — each get their own budget; a phase that runs out
+/// is REPORTED (`row_count: null` / `integrity_check: "not completed …"`) instead of failing
+/// the whole call. Before this, `quick_check` on a multi-GB database exhausted a single shared
+/// deadline and the tool returned only "timed out", discarding every cheap result with it.
+#[cfg(feature = "sqlite")]
+pub(crate) fn db_health_report(
+    path: &str,
+    count_budget: Duration,
+    check_budget: Duration,
+) -> Result<serde_json::Value, String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("cannot open database: {e}"))?;
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+        MAX_DB_HEALTH_CELL_BYTES,
+    );
+
+    let pragma_i64 = |name: &str| -> i64 {
+        conn.pragma_query_value(None, name, |r| r.get(0))
+            .unwrap_or(0)
+    };
+    let journal_mode: String = conn
+        .pragma_query_value(None, "journal_mode", |r| r.get(0))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let page_count = pragma_i64("page_count");
+    let page_size = pragma_i64("page_size");
+    let freelist_count = pragma_i64("freelist_count");
+    let wal_checkpoint = if journal_mode == "wal" {
+        "not run (read-only diagnostics)"
+    } else {
+        "n/a (not WAL mode)"
+    };
+    let db_size_mb = (page_count * page_size) as f64 / (1024.0 * 1024.0);
+
+    // Phase 1: table names (bounded listing) + row counts under a shared count budget.
+    let mut names = Vec::new();
+    let mut tables_truncated = false;
+    {
+        let mut table_bytes = 0usize;
+        let mut stmt = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+            .map_err(|e| format!("cannot list tables: {e}"))?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(|e| format!("cannot list tables: {e}"))?;
+        for name in rows.flatten() {
+            if names.len() >= MAX_DB_HEALTH_TABLES
+                || table_bytes.saturating_add(name.len()) > MAX_DB_HEALTH_TABLE_BYTES
+            {
+                tables_truncated = true;
+                break;
+            }
+            table_bytes = table_bytes.saturating_add(name.len());
+            names.push(name);
+        }
+    }
+    let counts_started = Instant::now();
+    let mut row_counts_complete = true;
+    let mut tables = Vec::with_capacity(names.len());
+    for name in names {
+        let remaining = count_budget.saturating_sub(counts_started.elapsed());
+        let count = if !row_counts_complete || remaining.is_zero() {
+            row_counts_complete = false;
+            None
+        } else {
+            let sql = format!("SELECT count(*) FROM {}", quote_sqlite_identifier(&name));
+            match run_bounded(&conn, remaining, |c| {
+                c.query_row(&sql, [], |r| r.get::<_, i64>(0))
+            }) {
+                Bounded::Done(n) => Some(n),
+                Bounded::TimedOut => {
+                    row_counts_complete = false;
+                    None
+                }
+                // A per-table failure (e.g. a virtual table whose module is not loaded) is
+                // not a budget problem — report no count for that table and keep going.
+                Bounded::Failed(_) => None,
+            }
+        };
+        tables.push(serde_json::json!({ "name": name, "row_count": count }));
+    }
+
+    // Phase 2: integrity, on its own budget — a full-file scan that dominates on large DBs.
+    let integrity = match run_bounded(&conn, check_budget, |c| {
+        c.pragma_query_value(None, "quick_check", |r| r.get::<_, String>(0))
+    }) {
+        Bounded::Done(s) => s,
+        Bounded::TimedOut => format!(
+            "not completed: quick_check exceeded its {} ms budget on a {:.0} MB database \
+             (a full-file scan; the result is unknown, not failed)",
+            check_budget.as_millis(),
+            db_size_mb
+        ),
+        Bounded::Failed(e) => format!("failed: {e}"),
+    };
+
+    Ok(serde_json::json!({
+        "database": path,
+        "journal_mode": journal_mode,
+        "page_count": page_count,
+        "page_size": page_size,
+        "db_size_mb": (db_size_mb * 100.0).round() / 100.0,
+        "freelist_count": freelist_count,
+        "wal_checkpoint": wal_checkpoint,
+        "integrity_check": integrity,
+        "tables": tables,
+        "tables_truncated": tables_truncated,
+        "row_counts_complete": row_counts_complete,
+    }))
+}
+
+/// Quote an arbitrary table name as a SQLite identifier (`"…"`, embedded quotes doubled).
+#[cfg(feature = "sqlite")]
+pub(crate) fn quote_sqlite_identifier(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 #[cfg(feature = "sqlite")]
 const MAX_ROWS_DEFAULT: usize = 100;
 #[cfg(feature = "sqlite")]
@@ -673,6 +851,53 @@ mod tests {
         )
         .unwrap();
         (file, path)
+    }
+
+    #[test]
+    fn db_health_report_complete_within_budget() {
+        let (_f, path) = create_test_db();
+        let long = Duration::from_secs(30);
+        let r = db_health_report(path.to_str().unwrap(), long, long).unwrap();
+        assert_eq!(r["integrity_check"], "ok");
+        assert_eq!(r["row_counts_complete"], true);
+        assert_eq!(r["tables"][0]["name"], "users");
+        assert_eq!(r["tables"][0]["row_count"], 3);
+        assert!(r["page_count"].as_i64().unwrap() > 0);
+    }
+
+    /// A database too big for the budgets must still return every cheap result, with the
+    /// slow phases REPORTED as incomplete — not fail the whole call (the live 4DA 1.4 GB case).
+    #[test]
+    fn db_health_report_degrades_instead_of_failing_when_budgets_run_out() {
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let path = file.path().to_path_buf();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Enough rows that quick_check needs far more than DB_HEALTH_PROGRESS_OPS VDBE ops,
+        // so a zero budget deterministically trips the progress handler.
+        conn.execute_batch(
+            "CREATE TABLE big (id INTEGER PRIMARY KEY, v TEXT);
+             CREATE INDEX big_v ON big(v);
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 50000)
+             INSERT INTO big SELECT i, hex(randomblob(16)) FROM n;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let r = db_health_report(path.to_str().unwrap(), Duration::ZERO, Duration::ZERO)
+            .expect("a timed-out phase must not fail the whole report");
+        assert_eq!(r["row_counts_complete"], false);
+        assert!(r["tables"][0]["row_count"].is_null());
+        assert_eq!(r["tables"][0]["name"], "big");
+        let integrity = r["integrity_check"].as_str().unwrap();
+        assert!(integrity.starts_with("not completed"), "got: {integrity}");
+        // The cheap metadata survives.
+        assert!(r["page_count"].as_i64().unwrap() > 0);
+        assert!(r["journal_mode"].is_string());
+    }
+
+    #[test]
+    fn quote_sqlite_identifier_doubles_embedded_quotes() {
+        assert_eq!(quote_sqlite_identifier("a\"b"), "\"a\"\"b\"");
     }
 
     #[test]
