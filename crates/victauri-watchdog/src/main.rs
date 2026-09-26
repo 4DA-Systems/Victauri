@@ -170,7 +170,10 @@ fn dir_is_trusted(path: &Path) -> bool {
 /// Cross-platform "is this pid a live process?" (same approach as victauri-test).
 #[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
+    // Absolute System32 path (as victauri-cli's bridge does): a writable PATH entry must not
+    // be able to shadow `tasklist`, which this loop spawns repeatedly.
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    std::process::Command::new(format!("{root}\\System32\\tasklist.exe"))
         .args(["/FI", &format!("PID eq {pid}"), "/NH"])
         .output()
         .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))

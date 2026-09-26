@@ -1129,7 +1129,9 @@ async fn drain_window(
     label: &str,
     since: f64,
 ) -> Option<f64> {
-    let code = format!("return window.__VICTAURI__?.getEventStream({since})");
+    // `true` = exclusive: `since` is our own watermark (the newest timestamp already
+    // ingested), so an inclusive read re-ingested the newest event on every tick.
+    let code = format!("return window.__VICTAURI__?.getEventStream({since}, true)");
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
