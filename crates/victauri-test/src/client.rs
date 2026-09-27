@@ -2502,10 +2502,14 @@ mod transport_tests {
         assert!(find_sse_response(body, 99).is_none());
     }
 
-    /// A port with nothing listening (bound, then released).
-    fn closed_port() -> u16 {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.local_addr().unwrap().port()
+    /// A port that refuses connections for as long as the returned socket lives: BOUND but
+    /// never listening. (Binding then releasing — the old approach — let another process on a
+    /// busy CI runner grab the port, turning "connection refused" into a non-HTTP reply.)
+    fn closed_port() -> (u16, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (port, socket)
     }
 
     fn client_at(port: u16, discovered: bool, app_identifier: Option<&str>) -> VictauriClient {
@@ -2532,7 +2536,7 @@ mod transport_tests {
         if explicit_discovery_env() {
             return; // explicit endpoint config bypasses discovery by design
         }
-        let port = closed_port();
+        let (port, _held) = closed_port();
         // An identity no live app can have: rediscovery must find nothing and say so,
         // instead of binding to whatever app holds the default port.
         let id = format!("com.victauri.test.absent-{}", std::process::id());
@@ -2557,7 +2561,7 @@ mod transport_tests {
 
     #[tokio::test]
     async fn connection_refused_on_explicit_client_is_not_rediscovered() {
-        let port = closed_port();
+        let (port, _held) = closed_port();
         let mut client = client_at(port, false, None);
         let err = client
             .call_tool("get_plugin_info", json!({}))
@@ -2575,7 +2579,7 @@ mod transport_tests {
         if explicit_discovery_env() {
             return;
         }
-        let port = closed_port();
+        let (port, _held) = closed_port();
         let id = format!("com.victauri.test.absent2-{}", std::process::id());
         let mut client = client_at(port, true, Some(&id));
         client.auth_token = Some("keep".to_string());
