@@ -1052,13 +1052,8 @@ async fn event_drain_loop(
     bridge: Arc<dyn WebviewBridge>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    // Per-window high-water marks. A single shared timestamp made every window
-    // after the first miss any events older than the previous window's latest —
-    // so the Rust event_log, the recorder (time-travel), and `explain` were blind
-    // to every non-default window (e.g. 4DA's notification/briefing windows).
-    // Track a watermark per label and drain every live window.
-    let mut watermarks: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-
+    // Per-window high-water marks live in `state.drain_watermarks` (shared with
+    // `recording flush`), one per label, so every live window is drained.
     loop {
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -1085,50 +1080,50 @@ async fn event_drain_loop(
         }
         // Drop watermarks for windows that have closed so the map can't grow
         // unbounded across many ephemeral windows.
-        watermarks.retain(|label, _| labels.contains(label));
+        state.drain_watermarks.retain(&labels);
 
         // Drain all windows concurrently. A blind window (e.g. one missing the
         // `victauri:default` capability) hangs until the 5s eval timeout; draining
         // sequentially would let it stall every other window's drain. Concurrency
         // keeps a healthy window's events flowing regardless of a blind sibling.
-        // Never read earlier than the recording's start: an initial watermark of 0 pulled the
-        // page's whole pre-recording history (e.g. app-startup IPC) into the new recording,
-        // and a watermark left from an earlier recording is older than this one's start.
-        #[allow(clippy::cast_precision_loss)]
-        let floor = state
-            .recorder
-            .started_at()
-            .map_or(0.0, |t| t.timestamp_millis() as f64);
         let mut set = tokio::task::JoinSet::new();
         for label in &labels {
-            let since = watermarks.get(label).copied().unwrap_or(0.0).max(floor);
             let state = Arc::clone(&state);
             let bridge = Arc::clone(&bridge);
             let label = label.clone();
-            set.spawn(async move {
-                let newest = drain_window(&state, &bridge, &label, since).await;
-                (label, newest)
-            });
+            set.spawn(async move { drain_window_into_recording(&state, &bridge, &label).await });
         }
-        while let Some(res) = set.join_next().await {
-            if let Ok((label, Some(newest))) = res {
-                watermarks.insert(label, newest);
-            }
-        }
+        while set.join_next().await.is_some() {}
     }
 }
 
-/// Drain one window's event stream into the event log / recorder. Returns the
-/// newest event timestamp seen (to advance the window's watermark), or `None` if
-/// nothing was drained (pending-eval saturation, eval-injection failure, callback
-/// timeout, or an unparseable result). Returning `None` leaves the watermark
-/// unchanged, so a transient failure simply re-fetches the same window next tick.
+/// Drain one window's new events (strictly after its shared watermark) into the event log and
+/// recorder, then advance the watermark. Serialized per window, so the background drain and
+/// `recording flush` never ingest the same window's events twice. Returns how many events were
+/// recorded, or `None` if the window could not be drained this time (the watermark is left
+/// unchanged, so a transient failure just re-reads the same range next time).
+pub async fn drain_window_into_recording(
+    state: &Arc<VictauriState>,
+    bridge: &Arc<dyn WebviewBridge>,
+    label: &str,
+) -> Option<usize> {
+    let lock = state.drain_watermarks.lock_for(label);
+    let _serialized = lock.lock().await;
+    let since = state.drain_watermarks.since(label);
+    let (newest, recorded) = drain_window(state, bridge, label, since).await?;
+    state.drain_watermarks.advance(label, newest);
+    Some(recorded)
+}
+/// Read one window's event stream strictly after `since` into the event log / recorder.
+/// Returns the newest watermark value seen and how many events were recorded, or `None` if
+/// nothing was drained (pending-eval saturation, eval-injection failure, callback timeout, or
+/// an unparseable result).
 async fn drain_window(
     state: &Arc<VictauriState>,
     bridge: &Arc<dyn WebviewBridge>,
     label: &str,
     since: f64,
-) -> Option<f64> {
+) -> Option<(f64, usize)> {
     // `true` = exclusive: `since` is our own watermark (the newest timestamp already
     // ingested), so an inclusive read re-ingested the newest event on every tick.
     let code = format!("return window.__VICTAURI__?.getEventStream({since}, true)");
@@ -1181,6 +1176,7 @@ async fn drain_window(
     #[allow(clippy::cast_precision_loss)]
     let now_ms = chrono::Utc::now().timestamp_millis() as f64;
     let mut newest = since;
+    let mut recorded = 0usize;
     for ev in &events {
         let ts = ev
             .get("seq_ts")
@@ -1197,10 +1193,11 @@ async fn drain_window(
             state.event_log.push(app_event.clone());
             if state.recorder.is_recording() {
                 state.recorder.record_event(app_event);
+                recorded += 1;
             }
         }
     }
-    Some(newest)
+    Some((newest, recorded))
 }
 
 #[cfg(test)]

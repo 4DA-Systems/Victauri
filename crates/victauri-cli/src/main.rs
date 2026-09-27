@@ -966,20 +966,19 @@ async fn cmd_coverage(
     eprintln!("{summary}");
 
     if let Some(path) = junit_path {
-        let verify_report = victauri_test::VerifyReport {
-            results: vec![victauri_test::CheckResult {
-                description: format!(
+        let verify_report =
+            victauri_test::VerifyReport::new(vec![victauri_test::CheckResult::new(
+                format!(
                     "IPC coverage {:.1}% ({}/{})",
                     report.coverage_percentage, report.tested_commands, report.total_commands
                 ),
-                passed: threshold.is_none_or(|t| report.meets_threshold(t)),
-                detail: if report.untested.is_empty() {
+                threshold.is_none_or(|t| report.meets_threshold(t)),
+                if report.untested.is_empty() {
                     String::new()
                 } else {
                     format!("untested: {}", report.untested.join(", "))
                 },
-            }],
-        };
+            )]);
         let junit = verify_report.to_junit("victauri-coverage", std::time::Duration::from_secs(0));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)

@@ -30,9 +30,10 @@ pub struct Screencast {
     generation: AtomicU64,
     frames: Mutex<Vec<TraceFrame>>,
     label: Mutex<Option<String>>,
-    /// Whether this trace started the event recorder (`with_events`), so `stop` can stop it —
-    /// otherwise the recorder (and the per-second drain loop it enables) outlives the trace.
-    owns_recording: AtomicBool,
+    /// Session id of the recording this trace started (`with_events`), so `stop` can stop
+    /// exactly that one — otherwise the recorder (and the per-second drain loop it enables)
+    /// outlives the trace. A bare flag could stop a recording someone else started later.
+    owned_recording: Mutex<Option<String>>,
 }
 
 impl Default for Screencast {
@@ -44,7 +45,7 @@ impl Default for Screencast {
             generation: AtomicU64::new(0),
             frames: Mutex::new(Vec::new()),
             label: Mutex::new(None),
-            owns_recording: AtomicBool::new(false),
+            owned_recording: Mutex::new(None),
         }
     }
 }
@@ -148,14 +149,41 @@ impl Screencast {
         true
     }
 
-    /// Record whether the current trace started the event recorder.
-    pub fn set_owns_recording(&self, owns: bool) {
-        self.owns_recording.store(owns, Ordering::SeqCst);
+    /// Record (or clear) the session id of the recording the current trace started.
+    pub fn set_owned_recording(&self, session_id: Option<String>) {
+        *self
+            .owned_recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = session_id;
     }
 
-    /// Clear and return whether the finished trace owned the event recorder.
-    pub fn take_owns_recording(&self) -> bool {
-        self.owns_recording.swap(false, Ordering::SeqCst)
+    /// Clear and return the session id of the recording the finished trace started.
+    pub fn take_owned_recording(&self) -> Option<String> {
+        self.owned_recording
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Stop the trace only if `generation` is still current — atomically, so an old capture
+    /// task's auto-stop can never stop a NEWER trace started in between. Returns whether it
+    /// stopped anything.
+    pub fn stop_if_generation(&self, generation: u64) -> bool {
+        if self
+            .generation
+            .compare_exchange(
+                generation,
+                generation + 1,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            self.active.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
+        }
     }
 
     /// Number of frames currently buffered.
@@ -260,11 +288,25 @@ mod tests {
     }
 
     #[test]
-    fn owns_recording_is_taken_once() {
+    fn owned_recording_is_taken_once() {
         let sc = Screencast::default();
-        sc.set_owns_recording(true);
-        assert!(sc.take_owns_recording());
-        assert!(!sc.take_owns_recording());
+        sc.set_owned_recording(Some("s1".into()));
+        assert_eq!(sc.take_owned_recording().as_deref(), Some("s1"));
+        assert_eq!(sc.take_owned_recording(), None);
+    }
+
+    #[test]
+    fn stale_generation_cannot_stop_a_newer_trace() {
+        let sc = Screencast::default();
+        let old = sc.start(100, 10, None);
+        let new = sc.start(100, 10, None);
+        assert!(
+            !sc.stop_if_generation(old),
+            "an old task must not stop the new trace"
+        );
+        assert!(sc.is_active());
+        assert!(sc.stop_if_generation(new));
+        assert!(!sc.is_active());
     }
 
     #[test]

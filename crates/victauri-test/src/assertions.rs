@@ -54,6 +54,7 @@ enum Check {
 
 /// A single check result — pass or fail with context.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CheckResult {
     /// Human-readable description of what was checked.
     pub description: String,
@@ -77,6 +78,7 @@ impl CheckResult {
 
 /// Collection of check results from a `verify()` run.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct VerifyReport {
     /// Individual check results in order.
     pub results: Vec<CheckResult>,

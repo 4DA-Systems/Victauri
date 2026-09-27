@@ -1957,6 +1957,7 @@ impl VictauriMcpHandler {
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
                 match self.state.recorder.start(session_id.clone()) {
                     Ok(()) => {
+                        self.reset_drain_floor();
                         let result = serde_json::json!({
                             "started": true,
                             "session_id": session_id,
@@ -2061,6 +2062,7 @@ impl VictauriMcpHandler {
                     "note": "the imported session is now the ACTIVE recording: live events are \
                              appended to it until you call recording action=stop",
                 });
+                self.reset_drain_floor();
                 self.state.recorder.import(session);
                 CallToolResult::success(vec![ContentBlock::text(result.to_string())])
             }
@@ -2068,41 +2070,39 @@ impl VictauriMcpHandler {
                 if !self.state.recorder.is_recording() {
                     return tool_error("no active recording — start a recording first");
                 }
-                // Only events NEWER than what the recording already holds (exclusive):
-                // `getEventStream(0)` re-ingested everything since page load, and reading from
-                // the recording start re-recorded whatever the background drain had already
-                // captured. Drained events carry their JS timestamp, so this watermark lines up.
-                let since_ms = self
-                    .state
-                    .recorder
-                    .latest_event_timestamp()
-                    .map_or(0, |t| t.timestamp_millis());
-                let code = format!("return window.__VICTAURI__?.getEventStream({since_ms}, true)");
-                let label = params.webview_label.as_deref().unwrap_or("main");
-                match self
-                    .eval_with_return(&code, params.webview_label.as_deref())
+                // Same routine (and the same shared per-window watermark + lock) as the
+                // background drain, so a flush never re-records what the drain already captured
+                // and vice versa. With no label, every live window is flushed.
+                let labels: Vec<String> = match params.webview_label.as_deref() {
+                    Some(l) => vec![l.to_string()],
+                    None => self.bridge.list_window_labels(),
+                };
+                let mut captured = 0usize;
+                let mut failed = Vec::new();
+                for label in &labels {
+                    match crate::mcp::server::drain_window_into_recording(
+                        &self.state,
+                        &self.bridge,
+                        label,
+                    )
                     .await
-                {
-                    Ok(result_str) => {
-                        let events: Vec<serde_json::Value> =
-                            serde_json::from_str(&result_str).unwrap_or_default();
-                        let mut count = 0u64;
-                        for ev in &events {
-                            if let Some(app_event) =
-                                crate::mcp::server::parse_bridge_event_from(ev, label)
-                            {
-                                self.state.event_log.push(app_event.clone());
-                                self.state.recorder.record_event(app_event);
-                                count += 1;
-                            }
-                        }
-                        json_result(&serde_json::json!({
-                            "flushed": true,
-                            "events_captured": count,
-                        }))
+                    {
+                        Some(n) => captured += n,
+                        None => failed.push(label.clone()),
                     }
-                    Err(e) => tool_error(format!("flush failed: {e}")),
                 }
+                if !labels.is_empty() && failed.len() == labels.len() {
+                    return tool_error(format!(
+                        "flush failed: no window answered ({})",
+                        failed.join(", ")
+                    ));
+                }
+                json_result(&serde_json::json!({
+                    "flushed": true,
+                    "events_captured": captured,
+                    "windows": labels,
+                    "unreachable_windows": failed,
+                }))
             }
             RecordingAction::Replay => {
                 let calls = self.state.recorder.ipc_replay_sequence();
@@ -2471,6 +2471,12 @@ impl VictauriMcpHandler {
                 let interval = params.interval_ms.unwrap_or(500);
                 let max_frames = params.max_frames.unwrap_or(60);
                 let label = params.webview_label.clone();
+                // A trace started over a running one supersedes it: end the recording the
+                // previous trace started (if it is still the active one), or it would be left
+                // running with no owner (and the per-second drain loop with it).
+                if let Some(prev) = self.state.screencast.take_owned_recording() {
+                    let _ = self.state.recorder.stop_if_session(&prev);
+                }
                 let generation = self
                     .state
                     .screencast
@@ -2479,13 +2485,14 @@ impl VictauriMcpHandler {
                 let mut events_started = false;
                 if params.with_events.unwrap_or(false) {
                     let session_id = uuid::Uuid::new_v4().to_string();
-                    if self.state.recorder.start(session_id).is_ok() {
+                    if self.state.recorder.start(session_id.clone()).is_ok() {
+                        self.reset_drain_floor();
                         events_started = true;
+                        // Only a recording THIS trace started is stopped with it — by session
+                        // id, so a recording the agent starts later is never stopped by us.
+                        self.state.screencast.set_owned_recording(Some(session_id));
                     }
                 }
-                // Only a recording THIS trace started is stopped with it; a recording the
-                // agent started separately is left alone.
-                self.state.screencast.set_owns_recording(events_started);
 
                 // Background capture task: snapshot the window each interval until the
                 // screencast is stopped, superseded by a newer start, or hits the max duration.
@@ -2496,11 +2503,11 @@ impl VictauriMcpHandler {
                     while screencast.is_active() && screencast.generation() == generation {
                         if t0.elapsed() >= MAX_TRACE_DURATION {
                             // An abandoned trace must not capture (and burn CPU) forever.
-                            if screencast.generation() == generation {
-                                screencast.stop();
-                                if screencast.take_owns_recording() {
-                                    let _ = handler.state.recorder.stop();
-                                }
+                            // Atomic: only if no newer trace has started in the meantime.
+                            if screencast.stop_if_generation(generation)
+                                && let Some(owned) = screencast.take_owned_recording()
+                            {
+                                let _ = handler.state.recorder.stop_if_session(&owned);
                             }
                             break;
                         }
@@ -2540,13 +2547,13 @@ impl VictauriMcpHandler {
                 // Stop the recording `with_events` started, so the recorder (and the
                 // per-second drain loop it enables) does not outlive the trace. The session
                 // stays readable via recording get_events/export (last stopped session).
-                let event_count = if self.state.screencast.take_owns_recording() {
-                    self.state
+                let event_count = match self.state.screencast.take_owned_recording() {
+                    Some(owned) => self
+                        .state
                         .recorder
-                        .stop()
-                        .map_or(0, |session| session.events.len())
-                } else {
-                    self.state.recorder.event_count()
+                        .stop_if_session(&owned)
+                        .map_or(0, |session| session.events.len()),
+                    None => self.state.recorder.event_count(),
                 };
                 json_result(&serde_json::json!({
                     "stopped": true,
@@ -4178,6 +4185,15 @@ impl VictauriMcpHandler {
                 .collect();
         events.sort_by_key(victauri_core::AppEvent::timestamp);
         events
+    }
+
+    /// Begin a new recording epoch for the drain: events at or before now are never pulled
+    /// into the recording (an imported session's old start time used to pull in the page's
+    /// whole history).
+    fn reset_drain_floor(&self) {
+        #[allow(clippy::cast_precision_loss)]
+        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
+        self.state.drain_watermarks.reset(now_ms);
     }
 
     /// Resolve the EXACT window a native capture (`screenshot`, `trace`) should target, and
@@ -5884,6 +5900,7 @@ mod authz_dispatch_tests {
             db_search_paths: Vec::new(),
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
+            drain_watermarks: crate::introspection::DrainWatermarks::default(),
         })
     }
 
@@ -6274,6 +6291,7 @@ mod command_policy_dispatch_tests {
             db_search_paths: Vec::new(),
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
+            drain_watermarks: crate::introspection::DrainWatermarks::default(),
         })
     }
 
@@ -6623,6 +6641,45 @@ mod command_policy_dispatch_tests {
         assert!(
             state.pending_evals.lock().await.is_empty(),
             "pending entry removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn trace_stop_never_stops_a_recording_it_did_not_start() {
+        let state = state_with(PrivacyConfig::default());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
+        let _ = call(&h, "trace", json!({"action": "start", "with_events": true})).await;
+        let traced = state
+            .recorder
+            .active_session_id()
+            .expect("trace started a recording");
+        // The agent ends the trace's recording and starts its own.
+        let _ = state.recorder.stop();
+        state.recorder.start("mine".to_string()).unwrap();
+        let _ = call(&h, "trace", json!({"action": "stop"})).await;
+        assert_eq!(
+            state.recorder.active_session_id().as_deref(),
+            Some("mine"),
+            "trace stop must not end a recording it did not start (it started {traced})"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_a_trace_does_not_orphan_its_recording() {
+        let state = state_with(PrivacyConfig::default());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
+        let _ = call(&h, "trace", json!({"action": "start", "with_events": true})).await;
+        let first = state.recorder.active_session_id().unwrap();
+        let _ = call(&h, "trace", json!({"action": "start", "with_events": true})).await;
+        let second = state.recorder.active_session_id().unwrap();
+        assert_ne!(
+            first, second,
+            "the first trace's recording was superseded, not orphaned"
+        );
+        let _ = call(&h, "trace", json!({"action": "stop"})).await;
+        assert!(
+            !state.recorder.is_recording(),
+            "stop ends the second trace's recording"
         );
     }
 
@@ -6996,6 +7053,7 @@ mod screenshot_visibility_tests {
             db_search_paths: Vec::new(),
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
+            drain_watermarks: crate::introspection::DrainWatermarks::default(),
         });
         VictauriMcpHandler::new(state, bridge)
     }

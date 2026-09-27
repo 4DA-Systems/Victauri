@@ -206,6 +206,9 @@ pub struct VictauriState {
     /// Application-defined state probes surfaced via the `app_state` tool.
     /// Registered through [`VictauriBuilder::probe`].
     pub probes: introspection::AppStateProbes,
+    /// Shared per-window watermarks for draining JS events into a recording.
+    #[doc(hidden)]
+    pub drain_watermarks: introspection::DrainWatermarks,
 }
 
 impl VictauriState {
@@ -245,6 +248,7 @@ impl VictauriState {
             screencast: Arc::new(screencast::Screencast::default()),
             db_search_paths: Vec::new(),
             probes: introspection::AppStateProbes::default(),
+            drain_watermarks: introspection::DrainWatermarks::default(),
         }
     }
 }
@@ -837,6 +841,7 @@ impl VictauriBuilder {
                         screencast: Arc::new(screencast::Screencast::default()),
                         db_search_paths,
                         probes: introspection::AppStateProbes::default(),
+                        drain_watermarks: introspection::DrainWatermarks::default(),
                     });
                     state.startup_timeline.mark("state_created");
 

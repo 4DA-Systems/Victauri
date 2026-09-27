@@ -1247,6 +1247,74 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
     children
 }
 
+// ── Recording drain watermarks ─────────────────────────────────────────────
+
+/// Per-window high-water marks for pulling the JS bridge's event stream into a recording,
+/// shared by the background drain loop and `recording flush`.
+///
+/// Each kept its own watermark before, so a flush re-recorded what the drain had captured
+/// (and vice versa). The floor is reset whenever a recording starts or is imported, so the
+/// page's pre-recording history is never pulled in. A per-window async lock serializes the
+/// two readers for the same window.
+#[derive(Default)]
+pub struct DrainWatermarks {
+    inner: std::sync::Mutex<WatermarkState>,
+}
+
+#[derive(Default)]
+struct WatermarkState {
+    floor_ms: f64,
+    per_label: HashMap<String, f64>,
+    locks: HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl DrainWatermarks {
+    fn state(&self) -> std::sync::MutexGuard<'_, WatermarkState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The exclusive watermark to read `label`'s stream from.
+    #[must_use]
+    pub fn since(&self, label: &str) -> f64 {
+        let s = self.state();
+        s.per_label
+            .get(label)
+            .copied()
+            .unwrap_or(s.floor_ms)
+            .max(s.floor_ms)
+    }
+
+    /// Advance `label`'s watermark to `ms` (never moves backwards).
+    pub fn advance(&self, label: &str, ms: f64) {
+        let mut s = self.state();
+        let entry = s.per_label.entry(label.to_string()).or_insert(ms);
+        if ms > *entry {
+            *entry = ms;
+        }
+    }
+
+    /// Start a new recording epoch: nothing at or before `floor_ms` is ever read.
+    pub fn reset(&self, floor_ms: f64) {
+        let mut s = self.state();
+        s.floor_ms = floor_ms;
+        s.per_label.clear();
+    }
+
+    /// Forget windows that no longer exist (bounds the maps across ephemeral windows).
+    pub fn retain(&self, labels: &[String]) {
+        let mut s = self.state();
+        s.per_label.retain(|l, _| labels.contains(l));
+        s.locks.retain(|l, _| labels.contains(l));
+    }
+
+    /// The lock that serializes readers of `label`'s stream.
+    #[must_use]
+    pub fn lock_for(&self, label: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(self.state().locks.entry(label.to_string()).or_default())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

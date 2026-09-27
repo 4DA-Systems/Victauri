@@ -255,6 +255,25 @@ impl EventRecorder {
         }
     }
 
+    /// Session id of the active recording, or `None` if not recording.
+    #[must_use]
+    pub fn active_session_id(&self) -> Option<String> {
+        crate::acquire_lock(&self.recording, "EventRecorder")
+            .as_ref()
+            .map(|r| r.session_id.clone())
+    }
+
+    /// Stop the active recording only if it is the session `session_id` (a caller that started
+    /// a recording must not stop a different one someone else started after it ended).
+    #[must_use]
+    pub fn stop_if_session(&self, session_id: &str) -> Option<RecordedSession> {
+        if self.active_session_id().as_deref() == Some(session_id) {
+            self.stop()
+        } else {
+            None
+        }
+    }
+
     /// When the active recording started, or `None` if not recording.
     #[must_use]
     pub fn started_at(&self) -> Option<DateTime<Utc>> {
