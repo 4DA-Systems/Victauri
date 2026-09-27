@@ -32,6 +32,9 @@ Browse files in app backend directories (data, config, log, local_data).
 
 **Returns:** `{root, entries: [{name, path, is_dir, size, modified}]}`
 
+A listing stops (and reports `truncated`) at 10,000 returned entries, 100,000 examined entries, or
+5 s — whichever comes first — so a pattern that matches nothing in a huge tree still returns.
+
 ---
 
 ### read_app_file
@@ -47,6 +50,8 @@ Read a file from one of the app's backend directories.
 | `binary` | boolean | no | Return base64 instead of UTF-8 text |
 
 **Returns:** UTF-8 text, or base64-encoded bytes when `binary` is true. Path-traversal-guarded.
+A read truncated at `max_bytes` in the middle of a multi-byte character drops the partial
+character and stays UTF-8 text.
 
 ---
 
@@ -69,6 +74,15 @@ Execute a read-only SQL query against a SQLite database in the app's data direct
 ```
 
 **Returns:** `{columns, rows, row_count, truncated, max_rows}`
+
+Limits: a 5 MB result budget charged cell by cell (the result is `truncated` rather than built
+past it), at most 256 result columns, 1 MB per value, `LIKE`/`GLOB` patterns up to 1000 bytes, a
+5 s CPU deadline, a 1 s wait for a lock held by the app, and at most two database calls
+(`query_db` / `db_health`) running at once — a third gets a "busy" error. Duplicate result
+column names get `:N` keys (`a`, `a:1`) so no value is lost; `columns` lists exactly the keys
+each row carries. A single string function (`LIKE`, `replace`, `instr`) is one uninterruptible
+SQLite step, so a pathological call can overrun the deadline by seconds on its worker thread;
+the tool call itself returns at the deadline.
 
 Read-only and path-traversal-guarded: writes (`INSERT`/`UPDATE`/…), stacked
 queries, `ATTACH`, and the write form of `PRAGMA` (`PRAGMA x = y`) are rejected.
@@ -105,9 +119,11 @@ or be wrapped in an IIFE; otherwise only the first statement runs. async/await i
 supported.
 
 JavaScript errors (thrown exceptions) return an MCP error with `isError: true`.
-`undefined` returns `"undefined"`, `null` returns `null`. A **syntax error**
-surfaces only as the eval timeout (the webview cannot report parse errors to the
-host). Targeting a hidden or unresponsive window fails fast (~2s); and if a prior
+`undefined` returns `"undefined"`, `null` returns `null`. A **syntax error** is
+reported at once as a JavaScript parse error ("the code did not begin executing") — code
+reported that way never runs later. A result JSON cannot represent (a circular object, a
+BigInt, a function) is reported as "the code ran, but its result could not be serialized",
+never as a JavaScript error. A page reload under the call fails it promptly. Targeting a hidden or unresponsive window fails fast (~2s); and if a prior
 eval timed out, the next call re-probes and fails fast if the webview reloaded or
 the app stopped responding.
 
@@ -327,6 +343,10 @@ List all registered commands with their metadata.
 
 **Parameters:** None.
 
+Each argument lists its Rust `name`, and — when it differs — the `key` the frontend invokes it
+by: Tauri camelCases argument names by default (`size_kb` → `sizeKb`), so pass `key` (or
+`name` when there is no `key`) in `invoke_command`'s `args`.
+
 ---
 
 ### get_memory_stats
@@ -509,6 +529,12 @@ allow/blocklist are reported as `blocked`. `passed` means the re-invocation succ
 the response is **not** diffed against the original (only its JSON type is reported).
 Re-invoked commands run for real, so their side effects happen again.
 
+Each call is re-invoked **in the window that recorded it** — a window's Tauri capabilities are
+its own — and is skipped if that window no longer exists (it never falls back to `main`);
+`webview_label` only filters which recorded calls are replayed. Calls that were fulfilled or
+blocked by a network route (`route add`, which page script can also use) are recorded as
+`mocked` and never replayed: they never reached the backend.
+
 **Example:**
 ```json
 {"action": "start"}
@@ -657,7 +683,7 @@ ring buffer via the native screenshot path (no CDP). Pairs with `recording`
 | `status` | — | Active flag + buffered frame count |
 | `frames` | `limit` | Return captured frames as base64 PNGs |
 
-`start` defaults: `interval_ms` 500 (min 50), `max_frames` 60 (max 600). Set
+`start` defaults: `interval_ms` 500 (min 50, max 60000), `max_frames` 60 (max 600). Set
 `with_events: true` to also start the event recorder so the trace bundles the
 IPC/DOM/console timeline alongside the screencast.
 

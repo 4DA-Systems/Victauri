@@ -53,6 +53,36 @@ tests, not covered by semver).
 - The compact `dom_snapshot` JSON-encodes page text (quotes/newlines in names appear escaped).
 - `victauri-watchdog` discovers the app's port and pins its identity; with `--app` and no match it
   reports the app down instead of polling 7373.
+- A compound tool call whose `action` is not a string (e.g. `{"action": {"go_to": null}}`), or a
+  REST body that is not a JSON object, is refused as invalid parameters (REST 400).
+- `eval_js` reports a syntax error at once as a parse error, a reload under the call promptly, and
+  an unserializable result as "the code ran" — never a timeout or a JavaScript error.
+- `recording replay` runs each call in the window that recorded it (never falls back to `main`)
+  and never replays a call a network route fulfilled or blocked (`IpcCall::mocked`).
+- The page-visible `window.__VICTAURI__` no longer carries agent-only operations (`clearRoutes`,
+  `setDialogAutoResponse`, `clear*Log`, …), and `window.__VICTAURI_SCRUB__` / `__SWEEP__` are gone.
+  Nothing in an app should have called them; the tools that use them are unchanged.
+- The compact `dom_snapshot` line format quotes non-trivial `role` and attribute values; recorded
+  selectors are CSS-escaped (`#\:r0\:`).
+- `#[inspectable]` registers each argument's IPC `key` (camelCase by default); a command using
+  `#[tauri::command(rename_all = "snake_case")]` or `rename = "…"` should repeat the option on
+  `#[inspectable(...)]` (or put `#[inspectable]` above `#[tauri::command(...)]`).
+- `victauri-test`: `Locator::check()`/`uncheck()` click the element (and verify it changed), and a
+  stale element reference is `ElementNotFound` instead of an empty/false value.
+- The server speaks HTTP/1.1 only and refuses browser-originated requests (any `Origin`, a
+  `Sec-Fetch-Site` other than `none`) with 403, including `tauri://` origins; it no longer sends
+  `Access-Control-Allow-Origin`. HTTP clients (curl, reqwest, the CLI, `victauri-test`) are
+  unaffected.
+- On Unix the discovery directory moved to `$XDG_RUNTIME_DIR/victauri/<pid>` or
+  `<temp>/victauri-<euid>/<pid>`. The 0.9 CLI, test client and watchdog also read the old
+  `<temp>/victauri/` root, so they find apps built with 0.8.x; a 0.8.x client does not find a 0.9 app.
+- `query_db` returns at most 256 columns (a wider `SELECT *` errors), suffixes duplicate column
+  names (`a`, `a:1`), refuses `LIKE`/`GLOB` patterns over 1000 bytes, and answers "busy" when two
+  database calls are already running. "database not found" also covers a path resolving outside
+  the allowed roots.
+- The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
+  `Junit*` report types stay exhaustive (struct-update syntax keeps working); a field added to one
+  of them later will be called out as a breaking change.
 ## v0.8.7 → v0.8.8 (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
 
 No consumer code changes are required and no dependency-requirement change is needed
