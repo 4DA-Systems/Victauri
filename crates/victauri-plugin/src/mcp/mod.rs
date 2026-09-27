@@ -111,6 +111,28 @@ const DB_HEALTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_se
 /// A page load within this long of an eval's injection is attributed to the page the eval is
 /// running in (a late ready signal), not to a reload that killed it.
 const PAGE_RELOAD_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
+/// A timeout for an error message: whole seconds, or milliseconds when under a second (so a
+/// short per-call timeout never reads as "timed out after 0s").
+fn format_timeout(timeout: std::time::Duration) -> String {
+    if timeout < std::time::Duration::from_secs(1) {
+        format!("{}ms", timeout.as_millis())
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
+}
+
+/// Upper bound for `invoke_command`'s per-call `timeout_ms` (matches the eval-timeout ceiling).
+const MAX_INVOKE_TIMEOUT_MS: u64 = 300_000;
+
+/// Whether an eval error means the call was cut off (timeout, app exit, closed window, page
+/// reload) rather than the command completing with an error.
+fn is_aborted_call(error: &str) -> bool {
+    error.starts_with("eval timed out")
+        || error.starts_with("the app began shutting down")
+        || (error.starts_with("window '")
+            && (error.contains("was closed while") || error.contains("loaded a new page")))
+}
+
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
 /// How often a slow eval re-checks that its target window still exists (first check after
@@ -344,7 +366,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Subject to privacy command filtering.",
+        description = "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Waits up to the eval timeout (30s) — pass `timeout_ms` (max 300000) for a legitimately slow command. Subject to privacy command filtering.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -433,11 +455,19 @@ impl VictauriMcpHandler {
             "return window.__TAURI_INTERNALS__.invoke({}, {args_str})",
             js_string(&params.command)
         );
+        let timeout = params.timeout_ms.map_or(self.state.eval_timeout, |ms| {
+            std::time::Duration::from_millis(ms.clamp(1, MAX_INVOKE_TIMEOUT_MS))
+        });
         let result = self
-            .eval_with_return(&code, params.webview_label.as_deref())
+            .eval_with_return_timeout(&code, params.webview_label.as_deref(), timeout)
             .await;
         let elapsed = start.elapsed();
-        self.state.command_timings.record(&params.command, elapsed);
+        // Only real outcomes are timings: a timeout, an app exit, a closed window or a reload
+        // measures how long we waited, not how long the command took (it skewed p95).
+        let aborted = result.as_ref().err().is_some_and(|e| is_aborted_call(e));
+        if !aborted {
+            self.state.command_timings.record(&params.command, elapsed);
+        }
 
         match result {
             Ok(result) => {
@@ -451,6 +481,10 @@ impl VictauriMcpHandler {
                 }
                 CallToolResult::success(vec![ContentBlock::text(result)])
             }
+            Err(e) if e.starts_with("eval timed out") => tool_error(format!(
+                "invoke_command failed: {e} If the command is legitimately slow, pass \
+                 `timeout_ms` (up to {MAX_INVOKE_TIMEOUT_MS})."
+            )),
             Err(e) => tool_error(format!("invoke_command failed: {e}")),
         }
     }
@@ -4732,14 +4766,14 @@ impl VictauriMcpHandler {
                 // ~2s instead of blocking the full timeout again.
                 self.timed_out_labels.lock().await.insert(label_key.clone());
                 Err(format!(
-                    "eval timed out after {}s — the code began executing but never resolved. \
+                    "eval timed out after {} — the code began executing but never resolved. \
                      (A syntax/parse error would have failed fast via the parse watchdog, so \
                      this is NOT a parse error.) Common causes: an unresolved promise, an \
                      infinite loop, an `await` on something that never settles, or the webview \
                      reloaded / the app stopped responding mid-eval. If the app may have \
                      navigated or crashed, retry (the next call fails fast if the bridge is \
                      gone).",
-                    timeout.as_secs()
+                    format_timeout(timeout)
                 ))
             }
         }
@@ -6993,6 +7027,34 @@ mod command_policy_dispatch_tests {
         let text = result_text(&r);
         assert!(!text.contains("loaded a new page"), "false reload: {text}");
         assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn invoke_command_honors_timeout_ms_and_skips_aborted_timings() {
+        let state = eval_state_with_timeout(20_000);
+        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let started = std::time::Instant::now();
+        let r = call(
+            &h,
+            "invoke_command",
+            json!({"command": "slow_thing", "webview_label": "main", "timeout_ms": 400}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "timeout_ms ignored"
+        );
+        assert!(text.contains("timed out after 400ms"), "{text}");
+        assert!(
+            text.contains("timeout_ms"),
+            "the error must point at timeout_ms: {text}"
+        );
+        assert!(
+            state.command_timings.stats_for("slow_thing").is_none(),
+            "a timed-out call is not a command duration"
+        );
     }
 
     #[tokio::test]

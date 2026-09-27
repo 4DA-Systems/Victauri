@@ -35,8 +35,9 @@ tests, not covered by semver).
 
 - `victauri bridge` does not replay a `tools/call` whose connection dropped after it was sent; it
   returns an error saying the call most likely ran (e.g. a command that quit the app).
-- `eval_js` / `invoke_command` report a closed target window or a shutting-down app promptly
-  instead of timing out.
+- `eval_js` / `invoke_command` report a closed target window, a shutting-down app, or a page
+  reload under the call promptly instead of timing out. `invoke_command` accepts an optional
+  `timeout_ms` (max 300000) for slow commands.
 - `recording replay` skips calls that had arguments, failed, or never completed (arguments are not
   recorded); `recording import` is refused while a recording is in progress; `trace stop` only
   stops the recording its own `with_events` started.

@@ -56,6 +56,10 @@ pub struct InvokeCommandParams {
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
+    /// How long to wait for the command's result, in ms (default: the plugin's eval timeout,
+    /// 30s; max 300000). Raise it for commands that are legitimately slow.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 /// Which app directory to target.

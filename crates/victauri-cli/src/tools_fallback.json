@@ -80,7 +80,7 @@
     "name": "introspect"
   },
   {
-    "description": "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Subject to privacy command filtering.",
+    "description": "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Waits up to the eval timeout (30s) — pass `timeout_ms` (max 300000) for a legitimately slow command. Subject to privacy command filtering.",
     "name": "invoke_command"
   },
   {

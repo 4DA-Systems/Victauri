@@ -76,6 +76,20 @@ future additions will always have defaults.
   mutate the page), and several descriptions were corrected. The CLI's baked fallback tool list is
   regenerated and pinned to the live tools by a test.
 
+### Found by the live 4DA verification (Victauri 0.9.0 inside the real app)
+
+- **An eval in flight when its page reloads now fails fast** ("window 'main' loaded a new page
+  while the call was in flight … check the app's state before re-running it") instead of waiting
+  out the 30s timeout. Every bridge (re)init records a per-window page load (label supplied by
+  Tauri, not the page); a 250ms grace keeps the page's own late ready signal from counting.
+  Live: the in-flight eval returned 50ms after the reload.
+- **`invoke_command` takes an optional `timeout_ms`** (max 300000) for legitimately slow commands
+  (4DA's `get_blind_spots` takes up to 57s cold); a timeout error now says so. Aborted calls
+  (timeout, app exit, closed window, reload) are no longer recorded as command durations.
+- **`find_elements` no longer reports a valid selector as "invalid"** while the page is
+  reloading (it validated against `document.body`, which is null mid-reload); it now says
+  "page not ready".
+
 ### CI / release / docs
 
 - VS Code release: the build job holds no secrets and runs `npm ci --ignore-scripts`; publish
