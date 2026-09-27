@@ -51,22 +51,36 @@ pub fn is_compound_tool(tool: &str) -> bool {
     COMPOUND_TOOLS.contains(&tool)
 }
 
-/// Resolve the canonical privacy-matrix capability identity for a tool call.
+/// Resolve the canonical privacy-matrix capability identity for a tool call, or
+/// refuse the call as malformed.
 ///
 /// For standalone tools this is the bare tool name. For compound tools it is the
-/// dot-qualified `tool.action` identity that the privacy matrix is keyed on. When
-/// a compound tool is called without a recognizable `action`, the bare tool name
-/// is returned (the per-tool arg parse will then reject the malformed call, and
-/// in restricted profiles the bare name is itself not allowed — fail closed).
-#[must_use]
-pub fn canonical_capability(tool: &str, args: &Value) -> String {
-    if !is_compound_tool(tool) {
-        return tool.to_string();
+/// dot-qualified `tool.action` identity that the privacy matrix is keyed on.
+///
+/// The gate and the handler must agree on WHICH action runs, so anything the gate
+/// cannot map to exactly one action is refused rather than gated on the bare tool
+/// name: serde also accepts an enum written as `{"go_to": null}` (externally-tagged
+/// unit variant) and a REST body written as a positional array, and both used to
+/// resolve to the bare name here — which the Test profile allows for `navigate` —
+/// while the handler still parsed and ran `go_to` (audit N1).
+///
+/// # Errors
+///
+/// Returns a human-readable message when the arguments are not a JSON object, or
+/// when a compound tool's `action` is missing, not a string, or not a known action.
+pub fn resolve_capability(tool: &str, args: &Value) -> Result<String, String> {
+    if !args.is_object() {
+        return Err(format!("arguments for '{tool}' must be a JSON object"));
     }
-    let Some(action) = args.get("action").and_then(Value::as_str) else {
-        return tool.to_string();
-    };
-    action_capability(tool, action).unwrap_or_else(|| tool.to_string())
+    if !is_compound_tool(tool) {
+        return Ok(tool.to_string());
+    }
+    match args.get("action") {
+        Some(Value::String(action)) => action_capability(tool, action)
+            .ok_or_else(|| format!("unknown action '{action}' for tool '{tool}'")),
+        Some(_) => Err(format!("`action` for tool '{tool}' must be a string")),
+        None => Err(format!("tool '{tool}' requires a string `action`")),
+    }
 }
 
 /// Map a `(compound tool, action)` pair to its canonical matrix identity.
@@ -181,6 +195,11 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// Test shim: the resolved capability, panicking on a refused call.
+    fn canonical_capability(tool: &str, args: &Value) -> String {
+        resolve_capability(tool, args).unwrap_or_else(|e| panic!("{tool}: refused: {e}"))
+    }
+
     #[test]
     fn standalone_tools_use_bare_name() {
         assert_eq!(canonical_capability("eval_js", &json!({})), "eval_js");
@@ -241,16 +260,45 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_unknown_action_fails_closed_to_bare_name() {
-        assert_eq!(canonical_capability("route", &json!({})), "route");
-        assert_eq!(
-            canonical_capability("route", &json!({"action": "nonsense"})),
-            "route"
-        );
-        assert_eq!(
-            canonical_capability("introspect", &json!({"action": "nonsense"})),
-            "introspect"
-        );
+    fn missing_or_unknown_action_is_refused() {
+        assert!(resolve_capability("route", &json!({})).is_err());
+        assert!(resolve_capability("route", &json!({"action": "nonsense"})).is_err());
+        assert!(resolve_capability("introspect", &json!({"action": "nonsense"})).is_err());
+    }
+
+    /// Audit N1: serde parses `{"go_to": null}` into `NavigateAction::GoTo`, and a
+    /// REST array body positionally into the params struct. Neither may slip past
+    /// the gate as the bare tool name.
+    #[test]
+    fn non_string_action_and_non_object_args_are_refused() {
+        for (tool, action, ..) in AUTHZ_SPEC {
+            let tagged = json!({ "action": { *action: null } });
+            assert!(
+                resolve_capability(tool, &tagged).is_err(),
+                "{tool}: tagged-enum action {tagged} must be refused"
+            );
+            for bad in [
+                json!({"action": 1}),
+                json!({"action": [action]}),
+                json!({"action": null}),
+            ] {
+                assert!(
+                    resolve_capability(tool, &bad).is_err(),
+                    "{tool}: {bad} must be refused"
+                );
+            }
+            let positional = json!([action, "https://evil.example", null, null, null, null]);
+            assert!(
+                resolve_capability(tool, &positional).is_err(),
+                "{tool}: positional array body must be refused"
+            );
+        }
+        for body in [json!([]), json!(null), json!("eval"), json!(1)] {
+            assert!(
+                resolve_capability("eval_js", &body).is_err(),
+                "{body} must be refused"
+            );
+        }
     }
 
     #[test]

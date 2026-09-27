@@ -3928,7 +3928,8 @@ impl VictauriMcpHandler {
         // Centralized authorization: resolve the canonical `tool.action` capability
         // and gate on it BEFORE dispatch, so every compound action is checked
         // uniformly (not just the ones whose handler remembers to). See `authz`.
-        let capability = authz::canonical_capability(name, &args);
+        let capability =
+            authz::resolve_capability(name, &args).map_err(rest::ToolCallError::InvalidParams)?;
         if !self.state.privacy.is_call_allowed(name, &capability) {
             return Ok(tool_disabled(&capability));
         }
@@ -4933,7 +4934,8 @@ impl ServerHandler for VictauriMcpHandler {
         // Centralized authorization: gate on the canonical `tool.action` capability
         // resolved from the call arguments, matching the REST path in `execute_tool`.
         let args_value = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
-        let capability = authz::canonical_capability(&tool_name, &args_value);
+        let capability = authz::resolve_capability(&tool_name, &args_value)
+            .map_err(|msg| ErrorData::invalid_params(msg, None))?;
         if !self.state.privacy.is_call_allowed(&tool_name, &capability) {
             tracing::debug!(tool = %tool_name, capability = %capability, "tool call blocked by privacy config");
             return Ok(tool_disabled(&capability).into());
@@ -6239,6 +6241,33 @@ mod authz_dispatch_tests {
         match h.execute_tool(tool, args).await {
             Ok(r) => r,
             Err(_) => panic!("dispatch returned a transport error (arg parse failure)"),
+        }
+    }
+
+    /// Audit N1: `{"action": {"go_to": null}}` (a tag-shaped enum serde accepts) and a
+    /// positional array body used to be gated as the bare tool name, which the Test
+    /// profile allows for `navigate` — the handler then parsed and ran `go_to`. Both
+    /// shapes must now be refused as invalid params before any handler runs, in every
+    /// profile (FullControl with the action disabled is the other half of the bypass).
+    #[tokio::test]
+    async fn non_string_action_cannot_slip_past_the_gate() {
+        let mut full_minus_go_to = PrivacyConfig::default();
+        full_minus_go_to
+            .disabled_tools
+            .insert("navigate.go_to".to_string());
+        for privacy in [crate::privacy::test_privacy_config(), full_minus_go_to] {
+            let h = handler(privacy);
+            for args in [
+                serde_json::json!({"action": {"go_to": null}, "url": "https://evil.example"}),
+                serde_json::json!(["go_to", "https://evil.example", null, null, null, null]),
+                serde_json::json!({"action": 0, "url": "https://evil.example"}),
+            ] {
+                match h.execute_tool("navigate", args.clone()).await {
+                    Err(rest::ToolCallError::InvalidParams(_)) => {}
+                    Ok(r) => panic!("{args} reached dispatch: {:?}", r.content),
+                    Err(rest::ToolCallError::UnknownTool(t)) => panic!("{args}: unknown tool {t}"),
+                }
+            }
         }
     }
 
