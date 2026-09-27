@@ -4179,18 +4179,6 @@ impl VictauriMcpHandler {
         events
     }
 
-    /// The window an unlabeled eval lands on, mirroring the bridge's default selection
-    /// (`main` → first visible → any). Used only to detect the window disappearing mid-call.
-    fn default_window_label(&self) -> Option<String> {
-        let states = self.bridge.get_window_states(None);
-        states
-            .iter()
-            .find(|s| s.label == "main")
-            .or_else(|| states.iter().find(|s| s.visible))
-            .or_else(|| states.first())
-            .map(|s| s.label.clone())
-    }
-
     /// Resolve the EXACT window a native capture (`screenshot`, `trace`) should target, and
     /// require it to be visible. A native capture reads the on-screen surface; a hidden window
     /// has none, so the OS path (`PrintWindow` / `CGWindowListCreateImage`) silently returns
@@ -4522,69 +4510,64 @@ impl VictauriMcpHandler {
         // parse never sets it. A valid-but-slow eval (e.g. a `wait_for` poll) sets `started`
         // immediately and is left to run to the real timeout — the watchdog only fires when
         // the code never began executing.
+        // The watchdog and the settle logic live in the bridge's closure-private state (see
+        // `_evalArm`/`_evalSettle` in js_bridge.rs): the page can neither enumerate pending eval
+        // ids nor suppress results, and serialization uses a `JSON.stringify` captured before
+        // any page script ran.
         let watchdog = format!(
-            r"
-            (function () {{
-                window.__VIC_EVAL__ = window.__VIC_EVAL__ || {{}};
-                var s = (window.__VIC_EVAL__[{id_js}] =
-                    window.__VIC_EVAL__[{id_js}] || {{ started: false, done: false }});
-                setTimeout(function () {{
-                    if (s.started || s.done) return;
-                    s.done = true;
-                    try {{
-                        window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                            id: {id_js},
-                            result: JSON.stringify({{ __victauri_err: 'code did not begin executing within {PARSE_WATCHDOG_MS}ms — this almost always means a syntax/parse error in the submitted code (or the page main thread was blocked)' }})
-                        }});
-                    }} catch (e) {{}}
-                    delete window.__VIC_EVAL__[{id_js}];
-                }}, {PARSE_WATCHDOG_MS});
-            }})();
-            "
+            "(function () {{ var v = window.__VICTAURI__; \
+             if (v && v._evalArm) v._evalArm({id_js}, {PARSE_WATCHDOG_MS}); }})();"
         );
 
+        // `{code}` is followed by a NEWLINE so a trailing `// comment` in the user code cannot
+        // comment out the rest of the wrapper (it used to turn every such eval into a parse
+        // error reported as "did not begin executing").
         let inject = format!(
             r"
             (async () => {{
-                var __s = (window.__VIC_EVAL__ && window.__VIC_EVAL__[{id_js}]) || null;
-                if (__s) __s.started = true;
+                const __vic = {{ id: {id_js}, bridge: window.__VICTAURI__ }};
+                const __settle = (p) => (__vic.bridge && __vic.bridge._evalSettle)
+                    ? __vic.bridge._evalSettle(__vic.id, p)
+                    : window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
+                        id: __vic.id, result: JSON.stringify(p)
+                    }});
+                if (__vic.bridge && __vic.bridge._evalBegin) __vic.bridge._evalBegin(__vic.id);
                 try {{
-                    const __result = await (async () => {{ {code} }})();
-                    if (__s) {{ if (__s.done) return; __s.done = true; delete window.__VIC_EVAL__[{id_js}]; }}
+                    const __result = await (async () => {{ {code}
+ }})();
                     const __type = __result === undefined ? 'undefined'
                         : __result === null ? 'null' : 'value';
-                    const __val = __type === 'undefined' ? null
-                        : __type === 'null' ? null : __result;
-                    await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                        id: {id_js},
-                        result: JSON.stringify({{ __victauri_ok: __val, __victauri_type: __type }})
-                    }});
+                    const __val = __type === 'value' ? __result : null;
+                    await __settle({{ __victauri_ok: __val, __victauri_type: __type }});
                 }} catch (e) {{
-                    if (__s) {{ if (__s.done) return; __s.done = true; delete window.__VIC_EVAL__[{id_js}]; }}
-                    await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                        id: {id_js},
-                        result: JSON.stringify({{ __victauri_err: (function (x) {{
-                            // A Tauri command's `Err(serde struct)` rejects with a plain object:
-                            // `String(obj)` would collapse it to '[object Object]'.
-                            if (x && typeof x.message === 'string') return x.message;
-                            if (typeof x === 'string') return x;
-                            try {{ var s = JSON.stringify(x); if (s !== undefined) return s; }} catch (_) {{}}
-                            try {{ return String(x); }} catch (_) {{ return Object.prototype.toString.call(x); }}
-                        }})(e) }})
-                    }});
+                    await __settle({{ __victauri_err: (function (x) {{
+                        // A Tauri command's `Err(serde struct)` rejects with a plain object:
+                        // ``String(obj)`` would collapse it to '[object Object]'.
+                        if (x && typeof x.message === 'string') return x.message;
+                        if (typeof x === 'string') return x;
+                        try {{ var s = JSON.stringify(x); if (s !== undefined) return s; }} catch (_) {{}}
+                        try {{ return String(x); }} catch (_) {{ return Object.prototype.toString.call(x); }}
+                    }})(e) }});
                 }}
             }})();
             "
         );
 
-        // Inject the watchdog first so it is armed before the user code runs. Order is not
-        // critical (the user-code script no-ops the watchdog state if it ran first), but
-        // arming first minimises the window.
-        if let Err(e) = self.bridge.eval_webview(webview_label, &watchdog) {
-            self.state.pending_evals.lock().await.remove(&id);
-            return Err(format!("eval injection failed: {e}"));
-        }
-        if let Err(e) = self.bridge.eval_webview(webview_label, &inject) {
+        // Arm the watchdog first, in the window the bridge resolves, then deliver the user code
+        // to THAT SAME window — so both land together and we know exactly which window to watch.
+        let target = match self.bridge.eval_webview_resolved(webview_label, &watchdog) {
+            Ok(label) => label,
+            Err(e) => {
+                self.state.pending_evals.lock().await.remove(&id);
+                return Err(format!("eval injection failed: {e}"));
+            }
+        };
+        let deliver_to = if target.is_empty() {
+            webview_label
+        } else {
+            Some(target.as_str())
+        };
+        if let Err(e) = self.bridge.eval_webview(deliver_to, &inject) {
             self.state.pending_evals.lock().await.remove(&id);
             return Err(format!("eval injection failed: {e}"));
         }
@@ -4594,14 +4577,19 @@ impl VictauriMcpHandler {
         // outcome of code that closes its own window or quits the app (e.g. invoking a
         // `quit_app` command) — reporting them after the full timeout as "an unresolved
         // promise, an infinite loop…" misled agents into thinking the call never ran.
-        // Resolved lazily on the first liveness tick, so a fast eval never pays for it.
-        let mut watched: Option<Option<String>> = None;
+        //
+        // The window check runs in its own task: listing windows is a main-thread round trip
+        // that can take up to its 10s dispatch timeout on a busy UI, and must neither stall this
+        // wait nor push it past its deadline. A listing that FAILS (a busy or wedged UI) is not
+        // evidence of anything — only a successful listing that lacks the window is.
+        let watched: Option<String> = (!target.is_empty()).then_some(target);
         let mut shutdown = self.state.shutdown_tx.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut liveness = tokio::time::interval_at(
             tokio::time::Instant::now() + EVAL_WINDOW_WATCH_INTERVAL,
             EVAL_WINDOW_WATCH_INTERVAL,
         );
+        let mut check: Option<tokio::task::JoinHandle<Result<Vec<String>, String>>> = None;
         let mut rx = rx;
         let outcome = loop {
             tokio::select! {
@@ -4618,14 +4606,16 @@ impl VictauriMcpHandler {
                         ));
                     }
                 }
-                _ = liveness.tick() => {
-                    let watched = watched.get_or_insert_with(|| {
-                        webview_label
-                            .map(str::to_string)
-                            .or_else(|| self.default_window_label())
-                    });
-                    if let Some(label) = watched.as_deref()
-                        && !self.bridge.list_window_labels().iter().any(|l| l == label)
+                _ = liveness.tick(), if watched.is_some() && check.is_none() => {
+                    let bridge = Arc::clone(&self.bridge);
+                    check = Some(tokio::spawn(async move { bridge.try_list_window_labels() }));
+                }
+                listed = async { check.as_mut().expect("guarded by precondition").await },
+                    if check.is_some() =>
+                {
+                    check = None;
+                    if let (Ok(Ok(labels)), Some(label)) = (listed, watched.as_deref())
+                        && !labels.iter().any(|l| l == label)
                     {
                         break Err(Some(format!(
                             "window '{label}' was closed while the call was in flight, so no \
@@ -4637,7 +4627,9 @@ impl VictauriMcpHandler {
                 }
             }
         };
-
+        if let Some(pending_check) = check {
+            pending_check.abort();
+        }
         let early = match outcome {
             Ok(r) => Ok(r),
             Err(Some(msg)) => {
@@ -6521,6 +6513,91 @@ mod command_policy_dispatch_tests {
             "must not wait out the 20s eval timeout (took {:?})",
             started.elapsed()
         );
+    }
+
+    /// A bridge whose UI thread never answers a window listing (a busy/wedged UI), but which
+    /// otherwise behaves like `RecordingBridge`.
+    struct WedgedListingBridge(RecordingBridge);
+
+    impl WebviewBridge for WedgedListingBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            self.0.eval_webview(label, script)
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn try_list_window_labels(&self) -> Result<Vec<String>, String> {
+            Err("list_window_labels did not complete on the main thread: timed out".to_string())
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
+    }
+
+    #[tokio::test]
+    async fn page_originated_evals_cannot_starve_agent_evals() {
+        // Red-team: page JS can call victauri_eval_js; with one shared pool it could park
+        // never-resolving evals in all 100 slots and fail every agent eval.
+        let state = state_with(PrivacyConfig::default());
+        let mut held = Vec::new();
+        for i in 0..crate::tools::MAX_PAGE_PENDING_EVALS {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let id = format!("{}{i}", crate::tools::PAGE_EVAL_PREFIX);
+            crate::tools::reserve_page_eval(&state, &id, tx)
+                .await
+                .unwrap();
+            held.push(rx);
+        }
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let over = crate::tools::reserve_page_eval(&state, "page:over", tx).await;
+        assert!(over.unwrap_err().contains("page-originated"));
+        // The agent path still has room.
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let (tx, _rx2) = tokio::sync::oneshot::channel();
+        assert!(h.reserve_pending("agent-1", tx).await.is_ok());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_busy_ui_is_not_mistaken_for_a_closed_window() {
+        // Red-team finding: a main-thread listing that times out returned `[]`, which the
+        // eval watch read as "window closed … it most likely ran — do not re-run it". A
+        // listing that FAILS is not evidence; the eval must run to its own timeout instead.
+        let Ok(mut s) = Arc::try_unwrap(state_with(PrivacyConfig::default())) else {
+            unreachable!("fresh Arc has one owner")
+        };
+        s.eval_timeout = std::time::Duration::from_millis(2500);
+        let state = Arc::new(s);
+        let bridge = WedgedListingBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(
+            !text.contains("was closed"),
+            "false 'window closed': {text}"
+        );
+        assert!(text.contains("timed out"), "{text}");
     }
 
     #[tokio::test]

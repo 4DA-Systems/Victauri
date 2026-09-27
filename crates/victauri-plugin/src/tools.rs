@@ -4,34 +4,57 @@ use victauri_core::{IpcCall, WindowState};
 
 use crate::VictauriState;
 
+/// Id prefix for evals started by page JS through these Tauri commands (vs. by an agent).
+pub(crate) const PAGE_EVAL_PREFIX: &str = "page:";
+/// Pending-eval slots page-originated evals may hold at once. They share the pending map with
+/// the agent's (MCP) evals; without their own small budget, page script could park
+/// never-resolving evals in every slot and starve the agent with "too many concurrent evals".
+pub(crate) const MAX_PAGE_PENDING_EVALS: usize = 10;
+
+/// Reserve a pending-eval slot for a page-originated eval, within both the page budget and the
+/// global ceiling.
+pub(crate) async fn reserve_page_eval(
+    state: &VictauriState,
+    id: &str,
+    tx: tokio::sync::oneshot::Sender<String>,
+) -> Result<(), String> {
+    let mut pending = state.pending_evals.lock().await;
+    let page_pending = pending
+        .keys()
+        .filter(|k| k.starts_with(PAGE_EVAL_PREFIX))
+        .count();
+    if page_pending >= MAX_PAGE_PENDING_EVALS {
+        return Err(format!(
+            "too many concurrent page-originated evals (limit {MAX_PAGE_PENDING_EVALS})"
+        ));
+    }
+    if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
+        return Err(format!(
+            "too many concurrent evals (limit {})",
+            crate::mcp::MAX_PENDING_EVALS
+        ));
+    }
+    pending.insert(id.to_string(), tx);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn victauri_eval_js<R: Runtime>(
     webview: tauri::WebviewWindow<R>,
     state: State<'_, Arc<VictauriState>>,
     code: String,
 ) -> Result<String, String> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = format!("{PAGE_EVAL_PREFIX}{}", uuid::Uuid::new_v4());
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    {
-        // Same ceiling the MCP eval path enforces: page JS can reach these commands, and
-        // never-resolving evals must not be able to fill the shared map and starve every
-        // agent eval with "too many concurrent" errors.
-        let mut pending = state.pending_evals.lock().await;
-        if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
-            return Err(format!(
-                "too many concurrent evals (limit {})",
-                crate::mcp::MAX_PENDING_EVALS
-            ));
-        }
-        pending.insert(id.clone(), tx);
-    }
+    reserve_page_eval(&state, &id, tx).await?;
 
     let inject = format!(
         r"
         (async () => {{
             try {{
-                const __result = await (async () => {{ {code} }})();
+                const __result = await (async () => {{ {code}
+ }})();
                 await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
                     id: '{id}',
                     result: JSON.stringify(__result)
@@ -94,22 +117,10 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
     webview: tauri::WebviewWindow<R>,
     state: State<'_, Arc<VictauriState>>,
 ) -> Result<String, String> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = format!("{PAGE_EVAL_PREFIX}{}", uuid::Uuid::new_v4());
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    {
-        // Same ceiling the MCP eval path enforces: page JS can reach these commands, and
-        // never-resolving evals must not be able to fill the shared map and starve every
-        // agent eval with "too many concurrent" errors.
-        let mut pending = state.pending_evals.lock().await;
-        if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
-            return Err(format!(
-                "too many concurrent evals (limit {})",
-                crate::mcp::MAX_PENDING_EVALS
-            ));
-        }
-        pending.insert(id.clone(), tx);
-    }
+    reserve_page_eval(&state, &id, tx).await?;
 
     let inject = format!(
         r"

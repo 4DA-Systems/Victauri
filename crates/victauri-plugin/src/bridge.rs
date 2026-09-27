@@ -27,14 +27,16 @@ pub trait WebviewBridge: Send + Sync {
         Ok(self.list_window_labels())
     }
     /// Like [`eval_webview`](Self::eval_webview), but returns the label of the window the
-    /// script was actually delivered to (for `None`, the resolved default window).
+    /// script was actually delivered to (for `None`, the resolved default window). The default
+    /// implementation returns the requested label, or an EMPTY string when it cannot know which
+    /// window a `None` label resolved to — callers must treat empty as "unknown".
     ///
     /// # Errors
     ///
     /// Returns an error string if no matching window is found or the eval fails.
     fn eval_webview_resolved(&self, label: Option<&str>, script: &str) -> Result<String, String> {
         self.eval_webview(label, script)?;
-        Ok(label.unwrap_or("main").to_string())
+        Ok(label.map(str::to_string).unwrap_or_default())
     }
     /// Return the platform-native window handle for screenshot capture.
     /// Windows: `HWND`, macOS: `CGWindowID` (window number), Linux: `X11` window ID.

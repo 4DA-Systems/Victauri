@@ -274,11 +274,61 @@ const INIT_SCRIPT_BODY: &str = r#"
         });
     }
 
+    // ── Eval bookkeeping (closure-private) ──────────────────────────────────
+    //
+    // The per-eval state used to live on a page-visible global (`window.__VIC_EVAL__`), so page
+    // script could enumerate pending eval ids and forge their results via the callback command,
+    // or suppress every result. It now lives in this closure, reachable only through the frozen,
+    // non-configurable `__VICTAURI__` methods below, which never reveal an id. Serialization uses
+    // `JSON.stringify` captured here, at init, before any page script can replace it.
+    var PRISTINE_STRINGIFY = JSON.stringify;
+    var evalState = new Map();
+    function evalCallback(id, body) {
+        try {
+            return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
+        } catch (e) { return null; }
+    }
+
     // ── Public API ───────────────────────────────────────────────────────────
 
     window.__VICTAURI__ = {
         version: '__VICTAURI_BRIDGE_VERSION__',
         _captureIpcBodies: true,
+
+        // Eval plumbing used by Victauri's injected eval scripts (not a user API).
+        // Arm the parse watchdog: if the user-code script never begins executing within `ms`
+        // (almost always a syntax error, which fails the whole script), report that instead of
+        // letting the caller wait for its full timeout.
+        _evalArm: function(id, ms) {
+            id = String(id);
+            if (evalState.has(id)) return;
+            var s = { started: false, done: false };
+            evalState.set(id, s);
+            setTimeout(function() {
+                if (s.started || s.done) return;
+                s.done = true;
+                evalState.delete(id);
+                evalCallback(id, PRISTINE_STRINGIFY({ __victauri_err: 'code did not begin executing within ' + ms + 'ms — this almost always means a syntax/parse error in the submitted code (or the page main thread was blocked)' }));
+            }, ms);
+        },
+        _evalBegin: function(id) {
+            var s = evalState.get(String(id));
+            if (s) s.started = true;
+        },
+        // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
+        _evalSettle: function(id, payload) {
+            id = String(id);
+            var s = evalState.get(id);
+            if (s) {
+                if (s.done) return null;
+                s.done = true;
+                evalState.delete(id);
+            }
+            var body;
+            try { body = PRISTINE_STRINGIFY(payload); }
+            catch (e) { body = PRISTINE_STRINGIFY({ __victauri_err: String((e && e.message) || e) }); }
+            return evalCallback(id, body);
+        },
 
         // ── DOM ──────────────────────────────────────────────────────────────
 
