@@ -30,17 +30,8 @@ assert_eq!(log.capacity(), 1000);
 
 // Command registry with search
 let registry = CommandRegistry::new();
-registry.register(CommandInfo {
-    name: "greet".to_string(),
-    plugin: None,
-    description: Some("Greet the user".to_string()),
-    args: vec![],
-    return_type: None,
-    is_async: false,
-    intent: None,
-    category: None,
-    examples: vec![],
-});
+// `CommandInfo` is `#[non_exhaustive]`: build it with the constructor and builders.
+registry.register(CommandInfo::new("greet").with_description("Greet the user"));
 let results = registry.search("greet");
 assert_eq!(results.len(), 1);
 ```

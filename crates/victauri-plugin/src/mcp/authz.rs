@@ -492,7 +492,7 @@ mod tests {
         ("logs", "events", "logs.events", true, true),
         ("logs", "slow_ipc", "logs.slow_ipc", true, true),
         ("logs", "clear", "logs.clear", false, true),
-        // introspect — FullControl-only (all 14 actions)
+        // introspect — FullControl-only (all 15 actions)
         (
             "introspect",
             "command_timings",

@@ -32,7 +32,9 @@ if (Get-Command bash -ErrorAction SilentlyContinue) {
     Write-Host "`n=== doc-count lint ===" -ForegroundColor Cyan
     Write-Host "skipped: bash not found (enforced by CI)" -ForegroundColor Yellow
 }
-Run "workspace tests"     { cargo test --workspace --features sqlite }
+Run "bridge test deps"    { npm ci --prefix crates/victauri-plugin/tests/bridge_tests --no-audit --no-fund }
+# VICTAURI_REQUIRE_JSDOM turns a missing jsdom into a failure instead of a silent skip.
+Run "workspace tests"     { $env:VICTAURI_REQUIRE_JSDOM = '1'; try { cargo test --workspace --features sqlite } finally { Remove-Item Env:VICTAURI_REQUIRE_JSDOM } }
 
 Write-Host ""
 if ($failed.Count -gt 0) {

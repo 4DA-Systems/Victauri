@@ -51,7 +51,15 @@ fn jsdom_available() -> bool {
 
 fn run_tests(def: &TestDef) -> Option<Vec<TestResult>> {
     if !jsdom_available() {
-        eprintln!("SKIP: jsdom not installed (run `npm install` in tests/bridge_tests/)");
+        // A skip is a silent pass, so it is only allowed where nobody relies on the
+        // result: CI (and the release preflight) must actually run these tests.
+        assert!(
+            std::env::var_os("CI").is_none()
+                && std::env::var_os("VICTAURI_REQUIRE_JSDOM").is_none(),
+            "jsdom is not installed, so the JS bridge tests cannot run: \
+             `npm ci` in crates/victauri-plugin/tests/bridge_tests/"
+        );
+        eprintln!("SKIP: jsdom not installed (run `npm ci` in tests/bridge_tests/)");
         return None;
     }
 

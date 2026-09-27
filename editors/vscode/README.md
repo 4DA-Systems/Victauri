@@ -94,7 +94,7 @@ The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op in
 
 ## Compatibility
 
-Tested against 5 real-world open-source Tauri apps (867/895 tests passing = 96.9%):
+In a one-time evaluation (May 2026, on an older Victauri release) against 5 real-world open-source Tauri apps, 867/895 checks passed (96.9%). Results of that evaluation (the per-release harness in `scripts/compat` re-verifies Kanri, En Croissant and Lettura on each release):
 
 | App | Framework | Result |
 |---|---|---|

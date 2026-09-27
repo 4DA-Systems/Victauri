@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.4da-systems/victauri",
+  "name": "io.github.4DA-Systems/victauri",
   "title": "Victauri",
   "description": "Full-stack introspection and control for Tauri apps: DOM, IPC with bodies, Rust backend state, and SQLite through one in-process server. Debug builds only.",
   "version": "0.9.0",

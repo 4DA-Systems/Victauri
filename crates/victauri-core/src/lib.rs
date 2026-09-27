@@ -77,3 +77,10 @@ pub fn acquire_write<'a, T>(
         poisoned.into_inner()
     })
 }
+
+/// Compiles the README's examples as doctests, so the crates.io landing page
+/// cannot drift from the API again (its `CommandInfo` struct literal outlived the
+/// 0.9 `#[non_exhaustive]` change).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
