@@ -5177,6 +5177,7 @@ const STMT_STARTS: &[&str] = &[
 ];
 
 /// Resolve `.` and `..` components without touching the filesystem.
+#[cfg(feature = "sqlite")]
 fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
     let mut out = std::path::PathBuf::new();
     for component in path.components() {
