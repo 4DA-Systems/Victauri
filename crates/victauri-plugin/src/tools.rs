@@ -94,7 +94,8 @@ pub async fn victauri_eval_js<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn victauri_eval_callback(
+pub async fn victauri_eval_callback<R: Runtime>(
+    webview: tauri::Webview<R>,
     state: State<'_, Arc<VictauriState>>,
     id: String,
     result: String,
@@ -104,6 +105,10 @@ pub async fn victauri_eval_callback(
             .bridge_ready
             .store(true, std::sync::atomic::Ordering::Release);
         state.bridge_notify.notify_waiters();
+        // A (re)initialized bridge means this window loaded a new page: any eval still pending
+        // in its previous page can never answer. The label comes from Tauri (the calling
+        // webview), so page script cannot touch another window's generation.
+        state.page_loads.record_load(webview.label());
         return Ok(());
     }
     if let Some(tx) = state.pending_evals.lock().await.remove(&id) {

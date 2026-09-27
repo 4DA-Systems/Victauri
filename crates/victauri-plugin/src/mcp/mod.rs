@@ -108,6 +108,9 @@ const DB_HEALTH_COUNT_BUDGET: std::time::Duration = std::time::Duration::from_se
 #[cfg(feature = "sqlite")]
 const DB_HEALTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A page load within this long of an eval's injection is attributed to the page the eval is
+/// running in (a late ready signal), not to a reload that killed it.
+const PAGE_RELOAD_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
 /// How often a slow eval re-checks that its target window still exists (first check after
@@ -4608,6 +4611,11 @@ impl VictauriMcpHandler {
                 return Err(format!("eval injection failed: {e}"));
             }
         };
+        // If the target window loads a NEW page after the code was delivered, the result can
+        // never arrive. The grace period absorbs the ready signal of the page the code is
+        // running in (sent fire-and-forget at bridge init, so it can land just after our
+        // probe) — a load only counts once it is clearly later than the injection.
+        let reload_cutoff = std::time::Instant::now() + PAGE_RELOAD_GRACE;
         let deliver_to = if target.is_empty() {
             webview_label
         } else {
@@ -4636,10 +4644,27 @@ impl VictauriMcpHandler {
             EVAL_WINDOW_WATCH_INTERVAL,
         );
         let mut check: Option<tokio::task::JoinHandle<Result<Vec<String>, String>>> = None;
+        let page_reloaded =
+            || {
+                watched.as_deref().and_then(|label| {
+                    self.state.page_loads.loaded_after(label, reload_cutoff).then(|| {
+                    format!(
+                        "window '{label}' loaded a new page (a reload or navigation) while the \
+                         call was in flight, so no result will arrive. The code may or may not \
+                         have run before the reload — check the app's state before re-running it."
+                    )
+                })
+                })
+            };
         let mut rx = rx;
         let outcome = loop {
             tokio::select! {
                 r = &mut rx => break Ok(r),
+                () = self.state.page_loads.changed() => {
+                    if let Some(msg) = page_reloaded() {
+                        break Err(Some(msg));
+                    }
+                }
                 () = tokio::time::sleep_until(deadline) => break Err(None),
                 changed = shutdown.changed() => {
                     if changed.is_err() || *shutdown.borrow() {
@@ -4653,6 +4678,10 @@ impl VictauriMcpHandler {
                     }
                 }
                 _ = liveness.tick(), if watched.is_some() && check.is_none() => {
+                    // Backstop for a page-load notification that fired between select rounds.
+                    if let Some(msg) = page_reloaded() {
+                        break Err(Some(msg));
+                    }
                     let bridge = Arc::clone(&self.bridge);
                     check = Some(tokio::spawn(async move { bridge.try_list_window_labels() }));
                 }
@@ -6155,6 +6184,7 @@ mod authz_dispatch_tests {
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
             drain_watermarks: crate::introspection::DrainWatermarks::default(),
+            page_loads: crate::introspection::PageLoads::default(),
         })
     }
 
@@ -6546,6 +6576,7 @@ mod command_policy_dispatch_tests {
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
             drain_watermarks: crate::introspection::DrainWatermarks::default(),
+            page_loads: crate::introspection::PageLoads::default(),
         })
     }
 
@@ -6870,6 +6901,97 @@ mod command_policy_dispatch_tests {
             !text.contains("was closed"),
             "false 'window closed': {text}"
         );
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    /// `RecordingBridge`, but reporting a live `main` window (so only page loads are in play).
+    struct MainWindowBridge(RecordingBridge);
+
+    impl WebviewBridge for MainWindowBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            self.0.eval_webview(label, script)
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            vec!["main".to_string()]
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
+    }
+
+    fn eval_state_with_timeout(ms: u64) -> Arc<VictauriState> {
+        let Ok(mut s) = Arc::try_unwrap(state_with(PrivacyConfig::default())) else {
+            unreachable!("fresh Arc has one owner")
+        };
+        s.eval_timeout = std::time::Duration::from_millis(ms);
+        Arc::new(s)
+    }
+
+    #[tokio::test]
+    async fn eval_fails_fast_when_its_page_reloads() {
+        let state = eval_state_with_timeout(20_000);
+        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let reloader = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            reloader.page_loads.record_load("main"); // the page reloaded
+        });
+        let started = std::time::Instant::now();
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(text.contains("loaded a new page"), "{text}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "must not wait out the 20s timeout (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            state.pending_evals.lock().await.is_empty(),
+            "pending entry removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_ready_signal_from_the_same_page_is_not_a_reload() {
+        // The bridge's ready signal is fire-and-forget at init and can land just after our
+        // probe; it belongs to the page the eval runs in and must not be read as a reload.
+        let state = eval_state_with_timeout(1_500);
+        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let late = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            late.page_loads.record_load("main");
+        });
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(!text.contains("loaded a new page"), "false reload: {text}");
         assert!(text.contains("timed out"), "{text}");
     }
 
@@ -7308,6 +7430,7 @@ mod screenshot_visibility_tests {
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
             drain_watermarks: crate::introspection::DrainWatermarks::default(),
+            page_loads: crate::introspection::PageLoads::default(),
         });
         VictauriMcpHandler::new(state, bridge)
     }

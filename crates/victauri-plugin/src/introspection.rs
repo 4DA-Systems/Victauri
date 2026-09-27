@@ -1247,6 +1247,43 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
     children
 }
 
+// ── Page loads ─────────────────────────────────────────────────────────────
+
+/// When each window last loaded a page, recorded whenever its JS bridge (re)initializes — i.e.
+/// on every page load or reload. An eval running in a page that has since been replaced can
+/// never deliver its result, so a later load lets the caller fail fast ("the page reloaded while
+/// the call was in flight") instead of waiting out the full timeout.
+#[derive(Default)]
+pub struct PageLoads {
+    last_load: std::sync::Mutex<HashMap<String, Instant>>,
+    changed: tokio::sync::Notify,
+}
+
+impl PageLoads {
+    /// Record that window `label` loaded a (new) page now.
+    pub fn record_load(&self, label: &str) {
+        self.last_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(label.to_string(), Instant::now());
+        self.changed.notify_waiters();
+    }
+
+    /// Whether window `label` loaded a page strictly after `t`.
+    #[must_use]
+    pub fn loaded_after(&self, label: &str, t: Instant) -> bool {
+        self.last_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(label)
+            .is_some_and(|at| *at > t)
+    }
+
+    /// Resolves the next time any window records a page load.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+}
 // ── Recording drain watermarks ─────────────────────────────────────────────
 
 /// Per-window high-water marks for pulling the JS bridge's event stream into a recording,
