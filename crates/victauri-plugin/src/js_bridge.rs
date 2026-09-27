@@ -418,9 +418,15 @@ const INIT_SCRIPT_BODY: &str = r#"
             var maxResults = query.max_results || 10;
 
             if (query.css) {
-                try { document.body.matches(query.css); } catch(e) {
+                // Validate against a detached fragment, not document.body: while the page is
+                // reloading `body` is null, and the resulting TypeError used to be reported as
+                // "invalid CSS selector" for a perfectly valid selector.
+                try { document.createDocumentFragment().querySelector(query.css); } catch(e) {
                     return { error: 'invalid CSS selector: ' + query.css + ' — ' + e.message };
                 }
+            }
+            if (!document.body) {
+                return { error: 'page not ready: the document has no body yet (it may be loading or reloading) — retry shortly' };
             }
 
             function matches(el) {

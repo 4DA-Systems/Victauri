@@ -5221,3 +5221,42 @@ fn bridge_hardening_regressions() {
     assert_eq!(x["url_is_string"], "string");
     assert_ne!(x["status"], "pending");
 }
+
+// Live-4DA soak finding: during a page reload `document.body` is null, and find_elements
+// reported a VALID selector as "invalid CSS selector" (the null TypeError was misattributed).
+#[test]
+fn find_elements_distinguishes_page_not_ready_from_bad_selector() {
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![
+            case(
+                "valid selector with no body reports page-not-ready",
+                r"
+                    document.documentElement.removeChild(document.body);
+                    return window.__VICTAURI__.findElements({ css: 'button' });
+                ",
+            ),
+            case(
+                "invalid selector is still reported as invalid",
+                r"return window.__VICTAURI__.findElements({ css: 'button[' });",
+            ),
+        ],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let no_body = results[0].result.as_ref().unwrap()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(no_body.contains("page not ready"), "{no_body}");
+    assert!(!no_body.contains("invalid CSS selector"), "{no_body}");
+    let bad = results[1].result.as_ref().unwrap()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(bad.contains("invalid CSS selector"), "{bad}");
+}
