@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// Current state of a Tauri window including geometry, visibility, and loaded URL.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct WindowState {
     /// Tauri window label (e.g. "main", "notification").
     pub label: String,
@@ -29,6 +30,7 @@ pub struct WindowState {
 
 /// A point-in-time snapshot of the DOM accessible tree from a specific webview.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DomSnapshot {
     /// Label of the webview this snapshot was taken from.
     pub webview_label: String,
@@ -40,6 +42,7 @@ pub struct DomSnapshot {
 
 /// A single element in the accessible DOM tree with semantic metadata and ref handle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct DomElement {
     /// Unique ref handle for this element (e.g. "e3"), used to target interactions.
     pub ref_id: String,
@@ -69,6 +72,7 @@ pub struct DomElement {
 
 /// Pixel-level bounding rectangle of a DOM element relative to the viewport.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ElementBounds {
     /// Left edge offset from viewport origin.
     pub x: f64,
@@ -80,33 +84,127 @@ pub struct ElementBounds {
     pub height: f64,
 }
 
+impl WindowState {
+    /// Creates a window state for `label` with every other field zeroed
+    /// (empty title/URL, not visible/focused/maximized/minimized/fullscreen,
+    /// position `(0, 0)`, size `(0, 0)`). Chain the `with_*` setters to fill it in.
+    ///
+    /// `WindowState` is `#[non_exhaustive]`; `victauri_plugin::bridge::WebviewBridge`
+    /// implementors and mock bridges outside this crate build it through this constructor.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use victauri_core::WindowState;
+    ///
+    /// let w = WindowState::new("main")
+    ///     .with_title("My App")
+    ///     .with_url("http://localhost/")
+    ///     .with_visible(true)
+    ///     .with_size(800, 600);
+    /// assert_eq!(w.label, "main");
+    /// assert_eq!(w.size, (800, 600));
+    /// assert!(!w.focused);
+    /// ```
+    #[must_use]
+    pub fn new(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            title: String::new(),
+            url: String::new(),
+            visible: false,
+            focused: false,
+            maximized: false,
+            minimized: false,
+            fullscreen: false,
+            position: (0, 0),
+            size: (0, 0),
+        }
+    }
+
+    /// Sets the window title.
+    #[must_use]
+    pub fn with_title(mut self, title: impl Into<String>) -> Self {
+        self.title = title.into();
+        self
+    }
+
+    /// Sets the URL loaded in the webview.
+    #[must_use]
+    pub fn with_url(mut self, url: impl Into<String>) -> Self {
+        self.url = url.into();
+        self
+    }
+
+    /// Sets whether the window is visible.
+    #[must_use]
+    pub fn with_visible(mut self, visible: bool) -> Self {
+        self.visible = visible;
+        self
+    }
+
+    /// Sets whether the window has input focus.
+    #[must_use]
+    pub fn with_focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+
+    /// Sets whether the window is maximized.
+    #[must_use]
+    pub fn with_maximized(mut self, maximized: bool) -> Self {
+        self.maximized = maximized;
+        self
+    }
+
+    /// Sets whether the window is minimized.
+    #[must_use]
+    pub fn with_minimized(mut self, minimized: bool) -> Self {
+        self.minimized = minimized;
+        self
+    }
+
+    /// Sets whether the window is fullscreen.
+    #[must_use]
+    pub fn with_fullscreen(mut self, fullscreen: bool) -> Self {
+        self.fullscreen = fullscreen;
+        self
+    }
+
+    /// Sets the window position in screen coordinates.
+    #[must_use]
+    pub fn with_position(mut self, x: i32, y: i32) -> Self {
+        self.position = (x, y);
+        self
+    }
+
+    /// Sets the window size in pixels.
+    #[must_use]
+    pub fn with_size(mut self, width: u32, height: u32) -> Self {
+        self.size = (width, height);
+        self
+    }
+}
+
 impl DomSnapshot {
     /// Renders the snapshot as indented accessible text (roles, names, and ref handles).
     ///
     /// # Examples
     ///
     /// ```
-    /// use victauri_core::{DomSnapshot, DomElement};
-    /// use std::collections::BTreeMap;
+    /// use victauri_core::DomSnapshot;
     ///
-    /// let snapshot = DomSnapshot {
-    ///     webview_label: "main".to_string(),
-    ///     elements: vec![DomElement {
-    ///         ref_id: "e1".to_string(),
-    ///         tag: "button".to_string(),
-    ///         role: Some("button".to_string()),
-    ///         name: Some("Submit".to_string()),
-    ///         text: None,
-    ///         value: None,
-    ///         enabled: true,
-    ///         visible: true,
-    ///         focusable: true,
-    ///         bounds: None,
-    ///         children: vec![],
-    ///         attributes: BTreeMap::new(),
+    /// // Snapshots are produced by the webview bridge; here one is parsed from JSON.
+    /// let snapshot: DomSnapshot = serde_json::from_value(serde_json::json!({
+    ///     "webview_label": "main",
+    ///     "elements": [{
+    ///         "ref_id": "e1", "tag": "button", "role": "button", "name": "Submit",
+    ///         "text": null, "value": null, "enabled": true, "visible": true,
+    ///         "focusable": true, "bounds": null, "children": [], "attributes": {}
     ///     }],
-    ///     ref_map: BTreeMap::new(),
-    /// };
+    ///     "ref_map": {}
+    /// }))
+    /// .unwrap();
     /// let text = snapshot.to_accessible_text(0);
     /// assert!(text.contains("button"));
     /// assert!(text.contains("Submit"));

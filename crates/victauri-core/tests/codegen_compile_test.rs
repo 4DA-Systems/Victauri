@@ -11,12 +11,7 @@ use victauri_core::recording::{RecordedEvent, RecordedSession};
 use victauri_core::{generate_test, generate_test_default};
 
 fn make_session(events: Vec<RecordedEvent>) -> RecordedSession {
-    RecordedSession {
-        id: "codegen-drift-test".to_string(),
-        started_at: Utc::now(),
-        events,
-        checkpoints: vec![],
-    }
+    RecordedSession::new("codegen-drift-test".to_string(), Utc::now(), events, vec![])
 }
 
 fn interaction(
@@ -27,17 +22,17 @@ fn interaction(
     offset_ms: i64,
 ) -> RecordedEvent {
     let ts = Utc::now() + Duration::milliseconds(offset_ms);
-    RecordedEvent {
+    RecordedEvent::new(
         index,
-        timestamp: ts,
-        event: AppEvent::DomInteraction {
+        ts,
+        AppEvent::dom_interaction(
             action,
-            selector: selector.to_string(),
-            value: value.map(String::from),
-            timestamp: ts,
-            webview_label: "main".to_string(),
-        },
-    }
+            selector.to_string(),
+            value.map(String::from),
+            ts,
+            "main".to_string(),
+        ),
+    )
 }
 
 /// The canonical set of `VictauriClient` method names. If the client adds or

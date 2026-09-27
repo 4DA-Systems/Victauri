@@ -14,6 +14,7 @@ const DEFAULT_MAX_EVENTS: usize = 50_000;
 
 /// A snapshot of application state taken at a specific point during recording.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StateCheckpoint {
     /// Unique identifier for this checkpoint.
     pub id: String,
@@ -29,6 +30,7 @@ pub struct StateCheckpoint {
 
 /// A complete recorded session with events and state checkpoints. Serializable for export/import.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RecordedSession {
     /// Unique session identifier (UUID).
     pub id: String,
@@ -42,6 +44,7 @@ pub struct RecordedSession {
 
 /// A single event captured during a recording session, with its sequence index.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RecordedEvent {
     /// Monotonically increasing sequence number within the recording session.
     pub index: usize,
@@ -49,6 +52,48 @@ pub struct RecordedEvent {
     pub timestamp: DateTime<Utc>,
     /// The captured application event.
     pub event: AppEvent,
+}
+
+impl RecordedSession {
+    /// Creates a recorded session from its parts (e.g. when importing a
+    /// session built outside a live [`EventRecorder`]).
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        started_at: DateTime<Utc>,
+        events: Vec<RecordedEvent>,
+        checkpoints: Vec<StateCheckpoint>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            started_at,
+            events,
+            checkpoints,
+        }
+    }
+}
+
+impl RecordedEvent {
+    /// Creates a recorded event with the given sequence index.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use victauri_core::{AppEvent, RecordedEvent, RecordedSession};
+    ///
+    /// let now = chrono::Utc::now();
+    /// let ev = RecordedEvent::new(0, now, AppEvent::window_event("main", "focus", now));
+    /// let session = RecordedSession::new("s1", now, vec![ev], vec![]);
+    /// assert_eq!(session.events.len(), 1);
+    /// ```
+    #[must_use]
+    pub fn new(index: usize, timestamp: DateTime<Utc>, event: AppEvent) -> Self {
+        Self {
+            index,
+            timestamp,
+            event,
+        }
+    }
 }
 
 /// Thread-safe session recorder for time-travel debugging. Records events and

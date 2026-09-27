@@ -13,6 +13,7 @@ use serde::Serialize;
 
 /// Per-command timing statistics aggregated from IPC invocations.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct CommandTimingStats {
     /// Command name.
     pub command: String,
@@ -187,6 +188,7 @@ impl Default for CommandTimings {
 
 /// The type of fault to inject into a command.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub enum FaultType {
     /// Add artificial latency before command execution.
     Delay {
@@ -206,6 +208,7 @@ pub enum FaultType {
 
 /// Configuration for a single fault injection rule.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FaultConfig {
     /// Target command name.
     pub command: String,
@@ -225,6 +228,19 @@ pub struct FaultConfig {
 pub const FAULT_TTL: Duration = Duration::from_secs(900); // 15 minutes
 
 impl FaultConfig {
+    /// Creates a fault rule for `command`, created now with zero triggers so far.
+    /// `max_triggers == 0` means unlimited (until [`FAULT_TTL`] expires it).
+    #[must_use]
+    pub fn new(command: impl Into<String>, fault_type: FaultType, max_triggers: u64) -> Self {
+        Self {
+            command: command.into(),
+            fault_type,
+            trigger_count: 0,
+            max_triggers,
+            created_at: Instant::now(),
+        }
+    }
+
     /// Whether this fault should still trigger, evaluated at `now`. A fault is
     /// inert once it is older than [`FAULT_TTL`] or has hit `max_triggers`.
     #[must_use]
@@ -322,6 +338,7 @@ impl Default for FaultRegistry {
 
 /// Describes the shape of a JSON value for contract comparison.
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[non_exhaustive]
 pub enum JsonShape {
     /// null
     Null,
@@ -376,6 +393,7 @@ impl JsonShape {
 
 /// A recorded contract baseline for a command's response.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ContractBaseline {
     /// Command name.
     pub command: String,
@@ -389,8 +407,29 @@ pub struct ContractBaseline {
     pub recorded_at: String,
 }
 
+impl ContractBaseline {
+    /// Creates a contract baseline for `command`.
+    #[must_use]
+    pub fn new(
+        command: impl Into<String>,
+        args: serde_json::Value,
+        shape: JsonShape,
+        sample: impl Into<String>,
+        recorded_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            args,
+            shape,
+            sample: sample.into(),
+            recorded_at: recorded_at.into(),
+        }
+    }
+}
+
 /// Differences found when checking a contract against baseline.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ContractDrift {
     /// Command name.
     pub command: String,
@@ -406,6 +445,7 @@ pub struct ContractDrift {
 
 /// A single field type change between baseline and current.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TypeChange {
     /// Dot-separated field path.
     pub path: String,
@@ -569,6 +609,7 @@ impl Default for ContractStore {
 
 /// A single phase in the startup timeline.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct StartupPhase {
     /// Phase name.
     pub name: String,
@@ -651,6 +692,7 @@ impl Default for StartupTimeline {
 
 /// A Tauri event captured from the application's native event bus.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct CapturedTauriEvent {
     /// Event name (e.g. "notification-added", `tauri://focus`).
     pub name: String,
@@ -658,6 +700,22 @@ pub struct CapturedTauriEvent {
     pub payload: String,
     /// ISO 8601 timestamp.
     pub timestamp: String,
+}
+
+impl CapturedTauriEvent {
+    /// Creates a captured event record (`timestamp` is an ISO 8601 string).
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        payload: impl Into<String>,
+        timestamp: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            payload: payload.into(),
+            timestamp: timestamp.into(),
+        }
+    }
 }
 
 const DEFAULT_EVENT_BUS_CAPACITY: usize = 1000;
@@ -808,6 +866,7 @@ impl AppStateProbes {
 
 /// Info about a tracked async task spawned by Victauri.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TrackedTaskInfo {
     /// Human-readable task name.
     pub name: String,
@@ -898,6 +957,7 @@ impl Default for TaskTracker {
 
 /// Information about a child process of the Tauri application.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ChildProcessInfo {
     /// Process ID.
     pub pid: u32,

@@ -1,11 +1,9 @@
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::json;
-use tokio::sync::Mutex;
-use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
 use victauri_plugin::mcp::build_app_stateful;
@@ -34,17 +32,17 @@ impl CallbackMockBridge {
         Self {
             windows: labels
                 .iter()
-                .map(|label| victauri_core::WindowState {
-                    label: label.to_string(),
-                    title: format!("{label} Window"),
-                    url: "http://localhost/".to_string(),
-                    visible: true,
-                    focused: labels.first() == Some(label),
-                    maximized: false,
-                    minimized: false,
-                    fullscreen: false,
-                    position: (100, 100),
-                    size: (800, 600),
+                .map(|label| {
+                    victauri_core::WindowState::new(label.to_string())
+                        .with_title(format!("{label} Window"))
+                        .with_url("http://localhost/".to_string())
+                        .with_visible(true)
+                        .with_focused(labels.first() == Some(label))
+                        .with_maximized(false)
+                        .with_minimized(false)
+                        .with_fullscreen(false)
+                        .with_position(100, 100)
+                        .with_size(800, 600)
                 })
                 .collect(),
             pending_evals,
@@ -131,29 +129,10 @@ impl WebviewBridge for CallbackMockBridge {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn make_state_with_privacy(privacy: PrivacyConfig) -> Arc<VictauriState> {
-    Arc::new(VictauriState {
-        event_log: EventLog::new(1000),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(0),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(1000),
-        privacy,
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
+    Arc::new({
+        let mut s = VictauriState::for_tests();
+        s.privacy = privacy;
+        s
     })
 }
 
@@ -977,9 +956,10 @@ async fn privacy_command_blocklist_blocks_invoke() {
 async fn privacy_command_allowlist_restricts_invoke() {
     let mut allow = HashSet::new();
     allow.insert("greet".to_string());
-    let config = PrivacyConfig {
-        command_allowlist: Some(allow),
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.command_allowlist = Some(allow);
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| "\"ok\"".to_string()).await;
@@ -1006,10 +986,11 @@ async fn privacy_blocklist_wins_over_allowlist() {
     allow.insert("save_key".to_string());
     let mut block = HashSet::new();
     block.insert("save_key".to_string());
-    let config = PrivacyConfig {
-        command_allowlist: Some(allow),
-        command_blocklist: block,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.command_allowlist = Some(allow);
+        c.command_blocklist = block;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| "\"ok\"".to_string()).await;
@@ -1031,9 +1012,10 @@ async fn privacy_blocklist_wins_over_allowlist() {
 
 #[tokio::test]
 async fn privacy_redaction_scrubs_eval_output() {
-    let config = PrivacyConfig {
-        redaction_enabled: true,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.redaction_enabled = true;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| {
@@ -1248,9 +1230,10 @@ async fn privacy_disable_all_tools() {
     for tool in &all_tools {
         disabled.insert(tool.to_string());
     }
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_server(state, &["main"]).await;
@@ -1284,9 +1267,10 @@ async fn privacy_disabled_tool_also_disabled_in_rest_listing() {
     let mut disabled = HashSet::new();
     disabled.insert("eval_js".to_string());
     disabled.insert("screenshot".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_server(state, &["main"]).await;
@@ -1319,9 +1303,10 @@ async fn privacy_disabled_tool_also_disabled_in_rest_listing() {
 
 #[tokio::test]
 async fn privacy_redaction_on_rest_api() {
-    let config = PrivacyConfig {
-        redaction_enabled: true,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.redaction_enabled = true;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| {

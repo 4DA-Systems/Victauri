@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// Metadata for a registered Tauri command, including intent and schema information.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CommandInfo {
     /// Fully qualified command name (e.g. "`get_settings`").
     pub name: String,
@@ -32,6 +33,7 @@ pub struct CommandInfo {
 
 /// Schema for a single argument of a registered command.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct CommandArg {
     /// Argument name as declared in the Rust function signature.
     pub name: String,
@@ -97,6 +99,87 @@ impl CommandInfo {
     #[must_use]
     pub fn with_category(mut self, category: impl Into<String>) -> Self {
         self.category = Some(category.into());
+        self
+    }
+
+    /// Sets the plugin namespace.
+    #[must_use]
+    pub fn with_plugin(mut self, plugin: impl Into<String>) -> Self {
+        self.plugin = Some(plugin.into());
+        self
+    }
+
+    /// Replaces the argument list.
+    #[must_use]
+    pub fn with_args(mut self, args: Vec<CommandArg>) -> Self {
+        self.args = args;
+        self
+    }
+
+    /// Appends one argument.
+    #[must_use]
+    pub fn with_arg(mut self, arg: CommandArg) -> Self {
+        self.args.push(arg);
+        self
+    }
+
+    /// Sets the Rust return type string.
+    #[must_use]
+    pub fn with_return_type(mut self, return_type: impl Into<String>) -> Self {
+        self.return_type = Some(return_type.into());
+        self
+    }
+
+    /// Sets whether the command handler is async.
+    #[must_use]
+    pub fn with_async(mut self, is_async: bool) -> Self {
+        self.is_async = is_async;
+        self
+    }
+
+    /// Replaces the example natural-language queries.
+    #[must_use]
+    pub fn with_examples(mut self, examples: Vec<String>) -> Self {
+        self.examples = examples;
+        self
+    }
+
+    /// Appends one example natural-language query.
+    #[must_use]
+    pub fn with_example(mut self, example: impl Into<String>) -> Self {
+        self.examples.push(example.into());
+        self
+    }
+}
+
+impl CommandArg {
+    /// Creates an argument schema with no JSON Schema attached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use victauri_core::{CommandArg, CommandInfo};
+    ///
+    /// let cmd = CommandInfo::new("greet")
+    ///     .with_arg(CommandArg::new("name", "String", true))
+    ///     .with_return_type("String");
+    /// assert_eq!(cmd.args[0].name, "name");
+    /// assert!(cmd.args[0].required);
+    /// ```
+    #[must_use]
+    pub fn new(name: impl Into<String>, type_name: impl Into<String>, required: bool) -> Self {
+        Self {
+            name: name.into(),
+            type_name: type_name.into(),
+            required,
+            schema: None,
+        }
+    }
+
+    /// Attaches a JSON Schema describing the argument's expected shape.
+    #[must_use]
+    pub fn with_schema(mut self, schema: serde_json::Value) -> Self {
+        self.schema = Some(schema);
         self
     }
 }
@@ -297,6 +380,7 @@ impl Default for CommandRegistry {
 
 /// A command paired with its relevance score from natural-language resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ScoredCommand {
     /// The matched command metadata.
     pub command: CommandInfo,

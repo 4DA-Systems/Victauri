@@ -42,6 +42,7 @@ impl MaskRegion {
 
 /// Named threshold presets for common use cases.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ThresholdPreset {
     /// Pixel-perfect: tolerance 0, threshold 0%.
     Strict,
@@ -75,6 +76,7 @@ impl ThresholdPreset {
 
 /// Result of comparing two screenshots pixel-by-pixel.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct VisualDiff {
     /// Percentage of pixels that matched (0.0 to 100.0).
     pub match_percentage: f64,

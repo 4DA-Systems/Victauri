@@ -633,6 +633,7 @@ pub fn is_webview_internal(path: &Path) -> bool {
 /// application actually uses.
 #[cfg(feature = "sqlite")]
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DbCandidate {
     /// Absolute path to the discovered database file.
     pub path: PathBuf,

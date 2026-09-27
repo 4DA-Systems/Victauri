@@ -938,7 +938,7 @@ pub fn parse_bridge_event(ev: &serde_json::Value) -> Option<victauri_core::AppEv
 /// [`parse_bridge_event`] for an event drained from the webview `label`. Uses the event's own
 /// JS timestamp (epoch ms) when present — not the drain time, which lags by up to the drain
 /// interval and collapses a burst of events onto one instant.
-pub fn parse_bridge_event_from(
+pub(super) fn parse_bridge_event_from(
     ev: &serde_json::Value,
     label: &str,
 ) -> Option<victauri_core::AppEvent> {
@@ -955,73 +955,67 @@ pub fn parse_bridge_event_from(
         .unwrap_or_else(Utc::now);
 
     let app_event = match event_type {
-        "console" => AppEvent::Console {
-            level: ev
-                .get("level")
+        "console" => AppEvent::console(
+            ev.get("level")
                 .and_then(|l| l.as_str())
                 .unwrap_or("log")
                 .to_string(),
-            message: ev
-                .get("message")
+            ev.get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_string(),
-            timestamp: now,
-        },
-        "dom_mutation" => AppEvent::DomMutation {
-            webview_label: label.to_string(),
-            timestamp: now,
-            mutation_count: ev
-                .get("count")
+            now,
+        ),
+        "dom_mutation" => AppEvent::dom_mutation(
+            label.to_string(),
+            now,
+            ev.get("count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
-        },
+        ),
         "ipc" => {
             let cmd = ev
                 .get("command")
                 .and_then(|c| c.as_str())
                 .unwrap_or("unknown");
-            AppEvent::Ipc(victauri_core::IpcCall {
-                id: uuid::Uuid::new_v4().to_string(),
-                command: cmd.to_string(),
-                timestamp: now,
-                result: match ev.get("status").and_then(|s| s.as_str()) {
+            AppEvent::Ipc(victauri_core::IpcCall::new(
+                uuid::Uuid::new_v4().to_string(),
+                cmd.to_string(),
+                now,
+                match ev.get("status").and_then(|s| s.as_str()) {
                     Some("ok") => victauri_core::IpcResult::Ok(serde_json::Value::Null),
                     Some("error") => victauri_core::IpcResult::Err("error".to_string()),
                     _ => victauri_core::IpcResult::Pending,
                 },
-                duration_ms: ev
-                    .get("duration_ms")
+                ev.get("duration_ms")
                     .and_then(serde_json::Value::as_f64)
                     .map(|d| d as u64),
-                arg_size_bytes: ev
-                    .get("arg_size_bytes")
+                ev.get("arg_size_bytes")
                     .and_then(serde_json::Value::as_u64)
                     .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
-                webview_label: label.to_string(),
-            })
+                label.to_string(),
+            ))
         }
-        "network" => AppEvent::StateChange {
-            key: format!(
+        "network" => AppEvent::state_change(
+            format!(
                 "network.{}",
                 ev.get("method").and_then(|m| m.as_str()).unwrap_or("GET")
             ),
-            timestamp: now,
-            caused_by: ev
-                .get("url")
+            now,
+            ev.get("url")
                 .and_then(|u| u.as_str())
                 .map(std::string::ToString::to_string),
-        },
-        "navigation" => AppEvent::WindowEvent {
-            label: label.to_string(),
-            event: format!(
+        ),
+        "navigation" => AppEvent::window_event(
+            label.to_string(),
+            format!(
                 "navigation.{}",
                 ev.get("nav_type")
                     .and_then(|n| n.as_str())
                     .unwrap_or("unknown")
             ),
-            timestamp: now,
-        },
+            now,
+        ),
         "dom_interaction" => {
             let action_str = ev.get("action").and_then(|a| a.as_str()).unwrap_or("click");
             let action = match action_str {
@@ -1034,20 +1028,18 @@ pub fn parse_bridge_event_from(
                 "scroll" => victauri_core::InteractionKind::Scroll,
                 _ => victauri_core::InteractionKind::Click,
             };
-            AppEvent::DomInteraction {
+            AppEvent::dom_interaction(
                 action,
-                selector: ev
-                    .get("selector")
+                ev.get("selector")
                     .and_then(|s| s.as_str())
                     .unwrap_or("body")
                     .to_string(),
-                value: ev
-                    .get("value")
+                ev.get("value")
                     .and_then(|v| v.as_str())
                     .map(std::string::ToString::to_string),
-                timestamp: now,
-                webview_label: label.to_string(),
-            }
+                now,
+                label.to_string(),
+            )
         }
         _ => return None,
     };

@@ -44,10 +44,18 @@
 /// Runtime-erased webview bridge trait and its Tauri implementation.
 pub mod bridge;
 /// Backend database access (`SQLite` read-only queries).
+///
+/// Internal: reached through the `query_db` / `introspect db_health` tools. Not
+/// part of the supported API.
 #[cfg(feature = "sqlite")]
+#[doc(hidden)]
 pub mod database;
 pub mod error;
 /// JS bridge script generation for webview injection.
+///
+/// Internal: public only so the crate's own integration tests can exercise the
+/// generated script. Not part of the supported API.
+#[doc(hidden)]
 pub mod js_bridge;
 /// MCP server, tool handler, and parameter types.
 pub mod mcp;
@@ -56,9 +64,16 @@ mod memory;
 pub mod privacy;
 
 /// Compose captured frames into a single contact-sheet PNG ("filmstrip").
-pub mod filmstrip;
+pub(crate) mod filmstrip;
 /// Output redaction for API keys, tokens, emails, and sensitive JSON keys.
+///
+/// Public because [`privacy::PrivacyConfig::redactor`] exposes a [`redaction::Redactor`].
 pub mod redaction;
+/// Screencast ring buffer backing the `trace` tool.
+///
+/// Internal: public only because [`VictauriState::screencast`] is. Not part of
+/// the supported API.
+#[doc(hidden)]
 pub mod screencast;
 pub(crate) mod screenshot;
 mod tools;
@@ -126,9 +141,18 @@ const MAX_EVAL_TIMEOUT_SECS: u64 = 300;
 
 /// Map of pending JavaScript eval callbacks, keyed by request ID.
 /// Each entry holds a oneshot sender that resolves when the webview returns a result.
+///
+/// Internal plumbing (the type of [`VictauriState::pending_evals`]); not part of
+/// the supported API.
+#[doc(hidden)]
 pub type PendingCallbacks = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;
 
 /// Runtime state shared between the MCP server and all tool handlers.
+///
+/// Built by the plugin at setup; apps reach it via
+/// `app.try_state::<Arc<VictauriState>>()` (see [`register_commands!`]).
+/// `#[non_exhaustive]`: new state can be added without a breaking release.
+#[non_exhaustive]
 pub struct VictauriState {
     /// Ring-buffer event log for IPC calls, state changes, and DOM mutations.
     pub event_log: EventLog,
@@ -182,6 +206,47 @@ pub struct VictauriState {
     /// Application-defined state probes surfaced via the `app_state` tool.
     /// Registered through [`VictauriBuilder::probe`].
     pub probes: introspection::AppStateProbes,
+}
+
+impl VictauriState {
+    /// A standalone state with test-friendly defaults, for driving the MCP
+    /// router (`mcp::build_app*`) without a Tauri runtime.
+    ///
+    /// Defaults: 1000-event log and recorder, port 0, default (full-control)
+    /// privacy, 30 s eval timeout, bridge already marked ready, no db search
+    /// paths or probes. All fields are `pub`, so adjust any of them on the
+    /// returned value before wrapping it in an `Arc`.
+    ///
+    /// Not part of the supported API — it exists so out-of-crate tests can build
+    /// the (`#[non_exhaustive]`) state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self {
+            event_log: EventLog::new(1000),
+            registry: CommandRegistry::new(),
+            port: AtomicU16::new(0),
+            pending_evals: Arc::new(Mutex::new(HashMap::new())),
+            recorder: EventRecorder::new(1000),
+            privacy: privacy::PrivacyConfig::default(),
+            eval_timeout: std::time::Duration::from_secs(30),
+            shutdown_tx: watch::channel(false).0,
+            started_at: std::time::Instant::now(),
+            tool_invocations: AtomicU64::new(0),
+            allow_file_navigation: false,
+            command_timings: introspection::CommandTimings::new(),
+            fault_registry: introspection::FaultRegistry::new(),
+            contract_store: introspection::ContractStore::new(),
+            startup_timeline: introspection::StartupTimeline::new(),
+            event_bus: introspection::EventBusMonitor::default(),
+            task_tracker: introspection::TaskTracker::new(),
+            bridge_ready: AtomicBool::new(true),
+            bridge_notify: tokio::sync::Notify::new(),
+            screencast: Arc::new(screencast::Screencast::default()),
+            db_search_paths: Vec::new(),
+            probes: introspection::AppStateProbes::default(),
+        }
+    }
 }
 
 /// Builder for configuring the Victauri plugin before adding it to a Tauri app.
@@ -810,12 +875,13 @@ impl VictauriBuilder {
                         .mark("event_bus_listeners_registered");
 
                     if let Some(ref token) = auth_token {
-                        let prefix_len = token.len().min(8);
-                        let suffix_start = token.len().saturating_sub(4);
+                        // Char-based (never byte-sliced: a configured token may hold
+                        // multi-byte chars) and deliberately short — the log is not a
+                        // place for recoverable token material.
+                        let prefix: String = token.chars().take(4).collect();
                         tracing::info!(
-                            "Victauri MCP server auth enabled — token: {}…{}",
-                            &token[..prefix_len],
-                            &token[suffix_start..]
+                            "Victauri MCP server auth enabled — token: {prefix}… ({} chars)",
+                            token.chars().count()
                         );
                     } else {
                         tracing::warn!(

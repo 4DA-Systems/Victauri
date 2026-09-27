@@ -57,29 +57,19 @@ pub fn inspectable(attr: TokenStream, item: TokenStream) -> TokenStream {
         .iter()
         .map(|(name, type_str, required)| {
             quote! {
-                victauri_core::registry::CommandArg {
-                    name: #name.to_string(),
-                    type_name: #type_str.to_string(),
-                    required: #required,
-                    schema: None,
-                }
+                victauri_core::registry::CommandArg::new(#name, #type_str, #required)
             }
         })
         .collect();
 
     let return_type = extract_return_type(&input.sig);
 
-    let intent_token = if let Some(i) = &attrs.intent {
-        quote! { Some(#i.to_string()) }
-    } else {
-        quote! { None }
-    };
+    let intent_token = attrs.intent.as_ref().map(|i| quote! { .with_intent(#i) });
 
-    let category_token = if let Some(c) = &attrs.category {
-        quote! { Some(#c.to_string()) }
-    } else {
-        quote! { None }
-    };
+    let category_token = attrs
+        .category
+        .as_ref()
+        .map(|c| quote! { .with_category(#c) });
 
     let example_tokens: Vec<_> = attrs
         .examples
@@ -92,17 +82,17 @@ pub fn inspectable(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         #[allow(dead_code, non_snake_case)]
         fn #schema_fn_name() -> victauri_core::registry::CommandInfo {
-            victauri_core::registry::CommandInfo {
-                name: #fn_name_str.to_string(),
-                plugin: None,
-                description: Some(#description.to_string()),
-                args: vec![#(#arg_tokens),*],
-                return_type: Some(#return_type.to_string()),
-                is_async: #is_async,
-                intent: #intent_token,
-                category: #category_token,
-                examples: vec![#(#example_tokens),*],
-            }
+            // Built via constructors, not a struct literal: `CommandInfo` and
+            // `CommandArg` are `#[non_exhaustive]`, and this code expands in the
+            // user's crate.
+            victauri_core::registry::CommandInfo::new(#fn_name_str)
+                .with_description(#description)
+                .with_args(vec![#(#arg_tokens),*])
+                .with_return_type(#return_type)
+                .with_async(#is_async)
+                #intent_token
+                #category_token
+                .with_examples(vec![#(#example_tokens),*])
         }
 
         victauri_core::inventory::submit! {
