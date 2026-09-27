@@ -4,7 +4,7 @@ Victauri works with any Tauri 2.x application. This page documents compatibility
 
 ## Will Victauri work on your app?
 
-Victauri is a **build-time dev dependency** — you add it to your app's source and rebuild. It is **not** an attach-to-anything tool: there is no way to point it at an already-running, shipped, or third-party binary you didn't build. It works when **all four** conditions hold:
+Victauri is a **development-time dependency** (a normal `[dependencies]` entry — the app binary cannot use `[dev-dependencies]`) — you add it to your app's source and rebuild. It is **not** an attach-to-anything tool: there is no way to point it at an already-running, shipped, or third-party binary you didn't build. It works when **all four** conditions hold:
 
 | # | Requirement | Why / what happens otherwise |
 |---|---|---|
@@ -64,7 +64,7 @@ Tauri's `js_init_script` does **not** run inside iframes ([tauri-apps/tauri#1357
 
 ### Service Workers
 
-Service workers can intercept `fetch()` calls, including calls to `http://ipc.localhost/` which Victauri uses to capture IPC traffic. An active service worker may cause:
+Service workers can intercept `fetch()` calls, including the IPC calls (`http://ipc.localhost/` on WebView2, `ipc://localhost/` on WebKit) Victauri uses to capture IPC traffic. An active service worker may cause:
 - Missing entries in `get_ipc_log`
 - False negatives in `detect_ghost_commands` and `check_ipc_integrity`
 

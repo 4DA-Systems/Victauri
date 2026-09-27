@@ -29,7 +29,16 @@ if [[ ! -f "$ROOT/Cargo.toml" ]]; then
     exit 1
 fi
 
-OLD_VERSION=$(grep -oP 'version\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' "$ROOT/Cargo.toml" | head -1)
+# Portable (GNU + BSD/macOS): no `grep -P`, no bare `sed -i`.
+# In-place sed that works on both GNU sed and BSD sed: `-i.bak` is accepted by both
+# (BSD requires a suffix argument; GNU accepts it attached), then the backup is removed.
+# The target file must be the LAST argument.
+sed_inplace() {
+    local target="${!#}"
+    sed -i.bak "$@" && rm -f "$target.bak"
+}
+
+OLD_VERSION=$(sed -n -E 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$ROOT/Cargo.toml" | head -1)
 
 if [[ -z "$OLD_VERSION" ]]; then
     echo "Error: Cannot detect current version from Cargo.toml"
@@ -54,7 +63,7 @@ replace_in_file() {
         if $DRY_RUN; then
             echo "  WOULD $desc"
         else
-            sed -i "s|$(echo "$old" | sed 's/[&/\]/\\&/g')|$(echo "$new" | sed 's/[&/\]/\\&/g')|g" "$path"
+            sed_inplace "s|$(echo "$old" | sed 's/[&/\]/\\&/g')|$(echo "$new" | sed 's/[&/\]/\\&/g')|g" "$path"
             echo "  OK    $desc"
         fi
     else
@@ -72,7 +81,7 @@ if [[ "$DRY_RUN" == true ]]; then
     echo "  WOULD update Cargo.toml [workspace.dependencies] victauri-* pins"
 else
     # `#` delimiter: the pattern's `(core|macros|...)` alternation contains `|`.
-    sed -i -E "s#(victauri-(core|macros|plugin|test) = \{ version = \")[^\"]+(\")#\1$NEW_VERSION\3#g" "$ROOT/Cargo.toml"
+    sed_inplace -E "s#(victauri-(core|macros|plugin|test) = \{ version = \")[^\"]+(\")#\1$NEW_VERSION\3#g" "$ROOT/Cargo.toml"
     echo "  OK    Cargo.toml [workspace.dependencies] victauri-* pins"
 fi
 
@@ -104,7 +113,7 @@ for f in "${PIN_DOCS[@]}"; do
     if $DRY_RUN; then
         echo "  WOULD $f install pins -> \"$NEW_MM\""
     else
-        sed -i -E "s#(victauri-(core|macros|plugin|test) *= *(\{ *version *= *)?\")[0-9]+\.[0-9]+(\")#\1$NEW_MM\4#g" "$ROOT/$f"
+        sed_inplace -E "s#(victauri-(core|macros|plugin|test) *= *(\{ *version *= *)?\")[0-9]+\.[0-9]+(\")#\1$NEW_MM\4#g" "$ROOT/$f"
         echo "  OK    $f install pins -> \"$NEW_MM\""
     fi
 done
@@ -113,7 +122,7 @@ for f in "${ACTION_DOCS[@]}"; do
     if $DRY_RUN; then
         echo "  WOULD $f victauri-test@v$NEW_VERSION"
     else
-        sed -i -E "s|(victauri-test@v)[0-9]+\.[0-9]+\.[0-9]+|\1$NEW_VERSION|g" "$ROOT/$f"
+        sed_inplace -E "s|(victauri-test@v)[0-9]+\.[0-9]+\.[0-9]+|\1$NEW_VERSION|g" "$ROOT/$f"
         echo "  OK    $f victauri-test@v$NEW_VERSION"
     fi
 done

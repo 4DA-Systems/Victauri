@@ -34,12 +34,12 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-if (-not (Test-Path "$root\Cargo.toml")) {
-    $root = Split-Path -Parent $PSScriptRoot
-}
-if (-not (Test-Path "$root\Cargo.toml")) {
-    Write-Error "Cannot find Cargo.toml — run from the victauri repo root or scripts/ dir"
+# The script lives in <repo>/scripts, so the repo root is exactly one level up. Never probe
+# further up: a Cargo.toml in an enclosing directory (e.g. a parent workspace or the
+# directory holding git worktrees) would otherwise be bumped instead of this repo.
+$root = Split-Path -Parent $PSScriptRoot
+if (-not (Test-Path (Join-Path $root 'Cargo.toml'))) {
+    Write-Error "Cannot find Cargo.toml at $root — bump-version.ps1 must live in <repo>/scripts"
     exit 1
 }
 
