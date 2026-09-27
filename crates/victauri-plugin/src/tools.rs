@@ -5,15 +5,15 @@ use victauri_core::{IpcCall, WindowState};
 use crate::VictauriState;
 
 /// Id prefix for evals started by page JS through these Tauri commands (vs. by an agent).
-pub(crate) const PAGE_EVAL_PREFIX: &str = "page:";
+pub const PAGE_EVAL_PREFIX: &str = "page:";
 /// Pending-eval slots page-originated evals may hold at once. They share the pending map with
 /// the agent's (MCP) evals; without their own small budget, page script could park
 /// never-resolving evals in every slot and starve the agent with "too many concurrent evals".
-pub(crate) const MAX_PAGE_PENDING_EVALS: usize = 10;
+pub const MAX_PAGE_PENDING_EVALS: usize = 10;
 
 /// Reserve a pending-eval slot for a page-originated eval, within both the page budget and the
 /// global ceiling.
-pub(crate) async fn reserve_page_eval(
+pub async fn reserve_page_eval(
     state: &VictauriState,
     id: &str,
     tx: tokio::sync::oneshot::Sender<String>,
