@@ -6,14 +6,18 @@
 
 mod authz;
 mod backend_params;
+mod bounded;
 mod compound_params;
 #[cfg(test)]
 mod drain_tests;
+mod hardening;
 mod helpers;
 mod introspection_params;
 mod other_params;
 pub(crate) mod page_json;
 mod rest;
+#[cfg(test)]
+mod robustness_tests;
 mod server;
 mod verification_params;
 mod webview_params;
@@ -94,6 +98,88 @@ const MAX_LOG_FIELD_BYTES: usize = 4096;
 /// unbounded result Vec and blow the eval/output cap (audit B7). When hit, the
 /// listing stops and the response is marked `truncated: true`.
 const MAX_DIR_ENTRIES: usize = 10_000;
+/// Cap on directory entries `list_app_dir` EXAMINES (returned or not): with a `pattern` that
+/// matches nothing, [`MAX_DIR_ENTRIES`] never trips and the walk used to cover the whole tree.
+const MAX_DIR_VISITED: usize = 100_000;
+/// Wall-clock budget for one `list_app_dir` walk (slow or network filesystems).
+const MAX_DIR_WALK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One bounded `list_app_dir` walk: stops (and reports `truncated`) at [`MAX_DIR_ENTRIES`]
+/// returned, [`MAX_DIR_VISITED`] examined, or [`MAX_DIR_WALK_TIME`].
+struct DirWalk {
+    /// The listing root, canonicalized ONCE (it used to be re-canonicalized per entry).
+    canon_base: std::path::PathBuf,
+    pattern: Option<String>,
+    max_depth: u32,
+    deadline: std::time::Instant,
+    max_visited: usize,
+    visited: usize,
+    truncated: bool,
+    entries: Vec<serde_json::Value>,
+}
+
+impl DirWalk {
+    fn out_of_budget(&mut self) -> bool {
+        if self.entries.len() >= MAX_DIR_ENTRIES
+            || self.visited >= self.max_visited
+            || std::time::Instant::now() >= self.deadline
+        {
+            self.truncated = true;
+        }
+        self.truncated
+    }
+
+    fn visit(&mut self, dir: &std::path::Path, base: &std::path::Path, depth: u32) {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read_dir.flatten() {
+            if self.out_of_budget() {
+                return;
+            }
+            self.visited += 1;
+            let path = entry.path();
+            if path.is_symlink() {
+                continue;
+            }
+            // `is_symlink` does not cover every redirecting filesystem object
+            // (notably Windows directory junctions/reparse points). Canonical
+            // containment is the actual boundary before metadata or recursion.
+            if !std::fs::canonicalize(&path).is_ok_and(|c| c.starts_with(&self.canon_base)) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = path.is_dir();
+            if let Some(pat) = self.pattern.as_deref()
+                && !is_dir
+                && !VictauriMcpHandler::matches_glob(&name, pat)
+            {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let meta = std::fs::metadata(&path).ok();
+
+            self.entries.push(serde_json::json!({
+                "name": name,
+                "path": relative,
+                "is_dir": is_dir,
+                "size": meta.as_ref().map(std::fs::Metadata::len),
+                "modified": meta.as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs()),
+            }));
+
+            if is_dir && depth < self.max_depth {
+                self.visit(&path, base, depth + 1);
+            }
+        }
+    }
+}
 
 /// `db_health` performs integrity checks and table counts against app-owned
 /// databases. Each size-dependent phase is bounded separately (see
@@ -113,6 +199,19 @@ fn format_timeout(timeout: std::time::Duration) -> String {
     } else {
         format!("{}s", timeout.as_secs())
     }
+}
+
+/// Error text for a window query the UI thread did not answer: a wedged/busy UI must never
+/// read as "no windows" or "window not found".
+fn ui_busy(error: &str) -> String {
+    format!("UI thread busy (dispatch timed out) - window state is unavailable, not empty: {error}")
+}
+
+/// The error result for a tool handler that panicked (see `bounded::CatchUnwind`).
+fn tool_panicked(tool: &str, panic: &str) -> CallToolResult {
+    tool_error(format!(
+        "internal error: the '{tool}' handler panicked ({panic}); the server is still running"
+    ))
 }
 
 /// Upper bound for `invoke_command`'s per-call `timeout_ms` (matches the eval-timeout ceiling).
@@ -147,6 +246,13 @@ impl EvalFailure {
         }
     }
 }
+
+/// How long `app_state` waits for an app-registered probe closure (shortened under test).
+const PROBE_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(10)
+};
 
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
@@ -712,7 +818,9 @@ impl VictauriMcpHandler {
     )]
     async fn wait_for(&self, Parameters(params): Parameters<WaitForParams>) -> CallToolResult {
         let timeout_ms = params.timeout_ms.unwrap_or(10_000).min(120_000);
-        let poll = params.poll_ms.unwrap_or(200).max(20);
+        // Clamp BEFORE the value reaches JS: a poll longer than the wait is meaningless, and
+        // one past 2^31 ms overflows `setTimeout` (which then fires immediately, in a loop).
+        let poll = params.poll_ms.unwrap_or(200).clamp(20, timeout_ms.max(20));
 
         // The `expression` and `event` conditions are awaited server-side (they
         // poll the eval engine and the captured event bus respectively), so a
@@ -830,8 +938,7 @@ impl VictauriMcpHandler {
         };
         let since_ms = params.since_ms.unwrap_or(2000);
         let start = std::time::Instant::now();
-        let baseline = chrono::Utc::now()
-            - chrono::TimeDelta::try_milliseconds(since_ms as i64).unwrap_or_default();
+        let baseline = bounded::ms_ago(chrono::Utc::now(), since_ms);
         let deadline = start + std::time::Duration::from_millis(timeout_ms);
         let poll = std::time::Duration::from_millis(poll_ms);
 
@@ -863,7 +970,11 @@ impl VictauriMcpHandler {
                     "elapsed_ms": start.elapsed().as_millis() as u64,
                 }));
             }
-            tokio::time::sleep(poll).await;
+            // Never sleep past the deadline (a full poll used to overshoot a short timeout).
+            tokio::time::sleep(
+                poll.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            )
+            .await;
         }
     }
 
@@ -953,8 +1064,20 @@ impl VictauriMcpHandler {
         let Some(name) = params.probe else {
             return json_result(&serde_json::json!({ "probes": self.state.probes.names() }));
         };
-        if let Some(value) = self.state.probes.run(&name) {
-            json_result(&value)
+        if let Some(probe) = self.state.probes.get(&name) {
+            // A probe is app code: run it off the async executor, bounded, and with a panic
+            // boundary (it used to run inline on a tokio worker with neither).
+            match bounded::run_blocking_bounded(
+                None,
+                &format!("probe '{name}'"),
+                PROBE_TIMEOUT,
+                move || Ok(probe()),
+            )
+            .await
+            {
+                Ok(value) => json_result(&value),
+                Err(e) => tool_error(e),
+            }
         } else {
             let available = self.state.probes.names();
             tool_error_with_hint(
@@ -1181,58 +1304,63 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(e),
         };
 
-        let target = if let Some(ref sub) = params.path {
-            // Lexical traversal guard BEFORE the existence check: `safe_within`
-            // canonicalizes (which errors on non-existent paths), so a `..` or
-            // absolute sub-path must be rejected as traversal up front rather
-            // than falling through to a misleading "does not exist" result.
-            if let Err(e) = Self::lexical_safe(std::path::Path::new(sub)) {
-                return tool_error(e);
-            }
-            let resolved = base.join(sub);
-            // A missing directory is a normal, non-error result.
-            if !resolved.exists() {
-                return json_result(&serde_json::json!({
-                    "base": base.to_string_lossy(),
-                    "path": sub,
-                    "exists": false,
-                    "entries": [],
-                    "count": 0,
-                }));
-            }
-            if let Err(e) = Self::safe_within(&base, &resolved) {
-                return tool_error(e);
-            }
-            resolved
-        } else {
-            base.clone()
-        };
+        // Lexical traversal guard BEFORE any filesystem access: a `..` or absolute sub-path
+        // is rejected as traversal up front.
+        if let Some(sub) = params.path.as_deref()
+            && let Err(e) = Self::lexical_safe(std::path::Path::new(sub))
+        {
+            return tool_error(e);
+        }
+        // Every filesystem call below is synchronous and unbounded in the directory's size, so
+        // the whole walk runs on the blocking pool (it used to run on an async worker).
+        let walk = tokio::task::spawn_blocking(move || Self::list_app_dir_blocking(&base, &params));
+        match walk.await {
+            Ok(Ok(listing)) => json_result(&listing),
+            Ok(Err(e)) => tool_error(e),
+            Err(e) => tool_error(format!("directory listing task failed: {e}")),
+        }
+    }
 
-        // A missing base directory is a normal, non-error result.
-        if !target.exists() {
-            return json_result(&serde_json::json!({
+    fn list_app_dir_blocking(
+        base: &std::path::Path,
+        params: &ListAppDirParams,
+    ) -> Result<serde_json::Value, String> {
+        let sub = params.path.clone().unwrap_or_default();
+        let target = base.join(&sub);
+        // A missing directory is a normal, non-error result — unless the path escapes the
+        // base through a symlink, which is refused whether or not its target exists (so the
+        // listing is no oracle for paths outside the base).
+        if !Self::contained_or_missing(base, &target)? {
+            return Ok(serde_json::json!({
                 "base": base.to_string_lossy(),
-                "path": params.path.unwrap_or_default(),
+                "path": sub,
                 "exists": false,
                 "entries": [],
                 "count": 0,
             }));
         }
+        let canon_base = std::fs::canonicalize(base)
+            .map_err(|e| format!("cannot resolve base directory: {e}"))?;
 
-        let max_depth = params.max_depth.unwrap_or(1).min(5);
-        let pattern = params.pattern.as_deref();
-        let mut entries = Vec::new();
+        let mut walk = DirWalk {
+            canon_base,
+            pattern: params.pattern.clone(),
+            max_depth: params.max_depth.unwrap_or(1).min(5),
+            deadline: std::time::Instant::now() + MAX_DIR_WALK_TIME,
+            max_visited: MAX_DIR_VISITED,
+            visited: 0,
+            truncated: false,
+            entries: Vec::new(),
+        };
+        walk.visit(&target, base, 0);
 
-        Self::list_dir_recursive(&target, &base, 0, max_depth, pattern, &mut entries);
-        let truncated = entries.len() >= MAX_DIR_ENTRIES;
-
-        json_result(&serde_json::json!({
+        Ok(serde_json::json!({
             "base": base.to_string_lossy(),
-            "path": params.path.unwrap_or_default(),
+            "path": sub,
             "exists": true,
-            "entries": entries,
-            "count": entries.len(),
-            "truncated": truncated,
+            "count": walk.entries.len(),
+            "entries": walk.entries,
+            "truncated": walk.truncated,
         }))
     }
 
@@ -1263,8 +1391,11 @@ impl VictauriMcpHandler {
             return tool_error(e);
         }
         let target = base.join(&params.path);
-        if !target.exists() {
-            return tool_error(format!("file not found: {}", params.path));
+        // Refused as traversal whether or not a symlinked-out target exists (no oracle).
+        match Self::contained_or_missing(&base, &target) {
+            Ok(true) => {}
+            Ok(false) => return tool_error(format!("file not found: {}", params.path)),
+            Err(e) => return tool_error(e),
         }
         if let Err(e) = Self::safe_within(&base, &target) {
             return tool_error(e);
@@ -1333,6 +1464,15 @@ impl VictauriMcpHandler {
                 "content": b64,
             }))
         } else {
+            // Truncation can split a multi-byte character; that is not a non-UTF-8 file.
+            // `error_len() == None` means the bytes end mid-character, so drop the partial
+            // character instead of returning the whole read as base64.
+            if truncated
+                && let Err(e) = std::str::from_utf8(&bytes)
+                && e.error_len().is_none()
+            {
+                bytes.truncate(e.valid_up_to());
+            }
             match String::from_utf8(bytes) {
                 Ok(text) => json_result(&serde_json::json!({
                     "file": file_info,
@@ -1390,22 +1530,7 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("cannot access app data directory: {e}")),
         };
 
-        let app_dirs: Vec<std::path::PathBuf> = [
-            self.bridge.app_data_dir(),
-            self.bridge.app_config_dir(),
-            self.bridge.app_local_data_dir(),
-            self.bridge.app_log_dir(),
-        ]
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-        // Explicitly-configured roots (VictauriBuilder::db_search_paths) take
-        // precedence over OS app directories for auto-discovery, so a configured
-        // application DB wins over incidental ones (e.g. WebView internals).
-        let mut search_dirs: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
-        search_dirs.extend(app_dirs);
+        let search_dirs = self.db_roots();
 
         let db_path = if let Some(ref requested_path) = params.path {
             match Self::resolve_existing_db_path(&search_dirs, requested_path) {
@@ -1439,20 +1564,51 @@ impl VictauriMcpHandler {
         let query = params.query;
         let max_rows = params.max_rows;
 
-        match tokio::task::spawn_blocking(move || {
-            crate::database::query(&db_path, &query, &bind_params, max_rows)
-        })
+        match bounded::run_blocking_bounded(
+            Some(&bounded::DB_SLOTS),
+            "database query",
+            crate::database::QUERY_TIMEOUT + bounded::BLOCKING_DEADLINE_SLACK,
+            move || crate::database::query(&db_path, &query, &bind_params, max_rows),
+        )
         .await
         {
-            Ok(Ok(mut result)) => {
+            Ok(mut result) => {
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert("database".to_string(), serde_json::json!(db_display));
                 }
                 json_result(&result)
             }
-            Ok(Err(e)) => tool_error(e),
-            Err(e) => tool_error(format!("database query task failed: {e}")),
+            Err(e) => tool_error(e),
         }
+    }
+
+    /// Roots a `query_db` / `db_health` database `path` resolves against, in precedence
+    /// order: configured `db_search_paths` (so a configured app DB beats incidental ones such
+    /// as `WebView` internals), then the app's data, config, local-data and log directories.
+    /// De-duplicated keeping the FIRST occurrence: a relative path present under two roots
+    /// always resolves to the same file (a `HashSet` made that nondeterministic), and both
+    /// tools search the same places (`db_health` used to skip the log directory).
+    #[cfg(feature = "sqlite")]
+    fn db_roots(&self) -> Vec<std::path::PathBuf> {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        let app_dirs = [
+            self.bridge.app_data_dir(),
+            self.bridge.app_config_dir(),
+            self.bridge.app_local_data_dir(),
+            self.bridge.app_log_dir(),
+        ];
+        let candidates = self
+            .state
+            .db_search_paths
+            .iter()
+            .cloned()
+            .chain(app_dirs.into_iter().filter_map(Result::ok));
+        for dir in candidates {
+            if !roots.contains(&dir) {
+                roots.push(dir);
+            }
+        }
+        roots
     }
 
     // ── Compound Tools ──────────────────────────────────────────────────────
@@ -1756,7 +1912,10 @@ impl VictauriMcpHandler {
     async fn window(&self, Parameters(params): Parameters<WindowParams>) -> CallToolResult {
         match params.action {
             WindowAction::GetState => {
-                let states = self.bridge.get_window_states(params.label.as_deref());
+                let states = match self.bridge.try_get_window_states(params.label.as_deref()) {
+                    Ok(states) => states,
+                    Err(e) => return tool_error(ui_busy(&e)),
+                };
                 // A specific label that matches no window is an error, not an
                 // empty array (which reads as "success, no state").
                 if states.is_empty()
@@ -1768,10 +1927,10 @@ impl VictauriMcpHandler {
                 }
                 json_result(&states)
             }
-            WindowAction::List => {
-                let labels = self.bridge.list_window_labels();
-                json_result(&labels)
-            }
+            WindowAction::List => match self.bridge.try_list_window_labels() {
+                Ok(labels) => json_result(&labels),
+                Err(e) => tool_error(ui_busy(&e)),
+            },
             WindowAction::Introspectability => self.window_introspectability().await,
             WindowAction::Manage => {
                 if !self.state.privacy.is_tool_enabled("window.manage") {
@@ -2151,7 +2310,10 @@ impl VictauriMcpHandler {
                 // and vice versa. With no label, every live window is flushed.
                 let labels: Vec<String> = match params.webview_label.as_deref() {
                     Some(l) => vec![l.to_string()],
-                    None => self.bridge.list_window_labels(),
+                    None => match self.bridge.try_list_window_labels() {
+                        Ok(labels) => labels,
+                        Err(e) => return tool_error(ui_busy(&e)),
+                    },
                 };
                 let mut captured = 0usize;
                 let mut failed = Vec::new();
@@ -3377,7 +3539,12 @@ impl VictauriMcpHandler {
             }
             IntrospectAction::Capabilities => {
                 let config = self.bridge.tauri_config();
-                let live_windows = self.bridge.list_window_labels();
+                // A busy UI is reported as such, never as "no live windows".
+                let (live_windows, live_windows_error) = match self.bridge.try_list_window_labels()
+                {
+                    Ok(labels) => (Some(labels), None),
+                    Err(e) => (None, Some(ui_busy(&e))),
+                };
 
                 let result = serde_json::json!({
                     "app": {
@@ -3388,6 +3555,7 @@ impl VictauriMcpHandler {
                     "security": config.get("security"),
                     "configured_windows": config.get("windows"),
                     "live_windows": live_windows,
+                    "live_windows_error": live_windows_error,
                     "configured_plugins": config.get("plugins"),
                     "victauri": {
                         "registered_commands": self.state.registry.list().len(),
@@ -3500,10 +3668,7 @@ impl VictauriMcpHandler {
                 let since_ms = opts
                     .and_then(|a| a.get("since_ms"))
                     .and_then(serde_json::Value::as_u64);
-                let cutoff = since_ms.map(|ms| {
-                    chrono::Utc::now()
-                        - chrono::TimeDelta::milliseconds(i64::try_from(ms).unwrap_or(i64::MAX))
-                });
+                let cutoff = since_ms.map(|ms| bounded::ms_ago(chrono::Utc::now(), ms));
 
                 let all_tauri = self.state.event_bus.events();
                 let tauri_total = all_tauri.len();
@@ -3707,8 +3872,7 @@ impl VictauriMcpHandler {
         match params.action {
             ExplainAction::Summary => {
                 let secs = params.seconds.unwrap_or(30);
-                let since = chrono::Utc::now()
-                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let since = bounded::secs_ago(chrono::Utc::now(), secs);
                 let events = self
                     .explain_events(since, params.webview_label.as_deref())
                     .await;
@@ -3801,8 +3965,7 @@ impl VictauriMcpHandler {
             }
             ExplainAction::LastAction => {
                 let secs = params.seconds.unwrap_or(5);
-                let since = chrono::Utc::now()
-                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let since = bounded::secs_ago(chrono::Utc::now(), secs);
                 let events = self
                     .explain_events(since, params.webview_label.as_deref())
                     .await;
@@ -3920,8 +4083,7 @@ impl VictauriMcpHandler {
             }
             ExplainAction::Diff => {
                 let secs = params.seconds.unwrap_or(10);
-                let since = chrono::Utc::now()
-                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let since = bounded::secs_ago(chrono::Utc::now(), secs);
                 let events = self
                     .explain_events(since, params.webview_label.as_deref())
                     .await;
@@ -4015,6 +4177,36 @@ impl VictauriMcpHandler {
         let start = std::time::Instant::now();
         tracing::debug!(tool = %name, "REST tool invocation started");
 
+        // A panicking handler becomes an error RESULT; without this boundary it unwound into
+        // hyper's connection task and the client saw a reset connection.
+        let result = match bounded::CatchUnwind::new(self.dispatch_tool(name, args)).await {
+            Ok(dispatched) => dispatched?,
+            Err(panic) => {
+                tracing::error!(tool = %name, "tool handler panicked: {panic}");
+                tool_panicked(name, &panic)
+            }
+        };
+
+        let elapsed = start.elapsed();
+        tracing::debug!(
+            tool = %name,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "REST tool invocation completed"
+        );
+
+        if self.state.privacy.redaction_enabled {
+            Ok(Self::redact_result(result, &self.state.privacy))
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// Route one already-authorized REST call to its tool handler.
+    async fn dispatch_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<CallToolResult, rest::ToolCallError> {
         let result = match name {
             "eval_js" => {
                 let p: EvalJsParams = Self::parse_args(args)?;
@@ -4149,19 +4341,7 @@ impl VictauriMcpHandler {
             }
             _ => return Err(rest::ToolCallError::UnknownTool(name.to_string())),
         };
-
-        let elapsed = start.elapsed();
-        tracing::debug!(
-            tool = %name,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "REST tool invocation completed"
-        );
-
-        if self.state.privacy.redaction_enabled {
-            Ok(Self::redact_result(result, &self.state.privacy))
-        } else {
-            Ok(result)
-        }
+        Ok(result)
     }
 
     fn parse_args<T: serde::de::DeserializeOwned>(
@@ -4236,7 +4416,23 @@ impl VictauriMcpHandler {
         requested: &str,
     ) -> Result<std::path::PathBuf, String> {
         let candidate = std::path::Path::new(requested);
+        // One answer for "missing" and "resolves outside every root" (a symlink inside a root
+        // pointing elsewhere): distinct answers told the caller whether an arbitrary path
+        // exists on disk.
+        let not_found = || {
+            format!(
+                "database not found (or it resolves outside the allowed directories): {requested}"
+            )
+        };
         if candidate.is_absolute() {
+            // `root/link/../y` normalizes lexically to `root/y`, but the OS resolves `..` AFTER
+            // following `link` — so the existence check probed a path outside every root.
+            if candidate
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err("path traversal not allowed: '..' is rejected".to_string());
+            }
             // Decide containment LEXICALLY first, before touching the requested path: checking
             // existence first answered "does X exist?" for any path on disk ("not found" vs
             // "not within an allowed directory"). The canonical check below still catches
@@ -4253,12 +4449,10 @@ impl VictauriMcpHandler {
                      register its parent via VictauriBuilder::db_search_paths"
                 ));
             }
-            if !candidate.exists() {
-                return Err(format!("database not found: {requested}"));
-            }
-            if roots
-                .iter()
-                .any(|root| Self::safe_within(root, candidate).is_ok())
+            if candidate.exists()
+                && roots
+                    .iter()
+                    .any(|root| Self::safe_within(root, candidate).is_ok())
             {
                 // Open the CANONICAL validated path, not the caller's literal absolute path,
                 // so the DB is opened at exactly the containment-approved location — symmetric
@@ -4269,17 +4463,14 @@ impl VictauriMcpHandler {
                     .map_err(|e| format!("cannot resolve database path: {e}"))?;
                 return Ok(canonical);
             }
-            return Err(format!(
-                "absolute path '{requested}' is not within an allowed directory; \
-                 register its parent via VictauriBuilder::db_search_paths"
-            ));
+            return Err(not_found());
         }
 
         Self::lexical_safe(candidate)?;
         for root in roots {
             let resolved = root.join(candidate);
-            if resolved.exists() {
-                Self::safe_within(root, &resolved)?;
+            // A match that escapes its root is treated exactly like a miss (see `not_found`).
+            if resolved.exists() && Self::safe_within(root, &resolved).is_ok() {
                 // Open the CANONICAL validated path, not the lexical join, so the DB is opened
                 // at exactly the path containment approved (closes the trivial validate-lexical
                 // vs open-lexical TOCTOU; a same-privilege local symlink swap between
@@ -4295,9 +4486,7 @@ impl VictauriMcpHandler {
             .map(|root| root.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        Err(format!(
-            "database not found: {requested} (searched: {roots})"
-        ))
+        Err(format!("{} (searched: {roots})", not_found()))
     }
 
     /// Events for `explain` since `since`. While a recording is active the background drain
@@ -4347,7 +4536,10 @@ impl VictauriMcpHandler {
     /// hidden in the gap is still TOCTOU; the worst case is a wrong image, not a security
     /// boundary.
     fn resolve_visible_capture_target(&self, label: Option<&str>) -> Result<String, String> {
-        let states = self.bridge.get_window_states(None);
+        let states = self
+            .bridge
+            .try_get_window_states(None)
+            .map_err(|e| ui_busy(&e))?;
         if let Some(label) = label {
             // An explicit label that the enumerator reports hidden is rejected; visible or
             // unknown labels fall through (an unknown one lets get_native_handle produce the
@@ -4377,66 +4569,34 @@ impl VictauriMcpHandler {
             })
     }
 
-    fn list_dir_recursive(
-        dir: &std::path::Path,
+    /// Whether `target` exists, after refusing it if it resolves outside `base`.
+    ///
+    /// For a missing target, containment is decided on its deepest EXISTING ancestor, so a
+    /// path routed through a symlink out of `base` is refused whether or not its final
+    /// component exists ("missing" vs "outside" would otherwise reveal whether an arbitrary
+    /// outside path exists).
+    fn contained_or_missing(
         base: &std::path::Path,
-        depth: u32,
-        max_depth: u32,
-        pattern: Option<&str>,
-        entries: &mut Vec<serde_json::Value>,
-    ) {
-        if entries.len() >= MAX_DIR_ENTRIES {
-            return;
-        }
-        let Ok(read_dir) = std::fs::read_dir(dir) else {
-            return;
+        target: &std::path::Path,
+    ) -> Result<bool, String> {
+        // A missing base holds nothing (and no symlink that could lead out of it).
+        let Ok(canon_base) = std::fs::canonicalize(base) else {
+            return Ok(false);
         };
-        for entry in read_dir.flatten() {
-            if entries.len() >= MAX_DIR_ENTRIES {
-                return;
-            }
-            let path = entry.path();
-            if path.is_symlink() {
-                continue;
-            }
-            // `is_symlink` does not cover every redirecting filesystem object
-            // (notably Windows directory junctions/reparse points). Canonical
-            // containment is the actual boundary before metadata or recursion.
-            if Self::safe_within(base, &path).is_err() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let relative = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-
-            if let Some(pat) = pattern
-                && !Self::matches_glob(&name, pat)
-                && !path.is_dir()
-            {
-                continue;
-            }
-
-            let is_dir = path.is_dir();
-            let meta = std::fs::metadata(&path).ok();
-
-            entries.push(serde_json::json!({
-                "name": name,
-                "path": relative,
-                "is_dir": is_dir,
-                "size": meta.as_ref().map(std::fs::Metadata::len),
-                "modified": meta.as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default().as_secs()),
-            }));
-
-            if is_dir && depth < max_depth {
-                Self::list_dir_recursive(&path, base, depth + 1, max_depth, pattern, entries);
+        let exists = target.exists();
+        let probe = if exists {
+            Some(target)
+        } else {
+            target.ancestors().skip(1).find(|a| a.exists())
+        };
+        if let Some(probe) = probe {
+            let canonical = std::fs::canonicalize(probe)
+                .map_err(|e| format!("cannot resolve target path: {e}"))?;
+            if !canonical.starts_with(&canon_base) {
+                return Err("path traversal not allowed".to_string());
             }
         }
+        Ok(exists)
     }
 
     fn matches_glob(name: &str, pattern: &str) -> bool {
@@ -4458,8 +4618,14 @@ impl VictauriMcpHandler {
     /// the bridge's callback IPC, so eval/dom/animation tools see nothing. This
     /// turns that silent dead-end into an actionable, up-front diagnosis.
     async fn window_introspectability(&self) -> CallToolResult {
-        let labels = self.bridge.list_window_labels();
-        let states = self.bridge.get_window_states(None);
+        let labels = match self.bridge.try_list_window_labels() {
+            Ok(labels) => labels,
+            Err(e) => return tool_error(ui_busy(&e)),
+        };
+        let states = match self.bridge.try_get_window_states(None) {
+            Ok(states) => states,
+            Err(e) => return tool_error(ui_busy(&e)),
+        };
         let mut report = Vec::with_capacity(labels.len());
         let mut blind = 0usize;
         for label in &labels {
@@ -4879,18 +5045,7 @@ impl VictauriMcpHandler {
 
     #[cfg(feature = "sqlite")]
     async fn run_db_health(&self, db_path: Option<&str>) -> Result<serde_json::Value, String> {
-        // Roots: configured db_search_paths first, then app directories.
-        let mut roots: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
-        for d in [
-            self.bridge.app_data_dir(),
-            self.bridge.app_local_data_dir(),
-            self.bridge.app_config_dir(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            roots.push(d);
-        }
+        let roots = self.db_roots();
 
         let path = if let Some(p) = db_path {
             Self::resolve_existing_db_path(&roots, p)?
@@ -4910,15 +5065,22 @@ impl VictauriMcpHandler {
             .ok_or_else(|| "invalid path encoding".to_string())?
             .to_string();
 
-        tokio::task::spawn_blocking(move || {
-            crate::database::db_health_report(
-                &path_str,
-                DB_HEALTH_COUNT_BUDGET,
-                DB_HEALTH_CHECK_BUDGET,
-            )
-        })
+        bounded::run_blocking_bounded(
+            Some(&bounded::DB_SLOTS),
+            "db health check",
+            crate::database::DB_HEALTH_META_BUDGET
+                + DB_HEALTH_COUNT_BUDGET
+                + DB_HEALTH_CHECK_BUDGET
+                + bounded::BLOCKING_DEADLINE_SLACK,
+            move || {
+                crate::database::db_health_report(
+                    &path_str,
+                    DB_HEALTH_COUNT_BUDGET,
+                    DB_HEALTH_CHECK_BUDGET,
+                )
+            },
+        )
         .await
-        .map_err(|e| format!("db health task failed: {e}"))?
     }
 
     fn check_bridge_version_once(&self) {
@@ -5047,7 +5209,14 @@ impl ServerHandler for VictauriMcpHandler {
         let start = std::time::Instant::now();
         tracing::debug!(tool = %tool_name, "tool invocation started");
         let ctx = ToolCallContext::new(self, request, context);
-        let response = Self::tool_router().call(ctx).await;
+        // Same panic boundary as the REST path: without it a panicking handler left the MCP
+        // request unanswered until the client's own timeout.
+        let response = bounded::CatchUnwind::new(Self::tool_router().call(ctx))
+            .await
+            .unwrap_or_else(|panic| {
+                tracing::error!(tool = %tool_name, "tool handler panicked: {panic}");
+                Ok(tool_panicked(&tool_name, &panic).into())
+            });
         let elapsed = start.elapsed();
         tracing::debug!(
             tool = %tool_name,
@@ -5151,7 +5320,10 @@ impl ServerHandler for VictauriMcpHandler {
                 }
             }
             RESOURCE_URI_WINDOWS => {
-                let states = self.bridge.get_window_states(None);
+                let states = self
+                    .bridge
+                    .try_get_window_states(None)
+                    .map_err(|e| ErrorData::internal_error(ui_busy(&e), None))?;
                 serde_json::to_string_pretty(&states)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
             }
@@ -5856,8 +6028,18 @@ mod tests {
         std::fs::File::create(&outside).unwrap();
         symlink(&outside, root.join("linked.db")).unwrap();
 
-        let err = VictauriMcpHandler::resolve_existing_db_path(&[root], "linked.db").unwrap_err();
-        assert!(err.contains("path traversal"), "unexpected error: {err}");
+        let err =
+            VictauriMcpHandler::resolve_existing_db_path(&[root.clone()], "linked.db").unwrap_err();
+        // Audit F6: an escape answers exactly like a miss (no existence oracle).
+        let miss = VictauriMcpHandler::resolve_existing_db_path(&[root], "absent.db").unwrap_err();
+        assert!(
+            err.contains("database not found"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            err.replace("linked.db", "X"),
+            miss.replace("absent.db", "X")
+        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -5989,11 +6171,12 @@ mod tests {
         assert!(e1.contains("not within an allowed directory"), "{e1}");
         assert!(e2.contains("not within an allowed directory"), "{e2}");
         assert!(!e1.contains("not found") && !e2.contains("not found"));
-        // `..` cannot climb out lexically either.
+        // `..` is refused outright in an absolute path (audit F6: the OS resolves it after
+        // following any symlink, so lexical normalization cannot vouch for it).
         let climb = root.path().join("..").join("x.db");
         let e3 = VictauriMcpHandler::resolve_existing_db_path(&roots, climb.to_str().unwrap())
             .unwrap_err();
-        assert!(e3.contains("not within an allowed directory"), "{e3}");
+        assert!(e3.contains("'..' is rejected"), "{e3}");
     }
 
     #[test]

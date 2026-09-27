@@ -163,8 +163,77 @@ enum Discovery {
     Ambiguous(Vec<(u32, u16)>),
 }
 
-fn discovery_base_dir() -> PathBuf {
-    std::env::temp_dir().join("victauri")
+/// The discovery roots the plugin may have written to, most specific first (mirrors the
+/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
+/// that directory is private to us, else `<temp>/victauri-<euid>` (a shared `/tmp/victauri`
+/// could be pre-created by another user, blocking discovery) — and the legacy
+/// `<temp>/victauri` is still read, subject to the same ownership check, for pre-0.9 plugins.
+/// Other platforms use `<temp>/victauri` (a per-user temp dir).
+fn discovery_roots() -> Vec<PathBuf> {
+    let legacy = std::env::temp_dir().join("victauri");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut roots = Vec::new();
+        if let Some(euid) = current_euid() {
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .filter(|dir| {
+                    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                        m.file_type().is_dir()
+                            && m.uid() == euid
+                            && m.permissions().mode() & 0o077 == 0
+                    })
+                })
+            {
+                roots.push(runtime.join("victauri"));
+            }
+            roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+        }
+        roots.push(legacy);
+        roots
+    }
+    #[cfg(not(unix))]
+    {
+        vec![legacy]
+    }
+}
+
+/// [`discover_in`] over every discovery root; a pid found under several roots counts once.
+fn discover_in_roots(
+    roots: &[PathBuf],
+    selector: &Selector,
+    is_alive: impl Fn(u32) -> bool,
+) -> Discovery {
+    let mut found: Vec<DiscoveredApp> = Vec::new();
+    let mut apps: Vec<(u32, u16)> = Vec::new();
+    for root in roots {
+        match discover_in(root, selector, &is_alive) {
+            Discovery::Found(app) => {
+                if !apps.iter().any(|(pid, _)| *pid == app.pid) {
+                    apps.push((app.pid, app.port));
+                    found.push(app);
+                }
+            }
+            Discovery::Ambiguous(more) => {
+                for app in more {
+                    if !apps.iter().any(|(pid, _)| *pid == app.0) {
+                        apps.push(app);
+                    }
+                }
+            }
+            Discovery::None => {}
+        }
+    }
+    match (apps.len(), found.len()) {
+        (0, _) => Discovery::None,
+        (1, 1) => Discovery::Found(found.remove(0)),
+        _ => {
+            apps.sort_unstable();
+            Discovery::Ambiguous(apps)
+        }
+    }
 }
 
 /// Scan `base` for live Victauri apps (owning pid alive) that match `selector`.
@@ -313,7 +382,7 @@ fn is_process_alive(pid: u32) -> bool {
 /// Resolve the app to watch from discovery, logging an ambiguous outcome. Returns `None`
 /// when discovery yields no single matching app.
 fn discover_app(selector: &Selector) -> Option<DiscoveredApp> {
-    match discover_in(&discovery_base_dir(), selector, is_process_alive) {
+    match discover_in_roots(&discovery_roots(), selector, is_process_alive) {
         Discovery::Found(app) => Some(app),
         Discovery::None => None,
         Discovery::Ambiguous(apps) => {
@@ -721,6 +790,43 @@ mod tests {
             discover_in(tmp.path(), &Selector::Any, alive),
             Discovery::Found(app(100, 7374, Some("com.a")))
         );
+    }
+
+    /// Audit N6: entries are read from every root (per-user + legacy); one pid counts once.
+    #[test]
+    fn discovery_merges_all_roots() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_entry(a.path(), 100, "7374", Some("com.a"));
+        let roots = [a.path().to_path_buf(), b.path().to_path_buf()];
+        let alive = |_| true;
+        assert_eq!(
+            discover_in_roots(&roots, &Selector::Any, alive),
+            Discovery::Found(app(100, 7374, Some("com.a")))
+        );
+        write_entry(b.path(), 100, "7374", Some("com.a")); // same pid again: still one app
+        assert_eq!(
+            discover_in_roots(&roots, &Selector::Any, alive),
+            Discovery::Found(app(100, 7374, Some("com.a")))
+        );
+        write_entry(b.path(), 200, "7375", Some("com.b"));
+        assert_eq!(
+            discover_in_roots(&roots, &Selector::Any, alive),
+            Discovery::Ambiguous(vec![(100, 7374), (200, 7375)])
+        );
+        assert_eq!(
+            discover_in_roots(&roots, &app_sel("com.b"), alive),
+            Discovery::Found(app(200, 7375, Some("com.b")))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_roots_are_per_user_first() {
+        let roots = discovery_roots();
+        let euid = current_euid().unwrap();
+        assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
+        assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
+        assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
     }
 
     fn app(pid: u32, port: u16, identity: Option<&str>) -> DiscoveredApp {

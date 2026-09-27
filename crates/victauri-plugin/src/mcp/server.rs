@@ -165,7 +165,10 @@ fn build_app_full_inner(
         StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
             .with_json_response(true)
-    };
+    }
+    // rmcp reads the `/mcp` body itself (default cap 4 MiB), so axum's `DefaultBodyLimit`
+    // below never applied to it; match the 2 MiB every other route has.
+    .with_max_request_body_bytes(super::hardening::MAX_REQUEST_BODY_BYTES);
     let mcp_service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -219,6 +222,12 @@ fn build_app_full_inner(
             }),
         );
 
+    // Bodies are read under a deadline INSIDE the auth check (an unauthenticated client is
+    // refused before any body is buffered) and inside the concurrency cap below, so a client
+    // trickling its body can hold a request slot for at most `BODY_READ_TIMEOUT`.
+    router = router.layer(axum::middleware::from_fn(
+        super::hardening::read_body_with_deadline,
+    ));
     if auth_token.is_some() {
         router = router.layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -232,7 +241,9 @@ fn build_app_full_inner(
     // `GlobalConcurrencyLimitLayer`: ONE shared semaphore. A plain `ConcurrencyLimitLayer` is
     // instantiated per route by axum, which gave `/mcp` and `/api/tools/*` 64 slots EACH.
     router = router
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(
+            super::hardening::MAX_REQUEST_BODY_BYTES,
+        ))
         .layer(GlobalConcurrencyLimitLayer::new(64));
 
     // `/health` is registered AFTER the auth layer (so liveness probes stay unauthenticated)
@@ -244,10 +255,18 @@ fn build_app_full_inner(
         axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
     );
 
+    // Requests presenting the valid token draw from their own bucket: traffic that cannot
+    // authenticate must not be able to exhaust the agent's budget. (The browser guards below
+    // run first, so a refused browser request spends no token at all.)
     let limiter = rate_limiter.unwrap_or_else(crate::auth::default_rate_limiter);
+    let authenticated = Arc::new(crate::auth::RateLimiterState::new(limiter.max_tokens()));
     router = router.layer(axum::middleware::from_fn_with_state(
-        limiter,
-        crate::auth::rate_limit,
+        Arc::new(super::hardening::SplitRateLimit {
+            token: auth_token,
+            public: limiter,
+            authenticated,
+        }),
+        super::hardening::split_rate_limit,
     ));
 
     router
@@ -327,7 +346,25 @@ pub async fn start_server_with_options<R: Runtime>(
     state: Arc<VictauriState>,
     port: u16,
     auth_token: Option<String>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    start_server_reporting_port(app_handle, state, port, auth_token, shutdown_rx, None).await
+}
+
+/// [`start_server_with_options`], additionally reporting the port ACTUALLY bound (or the
+/// bind failure) on `bound` — the preferred port may be taken, possibly by another process.
+///
+/// # Errors
+///
+/// As [`start_server_with_options`].
+#[doc(hidden)]
+pub async fn start_server_reporting_port<R: Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    state: Arc<VictauriState>,
+    port: u16,
+    auth_token: Option<String>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    bound: Option<tokio::sync::oneshot::Sender<Result<u16, String>>>,
 ) -> anyhow::Result<()> {
     let bridge: Arc<dyn WebviewBridge> = Arc::new(app_handle);
     // Normalize once so the discovery-file token and the request gate agree (B2):
@@ -336,7 +373,15 @@ pub async fn start_server_with_options<R: Runtime>(
     let token_for_file = auth_token.clone();
     let app = build_app_with_options(state.clone(), bridge.clone(), auth_token);
 
-    let (listener, actual_port) = try_bind(port).await?;
+    let (listener, actual_port) = match try_bind(port).await {
+        Ok(bound_listener) => bound_listener,
+        Err(e) => {
+            if let Some(bound) = bound {
+                let _ = bound.send(Err(e.to_string()));
+            }
+            return Err(e);
+        }
+    };
 
     if actual_port != port {
         tracing::warn!("Victauri: port {port} in use, fell back to {actual_port}");
@@ -346,17 +391,22 @@ pub async fn start_server_with_options<R: Runtime>(
     let cfg = bridge.tauri_config();
     let app_identifier = cfg.get("identifier").and_then(|v| v.as_str());
     let app_product_name = cfg.get("product_name").and_then(|v| v.as_str());
-    write_port_file(actual_port, app_identifier, app_product_name);
     // Always write a session token to the discovery directory so clients can
     // authenticate automatically.  When auth is explicitly configured the
     // configured token is used; otherwise a fresh UUID is generated.  The auth
     // middleware is only enabled when `auth_token` is `Some`, so this file is
     // purely informational when auth is off — sending the token header is a
     // harmless no-op.
+    // The token is written BEFORE the port: clients discover a server by its port file and
+    // then read the token, so the reverse order left a window in which they got 401.
     let discovery_token = token_for_file
         .as_deref()
         .map_or_else(crate::auth::generate_token, String::from);
     write_token_file(&discovery_token);
+    write_port_file(actual_port, app_identifier, app_product_name);
+    if let Some(bound) = bound {
+        let _ = bound.send(Ok(actual_port));
+    }
 
     tracing::info!("Victauri MCP server listening on 127.0.0.1:{actual_port}");
 
@@ -370,18 +420,19 @@ pub async fn start_server_with_options<R: Runtime>(
     });
 
     let mut shutdown_rx2 = shutdown_rx.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.wait_for(|&v| v).await;
-        remove_port_file();
-        tracing::info!("Victauri MCP server shutting down gracefully");
-    });
+    let server = super::hardening::serve_hardened(
+        listener,
+        app,
+        super::hardening::ServeLimits::DEFAULT,
+        async move {
+            let _ = shutdown_rx.wait_for(|&v| v).await;
+            remove_port_file();
+            tracing::info!("Victauri MCP server shutting down gracefully");
+        },
+    );
 
     tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                tracing::error!("Victauri MCP server error: {e}");
-            }
-        }
+        () = server => {}
         _ = async {
             let _ = shutdown_rx2.wait_for(|&v| v).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -415,9 +466,49 @@ async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u1
 }
 
 fn discovery_dir() -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join("victauri")
-        .join(std::process::id().to_string())
+    discovery_root().join(std::process::id().to_string())
+}
+
+/// The directory holding every `<pid>/` discovery entry of this user.
+///
+/// On Unix it is per-user: `$XDG_RUNTIME_DIR/victauri` when that directory is private to us,
+/// else `<temp>/victauri-<euid>`. The old shared `/tmp/victauri` let any other local user
+/// pre-create it, after which the ownership check refused it and discovery was blocked for
+/// good. Windows and other platforms keep `<temp>/victauri` (their temp dir is per-user).
+/// Every reader (`victauri` CLI, `victauri-test`, `victauri-watchdog`) scans the same roots.
+fn discovery_root() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        discovery_root_from(std::env::var_os("XDG_RUNTIME_DIR"), current_euid())
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("victauri")
+    }
+}
+
+#[cfg(unix)]
+fn discovery_root_from(
+    xdg_runtime_dir: Option<std::ffi::OsString>,
+    euid: Option<u32>,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(euid) = euid else {
+        // Unknown uid: the legacy path, which the ownership checks then refuse (fail closed).
+        return std::env::temp_dir().join("victauri");
+    };
+    let private_runtime_dir = xdg_runtime_dir
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| {
+            std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                m.file_type().is_dir() && m.uid() == euid && m.permissions().mode() & 0o077 == 0
+            })
+        });
+    private_runtime_dir.map_or_else(
+        || std::env::temp_dir().join(format!("victauri-{euid}")),
+        |dir| dir.join("victauri"),
+    )
 }
 
 #[cfg(unix)]
@@ -1387,6 +1478,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Audit N6: the discovery root was the shared `/tmp/victauri`; another local user who
+    /// created it first blocked discovery for everyone else. It is per-user now.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_root_is_per_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let euid = current_euid().expect("euid");
+        let shared = std::env::temp_dir().join("victauri");
+        let fallback = std::env::temp_dir().join(format!("victauri-{euid}"));
+        assert_ne!(discovery_root(), shared);
+        assert_eq!(discovery_root_from(None, Some(euid)), fallback);
+
+        // A private XDG runtime dir is preferred …
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid)),
+            runtime.path().join("victauri")
+        );
+        // … but not one others can reach, one we do not own, or a relative path.
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid)),
+            fallback
+        );
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid.wrapping_add(1))),
+            std::env::temp_dir().join(format!("victauri-{}", euid.wrapping_add(1)))
+        );
+        assert_eq!(
+            discovery_root_from(Some("relative/run".into()), Some(euid)),
+            fallback
+        );
     }
 
     #[cfg(unix)]

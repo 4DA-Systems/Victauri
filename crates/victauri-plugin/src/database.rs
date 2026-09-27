@@ -140,6 +140,11 @@ pub(crate) fn db_health_report(
         rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
         MAX_DB_HEALTH_CELL_BYTES,
     );
+    // The metadata phase runs `LIKE` against schema SQL the database file supplies.
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH,
+        MAX_LIKE_PATTERN_BYTES,
+    );
 
     // Phase 0: metadata + the (bounded) table listing.
     let meta = run_bounded(&conn, DB_HEALTH_META_BUDGET, |c| {
@@ -267,7 +272,7 @@ pub(crate) fn db_health_report(
 
 /// Budget for the metadata PRAGMAs + table listing in [`db_health_report`].
 #[cfg(feature = "sqlite")]
-const DB_HEALTH_META_BUDGET: Duration = Duration::from_secs(3);
+pub(crate) const DB_HEALTH_META_BUDGET: Duration = Duration::from_secs(3);
 
 /// Open a database file Victauri did not create as read-only UNTRUSTED input: with
 /// `trusted_schema=OFF` (schema-embedded SQL functions / virtual tables cannot run with side
@@ -300,9 +305,23 @@ const MAX_QUERY_RESULT_BYTES: usize = 5_000_000;
 #[cfg(feature = "sqlite")]
 const MAX_QUERY_SQL_BYTES: usize = 1_000_000;
 #[cfg(feature = "sqlite")]
-const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "sqlite")]
 const QUERY_PROGRESS_OPS: i32 = 10_000;
+/// Result-set width cap (`SQLite`'s default is 2000). With 1 MB cells, 2000 columns let a
+/// single row reach gigabytes before any Rust-side budget could see it.
+#[cfg(feature = "sqlite")]
+const MAX_QUERY_COLUMNS: i32 = 256;
+/// `LIKE`/`GLOB` pattern length cap (`SQLite`'s default is 50 000). Pattern matching is one
+/// C call that never checks for an interrupt, so a long pattern against a long value ran for
+/// tens of seconds past the query deadline.
+#[cfg(feature = "sqlite")]
+const MAX_LIKE_PATTERN_BYTES: i32 = 1_000;
+/// How long a query waits on a lock held by the app. Kept short: a query holds its read
+/// transaction for the lock wait PLUS its CPU deadline, and an open read transaction stalls
+/// WAL checkpointing in the app.
+#[cfg(feature = "sqlite")]
+const QUERY_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[cfg(feature = "sqlite")]
 static READ_ONLY_PREFIXES: &[&str] = &["select", "pragma", "explain", "with"];
@@ -806,7 +825,7 @@ fn query_with_limits(
     conn.authorizer(Some(query_authorizer));
 
     // Limit lock waits separately from the CPU deadline enforced below.
-    conn.busy_timeout(std::time::Duration::from_secs(5))
+    conn.busy_timeout(QUERY_BUSY_TIMEOUT)
         .map_err(|e| format!("failed to set timeout: {e}"))?;
 
     // Bound both SQLite's per-value/row allocation and CPU time. `busy_timeout`
@@ -819,6 +838,10 @@ fn query_with_limits(
         rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH,
         MAX_QUERY_SQL_BYTES as i32,
     );
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH,
+        MAX_LIKE_PATTERN_BYTES,
+    );
     let started = Instant::now();
     conn.progress_handler(
         QUERY_PROGRESS_OPS,
@@ -829,16 +852,27 @@ fn query_with_limits(
     // return path, including `?` errors below).
     let _interrupt = InterruptGuard::arm(&conn, query_timeout);
 
+    // `SQLITE_LIMIT_COLUMN` also bounds table DEFINITIONS, so a schema holding one wide table
+    // would fail to parse under it and make the whole database unqueryable. Load the schema
+    // first (preparing any statement does), then cap the width of the query's result set.
+    drop(
+        conn.prepare("SELECT 1 FROM sqlite_master LIMIT 0")
+            .map_err(|e| sqlite_query_error("failed to load database schema", e, query_timeout))?,
+    );
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_COLUMN,
+        MAX_QUERY_COLUMNS,
+    );
+
     let mut stmt = conn
         .prepare(sql)
         .map_err(|e| sqlite_query_error("failed to prepare query", e, query_timeout))?;
 
-    let column_names: Vec<String> = stmt
-        .column_names()
-        .iter()
-        .map(|s| (*s).to_string())
-        .collect();
-    let column_count = column_names.len();
+    let column_names = unique_column_keys(&stmt.column_names());
+    // `"key":` per column, sized once.
+    let key_bytes: Vec<usize> = column_names.iter().map(|k| json_len(k) + 1).collect();
+    // A row object's fixed cost: its braces and the commas between its fields.
+    let row_overhead = 2 + column_names.len().saturating_sub(1);
 
     let sqlite_params: Vec<Box<dyn rusqlite::types::ToSql>> =
         params.iter().map(json_to_sql).collect();
@@ -848,12 +882,13 @@ fn query_with_limits(
     let mut rows = stmt
         .query(param_refs.as_slice())
         .map_err(|e| sqlite_query_error("query execution failed", e, query_timeout))?;
-    let mut result_bytes = serde_json::to_vec(&column_names)
-        .map_err(|e| format!("failed to size query result columns: {e}"))?
-        .len();
+    let mut result_bytes = json_len(&column_names);
     let mut truncated = false;
 
-    while let Some(row) = rows
+    // The byte budget is charged CELL BY CELL, from each raw value's encoded size, before the
+    // cell is converted: a row can never be materialized past the cap (it used to be built,
+    // base64'd and re-serialized in full before the first size check).
+    'rows: while let Some(row) = rows
         .next()
         .map_err(|e| sqlite_query_error("row read failed", e, query_timeout))?
     {
@@ -861,21 +896,28 @@ fn query_with_limits(
             truncated = true;
             break;
         }
+        let mut row_bytes = row_overhead;
         let mut obj = serde_json::Map::new();
-        for (i, col_name) in column_names.iter().enumerate().take(column_count) {
-            let value = row_value_to_json(row, i);
+        for (i, col_name) in column_names.iter().enumerate() {
+            let spent = result_bytes
+                .saturating_add(row_bytes)
+                .saturating_add(key_bytes[i]);
+            let budget = max_result_bytes.saturating_sub(spent);
+            let Some((value, value_bytes)) = cell_to_json(row, i, budget) else {
+                truncated = true;
+                break 'rows;
+            };
+            row_bytes = row_bytes
+                .saturating_add(key_bytes[i])
+                .saturating_add(value_bytes);
             obj.insert(col_name.clone(), value);
         }
-        let row_value = serde_json::Value::Object(obj);
-        let row_bytes = serde_json::to_vec(&row_value)
-            .map_err(|e| format!("failed to size query result row: {e}"))?
-            .len();
         if result_bytes.saturating_add(row_bytes) > max_result_bytes {
             truncated = true;
             break;
         }
         result_bytes = result_bytes.saturating_add(row_bytes);
-        rows_out.push(row_value);
+        rows_out.push(serde_json::Value::Object(obj));
     }
 
     Ok(serde_json::json!({
@@ -920,32 +962,108 @@ fn json_to_sql(val: &serde_json::Value) -> Box<dyn rusqlite::types::ToSql> {
     }
 }
 
+/// Result-object keys for a statement's columns. `SQLite` allows duplicate result names
+/// (`SELECT 1 AS a, 2 AS a`), which as JSON object keys silently dropped all but one value
+/// while `columns` still listed both. A repeated name gets a `:N` suffix (`a`, `a:1`, …),
+/// skipping any suffix that is itself a real column name, so every key is unique and
+/// `columns` lists exactly the keys each row carries.
 #[cfg(feature = "sqlite")]
-fn row_value_to_json(row: &rusqlite::Row, idx: usize) -> serde_json::Value {
+fn unique_column_keys(names: &[&str]) -> Vec<String> {
+    let originals: std::collections::HashSet<&str> = names.iter().copied().collect();
+    let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+    names
+        .iter()
+        .map(|&name| {
+            let mut key = name.to_string();
+            let mut n = 0u32;
+            while used.contains(&key) || (n > 0 && originals.contains(key.as_str())) {
+                n += 1;
+                key = format!("{name}:{n}");
+            }
+            used.insert(key.clone());
+            key
+        })
+        .collect()
+}
+
+/// A `std::io::Write` sink that only counts bytes, so an encoded size can be measured
+/// without building the encoding.
+#[cfg(feature = "sqlite")]
+struct ByteCounter(usize);
+
+#[cfg(feature = "sqlite")]
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Exact compact-JSON length of `value`, measured without allocating the encoding.
+#[cfg(feature = "sqlite")]
+fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    let mut counter = ByteCounter(0);
+    // Serializing into a counter cannot fail for these value types; a failure would only
+    // under-count, and the caller's cap check is then conservative on the next cell.
+    let _ = serde_json::to_writer(&mut counter, value);
+    counter.0
+}
+
+/// Convert one result cell to JSON if its encoded size fits `budget` bytes, returning the value
+/// and that size. The size is taken from the RAW cell before converting (a blob's base64 length
+/// is computed, not encoded), so a cell that does not fit is never materialized.
+#[cfg(feature = "sqlite")]
+fn cell_to_json(
+    row: &rusqlite::Row,
+    idx: usize,
+    budget: usize,
+) -> Option<(serde_json::Value, usize)> {
     use rusqlite::types::ValueRef;
-    match row.get_ref(idx) {
-        Ok(ValueRef::Null) => serde_json::Value::Null,
-        Ok(ValueRef::Integer(i)) => serde_json::json!(i),
-        Ok(ValueRef::Real(f)) => serde_json::json!(f),
+    let (value, bytes) = match row.get_ref(idx) {
+        Ok(ValueRef::Null) | Err(_) => (serde_json::Value::Null, 4),
+        Ok(ValueRef::Integer(i)) => (serde_json::json!(i), json_len(&i)),
+        Ok(ValueRef::Real(f)) => {
+            let v = serde_json::json!(f);
+            let n = json_len(&v);
+            (v, n)
+        }
         Ok(ValueRef::Text(t)) => {
+            // Borrowed (no copy) for valid UTF-8; a cell is at most MAX_QUERY_CELL_BYTES.
             let s = String::from_utf8_lossy(t);
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s)
                 && (parsed.is_object() || parsed.is_array())
             {
-                return parsed;
+                let n = json_len(&parsed);
+                (parsed, n)
+            } else {
+                let n = json_len(&*s);
+                if n > budget {
+                    return None;
+                }
+                (serde_json::Value::String(s.into_owned()), n)
             }
-            serde_json::Value::String(s.into_owned())
         }
         Ok(ValueRef::Blob(b)) => {
             use base64::Engine;
-            serde_json::json!({
+            // `{"__blob":true,"size":N,"base64":"…"}`
+            let bytes = r#"{"__blob":true,"size":,"base64":""}"#.len()
+                + json_len(&b.len())
+                + b.len().div_ceil(3) * 4;
+            if bytes > budget {
+                return None;
+            }
+            let v = serde_json::json!({
                 "__blob": true,
                 "size": b.len(),
                 "base64": base64::engine::general_purpose::STANDARD.encode(b),
-            })
+            });
+            (v, bytes)
         }
-        Err(_) => serde_json::Value::Null,
-    }
+    };
+    (bytes <= budget).then_some((value, bytes))
 }
 
 #[cfg(all(test, feature = "sqlite"))]
@@ -1179,6 +1297,150 @@ mod tests {
         assert_eq!(result["row_count"], 2);
         assert_eq!(result["truncated"], true);
         assert!(result["result_bytes"].as_u64().unwrap() <= 250_000);
+    }
+
+    /// Audit F1: `SQLITE_LIMIT_COLUMN` was the 2000 default, so one row of 1 MB cells could
+    /// reach gigabytes inside `SQLite` + the host before any budget was consulted.
+    #[test]
+    fn result_set_width_is_capped() {
+        let (_f, path) = create_test_db();
+        let cols = (1..=300)
+            .map(|i| format!("x AS c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("WITH b(x) AS (SELECT 1) SELECT {cols} FROM b");
+        let err = query(&path, &sql, &[], None).unwrap_err();
+        assert!(err.contains("too many columns"), "{err}");
+    }
+
+    /// The column cap limits result sets, never the ability to read an app's wide table.
+    #[test]
+    fn wide_table_is_still_readable_under_the_column_cap() {
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        let cols = (1..=300)
+            .map(|i| format!("c{i} INTEGER"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!(
+            "CREATE TABLE wide ({cols}); INSERT INTO wide (c1, c300) VALUES (7, 9);"
+        ))
+        .unwrap();
+        drop(conn);
+        let r = query(file.path(), "SELECT c1, c300 FROM wide", &[], None).unwrap();
+        assert_eq!(r["rows"][0]["c1"], 7);
+        assert_eq!(r["rows"][0]["c300"], 9);
+        // Only a result set that wide is refused, with a clear reason.
+        let err = query(file.path(), "SELECT * FROM wide", &[], None).unwrap_err();
+        assert!(err.contains("too many columns"), "{err}");
+    }
+
+    /// Audit F1: a row of many large blobs stops at the byte cap, and what IS returned is
+    /// within the cap (the budget is charged per cell, before conversion).
+    #[test]
+    fn wide_row_of_large_blobs_stops_at_the_byte_cap() {
+        let (_f, path) = create_test_db();
+        let cols = (1..=40)
+            .map(|i| format!("x AS c{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("WITH b(x) AS (SELECT zeroblob(1000000)) SELECT {cols} FROM b");
+        let r = query(&path, &sql, &[], None).unwrap();
+        assert_eq!(r["truncated"], true);
+        assert_eq!(r["row_count"], 0);
+        assert!(r["result_bytes"].as_u64().unwrap() <= MAX_QUERY_RESULT_BYTES as u64);
+    }
+
+    /// `result_bytes` is the exact encoded size of `columns` + every returned row, measured
+    /// from raw cells without re-serializing the row.
+    #[test]
+    fn result_bytes_matches_the_encoded_rows_exactly() {
+        let (_f, path) = create_test_db();
+        let r = query(
+            &path,
+            "SELECT id, name, score, NULL AS n, X'00FF10' AS b, '{\"k\": [1, 2]}' AS j, \
+             'q\"\\\n\u{1}é' AS s, 1.5e300 AS big FROM users",
+            &[],
+            None,
+        )
+        .unwrap();
+        let mut expected = serde_json::to_vec(&r["columns"]).unwrap().len();
+        for row in r["rows"].as_array().unwrap() {
+            expected += serde_json::to_vec(row).unwrap().len();
+        }
+        assert_eq!(r["result_bytes"].as_u64().unwrap() as usize, expected);
+        assert!(r["rows"][0]["j"].is_object());
+        assert_eq!(r["rows"][0]["b"]["size"], 3);
+    }
+
+    /// Audit F1: `SELECT 1 AS a, 2 AS a` returned `columns: [a, a]` but a row object with one
+    /// `a` — a value silently vanished.
+    #[test]
+    fn duplicate_column_names_keep_every_value() {
+        let (_f, path) = create_test_db();
+        let r = query(
+            &path,
+            "SELECT 1 AS a, 2 AS a, 3 AS \"a:1\", 4 AS a",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(r["columns"], serde_json::json!(["a", "a:2", "a:1", "a:3"]));
+        let row = &r["rows"][0];
+        assert_eq!(row["a"], 1);
+        assert_eq!(row["a:2"], 2);
+        assert_eq!(row["a:1"], 3);
+        assert_eq!(row["a:3"], 4);
+        assert_eq!(row.as_object().unwrap().len(), 4);
+    }
+
+    /// Audit F2: `LIKE`/`GLOB` never check for an interrupt, so a long pattern ran tens of
+    /// seconds past the deadline. Long patterns are now refused up front.
+    #[test]
+    fn long_like_and_glob_patterns_are_refused() {
+        let (_f, path) = create_test_db();
+        let pattern = format!("%{}%", "a".repeat(5_000));
+        for sql in [
+            "SELECT name FROM users WHERE name LIKE ?",
+            "SELECT name FROM users WHERE name GLOB ?",
+        ] {
+            let started = Instant::now();
+            let err = query(&path, sql, &[serde_json::json!(pattern)], None).unwrap_err();
+            assert!(err.contains("pattern too complex"), "{sql}: {err}");
+            // Refused per row BEFORE matching (generous bound: loaded CI machines).
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+        // An ordinary pattern still works.
+        let r = query(
+            &path,
+            "SELECT name FROM users WHERE name LIKE ?",
+            &[serde_json::json!("A%")],
+            None,
+        )
+        .unwrap();
+        assert_eq!(r["row_count"], 1);
+    }
+
+    /// Audit F7: a query waited up to 5s on the app's lock before its 5s CPU deadline even
+    /// started, holding a read transaction (and stalling WAL checkpoints) for ~10s.
+    #[test]
+    fn lock_wait_is_short() {
+        let (_f, path) = create_test_db();
+        let locker = rusqlite::Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let started = Instant::now();
+        let err = query(&path, "SELECT * FROM users", &[], None).unwrap_err();
+        assert!(err.contains("locked"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "lock wait took {:?}",
+            started.elapsed()
+        );
+        locker.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

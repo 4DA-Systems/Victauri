@@ -940,14 +940,12 @@ impl VictauriBuilder {
                         .startup_timeline
                         .mark("event_bus_listeners_registered");
 
-                    if let Some(ref token) = auth_token {
-                        // Char-based (never byte-sliced: a configured token may hold
-                        // multi-byte chars) and deliberately short — the log is not a
-                        // place for recoverable token material.
-                        let prefix: String = token.chars().take(4).collect();
+                    if auth_token.is_some() {
+                        // Nothing about the token itself: even a prefix and length narrow a
+                        // guess, and logs travel further than the owner-only discovery file.
                         tracing::info!(
-                            "Victauri MCP server auth enabled — token: {prefix}… ({} chars)",
-                            token.chars().count()
+                            "Victauri MCP server auth enabled — clients read the token from \
+                             the discovery directory"
                         );
                     } else {
                         tracing::warn!(
@@ -961,13 +959,15 @@ impl VictauriBuilder {
                     let app_handle = app.clone();
                     let ready_state = state.clone();
                     let server_finished = state.task_tracker.track("mcp_server");
+                    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
                     tauri::async_runtime::spawn(async move {
-                        match mcp::start_server_with_options(
+                        match mcp::start_server_reporting_port(
                             app_handle,
                             state,
                             port,
                             auth_token,
                             shutdown_rx,
+                            Some(bound_tx),
                         )
                         .await
                         {
@@ -981,36 +981,31 @@ impl VictauriBuilder {
                         server_finished.store(true, std::sync::atomic::Ordering::Relaxed);
                     });
 
-                    if let Some(cb) = on_ready {
-                        let ready_finished = ready_state.task_tracker.track("on_ready_probe");
-                        tauri::async_runtime::spawn(async move {
-                            for _ in 0..50 {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                let actual_port =
-                                    ready_state.port.load(std::sync::atomic::Ordering::Relaxed);
-                                if tokio::net::TcpStream::connect(format!(
-                                    "127.0.0.1:{actual_port}"
-                                ))
-                                .await
-                                .is_ok()
-                                {
+                    // The banner and `on_ready` report the port the server actually BOUND. They
+                    // used the preferred port, and probing it by connecting could reach another
+                    // process squatting on it — or report it after the 5s probe gave up even
+                    // though nothing of ours was listening.
+                    let ready_finished = ready_state.task_tracker.track("on_ready_probe");
+                    tauri::async_runtime::spawn(async move {
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), bound_rx)
+                            .await
+                        {
+                            Ok(Ok(Ok(actual_port))) => {
+                                emit_security_banner(actual_port);
+                                if let Some(cb) = on_ready {
                                     cb(actual_port);
-                                    ready_finished
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return;
                                 }
                             }
-                            let actual_port =
-                                ready_state.port.load(std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                "Victauri on_ready: server did not become ready within 5s"
-                            );
-                            cb(actual_port);
-                            ready_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-                        });
-                    }
-
-                    emit_security_banner(port);
+                            Ok(Ok(Err(e))) => tracing::warn!(
+                                "Victauri: server did not start ({e}); on_ready not called"
+                            ),
+                            Ok(Err(_)) | Err(_) => tracing::warn!(
+                                "Victauri: server did not report a bound port within 5s; \
+                                 on_ready not called"
+                            ),
+                        }
+                        ready_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                    });
                     Ok(())
                 })
                 .on_event(|app, event| {

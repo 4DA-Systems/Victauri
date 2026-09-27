@@ -7,8 +7,41 @@
 
 use std::path::PathBuf;
 
-fn victauri_base_dir() -> PathBuf {
-    std::env::temp_dir().join("victauri")
+/// The discovery roots the plugin may have written to, most specific first (mirrors the
+/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
+/// that directory is private to us, else `<temp>/victauri-<euid>` (a shared `/tmp/victauri`
+/// could be pre-created by another user, blocking discovery) — and the legacy
+/// `<temp>/victauri` is still read, subject to the same ownership check, for pre-0.9 plugins.
+/// Other platforms use `<temp>/victauri` (a per-user temp dir).
+fn discovery_roots() -> Vec<PathBuf> {
+    let legacy = std::env::temp_dir().join("victauri");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut roots = Vec::new();
+        if let Some(euid) = current_euid() {
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .filter(|dir| {
+                    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                        m.file_type().is_dir()
+                            && m.uid() == euid
+                            && m.permissions().mode() & 0o077 == 0
+                    })
+                })
+            {
+                roots.push(runtime.join("victauri"));
+            }
+            roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+        }
+        roots.push(legacy);
+        roots
+    }
+    #[cfg(not(unix))]
+    {
+        vec![legacy]
+    }
 }
 
 /// Whether a discovery directory is safe to trust (audit #15). On Unix the temp
@@ -227,17 +260,14 @@ impl DiscoveryStatus {
 /// when you want to explain *why* a connection failed.
 #[must_use]
 pub fn diagnose_discovery() -> DiscoveryStatus {
-    let base = victauri_base_dir();
-    if !dir_is_trusted(&base) {
-        return DiscoveryStatus::None;
-    }
-    let Ok(entries) = std::fs::read_dir(&base) else {
-        return DiscoveryStatus::None;
-    };
-
     let mut stale = Vec::new();
     let mut any_dir = false;
-    for entry in entries.flatten() {
+    let entries = discovery_roots()
+        .into_iter()
+        .filter(|base| dir_is_trusted(base))
+        .filter_map(|base| std::fs::read_dir(base).ok())
+        .flat_map(Iterator::flatten);
+    for entry in entries {
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -308,7 +338,16 @@ fn unique_token_for_port(servers: &[DiscoveredServer], port: u16) -> Option<Stri
 }
 
 fn find_live_servers() -> Vec<DiscoveredServer> {
-    find_live_servers_in(&victauri_base_dir(), is_process_alive, port_is_reachable)
+    let mut servers: Vec<DiscoveredServer> = Vec::new();
+    for root in discovery_roots() {
+        for server in find_live_servers_in(&root, is_process_alive, port_is_reachable) {
+            // A pid already found under a more specific root counts once.
+            if !servers.iter().any(|seen| seen.pid == server.pid) {
+                servers.push(server);
+            }
+        }
+    }
+    servers
 }
 
 /// Testable core of [`find_live_servers`]: scan `base`, keep only entries whose OWNING
@@ -409,6 +448,17 @@ fn is_process_alive(pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit N6: the per-user root is scanned first; the legacy shared root is last.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_roots_are_per_user_first() {
+        let roots = discovery_roots();
+        let euid = current_euid().unwrap();
+        assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
+        assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
+        assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+    }
 
     #[cfg(unix)]
     #[test]
