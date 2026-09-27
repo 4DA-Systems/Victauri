@@ -168,8 +168,8 @@ adv!(eval_oversized_output_is_capped, base, {
 // ── B. Resilience: recover cleanly after an eval timeout ────────────────────
 
 adv!(eval_recovers_after_failed_eval, base, {
-    // A syntax error now fails FAST via the parse watchdog (~0.75s) instead of hanging for
-    // the full eval timeout. The NEXT eval must still succeed — proving the bridge recovers
+    // A syntax error now fails FAST via the parse check delivered right after the code,
+    // instead of hanging for the full eval timeout. The NEXT eval must still succeed — proving the bridge recovers
     // cleanly after a failed eval.
     let e = error(&eval(&base, "return 1 +").await);
     assert!(
