@@ -1183,12 +1183,20 @@ async fn drain_window(
 
     let events: Vec<serde_json::Value> = serde_json::from_str(&result).ok()?;
 
+    // Watermark = newest `seq_ts` (IPC completion time) or `timestamp`, clamped to now: a
+    // bogus far-future timestamp must never jump the watermark past all real events (it would
+    // silently stop this window's recording for the rest of the session).
+    #[allow(clippy::cast_precision_loss)]
+    let now_ms = chrono::Utc::now().timestamp_millis() as f64;
     let mut newest = since;
     for ev in &events {
         let ts = ev
-            .get("timestamp")
+            .get("seq_ts")
+            .or_else(|| ev.get("timestamp"))
             .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
+            .filter(|t| t.is_finite())
+            .unwrap_or(0.0)
+            .min(now_ms);
         if ts > newest {
             newest = ts;
         }

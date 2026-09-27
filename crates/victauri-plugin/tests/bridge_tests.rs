@@ -5087,11 +5087,29 @@ fn bridge_hardening_regressions() {
                     await fetch('http://ipc.localhost/bad_cmd', { method: 'POST', body: '{}',
                         headers: { 'x-vtest-tauri-response': 'error' } });
                     var all = window.__VICTAURI__.getEventStream();
-                    var last = all[all.length - 1].timestamp;
+                    // The watermark a consumer keeps is the newest seq_ts (IPC completion time)
+                    // or timestamp — exactly what the Rust drain computes.
+                    var last = all.reduce(function(m, e) {
+                        var k = (e.seq_ts !== undefined) ? e.seq_ts : e.timestamp;
+                        return k > m ? k : m;
+                    }, 0);
                     var incl = window.__VICTAURI__.getEventStream(last).length;
                     var excl = window.__VICTAURI__.getEventStream(last, true).length;
                     var ipc = all.filter(function(e) { return e.type === 'ipc'; })[0];
-                    return { incl_nonzero: incl > 0, excl: excl, ipc_status: ipc && ipc.status };
+                    // A slow call pending at one watermark read is emitted exactly once, when
+                    // it completes (it used to be keyed by start time and never re-read).
+                    var slow = fetch('http://ipc.localhost/slow_cmd', { method: 'POST', body: '{}',
+                        headers: { 'x-vtest-delay-ms': '120' } });
+                    var during = window.__VICTAURI__.getEventStream(0, true)
+                        .filter(function(e) { return e.command === 'slow_cmd'; }).length;
+                    var mark = Date.now();
+                    await slow;
+                    await new Promise(function(r) { setTimeout(r, 20); });
+                    var after = window.__VICTAURI__.getEventStream(mark, true)
+                        .filter(function(e) { return e.command === 'slow_cmd'; });
+                    return { incl_nonzero: incl > 0, excl: excl, ipc_status: ipc && ipc.status,
+                             slow_during: during, slow_after: after.length,
+                             slow_status: after[0] && after[0].status };
                 ",
             ),
             TestCase {
@@ -5183,6 +5201,15 @@ fn bridge_hardening_regressions() {
     assert_eq!(e["incl_nonzero"], true);
     assert_eq!(e["excl"], 0);
     assert_eq!(e["ipc_status"], "error");
+    assert_eq!(
+        e["slow_during"], 0,
+        "a pending call is not emitted in watermark mode"
+    );
+    assert_eq!(
+        e["slow_after"], 1,
+        "a slow call is emitted once when it completes"
+    );
+    assert_eq!(e["slow_status"], "ok");
 
     let rt = r(6);
     assert_eq!(rt["bad_ok"], false);

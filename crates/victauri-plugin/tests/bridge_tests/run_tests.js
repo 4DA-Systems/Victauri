@@ -255,6 +255,14 @@ async function run() {
             },
           };
         }
+        // Optional `x-vtest-delay-ms` keeps the call in flight (pending) for a while, to test
+        // how the bridge reports a slow command across event-stream reads.
+        var delayMs = Number(reqHeaders["x-vtest-delay-ms"] || 0);
+        if (delayMs > 0) {
+          return new Promise(function (res) {
+            setTimeout(function () { res(makeResponse()); }, delayMs);
+          });
+        }
         return Promise.resolve(makeResponse());
       };
     }

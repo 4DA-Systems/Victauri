@@ -140,12 +140,24 @@ const INIT_SCRIPT_BODY: &str = r#"
     // the URL is a Tauri IPC URL, else null.
     var IPC_PREFIXES = ['http://ipc.localhost/', 'ipc://localhost/'];
     function ipcCommandPath(url) {
+        if (typeof url !== 'string') {
+            try { url = String(url); } catch (e) { return null; }
+        }
         for (var pi = 0; pi < IPC_PREFIXES.length; pi++) {
             if (url.indexOf(IPC_PREFIXES[pi]) === 0) return url.substring(IPC_PREFIXES[pi].length);
         }
         return null;
     }
     function isIpcUrl(url) { return ipcCommandPath(url) !== null; }
+    // Victauri's own IPC (plugin:victauri|*). Decided from the parsed IPC command path — NOT a
+    // substring anywhere in the URL, which let any page request containing
+    // "plugin%3Avictauri%7C" in a query string escape route rules and network logging.
+    function isVictauriInternalUrl(url) {
+        var p = ipcCommandPath(url);
+        if (p === null) return false;
+        try { p = decodeURIComponent(p); } catch (e) {}
+        return p.indexOf('plugin:victauri|') === 0;
+    }
     var navigationLog = [];
     var dialogLog = [];
     var interactionLog = [];
@@ -170,9 +182,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     // Never matches Victauri's own internal IPC traffic.
     function matchRoute(url, method) {
         if (!routeRules.length) return null;
-        if (url.indexOf('plugin%3Avictauri%7C') !== -1 || url.indexOf('plugin:victauri|') !== -1) {
-            return null;
-        }
+        if (isVictauriInternalUrl(url)) return null;
         var m = (method || 'GET').toUpperCase();
         for (var i = 0; i < routeRules.length; i++) {
             var r = routeRules[i];
@@ -287,6 +297,20 @@ const INIT_SCRIPT_BODY: &str = r#"
         try {
             return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
         } catch (e) { return null; }
+    }
+
+    // The bridge's logs are handed out as per-entry COPIES. Returning the live internal arrays
+    // (as the getters used to) let page script push forged entries (a fake successful IPC call
+    // that `recording replay` would then invoke), splice out its own traffic, or plant values
+    // that break every later read. Freezing the bridge object does not protect its arrays.
+    var ASSIGN = Object.assign;
+    function copyEntries(arr) {
+        var out = new Array(arr.length);
+        for (var i = 0; i < arr.length; i++) {
+            var e = arr[i];
+            out[i] = (e && typeof e === 'object') ? ASSIGN({}, e) : e;
+        }
+        return out;
     }
 
     // ── Public API ───────────────────────────────────────────────────────────
@@ -739,8 +763,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── Console ──────────────────────────────────────────────────────────
 
         getConsoleLogs: function(since) {
-            if (since) return consoleLogs.filter(function(l) { return l.timestamp >= since; });
-            return consoleLogs;
+            return copyEntries(since ? consoleLogs.filter(function(l) { return l.timestamp >= since; }) : consoleLogs);
         },
 
         clearConsoleLogs: function() {
@@ -750,8 +773,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── Mutations ────────────────────────────────────────────────────────
 
         getMutationLog: function(since) {
-            if (since) return mutationLog.filter(function(m) { return m.timestamp >= since; });
-            return mutationLog;
+            return copyEntries(since ? mutationLog.filter(function(m) { return m.timestamp >= since; }) : mutationLog);
         },
 
         clearMutationLog: function() {
@@ -766,7 +788,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 log = log.filter(function(e) { return e.url.indexOf(filter) !== -1; });
             }
             if (limit) log = log.slice(-limit);
-            return log;
+            return copyEntries(log);
         },
 
         clearNetworkLog: function() {
@@ -803,7 +825,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             return { ok: true, id: r.id, rule: r };
         },
 
-        getRouteRules: function() { return routeRules; },
+        getRouteRules: function() { return copyEntries(routeRules); },
 
         clearRoute: function(id) {
             var before = routeRules.length;
@@ -818,7 +840,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
 
         getRouteMatches: function(limit) {
-            return limit ? routeMatchLog.slice(-limit) : routeMatchLog;
+            return copyEntries(limit ? routeMatchLog.slice(-limit) : routeMatchLog);
         },
 
         // ── Storage ──────────────────────────────────────────────────────────
@@ -882,7 +904,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── Navigation ───────────────────────────────────────────────────────
 
         getNavigationLog: function() {
-            return navigationLog;
+            return copyEntries(navigationLog);
         },
 
         navigate: function(url) {
@@ -898,7 +920,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── Dialogs ──────────────────────────────────────────────────────────
 
         getDialogLog: function() {
-            return dialogLog;
+            return copyEntries(dialogLog);
         },
 
         clearDialogLog: function() {
@@ -936,15 +958,24 @@ const INIT_SCRIPT_BODY: &str = r#"
 
             var victauriPrefix = 'plugin%3Avictauri%7C';
             networkLog.forEach(function(n) {
-                if (!inRange(n.timestamp)) return;
                 var raw = ipcCommandPath(n.url);
                 if (raw === null) {
                     // Plain network traffic. IPC requests are emitted once, as `ipc`
                     // events above/below — not a second time as `network`.
+                    if (!inRange(n.timestamp)) return;
                     events.push({ type: 'network', method: n.method, url: n.url, status: n.status, duration_ms: n.duration_ms, timestamp: n.timestamp });
                     return;
                 }
                 if (raw.indexOf(victauriPrefix) === 0) return;
+                // IPC calls are keyed by COMPLETION time (`seq_ts`), not start time. Keyed by
+                // start, a call still pending at one drain tick fell behind the watermark and was
+                // never read again — so every command slower than the drain gap stayed "pending"
+                // forever in recordings. In exclusive (watermark) mode a pending call is skipped
+                // and emitted once, when it completes.
+                var isPending = n.status === 'pending';
+                if (isPending && excl) return;
+                var seq = isPending ? n.timestamp : n.timestamp + (n.duration_ms || 0);
+                if (!inRange(seq)) return;
                 var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
                 // Same classification as getIpcLog: HTTP 200 with a
                 // `Tauri-Response: error` header is a failed command.
@@ -953,7 +984,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 else if (n.status !== 200 && n.status !== 'ok') st = 'error';
                 else if (n.ipc_response === 'error') st = 'error';
                 else st = 'ok';
-                events.push({ type: 'ipc', command: cmd, status: st, duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp });
+                events.push({ type: 'ipc', command: cmd, status: st, duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp, seq_ts: seq });
             });
 
             navigationLog.forEach(function(n) {
@@ -1891,6 +1922,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         return element;
     }
 
+    // An unquoted attribute value for the compact tree: escaped like a JSON string (no raw
+    // newlines, quotes or control characters) but without the surrounding quotes.
+    function compactAttr(v) {
+        var s = PRISTINE_STRINGIFY(String(v));
+        return s.substring(1, s.length - 1);
+    }
+
     function walkDomCompact(node, depth) {
         if (!node || node.nodeType !== 1) return '';
 
@@ -1921,12 +1959,15 @@ const INIT_SCRIPT_BODY: &str = r#"
             line += tag;
         }
 
+        // Page-derived strings are JSON-encoded: written raw, a newline in rendered text (an
+        // RSS title, a chat message) forged whole `[eN] button "…"` lines in this tree and could
+        // steer an agent's click onto a different element.
         if (name) {
-            line += ' "' + name.substring(0, 60) + '"';
+            line += ' ' + PRISTINE_STRINGIFY(name.substring(0, 60));
         } else if (text && text.length <= 60) {
-            line += ' "' + text + '"';
+            line += ' ' + PRISTINE_STRINGIFY(text);
         } else if (text) {
-            line += ' "' + text.substring(0, 57) + '..."';
+            line += ' ' + PRISTINE_STRINGIFY(text.substring(0, 57) + '...');
         }
 
         if (node.disabled) line += ' [disabled]';
@@ -1936,13 +1977,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
 
         var testId = node.getAttribute('data-testid');
-        if (testId) line += ' @' + testId;
+        if (testId) line += ' @' + compactAttr(testId);
 
         var type = node.getAttribute('type');
-        if (type && tag === 'input') line += ' type=' + type;
+        if (type && tag === 'input') line += ' type=' + compactAttr(type);
 
         var href = node.getAttribute('href');
-        if (href && tag === 'a') line += ' href=' + href.substring(0, 60);
+        if (href && tag === 'a') line += ' href=' + compactAttr(href.substring(0, 60));
 
         var result = line + '\n';
 
@@ -2202,7 +2243,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
                 var method = String((init && init.method) || (input && input.method) || 'GET');
                 var isIpc = isIpcUrl(url);
-                var isVictauriInternal = isIpc && url.indexOf('plugin%3Avictauri%7C') !== -1;
+                var isVictauriInternal = isVictauriInternalUrl(url);
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
 
                 if (isIpc && !isVictauriInternal) {
@@ -2363,8 +2404,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         };
         XMLHttpRequest.prototype.send = function() {
             if (this.__victauri_net) {
-                var isVictauriInternal = this.__victauri_net.url.indexOf('plugin%3Avictauri%7C') !== -1
-                    || this.__victauri_net.url.indexOf('plugin:victauri|') !== -1;
+                var isVictauriInternal = isVictauriInternalUrl(this.__victauri_net.url);
                 if (isVictauriInternal) {
                     return origSend.apply(this, arguments);
                 }
