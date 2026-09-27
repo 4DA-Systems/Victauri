@@ -172,7 +172,7 @@ pub fn action_capability(tool: &str, action: &str) -> Option<String> {
         },
         "logs" => match action {
             "console" | "network" | "ipc" | "navigation" | "dialogs" | "events" | "slow_ipc"
-            | "clear" => format!("logs.{action}"),
+            | "clear" | "backend" | "backend_digest" | "stdout" => format!("logs.{action}"),
             _ => return None,
         },
         "introspect" => match action {
@@ -504,6 +504,9 @@ mod tests {
         ("logs", "events", "logs.events", true, true),
         ("logs", "slow_ipc", "logs.slow_ipc", true, true),
         ("logs", "clear", "logs.clear", false, true),
+        ("logs", "backend", "logs.backend", true, true),
+        ("logs", "backend_digest", "logs.backend_digest", true, true),
+        ("logs", "stdout", "logs.stdout", true, true),
         // introspect — FullControl-only (all 15 actions)
         (
             "introspect",

@@ -2,6 +2,8 @@
 //! CLI for Victauri — scaffold tests, diagnose running apps, and record sessions.
 
 mod bridge;
+mod logs;
+mod run;
 
 use std::path::{Path, PathBuf};
 
@@ -108,6 +110,53 @@ enum Commands {
         #[arg(long)]
         allow_empty_registry: bool,
     },
+    /// Launch an app (or its dev command) with stdout/stderr captured for agents — zero app
+    /// changes, survives crashes. e.g. `victauri run -- npm run tauri dev`
+    Run {
+        /// Write the capture here instead of `<temp>/victauri/console/<pid>-<ms>.jsonl`
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        /// The command to run, after `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Show (or follow) the running app's Rust backend logs; falls back to the latest
+    /// `victauri run` capture when the app is down
+    Logs {
+        /// Which app, when several are running (bundle identifier or product name)
+        #[arg(long)]
+        app: Option<String>,
+        /// Minimum level: trace, debug, info, warn, error
+        #[arg(short, long)]
+        level: Option<String>,
+        /// Target prefix(es), comma-separated (e.g. `app::db`)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Only lines containing this text (case-insensitive)
+        #[arg(short, long)]
+        grep: Option<String>,
+        /// How many recent lines to show first
+        #[arg(short = 'n', long, default_value_t = 100)]
+        limit: usize,
+        /// Keep printing new lines as they arrive (one line per event — monitor-friendly)
+        #[arg(short, long)]
+        follow: bool,
+        /// Print the digest: counts, repeated messages, recent problems, panics
+        #[arg(long)]
+        digest: bool,
+        /// Read raw stdout/stderr from the `victauri run` capture instead
+        #[arg(long)]
+        stdout: bool,
+        /// Read a specific capture file (implies --stdout)
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        /// Print raw JSON records instead of formatted lines
+        #[arg(long)]
+        json: bool,
+        /// Poll interval for --follow, in milliseconds
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -155,6 +204,40 @@ async fn main() -> Result<()> {
             allow_empty_registry,
         } => {
             cmd_coverage(threshold, junit.as_deref(), allow_empty_registry).await?;
+        }
+        Commands::Run { capture, command } => {
+            let code = tokio::task::spawn_blocking(move || run::run(&command, capture))
+                .await
+                .context("launcher task failed")??;
+            std::process::exit(code);
+        }
+        Commands::Logs {
+            app,
+            level,
+            target,
+            grep,
+            limit,
+            follow,
+            digest,
+            stdout,
+            capture,
+            json,
+            interval_ms,
+        } => {
+            logs::cmd_logs(logs::LogsOptions {
+                app,
+                level,
+                target,
+                grep,
+                limit,
+                follow,
+                digest,
+                stdout,
+                json,
+                capture,
+                interval_ms: interval_ms.max(50),
+            })
+            .await?;
         }
     }
 
@@ -1448,7 +1531,35 @@ immediately (often `null`) while the real work runs. Don't poll by hand or sprin
   is still caught: `wait_for { condition: "event", value: "analysis-complete" }`. (Custom events
   must be registered via `VictauriBuilder::listen_events(&["…"])`.)
 
-The robust pattern is `invoke_command(...)` then `wait_for(expression|event, ...)` — never a bare sleep.
+- **Completion log line:** `wait_for` with `condition: "log"` blocks until the Rust backend
+  logs a line containing `value` (optional minimum `level`) — it wakes the instant the line is
+  logged: `wait_for { condition: "log", value: "sync complete" }`. Works for any app whose
+  backend log Victauri captures (see below).
+
+The robust pattern is `invoke_command(...)` then `wait_for(expression|event|log, ...)` — never a bare sleep.
+
+### The Rust backend's log (what the app prints to its console)
+
+The `logs` tool reads the **Rust side** too — the debug console a human would watch:
+- `logs { action: "backend_digest" }` — **start here** when something is off: per-level counts,
+  repeated messages collapsed into templates, recent warnings/errors, and every captured panic
+  (including panics on background threads that otherwise only reach stderr).
+- `logs { action: "backend", level: "warn", target: "my_app::db", filter: "timeout" }` —
+  structured entries (typed fields, span context, thread, file:line). Page forward with the
+  returned `next_seq` → `since_seq`.
+- `invoke_command { command, args, with_logs: true }` — the command's result **plus** the backend
+  log lines emitted while it ran, in one call.
+- `logs { action: "stdout" }` — raw stdout/stderr when the app was started with
+  `victauri run -- <dev command>`; after a crash, `victauri logs --stdout` (terminal) shows the
+  last words and the decoded exit status even though the app is gone.
+- Live monitoring from a terminal: `victauri logs --follow --level warn` prints one line per new
+  warning/error — hand it to a line-streaming monitor to be notified as they happen.
+
+Panics are captured automatically. Structured capture needs one line in the app's logging setup
+(`.with(victauri_plugin::log_layer())` on a `tracing_subscriber` registry, or
+`victauri_plugin::log_logger()` chained into `tauri-plugin-log`/fern); without it, launch the app
+via `victauri run` to capture its raw console with zero code changes. If `backend*` returns a
+`hint` saying no source is active, relay that one-line fix rather than grepping log files.
 
 ### Reading app-specific backend state
 

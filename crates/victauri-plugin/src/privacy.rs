@@ -227,6 +227,9 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "logs.dialogs"
                 | "logs.events"
                 | "logs.slow_ipc"
+                | "logs.backend"
+                | "logs.backend_digest"
+                | "logs.stdout"
                 // logs.clear erases captured logs — a test-time mutation, allowed
                 // in Test/FullControl but NOT in read-only Observe.
                 | "logs.clear"
@@ -274,6 +277,9 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "logs.dialogs"
                 | "logs.events"
                 | "logs.slow_ipc"
+                | "logs.backend"
+                | "logs.backend_digest"
+                | "logs.stdout"
                 // NOTE: logs.clear is intentionally excluded — clearing logs erases
                 // observable evidence, which the read-only Observe profile forbids.
                 | "inspect"

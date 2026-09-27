@@ -752,3 +752,158 @@ e2e_test!(
         assert!(reloads > 0, "reloader should have run at least once");
     }
 );
+
+// ────────────────────────────────────────────────────────────────────────────
+// Backend (Rust) logs — `logs backend*`, `wait_for log`, `invoke_command with_logs`
+// ────────────────────────────────────────────────────────────────────────────
+
+e2e_test!(
+    backend_log_awaits_fire_and_forget_work,
+    |client| async move {
+        // run_pipeline returns immediately; completion is announced in the backend log.
+        // The cursor from `with_logs` pins the wait to THIS run — an earlier run's
+        // identical "pipeline complete" line can never satisfy it.
+        let started = client
+            .call_tool(
+                "invoke_command",
+                json!({"command": "run_pipeline", "with_logs": true}),
+            )
+            .await
+            .unwrap();
+        let cursor = started["backend_log_cursor"]
+            .as_u64()
+            .expect("with_logs returns a cursor");
+        let hit = client
+            .wait_for_log_since(cursor, "pipeline complete", Some("info"), Some(10_000))
+            .await
+            .unwrap();
+        assert_eq!(
+            hit["ok"], true,
+            "pipeline completion was never logged: {hit}"
+        );
+        let entry = &hit["entry"];
+        assert_eq!(entry["target"], "demo::pipeline");
+        assert!(
+            entry["fields"]["processed"].as_u64().is_some(),
+            "typed fields: {entry}"
+        );
+        assert!(
+            entry["spans"].as_array().is_some_and(|s| s
+                .iter()
+                .any(|x| x.as_str().is_some_and(|x| x.starts_with("pipeline_run")))),
+            "span context: {entry}"
+        );
+        assert_eq!(entry["thread"], "pipeline-worker");
+    }
+);
+
+e2e_test!(
+    backend_log_attached_to_invoke_command,
+    |client| async move {
+        let r = client
+            .call_tool(
+                "invoke_command",
+                json!({"command": "run_pipeline", "with_logs": true}),
+            )
+            .await
+            .unwrap();
+        let logs = r["backend_logs"]
+            .as_array()
+            .expect("with_logs wraps the result");
+        assert!(
+            logs.iter().any(|e| e["message"] == "pipeline started"),
+            "the command's own log line rides along with its result: {r}"
+        );
+    }
+);
+
+e2e_test!(
+    backend_log_captures_background_panics_zero_config,
+    |client| async move {
+        client
+            .invoke_command("panic_in_background", None)
+            .await
+            .unwrap();
+        let hit = client
+            .wait_for_log("index out of bounds", Some("error"), Some(10_000))
+            .await
+            .unwrap();
+        assert_eq!(hit["ok"], true, "panic not captured: {hit}");
+        assert_eq!(hit["entry"]["source"], "panic");
+        assert_eq!(hit["entry"]["thread"], "flaky-worker");
+        let digest = client.backend_digest().await.unwrap();
+        assert!(
+            digest["panics"].as_array().is_some_and(|p| !p.is_empty()),
+            "digest lists panics: {digest}"
+        );
+        // A panic on a background thread must not take the app down.
+        let title = client.eval_js("document.title").await.unwrap();
+        assert!(title.is_string());
+    }
+);
+
+e2e_test!(backend_log_filters_and_cursor, |client| async move {
+    let start = client.backend_logs(json!({"limit": 1})).await.unwrap();
+    let cursor = start["next_seq"].as_u64().unwrap();
+    client.invoke_command("run_pipeline", None).await.unwrap();
+    let done = client
+        .wait_for_log_since(cursor, "pipeline complete", None, Some(10_000))
+        .await
+        .unwrap();
+    assert_eq!(done["ok"], true, "{done}");
+    let page = client
+        .backend_logs(json!({"since_seq": cursor, "target": "demo::pipeline", "level": "debug"}))
+        .await
+        .unwrap();
+    let entries = page["entries"].as_array().unwrap();
+    assert!(
+        entries.len() >= 3,
+        "start + chunks + complete since the cursor: {page}"
+    );
+    assert!(entries.iter().all(|e| e["seq"].as_u64().unwrap() >= cursor));
+    assert!(entries.iter().all(|e| e["target"] == "demo::pipeline"));
+});
+e2e_test!(
+    server_stays_responsive_while_the_app_blocks_its_async_runtime,
+    |client| async move {
+        // The classic app bug: blocking calls inside async tasks pin every Tokio worker.
+        // Victauri's server runs on its own runtime, so it must keep answering — that is
+        // precisely when an agent needs to look inside. (Before the isolated runtime:
+        // /health took ~9 s here.) The triggering invoke itself may time out: its reply
+        // travels through the app's own, now-blocked runtime.
+        let _ = client
+        .call_tool(
+            "invoke_command",
+            json!({"command": "saturate_async_runtime", "args": {"seconds": 4}, "timeout_ms": 500}),
+        )
+        .await;
+        let started = std::time::Instant::now();
+        let page = client
+            .backend_logs(json!({"target": "demo::runtime", "level": "warn", "limit": 5}))
+            .await
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "backend tools must not starve behind the app's runtime: took {elapsed:?}"
+        );
+        assert!(
+            page["entries"].as_array().is_some_and(|e| !e.is_empty()),
+            "the blocking tasks' own warnings are visible while they block: {page}"
+        );
+        // Don't leave a pinned runtime to the next test: the demo spawns 2x cores
+        // blocking tasks (two waves), so wait until the app's own IPC answers again.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let r = client
+                .call_tool(
+                    "invoke_command",
+                    json!({"command": "get_counter", "timeout_ms": 1000}),
+                )
+                .await;
+            if r.is_ok() || std::time::Instant::now() > deadline {
+                break;
+            }
+        }
+    }
+);

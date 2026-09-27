@@ -62,6 +62,12 @@ pub struct InvokeCommandParams {
     /// 30s; max 300000). Raise it for commands that are legitimately slow.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// When true, the result becomes `{"result": …, "backend_logs": […]}`: every
+    /// backend log entry (debug and above) captured while the command ran — what
+    /// the Rust side said about this call, in the same round trip. Concurrent
+    /// background activity in that window is included too. Needs backend capture.
+    #[serde(default)]
+    pub with_logs: Option<bool>,
 }
 
 /// Which app directory to target.

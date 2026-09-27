@@ -41,6 +41,9 @@
 //!     .unwrap();
 //! ```
 
+/// Backend (Rust-side) log capture: the `tracing` layer, the `log` adapter,
+/// the panic hook, and the buffer the `logs backend*` / `wait_for log` tools read.
+pub mod backend_logs;
 /// Runtime-erased webview bridge trait and its Tauri implementation.
 pub mod bridge;
 /// Backend database access (`SQLite` read-only queries).
@@ -91,6 +94,7 @@ use tauri::{Listener, Manager, RunEvent, Runtime};
 use tokio::sync::{Mutex, oneshot, watch};
 use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 
+pub use backend_logs::{log_layer, log_logger, wrap_logger};
 pub use error::BuilderError;
 pub use privacy::PrivacyProfile;
 
@@ -268,6 +272,9 @@ pub struct VictauriState {
     /// Per-window page-load generations (bumped by each bridge ready signal).
     #[doc(hidden)]
     pub page_loads: introspection::PageLoads,
+    /// Captured backend (Rust-side) log entries — fed by [`log_layer`],
+    /// [`log_logger`]/[`wrap_logger`] and the panic hook; read by `logs backend*`.
+    pub backend_logs: Arc<backend_logs::LogBuffer>,
 }
 
 impl VictauriState {
@@ -309,6 +316,9 @@ impl VictauriState {
             probes: introspection::AppStateProbes::default(),
             drain_watermarks: introspection::DrainWatermarks::default(),
             page_loads: introspection::PageLoads::default(),
+            // A private buffer, not the process-global one, so parallel tests
+            // never see each other's entries.
+            backend_logs: Arc::new(backend_logs::LogBuffer::default()),
         }
     }
 }
@@ -347,6 +357,7 @@ pub struct VictauriBuilder {
     listen_events: Vec<String>,
     db_search_paths: Vec<std::path::PathBuf>,
     probes: Vec<(String, std::sync::Arc<introspection::ProbeFn>)>,
+    capture_panics: bool,
 }
 
 impl Default for VictauriBuilder {
@@ -374,6 +385,7 @@ impl Default for VictauriBuilder {
             listen_events: Vec::new(),
             db_search_paths: Vec::new(),
             probes: Vec::new(),
+            capture_panics: true,
         }
     }
 }
@@ -716,6 +728,18 @@ impl VictauriBuilder {
         self
     }
 
+    /// Capture Rust panics into the backend log (`logs backend_digest` lists them).
+    ///
+    /// On by default in debug builds: the plugin installs a panic hook that
+    /// records the message, location, thread and backtrace, then calls the hook
+    /// that was installed before it — so the app's own hook and the default
+    /// stderr message still run. Pass `false` to leave the panic hook alone.
+    #[must_use]
+    pub const fn capture_panics(mut self, enabled: bool) -> Self {
+        self.capture_panics = enabled;
+        self
+    }
+
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
     #[must_use]
@@ -846,6 +870,12 @@ impl VictauriBuilder {
 
             self.validate()?;
 
+            // Zero-config backend visibility: panics (including ones on background
+            // threads that would otherwise only reach stderr) land in the backend log.
+            if self.capture_panics {
+                backend_logs::install_panic_hook();
+            }
+
             let port = self.resolve_port();
             let event_capacity = self.event_capacity;
             let recorder_capacity = self.recorder_capacity;
@@ -903,6 +933,7 @@ impl VictauriBuilder {
                         probes: introspection::AppStateProbes::default(),
                         drain_watermarks: introspection::DrainWatermarks::default(),
                         page_loads: introspection::PageLoads::default(),
+                        backend_logs: backend_logs::global(),
                     });
                     state.startup_timeline.mark("state_created");
 
@@ -960,7 +991,7 @@ impl VictauriBuilder {
                     let ready_state = state.clone();
                     let server_finished = state.task_tracker.track("mcp_server");
                     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-                    tauri::async_runtime::spawn(async move {
+                    spawn_server_isolated(async move {
                         match mcp::start_server_reporting_port(
                             app_handle,
                             state,
@@ -1059,6 +1090,44 @@ impl VictauriBuilder {
                     tools::victauri_check_ipc_integrity,
                 ])
                 .build())
+        }
+    }
+}
+
+/// Run the MCP server on its **own** Tokio runtime (dedicated OS threads) instead of
+/// Tauri's shared async runtime.
+///
+/// An app that blocks its async workers — a synchronous call inside an `async` command,
+/// a CPU-bound loop on a Tokio task — used to take Victauri down with it: measured on the
+/// demo app, `/health` took ~9 s while the runtime was pinned. That is exactly the
+/// moment an agent needs to look inside (backend logs, probes, memory, the DB). With its
+/// own runtime the server keeps answering; only tools that genuinely need the app's main
+/// thread or webview wait on them. Multi-threaded, because the bridge relies on
+/// `block_in_place`. Falls back to Tauri's runtime if a dedicated one cannot be built.
+#[cfg(debug_assertions)]
+fn spawn_server_isolated<F>(server: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("victauri-mcp")
+        .enable_all()
+        .build();
+    match runtime {
+        Ok(rt) => {
+            let spawned = std::thread::Builder::new()
+                .name("victauri-mcp-runtime".into())
+                .spawn(move || rt.block_on(server));
+            if let Err(e) = spawned {
+                tracing::error!("Victauri MCP server thread could not start: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Victauri: dedicated runtime unavailable ({e}); sharing the app's async runtime"
+            );
+            tauri::async_runtime::spawn(server);
         }
     }
 }

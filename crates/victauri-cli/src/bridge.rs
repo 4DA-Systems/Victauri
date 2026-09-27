@@ -947,6 +947,33 @@ enum Selection {
     Ambiguous(Vec<String>),
 }
 
+/// One trusted-discovery scan for other CLI commands (`victauri logs`): the live backend
+/// matching `app` (or the only one) as `(port, token, label)`.
+///
+/// # Errors
+/// Returns a message naming the running apps when the choice is ambiguous, or saying none
+/// is reachable.
+pub async fn resolve_backend(
+    app: Option<&str>,
+) -> std::result::Result<(u16, Option<String>, String), String> {
+    let app = app.map(str::to_string).or_else(|| {
+        std::env::var("VICTAURI_APP")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+    match scan_once(app.as_deref()).await {
+        Selection::One(s) => Ok((s.port, s.token.clone(), s.label())),
+        Selection::None => Err(match app {
+            Some(a) => format!("no running Victauri app matches '{a}'"),
+            None => "no running Victauri app found".to_string(),
+        }),
+        Selection::Ambiguous(labels) => Err(format!(
+            "several Victauri apps are running — pick one with --app <identifier>:\n  {}",
+            labels.join("\n  ")
+        )),
+    }
+}
+
 /// Pick the server matching `app`, or the sole running server.
 fn select(live: &[ServerInfo], app: Option<&str>) -> Selection {
     if live.is_empty() {

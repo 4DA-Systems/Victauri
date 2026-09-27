@@ -1494,6 +1494,88 @@ impl VictauriClient {
             .await
     }
 
+    /// Read the app's Rust backend log (`logs {action:"backend"}`).
+    ///
+    /// `filters` is merged into the call — e.g. `json!({"level": "warn",
+    /// "target": "app::db", "filter": "timeout", "since_seq": 42, "limit": 50})`.
+    /// The result carries `entries`, `next_seq` (pass back as `since_seq`) and the
+    /// active capture `sources`.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn backend_logs(&mut self, filters: Value) -> Result<Value, TestError> {
+        let mut args = json!({ "action": "backend" });
+        if let (Some(obj), Some(extra)) = (args.as_object_mut(), filters.as_object()) {
+            for (k, v) in extra {
+                if k != "action" {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        self.call_tool("logs", args).await
+    }
+
+    /// Aggregate view of the backend log: per-level counts, repeated messages,
+    /// recent warnings/errors and every captured panic.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn backend_digest(&mut self) -> Result<Value, TestError> {
+        self.call_tool("logs", json!({ "action": "backend_digest" }))
+            .await
+    }
+
+    /// Block until a backend log entry containing `text` (case-insensitive) is
+    /// captured, at or above `level` when given. Returns `{ok:true, entry}` or
+    /// `{ok:false, error}` on timeout. Looks back 2 s by default so a line logged
+    /// just before the call still counts.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn wait_for_log(
+        &mut self,
+        text: &str,
+        level: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, TestError> {
+        let mut args = json!({ "condition": "log", "value": text });
+        if let Some(l) = level {
+            args["level"] = json!(l);
+        }
+        if let Some(t) = timeout_ms {
+            args["timeout_ms"] = json!(t);
+        }
+        self.call_tool("wait_for", args).await
+    }
+
+    /// Like [`Self::wait_for_log`], but only entries with sequence number >= `since_seq`
+    /// count — take the cursor BEFORE starting the work (`backend_log_cursor` from
+    /// `invoke_command {with_logs:true}`, or `next_seq` from [`Self::backend_logs`]) so a
+    /// previous run's identical line can never satisfy the wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn wait_for_log_since(
+        &mut self,
+        since_seq: u64,
+        text: &str,
+        level: Option<&str>,
+        timeout_ms: Option<u64>,
+    ) -> Result<Value, TestError> {
+        let mut args = json!({ "condition": "log", "value": text, "since_seq": since_seq });
+        if let Some(l) = level {
+            args["level"] = json!(l);
+        }
+        if let Some(t) = timeout_ms {
+            args["timeout_ms"] = json!(t);
+        }
+        self.call_tool("wait_for", args).await
+    }
+
     /// Scroll an element into view by ref handle.
     ///
     /// # Errors

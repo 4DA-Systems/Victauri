@@ -5,6 +5,7 @@
 // etc.) to keep this file focused on dispatch logic.
 
 mod authz;
+mod backend_log_tools;
 mod backend_params;
 mod bounded;
 mod compound_params;
@@ -487,7 +488,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Waits up to the eval timeout (30s) — pass `timeout_ms` (max 300000) for a legitimately slow command. Subject to privacy command filtering.",
+        description = "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result — or, with `with_logs: true`, `{result, backend_logs}`: the Rust log entries captured while it ran. Waits up to the eval timeout (30s) — pass `timeout_ms` (max 300000) for a legitimately slow command. Subject to privacy command filtering.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -569,6 +570,10 @@ impl VictauriMcpHandler {
         }
 
         // ── Normal execution with timing ──
+        let log_cursor = params
+            .with_logs
+            .unwrap_or(false)
+            .then(|| self.backend_log_cursor());
         let start = std::time::Instant::now();
         let args_json = params.args.unwrap_or(serde_json::json!({}));
         let args_str = serde_json::to_string(&args_json).unwrap_or_else(|_| "{}".to_string());
@@ -603,6 +608,9 @@ impl VictauriMcpHandler {
                         "command '{}' returned error: {err}",
                         params.command
                     ));
+                }
+                if let Some(cursor) = log_cursor {
+                    return self.attach_backend_logs(&result, cursor);
                 }
                 CallToolResult::success(vec![ContentBlock::text(result)])
             }
@@ -808,7 +816,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Wait for a condition to be met. Polls at regular intervals until satisfied or timeout. Conditions: text (text appears), text_gone (text disappears), selector (CSS selector matches), selector_gone, url (URL contains value), ipc_idle (no pending IPC calls), network_idle (no pending network requests), expression (poll a JS expression in `value` until truthy or until it equals `expected` — may `await`, e.g. await a fire-and-forget command's status), event (block until the Tauri event named in `value` fires, with `since_ms` look-back). Use expression/event to await async backend work to true completion instead of guessing with a fixed sleep.",
+        description = "Wait for a condition to be met. Polls at regular intervals until satisfied or timeout. Conditions: text (text appears), text_gone (text disappears), selector (CSS selector matches), selector_gone, url (URL contains value), ipc_idle (no pending IPC calls), network_idle (no pending network requests), expression (poll a JS expression in `value` until truthy or until it equals `expected` — may `await`, e.g. await a fire-and-forget command's status), event (block until the Tauri event named in `value` fires, with `since_ms` look-back), log (block until a backend Rust log entry containing `value` is captured, optional min `level`, `fields` to also match structured fields e.g. {\"run_type\":\"foreground\"} so a concurrent run of the same code path cannot satisfy it, `since_ms` look-back — wakes the instant it is logged). Use expression/event/log to await async backend work to true completion instead of guessing with a fixed sleep.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -831,6 +839,9 @@ impl VictauriMcpHandler {
             }
             WaitCondition::Event => {
                 return self.wait_for_event(&params, timeout_ms, poll).await;
+            }
+            WaitCondition::Log => {
+                return self.wait_for_log(&params, timeout_ms, poll).await;
             }
             _ => {}
         }
@@ -3063,7 +3074,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation).",
+        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation). BACKEND (the Rust side — what the app prints to its debug console): backend (structured Rust log entries — tracing/log records with typed fields + span context, plus captured panics; filter by level / target prefix / filter text / `fields` (structured-field equality), page with since_seq→next_seq), backend_digest (START HERE: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic — one cheap call instead of paging thousands of lines), stdout (raw stdout/stderr lines when the app was launched via `victauri run` — also shows how the process exited).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3177,6 +3188,9 @@ impl VictauriMcpHandler {
                 );
                 self.eval_bridge(&code, None).await
             }
+            LogsAction::Backend => self.logs_backend(&params),
+            LogsAction::BackendDigest => self.logs_backend_digest(&params),
+            LogsAction::Stdout => Self::logs_stdout(&params),
             LogsAction::Clear => {
                 // Clearing the IPC/network logs erases captured evidence — a
                 // mutation of observable state — so it is gated separately and
@@ -6799,6 +6813,7 @@ mod authz_dispatch_tests {
             probes: crate::introspection::AppStateProbes::default(),
             drain_watermarks: crate::introspection::DrainWatermarks::default(),
             page_loads: crate::introspection::PageLoads::default(),
+            backend_logs: std::sync::Arc::new(crate::backend_logs::LogBuffer::default()),
         })
     }
 
@@ -7336,6 +7351,7 @@ mod command_policy_dispatch_tests {
             probes: crate::introspection::AppStateProbes::default(),
             drain_watermarks: crate::introspection::DrainWatermarks::default(),
             page_loads: crate::introspection::PageLoads::default(),
+            backend_logs: std::sync::Arc::new(crate::backend_logs::LogBuffer::default()),
         })
     }
 
@@ -8521,6 +8537,7 @@ mod screenshot_visibility_tests {
             probes: crate::introspection::AppStateProbes::default(),
             drain_watermarks: crate::introspection::DrainWatermarks::default(),
             page_loads: crate::introspection::PageLoads::default(),
+            backend_logs: std::sync::Arc::new(crate::backend_logs::LogBuffer::default()),
         });
         VictauriMcpHandler::new(state, bridge)
     }
