@@ -118,6 +118,11 @@ impl TimingSamples {
     }
 }
 
+/// Maximum distinct commands tracked. The map is keyed by the caller-supplied command name, so
+/// without a cap an agent (or a loop) invoking ever-new names grows it forever. Once full, new
+/// names are not tracked; commands already tracked keep accumulating.
+const MAX_TIMED_COMMANDS: usize = 1024;
+
 /// Thread-safe store for per-command timing data.
 pub struct CommandTimings {
     inner: RwLock<HashMap<String, TimingSamples>>,
@@ -138,7 +143,11 @@ impl CommandTimings {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.entry(command.to_string()).or_default().record(duration);
+        if let Some(samples) = map.get_mut(command) {
+            samples.record(duration);
+        } else if map.len() < MAX_TIMED_COMMANDS {
+            map.entry(command.to_string()).or_default().record(duration);
+        }
     }
 
     /// Get stats for all commands, sorted by total time descending.
@@ -1355,6 +1364,19 @@ impl DrainWatermarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C15e: the map is keyed by the caller-chosen command name, so it must be bounded.
+    #[test]
+    fn command_timings_bound_distinct_commands() {
+        let t = CommandTimings::new();
+        for i in 0..(MAX_TIMED_COMMANDS + 100) {
+            t.record(&format!("cmd-{i}"), Duration::from_millis(1));
+        }
+        assert_eq!(t.all_stats().len(), MAX_TIMED_COMMANDS);
+        // Commands already tracked keep accumulating once the cap is reached.
+        t.record("cmd-0", Duration::from_millis(1));
+        assert_eq!(t.stats_for("cmd-0").unwrap().count, 2);
+    }
 
     #[test]
     fn p95_is_nearest_rank_not_max_for_small_samples() {
