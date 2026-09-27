@@ -8,7 +8,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.8"
+victauri-plugin = "0.9"
 ```
 
 Wire it into your Tauri app:

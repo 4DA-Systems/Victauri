@@ -184,6 +184,35 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
+## Current State (2026-09-27)
+
+### v0.9.0 — two audit rounds + a one-time `#[non_exhaustive]` break (release-prepped, NOT published)
+
+Triggered by an in-the-wild failure: a 4DA session ran `invoke_command quit_app` through the
+bridge, the app quit, and the agent was told **"backend not reachable"** — the bridge had
+**replayed the delivered call** (up to 4×) after the connection dropped. Round 1 (PR #71, merged):
+a three-lens review + live 4DA sweep, ~50 verified fixes (bridge never replays a possibly-delivered
+`tools/call`; `db_health` degrades instead of failing on 4DA's 1.4 GB DB; replay/trace/recording
+lifecycle; JS-bridge host safety; CLI/test/VS Code/CI/docs). Round 2 (branch `release/0.9-prep`):
+a five-lens pre-audit red team (auth/network, new-code correctness, data access/JS injection,
+supply chain, semver/claims) — **no Critical/High**; every Medium/Low fixed, notably: eval state
+moved off the page-visible global (page could forge/suppress results), log getters return copies
+(page could plant a forged IPC call that replay would invoke), compact snapshot JSON-encodes page
+text (line forgery), `query_db` enforced by SQLite's **authorizer** (+ `trusted_schema=OFF`,
+defensive), browser-originated POSTs must be JSON, global concurrency cap, busy-UI ≠ closed window,
+shared drain/flush watermark, trace owns its recording by session id, ASI edge cases, honest tool
+annotations, and a test pinning the CLI's baked tool manifest to the live tools.
+
+**Why 0.9.0:** `VictauriState`, `IpcCall` and most public data types had all-pub fields and no
+`#[non_exhaustive]`, so EVERY field addition was technically breaking. They are now
+`#[non_exhaustive]` with constructors/builders (`#[inspectable]` expands to the builders). Consumers
+bump `"0.8"` → `"0.9"`; 4DA needs no code change (verified against its sources). See MIGRATION.md.
+
+**Process notes:** the jsdom bridge tests SKIP silently unless `npm ci` has been run in
+`crates/victauri-plugin/tests/bridge_tests/` (CI does it; fresh worktrees don't). The repo
+pre-commit hook "sweeps stale build artifacts" and can break a cargo build running in the same
+worktree — don't commit mid-gate. Unix-only code paths (bridge `ps -U`, watchdog/discovery owner
+checks) are verified under WSL (`CARGO_TARGET_DIR=$HOME/vt-target`).
 ## Current State (2026-08-12)
 
 ### v0.8.8 — host-crash fix (Linux/WebKitGTK heap corruption), found during release prep

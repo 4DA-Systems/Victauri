@@ -1,5 +1,57 @@
 # Migration Guide
 
+## v0.8.8 → v0.9.0 (public data types are `#[non_exhaustive]` — a one-time break)
+
+**Bump the requirement:** `victauri-plugin = "0.9"`, `victauri-test = "0.9"` (and `victauri-core`
+if you depend on it directly). `^0.8` does not pick up 0.9.
+
+**Most apps need no code change.** Wiring the plugin (`VictauriBuilder`, `init()`,
+`CommandInfo::new`, `register_commands!`, `#[inspectable]`), calling tools, and *reading* any
+result type all work unchanged. You only need to change code that **constructs** one of these types
+with a struct literal outside the crate that defines it — typically a mock `WebviewBridge` in
+tests, or code that builds recordings/reports by hand:
+
+| Was | Now |
+|---|---|
+| `WindowState { label, title, visible, .. }` | `WindowState::new(label).with_title(..).with_visible(..)` |
+| `IpcCall { id, command, .. }` | `IpcCall::new(id, command, timestamp, result, duration_ms, arg_size_bytes, webview_label)` |
+| `RecordedSession { .. }` / `RecordedEvent { .. }` | `RecordedSession::new(..)` / `RecordedEvent::new(..)` |
+| `SemanticAssertion { .. }` | `SemanticAssertion::new(..)` |
+| `CommandInfo { .. }` / `CommandArg { .. }` | `CommandInfo::new(name).with_args(..).with_return_type(..)…`, `CommandArg::new(..)` |
+| `AppEvent::Console { level, message, timestamp }` | `AppEvent::console(level, message, timestamp)` (same for `state_change`, `dom_mutation`, `dom_interaction`, `window_event`) |
+| `PrivacyConfig { disabled_tools, ..Default::default() }` | `let mut p = PrivacyConfig::default(); p.disabled_tools = ..;` |
+| `VictauriState { .. }` (tests) | `VictauriState::for_tests()` then set fields (hidden, test-only) |
+| `CheckResult { .. }` / `VerifyReport { .. }` | `CheckResult::new(..)` / `VerifyReport::new(..)` |
+
+Exhaustive `match`es on the now-`#[non_exhaustive]` enums (`InteractionKind`, `CodegenStyle`,
+`FaultType`, `JsonShape`, `PrivacyProfile`, `ThresholdPreset`) need a `_ =>` arm, and patterns on
+`AppEvent`'s struct variants need `..`.
+
+**No longer public API:** `victauri_plugin::filmstrip`, `mcp::parse_bridge_event_from`; the
+`js_bridge`, `screencast`, `database` modules and a few helpers are `#[doc(hidden)]` (reachable for
+tests, not covered by semver).
+
+**Behavior changes to be aware of:**
+
+- `victauri bridge` does not replay a `tools/call` whose connection dropped after it was sent; it
+  returns an error saying the call most likely ran (e.g. a command that quit the app).
+- `eval_js` / `invoke_command` report a closed target window or a shutting-down app promptly
+  instead of timing out.
+- `recording replay` skips calls that had arguments, failed, or never completed (arguments are not
+  recorded); `recording import` is refused while a recording is in progress; `trace stop` only
+  stops the recording its own `with_events` started.
+- `introspect db_health` returns partial results with `row_counts_complete` /
+  `integrity_check: "not completed…"` instead of failing on large databases.
+- `query_db` rejects table-valued `pragma_*()` functions for non-allowlisted pragmas and the
+  `PRAGMA name(value)` write form.
+- Browser-originated (`Origin`-bearing) POSTs to `/mcp` or `/api/tools` must be
+  `Content-Type: application/json` (415 otherwise). Non-browser clients are unaffected.
+- Several tools' MCP annotations changed (`recording`, `introspect`, `logs`, `window` are now
+  `destructive_hint`; `verify_state`, `wait_for`, `assert_semantic`, `inspect`, `animation` are no
+  longer `read_only_hint`). Clients that auto-approve read-only tools will now ask for these.
+- The compact `dom_snapshot` JSON-encodes page text (quotes/newlines in names appear escaped).
+- `victauri-watchdog` discovers the app's port and pins its identity; with `--app` and no match it
+  reports the app down instead of polling 7373.
 ## v0.8.7 → v0.8.8 (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
 
 No consumer code changes are required and no dependency-requirement change is needed

@@ -7,8 +7,86 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Full-surface audit (three review lenses + a live sweep of 4DA), every finding verified against
-the code before fixing. Additive/bugfix only — no public API removed or changed.
+## [0.9.0] - 2026-09-27
+
+A correctness-and-hardening release built from two audit rounds: a full-surface review (three
+lenses + a live sweep of 4DA) and a five-lens pre-audit red team (auth/network boundary, new-code
+correctness, data access & injection, supply chain, semver & claim honesty). Every finding was
+verified against the code before it was fixed. **0.9.0 is a deliberate, one-time semver break**
+(see below and MIGRATION.md) so that future field additions are never breaking again.
+
+### Breaking — public data types are now `#[non_exhaustive]`
+
+Output/data types across `victauri-core`, `victauri-plugin` and `victauri-test` (e.g. `IpcCall`,
+`WindowState`, `DomSnapshot`, `VerificationResult`, `RecordedSession`, `VictauriState`,
+`CommandTimingStats`, `PluginInfo`, `SmokeReport`, `AppEvent`'s struct variants, and several enums)
+are `#[non_exhaustive]`. Code that *reads* them is unaffected; code that *builds* them by struct
+literal uses the new constructors/builders instead (`IpcCall::new`, `WindowState::new(label)
+.with_*(..)`, `CommandInfo::new(..).with_*(..)`, `AppEvent::console(..)`, …). `#[inspectable]` now
+expands to those builders, so it keeps working unchanged. Internal-only modules and helpers
+(`filmstrip`, `parse_bridge_event_from`, …) are no longer public API. `WebviewBridge` gained two
+default-implemented methods (`try_list_window_labels`, `eval_webview_resolved`) and documents that
+future additions will always have defaults.
+
+### Security — pre-audit red team (no Critical/High found)
+
+- **Hostile page content could forge or suppress eval results.** Pending eval ids lived on a
+  page-visible global (`window.__VIC_EVAL__`); the eval bookkeeping now lives in the bridge's
+  frozen closure, and serialization uses a `JSON.stringify` captured before any page script ran.
+- **The injected bridge's log getters returned its live internal arrays**, so page script could
+  plant a forged "successful" IPC call (which `recording replay` would then invoke), hide its own
+  traffic, or freeze the recording drain. They now return copies; drain watermarks are clamped.
+- **Page text could forge lines in the compact DOM snapshot** (a newline in an RSS title → a fake
+  `[eN] button "Save"` line steering an agent's click). Page-derived strings are now JSON-encoded.
+- **`query_db` is enforced by SQLite's authorizer.** The string checks missed table-valued pragma
+  functions (`SELECT * FROM pragma_optimize` ran) and the parenthesized write form
+  (`PRAGMA user_version(5)`). Connections also run with `trusted_schema=OFF` + defensive mode, and
+  `db_health` never counts virtual tables (counting runs module code).
+- **Browser-originated POSTs must be JSON** — with `auth_disabled()`, a page on any localhost origin
+  could fire CORS-simple (no-preflight) tool calls. The concurrency cap is now global (it was 64
+  per route).
+- `victauri bridge` counts only the current user's processes as alive (Unix); `query_db` absolute
+  paths no longer act as a file-existence oracle; page-originated evals get their own small
+  pending-eval budget so page script cannot starve the agent; the watchdog pins the app it watches
+  and trusts discovery dirs by owner, not permission bits alone.
+
+### Fixed — pre-audit correctness
+
+- The eval "window closed" detection no longer fires on a busy UI (a listing that timed out read
+  as "closed … it most likely ran — do not re-run it"), watches the exact window the script was
+  delivered to, and never stalls past its deadline. A trailing `// comment` in `eval_js` code no
+  longer turns the call into a parse error. ASI handling covers postfix `++`/`--`, regex literals,
+  keyword operators at line end and U+2028/2029.
+- Recording: the background drain and `recording flush` share one per-window watermark (they
+  re-recorded each other's events); a new or imported recording never pulls in page history; IPC
+  calls are keyed by completion time, so a command slower than the drain gap no longer stays
+  "pending" forever.
+- `trace` owns its recording by session id: restarting a trace no longer orphans the previous
+  recording, stopping one never stops a recording someone else started, and the 30-minute
+  auto-stop cannot stop a newer trace.
+- `db_health` costs ~0 ms per table instead of ~25 ms (it capped out at ~200 tables per budget),
+  budgets its metadata phase, and reports a failed count as incomplete.
+- Main-thread callers of the bridge (a sync command, a menu handler) run inline instead of risking
+  a deadlock on the dispatch lock; the Tauri-command eval paths go through the bridge (main thread,
+  serialized) instead of calling `webview.eval` from a worker thread.
+- `victauri-test`: rediscovery after an app restart pins the app's identity and never falls back to
+  a default port; it also rediscovers on a refused connection.
+- Tool annotations now match behavior (`recording`, `introspect`, `logs`, `window` are
+  destructive; `verify_state`/`wait_for`/`assert_semantic` run caller JS; `inspect`/`animation`
+  mutate the page), and several descriptions were corrected. The CLI's baked fallback tool list is
+  regenerated and pinned to the live tools by a test.
+
+### CI / release / docs
+
+- VS Code release: the build job holds no secrets and runs `npm ci --ignore-scripts`; publish
+  tokens are scoped to single steps. Surface Audit checks all six crates and fails on an unknown
+  registry answer. `e2e.yml` repaired. Crates now ship their LICENSE. `deny.toml` denies unknown
+  registries/git sources. `victauri init` writes a least-privilege CI workflow, builds `.mcp.json`
+  with a JSON serializer, and refuses to write through symlinks.
+- README/docs: action names regenerated from the real enums; latency and "identical on all
+  platforms" overclaims corrected; plugin-as-dev-dependency advice fixed.
+
+The remainder of this entry is the first (full-surface) audit round, merged in #71:
 
 ### Fixed — agent-visible correctness
 
@@ -1519,7 +1597,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.8.8...HEAD
+[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/4DA-Systems/victauri/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/4DA-Systems/victauri/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/4DA-Systems/victauri/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/4DA-Systems/victauri/compare/v0.8.5...v0.8.6
