@@ -27,7 +27,7 @@ Note: "zero runtime cost" is not the same as "zero bytes." With `victauri-plugin
 regular dependency the crate (and its transitive deps) still compile into the build; the
 server code is simply unreachable at runtime because `init()` is a no-op. Dead-code
 elimination strips most of it, but if you want Victauri completely absent from the release
-binary, add it as a `dev-dependency` (and gate the `.plugin(...)` call behind `#[cfg(debug_assertions)]` / a debug-only feature).
+binary, make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature. (Not a `dev-dependency`: the app binary cannot see `[dev-dependencies]`, so it would no longer compile.)
 
 ### The one way this gate can fail — and how to stop it
 

@@ -84,13 +84,13 @@ Right-click any element in the DOM Explorer:
 
 Victauri runs an HTTP server **inside your Tauri app's process**. This extension talks to its REST API, giving it simultaneous access to the webview DOM, Rust backend state, IPC traffic, and native window state — something external tools like Playwright can't do.
 
-The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op in release builds — zero runtime cost (the server never starts). Add it as a `dev-dependency` if you also want it absent from the release binary.
+The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op in release builds — zero runtime cost (the server never starts). Add it as a normal dependency (the app binary cannot use `[dev-dependencies]`); to also keep it out of the release binary, make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature.
 
 ## Requirements
 
 - A Tauri 2.x app with [victauri-plugin](https://crates.io/crates/victauri-plugin) enabled
 - The plugin starts an HTTP server on `127.0.0.1:7373` that this extension connects to
-- Port discovery reads `victauri.port` from the temp directory if the default port is taken
+- Port discovery reads the per-process discovery directory (`<temp>/victauri/<pid>/port`, trusted and live entries only) if the default port is taken
 
 ## Compatibility
 

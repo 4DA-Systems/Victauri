@@ -30,7 +30,7 @@ In **release builds**: Zero *runtime* cost. The plugin is gated behind `#[cfg(de
 
 Two ways that matter, and we'll be precise because the naive "it sees the DOM, we see everything" line is only half true.
 
-**1. Playwright can't attach to a Tauri app at all on most platforms.** It drives a browser over CDP, but Tauri renders in the OS webview — WKWebView on macOS, WebKitGTK on Linux — where there is no CDP surface to attach to. Only WebView2 on Windows exposes a CDP-class debugging surface. Victauri lives *inside* the app process, so it works identically on macOS, Windows, and Linux.
+**1. Playwright can't attach to a Tauri app at all on most platforms.** It drives a browser over CDP, but Tauri renders in the OS webview — WKWebView on macOS, WebKitGTK on Linux — where there is no CDP surface to attach to. Only WebView2 on Windows exposes a CDP-class debugging surface. Victauri lives *inside* the app process, so the same tools work on macOS, Windows, and Linux (with a few documented platform limits — e.g. trusted OS-level input is Windows-only, and Linux screenshots need X11/XWayland).
 
 **2. Even where a browser tool *can* attach (Windows), it can poke the backend but can't read it safely.** Tauri exposes `window.__TAURI_INTERNALS__.invoke` in the webview, so any tool with JS evaluation can *invoke* a registered command — Victauri does not have a monopoly on "reaching the backend." But to learn what the backend is actually doing, a browser tool has to *mutate live state* (call write commands, submit forms, click-storm). And several things have **no JavaScript equivalent at all**:
 
@@ -70,7 +70,7 @@ Check that:
 
 If the default port (7373) is busy, Victauri tries 7374-7383. The actual port is:
 - Printed to stdout/logs on startup
-- Written to `<temp_dir>/victauri.port`
+- Written to the per-process discovery dir `<temp_dir>/victauri/<pid>/port` (next to the auth `token` and a `metadata.json` with the app identity)
 - Available via `GET /info` on the bound port
 - Discoverable by the `victauri check` CLI command
 
@@ -123,10 +123,10 @@ Yes. Pass arguments as a JSON object:
 ### Why not use Chrome DevTools Protocol?
 
 CDP requires an external debugger connection and only works with Chromium-based webviews. Victauri's embedded approach:
-- Works on all platforms identically (no CDP dependency)
+- Works on all three Tauri webviews with no CDP dependency (documented limits: trusted input is Windows-only; Linux screenshots need X11/XWayland)
 - Has access to the Rust backend (CDP can't see that)
 - Doesn't require debug flags or remote debugging ports
-- Responds in sub-milliseconds (no network hop)
+- No extra process hop: Rust-side tools answer in well under a millisecond; webview tools are a JS round trip (~10-30 ms)
 
 ### Why HTTP and not stdio for MCP transport?
 
@@ -151,7 +151,7 @@ The JS bridge may not have loaded yet. This can happen if:
 
 ### IPC log is empty
 
-IPC logging works by intercepting `fetch()` calls to `http://ipc.localhost/`. If your IPC log is empty:
+IPC logging works by intercepting `fetch()` calls to Tauri's IPC URLs — `http://ipc.localhost/` on Windows (WebView2), `ipc://localhost/` on macOS (WKWebView) and Linux (WebKitGTK). If your IPC log is empty:
 - Verify the app has actually made IPC calls (check network tab in dev tools)
 - The bridge's fetch interceptor must load before the first IPC call
 - `plugin:victauri|*` calls are intentionally excluded from the log

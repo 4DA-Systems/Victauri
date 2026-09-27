@@ -39,14 +39,14 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 - **Ghost command detection** — find high-confidence orphaned frontend calls (`confirmed_ghosts`: invoked but only ever errored "not found"), and backend commands the frontend never calls
 - **Cross-boundary state checking** — compare DOM state against Rust backend state and catch the drift between them
 - **Time-travel recording** — record interactions, checkpoint state, replay sequences, generate test files
-- **Cross-platform, no WebDriver** — identical behavior on macOS, Windows, and Linux; runs headless in CI under `xvfb`
-- **Zero runtime cost in release** — the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. (The crate still compiles in; add it as a `dev-dependency` if you want it absent from the release binary entirely.)
+- **Cross-platform, no WebDriver** — the same tool surface on macOS, Windows, and Linux (no CDP dependency); runs headless in CI under `xvfb`. Platform limits are documented, not hidden: trusted (OS-level) input is Windows-only (other platforms fall back to synthetic events), and window screenshots need X11/XWayland on Linux (pure Wayland fails with a clear error)
+- **Zero runtime cost in release** — the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. Add `victauri-plugin` as a normal `[dependencies]` entry (the app binary cannot see `[dev-dependencies]`); the crate still compiles in, so to keep it out of release binaries entirely make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature
 
 **Bonus — for AI agents:** the same server speaks MCP, so Claude Code, Cursor, Windsurf, and any MCP client get this full-stack access for interactive debugging — no extra setup.
 
 ## Will Victauri work on your app?
 
-Victauri is a **build-time dev dependency you add to your own app's source and rebuild** — not a tool you attach to an already-running or shipped app. It works when **all four** hold:
+Victauri is a **development-time dependency you add to your own app's source and rebuild** (a normal `[dependencies]` entry — not `[dev-dependencies]`, which the app binary cannot use) — not a tool you attach to an already-running or shipped app. It works when **all four** hold:
 
 1. **Tauri 2.** Tauri 1.x apps can't host it — their `webkit2gtk-sys 0.18` and Victauri's `2.x` both link the native `web_kit2` library, an unresolvable cargo conflict. (Tauri 2 is the current major; Tauri 1 is legacy.)
 2. **Built from source** with the plugin wired in — one line in `Cargo.toml`, `.plugin(victauri_plugin::init())`, and a `victauri:default` capability. There is no inject-into-a-foreign-binary path.
@@ -266,7 +266,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | `list_app_dir` | Browse files in app data/config/log/local_data directories |
 | `read_app_file` | Read files from app backend directories (UTF-8 or base64) |
 | `query_db` | Read-only SQLite queries with auto-discovery |
-| `invoke_command` | Call any Tauri command directly through IPC |
+| `invoke_command` | Call any Tauri command through the app's real IPC path (dispatched via the webview's `invoke`, so it needs a live window) |
 | `app_state` | Read app-defined backend-state probes (pipeline/queue/cache internals) — no IPC round-trip |
 | `get_memory_stats` | Real-time OS process memory (working set, page faults) |
 
@@ -295,16 +295,19 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 
 | Tool | Actions |
 |---|---|
-| **`interact`** | `click`, `double_click`, `hover`, `focus`, `scroll`, `select` |
-| **`input`** | `fill`, `type_text`, `press_key` (keyboard combos supported) |
-| **`window`** | `get_state`, `list`, `manage`, `resize`, `move`, `set_title` |
-| **`storage`** | `get`, `set`, `delete`, `cookies` |
-| **`navigate`** | `go_to`, `back`, `history`, `dialogs` |
-| **`recording`** | `start`, `stop`, `checkpoint`, `events`, `export`, `import` |
-| **`inspect`** | `styles`, `bounds`, `highlight`, `audit_accessibility`, `get_performance` |
-| **`logs`** | `console`, `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc` |
+| **`interact`** | `click`, `double_click`, `hover`, `focus`, `scroll_into_view`, `select_option` |
+| **`input`** | `fill`, `type_text`, `press_key` (keyboard combos supported; `trusted: true` = OS-level input, Windows only) |
+| **`window`** | `get_state`, `list`, `manage`, `resize`, `move_to`, `set_title`, `introspectability` |
+| **`storage`** | `get`, `set`, `delete`, `get_cookies` |
+| **`navigate`** | `go_to`, `go_back`, `get_history`, `set_dialog_response`, `get_dialog_log` |
+| **`recording`** | `start`, `stop`, `checkpoint`, `list_checkpoints`, `get_events`, `events_between`, `get_replay`, `export`, `import`, `replay`, `flush` |
+| **`inspect`** | `get_styles`, `get_bounding_boxes`, `highlight`, `clear_highlights`, `audit_accessibility`, `get_performance` |
 | **`css`** | `inject`, `remove` |
-| **`introspect`** | `command_timings`, `coverage`, `contract_record`, `contract_check`, `startup_timing`, `capabilities`, `db_health`, `plugin_state`, `processes`, `plugin_tasks`, `event_bus` |
+| **`route`** | `add` (block / fulfill / delay fetch+XHR), `list`, `clear`, `clear_all`, `matches` |
+| **`trace`** | `start`, `stop`, `status`, `frames` (background screencast ring buffer) |
+| **`animation`** | `list`, `scrub`, `sample` (Web Animations API — no CDP) |
+| **`logs`** | `console`, `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc`, `clear` |
+| **`introspect`** | `command_timings`, `coverage`, `command_catalog`, `contract_record`, `contract_check`, `contract_list`, `contract_clear`, `startup_timing`, `capabilities`, `db_health`, `plugin_state`, `processes`, `plugin_tasks`, `event_bus`, `event_bus_clear` |
 | **`fault`** | `inject` (delay/error/drop/corrupt), `list`, `clear`, `clear_all` |
 | **`explain`** | `summary`, `last_action`, `diff` |
 | `get_plugin_info` | Plugin config: port, tools, privacy, version |

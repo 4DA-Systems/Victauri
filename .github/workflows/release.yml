@@ -296,9 +296,11 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
-          # Get the previous tag
-          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -E '^v[0-9]' | sed -n '2p')
           CURRENT_TAG=${GITHUB_REF#refs/tags/}
+          # Previous release tag = the nearest v* tag reachable from the commit BEFORE this
+          # tag. Ancestry-based (not "second-highest version"), so a backport tag such as
+          # v0.8.9 cut after v0.9.0 gets ITS OWN history, not a diff against v0.9.0.
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "${CURRENT_TAG}^" 2>/dev/null || true)
 
           if [ -z "$PREVIOUS_TAG" ]; then
             # First release — use all commits

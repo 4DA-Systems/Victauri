@@ -9,12 +9,18 @@ on:
     - cron: "0 9 * * 1" # Mondays 09:00 UTC
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   audit:
     name: Audit published surfaces vs repo
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -25,6 +31,7 @@ jobs:
         run: |
           set +e
           DRIFT=0
+          UNKNOWN=0
           {
             echo "## Surface audit"
             echo ""
@@ -36,39 +43,57 @@ jobs:
           # crates.io 403s any request without a User-Agent (crawler policy); an
           # empty curl body makes jq print NOTHING (not the "unknown" fallback), so
           # treat empty as unknown too — otherwise `repo gt ""` is a false DRIFT.
+          # An UNKNOWN result is NOT "in sync": it fails the job (separately from
+          # DRIFT) so a broken query can never produce a silent green.
           UA='victauri-surface-audit (+https://github.com/4DA-Systems/Victauri)'
           is_unknown() { [ -z "$1" ] || [ "$1" = unknown ] || [ "$1" = null ]; }
 
-          # --- crates.io (core; workspace version) ---
+          # --- crates.io: EVERY published crate vs the workspace version ---
           REPO_CRATE=$(grep -m1 -E '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          PUB_CRATE=$(curl -fsSL -A "$UA" "https://crates.io/api/v1/crates/victauri-plugin" 2>/dev/null | jq -r '.crate.max_stable_version // .crate.max_version // "unknown"')
-          if is_unknown "$PUB_CRATE"; then PUB_CRATE=unknown; ST="⚠️ query failed";
-          elif newer "$REPO_CRATE" "$PUB_CRATE"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
-          else ST="✅ in sync"; fi
-          echo "| crates.io (victauri-plugin) | $REPO_CRATE | $PUB_CRATE | $ST |" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$REPO_CRATE" ]; then
+            echo "::error::could not read the workspace version from Cargo.toml"
+            UNKNOWN=1
+          fi
+          for CRATE in victauri-core victauri-macros victauri-plugin victauri-test victauri-cli victauri-watchdog; do
+            PUB_CRATE=$(curl -fsSL -A "$UA" "https://crates.io/api/v1/crates/$CRATE" 2>/dev/null | jq -r '.crate.max_stable_version // .crate.max_version // "unknown"' 2>/dev/null)
+            if is_unknown "$PUB_CRATE" || is_unknown "$REPO_CRATE"; then
+              PUB_CRATE=unknown; ST="⚠️ UNKNOWN (query failed)"; UNKNOWN=1
+            elif newer "$REPO_CRATE" "$PUB_CRATE"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1
+            else ST="✅ in sync"; fi
+            echo "| crates.io ($CRATE) | $REPO_CRATE | $PUB_CRATE | $ST |" >> "$GITHUB_STEP_SUMMARY"
+            sleep 1 # crates.io crawler policy: at most 1 request/second
+          done
 
           # --- VS Code Marketplace ---
           REPO_VSC=$(node -p "require('./editors/vscode/package.json').version")
           PUB_VSC=$(curl -fsSL -A "$UA" -X POST "https://marketplace.visualstudio.com/_apis/public/gallery/extensionquery" \
             -H "Accept: application/json;api-version=3.0-preview.1" -H "Content-Type: application/json" \
             -d '{"filters":[{"criteria":[{"filterType":7,"value":"4da-systems.victauri"}]}],"flags":914}' 2>/dev/null \
-            | jq -r '.results[0].extensions[0].versions[0].version // "unknown"')
-          if is_unknown "$PUB_VSC"; then PUB_VSC=unknown; ST="⚠️ not found / query failed";
-          elif newer "$REPO_VSC" "$PUB_VSC"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1;
+            | jq -r '.results[0].extensions[0].versions[0].version // "unknown"' 2>/dev/null)
+          if is_unknown "$PUB_VSC" || is_unknown "$REPO_VSC"; then
+            PUB_VSC=unknown; ST="⚠️ UNKNOWN (not found / query failed)"; UNKNOWN=1
+          elif newer "$REPO_VSC" "$PUB_VSC"; then ST="❌ DRIFT (repo ahead — publish)"; DRIFT=1
           else ST="✅ in sync"; fi
           echo "| VS Code Marketplace (4da-systems.victauri) | $REPO_VSC | $PUB_VSC | $ST |" >> "$GITHUB_STEP_SUMMARY"
 
           echo "drift=$DRIFT" >> "$GITHUB_OUTPUT"
+          echo "unknown=$UNKNOWN" >> "$GITHUB_OUTPUT"
 
       - name: VS Code extension build health
         id: vscodehealth
         working-directory: editors/vscode
         run: |
           set -e
-          npm ci --no-audit --no-fund
+          npm ci --ignore-scripts --no-audit --no-fund
           npm run lint
           npm run build
           echo "✅ VS Code extension still typechecks + builds" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail if any registry query was unknown
+        if: steps.versions.outputs.unknown != '0'
+        run: |
+          echo "::error::At least one published-surface query FAILED or returned nothing (UNKNOWN in the job summary). The audit cannot vouch for that surface — fix the query/registry access, do not treat this as in sync."
+          exit 1
 
       - name: Fail if anything drifted
         if: steps.versions.outputs.drift != '0'
