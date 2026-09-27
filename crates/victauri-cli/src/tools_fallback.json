@@ -104,7 +104,7 @@
     "name": "read_app_file"
   },
   {
-    "description": "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments — their side effects happen again; calls that had arguments, failed, or never completed are skipped because recordings do not capture arguments), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
+    "description": "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, or were answered by a route rule are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
     "name": "recording"
   },
   {
