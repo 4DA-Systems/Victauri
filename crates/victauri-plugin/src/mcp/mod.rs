@@ -1696,15 +1696,30 @@ impl VictauriMcpHandler {
                     return missing_param("key", "press_key");
                 };
                 if params.trusted.unwrap_or(false) {
-                    // Optionally focus a target element, then send a real OS key.
+                    // Optionally focus a target element, then send a real OS key. A failed focus
+                    // must stop here: the key would otherwise go to whatever holds focus.
                     if let Some(ref_id) = &params.ref_id {
                         let focus = format!(
                             "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); if(__e){{__e.focus();}} return !!__e",
                             js_string(ref_id)
                         );
-                        let _ = self
+                        let focused = self
                             .eval_with_return(&focus, params.webview_label.as_deref())
                             .await;
+                        match focused {
+                            Ok(f) if f == "true" => {}
+                            Ok(_) => {
+                                return tool_error_with_hint(
+                                    format!("ref not found or not focusable: {ref_id}"),
+                                    RecoveryHint::CheckInput,
+                                );
+                            }
+                            Err(e) => {
+                                return tool_error(format!(
+                                    "could not focus {ref_id} before the key press: {e}"
+                                ));
+                            }
+                        }
                     }
                     let bridge = self.bridge.clone();
                     let label = params.webview_label.clone();
@@ -7487,6 +7502,25 @@ mod command_policy_dispatch_tests {
         let r = call(&h, "invoke_command", json!({"command": "ran_and_threw"})).await;
         assert!(result_text(&r).contains("boom"), "{}", result_text(&r));
         assert!(state.command_timings.stats_for("ran_and_threw").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_trusted_key_press_stops_when_its_element_cannot_be_focused() {
+        // The focus result used to be ignored and the OS key sent regardless — into whatever
+        // element (or app) held focus.
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(r#"{"__victauri_ok":false,"__victauri_type":"value"}"#);
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(
+            &h,
+            "input",
+            json!({"action": "press_key", "key": "Enter", "ref_id": "e9", "trusted": true}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("not focusable"), "key sent anyway: {text}");
     }
 
     #[tokio::test]

@@ -268,7 +268,6 @@ where
     T: Send + 'static,
     F: FnOnce(&tauri::AppHandle<R>) -> T + Send + 'static,
 {
-    use std::sync::atomic::{AtomicBool, Ordering};
     let timeout = std::time::Duration::from_secs(10);
 
     // Already ON the main thread (a sync Tauri command, a menu handler, or an `on_main` closure
@@ -312,32 +311,19 @@ where
             ));
         }
 
-        let (tx, rx) = std::sync::mpsc::channel();
         let app_for_closure = app.clone();
-        // If the caller times out and gives up, this flag tells the still-queued closure to skip
-        // its work — so a state-mutating op (resize/move/close/set_title) cannot apply long after
-        // the caller already saw a timeout error and moved on (a "spontaneous" window change).
-        let abandoned = std::sync::Arc::new(AtomicBool::new(false));
-        let abandoned_closure = abandoned.clone();
-        app.run_on_main_thread(move || {
-            if abandoned_closure.load(Ordering::Acquire) {
-                return;
-            }
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&app_for_closure)));
-            // Send only fails if the caller already timed out and dropped the receiver — ignore.
-            let _ = tx.send(result);
-        })
-        .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))?;
-
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(_panic)) => Err(format!("{what} panicked on the main thread")),
-            Err(e) => {
-                abandoned.store(true, Ordering::Release);
-                Err(format!("{what} did not complete on the main thread: {e}"))
-            }
-        }
+        // Returns with the lock still held until the closure has either run or been abandoned,
+        // so no second round trip is ever in flight beside a closure that may still start.
+        dispatch_and_wait(
+            what,
+            remaining,
+            timeout,
+            |job| {
+                app.run_on_main_thread(job)
+                    .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))
+            },
+            move || f(&app_for_closure),
+        )
     };
 
     // Blocking here must not park a tokio runtime worker — under a wedged UI that could
@@ -348,6 +334,85 @@ where
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(round_trip),
         _ => round_trip(),
     }
+}
+
+/// A dispatched closure that has not started yet.
+const JOB_QUEUED: u8 = 0;
+/// A dispatched closure that has started (its effects will happen).
+const JOB_RUNNING: u8 = 1;
+/// A dispatched closure its caller gave up on before it started: it must never run.
+const JOB_ABANDONED: u8 = 2;
+
+/// Hand `f` to `post` (which queues it on the main thread) and wait up to `remaining` for it.
+///
+/// The closure and a caller that times out race through ONE compare-and-swap: the closure only
+/// runs if it moves Queued -> Running first, and the caller only reports a timeout if it moves
+/// Queued -> Abandoned first. So a timeout error always means the work never happened and never
+/// will — a state-mutating op (a resize, move, close, title change or eval) cannot apply after
+/// the caller already saw the error and moved on. A closure that started just before the
+/// deadline is waited for (up to `grace`) and its real outcome returned, instead of "timed out"
+/// for work that ran.
+fn dispatch_and_wait<T, F>(
+    what: &str,
+    remaining: std::time::Duration,
+    grace: std::time::Duration,
+    post: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
+    f: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let state = std::sync::Arc::new(AtomicU8::new(JOB_QUEUED));
+    let job_state = std::sync::Arc::clone(&state);
+    post(Box::new(move || {
+        if job_state
+            .compare_exchange(JOB_QUEUED, JOB_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        // Send only fails if the caller already gave up and dropped the receiver — ignore.
+        let _ = tx.send(result);
+    }))?;
+
+    let outcome = match rx.recv_timeout(remaining) {
+        Ok(outcome) => outcome,
+        Err(RecvTimeoutError::Disconnected) => {
+            return Err(format!(
+                "{what} did not complete on the main thread: the event loop dropped it"
+            ));
+        }
+        Err(RecvTimeoutError::Timeout) => {
+            if state
+                .compare_exchange(
+                    JOB_QUEUED,
+                    JOB_ABANDONED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return Err(format!(
+                    "{what} did not complete on the main thread: timed out before it started \
+                     (it will not run)"
+                ));
+            }
+            // It started before we gave up: its effects will happen, so report its outcome.
+            rx.recv_timeout(grace).map_err(|_| {
+                format!(
+                    "{what} started on the main thread but did not finish in time; its outcome \
+                     is unknown"
+                )
+            })?
+        }
+    };
+    outcome.map_err(|_panic| format!("{what} panicked on the main thread"))
 }
 
 impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
@@ -454,21 +519,21 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     #[cfg(windows)]
     fn native_type_text(&self, label: Option<&str>, text: &str) -> Result<(), String> {
         let hwnd = self.get_native_handle(label)?;
-        win_focus(hwnd);
+        win_focus(hwnd)?;
         win_send_text(text)
     }
 
     #[cfg(windows)]
     fn native_key(&self, label: Option<&str>, key: &str) -> Result<(), String> {
         let hwnd = self.get_native_handle(label)?;
-        win_focus(hwnd);
+        win_focus(hwnd)?;
         win_send_key(key)
     }
 
     #[cfg(windows)]
     fn native_click(&self, label: Option<&str>, x: f64, y: f64) -> Result<(), String> {
         let hwnd = self.get_native_handle(label)?;
-        win_focus(hwnd);
+        win_focus(hwnd)?;
         win_click(hwnd, x, y)
     }
 
@@ -652,18 +717,74 @@ fn win_hwnd(hwnd: isize) -> windows::Win32::Foundation::HWND {
     windows::Win32::Foundation::HWND(hwnd as *mut core::ffi::c_void)
 }
 
-/// Bring the target window to the foreground so input is routed to it, then
-/// give the OS a brief moment to apply focus.
+/// `SendInput` goes to whatever window has the foreground, not to a window we name: trusted
+/// input may only be sent once the target's top-level window IS the foreground window.
+#[cfg(any(windows, test))]
+fn foreground_verdict(target_root: isize, foreground_root: isize) -> Result<(), String> {
+    if target_root != 0 && target_root == foreground_root {
+        Ok(())
+    } else {
+        Err(
+            "refusing trusted input: the app window could not be brought to the foreground \
+             (Windows' foreground lock keeps focus with the app the user is working in, e.g. a \
+             terminal), so the keystrokes or click would go to that app instead. Bring the app \
+             window to the front and retry, or omit `trusted` to use synthetic input."
+                .to_string(),
+        )
+    }
+}
+
+/// A trusted click lands on whatever window is topmost at the point: it must be the target.
+#[cfg(any(windows, test))]
+fn click_target_verdict(target_root: isize, point_root: isize) -> Result<(), String> {
+    if target_root != 0 && target_root == point_root {
+        Ok(())
+    } else {
+        Err(
+            "refusing trusted click: the point is covered by another window (or lies outside \
+             this one), so the click would land there. Make the element visible on screen and \
+             retry, or omit `trusted` to use a synthetic click."
+                .to_string(),
+        )
+    }
+}
+
+/// The top-level window `hwnd` belongs to (0 for none).
 #[allow(unsafe_code)]
 #[cfg(windows)]
-fn win_focus(hwnd: isize) {
-    use windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow;
+fn win_root(hwnd: windows::Win32::Foundation::HWND) -> isize {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+    // SAFETY: GetAncestor accepts any HWND (including null) and returns null when there is none.
+    unsafe { GetAncestor(hwnd, GA_ROOT) }.0 as isize
+}
+
+/// Bring the target window to the foreground so input is routed to it, and verify it got
+/// there. `SetForegroundWindow` is refused while the user is active in another app (Windows'
+/// foreground lock); ignoring that sent the agent's keystrokes — Enter included — into the
+/// developer's terminal.
+#[allow(unsafe_code)]
+#[cfg(windows)]
+fn win_focus(hwnd: isize) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
+    let target = win_hwnd(hwnd);
+    let target_root = win_root(target);
     // SAFETY: hwnd comes from Tauri's window handle; SetForegroundWindow is safe
     // to call with any HWND (returns false if it fails).
     unsafe {
-        let _ = SetForegroundWindow(win_hwnd(hwnd));
+        let _ = SetForegroundWindow(target);
     }
+    // Give the OS a brief moment to apply focus, then poll briefly for it to take.
     std::thread::sleep(std::time::Duration::from_millis(40));
+    let mut verdict = Ok(());
+    for _ in 0..8 {
+        // SAFETY: GetForegroundWindow takes no arguments and may return null.
+        verdict = foreground_verdict(target_root, win_root(unsafe { GetForegroundWindow() }));
+        if verdict.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    verdict
 }
 
 #[cfg(windows)]
@@ -813,7 +934,7 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-        SM_YVIRTUALSCREEN,
+        SM_YVIRTUALSCREEN, WindowFromPoint,
     };
     let h = win_hwnd(hwnd);
     // SAFETY: GetDpiForWindow/GetSystemMetrics/ClientToScreen are safe to call
@@ -826,6 +947,8 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
             y: (y * scale) as i32,
         };
         let _ = ClientToScreen(h, &mut pt);
+        // The click goes to the topmost window at the point, whichever app that is.
+        click_target_verdict(win_root(h), win_root(WindowFromPoint(pt)))?;
         let vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
         let vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
         let vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
@@ -871,7 +994,83 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_main_thread, record_main_thread};
+    use super::{dispatch_and_wait, is_main_thread, record_main_thread};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    /// A stand-in main thread that starts each posted job after `delay`.
+    fn post_after(delay: Duration) -> impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String> {
+        move |job| {
+            std::thread::spawn(move || {
+                std::thread::sleep(delay);
+                job();
+            });
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_job_still_queued_at_the_deadline_never_runs() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&ran);
+        let out = dispatch_and_wait(
+            "resize_window",
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            post_after(Duration::from_millis(300)),
+            move || r.fetch_add(1, Ordering::SeqCst),
+        );
+        assert!(out.unwrap_err().contains("will not run"));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "an abandoned job ran anyway");
+    }
+
+    #[test]
+    fn a_job_running_at_the_deadline_reports_its_real_outcome() {
+        // It started before the caller gave up, so its effects happen: reporting "timed out"
+        // would tell the caller a window change / eval did not happen when it did.
+        let out = dispatch_and_wait(
+            "eval_webview",
+            Duration::from_millis(50),
+            Duration::from_secs(5),
+            post_after(Duration::ZERO),
+            || {
+                std::thread::sleep(Duration::from_millis(300));
+                7
+            },
+        );
+        assert_eq!(out, Ok(7));
+    }
+
+    #[test]
+    fn trusted_input_is_refused_unless_the_target_is_in_front() {
+        use super::{click_target_verdict, foreground_verdict};
+        assert!(foreground_verdict(0x42, 0x42).is_ok());
+        let other = foreground_verdict(0x42, 0x99).unwrap_err();
+        assert!(other.contains("foreground"), "{other}");
+        assert!(foreground_verdict(0x42, 0).is_err(), "no foreground window");
+        assert!(foreground_verdict(0, 0).is_err(), "unknown target window");
+        assert!(click_target_verdict(0x42, 0x42).is_ok());
+        assert!(
+            click_target_verdict(0x42, 0x99)
+                .unwrap_err()
+                .contains("covered")
+        );
+        assert!(click_target_verdict(0, 0).is_err());
+    }
+
+    #[test]
+    fn a_panicking_job_is_an_error_not_a_hang() {
+        let out: Result<(), String> = dispatch_and_wait(
+            "get_native_handle",
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            post_after(Duration::ZERO),
+            || panic!("boom"),
+        );
+        assert!(out.unwrap_err().contains("panicked"));
+    }
 
     #[test]
     fn main_thread_is_recorded_once_and_only_that_thread_matches() {
