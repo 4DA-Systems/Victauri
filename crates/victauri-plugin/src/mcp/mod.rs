@@ -77,12 +77,6 @@ const MAX_EVAL_CODE_LEN: usize = 1_000_000;
 /// Results exceeding this are truncated to prevent memory exhaustion.
 const MAX_EVAL_RESULT_LEN: usize = 5_000_000;
 
-/// How long the eval parse-watchdog waits for the user-code script to begin executing
-/// before reporting a likely syntax error. A parse error means the script never runs (so
-/// it never marks itself "started"); this caps that failure at ~0.75s instead of the full
-/// eval timeout, while still leaving valid-but-slow code to run to the real timeout.
-const PARSE_WATCHDOG_MS: u64 = 750;
-
 /// Default number of entries returned by IPC/network log tools when no explicit
 /// `limit` is given. Prevents busy apps (large logs) from exceeding the eval cap.
 const DEFAULT_LOG_LIMIT: usize = 100;
@@ -108,9 +102,6 @@ const DB_HEALTH_COUNT_BUDGET: std::time::Duration = std::time::Duration::from_se
 #[cfg(feature = "sqlite")]
 const DB_HEALTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// A page load within this long of an eval's injection is attributed to the page the eval is
-/// running in (a late ready signal), not to a reload that killed it.
-const PAGE_RELOAD_GRACE: std::time::Duration = std::time::Duration::from_millis(250);
 /// A timeout for an error message: whole seconds, or milliseconds when under a second (so a
 /// short per-call timeout never reads as "timed out after 0s").
 fn format_timeout(timeout: std::time::Duration) -> String {
@@ -124,13 +115,34 @@ fn format_timeout(timeout: std::time::Duration) -> String {
 /// Upper bound for `invoke_command`'s per-call `timeout_ms` (matches the eval-timeout ceiling).
 const MAX_INVOKE_TIMEOUT_MS: u64 = 300_000;
 
-/// Whether an eval error means the call was cut off (timeout, app exit, closed window, page
-/// reload) rather than the command completing with an error.
-fn is_aborted_call(error: &str) -> bool {
-    error.starts_with("eval timed out")
-        || error.starts_with("the app began shutting down")
-        || (error.starts_with("window '")
-            && (error.contains("was closed while") || error.contains("loaded a new page")))
+/// How an eval call failed — typed, so a caller never infers from error text whether the code
+/// ran (e.g. whether the call is a command timing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalFailureKind {
+    /// The code never ran: the call was refused or never delivered (saturated pending map, dead
+    /// bridge, failed injection, app exiting), or it did not parse.
+    NotSent,
+    /// Cut off in flight (timeout, app exit, window closed, page reload): it may or may not
+    /// have run.
+    Aborted,
+    /// The code ran in the page and threw, or ran but its result could not be returned.
+    Page,
+}
+
+/// A failed eval: what happened to the code, and the message for the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvalFailure {
+    kind: EvalFailureKind,
+    message: String,
+}
+
+impl EvalFailure {
+    fn new(kind: EvalFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
 }
 
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
@@ -459,15 +471,19 @@ impl VictauriMcpHandler {
             std::time::Duration::from_millis(ms.clamp(1, MAX_INVOKE_TIMEOUT_MS))
         });
         let result = self
-            .eval_with_return_timeout(&code, params.webview_label.as_deref(), timeout)
+            .eval_outcome(&code, params.webview_label.as_deref(), timeout)
             .await;
         let elapsed = start.elapsed();
-        // Only real outcomes are timings: a timeout, an app exit, a closed window or a reload
-        // measures how long we waited, not how long the command took (it skewed p95).
-        let aborted = result.as_ref().err().is_some_and(|e| is_aborted_call(e));
-        if !aborted {
+        // Only calls that reached the command are timings: one never sent (saturated, dead
+        // bridge, failed injection) measures nothing, and one cut off (timeout, app exit, closed
+        // window, reload) measures how long we waited — both skewed p95.
+        let ran = result
+            .as_ref()
+            .map_or_else(|f| f.kind == EvalFailureKind::Page, |_| true);
+        if ran {
             self.state.command_timings.record(&params.command, elapsed);
         }
+        let result = result.map_err(|f| f.message);
 
         match result {
             Ok(result) => {
@@ -4458,38 +4474,40 @@ impl VictauriMcpHandler {
     /// a TRUE hard ceiling — a separate check-then-insert races (concurrent callers all pass
     /// a stale check, then each inserts, blowing past the cap). On a saturated map it also
     /// fails fast (before any eval is injected) with the real "too many concurrent" cause
-    /// rather than letting a probe burn its full timeout.
+    /// rather than letting a probe burn its full timeout. The slot is released when the
+    /// returned guard drops — on every exit, including the caller's future being dropped.
     async fn reserve_pending(
         &self,
         id: &str,
         tx: tokio::sync::oneshot::Sender<String>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::PendingSlot, String> {
         let mut pending = self.state.pending_evals.lock().await;
         if pending.len() >= MAX_PENDING_EVALS {
             return Err(format!(
                 "too many concurrent eval requests (limit: {MAX_PENDING_EVALS})"
             ));
         }
-        pending.insert(id.to_string(), tx);
-        Ok(())
+        Ok(crate::PendingSlot::insert(
+            &self.state.pending_evals,
+            &mut pending,
+            id.to_string(),
+            tx,
+        ))
     }
 
-    async fn probe_bridge(&self, webview_label: Option<&str>) -> Result<(), String> {
+    /// Liveness probe. On success, returns the nonce of the page that answered (`None` for a
+    /// page without the Victauri bridge).
+    async fn probe_bridge(&self, webview_label: Option<&str>) -> Result<Option<String>, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.reserve_pending(&id, tx).await?;
-        let id_js = js_string(&id);
-        let probe = format!(
-            r#"(async()=>{{await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback',{{id:{id_js},result:'"probe_ok"'}});}})();"#
-        );
+        let _slot = self.reserve_pending(&id, tx).await?;
+        let probe = crate::js_bridge::eval_probe_script(&id);
         if let Err(e) = self.bridge.eval_webview(webview_label, &probe) {
-            self.state.pending_evals.lock().await.remove(&id);
             return Err(format!("eval injection failed: {e}"));
         }
-        if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
-            Ok(())
+        if let Ok(Ok(raw)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+            Ok(crate::js_bridge::probe_answer_nonce(&raw))
         } else {
-            self.state.pending_evals.lock().await.remove(&id);
             let label = webview_label.unwrap_or("default");
             Err(format!(
                 "bridge not responding on window '{label}' — the window may be hidden, \
@@ -4500,12 +4518,57 @@ impl VictauriMcpHandler {
         }
     }
 
+    /// Whether window `label` has shown a page other than the one an eval was armed in since
+    /// ready-signal `seen` — and if so, the error to report. A ready signal carrying the armed
+    /// nonce is the eval's own page announcing itself late (under load that can take seconds);
+    /// any other is confirmed by asking the page for its CURRENT nonce, because page script can
+    /// send a ready signal itself and must not be able to abort the agent's calls with it.
+    async fn page_replaced(
+        &self,
+        label: Option<&str>,
+        seen: &mut u64,
+        armed: Option<&str>,
+    ) -> Option<String> {
+        let label = label?;
+        let load = self.state.page_loads.latest(label)?;
+        if load.seq <= *seen {
+            return None;
+        }
+        *seen = load.seq;
+        if armed.is_some() && load.nonce.as_deref() == armed {
+            return None;
+        }
+        match self.probe_bridge(Some(label)).await {
+            Ok(current) if armed.is_some() && current.as_deref() == armed => None,
+            _ => Some(format!(
+                "window '{label}' loaded a new page (a reload or navigation) while the call was \
+                 in flight, so no result will arrive. The code may or may not have run before \
+                 the reload — check the app's state before re-running it."
+            )),
+        }
+    }
+
     async fn eval_with_return_timeout(
         &self,
         code: &str,
         webview_label: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
+        self.eval_outcome(code, webview_label, timeout)
+            .await
+            .map_err(|f| f.message)
+    }
+
+    /// Run `code` in the webview and wait for its outcome; a failure says whether the code ran.
+    #[allow(clippy::too_many_lines)]
+    async fn eval_outcome(
+        &self,
+        code: &str,
+        webview_label: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<String, EvalFailure> {
+        use EvalFailureKind::{Aborted, NotSent, Page};
+
         // The hard concurrency ceiling is enforced atomically at every reservation
         // (`reserve_pending`, used by both the probe and the real eval below) — NOT with a
         // separate early check, which races: concurrent callers would all pass a stale
@@ -4532,10 +4595,25 @@ impl VictauriMcpHandler {
             }
         }
 
+        // Subscribe before anything is sent AND check the current value: `subscribe()` marks it
+        // seen, so a call started after the app's exit signal would otherwise wait out its whole
+        // timeout for a change that has already happened.
+        let mut shutdown = self.state.shutdown_tx.subscribe();
+        if *shutdown.borrow() {
+            return Err(EvalFailure::new(
+                NotSent,
+                "the app is shutting down, so the call was not sent",
+            ));
+        }
+
         // Reserved sentinel key for the default (unlabeled) window — cannot
         // collide with a real label.
         let label_key =
             webview_label.map_or_else(|| "\u{1}__default__".to_string(), str::to_string);
+
+        // Ready signals from here on may come from a page that replaced the one this eval runs
+        // in; an earlier one cannot (the probe below then answers from the new page).
+        let mut loads_seen = self.state.page_loads.current_seq();
 
         // Liveness probe before EVERY eval — on the DEFAULT window as well as
         // labeled ones. The probe is a tiny round-trip that returns in ~ms on a
@@ -4547,23 +4625,32 @@ impl VictauriMcpHandler {
         // probed at all. Probing every call (not once-cached) is what guarantees
         // *zero* 30s hangs even across repeated reloads; the healthy-path cost is a
         // single sub-millisecond localhost round-trip, negligible against the value
-        // of never stalling an agent into a CDP fallback. (A saturated pending-eval
-        // map is already rejected above, before this probe.)
+        // of never stalling an agent into a CDP fallback. It also reports the nonce of the
+        // page the eval is armed in, which is what tells a reload from a late ready signal.
         let prev_timed_out = self.timed_out_labels.lock().await.remove(&label_key);
-        if let Err(e) = self.probe_bridge(webview_label).await {
-            return Err(if prev_timed_out {
-                format!(
-                    "{e} (a previous eval on this window also timed out — the webview \
-                     likely reloaded or the app stopped responding)"
-                )
-            } else {
-                e
-            });
-        }
+        let armed_nonce = match self.probe_bridge(webview_label).await {
+            Ok(nonce) => nonce,
+            Err(e) => {
+                return Err(EvalFailure::new(
+                    NotSent,
+                    if prev_timed_out {
+                        format!(
+                            "{e} (a previous eval on this window also timed out — the webview \
+                             likely reloaded or the app stopped responding)"
+                        )
+                    } else {
+                        e
+                    },
+                ));
+            }
+        };
 
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.reserve_pending(&id, tx).await?;
+        let _slot = self
+            .reserve_pending(&id, tx)
+            .await
+            .map_err(|e| EvalFailure::new(NotSent, e))?;
 
         // Auto-prepend `return` so bare expressions produce a value — but ONLY
         // for single expressions. Multi-statement blocks (or code containing an
@@ -4580,159 +4667,111 @@ impl VictauriMcpHandler {
             code.trim().to_string()
         };
 
-        let id_js = js_string(&id);
-
         // Fail fast on a SYNTAX error instead of hanging for the full timeout (audit /
         // red-team "malformed eval consumes the full 30s"). The user code is inlined into
-        // the script below; if it has a parse error the WHOLE script fails to parse and the
-        // try/catch never runs, so the callback never fires. We cannot wrap the code in
-        // `new Function`/`AsyncFunction` to surface the SyntaxError, because dynamic code
-        // generation is gated by the same `unsafe-eval` CSP that blocks `eval()` — which is
-        // exactly why the bridge uses an inline async-IIFE in the first place. Instead an
-        // independent watchdog (which always parses) reports a parse error quickly: the
-        // user-code script sets a `started` flag at its very top, so a script that fails to
-        // parse never sets it. A valid-but-slow eval (e.g. a `wait_for` poll) sets `started`
-        // immediately and is left to run to the real timeout — the watchdog only fires when
-        // the code never began executing.
-        // The watchdog and the settle logic live in the bridge's closure-private state (see
-        // `_evalArm`/`_evalSettle` in js_bridge.rs): the page can neither enumerate pending eval
-        // ids nor suppress results, and serialization uses a `JSON.stringify` captured before
-        // any page script ran.
-        let watchdog = format!(
-            "(function () {{ var v = window.__VICTAURI__; \
-             if (v && v._evalArm) v._evalArm({id_js}, {PARSE_WATCHDOG_MS}); }})();"
-        );
-
-        // `{code}` is followed by a NEWLINE so a trailing `// comment` in the user code cannot
-        // comment out the rest of the wrapper (it used to turn every such eval into a parse
-        // error reported as "did not begin executing").
-        let inject = format!(
-            r"
-            (async () => {{
-                const __vic = {{ id: {id_js}, bridge: window.__VICTAURI__ }};
-                const __settle = (p) => (__vic.bridge && __vic.bridge._evalSettle)
-                    ? __vic.bridge._evalSettle(__vic.id, p)
-                    : window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                        id: __vic.id, result: JSON.stringify(p)
-                    }});
-                if (__vic.bridge && __vic.bridge._evalBegin) __vic.bridge._evalBegin(__vic.id);
-                try {{
-                    const __result = await (async () => {{ {code}
- }})();
-                    const __type = __result === undefined ? 'undefined'
-                        : __result === null ? 'null' : 'value';
-                    const __val = __type === 'value' ? __result : null;
-                    await __settle({{ __victauri_ok: __val, __victauri_type: __type }});
-                }} catch (e) {{
-                    await __settle({{ __victauri_err: (function (x) {{
-                        // A Tauri command's `Err(serde struct)` rejects with a plain object:
-                        // ``String(obj)`` would collapse it to '[object Object]'.
-                        if (x && typeof x.message === 'string') return x.message;
-                        if (typeof x === 'string') return x;
-                        try {{ var s = JSON.stringify(x); if (s !== undefined) return s; }} catch (_) {{}}
-                        try {{ return String(x); }} catch (_) {{ return Object.prototype.toString.call(x); }}
-                    }})(e) }});
-                }}
-            }})();
-            "
-        );
-
-        // Arm the watchdog first, in the window the bridge resolves, then deliver the user code
-        // to THAT SAME window — so both land together and we know exactly which window to watch.
-        let target = match self.bridge.eval_webview_resolved(webview_label, &watchdog) {
-            Ok(label) => label,
-            Err(e) => {
-                self.state.pending_evals.lock().await.remove(&id);
-                return Err(format!("eval injection failed: {e}"));
-            }
-        };
-        // If the target window loads a NEW page after the code was delivered, the result can
-        // never arrive. The grace period absorbs the ready signal of the page the code is
-        // running in (sent fire-and-forget at bridge init, so it can land just after our
-        // probe) — a load only counts once it is clearly later than the injection.
-        let reload_cutoff = std::time::Instant::now() + PAGE_RELOAD_GRACE;
+        // the wrapper; if it has a parse error the WHOLE script fails to parse, so its callback
+        // never fires. We cannot wrap the code in `new Function`/`AsyncFunction` to surface the
+        // SyntaxError, because dynamic code generation is gated by the same `unsafe-eval` CSP
+        // that blocks `eval()` — which is exactly why the bridge uses an inline async-IIFE in
+        // the first place. Instead a check script (which always parses) is delivered right
+        // AFTER the wrapper, to the same window: webview evals run in order, and a wrapper that
+        // parsed has already marked itself begun, so "not begun" means it did not parse. There
+        // is no timer to race: the check used to be a 750ms watchdog armed BEFORE the code, and
+        // a busy main thread delaying the code past it reported a parse error for code that
+        // then ran (an `invoke_command` retried on that ran twice).
+        // The settle logic lives in the bridge's closure-private state (see `_evalBegin` /
+        // `_evalCheck` / `_evalSettle` in js_bridge.rs): the page can neither enumerate pending
+        // eval ids nor suppress results, each outcome is delivered at most once, and
+        // serialization uses a `JSON.stringify` captured before any page script ran.
+        let inject = crate::js_bridge::eval_wrapper_script(&id, &code);
+        let target = self
+            .bridge
+            .eval_webview_resolved(webview_label, &inject)
+            .map_err(|e| EvalFailure::new(NotSent, format!("eval injection failed: {e}")))?;
         let deliver_to = if target.is_empty() {
             webview_label
         } else {
             Some(target.as_str())
         };
-        if let Err(e) = self.bridge.eval_webview(deliver_to, &inject) {
-            self.state.pending_evals.lock().await.remove(&id);
-            return Err(format!("eval injection failed: {e}"));
+        let check = crate::js_bridge::eval_check_script(&id, armed_nonce.as_deref());
+        if let Err(e) = self.bridge.eval_webview(deliver_to, &check) {
+            // Only the fast parse-error report is lost; the code itself was delivered.
+            tracing::debug!("eval parse check not delivered: {e}");
         }
 
-        // While waiting, watch for the two ways a call ends with NO callback ever coming: the
-        // target window was destroyed, or the app began shutting down. Both are the EXPECTED
-        // outcome of code that closes its own window or quits the app (e.g. invoking a
-        // `quit_app` command) — reporting them after the full timeout as "an unresolved
-        // promise, an infinite loop…" misled agents into thinking the call never ran.
+        // While waiting, watch for the ways a call ends with NO callback ever coming: the
+        // target window was destroyed, it loaded a new page, or the app began shutting down.
+        // All are the EXPECTED outcome of code that closes its own window, navigates or quits
+        // the app (e.g. invoking a `quit_app` command) — reporting them after the full timeout
+        // as "an unresolved promise, an infinite loop…" misled agents into thinking the call
+        // never ran.
         //
         // The window check runs in its own task: listing windows is a main-thread round trip
         // that can take up to its 10s dispatch timeout on a busy UI, and must neither stall this
         // wait nor push it past its deadline. A listing that FAILS (a busy or wedged UI) is not
         // evidence of anything — only a successful listing that lacks the window is.
         let watched: Option<String> = (!target.is_empty()).then_some(target);
-        let mut shutdown = self.state.shutdown_tx.subscribe();
         let deadline = tokio::time::Instant::now() + timeout;
         let mut liveness = tokio::time::interval_at(
             tokio::time::Instant::now() + EVAL_WINDOW_WATCH_INTERVAL,
             EVAL_WINDOW_WATCH_INTERVAL,
         );
         let mut check: Option<tokio::task::JoinHandle<Result<Vec<String>, String>>> = None;
-        let page_reloaded =
-            || {
-                watched.as_deref().and_then(|label| {
-                    self.state.page_loads.loaded_after(label, reload_cutoff).then(|| {
-                    format!(
-                        "window '{label}' loaded a new page (a reload or navigation) while the \
-                         call was in flight, so no result will arrive. The code may or may not \
-                         have run before the reload — check the app's state before re-running it."
-                    )
-                })
-                })
-            };
+        let armed = armed_nonce.as_deref();
         let mut rx = rx;
-        let outcome = loop {
-            tokio::select! {
-                r = &mut rx => break Ok(r),
-                () = self.state.page_loads.changed() => {
-                    if let Some(msg) = page_reloaded() {
-                        break Err(Some(msg));
+        // A reload that completed while the code was being delivered is already recorded.
+        let outcome = if let Some(msg) = self
+            .page_replaced(watched.as_deref(), &mut loads_seen, armed)
+            .await
+        {
+            Err(Some(msg))
+        } else {
+            loop {
+                tokio::select! {
+                    r = &mut rx => break Ok(r),
+                    () = self.state.page_loads.changed() => {
+                        if let Some(msg) =
+                            self.page_replaced(watched.as_deref(), &mut loads_seen, armed).await
+                        {
+                            break Err(Some(msg));
+                        }
                     }
-                }
-                () = tokio::time::sleep_until(deadline) => break Err(None),
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break Err(Some(
-                            "the app began shutting down while the call was in flight, so no \
-                             result will arrive. If the code/command quits or restarts the app, \
-                             this is the expected outcome and it most likely ran — do not \
-                             re-run it blindly."
-                                .to_string(),
-                        ));
+                    () = tokio::time::sleep_until(deadline) => break Err(None),
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break Err(Some(
+                                "the app began shutting down while the call was in flight, so \
+                                 no result will arrive. If the code/command quits or restarts the \
+                                 app, this is the expected outcome and it most likely ran — do \
+                                 not re-run it blindly."
+                                    .to_string(),
+                            ));
+                        }
                     }
-                }
-                _ = liveness.tick(), if watched.is_some() && check.is_none() => {
-                    // Backstop for a page-load notification that fired between select rounds.
-                    if let Some(msg) = page_reloaded() {
-                        break Err(Some(msg));
+                    _ = liveness.tick(), if watched.is_some() && check.is_none() => {
+                        // Backstop for a ready signal that arrived between select rounds.
+                        if let Some(msg) =
+                            self.page_replaced(watched.as_deref(), &mut loads_seen, armed).await
+                        {
+                            break Err(Some(msg));
+                        }
+                        let bridge = Arc::clone(&self.bridge);
+                        check = Some(tokio::spawn(async move { bridge.try_list_window_labels() }));
                     }
-                    let bridge = Arc::clone(&self.bridge);
-                    check = Some(tokio::spawn(async move { bridge.try_list_window_labels() }));
-                }
-                listed = async { check.as_mut().expect("guarded by precondition").await },
-                    if check.is_some() =>
-                {
-                    check = None;
-                    if let (Ok(Ok(labels)), Some(label)) = (listed, watched.as_deref())
-                        && !labels.iter().any(|l| l == label)
+                    listed = async { check.as_mut().expect("guarded by precondition").await },
+                        if check.is_some() =>
                     {
-                        break Err(Some(format!(
-                            "window '{label}' was closed while the call was in flight, so no \
-                             result will arrive. If the code/command closes this window (or \
-                             quits the app), this is the expected outcome and it most likely \
-                             ran — do not re-run it blindly."
-                        )));
+                        check = None;
+                        if let (Ok(Ok(labels)), Some(label)) = (listed, watched.as_deref())
+                            && !labels.iter().any(|l| l == label)
+                        {
+                            break Err(Some(format!(
+                                "window '{label}' was closed while the call was in flight, so no \
+                                 result will arrive. If the code/command closes this window (or \
+                                 quits the app), this is the expected outcome and it most likely \
+                                 ran — do not re-run it blindly."
+                            )));
+                        }
                     }
                 }
             }
@@ -4742,39 +4781,44 @@ impl VictauriMcpHandler {
         }
         let early = match outcome {
             Ok(r) => Ok(r),
-            Err(Some(msg)) => {
-                self.state.pending_evals.lock().await.remove(&id);
-                return Err(msg);
-            }
+            // The result may have landed while the page change was being confirmed.
+            Err(Some(msg)) => match rx.try_recv() {
+                Ok(raw) => Ok(Ok(raw)),
+                Err(_) => return Err(EvalFailure::new(Aborted, msg)),
+            },
             Err(None) => Err(()),
         };
         match early {
             Ok(Ok(raw)) => {
                 self.check_bridge_version_once();
                 if raw.len() > MAX_EVAL_RESULT_LEN {
-                    return Err(format!(
-                        "eval result too large ({} bytes, limit {MAX_EVAL_RESULT_LEN})",
-                        raw.len()
+                    return Err(EvalFailure::new(
+                        Page,
+                        format!(
+                            "eval result too large ({} bytes, limit {MAX_EVAL_RESULT_LEN})",
+                            raw.len()
+                        ),
                     ));
                 }
                 unwrap_eval_envelope(raw)
             }
-            Ok(Err(_)) => Err("eval callback channel closed".to_string()),
-            Err(_) => {
-                self.state.pending_evals.lock().await.remove(&id);
+            Ok(Err(_)) => Err(EvalFailure::new(Aborted, "eval callback channel closed")),
+            Err(()) => {
                 // Mark this window so the NEXT eval does a fast liveness probe —
                 // if the bridge is gone (reloaded/crashed) the next call fails in
                 // ~2s instead of blocking the full timeout again.
                 self.timed_out_labels.lock().await.insert(label_key.clone());
-                Err(format!(
-                    "eval timed out after {} — the code began executing but never resolved. \
-                     (A syntax/parse error would have failed fast via the parse watchdog, so \
-                     this is NOT a parse error.) Common causes: an unresolved promise, an \
-                     infinite loop, an `await` on something that never settles, or the webview \
-                     reloaded / the app stopped responding mid-eval. If the app may have \
-                     navigated or crashed, retry (the next call fails fast if the bridge is \
-                     gone).",
-                    format_timeout(timeout)
+                Err(EvalFailure::new(
+                    Aborted,
+                    format!(
+                        "eval timed out after {} — the code began executing but never resolved. \
+                         (A syntax/parse error is reported immediately, so this is NOT a parse \
+                         error.) Common causes: an unresolved promise, an infinite loop, an \
+                         `await` on something that never settles, or the webview reloaded / the \
+                         app stopped responding mid-eval. If the app may have navigated or \
+                         crashed, retry (the next call fails fast if the bridge is gone).",
+                        format_timeout(timeout)
+                    ),
                 ))
             }
         }
@@ -5172,12 +5216,33 @@ fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
 /// fails because the value is too deeply nested, the envelope is stripped by
 /// string slicing (no recursion) so the actual value is still returned rather
 /// than leaking the raw envelope string.
-fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
+fn unwrap_eval_envelope(raw: String) -> Result<String, EvalFailure> {
     if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&raw) {
+        if let Some(why) = envelope.get("__victauri_not_run") {
+            return Err(EvalFailure::new(
+                EvalFailureKind::NotSent,
+                format!(
+                    "JavaScript parse error: {}",
+                    why.as_str().unwrap_or("the code did not begin executing")
+                ),
+            ));
+        }
         if let Some(err) = envelope.get("__victauri_err") {
-            return Err(format!(
-                "JavaScript error: {}",
-                err.as_str().unwrap_or("unknown error")
+            return Err(EvalFailure::new(
+                EvalFailureKind::Page,
+                format!(
+                    "JavaScript error: {}",
+                    err.as_str().unwrap_or("unknown error")
+                ),
+            ));
+        }
+        if let Some(why) = envelope.get("__victauri_unserializable") {
+            return Err(EvalFailure::new(
+                EvalFailureKind::Page,
+                format!(
+                    "the code ran, but its result could not be serialized to JSON ({}). Return a                      JSON-serializable value instead — e.g. String() a BigInt, or pick the fields                      you need from a circular object.",
+                    why.as_str().unwrap_or("unknown reason")
+                ),
             ));
         }
         if envelope.get("__victauri_ok").is_some() {
@@ -5205,7 +5270,10 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
     }
     if let Some(after) = raw.strip_prefix(r#"{"__victauri_err":"#) {
         let msg = after.trim_end_matches('}').trim_matches('"');
-        return Err(format!("JavaScript error: {msg}"));
+        return Err(EvalFailure::new(
+            EvalFailureKind::Page,
+            format!("JavaScript error: {msg}"),
+        ));
     }
     Ok(raw)
 }
@@ -5891,7 +5959,7 @@ mod tests {
     #[test]
     fn envelope_unwrap_error() {
         let r = unwrap_eval_envelope(r#"{"__victauri_err":"boom"}"#.into());
-        assert!(r.unwrap_err().contains("boom"));
+        assert!(r.unwrap_err().message.contains("boom"));
     }
 
     #[test]
@@ -6248,7 +6316,7 @@ mod authz_dispatch_tests {
     /// positional array body used to be gated as the bare tool name, which the Test
     /// profile allows for `navigate` — the handler then parsed and ran `go_to`. Both
     /// shapes must now be refused as invalid params before any handler runs, in every
-    /// profile (FullControl with the action disabled is the other half of the bypass).
+    /// profile (`FullControl` with the action disabled is the other half of the bypass).
     #[tokio::test]
     async fn non_string_action_cannot_slip_past_the_gate() {
         let mut full_minus_go_to = PrivacyConfig::default();
@@ -6534,11 +6602,21 @@ mod command_policy_dispatch_tests {
     struct RecordingBridge {
         scripts: Arc<StdMutex<Vec<String>>>,
         pending_evals: Option<crate::PendingCallbacks>,
+        /// The nonce of the page currently loaded (reported by the liveness probe).
+        page_nonce: Arc<StdMutex<Option<String>>>,
+        /// When set, the eval wrapper script is answered with this callback body.
+        eval_answer: Arc<StdMutex<Option<String>>>,
     }
 
     /// Extract the 36-char eval id from a probe script of the form `…id:"<uuid>"…`.
     fn extract_probe_id(script: &str) -> Option<String> {
         let start = script.find("id:\"")? + 4;
+        script.get(start..start + 36).map(str::to_string)
+    }
+
+    /// Extract the eval id from the eval wrapper script (`const __vic = { id: "<uuid>", …`).
+    fn extract_wrapper_id(script: &str) -> Option<String> {
+        let start = script.find("__vic = { id: \"")? + 15;
         script.get(start..start + 36).map(str::to_string)
     }
 
@@ -6548,9 +6626,31 @@ mod command_policy_dispatch_tests {
         /// injected.
         fn answering(pending_evals: crate::PendingCallbacks) -> Self {
             Self {
-                scripts: Arc::default(),
                 pending_evals: Some(pending_evals),
+                ..Self::default()
             }
+        }
+
+        /// Like [`answering`](Self::answering), in a page whose nonce is `nonce`.
+        fn in_page(pending_evals: crate::PendingCallbacks, nonce: &str) -> Self {
+            let b = Self::answering(pending_evals);
+            b.load_page(nonce);
+            b
+        }
+
+        /// The window now shows a page with this nonce (what the liveness probe reports).
+        fn load_page(&self, nonce: &str) {
+            *self
+                .page_nonce
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(nonce.to_string());
+        }
+
+        fn answer_evals_with(&self, body: &str) {
+            *self
+                .eval_answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body.to_string());
         }
 
         /// True iff any recorded eval script invoked `command` via the Tauri IPC bridge.
@@ -6575,15 +6675,33 @@ mod command_policy_dispatch_tests {
             // real eval is still left unanswered, so it times out fast at the 100ms
             // test `eval_timeout` — we only care WHICH scripts reached the bridge,
             // never the eval's return value.
-            if let Some(pending) = &self.pending_evals
-                && script.contains("probe_ok")
-                && let Some(id) = extract_probe_id(script)
-            {
+            let answer = if script.contains("probe_ok") {
+                extract_probe_id(script).map(|id| {
+                    let nonce = self
+                        .page_nonce
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let body = nonce.map_or_else(
+                        || "\"probe_ok\"".to_string(),
+                        |n| format!("\"probe_ok:{n}\""),
+                    );
+                    (id, body)
+                })
+            } else {
+                let body = self
+                    .eval_answer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                extract_wrapper_id(script).zip(body)
+            };
+            if let (Some(pending), Some((id, body))) = (&self.pending_evals, answer) {
                 let pending = pending.clone();
                 std::thread::spawn(move || {
                     let mut map = pending.blocking_lock();
                     if let Some(tx) = map.remove(&id) {
-                        let _ = tx.send("\"probe_ok\"".to_string());
+                        let _ = tx.send(body);
                     }
                 });
             }
@@ -6924,21 +7042,50 @@ mod command_policy_dispatch_tests {
         let mut held = Vec::new();
         for i in 0..crate::tools::MAX_PAGE_PENDING_EVALS {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let id = format!("{}{i}", crate::tools::PAGE_EVAL_PREFIX);
-            crate::tools::reserve_page_eval(&state, &id, tx)
+            // Spread over windows so the page-wide budget, not a window's, is what fills up.
+            let label = format!("w{}", i % 5);
+            let slot = crate::tools::reserve_page_eval(&state, &label, tx)
                 .await
                 .unwrap();
-            held.push(rx);
+            held.push((slot, rx));
         }
         let (tx, _rx) = tokio::sync::oneshot::channel();
-        let over = crate::tools::reserve_page_eval(&state, "page:over", tx).await;
-        assert!(over.unwrap_err().contains("page-originated"));
+        let over = crate::tools::reserve_page_eval(&state, "w9", tx).await;
+        assert!(over.err().unwrap().contains("page-originated"));
         // The agent path still has room.
         let bridge = RecordingBridge::answering(state.pending_evals.clone());
         let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
         let (tx, _rx2) = tokio::sync::oneshot::channel();
         assert!(h.reserve_pending("agent-1", tx).await.is_ok());
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn one_window_cannot_starve_another_windows_page_evals() {
+        let state = state_with(PrivacyConfig::default());
+        let mut held = Vec::new();
+        let mut refused = None;
+        // Window "a" (whose label is a prefix of "a:b") fills its own budget and no more.
+        for _ in 0..=crate::tools::MAX_PAGE_PENDING_EVALS_PER_WINDOW {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            match crate::tools::reserve_page_eval(&state, "a", tx).await {
+                Ok(slot) => held.push((slot, rx)),
+                Err(e) => refused = Some(e),
+            }
+        }
+        assert_eq!(held.len(), crate::tools::MAX_PAGE_PENDING_EVALS_PER_WINDOW);
+        assert!(refused.unwrap().contains("window 'a'"));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let other = crate::tools::reserve_page_eval(&state, "a:b", tx).await;
+        assert!(
+            other.is_ok(),
+            "window 'a:b' was starved by window 'a': {:?}",
+            other.as_ref().err()
+        );
+        // Dropping the slots releases them.
+        drop(held);
+        drop(other);
+        assert!(state.pending_evals.lock().await.is_empty());
     }
 
     #[tokio::test]
@@ -7008,12 +7155,13 @@ mod command_policy_dispatch_tests {
     #[tokio::test]
     async fn eval_fails_fast_when_its_page_reloads() {
         let state = eval_state_with_timeout(20_000);
-        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
-        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
         let reloader = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(600)).await;
-            reloader.page_loads.record_load("main"); // the page reloaded
+            inner.load_page("page-2"); // the page reloaded
+            ready_signal(&reloader, "main", "page-2");
         });
         let started = std::time::Instant::now();
         let r = call(
@@ -7038,14 +7186,14 @@ mod command_policy_dispatch_tests {
     #[tokio::test]
     async fn a_late_ready_signal_from_the_same_page_is_not_a_reload() {
         // The bridge's ready signal is fire-and-forget at init and can land just after our
-        // probe; it belongs to the page the eval runs in and must not be read as a reload.
+        // probe; it carries the nonce of the page the eval runs in and is not a reload.
         let state = eval_state_with_timeout(1_500);
-        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
-        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner)));
         let late = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            late.page_loads.record_load("main");
+            ready_signal(&late, "main", "page-1");
         });
         let r = call(
             &h,
@@ -7109,6 +7257,254 @@ mod command_policy_dispatch_tests {
             state.pending_evals.lock().await.is_empty(),
             "pending entry removed"
         );
+    }
+
+    /// The bridge's ready signal for window `label`, from a page whose nonce is `nonce`.
+    fn ready_signal(state: &VictauriState, label: &str, nonce: &str) {
+        state.page_loads.record_load(label, Some(nonce));
+    }
+
+    async fn hanging_eval(h: &VictauriMcpHandler) -> (String, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let r = call(
+            h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        (result_text(&r), started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn a_reload_right_after_injection_is_detected() {
+        // A reload that completes within a few ms of the injection (eval_js("location.reload()"),
+        // navigate, a fast HMR) was hidden by a 250ms grace and waited out the full timeout.
+        let state = eval_state_with_timeout(20_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
+        let reloader = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            inner.load_page("page-2");
+            ready_signal(&reloader, "main", "page-2");
+        });
+        let (text, took) = hanging_eval(&h).await;
+        assert!(text.contains("loaded a new page"), "{text}");
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_same_page_ready_signal_arriving_late_is_not_a_reload() {
+        // Under load the page's own ready signal can land seconds after the probe; it carries the
+        // nonce the eval was armed in, so the eval keeps waiting for its real result.
+        let state = eval_state_with_timeout(3_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner)));
+        let late = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+            ready_signal(&late, "main", "page-1");
+        });
+        let (text, _) = hanging_eval(&h).await;
+        assert!(!text.contains("loaded a new page"), "false reload: {text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_forged_ready_signal_does_not_abort_an_eval() {
+        // Page script can call victauri_eval_callback('__victauri_bridge_ready__') itself. The
+        // page did not change (the probe still reports the armed nonce), so it is not a reload.
+        let state = eval_state_with_timeout(2_500);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner)));
+        let forger = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            ready_signal(&forger, "main", "forged");
+        });
+        let (text, _) = hanging_eval(&h).await;
+        assert!(!text.contains("loaded a new page"), "forged reload: {text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_eval_started_after_app_exit_fails_fast() {
+        // `subscribe()` marks the current value seen: an eval started after the exit signal
+        // waited its whole timeout for a change that had already happened.
+        let state = slow_eval_state();
+        state.shutdown_tx.send_replace(true);
+        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let (text, took) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), hanging_eval(&h))
+                .await
+                .expect("an eval after app exit must not wait out its 20s timeout");
+        assert!(text.contains("shutting down"), "{text}");
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_eval_call_releases_its_pending_slot() {
+        // REST runs the tool inside the axum future: a client that disconnects or times out
+        // drops it mid-wait. The pending entry used to leak; 100 of them wedged every eval.
+        let state = eval_state_with_timeout(20_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        for _ in 0..3 {
+            let dropped = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                h.execute_tool("eval_js", json!({"code": "await new Promise(() => {})"})),
+            )
+            .await;
+            assert!(
+                dropped.is_err(),
+                "the call must still be in flight when dropped"
+            );
+        }
+        // The recording drain reserves slots too (its page never answers here).
+        let bridge: Arc<dyn WebviewBridge> = Arc::new(RecordingBridge::default());
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            drain_window_into_recording(&state, &bridge, "main"),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the drain must still be in flight when dropped"
+        );
+        // Removal on drop may be deferred to a task when the map is momentarily locked.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            state.pending_evals.lock().await.is_empty(),
+            "a dropped call leaked its pending-eval slot"
+        );
+    }
+
+    /// Answers the liveness probe, but every other script fails to inject.
+    struct InjectFailsBridge(RecordingBridge);
+
+    impl WebviewBridge for InjectFailsBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            self.0.eval_webview(label, script)?;
+            if script.contains("probe_ok") {
+                Ok(())
+            } else {
+                Err("window not found: main".to_string())
+            }
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            vec!["main".to_string()]
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_command_records_no_timing_for_calls_that_never_ran() {
+        // Only a call that reached the command is a command duration: a saturated pending map
+        // (~0ms), a dead bridge (~2s probe) or a failed injection measure nothing about it.
+        let state = eval_state_with_timeout(1_000);
+        let fillers: Vec<_> = (0..MAX_PENDING_EVALS)
+            .map(|_| tokio::sync::oneshot::channel::<String>())
+            .collect();
+        {
+            let mut p = state.pending_evals.lock().await;
+            for (i, (tx, _)) in fillers.into_iter().enumerate() {
+                p.insert(format!("filler-{i}"), tx);
+            }
+        }
+        let answering = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(answering.clone()));
+        let r = call(&h, "invoke_command", json!({"command": "saturated"})).await;
+        assert!(
+            result_text(&r).contains("too many concurrent"),
+            "{}",
+            result_text(&r)
+        );
+        state.pending_evals.lock().await.clear();
+
+        let dead = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
+        let r = call(&dead, "invoke_command", json!({"command": "dead_bridge"})).await;
+        assert!(
+            result_text(&r).contains("bridge not responding"),
+            "{}",
+            result_text(&r)
+        );
+
+        let failing = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(InjectFailsBridge(RecordingBridge::answering(
+                state.pending_evals.clone(),
+            ))),
+        );
+        let r = call(
+            &failing,
+            "invoke_command",
+            json!({"command": "not_injected"}),
+        )
+        .await;
+        assert!(
+            result_text(&r).contains("injection failed"),
+            "{}",
+            result_text(&r)
+        );
+
+        for cmd in ["saturated", "dead_bridge", "not_injected"] {
+            assert!(
+                state.command_timings.stats_for(cmd).is_none(),
+                "'{cmd}' never ran but was recorded as a command timing"
+            );
+        }
+
+        // Code that did not parse never ran either.
+        answering.answer_evals_with(r#"{"__victauri_not_run":"did not begin executing"}"#);
+        let r = call(&h, "invoke_command", json!({"command": "never_parsed"})).await;
+        assert!(
+            result_text(&r).contains("parse error"),
+            "{}",
+            result_text(&r)
+        );
+        assert!(state.command_timings.stats_for("never_parsed").is_none());
+
+        // Positive control: a call that ran (and threw) IS a timing.
+        answering.answer_evals_with(r#"{"__victauri_err":"boom"}"#);
+        let r = call(&h, "invoke_command", json!({"command": "ran_and_threw"})).await;
+        assert!(result_text(&r).contains("boom"), "{}", result_text(&r));
+        assert!(state.command_timings.stats_for("ran_and_threw").is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unserializable_result_is_reported_as_code_that_ran() {
+        // A circular object / BigInt result used to read "JavaScript error: …" although the code
+        // ran — an agent then re-ran side-effecting code to "fix" it.
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(
+            r#"{"__victauri_unserializable":"Do not know how to serialize a BigInt"}"#,
+        );
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(&h, "eval_js", json!({"code": "return 1n"})).await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("the code ran"), "{text}");
+        assert!(text.contains("BigInt"), "{text}");
+        assert!(!text.contains("JavaScript error"), "{text}");
     }
 
     #[tokio::test]
@@ -7246,19 +7642,19 @@ mod command_policy_dispatch_tests {
             let h = h.clone();
             tasks.push(tokio::spawn(async move {
                 let (tx, _rx) = tokio::sync::oneshot::channel();
-                // keep rx alive until the reservation has been decided
-                let ok = h.reserve_pending(&format!("c-{i}"), tx).await.is_ok();
-                (ok, _rx)
+                // keep rx and the slot alive until the reservation has been decided
+                let slot = h.reserve_pending(&format!("c-{i}"), tx).await.ok();
+                (slot, _rx)
             }));
         }
         let mut granted = 0;
         let mut keep = Vec::new();
         for t in tasks {
-            let (ok, rx) = t.await.unwrap();
-            if ok {
+            let (slot, rx) = t.await.unwrap();
+            if slot.is_some() {
                 granted += 1;
             }
-            keep.push(rx); // hold receivers so reserved entries are not dropped/removed
+            keep.push((slot, rx)); // hold slots so reserved entries are not released
         }
         let len = state.pending_evals.lock().await.len();
         assert!(

@@ -57,6 +57,96 @@ pub fn init_script(caps: &BridgeCapacities) -> String {
         + &INIT_SCRIPT_BODY.replace("__VICTAURI_BRIDGE_VERSION__", env!("CARGO_PKG_VERSION"))
 }
 
+// ── Eval scripts ─────────────────────────────────────────────────────────────
+//
+// The scripts an agent eval injects, in order: the liveness probe, then the wrapper around the
+// user code, then the parse check. Internal plumbing (`pub` only so the jsdom suite can drive
+// the real scripts); ids are Victauri-generated UUIDs and nonces come from the bridge.
+
+fn js_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "null".to_string())
+}
+
+/// The pre-eval liveness probe: answers `"probe_ok:<page nonce>"` (just `"probe_ok"` without a
+/// bridge). The id follows `id:` with no space, unlike the wrapper's `id: `.
+#[doc(hidden)]
+#[must_use]
+pub fn eval_probe_script(id: &str) -> String {
+    format!(
+        "(async()=>{{var v=window.__VICTAURI__;\
+         var n=(v&&typeof v._pageNonce==='string')?':'+v._pageNonce:'';\
+         await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback',\
+         {{id:{},result:'\"probe_ok'+n+'\"'}});}})();",
+        js_literal(id)
+    )
+}
+
+/// The page nonce reported by a liveness-probe answer (`None` for a page without a nonce).
+#[doc(hidden)]
+#[must_use]
+pub fn probe_answer_nonce(raw: &str) -> Option<String> {
+    let answer: String = serde_json::from_str(raw).ok()?;
+    answer
+        .strip_prefix("probe_ok:")
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+}
+
+/// The wrapper that runs `code` (already `return`-prefixed as needed) and settles its outcome
+/// exactly once through the bridge.
+#[doc(hidden)]
+#[must_use]
+pub fn eval_wrapper_script(id: &str, code: &str) -> String {
+    let id_js = js_literal(id);
+    // `{code}` is followed by a NEWLINE so a trailing `// comment` in the user code cannot
+    // comment out the rest of the wrapper (it used to turn every such eval into a parse error).
+    // `_evalBegin` runs synchronously when the script is evaluated, before the parse check.
+    format!(
+        r"
+        (async () => {{
+            const __vic = {{ id: {id_js}, bridge: window.__VICTAURI__ }};
+            const __settle = (p) => (__vic.bridge && __vic.bridge._evalSettle)
+                ? __vic.bridge._evalSettle(__vic.id, p)
+                : window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
+                    id: __vic.id, result: JSON.stringify(p)
+                }});
+            if (__vic.bridge && __vic.bridge._evalBegin && !__vic.bridge._evalBegin(__vic.id)) return;
+            try {{
+                const __result = await (async () => {{ {code}
+ }})();
+                const __type = __result === undefined ? 'undefined'
+                    : __result === null ? 'null' : 'value';
+                const __val = __type === 'value' ? __result : null;
+                await __settle({{ __victauri_ok: __val, __victauri_type: __type }});
+            }} catch (e) {{
+                await __settle({{ __victauri_err: (function (x) {{
+                    // A Tauri command's `Err(serde struct)` rejects with a plain object:
+                    // ``String(obj)`` would collapse it to '[object Object]'.
+                    if (x && typeof x.message === 'string') return x.message;
+                    if (typeof x === 'string') return x;
+                    try {{ var s = JSON.stringify(x); if (s !== undefined) return s; }} catch (_) {{}}
+                    try {{ return String(x); }} catch (_) {{ return Object.prototype.toString.call(x); }}
+                }})(e) }});
+            }}
+        }})();
+        "
+    )
+}
+
+/// The parse check, delivered right after the wrapper to the same window. It reports "did not
+/// begin executing" only if the wrapper never started in the page the eval was armed in
+/// (`nonce`, from the liveness probe; `None` disables the check).
+#[doc(hidden)]
+#[must_use]
+pub fn eval_check_script(id: &str, nonce: Option<&str>) -> String {
+    format!(
+        "(function () {{ var v = window.__VICTAURI__; \
+         if (v && v._evalCheck) v._evalCheck({}, {}); }})();",
+        js_literal(id),
+        nonce.map_or_else(|| "null".to_string(), js_literal)
+    )
+}
+
 /// The body of the init script (after capacity variable declarations).
 /// Uses CAP_* variables for all log limits.
 const INIT_SCRIPT_BODY: &str = r#"
@@ -292,7 +382,23 @@ const INIT_SCRIPT_BODY: &str = r#"
     // non-configurable `__VICTAURI__` methods below, which never reveal an id. Serialization uses
     // `JSON.stringify` captured here, at init, before any page script can replace it.
     var PRISTINE_STRINGIFY = JSON.stringify;
-    var evalState = new Map();
+    // Identity of THIS page load, reported with the ready signal and the liveness probe. An eval
+    // is armed in one page; only a ready signal carrying a DIFFERENT nonce can be a reload that
+    // killed it (a late ready from the same page, or one forged by page script, cannot).
+    var PAGE_NONCE = (function() {
+        try { if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID(); } catch (e) {}
+        return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+    })();
+    // Evals whose code has begun, and tombstones of settled ones (bounded, oldest evicted) so an
+    // outcome is delivered at most once and a "never began" report can never be followed by a run.
+    var evalState = new Set();
+    var evalDone = new Set();
+    var EVAL_DONE_CAP = 1000;
+    function evalMarkDone(id) {
+        evalState.delete(id);
+        evalDone.add(id);
+        if (evalDone.size > EVAL_DONE_CAP) evalDone.delete(evalDone.values().next().value);
+    }
     function evalCallback(id, body) {
         try {
             return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
@@ -320,37 +426,46 @@ const INIT_SCRIPT_BODY: &str = r#"
         _captureIpcBodies: true,
 
         // Eval plumbing used by Victauri's injected eval scripts (not a user API).
-        // Arm the parse watchdog: if the user-code script never begins executing within `ms`
-        // (almost always a syntax error, which fails the whole script), report that instead of
-        // letting the caller wait for its full timeout.
-        _evalArm: function(id, ms) {
-            id = String(id);
-            if (evalState.has(id)) return;
-            var s = { started: false, done: false };
-            evalState.set(id, s);
-            setTimeout(function() {
-                if (s.started || s.done) return;
-                s.done = true;
-                evalState.delete(id);
-                evalCallback(id, PRISTINE_STRINGIFY({ __victauri_err: 'code did not begin executing within ' + ms + 'ms — this almost always means a syntax/parse error in the submitted code (or the page main thread was blocked)' }));
-            }, ms);
-        },
+        _pageNonce: PAGE_NONCE,
+        // Called synchronously at the top of the eval wrapper. Returns false when the eval was
+        // already settled (reported as never begun), in which case the wrapper must not run it.
         _evalBegin: function(id) {
-            var s = evalState.get(String(id));
-            if (s) s.started = true;
+            id = String(id);
+            if (evalDone.has(id)) return false;
+            evalState.add(id);
+            return true;
+        },
+        // Delivered right AFTER the wrapper script (webview evals run in order). If the wrapper
+        // never began, it failed to parse — almost always a syntax error. No timer is involved,
+        // so a delayed delivery can never report a parse error for code that then runs. `nonce`
+        // is the page the eval was armed in: a check that lands in another page stays silent.
+        _evalCheck: function(id, nonce) {
+            id = String(id);
+            if (nonce !== PAGE_NONCE || evalState.has(id) || evalDone.has(id)) return null;
+            evalMarkDone(id);
+            return evalCallback(id, PRISTINE_STRINGIFY({ __victauri_not_run: 'the code did not begin executing — this almost always means a syntax/parse error in the submitted code' }));
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
             id = String(id);
-            var s = evalState.get(id);
-            if (s) {
-                if (s.done) return null;
-                s.done = true;
-                evalState.delete(id);
-            }
+            if (evalDone.has(id)) return null;
+            evalMarkDone(id);
             var body;
-            try { body = PRISTINE_STRINGIFY(payload); }
-            catch (e) { body = PRISTINE_STRINGIFY({ __victauri_err: String((e && e.message) || e) }); }
+            if (payload && payload.__victauri_type === 'value') {
+                // The code RAN; a result JSON cannot carry (circular, BigInt, a function) is
+                // reported as exactly that, never as a JavaScript error.
+                var json;
+                try { json = PRISTINE_STRINGIFY(payload.__victauri_ok); }
+                catch (e) { json = null; body = PRISTINE_STRINGIFY({ __victauri_unserializable: String((e && e.message) || e) }); }
+                if (body === undefined) {
+                    body = json === undefined
+                        ? PRISTINE_STRINGIFY({ __victauri_unserializable: 'the result is a ' + typeof payload.__victauri_ok + ', which JSON cannot represent' })
+                        : '{"__victauri_ok":' + json + ',"__victauri_type":"value"}';
+                }
+            } else {
+                try { body = PRISTINE_STRINGIFY(payload); }
+                catch (e) { body = PRISTINE_STRINGIFY({ __victauri_err: String((e && e.message) || e) }); }
+            }
             return evalCallback(id, body);
         },
 
@@ -2559,12 +2674,18 @@ const INIT_SCRIPT_BODY: &str = r#"
         };
     })();
 
-    // Signal to the Rust backend that the JS bridge is fully initialized.
-    try {
-        window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {
-            id: '__victauri_bridge_ready__',
-            result: ''
-        });
-    } catch(e) {}
+    // Signal to the Rust backend that the JS bridge is fully initialized, identifying this page
+    // load by its nonce. A page restored from the back/forward cache re-runs no init script, so
+    // it re-announces itself: an eval armed in the page it replaced must not wait out its timeout.
+    function signalReady() {
+        try {
+            window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {
+                id: '__victauri_bridge_ready__',
+                result: PAGE_NONCE
+            });
+        } catch(e) {}
+    }
+    window.addEventListener('pageshow', function(e) { if (e && e.persisted) signalReady(); });
+    signalReady();
 })();
 "#;

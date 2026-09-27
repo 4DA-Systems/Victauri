@@ -4987,6 +4987,258 @@ fn ipc_encoded_command_names() {
     );
 }
 
+// ── Eval lifecycle: the real probe / wrapper / parse-check scripts ────────────
+
+/// JS helpers for driving the eval scripts: a Tauri `invoke` stub that records callbacks,
+/// `run(script)` (global eval; returns the thrown error's name), and the scripts themselves
+/// as `S.<name>` (check scripts are built for the placeholder nonce `__NONCE__`).
+fn eval_lifecycle_prelude(scripts: &[(&str, String)]) -> String {
+    let mut js = String::from(
+        r#"
+        var calls = [];
+        window.__TAURI_INTERNALS__ = { invoke: function(cmd, a) { calls.push(a); return Promise.resolve(null); } };
+        function cb(id) { return calls.filter(function(c) { return c.id === id; }).map(function(c) { return c.result; }); }
+        function run(s) { try { (0, eval)(s); return null; } catch (e) { return e.name; } }
+        function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+        var N = window.__VICTAURI__._pageNonce;
+        function inPage(s, nonce) { return s.replace('"__NONCE__"', JSON.stringify(nonce === undefined ? N : nonce)); }
+        var S = {};
+        "#,
+    );
+    for (name, script) in scripts {
+        js.push_str(&format!(
+            "S[{}] = {};\n",
+            serde_json::to_string(name).unwrap(),
+            serde_json::to_string(script).unwrap()
+        ));
+    }
+    js
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn eval_lifecycle_has_no_timer_race_and_settles_once() {
+    use victauri_plugin::js_bridge::{
+        eval_check_script, eval_probe_script, eval_wrapper_script, probe_answer_nonce,
+    };
+    let order = "window.__orders = (window.__orders || 0) + 1; return 'order placed'";
+    let prelude = eval_lifecycle_prelude(&[
+        ("wrap_a", eval_wrapper_script("id-a", order)),
+        ("check_a", eval_check_script("id-a", Some("__NONCE__"))),
+        ("wrap_b", eval_wrapper_script("id-b", "return 1 +")),
+        ("check_b", eval_check_script("id-b", Some("__NONCE__"))),
+        ("wrap_c", eval_wrapper_script("id-c", order)),
+        ("check_c", eval_check_script("id-c", Some("__NONCE__"))),
+        ("wrap_d", eval_wrapper_script("id-d", "return 1 +")),
+        ("check_d", eval_check_script("id-d", Some("__NONCE__"))),
+        (
+            "wrap_e",
+            eval_wrapper_script(
+                "id-e",
+                "await new Promise(r => setTimeout(r, 50)); return 7",
+            ),
+        ),
+        ("check_e", eval_check_script("id-e", Some("__NONCE__"))),
+        ("probe", eval_probe_script("id-p")),
+    ]);
+    let with = |code: &str| format!("{prelude}\n{code}");
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![
+            case(
+                "a parse check delivered late never reports code that ran",
+                &with(
+                    r"
+                    run(S.wrap_a);
+                    await sleep(900); // the check's main-thread round trip was delayed
+                    run(inPage(S.check_a));
+                    await sleep(20);
+                    return { cbs: cb('id-a'), orders: window.__orders };
+                ",
+                ),
+            ),
+            case(
+                "a syntax error is reported once and a late settle is dropped",
+                &with(
+                    r"
+                    var parse = run(S.wrap_b);
+                    run(inPage(S.check_b));
+                    window.__VICTAURI__._evalSettle('id-b', { __victauri_ok: 1, __victauri_type: 'value' });
+                    await sleep(20);
+                    return { parse: parse, cbs: cb('id-b') };
+                ",
+                ),
+            ),
+            case(
+                "code delivered after its check was reported never runs",
+                &with(
+                    r"
+                    run(inPage(S.check_c));
+                    run(S.wrap_c);
+                    await sleep(20);
+                    return { cbs: cb('id-c'), orders: window.__orders || 0 };
+                ",
+                ),
+            ),
+            case(
+                "a check landing in another page stays silent",
+                &with(
+                    r"
+                    run(S.wrap_d);
+                    run(inPage(S.check_d, 'another-page'));
+                    await sleep(20);
+                    return { cbs: cb('id-d') };
+                ",
+                ),
+            ),
+            case(
+                "a slow eval is not reported by its check and settles once",
+                &with(
+                    r"
+                    run(S.wrap_e);
+                    run(inPage(S.check_e));
+                    var early = cb('id-e').length;
+                    await sleep(120);
+                    return { early: early, cbs: cb('id-e') };
+                ",
+                ),
+            ),
+            case(
+                "the probe reports this page's immutable nonce",
+                &with(
+                    r"
+                    try { window.__VICTAURI__._pageNonce = 'forged'; } catch (e) {}
+                    run(S.probe);
+                    await sleep(20);
+                    return { answer: cb('id-p')[0], nonce: N, still: window.__VICTAURI__._pageNonce };
+                ",
+                ),
+            ),
+        ],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = |i: usize| results[i].result.clone().unwrap();
+
+    let a = r(0);
+    assert_eq!(
+        a["cbs"],
+        serde_json::json!([r#"{"__victauri_ok":"order placed","__victauri_type":"value"}"#]),
+        "exactly the real result, no parse error: {a}"
+    );
+    assert_eq!(a["orders"], 1);
+
+    let b = r(1);
+    assert_eq!(b["parse"], "SyntaxError");
+    let cbs = b["cbs"].as_array().unwrap();
+    assert_eq!(cbs.len(), 1, "one outcome only: {b}");
+    assert!(
+        cbs[0].as_str().unwrap().contains("__victauri_not_run"),
+        "{b}"
+    );
+
+    let c = r(2);
+    assert_eq!(
+        c["orders"], 0,
+        "code reported as never begun must not run: {c}"
+    );
+    assert_eq!(c["cbs"].as_array().unwrap().len(), 1, "{c}");
+
+    assert_eq!(r(3)["cbs"], serde_json::json!([]));
+
+    let e = r(4);
+    assert_eq!(e["early"], 0);
+    assert_eq!(
+        e["cbs"],
+        serde_json::json!([r#"{"__victauri_ok":7,"__victauri_type":"value"}"#])
+    );
+
+    let p = r(5);
+    let nonce = p["nonce"].as_str().unwrap();
+    assert!(!nonce.is_empty());
+    assert_eq!(p["still"], nonce, "page script cannot replace the nonce");
+    assert_eq!(
+        probe_answer_nonce(p["answer"].as_str().unwrap()).as_deref(),
+        Some(nonce)
+    );
+    assert_eq!(probe_answer_nonce(r#""probe_ok""#), None);
+}
+
+#[test]
+fn eval_results_json_cannot_carry_are_reported_as_code_that_ran() {
+    use victauri_plugin::js_bridge::eval_wrapper_script;
+    let prelude = eval_lifecycle_prelude(&[
+        (
+            "circular",
+            eval_wrapper_script("id-1", "window.__ran = 1; var o = {}; o.self = o; return o"),
+        ),
+        ("bigint", eval_wrapper_script("id-2", "return 10n")),
+        (
+            "func",
+            eval_wrapper_script("id-3", "return function f() {}"),
+        ),
+        (
+            "plain",
+            eval_wrapper_script("id-4", "return { a: [1, 'x'] }"),
+        ),
+    ]);
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![case(
+            "unserializable results",
+            &format!(
+                "{prelude}
+                run(S.circular); run(S.bigint); run(S.func); run(S.plain);
+                await sleep(20);
+                return {{ c: cb('id-1'), b: cb('id-2'), f: cb('id-3'), p: cb('id-4'), ran: window.__ran }};
+                "
+            ),
+        )],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let v = results[0].result.clone().unwrap();
+    let body = |k: &str| -> serde_json::Value {
+        let arr = v[k].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{k}: {v}");
+        serde_json::from_str(arr[0].as_str().unwrap()).unwrap()
+    };
+    assert_eq!(v["ran"], 1);
+    let c = body("c");
+    assert!(
+        c["__victauri_unserializable"]
+            .as_str()
+            .unwrap()
+            .contains("circular"),
+        "{c}"
+    );
+    assert!(c.get("__victauri_err").is_none(), "{c}");
+    assert!(
+        body("b")["__victauri_unserializable"]
+            .as_str()
+            .unwrap()
+            .contains("BigInt")
+    );
+    assert!(
+        body("f")["__victauri_unserializable"]
+            .as_str()
+            .unwrap()
+            .contains("function")
+    );
+    assert_eq!(
+        body("p"),
+        serde_json::json!({"__victauri_ok": {"a": [1, "x"]}, "__victauri_type": "value"})
+    );
+}
+
 // ── Hardening regressions (bounded capture, never-throw hooks, ref reuse) ────
 
 fn case(name: &str, code: &str) -> TestCase {

@@ -1249,34 +1249,61 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
 
 // ── Page loads ─────────────────────────────────────────────────────────────
 
-/// When each window last loaded a page, recorded whenever its JS bridge (re)initializes — i.e.
-/// on every page load or reload. An eval running in a page that has since been replaced can
-/// never deliver its result, so a later load lets the caller fail fast ("the page reloaded while
-/// the call was in flight") instead of waiting out the full timeout.
+/// Each window's latest bridge ready signal — sent whenever its JS bridge (re)initializes, i.e.
+/// on every page load or reload — with the nonce identifying that page load. An eval running in
+/// a page that has since been replaced can never deliver its result, so a ready signal from a
+/// DIFFERENT page lets the caller fail fast ("the page reloaded while the call was in flight")
+/// instead of waiting out the full timeout.
 #[derive(Default)]
 pub struct PageLoads {
-    last_load: std::sync::Mutex<HashMap<String, Instant>>,
+    last_load: std::sync::Mutex<HashMap<String, PageLoad>>,
+    seq: std::sync::atomic::AtomicU64,
     changed: tokio::sync::Notify,
 }
 
+/// One recorded ready signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageLoad {
+    /// Increases with every ready signal (from any window), so a caller can tell "a new signal
+    /// since I looked" from "the same one".
+    pub seq: u64,
+    /// The page-load nonce the signal carried (`None` from a bridge that sends none).
+    pub nonce: Option<String>,
+}
+
+/// Longest nonce kept from a ready signal (the bridge's is a UUID; the signal is page-callable).
+const MAX_PAGE_NONCE_LEN: usize = 128;
+
 impl PageLoads {
-    /// Record that window `label` loaded a (new) page now.
-    pub fn record_load(&self, label: &str) {
-        self.last_load
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(label.to_string(), Instant::now());
+    /// Record that window `label` sent a ready signal for the page identified by `nonce`.
+    pub fn record_load(&self, label: &str, nonce: Option<&str>) {
+        let nonce = nonce.map(|n| n.chars().take(MAX_PAGE_NONCE_LEN).collect());
+        {
+            let mut loads = self
+                .last_load
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Numbered under the lock, so a window's stored seq only ever grows.
+            let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            loads.insert(label.to_string(), PageLoad { seq, nonce });
+        }
         self.changed.notify_waiters();
     }
 
-    /// Whether window `label` loaded a page strictly after `t`.
+    /// Window `label`'s latest ready signal, if any.
     #[must_use]
-    pub fn loaded_after(&self, label: &str, t: Instant) -> bool {
+    pub fn latest(&self, label: &str) -> Option<PageLoad> {
         self.last_load
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(label)
-            .is_some_and(|at| *at > t)
+            .cloned()
+    }
+
+    /// The sequence number of the most recent ready signal from any window (0 if none yet).
+    #[must_use]
+    pub fn current_seq(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Resolves the next time any window records a page load.

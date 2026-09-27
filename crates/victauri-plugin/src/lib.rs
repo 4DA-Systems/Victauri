@@ -147,6 +147,62 @@ const MAX_EVAL_TIMEOUT_SECS: u64 = 300;
 #[doc(hidden)]
 pub type PendingCallbacks = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;
 
+/// A reserved [`PendingCallbacks`] entry, removed when the guard is dropped.
+///
+/// Every exit path of an eval must release its slot, including the one no code runs on: a REST
+/// tool call executes inside the axum future, so a client that disconnects or times out DROPS
+/// the call mid-wait. Removing the entry only on the timeout/error paths leaked it then, and 100
+/// leaked entries failed every later eval with "too many concurrent" until the app restarted.
+pub(crate) struct PendingSlot {
+    map: PendingCallbacks,
+    id: String,
+}
+
+impl PendingSlot {
+    /// Insert `tx` under `id` into an already-locked map (the caller checked the ceilings under
+    /// the same lock).
+    pub(crate) fn insert(
+        map: &PendingCallbacks,
+        locked: &mut HashMap<String, oneshot::Sender<String>>,
+        id: String,
+        tx: oneshot::Sender<String>,
+    ) -> Self {
+        locked.insert(id.clone(), tx);
+        Self {
+            map: Arc::clone(map),
+            id,
+        }
+    }
+
+    /// The reserved eval id.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        // The map's lock is async and only held for map operations, so it is almost always
+        // free; when it is not, finish the removal on the runtime (or block, outside one).
+        if let Ok(mut map) = self.map.try_lock() {
+            map.remove(&self.id);
+            return;
+        }
+        let map = Arc::clone(&self.map);
+        let id = std::mem::take(&mut self.id);
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    map.lock().await.remove(&id);
+                });
+            }
+            Err(_) => {
+                map.blocking_lock().remove(&id);
+            }
+        }
+    }
+}
+
 /// Runtime state shared between the MCP server and all tool handlers.
 ///
 /// Built by the plugin at setup; apps reach it via
@@ -963,7 +1019,10 @@ impl VictauriBuilder {
                     };
                     match event {
                         RunEvent::Exit => {
-                            let _ = state.shutdown_tx.send(true);
+                            // `send_replace`: the value must flip even with no receiver left
+                            // (`send` then leaves it unchanged), since an eval started after
+                            // this reads it directly.
+                            state.shutdown_tx.send_replace(true);
                             tracing::info!("Victauri shutdown signal sent");
                         }
                         RunEvent::ExitRequested { .. } => {
