@@ -15,6 +15,27 @@ pub trait WebviewBridge: Send + Sync {
     fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState>;
     /// Return the labels of all open webview windows.
     fn list_window_labels(&self) -> Vec<String>;
+    /// Like [`list_window_labels`](Self::list_window_labels), but distinguishes "could not
+    /// ask" (e.g. the UI thread did not answer in time) from "there are no windows". A caller
+    /// deciding that a window is GONE must use this — an empty list from a wedged UI is not
+    /// evidence of anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the window list could not be obtained.
+    fn try_list_window_labels(&self) -> Result<Vec<String>, String> {
+        Ok(self.list_window_labels())
+    }
+    /// Like [`eval_webview`](Self::eval_webview), but returns the label of the window the
+    /// script was actually delivered to (for `None`, the resolved default window).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if no matching window is found or the eval fails.
+    fn eval_webview_resolved(&self, label: Option<&str>, script: &str) -> Result<String, String> {
+        self.eval_webview(label, script)?;
+        Ok(label.unwrap_or("main").to_string())
+    }
     /// Return the platform-native window handle for screenshot capture.
     /// Windows: `HWND`, macOS: `CGWindowID` (window number), Linux: `X11` window ID.
     ///
@@ -149,8 +170,18 @@ fn find_window<'a, R: Runtime>(
             .ok_or_else(|| format!("window not found: {l}")),
         None => windows
             .get("main")
-            .or_else(|| windows.values().find(|w| w.is_visible().unwrap_or(false)))
-            .or_else(|| windows.values().next())
+            // Deterministic fallbacks: `webview_windows()` is a HashMap whose iteration order
+            // differs between calls, so "first visible" must be chosen by a stable key or two
+            // consecutive calls can pick different windows.
+            .or_else(|| {
+                let mut visible: Vec<_> = windows
+                    .iter()
+                    .filter(|(_, w)| w.is_visible().unwrap_or(false))
+                    .collect();
+                visible.sort_by(|a, b| a.0.cmp(b.0));
+                visible.first().map(|(_, w)| *w)
+            })
+            .or_else(|| windows.iter().min_by(|a, b| a.0.cmp(b.0)).map(|(_, w)| w))
             .ok_or_else(|| "no window available".to_string()),
     }
 }
@@ -363,13 +394,27 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     }
 
     fn list_window_labels(&self) -> Vec<String> {
-        on_main(self, "list_window_labels", |app| {
-            app.webview_windows().keys().cloned().collect()
-        })
-        .unwrap_or_else(|e| {
+        self.try_list_window_labels().unwrap_or_else(|e| {
             tracing::warn!("list_window_labels: {e}");
             Vec::new()
         })
+    }
+
+    fn try_list_window_labels(&self) -> Result<Vec<String>, String> {
+        on_main(self, "list_window_labels", |app| {
+            app.webview_windows().keys().cloned().collect()
+        })
+    }
+
+    fn eval_webview_resolved(&self, label: Option<&str>, script: &str) -> Result<String, String> {
+        let label = label.map(str::to_string);
+        let script = script.to_string();
+        on_main(self, "eval_webview", move |app| {
+            let windows = app.webview_windows();
+            let webview = find_window(&windows, label.as_deref())?;
+            webview.eval(&script).map_err(|e| e.to_string())?;
+            Ok(webview.label().to_string())
+        })?
     }
 
     fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
