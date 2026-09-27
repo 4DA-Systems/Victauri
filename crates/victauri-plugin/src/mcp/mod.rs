@@ -1959,7 +1959,8 @@ impl VictauriMcpHandler {
                     .as_ref()
                     .map_or_else(|| "undefined".to_string(), |t| js_string(t));
                 let code = format!(
-                    "return window.__VICTAURI__?.setDialogAutoResponse({}, {}, {text_arg})",
+                    "return {}?.setDialogAutoResponse({}, {}, {text_arg})",
+                    crate::js_bridge::agent_ops_js(),
                     js_string(dialog_type.as_str()),
                     js_string(dialog_action.as_str())
                 );
@@ -2491,16 +2492,17 @@ impl VictauriMcpHandler {
                 let Some(id) = params.id else {
                     return missing_param("id", "clear");
                 };
-                let code = format!("return window.__VICTAURI__?.clearRoute({id})");
+                let code = format!(
+                    "return {}?.clearRoute({id})",
+                    crate::js_bridge::agent_ops_js()
+                );
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
             RouteAction::ClearAll => {
-                self.eval_bridge(
-                    "return window.__VICTAURI__?.clearRoutes()",
-                    params.webview_label.as_deref(),
-                )
-                .await
+                let code = format!("return {}?.clearRoutes()", crate::js_bridge::agent_ops_js());
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
             }
             RouteAction::Matches => {
                 let limit = params.limit.unwrap_or(100);
@@ -2969,15 +2971,10 @@ impl VictauriMcpHandler {
                     return missing_param("threshold_ms", "slow_ipc");
                 };
                 let limit = params.limit.unwrap_or(20);
-                let mb = MAX_LOG_FIELD_BYTES;
+                let trim_field = trim_field_js();
                 let code = format!(
                     r"return (function() {{
-                        var MB = {mb};
-                        function trimField(v) {{
-                            if (typeof v === 'string') return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
-                            if (v && typeof v === 'object') {{ var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }} if (s.length > MB) return '[truncated ' + s.length + ' bytes]'; }}
-                            return v;
-                        }}
+                        {trim_field}
                         function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
                         var log = window.__VICTAURI__?.getIpcLog() || [];
                         var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold}; }});
@@ -2994,8 +2991,11 @@ impl VictauriMcpHandler {
                 if !self.state.privacy.is_tool_enabled("logs.clear") {
                     return tool_disabled("logs.clear");
                 }
-                let code = "return (function(){ var b = window.__VICTAURI__; if (!b) return { ok:false, error:'bridge unavailable' }; if (b.clearIpcLog) b.clearIpcLog(); if (b.clearNetworkLog) b.clearNetworkLog(); return { ok:true, cleared:['ipc','network'] }; })()";
-                self.eval_bridge(code, params.webview_label.as_deref())
+                let code = format!(
+                    "return (function(){{ var b = {}; if (!b) return {{ ok:false, error:'bridge unavailable' }}; b.clearIpcLog(); b.clearNetworkLog(); return {{ ok:true, cleared:['ipc','network'] }}; }})()",
+                    crate::js_bridge::agent_ops_js()
+                );
+                self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
         }
@@ -5170,6 +5170,30 @@ impl ServerHandler for VictauriMcpHandler {
     }
 }
 
+/// JS `function trimField(v)` (with its `MB` bound): a string over [`MAX_LOG_FIELD_BYTES`]
+/// UTF-16 units is cut with a marker, an object whose JSON is larger becomes a size marker.
+/// The cut never falls between the halves of a surrogate pair — a lone surrogate serializes
+/// to JSON that `serde_json` rejects, which failed the whole log read.
+fn trim_field_js() -> String {
+    let mb = MAX_LOG_FIELD_BYTES;
+    format!(
+        r"var MB = {mb};
+            function trimField(v) {{
+                if (typeof v === 'string') {{
+                    if (v.length <= MB) return v;
+                    var end = MB, c = v.charCodeAt(end - 1);
+                    if (c >= 0xD800 && c <= 0xDBFF) end--;
+                    return v.slice(0, end) + '…[+' + (v.length - end) + ' bytes truncated]';
+                }}
+                if (v && typeof v === 'object') {{
+                    var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }}
+                    if (s.length > MB) {{ return '[truncated ' + s.length + ' bytes]'; }}
+                }}
+                return v;
+            }}"
+    )
+}
+
 /// Build a JS expression that takes an array of log entries (`source_expr`),
 /// keeps at most `limit` of the most recent, and truncates any per-entry field
 /// larger than [`MAX_LOG_FIELD_BYTES`]. This keeps IPC/network log results under
@@ -5177,20 +5201,10 @@ impl ServerHandler for VictauriMcpHandler {
 ///
 /// The returned code is a complete `return (...)` statement.
 fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
-    let mb = MAX_LOG_FIELD_BYTES;
+    let trim_field = trim_field_js();
     format!(
         r"return (function() {{
-            var MB = {mb};
-            function trimField(v) {{
-                if (typeof v === 'string') {{
-                    return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
-                }}
-                if (v && typeof v === 'object') {{
-                    var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }}
-                    if (s.length > MB) {{ return '[truncated ' + s.length + ' bytes]'; }}
-                }}
-                return v;
-            }}
+            {trim_field}
             function trimEntry(e) {{
                 if (e == null || typeof e !== 'object') return e;
                 var out = Array.isArray(e) ? [] : {{}};
@@ -5263,36 +5277,38 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
     Ok(raw)
 }
 
-/// Statement keywords where a leading `return` would be a syntax error.
-const STMT_STARTS: &[&str] = &[
-    "return ",
-    "return;",
-    "return\n",
-    "return\t",
-    "if ",
-    "if(",
-    "for ",
-    "for(",
-    "while ",
-    "while(",
-    "switch ",
-    "switch(",
-    "try ",
-    "try{",
-    "const ",
-    "let ",
-    "var ",
-    "function ",
-    "function(",
-    "function*",
-    "class ",
-    "throw ",
-    "do ",
-    "do{",
-    "{",
-    "async function",
-    "debugger",
+/// Statement keywords where a leading `return` would be a syntax error. Matched as whole words
+/// (followed by any non-identifier byte — `if\t(`, `const\n`, `function*` — or the end).
+const STMT_KEYWORDS: &[&str] = &[
+    "return", "if", "for", "while", "switch", "try", "const", "let", "var", "function", "class",
+    "throw", "do", "debugger", "with",
 ];
+
+/// `code` starts with the whole word `word` (not merely a longer identifier sharing its prefix).
+fn starts_with_word(code: &str, word: &str) -> bool {
+    code.starts_with(word)
+        && code
+            .as_bytes()
+            .get(word.len())
+            .is_none_or(|&b| !is_js_ident(b))
+}
+
+/// Does `code` begin with a statement (not an expression) — a statement keyword, a block, an
+/// `async function` declaration, or a label (`outer: for …`)? Prepending `return` to any of
+/// these is a syntax error or changes its meaning.
+fn starts_with_statement(code: &str) -> bool {
+    if code.starts_with('{') || STMT_KEYWORDS.iter().any(|k| starts_with_word(code, k)) {
+        return true;
+    }
+    if starts_with_word(code, "async") && starts_with_word(code[5..].trim_start(), "function") {
+        return true;
+    }
+    // A label: an identifier followed (after optional whitespace) by a single `:`.
+    let ident_len = code.bytes().take_while(|&b| is_js_ident(b)).count();
+    ident_len > 0
+        && !code.as_bytes()[0].is_ascii_digit()
+        && code[ident_len..].trim_start().starts_with(':')
+}
 
 /// Resolve `.` and `..` components without touching the filesystem.
 #[cfg(feature = "sqlite")]
@@ -5353,11 +5369,7 @@ fn should_prepend_return(code: &str) -> bool {
     use ScanState::{Code, DoubleQuote, SingleQuote, Template};
 
     let code = strip_leading_js_comments(code.trim());
-    if code.is_empty() {
-        return false;
-    }
-
-    if STMT_STARTS.iter().any(|k| code.starts_with(k)) {
+    if code.is_empty() || starts_with_statement(code) {
         return false;
     }
 
@@ -5365,13 +5377,20 @@ fn should_prepend_return(code: &str) -> bool {
     let mut i = 0;
     let mut depth: i32 = 0;
     let mut state = ScanState::Code;
+    // Depths at which a template literal's `${` substitution opened: the matching `}` resumes
+    // the template (else a backtick inside `${'`'}` was read as the template's end).
+    let mut template_depths: Vec<i32> = Vec::new();
+    // Only whitespace since the last line terminator (an HTML-like `-->` comment position).
+    let mut at_line_start = true;
 
-    // Is there a top-level `return` token starting at byte `i` (word-bounded)?
+    // Is there a top-level `return` token starting at byte `i` (word-bounded, and not a
+    // property name such as `obj.return`)?
     let is_return_token = |i: usize| -> bool {
         let prev_ok = i == 0 || !is_js_ident(bytes[i - 1]);
         prev_ok
             && code[i..].starts_with("return")
             && bytes.get(i + 6).copied().is_none_or(|b| !is_js_ident(b))
+            && !preceded_by_dot(code, i)
     };
 
     // The last two significant (non-whitespace, non-comment) bytes seen in code, and where the
@@ -5392,11 +5411,25 @@ fn should_prepend_return(code: &str) -> bool {
             {
                 return false;
             }
+            at_line_start = true;
             i = next_start;
             continue;
         }
         match state {
             Code => {
+                // HTML-like comments (Script goal): `<!--` anywhere, and `-->` at the start of
+                // a line, comment out the rest of the line.
+                if bytes[i..].starts_with(b"<!--")
+                    || (at_line_start && bytes[i..].starts_with(b"-->"))
+                {
+                    while i < bytes.len() && bytes[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                if !c.is_ascii_whitespace() {
+                    at_line_start = false;
+                }
                 match c {
                     b'\'' => state = SingleQuote,
                     b'"' => state = DoubleQuote,
@@ -5415,7 +5448,10 @@ fn should_prepend_return(code: &str) -> bool {
                         i += 2;
                         continue;
                     }
-                    b'/' if slash_starts_regex(code, last_sig, last_sig_idx) => {
+                    // After `}` a `/` is division if the brace closed an object literal, and a
+                    // regex if it closed a block — undecidable here, so run the code as-is.
+                    b'/' if last_sig == Some(b'}') => return false,
+                    b'/' if slash_starts_regex(code, last_sig, prev_sig, last_sig_idx) => {
                         // A regex literal: skip it whole (a quote or newline-like character
                         // inside it must not be read as code), then its flags.
                         i = skip_regex_literal(bytes, i);
@@ -5425,7 +5461,13 @@ fn should_prepend_return(code: &str) -> bool {
                         continue;
                     }
                     b'(' | b'[' | b'{' => depth += 1,
-                    b')' | b']' | b'}' => depth -= 1,
+                    b')' | b']' | b'}' => {
+                        depth -= 1;
+                        if c == b'}' && template_depths.last() == Some(&depth) {
+                            template_depths.pop();
+                            state = Template;
+                        }
+                    }
                     // A top-level `;` with more CODE after it (not just a comment) is a
                     // multi-statement block.
                     b';' if depth <= 0 && !strip_leading_js_comments(&code[i + 1..]).is_empty() => {
@@ -5449,6 +5491,11 @@ fn should_prepend_return(code: &str) -> bool {
                 };
                 if c == b'\\' {
                     i += 1;
+                } else if state == Template && c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    template_depths.push(depth);
+                    depth += 1;
+                    state = Code;
+                    i += 1;
                 } else if c == close {
                     state = Code;
                     prev_sig = last_sig;
@@ -5467,8 +5514,15 @@ fn is_js_ident(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
-/// The identifier that ends at byte `end` (inclusive), if `code[end]` is an identifier byte.
-fn js_word_ending_at(code: &str, end: usize) -> &str {
+/// Is the token starting at byte `start` a property name (`obj.of`, `a?.return`)? Such a
+/// word is never a keyword.
+fn preceded_by_dot(code: &str, start: usize) -> bool {
+    code[..start].trim_end().ends_with('.')
+}
+
+/// The KEYWORD candidate that ends at byte `end` (inclusive): the identifier there, or `""`
+/// when `code[end]` is not an identifier byte or the word is a property name after `.`.
+fn js_keyword_ending_at(code: &str, end: usize) -> &str {
     let bytes = code.as_bytes();
     if !bytes.get(end).copied().is_some_and(is_js_ident) {
         return "";
@@ -5476,6 +5530,9 @@ fn js_word_ending_at(code: &str, end: usize) -> &str {
     let mut start = end;
     while start > 0 && is_js_ident(bytes[start - 1]) {
         start -= 1;
+    }
+    if preceded_by_dot(code, start) {
+        return "";
     }
     &code[start..=end]
 }
@@ -5498,6 +5555,14 @@ const EXPR_KEYWORDS: &[&str] = &[
     "throw",
 ];
 
+/// A line (or operand) ending in POSTFIX `++`/`--`.
+fn ends_in_postfix(last_sig: Option<u8>, prev_sig: Option<u8>) -> bool {
+    matches!(
+        (prev_sig, last_sig),
+        (Some(b'+'), Some(b'+')) | (Some(b'-'), Some(b'-'))
+    )
+}
+
 /// Does a line break just before `next_start` end the statement (JavaScript ASI)? Only
 /// consulted at bracket depth 0.
 fn asi_ends_statement(
@@ -5515,25 +5580,36 @@ fn asi_ends_statement(
     if rest.starts_with("++") || rest.starts_with("--") {
         return true;
     }
-    // A line ending in POSTFIX `++`/`--` is complete, even though `+`/`-` normally continue.
-    let postfix = matches!(
-        (prev_sig, last_sig),
-        (Some(b'+'), Some(b'+')) | (Some(b'-'), Some(b'-'))
-    );
-    let continues_after = !postfix
-        && (last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p))
-            || EXPR_KEYWORDS.contains(&js_word_ending_at(code, last_sig_idx)));
+    // After POSTFIX `++`/`--` nothing but a binary operator can continue the expression, and
+    // `i++\n[…]` / `i++\n(…)` are ASI'd into two statements — treat any following line as a
+    // new statement (not prepending is always safe; prepending would drop that line).
+    if ends_in_postfix(last_sig, prev_sig) {
+        return true;
+    }
+    let continues_after = last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p))
+        || EXPR_KEYWORDS.contains(&js_keyword_ending_at(code, last_sig_idx));
     !(continues_after || ASI_CONTINUES_BEFORE.contains(&next))
 }
 
 /// Whether a `/` (not starting a comment) begins a regex literal rather than division:
 /// true where an operand is expected — at the start, after an operator or opening
-/// punctuation, or after a keyword such as `return`/`typeof`.
-fn slash_starts_regex(code: &str, last_sig: Option<u8>, last_sig_idx: usize) -> bool {
+/// punctuation, or after a keyword such as `return`/`typeof`. After a postfix `++`/`--`
+/// (a complete operand) it is division.
+fn slash_starts_regex(
+    code: &str,
+    last_sig: Option<u8>,
+    prev_sig: Option<u8>,
+    last_sig_idx: usize,
+) -> bool {
+    if ends_in_postfix(last_sig, prev_sig) {
+        return false;
+    }
     match last_sig {
         None => true,
         Some(b) if b"(,=:[!&|?{};+-*%<>~^".contains(&b) => true,
-        Some(b) if is_js_ident(b) => EXPR_KEYWORDS.contains(&js_word_ending_at(code, last_sig_idx)),
+        Some(b) if is_js_ident(b) => {
+            EXPR_KEYWORDS.contains(&js_keyword_ending_at(code, last_sig_idx))
+        }
         Some(_) => false,
     }
 }
@@ -5624,6 +5700,20 @@ mod prop_tests {
         fn newline_explicit_return_never_prepended(pre in bare_expr(), ret in bare_expr()) {
             let code = format!("{pre}\nreturn {ret}");
             prop_assert!(!should_prepend_return(&code), "explicit return prepended: {code:?}");
+        }
+
+        /// A line after a postfix `++`/`--`, or after a keyword-named PROPERTY (`obj.of`,
+        /// `obj.in`), starts a new statement: prepending would silently drop it (audit V-6).
+        #[test]
+        fn statement_after_postfix_or_keyword_property_never_prepended(
+            a in ident(), b in bare_expr(), op in prop_oneof![Just("++"), Just("--")],
+            open in prop_oneof![Just("["), Just("(")], prop in prop_oneof![Just("of"), Just("in")]
+        ) {
+            let close = if open == "[" { "]" } else { ")" };
+            let postfix = format!("{a}{op}\n{open}{b}{close}");
+            prop_assert!(!should_prepend_return(&postfix), "would drop a line: {postfix:?}");
+            let keyword_prop = format!("{a}.{prop}\n{b}");
+            prop_assert!(!should_prepend_return(&keyword_prop), "would drop a line: {keyword_prop:?}");
         }
 
         /// `;` or the word `return` INSIDE a string literal must not trigger a
@@ -5847,9 +5937,177 @@ mod tests {
             "s.split(/,/)\n.length",
             "document.title; // trailing note",
             "document.title // trailing note",
+            "obj.return",
+            "obj.of\n.length",
+            "i++ / 2",
+            "`a${'`'}b`",
         ] {
             assert!(should_prepend_return(code), "must wrap: {code:?}");
         }
+        // Round 2 (0.9 audit V-6): each of these used to be wrapped and silently lost a
+        // statement, or was wrapped into a syntax error.
+        for code in ASI_ROUND2_STATEMENT_CASES {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+    }
+
+    /// Run a Node script and return its stdout, or `None` (test skipped) without `node`.
+    fn run_node(script: &str) -> Option<String> {
+        let out = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn log_field_truncation_never_splits_a_surrogate_pair() {
+        // An emoji straddling the MAX_LOG_FIELD_BYTES cut used to leave a lone high surrogate,
+        // which serde_json rejects — failing the whole `logs` read (audit V-4).
+        let source = format!(
+            "[{{ body: 'a'.repeat({}) + '\\u{{1F600}}tail' }}]",
+            MAX_LOG_FIELD_BYTES - 1
+        );
+        let code = trimmed_log_js(&source, 10);
+        let script = format!(
+            "const r = (function() {{ {code} }})(); \
+             console.log('OUT:' + r[0].body.isWellFormed() + ':' + r[0].body.indexOf('bytes truncated'));"
+        );
+        let Some(out) = run_node(&script) else {
+            eprintln!("SKIP: node not installed");
+            return;
+        };
+        let line = out
+            .lines()
+            .find_map(|l| l.strip_prefix("OUT:"))
+            .unwrap_or_else(|| panic!("no output: {out}"));
+        let (well_formed, marker_at) = line.split_once(':').unwrap();
+        assert_eq!(
+            well_formed, "true",
+            "truncated field is not well-formed UTF-16"
+        );
+        assert_ne!(marker_at, "-1", "field was not truncated");
+    }
+
+    /// Multi-statement snippets from the 0.9 red-team round (audit V-6): each must run every
+    /// statement. `f()` pushes `'f'` onto the log.
+    const ASI_ROUND2_STATEMENT_CASES: &[&str] = &[
+        "i++ / 2; f()",
+        "x = {} / 1; f()",
+        "i++\n[f()]",
+        "i++\n(f)()",
+        "i--\n[f()]",
+        "i--\n(f)()",
+        "obj.of\nf()",
+        "obj.in\nf()",
+        "if\t(true) f()",
+        "if\n(true) f()",
+        "const\ny = 5; f()",
+        "outer: for (const a of [1]) { f() }",
+        "outer:\nfor (const a of [1]) { f() }",
+        "`a${'`'}b`; f()",
+        "`${'`'}`\nf()",
+        "f() <!-- don't\nf()",
+        "f()\n--> it's a comment\nf()",
+        "a = /[/]/\nf()",
+        "typeof x / 2; f()",
+    ];
+
+    /// Run each `(code, expected_return, expected_log)` through the REAL eval wrapper shape
+    /// (the code inlined in an async arrow, prepended with `return` exactly when
+    /// [`should_prepend_return`] says so) in Node, and check every statement ran and the
+    /// right value came back. Skips when `node` is not installed.
+    #[test]
+    fn prepend_return_decisions_run_every_statement_in_node() {
+        let mut cases: Vec<(&str, &str, Vec<&str>)> = ASI_ROUND2_STATEMENT_CASES
+            .iter()
+            .map(|c| {
+                let n = c.matches("f()").count() + c.matches("(f)()").count();
+                (*c, "undefined", vec!["f"; n])
+            })
+            .collect();
+        cases.extend([
+            ("obj.return", "\"RET\"", vec![]),
+            ("obj.of", "\"OF\"", vec![]),
+            ("obj.in\n.length", "2", vec![]),
+            ("i++ / 2", "0.5", vec![]),
+            ("`a${'`'}b`", "\"a`b\"", vec![]),
+            ("f() <!-- trailing html comment", "1", vec!["f"]),
+            ("f()\n+ 1", "2", vec!["f"]),
+            ("document", "\"doc\"", vec![]),
+        ]);
+        let bodies: Vec<String> = cases
+            .iter()
+            .map(|(code, _, _)| {
+                let body = strip_leading_js_comments(code.trim());
+                if should_prepend_return(body) {
+                    format!("return {body}")
+                } else {
+                    code.trim().to_string()
+                }
+            })
+            .collect();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            serde_json::to_string(&bodies).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let runner = r"
+            const vm = require('vm');
+            const bodies = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+            (async () => {
+              const out = [];
+              for (const body of bodies) {
+                const log = [];
+                globalThis.__log = log;
+                const src = '(async () => { const log = globalThis.__log; const f = () => log.push(\'f\');'
+                  + ' let i = 1, x = 0, a; const document = \'doc\';'
+                  + ' const obj = { of: \'OF\', in: \'IN\', return: \'RET\' };\n' + body + '\n })()';
+                let ret, err = null;
+                try { ret = await vm.runInThisContext(src); } catch (e) { err = e.name + ': ' + e.message; }
+                out.push({ ret: ret === undefined ? 'undefined' : JSON.stringify(ret), log, err });
+              }
+              console.log('ASI_RESULTS:' + JSON.stringify(out));
+            })();
+        ";
+        let Ok(output) = std::process::Command::new("node")
+            .arg("-e")
+            .arg(runner)
+            .arg(file.path())
+            .output()
+        else {
+            eprintln!("SKIP: node not installed");
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("ASI_RESULTS:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no results: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let results: Vec<serde_json::Value> = serde_json::from_str(line).unwrap();
+        let mut failures = Vec::new();
+        for (((code, want_ret, want_log), body), got) in cases.iter().zip(&bodies).zip(&results) {
+            let got_log: Vec<&str> = got["log"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            if !got["err"].is_null() || got["ret"] != *want_ret || got_log != *want_log {
+                failures.push(format!(
+                    "{code:?} (ran as {body:?}): got ret={} log={got_log:?} err={}; want ret={want_ret} log={want_log:?}",
+                    got["ret"], got["err"]
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     #[test]
