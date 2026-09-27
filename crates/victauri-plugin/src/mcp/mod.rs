@@ -5322,7 +5322,7 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, EvalFailure> {
             return Err(EvalFailure::new(
                 EvalFailureKind::Page,
                 format!(
-                    "the code ran, but its result could not be serialized to JSON ({}). Return a                      JSON-serializable value instead — e.g. String() a BigInt, or pick the fields                      you need from a circular object.",
+                    "the code ran, but its result could not be serialized to JSON ({}). Return a JSON-serializable value instead — e.g. String() a BigInt, or pick the fields you need from a circular object.",
                     why.as_str().unwrap_or("unknown reason")
                 ),
             ));
