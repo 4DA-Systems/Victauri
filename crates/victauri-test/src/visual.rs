@@ -257,7 +257,11 @@ struct DecodedImage {
 }
 
 fn decode_png(data: &[u8]) -> Result<DecodedImage, TestError> {
-    let decoder = png::Decoder::new(std::io::Cursor::new(data));
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(data));
+    // 8-bit samples only: palette and sub-byte grayscale expanded, 16-bit stripped.
+    // Without this a 16-bit or indexed baseline (e.g. one optimised by an image tool)
+    // was compared as if it were 8-bit RGBA, or refused outright.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder
         .read_info()
         .map_err(|e| TestError::Other(format!("PNG decode error: {e}")))?;
@@ -282,6 +286,14 @@ fn decode_png(data: &[u8]) -> Result<DecodedImage, TestError> {
             let mut rgba = Vec::with_capacity(gray.len() * 4);
             for &g in gray {
                 rgba.extend_from_slice(&[g, g, g, 255]);
+            }
+            rgba
+        }
+        png::ColorType::GrayscaleAlpha => {
+            let gray = &buf[..info.buffer_size()];
+            let mut rgba = Vec::with_capacity(gray.len() * 2);
+            for &[g, a] in gray.as_chunks::<2>().0 {
+                rgba.extend_from_slice(&[g, g, g, a]);
             }
             rgba
         }
@@ -574,6 +586,46 @@ mod tests {
         let result = compare_screenshot("rgb_test", &to_base64(&screenshot), &opts).unwrap();
         assert_eq!(result.match_percentage, 100.0);
         assert_eq!(result.diff_pixel_count, 0);
+    }
+
+    /// A 16-bit and an indexed encoding of the same solid colour both compare equal
+    /// to the 8-bit RGBA screenshot (they used to be misread or refused).
+    #[test]
+    fn sixteen_bit_and_indexed_baselines_decode_to_the_same_pixels() {
+        let (r, g, b) = (200u8, 100u8, 50u8);
+        let mut deep = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut deep, 4, 4);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Sixteen);
+            let mut writer = encoder.write_header().unwrap();
+            let px = [r, r, g, g, b, b, 255, 255];
+            writer.write_image_data(&px.repeat(16)).unwrap();
+        }
+        let mut indexed = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut indexed, 4, 4);
+            encoder.set_color(png::ColorType::Indexed);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_palette(vec![r, g, b]);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&[0u8; 16]).unwrap();
+        }
+        let screenshot = to_base64(&make_solid_png(4, 4, r, g, b));
+        for (name, baseline) in [("deep", deep), ("indexed", indexed)] {
+            let dir = tempfile::tempdir().unwrap();
+            let opts = VisualOptions {
+                snapshot_dir: dir.path().to_path_buf(),
+                channel_tolerance: 0,
+                platform_baselines: false,
+                ..VisualOptions::default()
+            };
+            std::fs::write(dir.path().join(format!("{name}.png")), &baseline).unwrap();
+            let result = compare_screenshot(name, &screenshot, &opts)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(result.diff_pixel_count, 0, "{name}");
+            assert_eq!(result.total_pixels, 16, "{name}");
+        }
     }
 
     #[test]

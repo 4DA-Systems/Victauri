@@ -2036,6 +2036,17 @@ impl VictauriClient {
         self.scroll_to(&ref_id).await
     }
 
+    /// Scroll the first element whose accessible text contains the given string into view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::ElementNotFound`] if no matching element is found.
+    /// Returns other errors from [`VictauriClient::call_tool`].
+    pub async fn scroll_to_by_text(&mut self, text: &str) -> Result<Value, TestError> {
+        let ref_id = self.find_ref_by_text(text).await?;
+        self.scroll_to(&ref_id).await
+    }
+
     /// Get the text content of an element identified by HTML `id`.
     ///
     /// # Errors

@@ -424,42 +424,48 @@ impl Locator {
         client.select_option(&el.ref_id, values).await
     }
 
-    /// Check a checkbox or radio button (sets `checked = true`).
+    /// Check a checkbox or radio button.
+    ///
+    /// Toggles it with a real `click()` when it is not already checked, so the page
+    /// sees the `click`/`input`/`change` sequence a user produces. (Assigning
+    /// `el.checked` is invisible to React-controlled inputs: React's value tracker
+    /// sees no change and swallows the synthetic `change` event.)
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::ElementNotFound`] if no element matches.
+    /// Returns [`TestError::ElementNotFound`] if no element matches or it went
+    /// stale, and [`TestError::Assertion`] if it did not end up checked (disabled,
+    /// or a handler prevented the change).
     pub async fn check(&self, client: &mut VictauriClient) -> Result<Value, TestError> {
-        let el = self.resolve_one(client).await?;
-        let code = format!(
-            "(function() {{ var el = window.__VICTAURI__?.getRef({}); \
-             if (!el) return null; \
-             if (!el.checked) {{ el.checked = true; \
-             el.dispatchEvent(new Event('change', {{bubbles:true}})); \
-             el.dispatchEvent(new Event('input', {{bubbles:true}})); }} \
-             return true; }})()",
-            serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string()),
-        );
-        client.eval_js(&code).await
+        self.set_checked(client, true).await
     }
 
-    /// Uncheck a checkbox (sets `checked = false`).
+    /// Uncheck a checkbox (toggled the same way as [`check`](Self::check)).
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::ElementNotFound`] if no element matches.
+    /// Returns [`TestError::ElementNotFound`] if no element matches or it went
+    /// stale, and [`TestError::Assertion`] for a checked radio button (a user cannot
+    /// uncheck one either) or if it did not end up unchecked.
     pub async fn uncheck(&self, client: &mut VictauriClient) -> Result<Value, TestError> {
-        let el = self.resolve_one(client).await?;
-        let code = format!(
-            "(function() {{ var el = window.__VICTAURI__?.getRef({}); \
-             if (!el) return null; \
-             if (el.checked) {{ el.checked = false; \
-             el.dispatchEvent(new Event('change', {{bubbles:true}})); \
-             el.dispatchEvent(new Event('input', {{bubbles:true}})); }} \
-             return true; }})()",
-            serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string()),
+        self.set_checked(client, false).await
+    }
+
+    async fn set_checked(
+        &self,
+        client: &mut VictauriClient,
+        want: bool,
+    ) -> Result<Value, TestError> {
+        let state = if want { "checked" } else { "unchecked" };
+        let body = format!(
+            "var want = {want}; \
+             if (!want && el.type === 'radio' && el.checked) return {{ {ERROR_KEY}: \
+               'a checked radio button cannot be unchecked; check another option' }}; \
+             if (!!el.checked !== want) el.click(); \
+             return !!el.checked === want ? true : {{ {ERROR_KEY}: \
+               'the element did not become {state} (disabled, or a handler prevented it)' }};"
         );
-        client.eval_js(&code).await
+        self.eval_on_element(client, &body).await
     }
 
     // ── Query methods ───────────────────────────────────────────────────
@@ -575,8 +581,9 @@ impl Locator {
         client: &mut VictauriClient,
         attr_name: &str,
     ) -> Result<Option<String>, TestError> {
-        let escaped = attr_name.replace('\\', "\\\\").replace('"', "\\\"");
-        let js_body = format!("return el.getAttribute(\"{escaped}\");");
+        // A JSON string is a valid JS string literal for any input (newlines, U+2028…).
+        let name = serde_json::to_string(attr_name).unwrap_or_else(|_| "\"\"".to_string());
+        let js_body = format!("return el.getAttribute({name});");
         let val = self.eval_on_element(client, &js_body).await?;
         if val.is_null() {
             Ok(None)
@@ -606,13 +613,8 @@ impl Locator {
         let elements = self.resolve_all(client).await?;
         let mut texts = Vec::with_capacity(elements.len());
         for el in &elements {
-            let code = format!(
-                "(function() {{ var el = window.__VICTAURI__?.getRef({}); \
-                 if (!el) return \"\"; \
-                 return el.textContent || \"\"; }})()",
-                serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string()),
-            );
-            let val = client.eval_js(&code).await?;
+            let code = element_script(&el.ref_id, "return el.textContent || \"\";");
+            let val = element_result(client.eval_js(&code).await?, self)?;
             texts.push(value_to_string(&val));
         }
         Ok(texts)
@@ -825,13 +827,38 @@ impl Locator {
         js_body: &str,
     ) -> Result<Value, TestError> {
         let el = self.resolve_one(client).await?;
-        let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
-        let code = format!(
-            "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-             if (!el) return null; {js_body} }})()"
-        );
-        client.eval_js(&code).await
+        let code = element_script(&el.ref_id, js_body);
+        element_result(client.eval_js(&code).await?, self)
     }
+}
+
+/// Marker an [`element_script`] returns when its ref no longer resolves.
+const MISSING_KEY: &str = "__victauri_missing_ref";
+/// Marker an [`element_script`] returns, with a message, when its action failed.
+const ERROR_KEY: &str = "__victauri_error";
+
+/// Wraps `js_body` (which sees the element as `el`) in a script that reports a ref
+/// that no longer resolves — instead of returning `null`, which callers would read
+/// as an empty text, an absent attribute or an unchecked box.
+fn element_script(ref_id: &str, js_body: &str) -> String {
+    let ref_str = serde_json::to_string(ref_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
+         if (!el) return {{ {MISSING_KEY}: true }}; {js_body} }})()"
+    )
+}
+
+/// Turns an [`element_script`] result's markers into errors.
+fn element_result(val: Value, locator: &Locator) -> Result<Value, TestError> {
+    if val.get(MISSING_KEY).and_then(Value::as_bool) == Some(true) {
+        return Err(TestError::ElementNotFound(format!(
+            "{locator} (the element went stale before it could be read)"
+        )));
+    }
+    if let Some(msg) = val.get(ERROR_KEY).and_then(Value::as_str) {
+        return Err(TestError::Assertion(format!("{locator}: {msg}")));
+    }
+    Ok(val)
 }
 
 impl fmt::Display for Locator {
