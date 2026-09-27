@@ -830,6 +830,7 @@ name = "demo-app"
 version = "0.9.0"
 dependencies = [
  "reqwest 0.12.28",
+ "rusqlite",
  "serde",
  "serde_json",
  "tauri",
