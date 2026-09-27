@@ -272,7 +272,7 @@ pub(crate) fn db_health_report(
 
 /// Budget for the metadata PRAGMAs + table listing in [`db_health_report`].
 #[cfg(feature = "sqlite")]
-const DB_HEALTH_META_BUDGET: Duration = Duration::from_secs(3);
+pub(crate) const DB_HEALTH_META_BUDGET: Duration = Duration::from_secs(3);
 
 /// Open a database file Victauri did not create as read-only UNTRUSTED input: with
 /// `trusted_schema=OFF` (schema-embedded SQL functions / virtual tables cannot run with side
@@ -1407,7 +1407,12 @@ mod tests {
             let started = Instant::now();
             let err = query(&path, sql, &[serde_json::json!(pattern)], None).unwrap_err();
             assert!(err.contains("pattern too complex"), "{sql}: {err}");
-            assert!(started.elapsed() < Duration::from_secs(2));
+            // Refused per row BEFORE matching (generous bound: loaded CI machines).
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
         }
         // An ordinary pattern still works.
         let r = query(

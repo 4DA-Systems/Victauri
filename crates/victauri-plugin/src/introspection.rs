@@ -837,13 +837,18 @@ impl AppStateProbes {
     /// registered under that name.
     #[must_use]
     pub fn run(&self, name: &str) -> Option<serde_json::Value> {
-        let probe = self
-            .inner
+        self.get(name).map(|p| p())
+    }
+
+    /// The probe registered under `name`, to run somewhere other than the caller's thread
+    /// (the `app_state` tool runs it on the blocking pool with a timeout).
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<std::sync::Arc<ProbeFn>> {
+        self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(name)
-            .cloned();
-        probe.map(|p| p())
+            .cloned()
     }
 
     /// Number of registered probes.

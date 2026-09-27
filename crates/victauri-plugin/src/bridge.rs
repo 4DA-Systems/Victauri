@@ -19,6 +19,16 @@ pub trait WebviewBridge: Send + Sync {
     fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String>;
     /// Retrieve the state of one or all windows (position, size, visibility, focus, URL).
     fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState>;
+    /// Like [`get_window_states`](Self::get_window_states), but distinguishes "could not ask"
+    /// (the UI thread did not answer in time) from "no such window". A caller that reports a
+    /// window as missing, or a list as empty, must use this.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the window states could not be obtained.
+    fn try_get_window_states(&self, label: Option<&str>) -> Result<Vec<WindowState>, String> {
+        Ok(self.get_window_states(label))
+    }
     /// Return the labels of all open webview windows.
     fn list_window_labels(&self) -> Vec<String>;
     /// Like [`list_window_labels`](Self::list_window_labels), but distinguishes "could not
@@ -362,6 +372,15 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     }
 
     fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+        // An empty Vec here means the main-thread dispatch failed/timed out (a wedged UI), not
+        // "no windows" — log it so that case is diagnosable rather than silently indistinguishable.
+        self.try_get_window_states(label).unwrap_or_else(|e| {
+            tracing::warn!("get_window_states: {e}");
+            Vec::new()
+        })
+    }
+
+    fn try_get_window_states(&self, label: Option<&str>) -> Result<Vec<WindowState>, String> {
         let label = label.map(str::to_string);
         on_main(self, "get_window_states", move |app| {
             let windows = app.webview_windows();
@@ -392,12 +411,6 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
             }
 
             states
-        })
-        // An empty Vec here means the main-thread dispatch failed/timed out (a wedged UI), not
-        // "no windows" — log it so that case is diagnosable rather than silently indistinguishable.
-        .unwrap_or_else(|e| {
-            tracing::warn!("get_window_states: {e}");
-            Vec::new()
         })
     }
 
