@@ -140,6 +140,10 @@ future additions will always have defaults.
   passed without checking); failures are annotated. Codecov upload (failing silently on every run)
   replaced by an artifact. jsdom bridge tests fail instead of silently skipping in CI/preflight.
 - MCP Registry name uses the case-sensitive GitHub login (`io.github.4DA-Systems/victauri`).
+- Victauri's own example apps (demo, gauntlet) opt out of Tauri's default features and so lacked
+  `x11`: tao then has no X11 window handle, and `screenshot` failed on Linux ("the underlying handle
+  is not available") — reproduced on WebKitGTK/X11, fixed, verified returning a PNG. Apps using
+  Tauri's defaults (as almost all do) were never affected.
 - The live demo-app suites that CI never ran (`e2e.yml` last ran in May) were stale: 5 tests
   asserted a 4-card page, 12 commands, a silent unknown-command result, and elements on hidden tabs.
   They now match the app, restore the state they change, and pass in any order.

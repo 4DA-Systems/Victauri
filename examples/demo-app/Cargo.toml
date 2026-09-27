@@ -12,7 +12,9 @@ tauri-build = { workspace = true }
 [dependencies]
 victauri-plugin = { workspace = true }
 victauri-core = { workspace = true }
-tauri = { workspace = true, features = ["wry"] }
+# `x11` (a Tauri default this workspace opts out of): without it tao has no X11 window
+# handle on Linux, so `screenshot` fails there with "the underlying handle is not available".
+tauri = { workspace = true, features = ["wry", "x11"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Seeds demo.db so query_db / introspect db_health have a real application database.
