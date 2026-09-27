@@ -40,6 +40,9 @@ regex = "1"
 url = { workspace = true }
 flate2 = "1"
 tower = { version = "0.5", features = ["limit"] }
+# Serve loop with a header-read timer and a connection cap (axum::serve sets neither).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1"] }
 rusqlite = { workspace = true, optional = true }
 
 [features]

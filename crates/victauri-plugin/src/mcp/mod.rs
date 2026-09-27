@@ -8,6 +8,7 @@ mod authz;
 mod backend_params;
 mod bounded;
 mod compound_params;
+mod hardening;
 mod helpers;
 mod introspection_params;
 mod other_params;
