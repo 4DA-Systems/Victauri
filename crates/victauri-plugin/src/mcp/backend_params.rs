@@ -44,8 +44,10 @@ pub struct RegistryParams {
 pub struct InvokeCommandParams {
     /// The Tauri command name to invoke (e.g. "greet", "`save_settings`").
     pub command: String,
-    /// Command arguments as a JSON OBJECT nested under this `args` key — keys are the Tauri
-    /// command's parameter names, e.g. `{"command":"get_item","args":{"itemId":42}}`. Do NOT
+    /// Command arguments as a JSON OBJECT nested under this `args` key — keys are the IPC
+    /// argument keys, which Tauri camelCases from the Rust parameter names by default
+    /// (`item_id` → `itemId`; the registry reports each argument's `key` when it differs),
+    /// e.g. `{"command":"get_item","args":{"itemId":42}}`. Do NOT
     /// put parameters at the top level next to `command` (a flat `{"command":...,"itemId":42}`
     /// leaves `args` empty and the handler sees a missing argument). Omit for no-arg commands.
     /// A JSON STRING containing that object is also accepted (some MCP clients stringify
