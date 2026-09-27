@@ -1,7 +1,6 @@
 import * as vscode from "vscode";
-import * as path from "path";
-import * as fs from "fs/promises";
 import { VictauriClient } from "./client";
+import { discoverServer } from "./discovery";
 import { AppStateProvider } from "./appStateView";
 import { DomExplorerProvider } from "./domExplorerView";
 import { IpcLogProvider } from "./ipcLogView";
@@ -347,91 +346,3 @@ function updateStatusBar(): void {
   }
 }
 
-interface DiscoveredServer {
-  port: number;
-  token: string | undefined;
-}
-
-// Whether a discovery dir is safe to trust (audit #9): on Unix the temp root is
-// world-writable, so it must be a real directory (not a symlink), owned by the
-// current user, and not group/other-writable. Windows temp is per-user and the
-// writer restricts ACLs via icacls, so no extra check is needed there.
-async function dirIsTrusted(dir: string): Promise<boolean> {
-  if (process.platform === "win32") return true;
-  try {
-    const st = await fs.lstat(dir);
-    if (!st.isDirectory()) return false;
-    const myUid = typeof process.getuid === "function" ? process.getuid() : -1;
-    if (myUid >= 0 && st.uid !== myUid) return false;
-    if ((st.mode & 0o022) !== 0) return false;
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// `process.kill(pid, 0)` sends no signal; it only checks that the process
-// exists. ESRCH = gone; EPERM = exists but owned by another user (alive).
-function pidIsAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (e) {
-    return (e as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
-
-async function discoverServer(
-  defaultPort: number
-): Promise<DiscoveredServer> {
-  const tmpDir =
-    process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp";
-  const baseDir = path.join(tmpDir, "victauri");
-
-  try {
-    // The root owner can swap a previously checked child directory. Refuse the
-    // entire discovery tree unless the root itself is trusted.
-    if (!(await dirIsTrusted(baseDir))) {
-      return { port: defaultPort, token: undefined };
-    }
-    const entries = await fs.readdir(baseDir, { withFileTypes: true });
-    const servers: DiscoveredServer[] = [];
-
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^\d+$/.test(entry.name)) continue;
-      const dir = path.join(baseDir, entry.name);
-      // Only trust a discovery dir we own — never read a token from a dir a local
-      // attacker could have planted in the world-writable temp root (audit #9).
-      if (!(await dirIsTrusted(dir))) continue;
-      // Skip dirs left behind by an exited app (a crash / kill leaves them on
-      // disk). Otherwise one stale dir next to the live one makes discovery
-      // ambiguous, and a lone stale dir hands us a dead port + stale token.
-      if (!pidIsAlive(parseInt(entry.name, 10))) continue;
-      try {
-        const portStr = (await fs.readFile(path.join(dir, "port"), "utf-8")).trim();
-        if (!/^\d+$/.test(portStr)) continue;
-        const port = parseInt(portStr, 10);
-        if (!Number.isInteger(port) || port <= 0 || port >= 65536) continue;
-
-        let token: string | undefined;
-        try {
-          const t = (await fs.readFile(path.join(dir, "token"), "utf-8")).trim();
-          if (t) token = t;
-        } catch {
-          // no token file
-        }
-
-        servers.push({ port, token });
-      } catch {
-        // no port file in this dir
-      }
-    }
-
-    if (servers.length === 1) return servers[0];
-  } catch {
-    // base dir doesn't exist
-  }
-
-  return { port: defaultPort, token: undefined };
-}

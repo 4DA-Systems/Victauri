@@ -90,7 +90,7 @@ The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op in
 
 - A Tauri 2.x app with [victauri-plugin](https://crates.io/crates/victauri-plugin) enabled
 - The plugin starts an HTTP server on `127.0.0.1:7373` that this extension connects to
-- Port discovery reads the per-process discovery directory (`<temp>/victauri/<pid>/port`, trusted and live entries only) if the default port is taken
+- Port discovery reads the per-process discovery directory (`%TEMP%\victauri\<pid>\` on Windows; `$XDG_RUNTIME_DIR/victauri/<pid>/` or `<temp>/victauri-<uid>/<pid>/` on Unix, plus the legacy `<temp>/victauri/`) — trusted entries owned by a live process of yours only — if the default port is taken
 
 ## Compatibility
 

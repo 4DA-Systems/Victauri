@@ -18,6 +18,12 @@ All notable changes to the Victauri VS Code extension will be documented in this
   authenticated liveness probe first.
 - **Auto-discovery ignores stale discovery dirs** whose app process has exited, and rejects
   malformed port files.
+- **Auto-discovery finds Victauri 0.9 apps on Unix** in their per-user discovery root
+  (`$XDG_RUNTIME_DIR/victauri` or `<temp>/victauri-<uid>`), still reading the legacy
+  `<temp>/victauri` for older apps.
+- **A discovery entry whose PID now belongs to another user's process is not live.** An
+  `EPERM` from the liveness probe counted as alive, so a recycled PID could make a stale
+  entry (and its token) look current.
 - REST tool errors now report the real HTTP status (e.g. 401/500) instead of a JSON parse
   error on non-JSON bodies.
 
