@@ -54,7 +54,27 @@ pub fn init_script(caps: &BridgeCapacities) -> String {
     // release — it silently drifted (stuck at 0.7.8 through 0.7.10), so `get_diagnostics`
     // reported a stale `bridge_version` and the startup self-check logged a false
     // "Bridge version mismatch" on every launch. Deriving it here makes drift impossible.
-        + &INIT_SCRIPT_BODY.replace("__VICTAURI_BRIDGE_VERSION__", env!("CARGO_PKG_VERSION"))
+        + &INIT_SCRIPT_BODY
+            .replace("__VICTAURI_BRIDGE_VERSION__", env!("CARGO_PKG_VERSION"))
+            .replace("__VICTAURI_AGENT_KEY__", agent_key())
+}
+
+/// Per-process secret that unlocks the bridge's agent-only operations (clearing logs and route
+/// rules, dialog auto-responses). It is embedded in the init script's closure and in the
+/// scripts Victauri itself injects, never in anything page script can read, so a page cannot
+/// silently remove the agent's block/mock rules or erase captured evidence.
+#[doc(hidden)]
+#[must_use]
+pub fn agent_key() -> &'static str {
+    static KEY: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| uuid::Uuid::new_v4().simple().to_string());
+    KEY.as_str()
+}
+
+/// JS expression evaluating to the bridge's agent-only operations object (or `undefined` when
+/// the bridge is not loaded). Only valid inside scripts Victauri injects.
+pub(crate) fn agent_ops_js() -> String {
+    format!("window.__VICTAURI__?._agent(\"{}\")", agent_key())
 }
 
 /// The body of the init script (after capacity variable declarations).
@@ -284,6 +304,64 @@ const INIT_SCRIPT_BODY: &str = r#"
         });
     }
 
+    // ── Built-ins captured at init ──────────────────────────────────────────
+    //
+    // Page script runs after this init script and can replace any global or prototype method
+    // (`Map.prototype.set`, `window.String`, `setTimeout`, `JSON.stringify`, …). Everything the
+    // bridge's security-relevant paths call is captured here, and called through bound copies
+    // so no `.call` / prototype lookup happens at call time.
+    var NATIVE_STRINGIFY = JSON.stringify;
+    var PRISTINE_PARSE = JSON.parse;
+    var OBJ_CREATE = Object.create;
+    var GET_PROTO = Object.getPrototypeOf;
+    var OBJECT_PROTO = Object.prototype;
+    var ARRAY_PROTO = Array.prototype;
+    var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
+    var SET_TIMEOUT = window.setTimeout.bind(window);
+    var AGENT_KEY = '__VICTAURI_AGENT_KEY__';
+
+    // Page script can plant `toJSON` on Object.prototype / Array.prototype, which JSON.stringify
+    // consults on EVERY object it serializes: that forged eval results (including the
+    // `__victauri_type` envelope) and rewrote every log the agent read. A `toJSON` inherited
+    // from those two universal prototypes is ignored; one an app defines on its own class
+    // (or a built-in such as Date) is honoured as usual.
+    function hasUniversalToJSON(o) {
+        for (var p = o; p !== null && p !== undefined; p = GET_PROTO(p)) {
+            if (hasOwn(p, 'toJSON')) return p === OBJECT_PROTO || p === ARRAY_PROTO;
+        }
+        return false;
+    }
+    function neutralReplacer(key, value) {
+        // `this[key]` is the raw value before toJSON; JSON.stringify never re-applies toJSON
+        // to what a replacer returns, so returning it serializes the object's own fields.
+        var raw = this[key];
+        if (raw !== value && raw !== null && typeof raw === 'object' && hasUniversalToJSON(raw)) return raw;
+        return value;
+    }
+    function PRISTINE_STRINGIFY(v) { return NATIVE_STRINGIFY(v, neutralReplacer); }
+
+    // A deep, detached copy of a JSON-shaped value (IPC args/results): the logs hand out copies
+    // so page script cannot rewrite what was captured through a returned reference.
+    function cloneJson(v) {
+        if (v === null || typeof v !== 'object') return v;
+        try { var s = PRISTINE_STRINGIFY(v); return s === undefined ? null : PRISTINE_PARSE(s); }
+        catch (e) { return null; }
+    }
+
+    // Truncate to at most `n` UTF-16 code units without splitting a surrogate pair: a lone
+    // surrogate serializes as an escape that serde_json rejects, failing the whole tool call.
+    function truncText(s, n) {
+        s = '' + s;
+        var start = 0;
+        var c0 = s.charCodeAt(0);
+        if (c0 >= 0xDC00 && c0 <= 0xDFFF) start = 1; // a leading lone low surrogate
+        if (s.length - start <= n) return start ? s.substring(start) : s;
+        var end = start + n;
+        var last = s.charCodeAt(end - 1);
+        if (last >= 0xD800 && last <= 0xDBFF) end--; // would end on a high surrogate
+        return s.substring(start, end);
+    }
+
     // ── Eval bookkeeping (closure-private) ──────────────────────────────────
     //
     // The per-eval state used to live on a page-visible global (`window.__VIC_EVAL__`), so page
@@ -291,8 +369,18 @@ const INIT_SCRIPT_BODY: &str = r#"
     // or suppress every result. It now lives in this closure, reachable only through the frozen,
     // non-configurable `__VICTAURI__` methods below, which never reveal an id. Serialization uses
     // `JSON.stringify` captured here, at init, before any page script can replace it.
-    var PRISTINE_STRINGIFY = JSON.stringify;
-    var evalState = new Map();
+    // The id -> state table is a null-prototype object behind own-property accessors, not a
+    // `Map`: `Map.prototype.set` is resolved at call time, so page script hooking it learned
+    // every pending eval id and could settle it with a forged result first.
+    var evalState = (function() {
+        var table = OBJ_CREATE(null);
+        return {
+            has: function(k) { return hasOwn(table, k); },
+            get: function(k) { return hasOwn(table, k) ? table[k] : undefined; },
+            set: function(k, v) { table[k] = v; },
+            delete: function(k) { delete table[k]; },
+        };
+    })();
     function evalCallback(id, body) {
         try {
             return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
@@ -303,12 +391,23 @@ const INIT_SCRIPT_BODY: &str = r#"
     // (as the getters used to) let page script push forged entries (a fake successful IPC call
     // that `recording replay` would then invoke), splice out its own traffic, or plant values
     // that break every later read. Freezing the bridge object does not protect its arrays.
+    // The copies are DEEP: an entry's nested objects (IPC request args, response bodies, route
+    // headers) are cloned too, else page script rewrote a logged call's arguments or result
+    // through the returned reference.
     var ASSIGN = Object.assign;
     function copyEntries(arr) {
         var out = new Array(arr.length);
         for (var i = 0; i < arr.length; i++) {
             var e = arr[i];
-            out[i] = (e && typeof e === 'object') ? ASSIGN({}, e) : e;
+            if (e && typeof e === 'object') {
+                var c = ASSIGN({}, e);
+                for (var k in c) {
+                    if (hasOwn(c, k) && c[k] !== null && typeof c[k] === 'object') c[k] = cloneJson(c[k]);
+                }
+                out[i] = c;
+            } else {
+                out[i] = e;
+            }
         }
         return out;
     }
@@ -324,11 +423,11 @@ const INIT_SCRIPT_BODY: &str = r#"
         // (almost always a syntax error, which fails the whole script), report that instead of
         // letting the caller wait for its full timeout.
         _evalArm: function(id, ms) {
-            id = String(id);
+            id = '' + id; // not String(id): page script can replace window.String
             if (evalState.has(id)) return;
             var s = { started: false, done: false };
             evalState.set(id, s);
-            setTimeout(function() {
+            SET_TIMEOUT(function() {
                 if (s.started || s.done) return;
                 s.done = true;
                 evalState.delete(id);
@@ -336,12 +435,12 @@ const INIT_SCRIPT_BODY: &str = r#"
             }, ms);
         },
         _evalBegin: function(id) {
-            var s = evalState.get(String(id));
+            var s = evalState.get('' + id);
             if (s) s.started = true;
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
-            id = String(id);
+            id = '' + id;
             var s = evalState.get(id);
             if (s) {
                 if (s.done) return null;
@@ -485,11 +584,11 @@ const INIT_SCRIPT_BODY: &str = r#"
                     tag: node.tagName.toLowerCase(),
                     role: role,
                     name: node.getAttribute('aria-label') || node.getAttribute('title') || null,
-                    text: (node.textContent || '').trim().substring(0, 100),
+                    text: truncText((node.textContent || '').trim(), 100),
                     bounds: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
                     visible: vis,
                     enabled: !node.disabled,
-                    value: (node.tagName === 'INPUT' && (node.getAttribute('type') || '').toLowerCase() === 'password') ? '[REDACTED]' : (node.value || null)
+                    value: isPasswordInput(node) ? '[REDACTED]' : safeValue(node)
                 };
             }
 
@@ -717,7 +816,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     } else if (n.response_body != null) {
                         // Command-level error: the body carries the error message.
                         errText = typeof n.response_body === 'string'
-                            ? n.response_body : JSON.stringify(n.response_body);
+                            ? n.response_body : PRISTINE_STRINGIFY(n.response_body);
                     } else {
                         errText = 'command error';
                     }
@@ -725,23 +824,18 @@ const INIT_SCRIPT_BODY: &str = r#"
                 entries.push({
                     id: n.id,
                     command: command,
-                    args: n.request_args || {},
+                    args: cloneJson(n.request_args) || {},
                     timestamp: n.timestamp,
                     status: st,
                     duration_ms: n.duration_ms,
                     // Nullish, not falsy: a command returning 0 / false / '' is a real result.
-                    result: (n.response_body === undefined || n.response_body === null) ? null : n.response_body,
+                    // Deep copies: the page must not rewrite a logged call through this entry.
+                    result: (n.response_body === undefined || n.response_body === null) ? null : cloneJson(n.response_body),
                     error: errText,
                 });
             }
             if (limit) return entries.slice(-limit);
             return entries;
-        },
-
-        clearIpcLog: function() {
-            for (var i = networkLog.length - 1; i >= 0; i--) {
-                if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
-            }
         },
 
         waitForIpcComplete: function(timeoutMs) {
@@ -772,18 +866,10 @@ const INIT_SCRIPT_BODY: &str = r#"
             return copyEntries(since ? consoleLogs.filter(function(l) { return l.timestamp >= since; }) : consoleLogs);
         },
 
-        clearConsoleLogs: function() {
-            consoleLogs.length = 0;
-        },
-
         // ── Mutations ────────────────────────────────────────────────────────
 
         getMutationLog: function(since) {
             return copyEntries(since ? mutationLog.filter(function(m) { return m.timestamp >= since; }) : mutationLog);
-        },
-
-        clearMutationLog: function() {
-            mutationLog.length = 0;
         },
 
         // ── Network ──────────────────────────────────────────────────────────
@@ -795,10 +881,6 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
             if (limit) log = log.slice(-limit);
             return copyEntries(log);
-        },
-
-        clearNetworkLog: function() {
-            networkLog.length = 0;
         },
 
         // ── Network routing (interception / mock / block / delay) ──────────────
@@ -833,20 +915,16 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         getRouteRules: function() { return copyEntries(routeRules); },
 
-        clearRoute: function(id) {
-            var before = routeRules.length;
-            routeRules = routeRules.filter(function(r) { return r.id !== id; });
-            return { ok: true, removed: before - routeRules.length };
-        },
-
-        clearRoutes: function() {
-            var n = routeRules.length;
-            routeRules = [];
-            return { ok: true, removed: n };
-        },
-
         getRouteMatches: function(limit) {
             return copyEntries(limit ? routeMatchLog.slice(-limit) : routeMatchLog);
+        },
+
+        // Agent-only operations (clear logs / route rules, dialog auto-responses) are NOT on
+        // this page-visible object: page script could otherwise silently remove the agent's
+        // block/mock rules, erase captured evidence, or flip dialog auto-answers. They are
+        // handed out only for the per-process key Victauri embeds in its own injected scripts.
+        _agent: function(key) {
+            return key === AGENT_KEY ? AGENT_OPS : null;
         },
 
         // ── Storage ──────────────────────────────────────────────────────────
@@ -927,15 +1005,6 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         getDialogLog: function() {
             return copyEntries(dialogLog);
-        },
-
-        clearDialogLog: function() {
-            dialogLog.length = 0;
-        },
-
-        setDialogAutoResponse: function(type, action, text) {
-            dialogAutoResponses[type] = { action: action, text: text };
-            return { ok: true };
         },
 
         // ── Combined Event Stream ────────────────────────────────────────────
@@ -1535,7 +1604,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             function describe(el) {
                 if (!el) return null;
                 var cls = (el.className && el.className.toString)
-                    ? el.className.toString().substring(0, 60) : null;
+                    ? truncText(el.className.toString(), 60) : null;
                 return { tag: el.tagName ? el.tagName.toLowerCase() : null,
                          id: el.id || null, cls: cls, rect: rect(el) };
             }
@@ -1611,7 +1680,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             var ends = anims.map(function(a) { return a.effect.getComputedTiming().endTime; });
             var duration = Math.max.apply(null, ends);
             anims.forEach(function(a) { try { a.pause(); } catch (e) {} });
-            window.__VICTAURI_SCRUB__ = { el: el, anims: anims, ends: ends, duration: duration };
+            scrubState = { el: el, anims: anims, ends: ends, duration: duration };
             return Promise.all(anims.map(function(a) { return a.ready.catch(function(){}); }))
                 .then(function() {
                     var b = el.getBoundingClientRect();
@@ -1623,7 +1692,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
 
         scrubSeek: function(progress) {
-            var S = window.__VICTAURI_SCRUB__;
+            var S = scrubState;
             if (!S) return Promise.resolve({ error: 'not prepared — scrubPrepare first' });
             var t = progress * S.duration;
             for (var i = 0; i < S.anims.length; i++) {
@@ -1657,10 +1726,10 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
 
         scrubRestore: function(resume) {
-            var S = window.__VICTAURI_SCRUB__;
+            var S = scrubState;
             if (!S) return { restored: false };
             S.anims.forEach(function(a) { try { if (resume) a.play(); } catch (e) {} });
-            window.__VICTAURI_SCRUB__ = null;
+            scrubState = null;
             return { restored: true, resumed: !!resume };
         },
 
@@ -1674,7 +1743,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             // for SWEEP_IDLE_STOP_MS, so an armed-and-forgotten recorder does not
             // run getComputedStyle every frame for the life of the page.
             var SWEEP_IDLE_STOP_MS = 60000;
-            var R = (window.__VICTAURI_SWEEP__ = { sel: selector || null,
+            var R = (sweepState = { sel: selector || null,
                 sessions: [], cur: null, touched: performance.now(), stopped: false,
                 idle_stop_ms: SWEEP_IDLE_STOP_MS });
             var matrix = function(el) {
@@ -1698,7 +1767,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             };
             var tick = function() {
                 // Stop if a newer recorder superseded this one.
-                if (window.__VICTAURI_SWEEP__ !== R) return;
+                if (sweepState !== R) return;
                 if (performance.now() - R.touched > SWEEP_IDLE_STOP_MS) {
                     if (R.cur) {
                         R.sessions.push(R.cur);
@@ -1740,7 +1809,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
 
         readSweep: function(clear) {
-            var R = window.__VICTAURI_SWEEP__;
+            var R = sweepState;
             if (!R) {
                 return { error: 'no recorder armed — call sample with record=true first, then '
                     + 'trigger the animation' };
@@ -1788,6 +1857,40 @@ const INIT_SCRIPT_BODY: &str = r#"
         });
     } catch(e) {}
 
+    // Animation scrub / sweep-recorder state. Closure-held, not `window.__VICTAURI_SCRUB__` /
+    // `window.__VICTAURI_SWEEP__` globals, which page script could overwrite to fake the
+    // measured animation curve and jank statistics.
+    var scrubState = null;
+    var sweepState = null;
+
+    // See `_agent`: reachable only with the per-process agent key.
+    var AGENT_OPS = OBJ_CREATE(null);
+    AGENT_OPS.clearIpcLog = function() {
+        for (var i = networkLog.length - 1; i >= 0; i--) {
+            if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
+        }
+        return { ok: true };
+    };
+    AGENT_OPS.clearNetworkLog = function() { networkLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearConsoleLogs = function() { consoleLogs.length = 0; return { ok: true }; };
+    AGENT_OPS.clearMutationLog = function() { mutationLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearDialogLog = function() { dialogLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearRoute = function(id) {
+        var before = routeRules.length;
+        routeRules = routeRules.filter(function(r) { return r.id !== id; });
+        return { ok: true, removed: before - routeRules.length };
+    };
+    AGENT_OPS.clearRoutes = function() {
+        var n = routeRules.length;
+        routeRules = [];
+        return { ok: true, removed: n };
+    };
+    AGENT_OPS.setDialogAutoResponse = function(type, action, text) {
+        dialogAutoResponses[type] = { action: action, text: text };
+        return { ok: true };
+    };
+    Object.freeze(AGENT_OPS);
+
     // ── Accessibility Helpers ────────────────────────────────────────────────
 
     function describeEl(el) {
@@ -1795,7 +1898,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (el.id) s += ' id="' + el.id + '"';
         if (el.className && typeof el.className === 'string') {
             var cls = el.className.trim();
-            if (cls) s += ' class="' + cls.substring(0, 50) + '"';
+            if (cls) s += ' class="' + truncText(cls, 50) + '"';
         }
         s += '>';
         return s;
@@ -1869,8 +1972,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         var name = node.getAttribute('aria-label')
             || node.getAttribute('title')
             || node.getAttribute('placeholder')
-            || (node.tagName === 'BUTTON' ? node.textContent.trim().substring(0, 80) : null)
-            || (node.tagName === 'A' ? node.textContent.trim().substring(0, 80) : null);
+            || (node.tagName === 'BUTTON' ? truncText(node.textContent.trim(), 80) : null)
+            || (node.tagName === 'A' ? truncText(node.textContent.trim(), 80) : null);
 
         var element = {
             ref_id: ref_id,
@@ -1878,7 +1981,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             role: role,
             name: name,
             text: getDirectText(node),
-            value: (node.tagName === 'INPUT' && (node.getAttribute('type') || '').toLowerCase() === 'password') ? '[REDACTED]' : (node.value || null),
+            value: isPasswordInput(node) ? '[REDACTED]' : safeValue(node),
             enabled: !node.disabled,
             visible: true,
             focusable: node.tabIndex >= 0 || ['INPUT','BUTTON','SELECT','TEXTAREA','A'].indexOf(node.tagName) !== -1,
@@ -1928,12 +2031,42 @@ const INIT_SCRIPT_BODY: &str = r#"
         return element;
     }
 
-    // An unquoted attribute value for the compact tree: escaped like a JSON string (no raw
-    // newlines, quotes or control characters) but without the surrounding quotes.
-    function compactAttr(v) {
-        var s = PRISTINE_STRINGIFY(String(v));
-        return s.substring(1, s.length - 1);
+    // An element's `.value` for a snapshot: a string (or null). `.value` is not always a string
+    // — `<li value=3>`, `<progress>`, `<meter>` and many web components expose a number or an
+    // object (possibly self-referencing) — and calling string methods on it, or serializing a
+    // cyclic object, used to fail the WHOLE dom_snapshot / find_elements call.
+    function safeValue(node) {
+        var v;
+        try { v = node.value; } catch (e) { return null; }
+        if (typeof v === 'string') return v || null;
+        if ((typeof v === 'number' && v === v) || typeof v === 'boolean') return v ? '' + v : null;
+        return null;
     }
+
+    function isPasswordInput(node) {
+        return node.tagName === 'INPUT' && (node.getAttribute('type') || '').toLowerCase() === 'password';
+    }
+
+    // A page-derived string for the compact tree, always as a quoted JSON string. U+2028 /
+    // U+2029 / U+0085 are escaped too: JSON leaves them raw, and a reader may treat them as a
+    // line break (and so as the start of a forged `[eN] …` line).
+    function compactStr(v) {
+        return PRISTINE_STRINGIFY('' + v)
+            .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029').replace(/\u0085/g, '\\u0085');
+    }
+
+    // An attribute value for the compact tree: bare when it is one plain token (the common
+    // `@submit-btn`, `type=password`, `href=/about?x=1`), otherwise a quoted JSON string — a
+    // value holding a space or quote used to print unquoted and spoof further same-line fields
+    // (`@note type=password`, `href=https://evil`).
+    var COMPACT_TOKEN_RE = /^[A-Za-z0-9_\-.:\/#?&=%+~,]+$/;
+    function compactAttr(v) {
+        var s = '' + v;
+        return COMPACT_TOKEN_RE.test(s) ? s : compactStr(s);
+    }
+    // A role or tag printed as a line's head word. Anything but a plain lowercase word (a role
+    // attribute is free text) would let page markup inject a forged line or fields.
+    var COMPACT_WORD_RE = /^[a-z][a-z0-9-]*$/;
 
     function walkDomCompact(node, depth) {
         if (!node || node.nodeType !== 1) return '';
@@ -1957,29 +2090,38 @@ const INIT_SCRIPT_BODY: &str = r#"
         var text = getDirectText(node) || '';
         var tag = node.tagName.toLowerCase();
 
+        // Grammar, one line per element (every page-derived field is a bare plain token or a
+        // JSON string, so markup cannot forge a line or a field):
+        //   [eN] <head> [role=<json>] [<json name/text>] [[disabled]] [value=<json>]
+        //        [@<attr>] [type=<attr>] [href=<attr>]
         var line = indent + '[' + ref_id + '] ';
 
+        var head = COMPACT_WORD_RE.test(tag) ? tag : compactStr(tag);
         if (role && role !== tag) {
-            line += role;
+            if (COMPACT_WORD_RE.test(role)) {
+                line += role;
+            } else {
+                line += head + ' role=' + compactStr(truncText(role, 60));
+            }
         } else {
-            line += tag;
+            line += head;
         }
 
         // Page-derived strings are JSON-encoded: written raw, a newline in rendered text (an
         // RSS title, a chat message) forged whole `[eN] button "…"` lines in this tree and could
         // steer an agent's click onto a different element.
         if (name) {
-            line += ' ' + PRISTINE_STRINGIFY(name.substring(0, 60));
+            line += ' ' + compactStr(truncText(name, 60));
         } else if (text && text.length <= 60) {
-            line += ' ' + PRISTINE_STRINGIFY(text);
+            line += ' ' + compactStr(text);
         } else if (text) {
-            line += ' ' + PRISTINE_STRINGIFY(text.substring(0, 57) + '...');
+            line += ' ' + compactStr(truncText(text, 57) + '...');
         }
 
         if (node.disabled) line += ' [disabled]';
-        if (node.value) {
-            var isPassword = node.tagName === 'INPUT' && (node.getAttribute('type') || '').toLowerCase() === 'password';
-            line += ' value=' + JSON.stringify(isPassword ? '[REDACTED]' : node.value.substring(0, 40));
+        var value = safeValue(node);
+        if (value !== null) {
+            line += ' value=' + compactStr(isPasswordInput(node) ? '[REDACTED]' : truncText(value, 40));
         }
 
         var testId = node.getAttribute('data-testid');
@@ -1989,7 +2131,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (type && tag === 'input') line += ' type=' + compactAttr(type);
 
         var href = node.getAttribute('href');
-        if (href && tag === 'a') line += ' href=' + compactAttr(href.substring(0, 60));
+        if (href && tag === 'a') line += ' href=' + compactAttr(truncText(href, 60));
 
         var result = line + '\n';
 
@@ -2049,7 +2191,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (node.childNodes[i].nodeType === 3) text += node.childNodes[i].textContent;
         }
         text = text.trim();
-        return text.length > 0 ? text.substring(0, 200) : null;
+        return text.length > 0 ? truncText(text, 200) : null;
     }
 
     // ── Console Hooking ──────────────────────────────────────────────────────
@@ -2084,7 +2226,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }
                 msg = msg.replace(CTRL_RE, '');
                 if (msg.length > MAX_CONSOLE_MSG) {
-                    msg = msg.slice(0, MAX_CONSOLE_MSG) + '…[+' + (msg.length - MAX_CONSOLE_MSG) + ' bytes truncated'
+                    msg = truncText(msg, MAX_CONSOLE_MSG) + '…[+' + (msg.length - MAX_CONSOLE_MSG) + ' bytes truncated'
                         + (skippedArgs ? ', ' + skippedArgs + ' more args' : '') + ']';
                 }
                 consoleLogs.push({ level: level, message: msg, timestamp: Date.now() });
@@ -2118,24 +2260,60 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // ── Interaction Observer (for record mode) ────────────────────────────────
 
+    // CSS escaping for recorded selectors (the codegen decoder in victauri-core parses exactly
+    // these forms). cssString: the body of a double-quoted CSS string — `\` -> `\\`, `"` -> `\"`,
+    // every char < U+0020, U+007F, U+2028 and U+2029 -> `\` + lowercase hex + ONE space (a
+    // newline is `\a `); everything else literal. cssIdent: CSS.escape() (CSSOM "serialize an
+    // identifier"), implemented here so it cannot be replaced by page script.
+    function hexEscape(code) { return '\\' + code.toString(16) + ' '; }
+    function cssString(s) {
+        s = '' + s;
+        var out = '';
+        for (var i = 0; i < s.length; i++) {
+            var c = s.charCodeAt(i);
+            if (c < 0x20 || c === 0x7F || c === 0x2028 || c === 0x2029) out += hexEscape(c);
+            else if (c === 0x5C) out += '\\\\';
+            else if (c === 0x22) out += '\\"';
+            else out += s.charAt(i);
+        }
+        return out;
+    }
+    function cssIdent(s) {
+        s = '' + s;
+        var out = '';
+        var first = s.charCodeAt(0);
+        for (var i = 0; i < s.length; i++) {
+            var c = s.charCodeAt(i);
+            if (c === 0) out += '\uFFFD';
+            else if ((c >= 0x1 && c <= 0x1F) || c === 0x7F
+                || (i === 0 && c >= 0x30 && c <= 0x39)
+                || (i === 1 && c >= 0x30 && c <= 0x39 && first === 0x2D)) out += hexEscape(c);
+            else if (i === 0 && c === 0x2D && s.length === 1) out += '\\-';
+            else if (c >= 0x80 || c === 0x2D || c === 0x5F || (c >= 0x30 && c <= 0x39)
+                || (c >= 0x41 && c <= 0x5A) || (c >= 0x61 && c <= 0x7A)) out += s.charAt(i);
+            else out += '\\' + s.charAt(i);
+        }
+        return out;
+    }
+
     function bestSelector(el) {
-        if (el.dataset && el.dataset.testid) return '[data-testid="' + el.dataset.testid + '"]';
-        if (el.id) return '#' + el.id;
+        if (el.dataset && el.dataset.testid) return '[data-testid="' + cssString(el.dataset.testid) + '"]';
+        if (el.id) return '#' + cssIdent(el.id);
         if (el.getAttribute && el.getAttribute('role')) {
             var role = el.getAttribute('role');
-            var text = (el.textContent || '').trim().substring(0, 50);
-            if (text) return '[role="' + role + '"]:has-text("' + text + '")';
-            return '[role="' + role + '"]';
+            var text = truncText((el.textContent || '').trim(), 50);
+            if (text) return '[role="' + cssString(role) + '"]:has-text("' + cssString(text) + '")';
+            return '[role="' + cssString(role) + '"]';
         }
         var tag = (el.tagName || 'div').toLowerCase();
-        var text = (el.textContent || '').trim().substring(0, 50);
+        var text = truncText((el.textContent || '').trim(), 50);
         if (text && ['button', 'a', 'label', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'span'].indexOf(tag) !== -1) {
-            return tag + ':has-text("' + text + '")';
+            return tag + ':has-text("' + cssString(text) + '")';
         }
-        if (el.name) return tag + '[name="' + el.name + '"]';
+        if (typeof el.name === 'string' && el.name) return tag + '[name="' + cssString(el.name) + '"]';
         if (el.className && typeof el.className === 'string') {
-            var cls = el.className.trim().split(/\s+/).slice(0, 2).join('.');
-            if (cls) return tag + '.' + cls;
+            var classes = el.className.trim().split(/\s+/).slice(0, 2);
+            if (classes[0]) return tag + '.' + classes.map(cssIdent).join('.');
         }
         return tag;
     }
@@ -2518,7 +2696,25 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // ── Resource Cleanup ────────────────────────────────────────────────────
 
-    window.addEventListener('pagehide', function() {
+    // A page entering the back/forward cache (`persisted`) is frozen, not unloaded: it can be
+    // restored as-is and the init script does NOT run again. Tearing capture down here left a
+    // restored page with console and DOM-mutation capture permanently off. So a persisted
+    // pagehide keeps everything, and `pageshow` re-installs whatever a teardown removed.
+    var captureTornDown = false;
+    window.addEventListener('pageshow', function(e) {
+        if (!e || !e.persisted || !captureTornDown) return;
+        captureTornDown = false;
+        hookConsole('log');
+        hookConsole('warn');
+        hookConsole('error');
+        hookConsole('info');
+        hookConsole('debug');
+        if (!__mutationObserver) startMutationObserver();
+    });
+
+    window.addEventListener('pagehide', function(e) {
+        if (e && e.persisted) return;
+        captureTornDown = true;
         if (__mutationObserver) { __mutationObserver.disconnect(); __mutationObserver = null; }
         if (mutationBatchTimer) { clearTimeout(mutationBatchTimer); mutationBatchTimer = null; }
         console.log = originalConsole.log;

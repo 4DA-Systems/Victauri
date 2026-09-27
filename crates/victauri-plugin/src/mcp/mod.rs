@@ -1956,7 +1956,8 @@ impl VictauriMcpHandler {
                     .as_ref()
                     .map_or_else(|| "undefined".to_string(), |t| js_string(t));
                 let code = format!(
-                    "return window.__VICTAURI__?.setDialogAutoResponse({}, {}, {text_arg})",
+                    "return {}?.setDialogAutoResponse({}, {}, {text_arg})",
+                    crate::js_bridge::agent_ops_js(),
                     js_string(dialog_type.as_str()),
                     js_string(dialog_action.as_str())
                 );
@@ -2461,16 +2462,17 @@ impl VictauriMcpHandler {
                 let Some(id) = params.id else {
                     return missing_param("id", "clear");
                 };
-                let code = format!("return window.__VICTAURI__?.clearRoute({id})");
+                let code = format!(
+                    "return {}?.clearRoute({id})",
+                    crate::js_bridge::agent_ops_js()
+                );
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
             RouteAction::ClearAll => {
-                self.eval_bridge(
-                    "return window.__VICTAURI__?.clearRoutes()",
-                    params.webview_label.as_deref(),
-                )
-                .await
+                let code = format!("return {}?.clearRoutes()", crate::js_bridge::agent_ops_js());
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
             }
             RouteAction::Matches => {
                 let limit = params.limit.unwrap_or(100);
@@ -2928,15 +2930,10 @@ impl VictauriMcpHandler {
                     return missing_param("threshold_ms", "slow_ipc");
                 };
                 let limit = params.limit.unwrap_or(20);
-                let mb = MAX_LOG_FIELD_BYTES;
+                let trim_field = trim_field_js();
                 let code = format!(
                     r"return (function() {{
-                        var MB = {mb};
-                        function trimField(v) {{
-                            if (typeof v === 'string') return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
-                            if (v && typeof v === 'object') {{ var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }} if (s.length > MB) return '[truncated ' + s.length + ' bytes]'; }}
-                            return v;
-                        }}
+                        {trim_field}
                         function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
                         var log = window.__VICTAURI__?.getIpcLog() || [];
                         var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold}; }});
@@ -2953,8 +2950,11 @@ impl VictauriMcpHandler {
                 if !self.state.privacy.is_tool_enabled("logs.clear") {
                     return tool_disabled("logs.clear");
                 }
-                let code = "return (function(){ var b = window.__VICTAURI__; if (!b) return { ok:false, error:'bridge unavailable' }; if (b.clearIpcLog) b.clearIpcLog(); if (b.clearNetworkLog) b.clearNetworkLog(); return { ok:true, cleared:['ipc','network'] }; })()";
-                self.eval_bridge(code, params.webview_label.as_deref())
+                let code = format!(
+                    "return (function(){{ var b = {}; if (!b) return {{ ok:false, error:'bridge unavailable' }}; b.clearIpcLog(); b.clearNetworkLog(); return {{ ok:true, cleared:['ipc','network'] }}; }})()",
+                    crate::js_bridge::agent_ops_js()
+                );
+                self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
         }
@@ -5128,6 +5128,30 @@ impl ServerHandler for VictauriMcpHandler {
     }
 }
 
+/// JS `function trimField(v)` (with its `MB` bound): a string over [`MAX_LOG_FIELD_BYTES`]
+/// UTF-16 units is cut with a marker, an object whose JSON is larger becomes a size marker.
+/// The cut never falls between the halves of a surrogate pair — a lone surrogate serializes
+/// to JSON that `serde_json` rejects, which failed the whole log read.
+fn trim_field_js() -> String {
+    let mb = MAX_LOG_FIELD_BYTES;
+    format!(
+        r"var MB = {mb};
+            function trimField(v) {{
+                if (typeof v === 'string') {{
+                    if (v.length <= MB) return v;
+                    var end = MB, c = v.charCodeAt(end - 1);
+                    if (c >= 0xD800 && c <= 0xDBFF) end--;
+                    return v.slice(0, end) + '…[+' + (v.length - end) + ' bytes truncated]';
+                }}
+                if (v && typeof v === 'object') {{
+                    var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }}
+                    if (s.length > MB) {{ return '[truncated ' + s.length + ' bytes]'; }}
+                }}
+                return v;
+            }}"
+    )
+}
+
 /// Build a JS expression that takes an array of log entries (`source_expr`),
 /// keeps at most `limit` of the most recent, and truncates any per-entry field
 /// larger than [`MAX_LOG_FIELD_BYTES`]. This keeps IPC/network log results under
@@ -5135,20 +5159,10 @@ impl ServerHandler for VictauriMcpHandler {
 ///
 /// The returned code is a complete `return (...)` statement.
 fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
-    let mb = MAX_LOG_FIELD_BYTES;
+    let trim_field = trim_field_js();
     format!(
         r"return (function() {{
-            var MB = {mb};
-            function trimField(v) {{
-                if (typeof v === 'string') {{
-                    return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
-                }}
-                if (v && typeof v === 'object') {{
-                    var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }}
-                    if (s.length > MB) {{ return '[truncated ' + s.length + ' bytes]'; }}
-                }}
-                return v;
-            }}
+            {trim_field}
             function trimEntry(e) {{
                 if (e == null || typeof e !== 'object') return e;
                 var out = Array.isArray(e) ? [] : {{}};
@@ -6248,7 +6262,7 @@ mod authz_dispatch_tests {
     /// positional array body used to be gated as the bare tool name, which the Test
     /// profile allows for `navigate` — the handler then parsed and ran `go_to`. Both
     /// shapes must now be refused as invalid params before any handler runs, in every
-    /// profile (FullControl with the action disabled is the other half of the bypass).
+    /// profile (`FullControl` with the action disabled is the other half of the bypass).
     #[tokio::test]
     async fn non_string_action_cannot_slip_past_the_gate() {
         let mut full_minus_go_to = PrivacyConfig::default();
