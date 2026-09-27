@@ -118,6 +118,10 @@ future additions will always have defaults.
 - **A panic in any tool handler** hung the MCP request until the client timed out (and reset the
   REST connection): chrono overflows on huge `since_ms`/`seconds` values reached it live. Look-back
   windows now saturate, and a panic boundary around both dispatchers returns an internal error.
+- `query_db` refuses a write, a PRAGMA write or stacked statements before looking up any database,
+  so the refusal no longer depends on whether the app has one (on Windows the demo app has none,
+  and a `DELETE` came back as "only WebView internal databases were found"). The demo app now
+  seeds a real `demo.db`.
 - App-state probes run on the blocking pool with a timeout; a busy UI thread is reported as busy
   instead of "no windows"; relative DB paths resolve in a fixed root order for both `query_db` and
   `db_health`; `read_app_file` keeps UTF-8 when truncating mid-character; duplicate result column
@@ -136,6 +140,9 @@ future additions will always have defaults.
   passed without checking); failures are annotated. Codecov upload (failing silently on every run)
   replaced by an artifact. jsdom bridge tests fail instead of silently skipping in CI/preflight.
 - MCP Registry name uses the case-sensitive GitHub login (`io.github.4DA-Systems/victauri`).
+- The live demo-app suites that CI never ran (`e2e.yml` last ran in May) were stale: 5 tests
+  asserted a 4-card page, 12 commands, a silent unknown-command result, and elements on hidden tabs.
+  They now match the app, restore the state they change, and pass in any order.
 - victauri-core's README example compiles again and is now a doctest; visual-regression docs use
   the real API; crate/compat counts corrected.
 

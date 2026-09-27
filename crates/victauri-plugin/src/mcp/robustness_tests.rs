@@ -559,3 +559,23 @@ async fn app_state_probes_are_bounded_and_panic_isolated() {
     let r = json(&call(&h, "app_state", serde_json::json!({"probe": "fine"})).await);
     assert_eq!(r["depth"], 3);
 }
+
+/// A refused query is refused for what it is, before any database is looked up. Seen live on
+/// Windows: the demo app has no application database, so a DELETE came back as "only `WebView`
+/// internal databases were found" instead of "read-only" (the adversarial E2E suite, which CI
+/// runs on Linux only, failed there). Here the app has no data directory at all.
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn a_refused_query_is_refused_before_any_database_is_resolved() {
+    let h = handler(TestBridge::default());
+    for (sql, expect) in [
+        ("DELETE FROM x", "read-only"),
+        ("PRAGMA journal_mode = WAL", "PRAGMA writes"),
+        ("PRAGMA wal_checkpoint", "side-effecting PRAGMAs"),
+        ("SELECT 1; DROP TABLE x", "stacked"),
+    ] {
+        let r = call(&h, "query_db", serde_json::json!({ "query": sql })).await;
+        assert_eq!(r.is_error, Some(true), "{sql}");
+        assert!(text(&r).contains(expect), "{sql}: {}", text(&r));
+    }
+}

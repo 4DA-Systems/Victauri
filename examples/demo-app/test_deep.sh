@@ -1,7 +1,7 @@
 #!/bin/bash
 # Deep integration test for Victauri demo-app
 # Tests EVERYTHING — especially features never tested on third-party apps:
-#   - Command registry with 19 #[inspectable] commands
+#   - Command registry with 21 #[inspectable] commands
 #   - Natural language command resolution
 #   - Ghost command detection against populated registry
 #   - invoke_command with real args and validation errors
@@ -60,7 +60,7 @@ check_not() {
 }
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  Victauri Deep Integration Test — Demo App (19 commands)   ║"
+echo "║  Victauri Deep Integration Test — Demo App (21 commands)   ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -73,7 +73,7 @@ R=$(curl -s "$BASE/health")
 check "1.1 health endpoint" "$R" '"status".*"ok"'
 
 R=$(curl -s "$BASE/info")
-check "1.2 info shows 19 commands" "$R" '"commands_registered":19'
+check "1.2 info shows 21 commands" "$R" '"commands_registered":21'
 check "1.3 info auth disabled" "$R" '"auth_required":false'
 check "1.4 info version is semver" "$R" '"version":"[0-9]+\.[0-9]+\.[0-9]+"'
 check "1.5 info port correct" "$R" "\"port\":$PORT"
@@ -93,7 +93,7 @@ check "1.10 diagnostics returns data" "$R" '"bridge_version"\|"warnings"'
 # MODULE 2: Command Registry (FIRST TIME TESTING NON-EMPTY REGISTRY)
 # ═══════════════════════════════════════════════════════════════════
 echo ""
-echo "── Module 2: Command Registry (19 #[inspectable] commands) ──"
+echo "── Module 2: Command Registry (21 #[inspectable] commands) ──"
 
 R=$(call_tool "get_registry" '{}')
 check "2.1 registry returns commands" "$R" '"name"'
@@ -108,7 +108,7 @@ check "2.9 registry has show_notification_window" "$R" '"show_notification_windo
 
 # Count commands in registry
 CMD_COUNT=$(echo "$R" | grep -o '"name"' | wc -l)
-check "2.10 registry count = 19" "$CMD_COUNT" "^19$"
+check "2.10 registry count = 21" "$CMD_COUNT" "^21$"
 
 # Check metadata fields
 check "2.11 has description field" "$R" '"description"'

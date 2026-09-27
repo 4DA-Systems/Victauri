@@ -751,15 +751,16 @@ pub fn query(
     )
 }
 
+/// The checks a query must pass before any database is even opened: length, read-only
+/// statement kind, no PRAGMA write or side-effecting PRAGMA, no stacked statements. The
+/// `query_db` tool runs them BEFORE resolving which database to open, so a refused query is
+/// refused for what it is — whether or not the app has a database — and touches no file.
+///
+/// # Errors
+///
+/// Returns the refusal message for the first check the query fails.
 #[cfg(feature = "sqlite")]
-fn query_with_limits(
-    db_path: &Path,
-    sql: &str,
-    params: &[serde_json::Value],
-    max_rows: Option<usize>,
-    query_timeout: Duration,
-    max_result_bytes: usize,
-) -> Result<serde_json::Value, String> {
+pub fn validate_query(sql: &str) -> Result<(), String> {
     if sql.len() > MAX_QUERY_SQL_BYTES {
         return Err(format!(
             "query exceeds maximum length ({MAX_QUERY_SQL_BYTES} bytes)"
@@ -806,6 +807,19 @@ fn query_with_limits(
             );
         }
     }
+    Ok(())
+}
+
+#[cfg(feature = "sqlite")]
+fn query_with_limits(
+    db_path: &Path,
+    sql: &str,
+    params: &[serde_json::Value],
+    max_rows: Option<usize>,
+    query_timeout: Duration,
+    max_result_bytes: usize,
+) -> Result<serde_json::Value, String> {
+    validate_query(sql)?;
 
     let max_rows = max_rows.unwrap_or(MAX_ROWS_DEFAULT).min(MAX_ROWS_LIMIT);
 

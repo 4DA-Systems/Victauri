@@ -489,6 +489,15 @@ fn get_app_state(state: tauri::State<'_, AppState>) -> serde_json::Value {
     })
 }
 
+fn seed_db(path: &std::path::Path) -> rusqlite::Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL);
+         DELETE FROM todos;
+         INSERT INTO todos (id, title, done) VALUES (1, 'Write tests', 0), (2, 'Ship', 0), (3, 'Celebrate', 1);",
+    )
+}
+
 fn main() {
     // Shared pipeline state: one Arc cloned into both the `app_state` probe and
     // Tauri's managed state (the idiomatic VictauriBuilder::probe pattern).
@@ -555,6 +564,15 @@ fn main() {
         .setup(|app| {
             let window = app.get_webview_window("main").unwrap();
             window.set_title("Victauri Demo").unwrap();
+            // A real application database in the app data dir (a default query_db search
+            // root). Without it the only SQLite files there are the webview's own stores,
+            // which query_db rightly refuses to treat as the app's data.
+            if let Ok(dir) = app.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = seed_db(&dir.join("demo.db")) {
+                    eprintln!("demo-app: failed to seed demo.db: {e}");
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

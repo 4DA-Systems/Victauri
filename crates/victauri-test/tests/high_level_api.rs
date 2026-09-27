@@ -47,12 +47,33 @@ async fn fill_by_id_and_expect_text() {
         return;
     }
     let mut client = VictauriClient::connect(port()).await.unwrap();
+    // The input lives on the Todos tab; hidden panels are not in the snapshot.
+    client
+        .click_by_selector("[data-tab=\"todos\"]")
+        .await
+        .unwrap();
     client
         .fill_by_id("todo-input", "Write tests")
         .await
         .unwrap();
     client.click_by_id("add-todo-btn").await.unwrap();
     client.expect_text("Write tests").await.unwrap();
+
+    // Leave the shared app as found: the suites after this one expect the Home tab and the
+    // original todo list.
+    let todos = client.invoke_command("list_todos", None).await.unwrap();
+    for todo in todos.as_array().into_iter().flatten() {
+        if todo["title"] == "Write tests" {
+            client
+                .invoke_command("delete_todo", Some(serde_json::json!({ "id": todo["id"] })))
+                .await
+                .unwrap();
+        }
+    }
+    client
+        .click_by_selector("[data-tab=\"home\"]")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -61,7 +82,19 @@ async fn select_by_id_language() {
         return;
     }
     let mut client = VictauriClient::connect(port()).await.unwrap();
+    // The select lives on the Settings tab; hidden panels are not in the snapshot.
+    client
+        .click_by_selector("[data-tab=\"settings\"]")
+        .await
+        .unwrap();
     client.select_by_id("lang-select", "ja").await.unwrap();
+
+    // Leave the shared app as found (default language, Home tab).
+    client.select_by_id("lang-select", "en").await.unwrap();
+    client
+        .click_by_selector("[data-tab=\"home\"]")
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

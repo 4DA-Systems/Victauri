@@ -1525,6 +1525,12 @@ impl VictauriMcpHandler {
     /// Real `query_db` implementation — compiled only with the `sqlite` feature.
     #[cfg(feature = "sqlite")]
     async fn query_db_impl(&self, params: QueryDbParams) -> CallToolResult {
+        // A refused query is refused for what it is, before any database is looked up: the
+        // error used to depend on whether the app HAS a database ("no application database"
+        // for a DELETE on an app without one), and it touched the filesystem for nothing.
+        if let Err(e) = crate::database::validate_query(&params.query) {
+            return tool_error(e);
+        }
         let data_dir = match self.bridge.app_data_dir() {
             Ok(d) => d,
             Err(e) => return tool_error(format!("cannot access app data directory: {e}")),

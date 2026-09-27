@@ -203,9 +203,21 @@ adv!(query_db_blocks_all_writes, base, {
     // Stacked queries blocked.
     let e = error(&call(&base, "query_db", json!({"query":"SELECT 1; DROP TABLE x"})).await);
     assert!(e.contains("stacked"), "stacked query not blocked: {e}");
-    // A read still works.
-    let ok = call(&base, "query_db", json!({"query":"SELECT 1 AS x"})).await;
-    assert_eq!(result(&ok)["rows"][0]["x"], json!(1));
+    // A read still works, against the demo's own database (named explicitly: the webview's
+    // internal stores live in the same directory and differ per engine).
+    let ok = call(
+        &base,
+        "query_db",
+        json!({"query":"SELECT count(*) AS n FROM todos", "path": "demo.db"}),
+    )
+    .await;
+    assert_eq!(result(&ok)["rows"][0]["n"], json!(3));
+    // Which database auto-selection picks on this engine (informational).
+    let auto = call(&base, "query_db", json!({"query":"SELECT 1"})).await;
+    eprintln!(
+        "query_db auto-selected: {}",
+        auto["result"]["database"].as_str().unwrap_or("<error>")
+    );
 });
 
 // ── D. Filesystem + selector + command error paths ─────────────────────────
