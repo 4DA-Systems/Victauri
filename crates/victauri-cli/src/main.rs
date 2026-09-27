@@ -1248,14 +1248,24 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
             new_lines.push(&plugin_line);
             new_lines.extend_from_slice(&lines[idx..]);
 
-            let new_content = new_lines.join("\n");
+            // Keep the file's line endings: `lines()` drops them, and re-joining with "\n"
+            // turned a CRLF source file into a whole-file LF diff.
+            let eol = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let new_content = new_lines.join(eol);
             // Preserve trailing newline if original had one
             let new_content = if content.ends_with('\n') {
-                format!("{new_content}\n")
+                format!("{new_content}{eol}")
             } else {
                 new_content
             };
 
+            // Same rule as every file `init` creates: never write through a symlink (a cloned
+            // repo's `src/main.rs` could point at a file outside the project).
+            refuse_symlink(&path)?;
             std::fs::write(&path, new_content)
                 .with_context(|| format!("failed to write {}", path.display()))?;
             eprintln!(
@@ -1757,6 +1767,7 @@ fn add_dependencies(cargo_toml_path: &Path) -> Result<bool> {
     }
 
     if changed {
+        refuse_symlink(cargo_toml_path)?;
         std::fs::write(cargo_toml_path, doc.to_string())?;
     }
     Ok(changed)
@@ -2199,6 +2210,27 @@ mod tests {
     }
 
     #[test]
+    fn patch_tauri_builder_keeps_crlf_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "fn main() {\r\n    tauri::Builder::default()\r\n        .run(tauri::generate_context!())\r\n        .unwrap();\r\n}\r\n",
+        )
+        .unwrap();
+        assert!(try_patch_tauri_builder(&src).unwrap());
+        let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        assert!(content.contains("victauri_plugin::init()"));
+        assert_eq!(
+            content.matches('\n').count(),
+            content.matches("\r\n").count(),
+            "every line ending stays CRLF: {content:?}"
+        );
+        assert!(content.ends_with("}\r\n"));
+    }
+
+    #[test]
     fn patch_tauri_builder_skips_if_already_present() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -2306,6 +2338,31 @@ mod tests {
         std::fs::write(&f, "a").unwrap();
         append_to_regular_file(&f, "b").unwrap();
         assert_eq!(std::fs::read_to_string(&f).unwrap(), "ab");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_patches_never_follow_a_symlinked_source_or_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.rs");
+        let original = "fn main() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n";
+        std::fs::write(&outside, original).unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("main.rs")).unwrap();
+        assert!(try_patch_tauri_builder(&src).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+
+        let manifest = dir.path().join("outside.toml");
+        std::fs::write(&manifest, "[package]\nname = \"x\"\n\n[dependencies]\n").unwrap();
+        let link = dir.path().join("Cargo.toml");
+        std::os::unix::fs::symlink(&manifest, &link).unwrap();
+        assert!(add_dependencies(&link).is_err());
+        assert!(
+            !std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("victauri")
+        );
     }
 
     #[cfg(unix)]
