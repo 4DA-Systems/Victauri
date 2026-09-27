@@ -11,6 +11,7 @@ use crate::error::TestError;
 
 /// IPC coverage report showing which commands were exercised.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CoverageReport {
     /// Total number of registered commands.
     pub total_commands: usize,
@@ -26,6 +27,7 @@ pub struct CoverageReport {
 
 /// A command name with its invocation count.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct CommandCalls {
     /// Name of the Tauri command.
     pub name: String,

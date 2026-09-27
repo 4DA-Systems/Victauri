@@ -11,6 +11,7 @@ use crate::recording::RecordedSession;
 
 /// Controls whether generated code uses direct client methods or the Locator API.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[non_exhaustive]
 pub enum CodegenStyle {
     /// Generate `client.click_by_id("btn")` style calls.
     #[default]

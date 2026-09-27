@@ -35,6 +35,7 @@ use crate::error::TestError;
 
 /// Bounding rectangle of a DOM element in CSS pixels.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Bounds {
     /// X offset from the viewport left edge.
     pub x: f64,
@@ -48,6 +49,7 @@ pub struct Bounds {
 
 /// A single element resolved from a [`Locator`] query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LocatorMatch {
     /// Ref handle ID used to target this element in subsequent actions.
     pub ref_id: String,

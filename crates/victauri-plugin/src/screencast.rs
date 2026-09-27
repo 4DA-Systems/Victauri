@@ -12,6 +12,7 @@ pub const MAX_TRACE_BYTES: usize = 256 * 1024 * 1024;
 
 /// A single captured frame: milliseconds since trace start + base64 PNG.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct TraceFrame {
     /// Milliseconds since the trace started.
     pub t_ms: u64,

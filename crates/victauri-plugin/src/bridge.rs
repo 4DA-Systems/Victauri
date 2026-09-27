@@ -369,18 +369,18 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
                 let pos = window.outer_position().unwrap_or_default();
                 let size = window.inner_size().unwrap_or_default();
 
-                states.push(WindowState {
-                    label: win_label.clone(),
-                    title: window.title().unwrap_or_default(),
-                    url: window.url().map(|u| u.to_string()).unwrap_or_default(),
-                    visible: window.is_visible().unwrap_or(false),
-                    focused: window.is_focused().unwrap_or(false),
-                    maximized: window.is_maximized().unwrap_or(false),
-                    minimized: window.is_minimized().unwrap_or(false),
-                    fullscreen: window.is_fullscreen().unwrap_or(false),
-                    position: (pos.x, pos.y),
-                    size: (size.width, size.height),
-                });
+                states.push(
+                    WindowState::new(win_label.clone())
+                        .with_title(window.title().unwrap_or_default())
+                        .with_url(window.url().map(|u| u.to_string()).unwrap_or_default())
+                        .with_visible(window.is_visible().unwrap_or(false))
+                        .with_focused(window.is_focused().unwrap_or(false))
+                        .with_maximized(window.is_maximized().unwrap_or(false))
+                        .with_minimized(window.is_minimized().unwrap_or(false))
+                        .with_fullscreen(window.is_fullscreen().unwrap_or(false))
+                        .with_position(pos.x, pos.y)
+                        .with_size(size.width, size.height),
+                );
             }
 
             states

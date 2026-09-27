@@ -6,15 +6,15 @@ use victauri_core::registry::{CommandInfo, CommandRegistry};
 use victauri_core::verification;
 
 fn make_ipc(id: &str, cmd: &str) -> AppEvent {
-    AppEvent::Ipc(IpcCall {
-        id: id.to_string(),
-        command: cmd.to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(1),
-        result: IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 32,
-        webview_label: "main".to_string(),
-    })
+    AppEvent::Ipc(IpcCall::new(
+        id.to_string(),
+        cmd.to_string(),
+        Utc::now(),
+        IpcResult::Ok(serde_json::json!("ok")),
+        Some(1),
+        32,
+        "main".to_string(),
+    ))
 }
 
 fn bench_event_log(c: &mut Criterion) {
@@ -54,11 +54,7 @@ fn bench_event_log(c: &mut Criterion) {
             log.push(make_ipc(&i.to_string(), "ipc_cmd"));
         }
         for i in 0..500 {
-            log.push(AppEvent::StateChange {
-                key: format!("key_{i}"),
-                timestamp: Utc::now(),
-                caused_by: None,
-            });
+            log.push(AppEvent::state_change(format!("key_{i}"), Utc::now(), None));
         }
         b.iter(|| {
             black_box(log.ipc_calls());
@@ -165,11 +161,11 @@ fn bench_verification(c: &mut Criterion) {
     });
 
     group.bench_function("evaluate_assertion", |b| {
-        let assertion = verification::SemanticAssertion {
-            label: "check_count".to_string(),
-            condition: verification::AssertionCondition::GreaterThan,
-            expected: serde_json::json!(10),
-        };
+        let assertion = verification::SemanticAssertion::new(
+            "check_count".to_string(),
+            verification::AssertionCondition::GreaterThan,
+            serde_json::json!(10),
+        );
         b.iter(|| {
             black_box(verification::evaluate_assertion(
                 serde_json::json!(42),

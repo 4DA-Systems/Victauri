@@ -63,6 +63,18 @@ pub struct CheckResult {
     pub detail: String,
 }
 
+impl CheckResult {
+    /// Creates a check result (`detail` is conventionally empty when `passed`).
+    #[must_use]
+    pub fn new(description: impl Into<String>, passed: bool, detail: impl Into<String>) -> Self {
+        Self {
+            description: description.into(),
+            passed,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// Collection of check results from a `verify()` run.
 #[derive(Debug)]
 pub struct VerifyReport {
@@ -71,6 +83,13 @@ pub struct VerifyReport {
 }
 
 impl VerifyReport {
+    /// Creates a report from individual check results (e.g. to export custom
+    /// checks through [`Self::to_junit`]).
+    #[must_use]
+    pub fn new(results: Vec<CheckResult>) -> Self {
+        Self { results }
+    }
+
     /// Returns true if all checks passed.
     #[must_use]
     pub fn all_passed(&self) -> bool {

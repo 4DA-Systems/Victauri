@@ -841,11 +841,8 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("expression did not return valid JSON: {e}")),
         };
 
-        let assertion = victauri_core::SemanticAssertion {
-            label: params.label,
-            condition: params.condition,
-            expected: params.expected,
-        };
+        let assertion =
+            victauri_core::SemanticAssertion::new(params.label, params.condition, params.expected);
 
         let result = victauri_core::evaluate_assertion(actual, &assertion);
         json_result(&result)
@@ -3699,6 +3696,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             mutation_count,
                             webview_label,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -3725,6 +3723,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             key,
                             caused_by,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -3739,6 +3738,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             level,
                             message,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -3750,6 +3750,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             label,
                             event,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -6295,15 +6296,15 @@ mod command_policy_dispatch_tests {
     }
 
     fn ipc_event(command: &str) -> AppEvent {
-        AppEvent::Ipc(IpcCall {
-            id: format!("c-{command}"),
-            command: command.to_string(),
-            timestamp: chrono::Utc::now(),
-            duration_ms: Some(1),
-            result: IpcResult::Ok(json!(true)),
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        })
+        AppEvent::Ipc(IpcCall::new(
+            format!("c-{command}"),
+            command.to_string(),
+            chrono::Utc::now(),
+            IpcResult::Ok(json!(true)),
+            Some(1),
+            0,
+            "main".to_string(),
+        ))
     }
 
     fn result_text(r: &CallToolResult) -> String {
@@ -6412,16 +6413,16 @@ mod command_policy_dispatch_tests {
         let state = state_with(blocking(&["wipe_database"]));
         let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
 
-        let session = RecordedSession {
-            id: "poisoned".to_string(),
-            started_at: chrono::Utc::now(),
-            events: vec![RecordedEvent {
-                index: 0,
-                timestamp: chrono::Utc::now(),
-                event: ipc_event("wipe_database"),
-            }],
-            checkpoints: Vec::new(),
-        };
+        let session = RecordedSession::new(
+            "poisoned".to_string(),
+            chrono::Utc::now(),
+            vec![RecordedEvent::new(
+                0,
+                chrono::Utc::now(),
+                ipc_event("wipe_database"),
+            )],
+            Vec::new(),
+        );
         let session_json = serde_json::to_string(&session).unwrap();
 
         let imp = call(
@@ -6553,12 +6554,12 @@ mod command_policy_dispatch_tests {
         let state = state_with(PrivacyConfig::default());
         state.recorder.start("live".to_string()).unwrap();
         let h = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
-        let session = RecordedSession {
-            id: "other".to_string(),
-            started_at: chrono::Utc::now(),
-            events: Vec::new(),
-            checkpoints: Vec::new(),
-        };
+        let session = RecordedSession::new(
+            "other".to_string(),
+            chrono::Utc::now(),
+            Vec::new(),
+            Vec::new(),
+        );
         let r = call(
             &h,
             "recording",
@@ -6815,18 +6816,16 @@ mod screenshot_visibility_tests {
     use victauri_core::{CommandRegistry, EventLog, EventRecorder, WindowState};
 
     fn window(label: &str, visible: bool) -> WindowState {
-        WindowState {
-            label: label.to_string(),
-            title: label.to_string(),
-            url: "http://localhost/".to_string(),
-            visible,
-            focused: false,
-            maximized: false,
-            minimized: false,
-            fullscreen: false,
-            position: (0, 0),
-            size: (800, 600),
-        }
+        WindowState::new(label.to_string())
+            .with_title(label.to_string())
+            .with_url("http://localhost/".to_string())
+            .with_visible(visible)
+            .with_focused(false)
+            .with_maximized(false)
+            .with_minimized(false)
+            .with_fullscreen(false)
+            .with_position(0, 0)
+            .with_size(800, 600)
     }
 
     /// A bridge with a configurable window set that RECORDS the label `get_native_handle`

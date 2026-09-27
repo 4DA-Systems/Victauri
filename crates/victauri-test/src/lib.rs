@@ -53,8 +53,9 @@ pub use assertions::{
     assert_ipc_not_called,
 };
 pub use client::{
-    MemoryStats, PluginInfo, VictauriClient, WaitForBuilder, assert_ipc_healthy, assert_json_eq,
-    assert_json_truthy, assert_no_a11y_violations, assert_performance_budget, assert_state_matches,
+    MemoryStats, PluginInfo, PluginToolInfo, VictauriClient, WaitForBuilder, assert_ipc_healthy,
+    assert_json_eq, assert_json_truthy, assert_no_a11y_violations, assert_performance_budget,
+    assert_state_matches,
 };
 pub use error::TestError;
 pub use locator::{Bounds, Locator, LocatorExpect, LocatorMatch};
