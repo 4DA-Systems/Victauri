@@ -1184,13 +1184,14 @@ async fn drain_window(
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    {
+    // Released however this ends — including the drain future being dropped mid-wait.
+    let _slot = {
         let mut pending = state.pending_evals.lock().await;
         if pending.len() >= MAX_PENDING_EVALS {
             return None;
         }
-        pending.insert(id.clone(), tx);
-    }
+        crate::PendingSlot::insert(&state.pending_evals, &mut pending, id.clone(), tx)
+    };
 
     // Delivered through the bridge's frozen `_evalSettle`, which serializes with the
     // `JSON.stringify` captured at bridge init — not the page's own, which page script can
@@ -1210,12 +1211,10 @@ async fn drain_window(
     );
 
     if bridge.eval_webview(Some(label), &inject).is_err() {
-        state.pending_evals.lock().await.remove(&id);
         return None;
     }
 
     let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await else {
-        state.pending_evals.lock().await.remove(&id);
         return None;
     };
 

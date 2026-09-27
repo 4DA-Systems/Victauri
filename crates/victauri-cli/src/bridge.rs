@@ -400,15 +400,37 @@ fn may_replay(msg: &Value, err: &anyhow::Error) -> bool {
         .is_some_and(reqwest::Error::is_connect)
 }
 
+/// Whole-request HTTP timeout for a forwarded message that sets no longer wait of its own.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Headroom on top of a tool call's own `timeout_ms`: before its wait starts the server may
+/// wait for the bridge, probe it (up to 2s) and make main-thread round trips (up to 10s each).
+const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(40);
+/// The server's ceiling for any per-call `timeout_ms` (`invoke_command`; `wait_for` caps lower).
+const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
+
+/// HTTP timeout for forwarding `msg`. A tool call that blocks server-side for a caller-chosen
+/// `timeout_ms` (`invoke_command` up to 300s, `wait_for` up to 120s) must outlast that wait;
+/// with the fixed 120s timeout such calls failed at the bridge while the command kept running.
+fn request_timeout_for(msg: &Value) -> Duration {
+    msg.pointer("/params/arguments/timeout_ms")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_REQUEST_TIMEOUT, |ms| {
+            DEFAULT_REQUEST_TIMEOUT
+                .max(Duration::from_millis(ms.min(MAX_TOOL_TIMEOUT_MS)) + TOOL_TIMEOUT_HEADROOM)
+        })
+}
+
 /// Error text for a tool call that was (probably) delivered but got no response.
-fn undelivered_response_message(err: &anyhow::Error, app_still_up: bool) -> String {
+fn undelivered_response_message(msg: &Value, err: &anyhow::Error, app_still_up: bool) -> String {
     let timed_out = err
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_timeout);
     let what = if timed_out {
-        "the tool call was sent to the app but no response arrived before the bridge's \
-         120s timeout"
-            .to_string()
+        format!(
+            "the tool call was sent to the app but no response arrived before the bridge's \
+             {}s timeout",
+            request_timeout_for(msg).as_secs()
+        )
     } else if app_still_up {
         "the tool call was sent to the app but the connection closed before a response \
          arrived (the app is still running — it may have restarted or reloaded while handling \
@@ -674,7 +696,7 @@ async fn forward_with_retries(
                     return ForwardResult::Payloads(vec![error_for_request(
                         msg,
                         -32000,
-                        &undelivered_response_message(&e, still_up),
+                        &undelivered_response_message(msg, &e, still_up),
                     )]);
                 }
                 if attempt + 1 < MAX_RETRIES {
@@ -706,8 +728,9 @@ async fn forward_with_retries(
 }
 
 fn build_client() -> Result<reqwest::Client> {
+    // The default; `post_message` sets each request's own (see `request_timeout_for`).
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(Into::into)
@@ -739,6 +762,7 @@ async fn post_message(
     let url = format!("http://127.0.0.1:{port}/mcp");
     let mut req = http
         .post(&url)
+        .timeout(request_timeout_for(msg))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(t) = token {
@@ -1375,14 +1399,14 @@ mod tests {
     #[test]
     fn undelivered_message_says_the_call_likely_ran_when_the_app_exited() {
         let err = anyhow::anyhow!("connection reset");
-        let gone = undelivered_response_message(&err, false);
+        let gone = undelivered_response_message(&call("tools/call"), &err, false);
         assert!(gone.contains("exited before responding"), "{gone}");
         assert!(gone.contains("NOT retried"));
         assert!(
             !gone.contains("not reachable"),
             "must not claim the app was never reached"
         );
-        let up = undelivered_response_message(&err, true);
+        let up = undelivered_response_message(&call("tools/call"), &err, true);
         assert!(up.contains("still running"), "{up}");
     }
 
@@ -1393,6 +1417,41 @@ mod tests {
         // account's processes. PID 4 (System) is live but never ours.
         #[cfg(windows)]
         assert!(!is_process_alive(4));
+    }
+
+    #[test]
+    fn a_tool_call_timeout_outlasts_the_servers_own_wait() {
+        let tool = |args: Value| {
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "invoke_command", "arguments": args}})
+        };
+        assert_eq!(
+            request_timeout_for(&call("tools/list")),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&tool(json!({}))),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": 5_000}))),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        // invoke_command at its 300s ceiling, and wait_for at its 120s one, finish at the
+        // server before the bridge gives up on them.
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": 300_000}))),
+            Duration::from_secs(340)
+        );
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": 120_000}))),
+            Duration::from_secs(160)
+        );
+        // Values past the server's ceiling are clamped the way the server clamps them.
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": u64::MAX}))),
+            Duration::from_secs(340)
+        );
     }
 
     #[test]
