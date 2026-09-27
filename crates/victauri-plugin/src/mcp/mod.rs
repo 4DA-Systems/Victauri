@@ -7755,7 +7755,13 @@ mod command_policy_dispatch_tests {
                 "the call must still be in flight when dropped"
             );
         }
-        // The recording drain reserves slots too (its page never answers here).
+        // The recording drain reserves slots too (its page never answers here). It only reads
+        // while a recording is active and its drain epoch is set, as `recording start` does.
+        let generation = state
+            .recorder
+            .start_session("slot-release".to_string())
+            .unwrap();
+        state.drain_watermarks.reset(0.0, generation);
         let bridge: Arc<dyn WebviewBridge> = Arc::new(RecordingBridge::default());
         let dropped = tokio::time::timeout(
             std::time::Duration::from_millis(300),

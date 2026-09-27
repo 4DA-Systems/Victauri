@@ -2928,3 +2928,61 @@ async fn delete_to_health_rejected() {
         resp.status()
     );
 }
+
+/// Audit N1, end to end over the real HTTP server: in the Test profile `navigate.go_to` is
+/// FullControl-only, but `{"action": {"go_to": null}}` (a shape serde accepts for the enum)
+/// and a positional REST array body were gated as the bare `navigate` — which Test allows —
+/// and the handler then navigated the webview. Neither may reach the bridge now, via REST or
+/// MCP, while the string form is still refused by the profile.
+#[tokio::test]
+async fn tag_shaped_or_positional_action_cannot_bypass_the_profile() {
+    let navigated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&navigated);
+    let state = make_state_with_privacy(victauri_plugin::privacy::test_privacy_config());
+    let base = start_callback_server(state, &["main"], move |script| {
+        if script.contains("evil.example") {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        "null".to_string()
+    })
+    .await;
+    let client = reqwest::Client::new();
+    for body in [
+        r#"{"action":{"go_to":null},"url":"https://evil.example"}"#,
+        r#"["go_to","https://evil.example",null,null,null,null]"#,
+    ] {
+        let resp = rest_call(&client, &base, "navigate", body).await;
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 400, "REST {body} must be refused: {status} {text}");
+    }
+    let (mcp, sid) = mcp_session(&base).await;
+    let body = call_tool(
+        &mcp,
+        &base,
+        &sid,
+        "navigate",
+        json!({"action": {"go_to": null}, "url": "https://evil.example"}),
+    )
+    .await;
+    assert!(
+        body.contains("must be a string"),
+        "MCP tag-shaped action must be refused: {body}"
+    );
+    let body = call_tool(
+        &mcp,
+        &base,
+        &sid,
+        "navigate",
+        json!({"action": "go_to", "url": "https://evil.example"}),
+    )
+    .await;
+    assert!(
+        body.contains("disabled"),
+        "string go_to stays FullControl-only: {body}"
+    );
+    assert!(
+        !navigated.load(std::sync::atomic::Ordering::SeqCst),
+        "the webview was navigated"
+    );
+}
