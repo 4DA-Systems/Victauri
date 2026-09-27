@@ -6248,7 +6248,7 @@ mod authz_dispatch_tests {
     /// positional array body used to be gated as the bare tool name, which the Test
     /// profile allows for `navigate` — the handler then parsed and ran `go_to`. Both
     /// shapes must now be refused as invalid params before any handler runs, in every
-    /// profile (FullControl with the action disabled is the other half of the bypass).
+    /// profile (`FullControl` with the action disabled is the other half of the bypass).
     #[tokio::test]
     async fn non_string_action_cannot_slip_past_the_gate() {
         let mut full_minus_go_to = PrivacyConfig::default();
