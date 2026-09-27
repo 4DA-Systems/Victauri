@@ -1,5 +1,6 @@
 #![deny(missing_docs)]
-#![forbid(unsafe_code)]
+// `deny`, not `forbid`: the one audited exception is the Win32 liveness query in `process`.
+#![deny(unsafe_code)]
 //! Integration testing for Tauri apps via the Victauri MCP server.
 //!
 //! Provides [`TestApp`] for managed app lifecycle and [`VictauriClient`] with
@@ -43,6 +44,8 @@ mod discovery;
 mod error;
 pub mod locator;
 pub mod prelude;
+#[doc(hidden)]
+pub mod process;
 pub mod reporting;
 pub mod smoke;
 pub mod visual;

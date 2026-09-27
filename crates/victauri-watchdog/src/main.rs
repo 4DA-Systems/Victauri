@@ -1,5 +1,7 @@
 //! Watchdog process that monitors and restarts the Victauri MCP server if it becomes unresponsive.
 
+mod process;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -301,25 +303,11 @@ fn dir_is_trusted(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// Cross-platform "is this pid a live process?" (same approach as victauri-test).
-#[cfg(windows)]
+/// Whether `pid` is a live process owned by the current user (exact PID, own user; see
+/// `process.rs`). The old Windows check substring-matched `tasklist` output, so a crashed app
+/// whose PID was a prefix of a live one looked alive and was never restarted.
 fn is_process_alive(pid: u32) -> bool {
-    // Absolute System32 path (as victauri-cli's bridge does): a writable PATH entry must not
-    // be able to shadow `tasklist`, which this loop spawns repeatedly.
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    std::process::Command::new(format!("{root}\\System32\\tasklist.exe"))
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-}
-
-#[cfg(not(windows))]
-fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    process::is_own_live_process(pid)
 }
 
 /// Resolve the app to watch from discovery, logging an ambiguous outcome. Returns `None`

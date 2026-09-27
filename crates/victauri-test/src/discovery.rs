@@ -399,26 +399,11 @@ fn port_is_reachable(port: u16) -> bool {
     .is_ok()
 }
 
-/// Cross-platform "is this pid a live process?" — mirrors the audited helper in the
-/// MCP-bridge discovery path (`victauri-cli::bridge`). Used to prune discovery entries
-/// whose owning app has exited even when a different app holds the same shared port.
-#[cfg(windows)]
+/// Whether `pid` is a live process owned by the current user (see [`crate::process`]).
+/// Used to prune discovery entries whose owning app has exited even when a different app
+/// holds the same shared port.
 fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-}
-
-#[cfg(not(windows))]
-fn is_process_alive(pid: u32) -> bool {
-    // `kill -0` sends no signal but succeeds iff the process exists and is signalable by us
-    // (discovery entries are our own user's processes). Portable across Linux and macOS.
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    crate::process::is_own_live_process(pid)
 }
 
 #[cfg(test)]

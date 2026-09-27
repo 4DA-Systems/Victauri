@@ -834,9 +834,9 @@ async fn scan_once(app: Option<&str>) -> Selection {
         });
     }
 
-    // Liveness-FIRST (batched), then health. `alive_pids` snapshots every live PID in ONE OS
-    // call (~60ms), so a machine with many stale discovery dirs (dead dev sessions) is filtered
-    // for ~free instead of one process spawn PER dir. Crucially we then health-check ONLY the
+    // Liveness-FIRST, then health. On Unix `alive_pids` snapshots our user's live PIDs in ONE
+    // `ps` call, so many stale discovery dirs cost one spawn, not one each; on Windows each PID
+    // is checked in-process (no spawn at all). Crucially we then health-check ONLY the
     // live-pid entries: a stale dir whose long-dead port was reused by some other service is
     // never probed (that mis-order made a down-state scan hang on an unresponsive reused port).
     // When the app is down there are zero live entries, so zero health probes — the poller
@@ -849,6 +849,12 @@ async fn scan_once(app: Option<&str>) -> Selection {
     // binding the freed port, could still pass liveness+health+identity and receive the token.
     // Re-resolving on every forward (audit #1) shrinks this to a per-call coincidence rather than
     // a cache-lifetime one; fully closing it needs mutual auth on `/health` (a plugin-side change).
+    let entries = discover_entries();
+    // Nothing discovered (the app is down): nothing to check, so no process enumeration —
+    // the availability poller runs this every 1.5 s.
+    if entries.is_empty() {
+        return Selection::None;
+    }
     let alive = alive_pids();
     let is_alive = |pid: u32| {
         alive
@@ -856,7 +862,7 @@ async fn scan_once(app: Option<&str>) -> Selection {
             .map_or_else(|| is_process_alive(pid), |set| set.contains(&pid))
     };
     let mut live = Vec::new();
-    for (pid, s) in discover_entries() {
+    for (pid, s) in entries {
         if is_alive(pid) && health_ok(s.port).await {
             live.push(s);
         }
@@ -1091,15 +1097,6 @@ async fn health_ok(port: u16) -> bool {
         .is_ok_and(|r| r.status().is_success())
 }
 
-/// Resolve a System32 executable from `%SystemRoot%` instead of `PATH`, so an attacker-writable
-/// `PATH` entry cannot shadow it. The availability poller spawns `tasklist` repeatedly, so this
-/// PATH-hijack surface is continuous — always invoke it by absolute path.
-#[cfg(windows)]
-fn system32_exe(name: &str) -> String {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    format!("{root}\\System32\\{name}")
-}
-
 /// No batched process enumeration on this platform: callers fall back to per-pid checks.
 #[cfg(not(any(unix, windows)))]
 fn alive_pids() -> Option<HashSet<u32>> {
@@ -1119,31 +1116,14 @@ fn abs_bin(name: &str) -> String {
     name.to_string()
 }
 
-/// Snapshot the set of currently-live PIDs in ONE OS call, so discovery cost stays O(1)
-/// process spawns regardless of how many (possibly stale) discovery directories exist.
-/// Returns `None` if enumeration fails or is empty, in which case callers fall back to the
-/// per-pid `is_process_alive` (never worse than the previous behavior).
+/// Windows: no batched enumeration — each discovered PID is checked in-process by
+/// [`is_process_alive`] (microseconds, no spawn). The `tasklist` snapshot this replaced cost
+/// ~0.5 s per poll on an idle machine and spiked past 10 s under load, which stalled the
+/// bridge's own replies; its per-PID fallback also substring-matched (PID 12 "matched" 123)
+/// and counted other users' processes.
 #[cfg(windows)]
 fn alive_pids() -> Option<HashSet<u32>> {
-    // One `tasklist` in CSV form (~60ms) lists every process; column 2 is the PID.
-    let out = std::process::Command::new(system32_exe("tasklist.exe"))
-        .args(["/FO", "CSV", "/NH"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let set: HashSet<u32> = text
-        .lines()
-        .filter_map(|line| {
-            // Rows look like: "name","pid","session","sessname","mem"
-            line.split("\",\"")
-                .nth(1)
-                .and_then(|f| f.trim_matches('"').trim().parse::<u32>().ok())
-        })
-        .collect();
-    (!set.is_empty()).then_some(set)
+    None
 }
 
 /// One `ps` lists the PIDs on both Linux and macOS (portable; `/proc` is Linux-only) — only
@@ -1169,16 +1149,11 @@ fn alive_pids() -> Option<HashSet<u32>> {
     (!set.is_empty()).then_some(set)
 }
 
+/// A live process owned by the current user — exact PID, own-user only (the cross-user PID
+/// reuse fix `ps -U` gave Unix, audit R2-7).
 #[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
-    use std::process::Command;
-    Command::new(system32_exe("tasklist.exe"))
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .is_ok_and(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.contains(&pid.to_string())
-        })
+    victauri_test::process::is_own_live_process(pid)
 }
 
 #[cfg(not(windows))]
@@ -1409,6 +1384,15 @@ mod tests {
         );
         let up = undelivered_response_message(&err, true);
         assert!(up.contains("still running"), "{up}");
+    }
+
+    #[test]
+    fn liveness_is_exact_and_own_user_only() {
+        assert!(is_process_alive(std::process::id()));
+        // The old Windows check substring-matched tasklist output, and counted every
+        // account's processes. PID 4 (System) is live but never ours.
+        #[cfg(windows)]
+        assert!(!is_process_alive(4));
     }
 
     #[test]
