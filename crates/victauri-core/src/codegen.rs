@@ -592,6 +592,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!(true)),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let code = generate_test_default(&session);
@@ -612,6 +613,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!({})),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let code = generate_test_default(&session);
@@ -632,6 +634,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!(true)),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let opts = CodegenOptions {
@@ -1033,6 +1036,7 @@ mod tests {
                     result: IpcResult::Ok(serde_json::json!({"saved": true})),
                     arg_size_bytes: 42,
                     webview_label: "main".to_string(),
+                    mocked: false,
                 }),
             },
             // 4: StateChange caused by save_draft
@@ -1225,6 +1229,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!(true)),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let opts = CodegenOptions {
