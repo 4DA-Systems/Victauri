@@ -1,5 +1,88 @@
 # Migration Guide
 
+## v0.8.8 → v0.9.0 (public data types are `#[non_exhaustive]` — a one-time break)
+
+**Bump the requirement:** `victauri-plugin = "0.9"`, `victauri-test = "0.9"` (and `victauri-core`
+if you depend on it directly). `^0.8` does not pick up 0.9.
+
+**Most apps need no code change.** Wiring the plugin (`VictauriBuilder`, `init()`,
+`CommandInfo::new`, `register_commands!`, `#[inspectable]`), calling tools, and *reading* any
+result type all work unchanged. You only need to change code that **constructs** one of these types
+with a struct literal outside the crate that defines it — typically a mock `WebviewBridge` in
+tests, or code that builds recordings/reports by hand:
+
+| Was | Now |
+|---|---|
+| `WindowState { label, title, visible, .. }` | `WindowState::new(label).with_title(..).with_visible(..)` |
+| `IpcCall { id, command, .. }` | `IpcCall::new(id, command, timestamp, result, duration_ms, arg_size_bytes, webview_label)` |
+| `RecordedSession { .. }` / `RecordedEvent { .. }` | `RecordedSession::new(..)` / `RecordedEvent::new(..)` |
+| `SemanticAssertion { .. }` | `SemanticAssertion::new(..)` |
+| `CommandInfo { .. }` / `CommandArg { .. }` | `CommandInfo::new(name).with_args(..).with_return_type(..)…`, `CommandArg::new(..)` |
+| `AppEvent::Console { level, message, timestamp }` | `AppEvent::console(level, message, timestamp)` (same for `state_change`, `dom_mutation`, `dom_interaction`, `window_event`) |
+| `PrivacyConfig { disabled_tools, ..Default::default() }` | `let mut p = PrivacyConfig::default(); p.disabled_tools = ..;` |
+| `VictauriState { .. }` (tests) | `VictauriState::for_tests()` then set fields (hidden, test-only) |
+| `CheckResult { .. }` / `VerifyReport { .. }` | `CheckResult::new(..)` / `VerifyReport::new(..)` |
+
+Exhaustive `match`es on the now-`#[non_exhaustive]` enums (`InteractionKind`, `CodegenStyle`,
+`FaultType`, `JsonShape`, `PrivacyProfile`, `ThresholdPreset`) need a `_ =>` arm, and patterns on
+`AppEvent`'s struct variants need `..`.
+
+**No longer public API:** `victauri_plugin::filmstrip`, `mcp::parse_bridge_event_from`; the
+`js_bridge`, `screencast`, `database` modules and a few helpers are `#[doc(hidden)]` (reachable for
+tests, not covered by semver).
+
+**Behavior changes to be aware of:**
+
+- `victauri bridge` does not replay a `tools/call` whose connection dropped after it was sent; it
+  returns an error saying the call most likely ran (e.g. a command that quit the app).
+- `eval_js` / `invoke_command` report a closed target window, a shutting-down app, or a page
+  reload under the call promptly instead of timing out. `invoke_command` accepts an optional
+  `timeout_ms` (max 300000) for slow commands.
+- `recording replay` skips calls that had arguments, failed, or never completed (arguments are not
+  recorded); `recording import` is refused while a recording is in progress; `trace stop` only
+  stops the recording its own `with_events` started.
+- `introspect db_health` returns partial results with `row_counts_complete` /
+  `integrity_check: "not completed…"` instead of failing on large databases.
+- `query_db` rejects table-valued `pragma_*()` functions for non-allowlisted pragmas and the
+  `PRAGMA name(value)` write form.
+- Browser-originated (`Origin`-bearing) POSTs to `/mcp` or `/api/tools` must be
+  `Content-Type: application/json` (415 otherwise). Non-browser clients are unaffected.
+- Several tools' MCP annotations changed (`recording`, `introspect`, `logs`, `window` are now
+  `destructive_hint`; `verify_state`, `wait_for`, `assert_semantic`, `inspect`, `animation` are no
+  longer `read_only_hint`). Clients that auto-approve read-only tools will now ask for these.
+- The compact `dom_snapshot` JSON-encodes page text (quotes/newlines in names appear escaped).
+- `victauri-watchdog` discovers the app's port and pins its identity; with `--app` and no match it
+  reports the app down instead of polling 7373.
+- A compound tool call whose `action` is not a string (e.g. `{"action": {"go_to": null}}`), or a
+  REST body that is not a JSON object, is refused as invalid parameters (REST 400).
+- `eval_js` reports a syntax error at once as a parse error, a reload under the call promptly, and
+  an unserializable result as "the code ran" — never a timeout or a JavaScript error.
+- `recording replay` runs each call in the window that recorded it (never falls back to `main`)
+  and never replays a call a network route fulfilled or blocked (`IpcCall::mocked`).
+- The page-visible `window.__VICTAURI__` no longer carries agent-only operations (`clearRoutes`,
+  `setDialogAutoResponse`, `clear*Log`, …), and `window.__VICTAURI_SCRUB__` / `__SWEEP__` are gone.
+  Nothing in an app should have called them; the tools that use them are unchanged.
+- The compact `dom_snapshot` line format quotes non-trivial `role` and attribute values; recorded
+  selectors are CSS-escaped (`#\:r0\:`).
+- `#[inspectable]` registers each argument's IPC `key` (camelCase by default); a command using
+  `#[tauri::command(rename_all = "snake_case")]` or `rename = "…"` should repeat the option on
+  `#[inspectable(...)]` (or put `#[inspectable]` above `#[tauri::command(...)]`).
+- `victauri-test`: `Locator::check()`/`uncheck()` click the element (and verify it changed), and a
+  stale element reference is `ElementNotFound` instead of an empty/false value.
+- The server speaks HTTP/1.1 only and refuses browser-originated requests (any `Origin`, a
+  `Sec-Fetch-Site` other than `none`) with 403, including `tauri://` origins; it no longer sends
+  `Access-Control-Allow-Origin`. HTTP clients (curl, reqwest, the CLI, `victauri-test`) are
+  unaffected.
+- On Unix the discovery directory moved to `$XDG_RUNTIME_DIR/victauri/<pid>` or
+  `<temp>/victauri-<euid>/<pid>`. The 0.9 CLI, test client and watchdog also read the old
+  `<temp>/victauri/` root, so they find apps built with 0.8.x; a 0.8.x client does not find a 0.9 app.
+- `query_db` returns at most 256 columns (a wider `SELECT *` errors), suffixes duplicate column
+  names (`a`, `a:1`), refuses `LIKE`/`GLOB` patterns over 1000 bytes, and answers "busy" when two
+  database calls are already running. "database not found" also covers a path resolving outside
+  the allowed roots.
+- The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
+  `Junit*` report types stay exhaustive (struct-update syntax keeps working); a field added to one
+  of them later will be called out as a breaking change.
 ## v0.8.7 → v0.8.8 (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
 
 No consumer code changes are required and no dependency-requirement change is needed

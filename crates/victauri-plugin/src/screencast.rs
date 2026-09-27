@@ -3,15 +3,20 @@
 //! `EventRecorder` (events) and `logs` (network/console) to form a trace bundle.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// Cap on the total base64 bytes buffered across all frames. `max_frames` alone does not bound
 /// memory: 600 frames of a 4K window is well over a gigabyte. The oldest frames are evicted
 /// first once this is exceeded.
 pub const MAX_TRACE_BYTES: usize = 256 * 1024 * 1024;
 
+/// Longest allowed capture interval. The capture task checks the trace's maximum duration once
+/// per interval, so an unbounded interval (hours) defeated the 30-minute auto-stop.
+pub const MAX_INTERVAL_MS: u64 = 60_000;
+
 /// A single captured frame: milliseconds since trace start + base64 PNG.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct TraceFrame {
     /// Milliseconds since the trace started.
     pub t_ms: u64,
@@ -23,76 +28,105 @@ pub struct TraceFrame {
 /// recover from poisoning.
 #[derive(Debug)]
 pub struct Screencast {
-    active: AtomicBool,
     interval_ms: AtomicU64,
     max_frames: AtomicUsize,
-    generation: AtomicU64,
+    /// Active flag, generation and owned recording change together under ONE lock: as separate
+    /// atomics a `stop` landing inside a `start` left the trace active under a generation no
+    /// capture task was running for, and an old task's auto-stop could take the recording a
+    /// newer trace owned.
+    trace: Mutex<TraceState>,
     frames: Mutex<Vec<TraceFrame>>,
     label: Mutex<Option<String>>,
-    /// Whether this trace started the event recorder (`with_events`), so `stop` can stop it —
-    /// otherwise the recorder (and the per-second drain loop it enables) outlives the trace.
-    owns_recording: AtomicBool,
+}
+
+#[derive(Debug, Default)]
+struct TraceState {
+    active: bool,
+    generation: u64,
+    /// Recorder generation of the recording this trace started (`with_events`), so stopping
+    /// the trace stops exactly that one — otherwise the recorder (and the per-second drain
+    /// loop it enables) outlives the trace. A session id could name a recording someone else
+    /// started later with the same id.
+    owned_recording: Option<u64>,
 }
 
 impl Default for Screencast {
     fn default() -> Self {
         Self {
-            active: AtomicBool::new(false),
             interval_ms: AtomicU64::new(500),
             max_frames: AtomicUsize::new(60),
-            generation: AtomicU64::new(0),
+            trace: Mutex::new(TraceState::default()),
             frames: Mutex::new(Vec::new()),
             label: Mutex::new(None),
-            owns_recording: AtomicBool::new(false),
         }
     }
 }
 
 impl Screencast {
-    /// Begin a new trace: clears frames, records settings, returns the
-    /// generation token the capture task must check to know it is current.
-    pub fn start(&self, interval_ms: u64, max_frames: usize, label: Option<String>) -> u64 {
-        self.interval_ms
-            .store(interval_ms.max(50), Ordering::Relaxed);
-        self.max_frames
-            .store(max_frames.clamp(1, 600), Ordering::Relaxed);
-        {
-            let mut f = self
-                .frames
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            f.clear();
-        }
-        {
-            let mut l = self
-                .label
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *l = label;
-        }
-        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
-        self.active.store(true, Ordering::SeqCst);
-        generation
+    fn trace(&self) -> std::sync::MutexGuard<'_, TraceState> {
+        self.trace
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Stop the current trace. Returns the captured frame count.
-    pub fn stop(&self) -> usize {
-        self.active.store(false, Ordering::SeqCst);
-        // Invalidate any running task.
-        self.generation.fetch_add(1, Ordering::SeqCst);
-        self.frame_count()
+    /// Begin a new trace: clears frames, records settings (the interval clamped to
+    /// 50..=[`MAX_INTERVAL_MS`]), and returns the generation token the capture task must check
+    /// to know it is current, plus the recording owned by the trace this one superseded (the
+    /// caller stops it).
+    pub fn start(
+        &self,
+        interval_ms: u64,
+        max_frames: usize,
+        label: Option<String>,
+    ) -> (u64, Option<u64>) {
+        let mut t = self.trace();
+        self.interval_ms
+            .store(interval_ms.clamp(50, MAX_INTERVAL_MS), Ordering::Relaxed);
+        self.max_frames
+            .store(max_frames.clamp(1, 600), Ordering::Relaxed);
+        self.frames
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        *self
+            .label
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = label;
+        t.generation += 1;
+        t.active = true;
+        (t.generation, t.owned_recording.take())
+    }
+
+    /// Stop the current trace. Returns the captured frame count and the recording the trace
+    /// owned (the caller stops it).
+    pub fn stop(&self) -> (usize, Option<u64>) {
+        let owned = {
+            let mut t = self.trace();
+            t.active = false;
+            // Invalidate any running task.
+            t.generation += 1;
+            t.owned_recording.take()
+        };
+        (self.frame_count(), owned)
     }
 
     /// Whether a trace is currently active.
     #[must_use]
     pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::SeqCst)
+        self.trace().active
     }
 
     /// The current generation token (a capture task is stale if it differs).
     #[must_use]
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.trace().generation
+    }
+
+    /// Whether the trace of `generation` is still the active one.
+    #[must_use]
+    pub fn is_current(&self, generation: u64) -> bool {
+        let t = self.trace();
+        t.active && t.generation == generation
     }
 
     /// Configured capture interval in milliseconds.
@@ -140,21 +174,39 @@ impl Screencast {
     /// generation before a (slow) capture; re-checking at push time stops a stale task from
     /// inserting a frame into a trace started after it.
     pub fn push_frame_if_current(&self, generation: u64, t_ms: u64, data_b64: String) -> bool {
-        if !self.is_active() || self.generation() != generation {
+        if !self.is_current(generation) {
             return false;
         }
         self.push_frame(t_ms, data_b64);
         true
     }
 
-    /// Record whether the current trace started the event recorder.
-    pub fn set_owns_recording(&self, owns: bool) {
-        self.owns_recording.store(owns, Ordering::SeqCst);
+    /// Record that the trace of `generation` started the recording of `recorder_generation`.
+    /// Returns `false` (recording nothing) if that trace was already stopped or superseded —
+    /// the caller then stops the recording itself, or nothing ever would.
+    pub fn set_owned_recording(&self, generation: u64, recorder_generation: u64) -> bool {
+        let mut t = self.trace();
+        if t.active && t.generation == generation {
+            t.owned_recording = Some(recorder_generation);
+            true
+        } else {
+            false
+        }
     }
 
-    /// Clear and return whether the finished trace owned the event recorder.
-    pub fn take_owns_recording(&self) -> bool {
-        self.owns_recording.swap(false, Ordering::SeqCst)
+    /// Stop the trace only if `generation` is still current — atomically, so an old capture
+    /// task's auto-stop can never stop a NEWER trace started in between (or take the recording
+    /// that trace owns). Returns `None` if it stopped nothing, else the stopped trace's owned
+    /// recording.
+    pub fn stop_if_generation(&self, generation: u64) -> Option<Option<u64>> {
+        let mut t = self.trace();
+        if t.active && t.generation == generation {
+            t.active = false;
+            t.generation += 1;
+            Some(t.owned_recording.take())
+        } else {
+            None
+        }
     }
 
     /// Number of frames currently buffered.
@@ -192,6 +244,24 @@ impl Screencast {
     }
 }
 
+/// Ends the trace of `generation` when its capture task finishes — normally, at the maximum
+/// duration, or by PANICKING (a drop guard runs during unwinding; a panicked task used to leave
+/// the trace active and its recording running forever). A no-op if the trace was already
+/// stopped or superseded.
+pub(crate) struct CaptureTaskGuard {
+    pub(crate) screencast: std::sync::Arc<Screencast>,
+    pub(crate) recorder: victauri_core::EventRecorder,
+    pub(crate) generation: u64,
+}
+
+impl Drop for CaptureTaskGuard {
+    fn drop(&mut self) {
+        if let Some(Some(owned)) = self.screencast.stop_if_generation(self.generation) {
+            let _ = self.recorder.stop_if_generation(owned);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,10 +283,10 @@ mod tests {
     #[test]
     fn start_clears_and_bumps_generation() {
         let sc = Screencast::default();
-        let g1 = sc.start(200, 10, Some("main".into()));
+        let (g1, _) = sc.start(200, 10, Some("main".into()));
         sc.push_frame(0, "x".into());
         assert_eq!(sc.frame_count(), 1);
-        let g2 = sc.start(200, 10, None);
+        let (g2, _) = sc.start(200, 10, None);
         assert!(g2 > g1, "generation must increase");
         assert_eq!(sc.frame_count(), 0, "start clears frames");
         assert!(sc.is_active());
@@ -225,7 +295,7 @@ mod tests {
     #[test]
     fn stop_deactivates_and_invalidates() {
         let sc = Screencast::default();
-        let g = sc.start(200, 10, None);
+        let (g, _) = sc.start(200, 10, None);
         sc.stop();
         assert!(!sc.is_active());
         assert!(sc.generation() > g, "stop invalidates the task generation");
@@ -234,8 +304,8 @@ mod tests {
     #[test]
     fn stale_generation_push_is_rejected() {
         let sc = Screencast::default();
-        let old = sc.start(100, 10, None);
-        let new = sc.start(100, 10, None);
+        let (old, _) = sc.start(100, 10, None);
+        let (new, _) = sc.start(100, 10, None);
         assert!(!sc.push_frame_if_current(old, 0, "stale".into()));
         assert!(sc.push_frame_if_current(new, 0, "fresh".into()));
         assert_eq!(sc.frames(0)[0].data_b64, "fresh");
@@ -259,11 +329,123 @@ mod tests {
     }
 
     #[test]
-    fn owns_recording_is_taken_once() {
+    fn owned_recording_is_taken_once() {
         let sc = Screencast::default();
-        sc.set_owns_recording(true);
-        assert!(sc.take_owns_recording());
-        assert!(!sc.take_owns_recording());
+        let (g, _) = sc.start(100, 10, None);
+        assert!(sc.set_owned_recording(g, 7));
+        assert_eq!(sc.stop(), (0, Some(7)));
+        assert_eq!(sc.stop(), (0, None));
+    }
+
+    // C14b: ownership is scoped to the trace generation. An old task's auto-stop (after its
+    // stop_if_generation) used to `take_owned_recording()` separately and could take the
+    // recording a newer trace had just registered.
+    #[test]
+    fn owned_recording_belongs_to_its_trace_generation() {
+        let sc = Screencast::default();
+        let (old, _) = sc.start(100, 10, None);
+        assert!(sc.set_owned_recording(old, 1));
+        // A newer trace supersedes the old one and is handed the old trace's recording.
+        let (new, superseded) = sc.start(100, 10, None);
+        assert_eq!(superseded, Some(1));
+        assert!(sc.set_owned_recording(new, 2));
+        // The old task's auto-stop stops nothing and takes nothing.
+        assert_eq!(sc.stop_if_generation(old), None);
+        // A stale trace cannot register a recording (its starter must stop it itself).
+        assert!(!sc.set_owned_recording(old, 3));
+        assert_eq!(sc.stop_if_generation(new), Some(Some(2)));
+    }
+
+    // C14c: the interval is clamped so the per-interval max-duration check keeps running.
+    #[test]
+    fn interval_is_clamped() {
+        let sc = Screencast::default();
+        let _ = sc.start(u64::MAX, 10, None);
+        assert_eq!(sc.interval_ms(), MAX_INTERVAL_MS);
+        let _ = sc.start(1, 10, None);
+        assert_eq!(sc.interval_ms(), 50);
+    }
+
+    // C14: a panicking capture task must still end its trace and the recording it started.
+    #[test]
+    fn capture_task_guard_cleans_up_after_a_panic() {
+        let sc = std::sync::Arc::new(Screencast::default());
+        let recorder = victauri_core::EventRecorder::new(10);
+        let (g, _) = sc.start(100, 10, None);
+        let rg = recorder.start_session("trace".into()).unwrap();
+        assert!(sc.set_owned_recording(g, rg));
+        let guard = CaptureTaskGuard {
+            screencast: std::sync::Arc::clone(&sc),
+            recorder: recorder.clone(),
+            generation: g,
+        };
+        let r = std::thread::spawn(move || {
+            let _guard = guard;
+            panic!("capture blew up");
+        })
+        .join();
+        assert!(r.is_err());
+        assert!(!sc.is_active(), "trace left active after its task panicked");
+        assert!(!recorder.is_recording(), "owned recording left running");
+    }
+
+    // A guard of a superseded trace touches neither the newer trace nor its recording.
+    #[test]
+    fn capture_task_guard_of_a_stale_trace_is_a_no_op() {
+        let sc = std::sync::Arc::new(Screencast::default());
+        let recorder = victauri_core::EventRecorder::new(10);
+        let (old, _) = sc.start(100, 10, None);
+        let (new, _) = sc.start(100, 10, None);
+        let rg = recorder.start_session("new".into()).unwrap();
+        assert!(sc.set_owned_recording(new, rg));
+        drop(CaptureTaskGuard {
+            screencast: std::sync::Arc::clone(&sc),
+            recorder: recorder.clone(),
+            generation: old,
+        });
+        assert!(sc.is_current(new));
+        assert!(recorder.is_recording());
+    }
+
+    #[test]
+    fn stale_generation_cannot_stop_a_newer_trace() {
+        let sc = Screencast::default();
+        let (old, _) = sc.start(100, 10, None);
+        let (new, _) = sc.start(100, 10, None);
+        assert!(
+            sc.stop_if_generation(old).is_none(),
+            "an old task must not stop the new trace"
+        );
+        assert!(sc.is_active());
+        assert!(sc.stop_if_generation(new).is_some());
+        assert!(!sc.is_active());
+    }
+
+    // C14a: a stop racing a start must never leave the trace active under a generation no
+    // start returned (active, but with no capture task running for it).
+    #[test]
+    fn concurrent_start_and_stop_never_orphan_an_active_trace() {
+        let sc = std::sync::Arc::new(Screencast::default());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (sc2, b2) = (std::sync::Arc::clone(&sc), std::sync::Arc::clone(&barrier));
+        let stopper = std::thread::spawn(move || {
+            for _ in 0..20_000 {
+                b2.wait();
+                let _ = sc2.stop();
+                b2.wait();
+            }
+        });
+        let mut orphaned = 0;
+        for _ in 0..20_000 {
+            barrier.wait();
+            let (g, _) = sc.start(100, 10, None);
+            barrier.wait();
+            if sc.is_active() && sc.generation() != g {
+                orphaned += 1;
+            }
+        }
+        stopper.join().unwrap();
+        assert_eq!(orphaned, 0, "active trace with no capture task");
     }
 
     #[test]

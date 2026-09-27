@@ -30,8 +30,11 @@ fi
 #    will flip to true once CGEvent native input lands + Accessibility is granted.
 echo "[trusted input] needs: Accessibility (CGEvent impl pending)"
 # Type into the name field with trusted:true, then read back isTrusted of the last key.
-call eval_js '{"code":"window.__lastTrusted=null; document.addEventListener(\"keydown\",function(e){window.__lastTrusted=e.isTrusted;},{once:true}); return \"armed\""}' >/dev/null
-call input '{"action":"type","selector":"[data-testid=name-input]","text":"x","trusted":true}' >/dev/null
+call eval_js '{"code":"window.__lastTrusted=null; document.addEventListener(\"keydown\",function(e){window.__lastTrusted=e.isTrusted;},{once:true}); var el=document.querySelector(\"[data-testid=name-input]\"); if (el) el.focus(); return \"armed\""}' >/dev/null
+# `input` takes a snapshot `ref_id`, not a CSS selector (and there is no `type` action).
+# The field was focused above; `press_key` with no `ref_id` sends the trusted key to the
+# focused element.
+call input '{"action":"press_key","key":"x","trusted":true}' >/dev/null
 sleep 1
 it=$(call eval_js '{"code":"return String(window.__lastTrusted)"}')
 echo "  isTrusted observed -> $it"

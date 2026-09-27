@@ -118,7 +118,7 @@ export class VictauriClient {
     if (resp.status === 401) {
       throw new Error(
         "Unauthorized (401): the auth token is missing or wrong. Auth is on by " +
-          "default — the token is in <temp>/victauri/<pid>/token, or set " +
+          "default — the token is in the app's discovery directory (<pid>/token), or set " +
           "`victauri.authToken`."
       );
     }

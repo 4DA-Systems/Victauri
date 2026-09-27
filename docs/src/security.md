@@ -27,7 +27,7 @@ Note: "zero runtime cost" is not the same as "zero bytes." With `victauri-plugin
 regular dependency the crate (and its transitive deps) still compile into the build; the
 server code is simply unreachable at runtime because `init()` is a no-op. Dead-code
 elimination strips most of it, but if you want Victauri completely absent from the release
-binary, add it as a `dev-dependency` (and gate the `.plugin(...)` call behind `#[cfg(debug_assertions)]` / a debug-only feature).
+binary, make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature. (Not a `dev-dependency`: the app binary cannot see `[dev-dependencies]`, so it would no longer compile.)
 
 ### The one way this gate can fail — and how to stop it
 
@@ -73,12 +73,18 @@ Every request except `/health` must include a valid Bearer token.
 
 ### Discovery-directory protection
 
-The per-process discovery directory (`<temp>/victauri/<pid>/`) holds the auth token, so it
-is locked to the current user:
+The per-process discovery directory holds the auth token, so it is locked to the current user.
+It lives in a **per-user** root: `$XDG_RUNTIME_DIR/victauri/<pid>/` when that directory is private
+to the user, else `<temp>/victauri-<euid>/<pid>/` on Unix, and `%TEMP%\victauri\<pid>\` on Windows
+(where `%TEMP%` is already per-user). Clients also read the legacy shared `<temp>/victauri/` root,
+owner-checked, so an app built with an older plugin is still found.
 
-- **Unix:** the directory is created `0700`, and both it and the shared root are trusted only
+- **Unix:** the directory is created `0700`, and both it and its root are trusted only
   when they are real directories (not symlinks) owned by the current uid and not
-  group/other-writable. A planted or world-writable path is refused, never trusted.
+  group/other-writable. A planted or world-writable path is refused, never trusted. A
+  per-user root means another local user can no longer block discovery by pre-creating the
+  shared root; with no `XDG_RUNTIME_DIR`, they could still pre-create `/tmp/victauri-<uid>`
+  (discovery then fails closed rather than trusting it).
 - **Windows:** before any token is trusted, Victauri verifies the directory is **owned by the
   current user** (an attacker who pre-created it on a shared `TEMP` would be its owner, so the
   directory is refused). It then replaces the directory's DACL with a **protected, owner-only
@@ -124,16 +130,20 @@ VictauriBuilder::new()
 
 The `/health` endpoint is unauthenticated so that the watchdog and load balancers can check liveness without credentials.
 
-## Rate Limiting
+## Rate Limiting and connection limits
 
 A token-bucket rate limiter prevents abuse, even from authenticated clients:
 
 - **Default rate:** 1000 requests per second
-- **Implementation:** Lock-free `AtomicU64` counter
+- **Two buckets:** requests carrying the valid token draw from their own bucket, so traffic
+  that cannot authenticate (a local flood, a web page hammering `/health`) cannot exhaust
+  the agent's budget
 - **Bucket refill:** Continuous (not windowed)
 - **Response on limit:** HTTP 429 Too Many Requests
 
-This protects against runaway agents or scripts that flood the server with requests.
+The server speaks HTTP/1.1 only, closes a connection whose request head has not arrived within
+30 s, reads each request body under a 30 s / 2 MiB deadline (after authentication — an
+unauthenticated body is never buffered), and accepts at most 256 concurrent connections.
 
 ## Privacy Layer
 
@@ -242,6 +252,12 @@ The MCP server only accepts connections from localhost (`127.0.0.1` / `::1`). Th
 - Other machines on the LAN cannot connect
 - Only processes on the same machine can reach the server
 
+Browsers on the same machine are refused outright, before any rate limiting: a request carrying
+an `Origin` header (including an unreadable one or a `tauri://` origin — the app's own webview
+talks to Victauri over Tauri IPC, never HTTP) or any `Sec-Fetch-Site` other than `none` gets 403,
+and no `Access-Control-Allow-Origin` header is ever sent. (Browsers too old to send
+`Sec-Fetch-*` headers, e.g. Safari before 16.4, are still stopped by the Host/Origin checks.)
+
 ## Security Headers
 
 All HTTP responses include security headers:
@@ -326,6 +342,32 @@ embedded third-party widgets, or user-generated content rendered in the DOM.
 - **Enable output redaction** (`.enable_redaction()`) so captured secrets are masked before they
   reach the agent.
 - Treat every tool result as potentially attacker-influenced data, not trusted instructions.
+
+### What page script can and cannot do to the bridge
+
+Script running in the app's own page (an XSS, or content the app renders) shares the page's
+JavaScript realm with the injected bridge, so no in-page mechanism can fully isolate the two.
+Victauri narrows what such script can reach:
+
+- **Eval results and ids.** Eval bookkeeping lives in closures behind null-prototype tables, ids
+  are coerced without page-replaceable globals, and results are serialized with a `JSON.stringify`
+  captured at injection that ignores a `toJSON` planted on `Object.prototype`/`Array.prototype`.
+  Hooking `Map`/`Set`/`String`/`setTimeout`/`toJSON` no longer reveals pending ids or rewrites
+  results. **Residual:** Tauri's own IPC transport reads `window.__TAURI_INTERNALS__` and `fetch`
+  when each call is made, so same-window script can still observe or alter its own window's
+  results by wrapping them. Other windows' results, and Rust-side tools (`query_db`, `app_state`,
+  the registry, memory stats), are unaffected.
+- **Agent-only controls** — clearing logs and network routes, dialog auto-answers — are not on
+  the page-visible `window.__VICTAURI__`; they need a per-process key that only the plugin's own
+  injected scripts carry.
+- **Logs are copies.** Every log read hands out a deep copy, so page script cannot rewrite what was
+  captured through a returned reference.
+- **Replay never runs what did not run.** An IPC call fulfilled or blocked by a network route
+  (which page script can also add) is recorded as `mocked` and never replayed, and `recording
+  replay` runs each call in the window that recorded it (a window's Tauri capabilities are its
+  own) — or not at all if that window is gone.
+- **Reload detection** keys on a per-page nonce, so page script cannot forge "the page reloaded"
+  to abort the agent's evals.
 
 ## Disclosure & Capture Notes
 

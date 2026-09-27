@@ -14,10 +14,10 @@ Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.8"
+victauri-plugin = "0.9"
 ```
 
-The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary (inert in release). For a zero compiled-footprint release, make it an optional dependency behind a Cargo feature (`victauri-plugin = { version = "0.8", optional = true }` + `[features] victauri = ["dep:victauri-plugin"]`) and gate the `.plugin(...)` call with `#[cfg(feature = "victauri")]`. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
+The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary (inert in release). For a zero compiled-footprint release, make it an optional dependency behind a Cargo feature (`victauri-plugin = { version = "0.9", optional = true }` + `[features] victauri = ["dep:victauri-plugin"]`) and gate the `.plugin(...)` call with `#[cfg(feature = "victauri")]`. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
 
 ## Step 2: Initialize the Plugin
 
@@ -114,7 +114,7 @@ curl http://127.0.0.1:7373/health
 
 TOKEN=$(cat "${TMPDIR:-/tmp}"/victauri/*/token | head -n1)   # single running app
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.8.8",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.9.0",...}
 ```
 
 Or use the Victauri CLI:
@@ -135,8 +135,8 @@ crate victauri_core`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.8"
-victauri-core = "0.8"
+victauri-plugin = "0.9"
+victauri-core = "0.9"
 ```
 
 ```rust

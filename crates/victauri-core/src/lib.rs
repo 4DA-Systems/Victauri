@@ -11,10 +11,13 @@ pub extern crate inventory;
 pub mod codegen;
 pub mod error;
 pub mod event;
+// Shared plumbing for the plugin/CLI crates — not part of the supported API.
 #[cfg(feature = "middleware")]
+#[doc(hidden)]
 pub mod middleware;
 pub mod recording;
 pub mod registry;
+#[doc(hidden)]
 pub mod security;
 pub mod snapshot;
 pub mod types;
@@ -40,6 +43,7 @@ pub use verification::{
 ///
 /// Victauri's mutex-protected data is append-only logs and registries where
 /// stale data is preferable to crashing the testing framework.
+#[doc(hidden)]
 pub fn acquire_lock<'a, T>(
     mutex: &'a std::sync::Mutex<T>,
     context: &str,
@@ -51,6 +55,7 @@ pub fn acquire_lock<'a, T>(
 }
 
 /// Acquire a read lock on an `RwLock`, recovering from poisoning.
+#[doc(hidden)]
 pub fn acquire_read<'a, T>(
     lock: &'a std::sync::RwLock<T>,
     context: &str,
@@ -62,6 +67,7 @@ pub fn acquire_read<'a, T>(
 }
 
 /// Acquire a write lock on an `RwLock`, recovering from poisoning.
+#[doc(hidden)]
 pub fn acquire_write<'a, T>(
     lock: &'a std::sync::RwLock<T>,
     context: &str,
@@ -71,3 +77,10 @@ pub fn acquire_write<'a, T>(
         poisoned.into_inner()
     })
 }
+
+/// Compiles the README's examples as doctests, so the crates.io landing page
+/// cannot drift from the API again (its `CommandInfo` struct literal outlived the
+/// 0.9 `#[non_exhaustive]` change).
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

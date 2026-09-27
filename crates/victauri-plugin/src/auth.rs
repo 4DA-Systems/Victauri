@@ -225,14 +225,74 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Audit I3: `tauri://` was accepted by prefix, for any host. No caller needs it (the
+    /// app's webview reaches Victauri over IPC), so it is refused.
     #[tokio::test]
-    async fn origin_allows_tauri_scheme() {
+    async fn origin_blocks_tauri_scheme() {
+        for origin in ["tauri://localhost", "tauri://evil.com"] {
+            let app = origin_router();
+            let resp = app.oneshot(origin_request(Some(origin))).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{origin}");
+        }
+    }
+
+    /// Audit I1: an Origin that is not visible ASCII used to be treated as ABSENT (allowed).
+    #[tokio::test]
+    async fn origin_blocks_unreadable_origin() {
         let app = origin_router();
-        let resp = app
-            .oneshot(origin_request(Some("tauri://localhost")))
-            .await
+        let req = axum::extract::Request::builder()
+            .uri("/test")
+            .header(
+                "origin",
+                axum::http::HeaderValue::from_bytes(b"http://\xe9vil.com").unwrap(),
+            )
+            .body(Body::empty())
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            app.oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    /// Audit N3: a page can make a browser send `GET /health` with no Origin header
+    /// (`<img src=…>`); `Sec-Fetch-Site` marks it. It is refused BEFORE the rate limiter, so it
+    /// spends no token.
+    #[tokio::test]
+    async fn browser_initiated_requests_are_refused_without_spending_a_token() {
+        let limiter = Arc::new(RateLimiterState::new(5));
+        let app = Router::new()
+            .route("/test", get(ok_handler))
+            .layer(middleware::from_fn_with_state(limiter.clone(), rate_limit))
+            .layer(middleware::from_fn(origin_guard));
+        for site in ["cross-site", "same-site", "same-origin"] {
+            let req = axum::extract::Request::builder()
+                .uri("/test")
+                .header("sec-fetch-site", site)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{site}");
+        }
+        assert_eq!(
+            limiter.current_tokens(),
+            5,
+            "a refused request spent a token"
+        );
+        // A user navigation (`none`) and a non-browser client (no header) pass.
+        let req = axum::extract::Request::builder()
+            .uri("/test")
+            .header("sec-fetch-site", "none")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let req = axum::extract::Request::builder()
+            .uri("/test")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -483,8 +543,8 @@ mod tests {
         assert!(is_allowed_origin("https://127.0.0.1"));
         assert!(is_allowed_origin("http://[::1]"));
         assert!(is_allowed_origin("http://[::1]:7373"));
-        assert!(is_allowed_origin("tauri://localhost"));
-        assert!(is_allowed_origin("tauri://some-app"));
+        assert!(!is_allowed_origin("tauri://localhost"));
+        assert!(!is_allowed_origin("tauri://some-app"));
     }
 
     #[test]
@@ -545,6 +605,8 @@ mod tests {
 
     // ── Security headers: CORS + CSP tests ───────────────────────────────
 
+    /// Audit I2: `Access-Control-Allow-Origin: null` GRANTS the opaque `null` origin
+    /// (sandboxed iframes, `data:` documents); denying CORS means sending no ACAO at all.
     #[tokio::test]
     async fn security_headers_cors_deny() {
         let app = security_headers_router();
@@ -553,10 +615,7 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(
-            resp.headers().get("access-control-allow-origin").unwrap(),
-            "null"
-        );
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
     }
 
     #[tokio::test]

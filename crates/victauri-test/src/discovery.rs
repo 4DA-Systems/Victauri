@@ -7,8 +7,41 @@
 
 use std::path::PathBuf;
 
-fn victauri_base_dir() -> PathBuf {
-    std::env::temp_dir().join("victauri")
+/// The discovery roots the plugin may have written to, most specific first (mirrors the
+/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
+/// that directory is private to us, else `<temp>/victauri-<euid>` (a shared `/tmp/victauri`
+/// could be pre-created by another user, blocking discovery) — and the legacy
+/// `<temp>/victauri` is still read, subject to the same ownership check, for pre-0.9 plugins.
+/// Other platforms use `<temp>/victauri` (a per-user temp dir).
+fn discovery_roots() -> Vec<PathBuf> {
+    let legacy = std::env::temp_dir().join("victauri");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut roots = Vec::new();
+        if let Some(euid) = current_euid() {
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .filter(|dir| {
+                    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                        m.file_type().is_dir()
+                            && m.uid() == euid
+                            && m.permissions().mode() & 0o077 == 0
+                    })
+                })
+            {
+                roots.push(runtime.join("victauri"));
+            }
+            roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+        }
+        roots.push(legacy);
+        roots
+    }
+    #[cfg(not(unix))]
+    {
+        vec![legacy]
+    }
 }
 
 /// Whether a discovery directory is safe to trust (audit #15). On Unix the temp
@@ -129,6 +162,51 @@ pub fn resolve_connection() -> (u16, Option<String>) {
     scan_discovery_dirs_for_connection().unwrap_or((7373, None))
 }
 
+/// Re-resolve the endpoint of a previously discovered client, pinned to its app.
+///
+/// Explicit configuration (`VICTAURI_PORT` / `VICTAURI_AUTH_TOKEN`) is honored exactly
+/// as [`resolve_connection`] does — the caller named the endpoint. Otherwise only a live
+/// discovery entry whose app `identifier` equals `expected_identifier` is accepted; when
+/// the identity is unknown (`None`, e.g. a plugin too old to report one) the single live
+/// server is accepted as before. Returns `None` — never the default port — when nothing
+/// (or more than one server) matches, so a restarted client cannot silently bind to a
+/// different app that happens to hold the shared default port.
+pub fn resolve_rediscovery(expected_identifier: Option<&str>) -> Option<(u16, Option<String>)> {
+    if configured_port().is_some() || configured_token().is_some() {
+        return Some(resolve_connection());
+    }
+    select_for_identity(&find_live_servers(), expected_identifier)
+}
+
+/// The app identifier advertised in discovery metadata by the single live server on
+/// `port`, if exactly one such server exists and it recorded an identifier.
+pub fn identifier_for_port(port: u16) -> Option<String> {
+    let servers = find_live_servers();
+    let mut matching = servers.iter().filter(|server| server.port == port);
+    let server = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    server.identifier.clone()
+}
+
+fn select_for_identity(
+    servers: &[DiscoveredServer],
+    expected_identifier: Option<&str>,
+) -> Option<(u16, Option<String>)> {
+    let Some(expected) = expected_identifier else {
+        return unique_connection(servers);
+    };
+    let mut matching = servers
+        .iter()
+        .filter(|server| server.identifier.as_deref() == Some(expected));
+    let server = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    Some((server.port, server.token.clone()))
+}
+
 /// Non-destructive classification of the discovery directory, used to turn a
 /// bare "connection refused" into an actionable diagnosis.
 #[derive(Debug, Clone)]
@@ -182,17 +260,14 @@ impl DiscoveryStatus {
 /// when you want to explain *why* a connection failed.
 #[must_use]
 pub fn diagnose_discovery() -> DiscoveryStatus {
-    let base = victauri_base_dir();
-    if !dir_is_trusted(&base) {
-        return DiscoveryStatus::None;
-    }
-    let Ok(entries) = std::fs::read_dir(&base) else {
-        return DiscoveryStatus::None;
-    };
-
     let mut stale = Vec::new();
     let mut any_dir = false;
-    for entry in entries.flatten() {
+    let entries = discovery_roots()
+        .into_iter()
+        .filter(|base| dir_is_trusted(base))
+        .filter_map(|base| std::fs::read_dir(base).ok())
+        .flat_map(Iterator::flatten);
+    for entry in entries {
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -242,6 +317,8 @@ struct DiscoveredServer {
     pid: u32,
     port: u16,
     token: Option<String>,
+    /// Tauri app identifier from `metadata.json`, when the plugin recorded one.
+    identifier: Option<String>,
 }
 
 fn unique_connection(servers: &[DiscoveredServer]) -> Option<(u16, Option<String>)> {
@@ -261,7 +338,16 @@ fn unique_token_for_port(servers: &[DiscoveredServer], port: u16) -> Option<Stri
 }
 
 fn find_live_servers() -> Vec<DiscoveredServer> {
-    find_live_servers_in(&victauri_base_dir(), is_process_alive, port_is_reachable)
+    let mut servers: Vec<DiscoveredServer> = Vec::new();
+    for root in discovery_roots() {
+        for server in find_live_servers_in(&root, is_process_alive, port_is_reachable) {
+            // A pid already found under a more specific root counts once.
+            if !servers.iter().any(|seen| seen.pid == server.pid) {
+                servers.push(server);
+            }
+        }
+    }
+    servers
 }
 
 /// Testable core of [`find_live_servers`]: scan `base`, keep only entries whose OWNING
@@ -326,7 +412,20 @@ fn find_live_servers_in(
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-        servers.push(DiscoveredServer { pid, port, token });
+        let identifier = std::fs::read_to_string(path.join("metadata.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|meta| {
+                meta.get("identifier")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        servers.push(DiscoveredServer {
+            pid,
+            port,
+            token,
+            identifier,
+        });
     }
     servers
 }
@@ -339,31 +438,27 @@ fn port_is_reachable(port: u16) -> bool {
     .is_ok()
 }
 
-/// Cross-platform "is this pid a live process?" — mirrors the audited helper in the
-/// MCP-bridge discovery path (`victauri-cli::bridge`). Used to prune discovery entries
-/// whose owning app has exited even when a different app holds the same shared port.
-#[cfg(windows)]
+/// Whether `pid` is a live process owned by the current user (see [`crate::process`]).
+/// Used to prune discovery entries whose owning app has exited even when a different app
+/// holds the same shared port.
 fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
-}
-
-#[cfg(not(windows))]
-fn is_process_alive(pid: u32) -> bool {
-    // `kill -0` sends no signal but succeeds iff the process exists and is signalable by us
-    // (discovery entries are our own user's processes). Portable across Linux and macOS.
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+    crate::process::is_own_live_process(pid)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit N6: the per-user root is scanned first; the legacy shared root is last.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_roots_are_per_user_first() {
+        let roots = discovery_roots();
+        let euid = current_euid().unwrap();
+        assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
+        assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
+        assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -413,6 +508,7 @@ mod tests {
             pid: 10,
             port: 7374,
             token: Some("token-b".to_string()),
+            identifier: None,
         }];
         assert_eq!(
             unique_connection(&servers),
@@ -427,11 +523,13 @@ mod tests {
                 pid: 10,
                 port: 7373,
                 token: Some("token-a".to_string()),
+                identifier: None,
             },
             DiscoveredServer {
                 pid: 11,
                 port: 7374,
                 token: Some("token-b".to_string()),
+                identifier: None,
             },
         ];
         assert_eq!(
@@ -445,11 +543,13 @@ mod tests {
                 pid: 12,
                 port: 7373,
                 token: Some("old-token".to_string()),
+                identifier: None,
             },
             DiscoveredServer {
                 pid: 13,
                 port: 7373,
                 token: Some("new-token".to_string()),
+                identifier: None,
             },
         ];
         assert_eq!(unique_token_for_port(&duplicate, 7373), None);
@@ -492,6 +592,78 @@ mod tests {
         assert_eq!(
             unique_token_for_port(&servers, 7373).as_deref(),
             Some("LIVE-TOKEN")
+        );
+    }
+
+    fn server(pid: u32, port: u16, token: &str, identifier: Option<&str>) -> DiscoveredServer {
+        DiscoveredServer {
+            pid,
+            port,
+            token: Some(token.to_string()),
+            identifier: identifier.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn rediscovery_pins_the_app_identity() {
+        // The restarted app came back on 7374; a DIFFERENT app now holds 7373.
+        let servers = vec![
+            server(20, 7373, "other-token", Some("com.other.app")),
+            server(21, 7374, "mine-token", Some("com.mine.app")),
+        ];
+        assert_eq!(
+            select_for_identity(&servers, Some("com.mine.app")),
+            Some((7374, Some("mine-token".to_string())))
+        );
+    }
+
+    #[test]
+    fn rediscovery_never_falls_back_when_the_app_is_absent() {
+        // Only a different app is live (on the default port): no match => None, never
+        // that app and never a default-port guess.
+        let servers = vec![server(20, 7373, "other-token", Some("com.other.app"))];
+        assert_eq!(select_for_identity(&servers, Some("com.mine.app")), None);
+        assert_eq!(select_for_identity(&[], Some("com.mine.app")), None);
+    }
+
+    #[test]
+    fn rediscovery_rejects_an_ambiguous_identity_match() {
+        let servers = vec![
+            server(20, 7373, "a", Some("com.mine.app")),
+            server(21, 7374, "b", Some("com.mine.app")),
+        ];
+        assert_eq!(select_for_identity(&servers, Some("com.mine.app")), None);
+    }
+
+    #[test]
+    fn rediscovery_without_known_identity_keeps_the_unique_server_rule() {
+        let one = vec![server(20, 7375, "t", None)];
+        assert_eq!(
+            select_for_identity(&one, None),
+            Some((7375, Some("t".to_string())))
+        );
+        let two = vec![server(20, 7375, "t", None), server(21, 7376, "u", None)];
+        assert_eq!(select_for_identity(&two, None), None);
+    }
+
+    #[test]
+    fn scan_reads_the_identifier_from_metadata() {
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("77");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("port"), "7380").unwrap();
+        std::fs::write(dir.join("token"), "tok").unwrap();
+        std::fs::write(
+            dir.join("metadata.json"),
+            r#"{"pid":77,"port":7380,"identifier":"com.meta.app","product_name":"Meta"}"#,
+        )
+        .unwrap();
+        let servers = find_live_servers_in(base.path(), |_| true, |_| true);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].identifier.as_deref(), Some("com.meta.app"));
+        assert_eq!(
+            select_for_identity(&servers, Some("com.meta.app")),
+            Some((7380, Some("tok".to_string())))
         );
     }
 

@@ -26,6 +26,10 @@ tokio = { workspace = true }
 png = "0.17"
 base64 = "0.22"
 
+[target.'cfg(windows)'.dependencies]
+# Process liveness + owner check for discovery (`process.rs`), instead of spawning tasklist.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
 [dev-dependencies]
 axum = { workspace = true }
 uuid = { workspace = true }

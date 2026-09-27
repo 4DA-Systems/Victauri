@@ -41,13 +41,24 @@
 //!     .unwrap();
 //! ```
 
+/// Backend (Rust-side) log capture: the `tracing` layer, the `log` adapter,
+/// the panic hook, and the buffer the `logs backend*` / `wait_for log` tools read.
+pub mod backend_logs;
 /// Runtime-erased webview bridge trait and its Tauri implementation.
 pub mod bridge;
 /// Backend database access (`SQLite` read-only queries).
+///
+/// Internal: reached through the `query_db` / `introspect db_health` tools. Not
+/// part of the supported API.
 #[cfg(feature = "sqlite")]
+#[doc(hidden)]
 pub mod database;
 pub mod error;
 /// JS bridge script generation for webview injection.
+///
+/// Internal: public only so the crate's own integration tests can exercise the
+/// generated script. Not part of the supported API.
+#[doc(hidden)]
 pub mod js_bridge;
 /// MCP server, tool handler, and parameter types.
 pub mod mcp;
@@ -56,9 +67,16 @@ mod memory;
 pub mod privacy;
 
 /// Compose captured frames into a single contact-sheet PNG ("filmstrip").
-pub mod filmstrip;
+pub(crate) mod filmstrip;
 /// Output redaction for API keys, tokens, emails, and sensitive JSON keys.
+///
+/// Public because [`privacy::PrivacyConfig::redactor`] exposes a [`redaction::Redactor`].
 pub mod redaction;
+/// Screencast ring buffer backing the `trace` tool.
+///
+/// Internal: public only because [`VictauriState::screencast`] is. Not part of
+/// the supported API.
+#[doc(hidden)]
 pub mod screencast;
 pub(crate) mod screenshot;
 mod tools;
@@ -76,6 +94,7 @@ use tauri::{Listener, Manager, RunEvent, Runtime};
 use tokio::sync::{Mutex, oneshot, watch};
 use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 
+pub use backend_logs::{log_layer, log_logger, wrap_logger};
 pub use error::BuilderError;
 pub use privacy::PrivacyProfile;
 
@@ -126,9 +145,74 @@ const MAX_EVAL_TIMEOUT_SECS: u64 = 300;
 
 /// Map of pending JavaScript eval callbacks, keyed by request ID.
 /// Each entry holds a oneshot sender that resolves when the webview returns a result.
+///
+/// Internal plumbing (the type of [`VictauriState::pending_evals`]); not part of
+/// the supported API.
+#[doc(hidden)]
 pub type PendingCallbacks = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>;
 
+/// A reserved [`PendingCallbacks`] entry, removed when the guard is dropped.
+///
+/// Every exit path of an eval must release its slot, including the one no code runs on: a REST
+/// tool call executes inside the axum future, so a client that disconnects or times out DROPS
+/// the call mid-wait. Removing the entry only on the timeout/error paths leaked it then, and 100
+/// leaked entries failed every later eval with "too many concurrent" until the app restarted.
+pub(crate) struct PendingSlot {
+    map: PendingCallbacks,
+    id: String,
+}
+
+impl PendingSlot {
+    /// Insert `tx` under `id` into an already-locked map (the caller checked the ceilings under
+    /// the same lock).
+    pub(crate) fn insert(
+        map: &PendingCallbacks,
+        locked: &mut HashMap<String, oneshot::Sender<String>>,
+        id: String,
+        tx: oneshot::Sender<String>,
+    ) -> Self {
+        locked.insert(id.clone(), tx);
+        Self {
+            map: Arc::clone(map),
+            id,
+        }
+    }
+
+    /// The reserved eval id.
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for PendingSlot {
+    fn drop(&mut self) {
+        // The map's lock is async and only held for map operations, so it is almost always
+        // free; when it is not, finish the removal on the runtime (or block, outside one).
+        if let Ok(mut map) = self.map.try_lock() {
+            map.remove(&self.id);
+            return;
+        }
+        let map = Arc::clone(&self.map);
+        let id = std::mem::take(&mut self.id);
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) => {
+                rt.spawn(async move {
+                    map.lock().await.remove(&id);
+                });
+            }
+            Err(_) => {
+                map.blocking_lock().remove(&id);
+            }
+        }
+    }
+}
+
 /// Runtime state shared between the MCP server and all tool handlers.
+///
+/// Built by the plugin at setup; apps reach it via
+/// `app.try_state::<Arc<VictauriState>>()` (see [`register_commands!`]).
+/// `#[non_exhaustive]`: new state can be added without a breaking release.
+#[non_exhaustive]
 pub struct VictauriState {
     /// Ring-buffer event log for IPC calls, state changes, and DOM mutations.
     pub event_log: EventLog,
@@ -182,6 +266,61 @@ pub struct VictauriState {
     /// Application-defined state probes surfaced via the `app_state` tool.
     /// Registered through [`VictauriBuilder::probe`].
     pub probes: introspection::AppStateProbes,
+    /// Shared per-window watermarks for draining JS events into a recording.
+    #[doc(hidden)]
+    pub drain_watermarks: introspection::DrainWatermarks,
+    /// Per-window page-load generations (bumped by each bridge ready signal).
+    #[doc(hidden)]
+    pub page_loads: introspection::PageLoads,
+    /// Captured backend (Rust-side) log entries — fed by [`log_layer`],
+    /// [`log_logger`]/[`wrap_logger`] and the panic hook; read by `logs backend*`.
+    pub backend_logs: Arc<backend_logs::LogBuffer>,
+}
+
+impl VictauriState {
+    /// A standalone state with test-friendly defaults, for driving the MCP
+    /// router (`mcp::build_app*`) without a Tauri runtime.
+    ///
+    /// Defaults: 1000-event log and recorder, port 0, default (full-control)
+    /// privacy, 30 s eval timeout, bridge already marked ready, no db search
+    /// paths or probes. All fields are `pub`, so adjust any of them on the
+    /// returned value before wrapping it in an `Arc`.
+    ///
+    /// Not part of the supported API — it exists so out-of-crate tests can build
+    /// the (`#[non_exhaustive]`) state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn for_tests() -> Self {
+        Self {
+            event_log: EventLog::new(1000),
+            registry: CommandRegistry::new(),
+            port: AtomicU16::new(0),
+            pending_evals: Arc::new(Mutex::new(HashMap::new())),
+            recorder: EventRecorder::new(1000),
+            privacy: privacy::PrivacyConfig::default(),
+            eval_timeout: std::time::Duration::from_secs(30),
+            shutdown_tx: watch::channel(false).0,
+            started_at: std::time::Instant::now(),
+            tool_invocations: AtomicU64::new(0),
+            allow_file_navigation: false,
+            command_timings: introspection::CommandTimings::new(),
+            fault_registry: introspection::FaultRegistry::new(),
+            contract_store: introspection::ContractStore::new(),
+            startup_timeline: introspection::StartupTimeline::new(),
+            event_bus: introspection::EventBusMonitor::default(),
+            task_tracker: introspection::TaskTracker::new(),
+            bridge_ready: AtomicBool::new(true),
+            bridge_notify: tokio::sync::Notify::new(),
+            screencast: Arc::new(screencast::Screencast::default()),
+            db_search_paths: Vec::new(),
+            probes: introspection::AppStateProbes::default(),
+            drain_watermarks: introspection::DrainWatermarks::default(),
+            page_loads: introspection::PageLoads::default(),
+            // A private buffer, not the process-global one, so parallel tests
+            // never see each other's entries.
+            backend_logs: Arc::new(backend_logs::LogBuffer::default()),
+        }
+    }
 }
 
 /// Builder for configuring the Victauri plugin before adding it to a Tauri app.
@@ -218,6 +357,7 @@ pub struct VictauriBuilder {
     listen_events: Vec<String>,
     db_search_paths: Vec<std::path::PathBuf>,
     probes: Vec<(String, std::sync::Arc<introspection::ProbeFn>)>,
+    capture_panics: bool,
 }
 
 impl Default for VictauriBuilder {
@@ -245,6 +385,7 @@ impl Default for VictauriBuilder {
             listen_events: Vec::new(),
             db_search_paths: Vec::new(),
             probes: Vec::new(),
+            capture_panics: true,
         }
     }
 }
@@ -587,6 +728,18 @@ impl VictauriBuilder {
         self
     }
 
+    /// Capture Rust panics into the backend log (`logs backend_digest` lists them).
+    ///
+    /// On by default in debug builds: the plugin installs a panic hook that
+    /// records the message, location, thread and backtrace, then calls the hook
+    /// that was installed before it — so the app's own hook and the default
+    /// stderr message still run. Pass `false` to leave the panic hook alone.
+    #[must_use]
+    pub const fn capture_panics(mut self, enabled: bool) -> Self {
+        self.capture_panics = enabled;
+        self
+    }
+
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
     #[must_use]
@@ -717,6 +870,12 @@ impl VictauriBuilder {
 
             self.validate()?;
 
+            // Zero-config backend visibility: panics (including ones on background
+            // threads that would otherwise only reach stderr) land in the backend log.
+            if self.capture_panics {
+                backend_logs::install_panic_hook();
+            }
+
             let port = self.resolve_port();
             let event_capacity = self.event_capacity;
             let recorder_capacity = self.recorder_capacity;
@@ -733,6 +892,9 @@ impl VictauriBuilder {
 
             Ok(Builder::new("victauri")
                 .setup(move |app, _api| {
+                    // Tauri runs plugin setup on the main (UI) thread — record it so the bridge
+                    // can run main-thread callers inline instead of deadlocking on its lock.
+                    bridge::record_main_thread();
                     let startup_timeline = introspection::StartupTimeline::new();
                     let event_log = EventLog::new(event_capacity);
                     startup_timeline.mark("event_log_created");
@@ -769,6 +931,9 @@ impl VictauriBuilder {
                         screencast: Arc::new(screencast::Screencast::default()),
                         db_search_paths,
                         probes: introspection::AppStateProbes::default(),
+                        drain_watermarks: introspection::DrainWatermarks::default(),
+                        page_loads: introspection::PageLoads::default(),
+                        backend_logs: backend_logs::global(),
                     });
                     state.startup_timeline.mark("state_created");
 
@@ -806,13 +971,12 @@ impl VictauriBuilder {
                         .startup_timeline
                         .mark("event_bus_listeners_registered");
 
-                    if let Some(ref token) = auth_token {
-                        let prefix_len = token.len().min(8);
-                        let suffix_start = token.len().saturating_sub(4);
+                    if auth_token.is_some() {
+                        // Nothing about the token itself: even a prefix and length narrow a
+                        // guess, and logs travel further than the owner-only discovery file.
                         tracing::info!(
-                            "Victauri MCP server auth enabled — token: {}…{}",
-                            &token[..prefix_len],
-                            &token[suffix_start..]
+                            "Victauri MCP server auth enabled — clients read the token from \
+                             the discovery directory"
                         );
                     } else {
                         tracing::warn!(
@@ -826,13 +990,15 @@ impl VictauriBuilder {
                     let app_handle = app.clone();
                     let ready_state = state.clone();
                     let server_finished = state.task_tracker.track("mcp_server");
-                    tauri::async_runtime::spawn(async move {
-                        match mcp::start_server_with_options(
+                    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+                    spawn_server_isolated(async move {
+                        match mcp::start_server_reporting_port(
                             app_handle,
                             state,
                             port,
                             auth_token,
                             shutdown_rx,
+                            Some(bound_tx),
                         )
                         .await
                         {
@@ -846,36 +1012,31 @@ impl VictauriBuilder {
                         server_finished.store(true, std::sync::atomic::Ordering::Relaxed);
                     });
 
-                    if let Some(cb) = on_ready {
-                        let ready_finished = ready_state.task_tracker.track("on_ready_probe");
-                        tauri::async_runtime::spawn(async move {
-                            for _ in 0..50 {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                let actual_port =
-                                    ready_state.port.load(std::sync::atomic::Ordering::Relaxed);
-                                if tokio::net::TcpStream::connect(format!(
-                                    "127.0.0.1:{actual_port}"
-                                ))
-                                .await
-                                .is_ok()
-                                {
+                    // The banner and `on_ready` report the port the server actually BOUND. They
+                    // used the preferred port, and probing it by connecting could reach another
+                    // process squatting on it — or report it after the 5s probe gave up even
+                    // though nothing of ours was listening.
+                    let ready_finished = ready_state.task_tracker.track("on_ready_probe");
+                    tauri::async_runtime::spawn(async move {
+                        match tokio::time::timeout(std::time::Duration::from_secs(5), bound_rx)
+                            .await
+                        {
+                            Ok(Ok(Ok(actual_port))) => {
+                                emit_security_banner(actual_port);
+                                if let Some(cb) = on_ready {
                                     cb(actual_port);
-                                    ready_finished
-                                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                                    return;
                                 }
                             }
-                            let actual_port =
-                                ready_state.port.load(std::sync::atomic::Ordering::Relaxed);
-                            tracing::warn!(
-                                "Victauri on_ready: server did not become ready within 5s"
-                            );
-                            cb(actual_port);
-                            ready_finished.store(true, std::sync::atomic::Ordering::Relaxed);
-                        });
-                    }
-
-                    emit_security_banner(port);
+                            Ok(Ok(Err(e))) => tracing::warn!(
+                                "Victauri: server did not start ({e}); on_ready not called"
+                            ),
+                            Ok(Err(_)) | Err(_) => tracing::warn!(
+                                "Victauri: server did not report a bound port within 5s; \
+                                 on_ready not called"
+                            ),
+                        }
+                        ready_finished.store(true, std::sync::atomic::Ordering::Relaxed);
+                    });
                     Ok(())
                 })
                 .on_event(|app, event| {
@@ -884,7 +1045,10 @@ impl VictauriBuilder {
                     };
                     match event {
                         RunEvent::Exit => {
-                            let _ = state.shutdown_tx.send(true);
+                            // `send_replace`: the value must flip even with no receiver left
+                            // (`send` then leaves it unchanged), since an eval started after
+                            // this reads it directly.
+                            state.shutdown_tx.send_replace(true);
                             tracing::info!("Victauri shutdown signal sent");
                         }
                         RunEvent::ExitRequested { .. } => {
@@ -926,6 +1090,44 @@ impl VictauriBuilder {
                     tools::victauri_check_ipc_integrity,
                 ])
                 .build())
+        }
+    }
+}
+
+/// Run the MCP server on its **own** Tokio runtime (dedicated OS threads) instead of
+/// Tauri's shared async runtime.
+///
+/// An app that blocks its async workers — a synchronous call inside an `async` command,
+/// a CPU-bound loop on a Tokio task — used to take Victauri down with it: measured on the
+/// demo app, `/health` took ~9 s while the runtime was pinned. That is exactly the
+/// moment an agent needs to look inside (backend logs, probes, memory, the DB). With its
+/// own runtime the server keeps answering; only tools that genuinely need the app's main
+/// thread or webview wait on them. Multi-threaded, because the bridge relies on
+/// `block_in_place`. Falls back to Tauri's runtime if a dedicated one cannot be built.
+#[cfg(debug_assertions)]
+fn spawn_server_isolated<F>(server: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("victauri-mcp")
+        .enable_all()
+        .build();
+    match runtime {
+        Ok(rt) => {
+            let spawned = std::thread::Builder::new()
+                .name("victauri-mcp-runtime".into())
+                .spawn(move || rt.block_on(server));
+            if let Err(e) = spawned {
+                tracing::error!("Victauri MCP server thread could not start: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Victauri: dedicated runtime unavailable ({e}); sharing the app's async runtime"
+            );
+            tauri::async_runtime::spawn(server);
         }
     }
 }

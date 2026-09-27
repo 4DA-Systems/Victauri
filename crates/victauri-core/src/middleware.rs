@@ -40,28 +40,26 @@ pub async fn require_auth(
         return Ok(next.run(request).await);
     };
 
-    let provided = request
-        .headers()
+    if bearer_matches(request.headers(), expected) {
+        Ok(next.run(request).await)
+    } else {
+        tracing::warn!("Victauri: rejected request — invalid or missing auth token");
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Whether `headers` carry `Authorization: Bearer <expected>` (scheme matched
+/// case-insensitively per RFC 7235, token compared in constant time).
+#[must_use]
+pub fn bearer_matches(headers: &axum::http::HeaderMap, expected: &str) -> bool {
+    headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| {
-            let lower = v.to_lowercase();
-            if lower.starts_with("bearer ") {
-                Some(v[BEARER_PREFIX_LEN..].to_string())
-            } else {
-                None
-            }
-        });
-
-    match provided {
-        Some(ref token) if constant_time_eq(token.as_bytes(), expected.as_bytes()) => {
-            Ok(next.run(request).await)
-        }
-        _ => {
-            tracing::warn!("Victauri: rejected request — invalid or missing auth token");
-            Err(StatusCode::UNAUTHORIZED)
-        }
-    }
+        .filter(|v| {
+            v.get(..BEARER_PREFIX_LEN)
+                .is_some_and(|scheme| scheme.eq_ignore_ascii_case("bearer "))
+        })
+        .is_some_and(|v| constant_time_eq(&v.as_bytes()[BEARER_PREFIX_LEN..], expected.as_bytes()))
 }
 
 /// Create a rate limiter with the default capacity of
@@ -123,21 +121,34 @@ pub async fn dns_rebinding_guard(request: Request, next: Next) -> Result<Respons
     Ok(next.run(request).await)
 }
 
-/// Axum middleware that blocks cross-origin requests from browsers.
+/// Axum middleware that blocks requests a web page made a browser send.
+///
+/// Runs before the rate limiter, so a refused request never spends a token (a page looping
+/// `<img src="http://127.0.0.1:7373/health">` sends no `Origin` and used to drain the shared
+/// bucket until the agent was answered 429).
 ///
 /// # Errors
 ///
-/// Returns [`StatusCode::FORBIDDEN`] if the `Origin` header is present and does
-/// not match a localhost or `tauri://` origin.
+/// Returns [`StatusCode::FORBIDDEN`] if the request carries a `Sec-Fetch-Site` header other
+/// than `none` (every modern browser marks page-initiated requests; `none` is a user
+/// navigation), or an `Origin` header that is unreadable or not a localhost origin.
 pub async fn origin_guard(request: Request, next: Next) -> Result<Response, StatusCode> {
-    if let Some(origin) = request
-        .headers()
-        .get("origin")
-        .and_then(|v| v.to_str().ok())
-        && !is_allowed_origin(origin)
+    if let Some(site) = request.headers().get("sec-fetch-site")
+        && site.as_bytes() != b"none"
     {
-        tracing::warn!("Cross-origin request blocked: Origin={origin}");
+        tracing::warn!("Browser-initiated request blocked: Sec-Fetch-Site={site:?}");
         return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(origin) = request.headers().get("origin") {
+        // An Origin that is not visible ASCII cannot be judged, so it is refused rather than
+        // treated as absent (absent means "not a browser").
+        match origin.to_str() {
+            Ok(origin) if is_allowed_origin(origin) => {}
+            _ => {
+                tracing::warn!("Cross-origin request blocked: Origin={origin:?}");
+                return Err(StatusCode::FORBIDDEN);
+            }
+        }
     }
     Ok(next.run(request).await)
 }
@@ -159,10 +170,8 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
         axum::http::header::HeaderName::from_static("x-frame-options"),
         axum::http::HeaderValue::from_static("DENY"),
     );
-    headers.insert(
-        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
-        axum::http::HeaderValue::from_static("null"),
-    );
+    // No `Access-Control-Allow-Origin` at all: `null` is not "deny" — it GRANTS the opaque
+    // `null` origin (sandboxed iframes, `data:` / `file:` documents).
     headers.insert(
         axum::http::header::HeaderName::from_static("content-security-policy"),
         axum::http::HeaderValue::from_static("default-src 'none'"),

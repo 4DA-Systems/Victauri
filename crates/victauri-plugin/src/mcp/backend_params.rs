@@ -44,8 +44,10 @@ pub struct RegistryParams {
 pub struct InvokeCommandParams {
     /// The Tauri command name to invoke (e.g. "greet", "`save_settings`").
     pub command: String,
-    /// Command arguments as a JSON OBJECT nested under this `args` key — keys are the Tauri
-    /// command's parameter names, e.g. `{"command":"get_item","args":{"itemId":42}}`. Do NOT
+    /// Command arguments as a JSON OBJECT nested under this `args` key — keys are the IPC
+    /// argument keys, which Tauri camelCases from the Rust parameter names by default
+    /// (`item_id` → `itemId`; the registry reports each argument's `key` when it differs),
+    /// e.g. `{"command":"get_item","args":{"itemId":42}}`. Do NOT
     /// put parameters at the top level next to `command` (a flat `{"command":...,"itemId":42}`
     /// leaves `args` empty and the handler sees a missing argument). Omit for no-arg commands.
     /// A JSON STRING containing that object is also accepted (some MCP clients stringify
@@ -56,6 +58,16 @@ pub struct InvokeCommandParams {
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
+    /// How long to wait for the command's result, in ms (default: the plugin's eval timeout,
+    /// 30s; max 300000). Raise it for commands that are legitimately slow.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    /// When true, the result becomes `{"result": …, "backend_logs": […]}`: every
+    /// backend log entry (debug and above) captured while the command ran — what
+    /// the Rust side said about this call, in the same round trip. Concurrent
+    /// background activity in that window is included too. Needs backend capture.
+    #[serde(default)]
+    pub with_logs: Option<bool>,
 }
 
 /// Which app directory to target.

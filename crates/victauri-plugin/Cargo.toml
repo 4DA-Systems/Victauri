@@ -29,6 +29,10 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Backend log capture: the `log_layer()` tracing layer (registry only — no fmt/env-filter)
+# and the `log` crate adapter. Both are already in every Tauri app's dependency graph.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+log = { version = "0.4", features = ["std"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 schemars = { workspace = true }
@@ -40,6 +44,9 @@ regex = "1"
 url = { workspace = true }
 flate2 = "1"
 tower = { version = "0.5", features = ["limit"] }
+# Serve loop with a header-read timer and a connection cap (axum::serve sets neither).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1"] }
 rusqlite = { workspace = true, optional = true }
 
 [features]
@@ -56,6 +63,10 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 proptest = "1"
+# Proves the tauri-plugin-log recipe: TargetKind::Dispatch(fern::Dispatch::new().chain(log_logger())).
+fern = "0.7"
+# Proves the documented tracing recipes (registry + EnvFilter + fmt, and fmt().finish().with(..)).
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["composite"] }

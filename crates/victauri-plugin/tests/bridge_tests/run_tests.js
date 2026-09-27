@@ -18,6 +18,9 @@
 
 const fs = require("fs");
 const { JSDOM } = require("jsdom");
+const { fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
+const { implForWrapper } = require("jsdom/lib/jsdom/living/generated/utils.js");
+const MouseEventIface = require("jsdom/lib/jsdom/living/generated/MouseEvent.js");
 
 const testDefPath = process.argv[2];
 if (!testDefPath) {
@@ -255,6 +258,14 @@ async function run() {
             },
           };
         }
+        // Optional `x-vtest-delay-ms` keeps the call in flight (pending) for a while, to test
+        // how the bridge reports a slow command across event-stream reads.
+        var delayMs = Number(reqHeaders["x-vtest-delay-ms"] || 0);
+        if (delayMs > 0) {
+          return new Promise(function (res) {
+            setTimeout(function () { res(makeResponse()); }, delayMs);
+          });
+        }
         return Promise.resolve(makeResponse());
       };
     }
@@ -295,6 +306,15 @@ async function run() {
     if (!window.scrollTo) {
       window.scrollTo = function () {};
     }
+
+    // Dispatch a TRUSTED (isTrusted === true) click, as a real user click would be — page
+    // script cannot forge one, so the bridge's record-mode observer ignores synthetic events.
+    window.__vtestTrustedClick = function (el) {
+      fireAnEvent("click", implForWrapper(el), MouseEventIface, {
+        bubbles: true,
+        cancelable: true,
+      });
+    };
 
     // Inject the bridge script
     try {

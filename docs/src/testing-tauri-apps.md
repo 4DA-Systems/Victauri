@@ -118,12 +118,12 @@ import { _electron as electron } from 'playwright';
 
 // This only works for Electron apps, not Tauri.
 // For Tauri, you'd need to connect to the webview's DevTools port,
-// which requires CDP support that varies by platform.
+// which requires CDP — available only on Windows (WebView2).
 ```
 
 **Limitations:**
 - No official Tauri support — community workarounds only
-- CDP (Chrome DevTools Protocol) availability varies: Windows (WebView2 supports CDP), macOS (WKWebView does not), Linux (WebKitGTK has partial support)
+- CDP (Chrome DevTools Protocol) is only available on Windows (WebView2). macOS WKWebView and Linux WebKitGTK expose no CDP surface (they have their own, separate remote-inspector protocols), so a CDP-based tool cannot attach there
 - Cross-platform testing becomes platform-specific
 - Same DOM-only limitation as WebDriver
 
@@ -436,7 +436,7 @@ Coverage gate ──────────────── victauri coverage
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.8
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.9.0
   with:
     max-load-ms: 5000
     coverage: true

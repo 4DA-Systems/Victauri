@@ -3,20 +3,32 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use victauri_core::*;
 
+/// Builds a `#[non_exhaustive]` output type (e.g. `DomSnapshot`, `VerificationResult`)
+/// from named fields. These types are produced by victauri, never constructed by
+/// consumers, so outside the crate the only way to fabricate one is through serde —
+/// exactly how a client receives them.
+macro_rules! lit {
+    ($t:path { $($f:ident : $v:expr),* $(,)? }) => {{
+        let mut map = serde_json::Map::new();
+        $( map.insert(stringify!($f).to_owned(), serde_json::to_value($v).expect("serialize field")); )*
+        serde_json::from_value::<$t>(serde_json::Value::Object(map)).expect("build literal")
+    }};
+}
+
 #[test]
 fn event_log_push_and_snapshot() {
     let log = EventLog::new(100);
     assert!(log.is_empty());
 
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "test_cmd".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
-        result: event::IpcResult::Ok(serde_json::json!(42)),
-        arg_size_bytes: 10,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "test_cmd".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!(42)),
+        Some(5),
+        10,
+        "main".to_string(),
+    )));
 
     assert_eq!(log.len(), 1);
     assert!(!log.is_empty());
@@ -37,15 +49,15 @@ fn event_log_ring_buffer_eviction() {
     let log = EventLog::new(3);
 
     for i in 0..5 {
-        log.push(AppEvent::Ipc(IpcCall {
-            id: i.to_string(),
-            command: format!("cmd_{i}"),
-            timestamp: Utc::now(),
-            duration_ms: None,
-            result: event::IpcResult::Pending,
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
+        log.push(AppEvent::Ipc(IpcCall::new(
+            i.to_string(),
+            format!("cmd_{i}"),
+            Utc::now(),
+            event::IpcResult::Pending,
+            None,
+            0,
+            "main".to_string(),
+        )));
     }
 
     assert_eq!(log.len(), 3);
@@ -59,31 +71,27 @@ fn event_log_ring_buffer_eviction() {
 fn event_log_ipc_calls_filter() {
     let log = EventLog::new(100);
 
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "save".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "save".to_string(),
+        Utc::now(),
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
 
-    log.push(AppEvent::StateChange {
-        key: "user".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
+    log.push(AppEvent::state_change("user".to_string(), Utc::now(), None));
 
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "2".to_string(),
-        command: "load".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(10),
-        result: event::IpcResult::Ok(serde_json::json!("data")),
-        arg_size_bytes: 5,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "2".to_string(),
+        "load".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("data")),
+        Some(10),
+        5,
+        "main".to_string(),
+    )));
 
     assert_eq!(log.len(), 3);
     let ipc_only = log.ipc_calls();
@@ -95,11 +103,11 @@ fn event_log_ipc_calls_filter() {
 #[test]
 fn event_log_clear() {
     let log = EventLog::new(100);
-    log.push(AppEvent::WindowEvent {
-        label: "main".to_string(),
-        event: "focus".to_string(),
-        timestamp: Utc::now(),
-    });
+    log.push(AppEvent::window_event(
+        "main".to_string(),
+        "focus".to_string(),
+        Utc::now(),
+    ));
     assert_eq!(log.len(), 1);
     log.clear();
     assert!(log.is_empty());
@@ -111,12 +119,11 @@ fn command_registry_register_and_list() {
     assert_eq!(registry.count(), 0);
 
     let mut cmd = CommandInfo::new("save_file").with_description("Save a file to disk");
-    cmd.args = vec![CommandArg {
-        name: "path".to_string(),
-        type_name: "String".to_string(),
-        required: true,
-        schema: None,
-    }];
+    cmd.args = vec![CommandArg::new(
+        "path".to_string(),
+        "String".to_string(),
+        true,
+    )];
     cmd.return_type = Some("Result<(), String>".to_string());
     cmd.is_async = true;
     registry.register(cmd);
@@ -151,53 +158,53 @@ fn command_registry_search() {
 
 #[test]
 fn dom_snapshot_accessible_text() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![DomElement {
+        elements: vec![lit!(DomElement {
             ref_id: "e0".to_string(),
             tag: "div".to_string(),
             role: Some("main".to_string()),
             name: Some("Content".to_string()),
-            text: None,
-            value: None,
+            text: Option::<()>::None,
+            value: Option::<()>::None,
             enabled: true,
             visible: true,
             focusable: false,
-            bounds: None,
+            bounds: Option::<()>::None,
             children: vec![
-                DomElement {
+                lit!(DomElement {
                     ref_id: "e1".to_string(),
                     tag: "button".to_string(),
                     role: Some("button".to_string()),
                     name: Some("Submit".to_string()),
                     text: Some("Submit".to_string()),
-                    value: None,
+                    value: Option::<()>::None,
                     enabled: true,
                     visible: true,
                     focusable: true,
-                    bounds: None,
-                    children: vec![],
-                    attributes: BTreeMap::new(),
-                },
-                DomElement {
+                    bounds: Option::<()>::None,
+                    children: Vec::<()>::new(),
+                    attributes: BTreeMap::<String, String>::new(),
+                }),
+                lit!(DomElement {
                     ref_id: "e2".to_string(),
                     tag: "input".to_string(),
                     role: Some("textbox".to_string()),
                     name: Some("Email".to_string()),
-                    text: None,
-                    value: None,
+                    text: Option::<()>::None,
+                    value: Option::<()>::None,
                     enabled: true,
                     visible: true,
                     focusable: true,
-                    bounds: None,
-                    children: vec![],
-                    attributes: BTreeMap::new(),
-                },
+                    bounds: Option::<()>::None,
+                    children: Vec::<()>::new(),
+                    attributes: BTreeMap::<String, String>::new(),
+                }),
             ],
-            attributes: BTreeMap::new(),
-        }],
-        ref_map: BTreeMap::new(),
-    };
+            attributes: BTreeMap::<String, String>::new(),
+        })],
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     let text = snapshot.to_accessible_text(0);
     assert!(text.contains("main \"Content\""));
@@ -207,24 +214,24 @@ fn dom_snapshot_accessible_text() {
 
 #[test]
 fn dom_snapshot_hides_invisible() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![DomElement {
+        elements: vec![lit!(DomElement {
             ref_id: "e0".to_string(),
             tag: "div".to_string(),
-            role: None,
-            name: None,
-            text: None,
-            value: None,
+            role: Option::<()>::None,
+            name: Option::<()>::None,
+            text: Option::<()>::None,
+            value: Option::<()>::None,
             enabled: true,
             visible: false,
             focusable: false,
-            bounds: None,
-            children: vec![],
-            attributes: BTreeMap::new(),
-        }],
-        ref_map: BTreeMap::new(),
-    };
+            bounds: Option::<()>::None,
+            children: Vec::<()>::new(),
+            attributes: BTreeMap::<String, String>::new(),
+        })],
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     let text = snapshot.to_accessible_text(0);
     assert!(text.is_empty());
@@ -232,18 +239,16 @@ fn dom_snapshot_hides_invisible() {
 
 #[test]
 fn window_state_serialization() {
-    let state = WindowState {
-        label: "main".to_string(),
-        title: "My App".to_string(),
-        url: "tauri://localhost".to_string(),
-        visible: true,
-        focused: true,
-        maximized: false,
-        minimized: false,
-        fullscreen: false,
-        position: (100, 200),
-        size: (800, 600),
-    };
+    let state = WindowState::new("main".to_string())
+        .with_title("My App".to_string())
+        .with_url("tauri://localhost".to_string())
+        .with_visible(true)
+        .with_focused(true)
+        .with_maximized(false)
+        .with_minimized(false)
+        .with_fullscreen(false)
+        .with_position(100, 200)
+        .with_size(800, 600);
 
     let json = serde_json::to_string(&state).unwrap();
     let deserialized: WindowState = serde_json::from_str(&json).unwrap();
@@ -256,17 +261,17 @@ fn window_state_serialization() {
 fn verification_result_with_divergences() {
     use victauri_core::types::{Divergence, DivergenceSeverity, VerificationResult};
 
-    let result = VerificationResult {
+    let result = lit!(VerificationResult {
         passed: false,
         frontend_state: serde_json::json!({"count": 5}),
         backend_state: serde_json::json!({"count": 3}),
-        divergences: vec![Divergence {
+        divergences: vec![lit!(Divergence {
             path: "count".to_string(),
             frontend_value: serde_json::json!(5),
             backend_value: serde_json::json!(3),
             severity: DivergenceSeverity::Error,
-        }],
-    };
+        })],
+    });
 
     assert!(!result.passed);
     assert_eq!(result.divergences.len(), 1);
@@ -438,24 +443,24 @@ fn ghost_commands_bidirectional() {
 #[test]
 fn ipc_integrity_healthy() {
     let log = EventLog::new(100);
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "save".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
-        result: event::IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 10,
-        webview_label: "main".to_string(),
-    }));
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "2".to_string(),
-        command: "load".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(3),
-        result: event::IpcResult::Ok(serde_json::json!("data")),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "save".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("ok")),
+        Some(5),
+        10,
+        "main".to_string(),
+    )));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "2".to_string(),
+        "load".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("data")),
+        Some(3),
+        0,
+        "main".to_string(),
+    )));
 
     let report = victauri_core::check_ipc_integrity(&log, 5000);
     assert!(report.healthy);
@@ -470,15 +475,15 @@ fn ipc_integrity_healthy() {
 #[test]
 fn ipc_integrity_with_errors() {
     let log = EventLog::new(100);
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "save".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
-        result: event::IpcResult::Err("permission denied".to_string()),
-        arg_size_bytes: 10,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "save".to_string(),
+        Utc::now(),
+        event::IpcResult::Err("permission denied".to_string()),
+        Some(5),
+        10,
+        "main".to_string(),
+    )));
 
     let report = victauri_core::check_ipc_integrity(&log, 5000);
     assert!(!report.healthy);
@@ -492,15 +497,15 @@ fn ipc_integrity_with_errors() {
 fn ipc_integrity_stale_pending() {
     let log = EventLog::new(100);
     let old_timestamp = Utc::now() - chrono::Duration::seconds(10);
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "slow_cmd".to_string(),
-        timestamp: old_timestamp,
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "slow_cmd".to_string(),
+        old_timestamp,
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
 
     let report = victauri_core::check_ipc_integrity(&log, 5000);
     assert!(!report.healthy);
@@ -513,15 +518,15 @@ fn ipc_integrity_stale_pending() {
 #[test]
 fn ipc_integrity_recent_pending_not_stale() {
     let log = EventLog::new(100);
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "fast_cmd".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "fast_cmd".to_string(),
+        Utc::now(),
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
 
     let report = victauri_core::check_ipc_integrity(&log, 5000);
     assert!(report.healthy);
@@ -534,33 +539,33 @@ fn ipc_integrity_mixed_status() {
     let log = EventLog::new(100);
     let old = Utc::now() - chrono::Duration::seconds(30);
 
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "ok_cmd".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(1),
-        result: event::IpcResult::Ok(serde_json::json!(null)),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "2".to_string(),
-        command: "stuck_cmd".to_string(),
-        timestamp: old,
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
-    log.push(AppEvent::Ipc(IpcCall {
-        id: "3".to_string(),
-        command: "err_cmd".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(2),
-        result: event::IpcResult::Err("boom".to_string()),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "ok_cmd".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!(null)),
+        Some(1),
+        0,
+        "main".to_string(),
+    )));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "2".to_string(),
+        "stuck_cmd".to_string(),
+        old,
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
+    log.push(AppEvent::Ipc(IpcCall::new(
+        "3".to_string(),
+        "err_cmd".to_string(),
+        Utc::now(),
+        event::IpcResult::Err("boom".to_string()),
+        Some(2),
+        0,
+        "main".to_string(),
+    )));
 
     let report = victauri_core::check_ipc_integrity(&log, 5000);
     assert!(!report.healthy);
@@ -758,11 +763,11 @@ fn resolve_scores_normalized_across_query_lengths() {
 
 #[test]
 fn semantic_assertion_equals() {
-    let assertion = victauri_core::SemanticAssertion {
-        label: "count is 5".to_string(),
-        condition: victauri_core::AssertionCondition::Equals,
-        expected: serde_json::json!(5),
-    };
+    let assertion = victauri_core::SemanticAssertion::new(
+        "count is 5".to_string(),
+        victauri_core::AssertionCondition::Equals,
+        serde_json::json!(5),
+    );
 
     let pass = victauri_core::evaluate_assertion(serde_json::json!(5), &assertion);
     assert!(pass.passed);
@@ -775,22 +780,22 @@ fn semantic_assertion_equals() {
 
 #[test]
 fn semantic_assertion_truthy_falsy() {
-    let truthy = victauri_core::SemanticAssertion {
-        label: "value is truthy".to_string(),
-        condition: victauri_core::AssertionCondition::Truthy,
-        expected: serde_json::Value::Null,
-    };
+    let truthy = victauri_core::SemanticAssertion::new(
+        "value is truthy".to_string(),
+        victauri_core::AssertionCondition::Truthy,
+        serde_json::Value::Null,
+    );
 
     assert!(victauri_core::evaluate_assertion(serde_json::json!(true), &truthy).passed);
     assert!(victauri_core::evaluate_assertion(serde_json::json!("hello"), &truthy).passed);
     assert!(victauri_core::evaluate_assertion(serde_json::json!(42), &truthy).passed);
     assert!(!victauri_core::evaluate_assertion(serde_json::Value::Null, &truthy).passed);
 
-    let falsy = victauri_core::SemanticAssertion {
-        label: "value is falsy".to_string(),
-        condition: victauri_core::AssertionCondition::Falsy,
-        expected: serde_json::Value::Null,
-    };
+    let falsy = victauri_core::SemanticAssertion::new(
+        "value is falsy".to_string(),
+        victauri_core::AssertionCondition::Falsy,
+        serde_json::Value::Null,
+    );
 
     assert!(victauri_core::evaluate_assertion(serde_json::Value::Null, &falsy).passed);
     assert!(victauri_core::evaluate_assertion(serde_json::json!(false), &falsy).passed);
@@ -800,11 +805,11 @@ fn semantic_assertion_truthy_falsy() {
 
 #[test]
 fn semantic_assertion_contains() {
-    let assertion = victauri_core::SemanticAssertion {
-        label: "string contains hello".to_string(),
-        condition: victauri_core::AssertionCondition::Contains,
-        expected: serde_json::json!("hello"),
-    };
+    let assertion = victauri_core::SemanticAssertion::new(
+        "string contains hello".to_string(),
+        victauri_core::AssertionCondition::Contains,
+        serde_json::json!("hello"),
+    );
 
     assert!(
         victauri_core::evaluate_assertion(serde_json::json!("say hello world"), &assertion).passed
@@ -814,20 +819,20 @@ fn semantic_assertion_contains() {
 
 #[test]
 fn semantic_assertion_comparisons() {
-    let gt = victauri_core::SemanticAssertion {
-        label: "greater than 10".to_string(),
-        condition: victauri_core::AssertionCondition::GreaterThan,
-        expected: serde_json::json!(10),
-    };
+    let gt = victauri_core::SemanticAssertion::new(
+        "greater than 10".to_string(),
+        victauri_core::AssertionCondition::GreaterThan,
+        serde_json::json!(10),
+    );
 
     assert!(victauri_core::evaluate_assertion(serde_json::json!(15), &gt).passed);
     assert!(!victauri_core::evaluate_assertion(serde_json::json!(5), &gt).passed);
 
-    let lt = victauri_core::SemanticAssertion {
-        label: "less than 10".to_string(),
-        condition: victauri_core::AssertionCondition::LessThan,
-        expected: serde_json::json!(10),
-    };
+    let lt = victauri_core::SemanticAssertion::new(
+        "less than 10".to_string(),
+        victauri_core::AssertionCondition::LessThan,
+        serde_json::json!(10),
+    );
 
     assert!(victauri_core::evaluate_assertion(serde_json::json!(5), &lt).passed);
     assert!(!victauri_core::evaluate_assertion(serde_json::json!(15), &lt).passed);
@@ -835,11 +840,11 @@ fn semantic_assertion_comparisons() {
 
 #[test]
 fn semantic_assertion_type_is() {
-    let assertion = victauri_core::SemanticAssertion {
-        label: "is a string".to_string(),
-        condition: victauri_core::AssertionCondition::TypeIs,
-        expected: serde_json::json!("string"),
-    };
+    let assertion = victauri_core::SemanticAssertion::new(
+        "is a string".to_string(),
+        victauri_core::AssertionCondition::TypeIs,
+        serde_json::json!("string"),
+    );
 
     assert!(victauri_core::evaluate_assertion(serde_json::json!("hello"), &assertion).passed);
     assert!(!victauri_core::evaluate_assertion(serde_json::json!(42), &assertion).passed);
@@ -847,11 +852,11 @@ fn semantic_assertion_type_is() {
 
 #[test]
 fn semantic_assertion_exists() {
-    let assertion = victauri_core::SemanticAssertion {
-        label: "value exists".to_string(),
-        condition: victauri_core::AssertionCondition::Exists,
-        expected: serde_json::Value::Null,
-    };
+    let assertion = victauri_core::SemanticAssertion::new(
+        "value exists".to_string(),
+        victauri_core::AssertionCondition::Exists,
+        serde_json::Value::Null,
+    );
 
     assert!(victauri_core::evaluate_assertion(serde_json::json!("something"), &assertion).passed);
     assert!(!victauri_core::evaluate_assertion(serde_json::Value::Null, &assertion).passed);
@@ -879,21 +884,21 @@ fn recorder_record_events() {
     let recorder = EventRecorder::new(1000);
     recorder.start("s1".to_string()).unwrap();
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "save".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
-        result: event::IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 10,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "save".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("ok")),
+        Some(5),
+        10,
+        "main".to_string(),
+    )));
 
-    recorder.record_event(AppEvent::StateChange {
-        key: "user".to_string(),
-        timestamp: Utc::now(),
-        caused_by: Some("save".to_string()),
-    });
+    recorder.record_event(AppEvent::state_change(
+        "user".to_string(),
+        Utc::now(),
+        Some("save".to_string()),
+    ));
 
     assert_eq!(recorder.event_count(), 2);
 
@@ -914,15 +919,15 @@ fn recorder_checkpoints() {
 
     recorder.start("s1".to_string()).unwrap();
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "load".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "load".to_string(),
+        Utc::now(),
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
 
     recorder
         .checkpoint(
@@ -932,15 +937,15 @@ fn recorder_checkpoints() {
         )
         .unwrap();
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "2".to_string(),
-        command: "save".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
-        result: event::IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 10,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "2".to_string(),
+        "save".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("ok")),
+        Some(5),
+        10,
+        "main".to_string(),
+    )));
 
     recorder
         .checkpoint(
@@ -966,15 +971,15 @@ fn recorder_events_since() {
     recorder.start("s1".to_string()).unwrap();
 
     for i in 0..5 {
-        recorder.record_event(AppEvent::Ipc(IpcCall {
-            id: i.to_string(),
-            command: format!("cmd_{i}"),
-            timestamp: Utc::now(),
-            duration_ms: None,
-            result: event::IpcResult::Pending,
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
+        recorder.record_event(AppEvent::Ipc(IpcCall::new(
+            i.to_string(),
+            format!("cmd_{i}"),
+            Utc::now(),
+            event::IpcResult::Pending,
+            None,
+            0,
+            "main".to_string(),
+        )));
     }
 
     let since_3 = recorder.events_since(3);
@@ -988,39 +993,39 @@ fn recorder_events_between_checkpoints() {
     let recorder = EventRecorder::new(1000);
     recorder.start("s1".to_string()).unwrap();
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "0".to_string(),
-        command: "before".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "0".to_string(),
+        "before".to_string(),
+        Utc::now(),
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
 
     recorder
         .checkpoint("cp1".to_string(), None, serde_json::json!(null))
         .unwrap();
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "between".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "between".to_string(),
+        Utc::now(),
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "2".to_string(),
-        command: "between2".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: event::IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "2".to_string(),
+        "between2".to_string(),
+        Utc::now(),
+        event::IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    )));
 
     recorder
         .checkpoint("cp2".to_string(), None, serde_json::json!(null))
@@ -1041,31 +1046,27 @@ fn recorder_ipc_replay_sequence() {
     let recorder = EventRecorder::new(1000);
     recorder.start("s1".to_string()).unwrap();
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "1".to_string(),
-        command: "save".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
-        result: event::IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 10,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "1".to_string(),
+        "save".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("ok")),
+        Some(5),
+        10,
+        "main".to_string(),
+    )));
 
-    recorder.record_event(AppEvent::StateChange {
-        key: "user".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
+    recorder.record_event(AppEvent::state_change("user".to_string(), Utc::now(), None));
 
-    recorder.record_event(AppEvent::Ipc(IpcCall {
-        id: "2".to_string(),
-        command: "load".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(3),
-        result: event::IpcResult::Ok(serde_json::json!("data")),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    }));
+    recorder.record_event(AppEvent::Ipc(IpcCall::new(
+        "2".to_string(),
+        "load".to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("data")),
+        Some(3),
+        0,
+        "main".to_string(),
+    )));
 
     let replay = recorder.ipc_replay_sequence();
     assert_eq!(replay.len(), 2);
@@ -1087,11 +1088,7 @@ fn recorder_not_recording_returns_empty() {
 fn recorder_export_does_not_stop_recording() {
     let recorder = EventRecorder::new(1000);
     recorder.start("s1".to_string()).unwrap();
-    recorder.record_event(AppEvent::StateChange {
-        key: "k".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
+    recorder.record_event(AppEvent::state_change("k".to_string(), Utc::now(), None));
 
     let exported = recorder.export();
     assert!(exported.is_some());
@@ -1105,11 +1102,7 @@ fn recorder_export_does_not_stop_recording() {
     );
     assert_eq!(recorder.event_count(), 1);
 
-    recorder.record_event(AppEvent::StateChange {
-        key: "k2".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
+    recorder.record_event(AppEvent::state_change("k2".to_string(), Utc::now(), None));
     assert_eq!(recorder.event_count(), 2);
 }
 
@@ -1123,37 +1116,25 @@ fn recorder_export_returns_none_when_not_recording() {
 fn recorder_import_replaces_active_recording() {
     let recorder = EventRecorder::new(1000);
     recorder.start("original".to_string()).unwrap();
-    recorder.record_event(AppEvent::StateChange {
-        key: "k".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
+    recorder.record_event(AppEvent::state_change("k".to_string(), Utc::now(), None));
 
-    let session = victauri_core::RecordedSession {
-        id: "imported".to_string(),
-        started_at: Utc::now(),
-        events: vec![
-            victauri_core::RecordedEvent {
-                index: 0,
-                timestamp: Utc::now(),
-                event: AppEvent::StateChange {
-                    key: "a".to_string(),
-                    timestamp: Utc::now(),
-                    caused_by: None,
-                },
-            },
-            victauri_core::RecordedEvent {
-                index: 1,
-                timestamp: Utc::now(),
-                event: AppEvent::StateChange {
-                    key: "b".to_string(),
-                    timestamp: Utc::now(),
-                    caused_by: None,
-                },
-            },
+    let session = victauri_core::RecordedSession::new(
+        "imported".to_string(),
+        Utc::now(),
+        vec![
+            victauri_core::RecordedEvent::new(
+                0,
+                Utc::now(),
+                AppEvent::state_change("a".to_string(), Utc::now(), None),
+            ),
+            victauri_core::RecordedEvent::new(
+                1,
+                Utc::now(),
+                AppEvent::state_change("b".to_string(), Utc::now(), None),
+            ),
         ],
-        checkpoints: vec![],
-    };
+        vec![],
+    );
 
     recorder.import(session);
     assert!(recorder.is_recording());
@@ -1169,12 +1150,8 @@ fn recorder_import_when_not_recording() {
     let recorder = EventRecorder::new(1000);
     assert!(!recorder.is_recording());
 
-    let session = victauri_core::RecordedSession {
-        id: "fresh".to_string(),
-        started_at: Utc::now(),
-        events: vec![],
-        checkpoints: vec![],
-    };
+    let session =
+        victauri_core::RecordedSession::new("fresh".to_string(), Utc::now(), vec![], vec![]);
 
     recorder.import(session);
     assert!(recorder.is_recording());
@@ -1184,16 +1161,16 @@ fn recorder_import_when_not_recording() {
 #[test]
 fn truthy_falsy_are_never_both_true() {
     use victauri_core::verification;
-    let truthy = verification::SemanticAssertion {
-        label: "t".to_string(),
-        condition: verification::AssertionCondition::Truthy,
-        expected: serde_json::Value::Null,
-    };
-    let falsy = verification::SemanticAssertion {
-        label: "f".to_string(),
-        condition: verification::AssertionCondition::Falsy,
-        expected: serde_json::Value::Null,
-    };
+    let truthy = verification::SemanticAssertion::new(
+        "t".to_string(),
+        verification::AssertionCondition::Truthy,
+        serde_json::Value::Null,
+    );
+    let falsy = verification::SemanticAssertion::new(
+        "f".to_string(),
+        verification::AssertionCondition::Falsy,
+        serde_json::Value::Null,
+    );
     let test_values = vec![
         serde_json::json!(null),
         serde_json::json!(true),
@@ -1227,15 +1204,15 @@ mod adversarial {
     use std::thread;
 
     fn make_ipc(id: &str, cmd: &str) -> AppEvent {
-        AppEvent::Ipc(IpcCall {
-            id: id.to_string(),
-            command: cmd.to_string(),
-            timestamp: Utc::now(),
-            duration_ms: Some(1),
-            result: event::IpcResult::Ok(serde_json::json!("ok")),
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        })
+        AppEvent::Ipc(IpcCall::new(
+            id.to_string(),
+            cmd.to_string(),
+            Utc::now(),
+            event::IpcResult::Ok(serde_json::json!("ok")),
+            Some(1),
+            0,
+            "main".to_string(),
+        ))
     }
 
     // ── Mutex poisoning recovery ────────────────────────────────────────
@@ -1475,11 +1452,11 @@ mod adversarial {
 
     #[test]
     fn assertion_truthy_edge_cases() {
-        let truthy = verification::SemanticAssertion {
-            label: "t".to_string(),
-            condition: verification::AssertionCondition::Truthy,
-            expected: serde_json::json!(null),
-        };
+        let truthy = verification::SemanticAssertion::new(
+            "t".to_string(),
+            verification::AssertionCondition::Truthy,
+            serde_json::json!(null),
+        );
         // 0 is falsy (JS semantics — Victauri evaluates JS expressions)
         assert!(!verification::evaluate_assertion(serde_json::json!(0), &truthy).passed);
         // Non-zero numbers are truthy
@@ -1496,11 +1473,11 @@ mod adversarial {
 
     #[test]
     fn assertion_contains_in_array() {
-        let assertion = verification::SemanticAssertion {
-            label: "arr".to_string(),
-            condition: verification::AssertionCondition::Contains,
-            expected: serde_json::json!(2),
-        };
+        let assertion = verification::SemanticAssertion::new(
+            "arr".to_string(),
+            verification::AssertionCondition::Contains,
+            serde_json::json!(2),
+        );
         assert!(verification::evaluate_assertion(serde_json::json!([1, 2, 3]), &assertion).passed);
         assert!(!verification::evaluate_assertion(serde_json::json!([1, 3, 5]), &assertion).passed);
     }
@@ -1518,15 +1495,15 @@ mod adversarial {
     #[test]
     fn ipc_integrity_detects_errors() {
         let log = EventLog::new(100);
-        log.push(AppEvent::Ipc(IpcCall {
-            id: "err1".to_string(),
-            command: "broken_cmd".to_string(),
-            timestamp: Utc::now(),
-            duration_ms: None,
-            result: event::IpcResult::Err("something failed".to_string()),
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
+        log.push(AppEvent::Ipc(IpcCall::new(
+            "err1".to_string(),
+            "broken_cmd".to_string(),
+            Utc::now(),
+            event::IpcResult::Err("something failed".to_string()),
+            None,
+            0,
+            "main".to_string(),
+        )));
         let report = check_ipc_integrity(&log, 5000);
         assert!(!report.healthy);
         assert_eq!(report.errored, 1);
@@ -1685,26 +1662,26 @@ mod adversarial {
         let log = EventLog::new(100);
         let t1 = Utc::now();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        log.push(AppEvent::Ipc(IpcCall {
-            id: "1".to_string(),
-            command: "old".to_string(),
-            timestamp: t1,
-            duration_ms: None,
-            result: event::IpcResult::Pending,
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
+        log.push(AppEvent::Ipc(IpcCall::new(
+            "1".to_string(),
+            "old".to_string(),
+            t1,
+            event::IpcResult::Pending,
+            None,
+            0,
+            "main".to_string(),
+        )));
         let t2 = Utc::now();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        log.push(AppEvent::Ipc(IpcCall {
-            id: "2".to_string(),
-            command: "new".to_string(),
-            timestamp: Utc::now(),
-            duration_ms: None,
-            result: event::IpcResult::Pending,
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
+        log.push(AppEvent::Ipc(IpcCall::new(
+            "2".to_string(),
+            "new".to_string(),
+            Utc::now(),
+            event::IpcResult::Pending,
+            None,
+            0,
+            "main".to_string(),
+        )));
 
         let since = log.since(t2);
         assert_eq!(since.len(), 1);
@@ -1716,30 +1693,22 @@ mod adversarial {
         let past = Utc::now() - chrono::Duration::seconds(10);
         let future = Utc::now() + chrono::Duration::seconds(10);
 
-        log.push(AppEvent::Ipc(IpcCall {
-            id: "1".to_string(),
-            command: "test".to_string(),
-            timestamp: past,
-            duration_ms: None,
-            result: event::IpcResult::Pending,
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
-        log.push(AppEvent::StateChange {
-            key: "k".to_string(),
-            timestamp: future,
-            caused_by: None,
-        });
-        log.push(AppEvent::DomMutation {
-            webview_label: "main".to_string(),
-            timestamp: past,
-            mutation_count: 1,
-        });
-        log.push(AppEvent::WindowEvent {
-            label: "main".to_string(),
-            event: "focus".to_string(),
-            timestamp: future,
-        });
+        log.push(AppEvent::Ipc(IpcCall::new(
+            "1".to_string(),
+            "test".to_string(),
+            past,
+            event::IpcResult::Pending,
+            None,
+            0,
+            "main".to_string(),
+        )));
+        log.push(AppEvent::state_change("k".to_string(), future, None));
+        log.push(AppEvent::dom_mutation("main".to_string(), past, 1));
+        log.push(AppEvent::window_event(
+            "main".to_string(),
+            "focus".to_string(),
+            future,
+        ));
 
         let since = log.since(Utc::now());
         assert_eq!(since.len(), 2); // only the future ones
@@ -1789,29 +1758,25 @@ mod adversarial {
         let log = EventLog::new(100);
         let past = Utc::now() - chrono::Duration::seconds(10);
 
-        log.push(AppEvent::Ipc(IpcCall {
-            id: "old".to_string(),
-            command: "old_cmd".to_string(),
-            timestamp: past,
-            duration_ms: None,
-            result: event::IpcResult::Pending,
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
-        log.push(AppEvent::StateChange {
-            key: "k".to_string(),
-            timestamp: Utc::now(),
-            caused_by: None,
-        });
-        log.push(AppEvent::Ipc(IpcCall {
-            id: "new".to_string(),
-            command: "new_cmd".to_string(),
-            timestamp: Utc::now(),
-            duration_ms: Some(1),
-            result: event::IpcResult::Ok(serde_json::json!("ok")),
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }));
+        log.push(AppEvent::Ipc(IpcCall::new(
+            "old".to_string(),
+            "old_cmd".to_string(),
+            past,
+            event::IpcResult::Pending,
+            None,
+            0,
+            "main".to_string(),
+        )));
+        log.push(AppEvent::state_change("k".to_string(), Utc::now(), None));
+        log.push(AppEvent::Ipc(IpcCall::new(
+            "new".to_string(),
+            "new_cmd".to_string(),
+            Utc::now(),
+            event::IpcResult::Ok(serde_json::json!("ok")),
+            Some(1),
+            0,
+            "main".to_string(),
+        )));
 
         let calls = log.ipc_calls_since(Utc::now() - chrono::Duration::seconds(1));
         assert_eq!(calls.len(), 1);
@@ -1822,27 +1787,27 @@ mod adversarial {
 // ── Additional EventLog tests ─────────────────────────────────────────────
 
 fn make_ipc_at(id: &str, cmd: &str, ts: DateTime<Utc>) -> AppEvent {
-    AppEvent::Ipc(IpcCall {
-        id: id.to_string(),
-        command: cmd.to_string(),
-        timestamp: ts,
-        duration_ms: Some(1),
-        result: event::IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    })
+    AppEvent::Ipc(IpcCall::new(
+        id.to_string(),
+        cmd.to_string(),
+        ts,
+        event::IpcResult::Ok(serde_json::json!("ok")),
+        Some(1),
+        0,
+        "main".to_string(),
+    ))
 }
 
 fn make_ipc_simple(id: &str, cmd: &str) -> AppEvent {
-    AppEvent::Ipc(IpcCall {
-        id: id.to_string(),
-        command: cmd.to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(1),
-        result: event::IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    })
+    AppEvent::Ipc(IpcCall::new(
+        id.to_string(),
+        cmd.to_string(),
+        Utc::now(),
+        event::IpcResult::Ok(serde_json::json!("ok")),
+        Some(1),
+        0,
+        "main".to_string(),
+    ))
 }
 
 #[test]
@@ -1970,38 +1935,22 @@ fn event_log_since_filters_all_event_types() {
     let cutoff = Utc::now();
 
     log.push(make_ipc_at("1", "old_ipc", t_old));
-    log.push(AppEvent::StateChange {
-        key: "old_state".to_string(),
-        timestamp: t_old,
-        caused_by: None,
-    });
-    log.push(AppEvent::DomMutation {
-        webview_label: "main".to_string(),
-        timestamp: t_old,
-        mutation_count: 5,
-    });
-    log.push(AppEvent::WindowEvent {
-        label: "main".to_string(),
-        event: "old_focus".to_string(),
-        timestamp: t_old,
-    });
+    log.push(AppEvent::state_change("old_state".to_string(), t_old, None));
+    log.push(AppEvent::dom_mutation("main".to_string(), t_old, 5));
+    log.push(AppEvent::window_event(
+        "main".to_string(),
+        "old_focus".to_string(),
+        t_old,
+    ));
 
     log.push(make_ipc_at("2", "new_ipc", t_new));
-    log.push(AppEvent::StateChange {
-        key: "new_state".to_string(),
-        timestamp: t_new,
-        caused_by: None,
-    });
-    log.push(AppEvent::DomMutation {
-        webview_label: "main".to_string(),
-        timestamp: t_new,
-        mutation_count: 10,
-    });
-    log.push(AppEvent::WindowEvent {
-        label: "main".to_string(),
-        event: "new_focus".to_string(),
-        timestamp: t_new,
-    });
+    log.push(AppEvent::state_change("new_state".to_string(), t_new, None));
+    log.push(AppEvent::dom_mutation("main".to_string(), t_new, 10));
+    log.push(AppEvent::window_event(
+        "main".to_string(),
+        "new_focus".to_string(),
+        t_new,
+    ));
 
     let recent = log.since(cutoff);
     assert_eq!(recent.len(), 4);
@@ -2028,21 +1977,17 @@ fn event_log_ipc_calls_returns_only_ipc_events() {
     let log = EventLog::new(100);
 
     log.push(make_ipc_simple("1", "save"));
-    log.push(AppEvent::StateChange {
-        key: "data".to_string(),
-        timestamp: Utc::now(),
-        caused_by: Some("save".to_string()),
-    });
-    log.push(AppEvent::DomMutation {
-        webview_label: "main".to_string(),
-        timestamp: Utc::now(),
-        mutation_count: 3,
-    });
-    log.push(AppEvent::WindowEvent {
-        label: "main".to_string(),
-        event: "resize".to_string(),
-        timestamp: Utc::now(),
-    });
+    log.push(AppEvent::state_change(
+        "data".to_string(),
+        Utc::now(),
+        Some("save".to_string()),
+    ));
+    log.push(AppEvent::dom_mutation("main".to_string(), Utc::now(), 3));
+    log.push(AppEvent::window_event(
+        "main".to_string(),
+        "resize".to_string(),
+        Utc::now(),
+    ));
     log.push(make_ipc_simple("2", "load"));
 
     assert_eq!(log.len(), 5);
@@ -2057,21 +2002,13 @@ fn event_log_ipc_calls_returns_only_ipc_events() {
 fn event_log_ipc_calls_empty_when_no_ipc_events() {
     let log = EventLog::new(100);
 
-    log.push(AppEvent::StateChange {
-        key: "data".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
-    log.push(AppEvent::DomMutation {
-        webview_label: "main".to_string(),
-        timestamp: Utc::now(),
-        mutation_count: 1,
-    });
-    log.push(AppEvent::WindowEvent {
-        label: "main".to_string(),
-        event: "focus".to_string(),
-        timestamp: Utc::now(),
-    });
+    log.push(AppEvent::state_change("data".to_string(), Utc::now(), None));
+    log.push(AppEvent::dom_mutation("main".to_string(), Utc::now(), 1));
+    log.push(AppEvent::window_event(
+        "main".to_string(),
+        "focus".to_string(),
+        Utc::now(),
+    ));
 
     assert_eq!(log.len(), 3);
     assert!(log.ipc_calls().is_empty());
@@ -2085,11 +2022,7 @@ fn event_log_ipc_calls_since_filters_by_timestamp() {
     let cutoff = Utc::now() - chrono::Duration::seconds(30);
 
     log.push(make_ipc_at("1", "old_cmd", t_old));
-    log.push(AppEvent::StateChange {
-        key: "k".to_string(),
-        timestamp: t_new,
-        caused_by: None,
-    });
+    log.push(AppEvent::state_change("k".to_string(), t_new, None));
     log.push(make_ipc_at("2", "new_cmd", t_new));
 
     let calls = log.ipc_calls_since(cutoff);
@@ -2103,16 +2036,12 @@ fn event_log_ipc_calls_since_excludes_non_ipc() {
     let ts = Utc::now();
 
     // Add non-IPC events with recent timestamps
-    log.push(AppEvent::StateChange {
-        key: "k".to_string(),
-        timestamp: ts,
-        caused_by: None,
-    });
-    log.push(AppEvent::WindowEvent {
-        label: "main".to_string(),
-        event: "focus".to_string(),
-        timestamp: ts,
-    });
+    log.push(AppEvent::state_change("k".to_string(), ts, None));
+    log.push(AppEvent::window_event(
+        "main".to_string(),
+        "focus".to_string(),
+        ts,
+    ));
 
     let calls = log.ipc_calls_since(ts - chrono::Duration::seconds(1));
     assert!(calls.is_empty());
@@ -2209,16 +2138,12 @@ fn event_log_ring_buffer_eviction_mixed_event_types() {
     let log = EventLog::new(3);
 
     log.push(make_ipc_simple("1", "ipc_1"));
-    log.push(AppEvent::StateChange {
-        key: "state_1".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
-    log.push(AppEvent::DomMutation {
-        webview_label: "main".to_string(),
-        timestamp: Utc::now(),
-        mutation_count: 1,
-    });
+    log.push(AppEvent::state_change(
+        "state_1".to_string(),
+        Utc::now(),
+        None,
+    ));
+    log.push(AppEvent::dom_mutation("main".to_string(), Utc::now(), 1));
 
     // At capacity. Push one more IPC to evict ipc_1.
     log.push(make_ipc_simple("2", "ipc_2"));
@@ -2421,11 +2346,7 @@ fn recorder_event_count_increments() {
     recorder.record_event(make_ipc_simple("2", "cmd2"));
     assert_eq!(recorder.event_count(), 2);
 
-    recorder.record_event(AppEvent::StateChange {
-        key: "k".to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    });
+    recorder.record_event(AppEvent::state_change("k".to_string(), Utc::now(), None));
     assert_eq!(recorder.event_count(), 3);
 }
 
@@ -2473,50 +2394,50 @@ fn recorder_is_recording_lifecycle() {
 
 #[test]
 fn dom_snapshot_accessible_text_nested_indentation() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![DomElement {
+        elements: vec![lit!(DomElement {
             ref_id: "e0".to_string(),
             tag: "div".to_string(),
             role: Some("navigation".to_string()),
             name: Some("Nav".to_string()),
-            text: None,
-            value: None,
+            text: Option::<()>::None,
+            value: Option::<()>::None,
             enabled: true,
             visible: true,
             focusable: false,
-            bounds: None,
-            children: vec![DomElement {
+            bounds: Option::<()>::None,
+            children: vec![lit!(DomElement {
                 ref_id: "e1".to_string(),
                 tag: "ul".to_string(),
                 role: Some("list".to_string()),
-                name: None,
-                text: None,
-                value: None,
+                name: Option::<()>::None,
+                text: Option::<()>::None,
+                value: Option::<()>::None,
                 enabled: true,
                 visible: true,
                 focusable: false,
-                bounds: None,
-                children: vec![DomElement {
+                bounds: Option::<()>::None,
+                children: vec![lit!(DomElement {
                     ref_id: "e2".to_string(),
                     tag: "button".to_string(),
                     role: Some("button".to_string()),
                     name: Some("Home".to_string()),
                     text: Some("Home".to_string()),
-                    value: None,
+                    value: Option::<()>::None,
                     enabled: true,
                     visible: true,
                     focusable: true,
-                    bounds: None,
-                    children: vec![],
-                    attributes: BTreeMap::new(),
-                }],
-                attributes: BTreeMap::new(),
-            }],
-            attributes: BTreeMap::new(),
-        }],
-        ref_map: BTreeMap::new(),
-    };
+                    bounds: Option::<()>::None,
+                    children: Vec::<()>::new(),
+                    attributes: BTreeMap::<String, String>::new(),
+                })],
+                attributes: BTreeMap::<String, String>::new(),
+            })],
+            attributes: BTreeMap::<String, String>::new(),
+        })],
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     let text = snapshot.to_accessible_text(0);
 
@@ -2530,53 +2451,53 @@ fn dom_snapshot_accessible_text_nested_indentation() {
 
 #[test]
 fn dom_snapshot_accessible_text_skips_invisible_children() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![DomElement {
+        elements: vec![lit!(DomElement {
             ref_id: "e0".to_string(),
             tag: "div".to_string(),
-            role: None,
-            name: None,
-            text: None,
-            value: None,
+            role: Option::<()>::None,
+            name: Option::<()>::None,
+            text: Option::<()>::None,
+            value: Option::<()>::None,
             enabled: true,
             visible: true,
             focusable: false,
-            bounds: None,
+            bounds: Option::<()>::None,
             children: vec![
-                DomElement {
+                lit!(DomElement {
                     ref_id: "e1".to_string(),
                     tag: "button".to_string(),
                     role: Some("button".to_string()),
                     name: Some("Visible".to_string()),
-                    text: None,
-                    value: None,
+                    text: Option::<()>::None,
+                    value: Option::<()>::None,
                     enabled: true,
                     visible: true,
                     focusable: true,
-                    bounds: None,
-                    children: vec![],
-                    attributes: BTreeMap::new(),
-                },
-                DomElement {
+                    bounds: Option::<()>::None,
+                    children: Vec::<()>::new(),
+                    attributes: BTreeMap::<String, String>::new(),
+                }),
+                lit!(DomElement {
                     ref_id: "e2".to_string(),
                     tag: "button".to_string(),
                     role: Some("button".to_string()),
                     name: Some("Hidden".to_string()),
-                    text: None,
-                    value: None,
+                    text: Option::<()>::None,
+                    value: Option::<()>::None,
                     enabled: true,
                     visible: false,
                     focusable: true,
-                    bounds: None,
-                    children: vec![],
-                    attributes: BTreeMap::new(),
-                },
+                    bounds: Option::<()>::None,
+                    children: Vec::<()>::new(),
+                    attributes: BTreeMap::<String, String>::new(),
+                }),
             ],
-            attributes: BTreeMap::new(),
-        }],
-        ref_map: BTreeMap::new(),
-    };
+            attributes: BTreeMap::<String, String>::new(),
+        })],
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     let text = snapshot.to_accessible_text(0);
     assert!(text.contains("Visible"));
@@ -2585,54 +2506,54 @@ fn dom_snapshot_accessible_text_skips_invisible_children() {
 
 #[test]
 fn dom_snapshot_accessible_text_ref_on_focusable_and_input() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
         elements: vec![
-            DomElement {
+            lit!(DomElement {
                 ref_id: "e0".to_string(),
                 tag: "div".to_string(),
-                role: None,
+                role: Option::<()>::None,
                 name: Some("Container".to_string()),
-                text: None,
-                value: None,
+                text: Option::<()>::None,
+                value: Option::<()>::None,
                 enabled: true,
                 visible: true,
-                focusable: false, // not focusable, not button/input => no ref
-                bounds: None,
-                children: vec![],
-                attributes: BTreeMap::new(),
-            },
-            DomElement {
+                focusable: false,
+                bounds: Option::<()>::None,
+                children: Vec::<()>::new(),
+                attributes: BTreeMap::<String, String>::new(),
+            }),
+            lit!(DomElement {
                 ref_id: "e1".to_string(),
                 tag: "input".to_string(),
                 role: Some("textbox".to_string()),
                 name: Some("Name".to_string()),
-                text: None,
-                value: None,
+                text: Option::<()>::None,
+                value: Option::<()>::None,
                 enabled: true,
                 visible: true,
-                focusable: false, // input tag => ref regardless of focusable
-                bounds: None,
-                children: vec![],
-                attributes: BTreeMap::new(),
-            },
-            DomElement {
+                focusable: false,
+                bounds: Option::<()>::None,
+                children: Vec::<()>::new(),
+                attributes: BTreeMap::<String, String>::new(),
+            }),
+            lit!(DomElement {
                 ref_id: "e2".to_string(),
                 tag: "span".to_string(),
-                role: None,
+                role: Option::<()>::None,
                 name: Some("Label".to_string()),
-                text: None,
-                value: None,
+                text: Option::<()>::None,
+                value: Option::<()>::None,
                 enabled: true,
                 visible: true,
-                focusable: true, // focusable => ref
-                bounds: None,
-                children: vec![],
-                attributes: BTreeMap::new(),
-            },
+                focusable: true,
+                bounds: Option::<()>::None,
+                children: Vec::<()>::new(),
+                attributes: BTreeMap::<String, String>::new(),
+            }),
         ],
-        ref_map: BTreeMap::new(),
-    };
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     let text = snapshot.to_accessible_text(0);
 
@@ -2649,24 +2570,24 @@ fn dom_snapshot_accessible_text_ref_on_focusable_and_input() {
 
 #[test]
 fn dom_snapshot_accessible_text_custom_starting_indent() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![DomElement {
+        elements: vec![lit!(DomElement {
             ref_id: "e0".to_string(),
             tag: "div".to_string(),
             role: Some("main".to_string()),
-            name: None,
-            text: None,
-            value: None,
+            name: Option::<()>::None,
+            text: Option::<()>::None,
+            value: Option::<()>::None,
             enabled: true,
             visible: true,
             focusable: false,
-            bounds: None,
-            children: vec![],
-            attributes: BTreeMap::new(),
-        }],
-        ref_map: BTreeMap::new(),
-    };
+            bounds: Option::<()>::None,
+            children: Vec::<()>::new(),
+            attributes: BTreeMap::<String, String>::new(),
+        })],
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     // Start at indent 3 => 6 spaces prefix
     let text = snapshot.to_accessible_text(3);
@@ -2675,11 +2596,11 @@ fn dom_snapshot_accessible_text_custom_starting_indent() {
 
 #[test]
 fn dom_snapshot_accessible_text_empty_elements() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![],
-        ref_map: BTreeMap::new(),
-    };
+        elements: Vec::<()>::new(),
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     let text = snapshot.to_accessible_text(0);
     assert!(text.is_empty());
@@ -2687,24 +2608,24 @@ fn dom_snapshot_accessible_text_empty_elements() {
 
 #[test]
 fn dom_snapshot_accessible_text_uses_tag_when_no_role() {
-    let snapshot = DomSnapshot {
+    let snapshot = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![DomElement {
+        elements: vec![lit!(DomElement {
             ref_id: "e0".to_string(),
             tag: "section".to_string(),
-            role: None, // no role => falls back to tag name
+            role: Option::<()>::None,
             name: Some("Content".to_string()),
-            text: None,
-            value: None,
+            text: Option::<()>::None,
+            value: Option::<()>::None,
             enabled: true,
             visible: true,
             focusable: false,
-            bounds: None,
-            children: vec![],
-            attributes: BTreeMap::new(),
-        }],
-        ref_map: BTreeMap::new(),
-    };
+            bounds: Option::<()>::None,
+            children: Vec::<()>::new(),
+            attributes: BTreeMap::<String, String>::new(),
+        })],
+        ref_map: BTreeMap::<String, String>::new(),
+    });
 
     let text = snapshot.to_accessible_text(0);
     assert!(text.contains("- section \"Content\""));

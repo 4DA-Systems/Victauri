@@ -13,6 +13,7 @@ use serde::Serialize;
 
 /// Per-command timing statistics aggregated from IPC invocations.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct CommandTimingStats {
     /// Command name.
     pub command: String,
@@ -117,6 +118,11 @@ impl TimingSamples {
     }
 }
 
+/// Maximum distinct commands tracked. The map is keyed by the caller-supplied command name, so
+/// without a cap an agent (or a loop) invoking ever-new names grows it forever. Once full, new
+/// names are not tracked; commands already tracked keep accumulating.
+const MAX_TIMED_COMMANDS: usize = 1024;
+
 /// Thread-safe store for per-command timing data.
 pub struct CommandTimings {
     inner: RwLock<HashMap<String, TimingSamples>>,
@@ -137,7 +143,11 @@ impl CommandTimings {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.entry(command.to_string()).or_default().record(duration);
+        if let Some(samples) = map.get_mut(command) {
+            samples.record(duration);
+        } else if map.len() < MAX_TIMED_COMMANDS {
+            map.entry(command.to_string()).or_default().record(duration);
+        }
     }
 
     /// Get stats for all commands, sorted by total time descending.
@@ -187,6 +197,7 @@ impl Default for CommandTimings {
 
 /// The type of fault to inject into a command.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub enum FaultType {
     /// Add artificial latency before command execution.
     Delay {
@@ -206,6 +217,7 @@ pub enum FaultType {
 
 /// Configuration for a single fault injection rule.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FaultConfig {
     /// Target command name.
     pub command: String,
@@ -225,6 +237,19 @@ pub struct FaultConfig {
 pub const FAULT_TTL: Duration = Duration::from_secs(900); // 15 minutes
 
 impl FaultConfig {
+    /// Creates a fault rule for `command`, created now with zero triggers so far.
+    /// `max_triggers == 0` means unlimited (until [`FAULT_TTL`] expires it).
+    #[must_use]
+    pub fn new(command: impl Into<String>, fault_type: FaultType, max_triggers: u64) -> Self {
+        Self {
+            command: command.into(),
+            fault_type,
+            trigger_count: 0,
+            max_triggers,
+            created_at: Instant::now(),
+        }
+    }
+
     /// Whether this fault should still trigger, evaluated at `now`. A fault is
     /// inert once it is older than [`FAULT_TTL`] or has hit `max_triggers`.
     #[must_use]
@@ -322,6 +347,7 @@ impl Default for FaultRegistry {
 
 /// Describes the shape of a JSON value for contract comparison.
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[non_exhaustive]
 pub enum JsonShape {
     /// null
     Null,
@@ -376,6 +402,7 @@ impl JsonShape {
 
 /// A recorded contract baseline for a command's response.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ContractBaseline {
     /// Command name.
     pub command: String,
@@ -389,8 +416,29 @@ pub struct ContractBaseline {
     pub recorded_at: String,
 }
 
+impl ContractBaseline {
+    /// Creates a contract baseline for `command`.
+    #[must_use]
+    pub fn new(
+        command: impl Into<String>,
+        args: serde_json::Value,
+        shape: JsonShape,
+        sample: impl Into<String>,
+        recorded_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            args,
+            shape,
+            sample: sample.into(),
+            recorded_at: recorded_at.into(),
+        }
+    }
+}
+
 /// Differences found when checking a contract against baseline.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ContractDrift {
     /// Command name.
     pub command: String,
@@ -406,6 +454,7 @@ pub struct ContractDrift {
 
 /// A single field type change between baseline and current.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TypeChange {
     /// Dot-separated field path.
     pub path: String,
@@ -569,6 +618,7 @@ impl Default for ContractStore {
 
 /// A single phase in the startup timeline.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct StartupPhase {
     /// Phase name.
     pub name: String,
@@ -651,6 +701,7 @@ impl Default for StartupTimeline {
 
 /// A Tauri event captured from the application's native event bus.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct CapturedTauriEvent {
     /// Event name (e.g. "notification-added", `tauri://focus`).
     pub name: String,
@@ -658,6 +709,22 @@ pub struct CapturedTauriEvent {
     pub payload: String,
     /// ISO 8601 timestamp.
     pub timestamp: String,
+}
+
+impl CapturedTauriEvent {
+    /// Creates a captured event record (`timestamp` is an ISO 8601 string).
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        payload: impl Into<String>,
+        timestamp: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            payload: payload.into(),
+            timestamp: timestamp.into(),
+        }
+    }
 }
 
 const DEFAULT_EVENT_BUS_CAPACITY: usize = 1000;
@@ -779,13 +846,18 @@ impl AppStateProbes {
     /// registered under that name.
     #[must_use]
     pub fn run(&self, name: &str) -> Option<serde_json::Value> {
-        let probe = self
-            .inner
+        self.get(name).map(|p| p())
+    }
+
+    /// The probe registered under `name`, to run somewhere other than the caller's thread
+    /// (the `app_state` tool runs it on the blocking pool with a timeout).
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<std::sync::Arc<ProbeFn>> {
+        self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(name)
-            .cloned();
-        probe.map(|p| p())
+            .cloned()
     }
 
     /// Number of registered probes.
@@ -808,6 +880,7 @@ impl AppStateProbes {
 
 /// Info about a tracked async task spawned by Victauri.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TrackedTaskInfo {
     /// Human-readable task name.
     pub name: String,
@@ -898,6 +971,7 @@ impl Default for TaskTracker {
 
 /// Information about a child process of the Tauri application.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ChildProcessInfo {
     /// Process ID.
     pub pid: u32,
@@ -1187,9 +1261,185 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
     children
 }
 
+// ── Page loads ─────────────────────────────────────────────────────────────
+
+/// Each window's latest bridge ready signal — sent whenever its JS bridge (re)initializes, i.e.
+/// on every page load or reload — with the nonce identifying that page load. An eval running in
+/// a page that has since been replaced can never deliver its result, so a ready signal from a
+/// DIFFERENT page lets the caller fail fast ("the page reloaded while the call was in flight")
+/// instead of waiting out the full timeout.
+#[derive(Default)]
+pub struct PageLoads {
+    last_load: std::sync::Mutex<HashMap<String, PageLoad>>,
+    seq: std::sync::atomic::AtomicU64,
+    changed: tokio::sync::Notify,
+}
+
+/// One recorded ready signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageLoad {
+    /// Increases with every ready signal (from any window), so a caller can tell "a new signal
+    /// since I looked" from "the same one".
+    pub seq: u64,
+    /// The page-load nonce the signal carried (`None` from a bridge that sends none).
+    pub nonce: Option<String>,
+}
+
+/// Longest nonce kept from a ready signal (the bridge's is a UUID; the signal is page-callable).
+const MAX_PAGE_NONCE_LEN: usize = 128;
+
+impl PageLoads {
+    /// Record that window `label` sent a ready signal for the page identified by `nonce`.
+    pub fn record_load(&self, label: &str, nonce: Option<&str>) {
+        let nonce = nonce.map(|n| n.chars().take(MAX_PAGE_NONCE_LEN).collect());
+        {
+            let mut loads = self
+                .last_load
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Numbered under the lock, so a window's stored seq only ever grows.
+            let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            loads.insert(label.to_string(), PageLoad { seq, nonce });
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Window `label`'s latest ready signal, if any.
+    #[must_use]
+    pub fn latest(&self, label: &str) -> Option<PageLoad> {
+        self.last_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(label)
+            .cloned()
+    }
+
+    /// The sequence number of the most recent ready signal from any window (0 if none yet).
+    #[must_use]
+    pub fn current_seq(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolves the next time any window records a page load.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+}
+// ── Recording drain watermarks ─────────────────────────────────────────────
+
+/// Per-window drain positions for pulling the JS bridge's event stream into a recording,
+/// shared by the background drain loop and `recording flush`.
+///
+/// Each kept its own watermark before, so a flush re-recorded what the drain had captured
+/// (and vice versa). A position is the bridge's per-page event SEQUENCE (plus the page
+/// instance it belongs to), not a wall-clock timestamp: a timestamp watermark clamped to the
+/// Rust clock re-read an event stamped ahead of it on every drain, and lost events pushed in
+/// the same millisecond after a read. Positions are reset whenever a recording starts or is
+/// imported — the new epoch is the recorder generation, and a window's first read in it skips
+/// the page's pre-recording history by the `floor_ms` timestamp. A per-window async lock
+/// serializes the two readers for the same window.
+#[derive(Default)]
+pub struct DrainWatermarks {
+    inner: std::sync::Mutex<WatermarkState>,
+}
+
+#[derive(Default)]
+struct WatermarkState {
+    floor_ms: f64,
+    epoch: u64,
+    per_label: HashMap<String, DrainMark>,
+    locks: HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// How far a window's event stream has been drained: the bridge's page `instance` and the
+/// last sequence number read from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainMark {
+    /// Identifies one page load of the window (the sequence restarts on reload).
+    pub instance: String,
+    /// The last sequence number read from that page.
+    pub seq: u64,
+}
+
+/// Where the next drain of a window starts, captured in one step.
+#[derive(Debug, Clone)]
+pub struct DrainCursor {
+    /// The recording epoch (recorder generation) this position belongs to.
+    pub epoch: u64,
+    /// Entries completed at or before this time predate the recording (first read only).
+    pub floor_ms: f64,
+    /// The window's position, or `None` if it has not been read in this epoch.
+    pub mark: Option<DrainMark>,
+}
+
+impl DrainWatermarks {
+    fn state(&self) -> std::sync::MutexGuard<'_, WatermarkState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Where to read `label`'s stream from.
+    #[must_use]
+    pub fn cursor(&self, label: &str) -> DrainCursor {
+        let s = self.state();
+        DrainCursor {
+            epoch: s.epoch,
+            floor_ms: s.floor_ms,
+            mark: s.per_label.get(label).cloned(),
+        }
+    }
+
+    /// Record that `label` was read up to `mark`, if `epoch` is still the current one (a read
+    /// that straddled a reset must not plant an old position in the new epoch). Returns
+    /// whether the position was stored.
+    pub fn advance(&self, label: &str, epoch: u64, mark: DrainMark) -> bool {
+        let mut s = self.state();
+        if s.epoch != epoch {
+            return false;
+        }
+        s.per_label.insert(label.to_string(), mark);
+        true
+    }
+
+    /// Start recording epoch `epoch`: every window is read afresh, skipping entries at or
+    /// before `floor_ms`.
+    pub fn reset(&self, floor_ms: f64, epoch: u64) {
+        let mut s = self.state();
+        s.floor_ms = floor_ms;
+        s.epoch = epoch;
+        s.per_label.clear();
+    }
+
+    /// Forget windows that no longer exist (bounds the maps across ephemeral windows).
+    pub fn retain(&self, labels: &[String]) {
+        let mut s = self.state();
+        s.per_label.retain(|l, _| labels.contains(l));
+        s.locks.retain(|l, _| labels.contains(l));
+    }
+
+    /// The lock that serializes readers of `label`'s stream.
+    #[must_use]
+    pub fn lock_for(&self, label: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(self.state().locks.entry(label.to_string()).or_default())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C15e: the map is keyed by the caller-chosen command name, so it must be bounded.
+    #[test]
+    fn command_timings_bound_distinct_commands() {
+        let t = CommandTimings::new();
+        for i in 0..(MAX_TIMED_COMMANDS + 100) {
+            t.record(&format!("cmd-{i}"), Duration::from_millis(1));
+        }
+        assert_eq!(t.all_stats().len(), MAX_TIMED_COMMANDS);
+        // Commands already tracked keep accumulating once the cap is reached.
+        t.record("cmd-0", Duration::from_millis(1));
+        assert_eq!(t.stats_for("cmd-0").unwrap().count, 2);
+    }
 
     #[test]
     fn p95_is_nearest_rank_not_max_for_small_samples() {

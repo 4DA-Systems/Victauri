@@ -463,7 +463,8 @@ pub struct RecordingParams {
     pub since_index: Option<usize>,
     /// JSON string of a previously exported `RecordedSession` (for import).
     pub session_json: Option<String>,
-    /// Target webview label (for replay).
+    /// Target webview label: the window to flush, or for replay, replay only the calls
+    /// recorded in this window (each call always runs in the window that recorded it).
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
@@ -710,7 +711,7 @@ impl fmt::Display for TraceAction {
 pub struct TraceParams {
     /// Action: start, stop, status, frames.
     pub action: TraceAction,
-    /// Capture interval in milliseconds (for start). Default 500, min 50.
+    /// Capture interval in milliseconds (for start). Default 500, clamped to 50..=60000.
     pub interval_ms: Option<u64>,
     /// Maximum frames to retain in the ring buffer (for start). Default 60, max 600.
     pub max_frames: Option<usize>,
@@ -804,6 +805,12 @@ pub enum LogsAction {
     /// before exercising the app so `detect_ghost_commands`/`logs ipc` reflect
     /// only the current test's traffic, not stale accumulated probe history).
     Clear,
+    /// Rust backend log entries (tracing / log / panics) with structured fields.
+    Backend,
+    /// Aggregate view of the backend log: counts, repeats, recent problems, panics.
+    BackendDigest,
+    /// Raw stdout/stderr lines captured by `victauri run` (out-of-process).
+    Stdout,
 }
 
 impl fmt::Display for LogsAction {
@@ -817,6 +824,9 @@ impl fmt::Display for LogsAction {
             Self::Events => f.write_str("events"),
             Self::SlowIpc => f.write_str("slow_ipc"),
             Self::Clear => f.write_str("clear"),
+            Self::Backend => f.write_str("backend"),
+            Self::BackendDigest => f.write_str("backend_digest"),
+            Self::Stdout => f.write_str("stdout"),
         }
     }
 }
@@ -826,10 +836,21 @@ impl fmt::Display for LogsAction {
 pub struct LogsParams {
     /// Action to perform: console, network, ipc, navigation, dialogs, events, `slow_ipc`.
     pub action: LogsAction,
-    /// Only return entries after this Unix timestamp in milliseconds (for console, events).
+    /// Only return entries after this Unix timestamp in milliseconds (for console, events, backend).
     pub since: Option<f64>,
-    /// Filter by URL substring (for network).
+    /// Filter by URL substring (for network); case-insensitive text match over
+    /// message/target/fields/spans (for backend, stdout).
     pub filter: Option<String>,
+    /// Minimum level for backend/stdout: trace, debug, info, warn, error.
+    pub level: Option<String>,
+    /// Target prefix(es) for backend, comma-separated (e.g. `"app::db,app::sync"`).
+    pub target: Option<String>,
+    /// Cursor (for backend: entry sequence; for stdout: byte offset). Pass the
+    /// previous response's `next_seq` to get only newer entries.
+    pub since_seq: Option<u64>,
+    /// For backend: only entries whose structured fields equal these values
+    /// (text compare, case-insensitive), e.g. `{"run_type": "foreground_fast"}`.
+    pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// Maximum number of entries to return (for ipc, network, `slow_ipc`).
     pub limit: Option<usize>,
     /// Threshold in milliseconds for slow IPC calls (for `slow_ipc`).

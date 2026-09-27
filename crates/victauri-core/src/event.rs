@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 /// A single Tauri IPC call with timing, result, and source webview.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IpcCall {
     /// Unique call identifier for correlation.
     pub id: String,
@@ -24,6 +25,11 @@ pub struct IpcCall {
     pub arg_size_bytes: usize,
     /// Label of the webview that initiated the call.
     pub webview_label: String,
+    /// The call never reached the backend: a `route` rule fulfilled or blocked it in the
+    /// webview. `recording replay` skips such calls — replaying a mocked call would turn a
+    /// fake success into a real invocation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mocked: bool,
 }
 
 /// Outcome of an IPC call: pending, success with a JSON value, or error.
@@ -36,6 +42,59 @@ pub enum IpcResult {
     Ok(serde_json::Value),
     /// Call failed with an error message.
     Err(String),
+}
+
+impl IpcCall {
+    /// Creates an IPC call record.
+    ///
+    /// `IpcCall` is `#[non_exhaustive]`, so code outside this crate (bridges,
+    /// mocks, tests) builds it through this constructor rather than a struct
+    /// literal; fields added later get a default here instead of breaking callers.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use victauri_core::{IpcCall, IpcResult};
+    ///
+    /// let call = IpcCall::new(
+    ///     "c1",
+    ///     "greet",
+    ///     chrono::Utc::now(),
+    ///     IpcResult::Pending,
+    ///     None,
+    ///     0,
+    ///     "main",
+    /// );
+    /// assert_eq!(call.command, "greet");
+    /// ```
+    #[must_use]
+    pub fn new(
+        id: impl Into<String>,
+        command: impl Into<String>,
+        timestamp: DateTime<Utc>,
+        result: IpcResult,
+        duration_ms: Option<u64>,
+        arg_size_bytes: usize,
+        webview_label: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            command: command.into(),
+            timestamp,
+            duration_ms,
+            result,
+            arg_size_bytes,
+            webview_label: webview_label.into(),
+            mocked: false,
+        }
+    }
+
+    /// Mark the call as answered by a route rule instead of the backend.
+    #[must_use]
+    pub fn with_mocked(mut self, mocked: bool) -> Self {
+        self.mocked = mocked;
+        self
+    }
 }
 
 impl fmt::Display for IpcResult {
@@ -62,6 +121,7 @@ impl From<IpcCall> for AppEvent {
 
 /// The kind of user interaction captured from the DOM.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum InteractionKind {
     /// Mouse click on an element.
     Click,
@@ -101,6 +161,7 @@ pub enum AppEvent {
     /// An IPC call between webview and Rust backend.
     Ipc(IpcCall),
     /// A change to application state in the backend.
+    #[non_exhaustive]
     StateChange {
         /// State key that changed.
         key: String,
@@ -110,6 +171,7 @@ pub enum AppEvent {
         caused_by: Option<String>,
     },
     /// A batch of DOM mutations observed in a webview.
+    #[non_exhaustive]
     DomMutation {
         /// Webview where the mutations were observed.
         webview_label: String,
@@ -119,6 +181,7 @@ pub enum AppEvent {
         mutation_count: u32,
     },
     /// A user interaction captured from the DOM during recording.
+    #[non_exhaustive]
     DomInteraction {
         /// What kind of interaction occurred.
         action: InteractionKind,
@@ -132,6 +195,7 @@ pub enum AppEvent {
         webview_label: String,
     },
     /// A native window lifecycle event (e.g. focus, resize, close).
+    #[non_exhaustive]
     WindowEvent {
         /// Tauri window label that emitted the event.
         label: String,
@@ -141,6 +205,7 @@ pub enum AppEvent {
         timestamp: DateTime<Utc>,
     },
     /// A console log/warn/error message captured from the webview.
+    #[non_exhaustive]
     Console {
         /// Severity level: "log", "warn", or "error".
         level: String,
@@ -152,6 +217,89 @@ pub enum AppEvent {
 }
 
 impl AppEvent {
+    /// Builds an [`AppEvent::StateChange`].
+    #[must_use]
+    pub fn state_change(
+        key: impl Into<String>,
+        timestamp: DateTime<Utc>,
+        caused_by: Option<String>,
+    ) -> Self {
+        Self::StateChange {
+            key: key.into(),
+            timestamp,
+            caused_by,
+        }
+    }
+
+    /// Builds an [`AppEvent::DomMutation`].
+    #[must_use]
+    pub fn dom_mutation(
+        webview_label: impl Into<String>,
+        timestamp: DateTime<Utc>,
+        mutation_count: u32,
+    ) -> Self {
+        Self::DomMutation {
+            webview_label: webview_label.into(),
+            timestamp,
+            mutation_count,
+        }
+    }
+
+    /// Builds an [`AppEvent::DomInteraction`].
+    #[must_use]
+    pub fn dom_interaction(
+        action: InteractionKind,
+        selector: impl Into<String>,
+        value: Option<String>,
+        timestamp: DateTime<Utc>,
+        webview_label: impl Into<String>,
+    ) -> Self {
+        Self::DomInteraction {
+            action,
+            selector: selector.into(),
+            value,
+            timestamp,
+            webview_label: webview_label.into(),
+        }
+    }
+
+    /// Builds an [`AppEvent::WindowEvent`].
+    #[must_use]
+    pub fn window_event(
+        label: impl Into<String>,
+        event: impl Into<String>,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        Self::WindowEvent {
+            label: label.into(),
+            event: event.into(),
+            timestamp,
+        }
+    }
+
+    /// Builds an [`AppEvent::Console`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use victauri_core::AppEvent;
+    ///
+    /// let ev = AppEvent::console("warn", "deprecated", chrono::Utc::now());
+    /// assert!(matches!(ev, AppEvent::Console { .. }));
+    /// ```
+    #[must_use]
+    pub fn console(
+        level: impl Into<String>,
+        message: impl Into<String>,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        Self::Console {
+            level: level.into(),
+            message: message.into(),
+            timestamp,
+        }
+    }
+
     /// Returns the timestamp of this event, regardless of variant.
     #[must_use]
     pub fn timestamp(&self) -> DateTime<Utc> {
@@ -217,11 +365,7 @@ impl EventLog {
     /// use chrono::Utc;
     ///
     /// let log = EventLog::new(100);
-    /// log.push(AppEvent::StateChange {
-    ///     key: "theme".to_string(),
-    ///     timestamp: Utc::now(),
-    ///     caused_by: None,
-    /// });
+    /// log.push(AppEvent::state_change("theme", Utc::now(), None));
     /// assert_eq!(log.len(), 1);
     /// assert_eq!(log.snapshot().len(), 1);
     /// ```
@@ -272,15 +416,15 @@ impl EventLog {
     /// use chrono::Utc;
     ///
     /// let log = EventLog::new(100);
-    /// log.push(AppEvent::Ipc(IpcCall {
-    ///     id: "c1".to_string(),
-    ///     command: "greet".to_string(),
-    ///     timestamp: Utc::now(),
-    ///     duration_ms: Some(5),
-    ///     result: IpcResult::Ok(serde_json::json!("hi")),
-    ///     arg_size_bytes: 0,
-    ///     webview_label: "main".to_string(),
-    /// }));
+    /// log.push(AppEvent::Ipc(IpcCall::new(
+    ///     "c1",
+    ///     "greet",
+    ///     Utc::now(),
+    ///     IpcResult::Ok(serde_json::json!("hi")),
+    ///     Some(5),
+    ///     0,
+    ///     "main",
+    /// )));
     /// assert_eq!(log.ipc_calls().len(), 1);
     /// ```
     #[must_use]

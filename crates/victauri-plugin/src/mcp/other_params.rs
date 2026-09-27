@@ -39,6 +39,15 @@ pub enum WaitCondition {
     /// `VictauriBuilder::listen_events(&["..."])` (window-lifecycle events are
     /// captured automatically).
     Event,
+    /// Block until a backend (Rust) log entry containing `value` is captured.
+    ///
+    /// Matches case-insensitively against message, target, fields and spans,
+    /// at or above `level` (default: any). Server-side and edge-triggered: the
+    /// waiter wakes the moment the entry is captured (no polling), with a
+    /// `since_ms` look-back (default 2000) so a line logged just before this call
+    /// still counts. Needs backend capture (`victauri_plugin::log_layer()` /
+    /// `log_logger()` in the app, or the app launched via `victauri run`).
+    Log,
 }
 
 impl WaitCondition {
@@ -55,6 +64,7 @@ impl WaitCondition {
             Self::NetworkIdle => "network_idle",
             Self::Expression => "expression",
             Self::Event => "event",
+            Self::Log => "log",
         }
     }
 }
@@ -117,8 +127,19 @@ pub struct WaitForParams {
     pub expected: Option<serde_json::Value>,
     /// For the `event` condition: how far back (in milliseconds) to look for a
     /// matching event when the wait begins, so an event that fired just before
-    /// this call is not missed. Default: 2000.
+    /// this call is not missed. Default: 2000. Also the look-back for `log`.
     pub since_ms: Option<u64>,
+    /// For the `log` condition: minimum level (trace/debug/info/warn/error).
+    pub level: Option<String>,
+    /// For the `log` condition: the entry's structured fields must also equal these
+    /// (text compare, case-insensitive) — e.g. `{"run_type": "foreground_fast"}` to
+    /// match YOUR run's completion line, not a concurrent run of the same code path.
+    pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// For the `log` condition: only entries with sequence number >= this count
+    /// (overrides `since_ms`). Take it from `invoke_command {with_logs:true}`'s
+    /// `backend_log_cursor` (or any `logs backend` call's `next_seq`) BEFORE the work
+    /// starts, so a previous run's identical line can never satisfy the wait.
+    pub since_seq: Option<u64>,
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,

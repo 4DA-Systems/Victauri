@@ -51,22 +51,41 @@ pub fn is_compound_tool(tool: &str) -> bool {
     COMPOUND_TOOLS.contains(&tool)
 }
 
-/// Resolve the canonical privacy-matrix capability identity for a tool call.
+/// Resolve the canonical privacy-matrix capability identity for a tool call, or
+/// refuse the call as malformed.
 ///
 /// For standalone tools this is the bare tool name. For compound tools it is the
-/// dot-qualified `tool.action` identity that the privacy matrix is keyed on. When
-/// a compound tool is called without a recognizable `action`, the bare tool name
-/// is returned (the per-tool arg parse will then reject the malformed call, and
-/// in restricted profiles the bare name is itself not allowed — fail closed).
-#[must_use]
-pub fn canonical_capability(tool: &str, args: &Value) -> String {
-    if !is_compound_tool(tool) {
-        return tool.to_string();
+/// dot-qualified `tool.action` identity that the privacy matrix is keyed on.
+///
+/// The gate and the handler must agree on WHICH action runs. serde also accepts an
+/// enum written as `{"go_to": null}` (externally-tagged unit variant) and a REST body
+/// written as a positional array; both used to be gated as the bare tool name —
+/// which the Test profile allows for `navigate` — while the handler still parsed and
+/// ran `go_to` (audit N1). So a non-object body or a non-string `action` is refused.
+///
+/// A missing or unknown STRING action is gated as the bare tool name, as before: the
+/// handler's typed parse rejects it (listing the valid actions) before anything runs.
+/// That is sound only while every action variant is mapped here, which
+/// `every_action_variant_has_a_capability` pins for each compound tool's enum.
+///
+/// # Errors
+///
+/// Returns a human-readable message when the arguments are not a JSON object, or a
+/// compound tool's `action` is present but not a string.
+pub fn resolve_capability(tool: &str, args: &Value) -> Result<String, String> {
+    if !args.is_object() {
+        return Err(format!("arguments for '{tool}' must be a JSON object"));
     }
-    let Some(action) = args.get("action").and_then(Value::as_str) else {
-        return tool.to_string();
-    };
-    action_capability(tool, action).unwrap_or_else(|| tool.to_string())
+    if !is_compound_tool(tool) {
+        return Ok(tool.to_string());
+    }
+    match args.get("action") {
+        Some(Value::String(action)) => {
+            Ok(action_capability(tool, action).unwrap_or_else(|| tool.to_string()))
+        }
+        None => Ok(tool.to_string()),
+        Some(_) => Err(format!("`action` for tool '{tool}' must be a string")),
+    }
 }
 
 /// Map a `(compound tool, action)` pair to its canonical matrix identity.
@@ -153,7 +172,7 @@ pub fn action_capability(tool: &str, action: &str) -> Option<String> {
         },
         "logs" => match action {
             "console" | "network" | "ipc" | "navigation" | "dialogs" | "events" | "slow_ipc"
-            | "clear" => format!("logs.{action}"),
+            | "clear" | "backend" | "backend_digest" | "stdout" => format!("logs.{action}"),
             _ => return None,
         },
         "introspect" => match action {
@@ -180,6 +199,11 @@ pub fn action_capability(tool: &str, action: &str) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Test shim: the resolved capability, panicking on a refused call.
+    fn canonical_capability(tool: &str, args: &Value) -> String {
+        resolve_capability(tool, args).unwrap_or_else(|e| panic!("{tool}: refused: {e}"))
+    }
 
     #[test]
     fn standalone_tools_use_bare_name() {
@@ -241,7 +265,8 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_unknown_action_fails_closed_to_bare_name() {
+    fn missing_or_unknown_string_action_is_gated_as_the_bare_tool() {
+        // The handler's typed parse then rejects it before anything runs.
         assert_eq!(canonical_capability("route", &json!({})), "route");
         assert_eq!(
             canonical_capability("route", &json!({"action": "nonsense"})),
@@ -251,6 +276,41 @@ mod tests {
             canonical_capability("introspect", &json!({"action": "nonsense"})),
             "introspect"
         );
+    }
+
+    /// Audit N1: serde parses `{"go_to": null}` into `NavigateAction::GoTo`, and a
+    /// REST array body positionally into the params struct. Neither may slip past
+    /// the gate as the bare tool name.
+    #[test]
+    fn non_string_action_and_non_object_args_are_refused() {
+        for (tool, action, ..) in AUTHZ_SPEC {
+            let tagged = json!({ "action": { *action: null } });
+            assert!(
+                resolve_capability(tool, &tagged).is_err(),
+                "{tool}: tagged-enum action {tagged} must be refused"
+            );
+            for bad in [
+                json!({"action": 1}),
+                json!({"action": [action]}),
+                json!({"action": null}),
+            ] {
+                assert!(
+                    resolve_capability(tool, &bad).is_err(),
+                    "{tool}: {bad} must be refused"
+                );
+            }
+            let positional = json!([action, "https://evil.example", null, null, null, null]);
+            assert!(
+                resolve_capability(tool, &positional).is_err(),
+                "{tool}: positional array body must be refused"
+            );
+        }
+        for body in [json!([]), json!(null), json!("eval"), json!(1)] {
+            assert!(
+                resolve_capability("eval_js", &body).is_err(),
+                "{body} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -444,7 +504,10 @@ mod tests {
         ("logs", "events", "logs.events", true, true),
         ("logs", "slow_ipc", "logs.slow_ipc", true, true),
         ("logs", "clear", "logs.clear", false, true),
-        // introspect — FullControl-only (all 14 actions)
+        ("logs", "backend", "logs.backend", true, true),
+        ("logs", "backend_digest", "logs.backend_digest", true, true),
+        ("logs", "stdout", "logs.stdout", true, true),
+        // introspect — FullControl-only (all 15 actions)
         (
             "introspect",
             "command_timings",

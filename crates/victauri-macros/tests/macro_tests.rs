@@ -151,3 +151,68 @@ fn registry_from_auto_discovery() {
         "registry should contain load_user"
     );
 }
+
+// ── IPC argument keys (audit: the registry advertised Rust names, but Tauri invokes
+//    commands with camelCase keys by default, so an agent following it failed) ──
+
+#[victauri_macros::inspectable]
+fn large_payload(size_kb: usize, r#type: String) -> String {
+    let _ = (size_kb, r#type);
+    String::new()
+}
+
+#[victauri_macros::inspectable(rename_all = "snake_case")]
+fn snake_keys(size_kb: usize) -> usize {
+    size_kb
+}
+
+#[victauri_macros::inspectable(rename = "renamed_cmd")]
+fn original_name(user_id: u64) -> u64 {
+    user_id
+}
+
+/// A path-qualified `State` whose generics contain `::` is still an injected arg.
+#[victauri_macros::inspectable]
+fn with_injected(
+    app: fake_tauri_types::AppHandle,
+    state: fake_tauri_types::State<std::sync::Mutex<u8>>,
+    window: &fake_tauri_types::Window,
+    page_size: u32,
+) -> u32 {
+    let _ = (app, state, window);
+    page_size
+}
+
+#[test]
+fn arg_keys_follow_tauris_camel_case_default() {
+    let info = large_payload__schema();
+    assert_eq!(info.args[0].name, "size_kb");
+    assert_eq!(info.args[0].invoke_key(), "sizeKb");
+    // Raw identifiers are invoked without the `r#` prefix.
+    assert_eq!(info.args[1].name, "type");
+    assert_eq!(info.args[1].key, None);
+    // Unchanged keys stay implicit (`key: None`), as for single-word args.
+    assert_eq!(save_api_key__schema().args[0].key, None);
+}
+
+#[test]
+fn rename_all_snake_case_keeps_rust_names() {
+    let info = snake_keys__schema();
+    assert_eq!(info.args[0].invoke_key(), "size_kb");
+    assert_eq!(info.args[0].key, None);
+}
+
+#[test]
+fn rename_sets_the_invoked_command_name() {
+    let info = original_name__schema();
+    assert_eq!(info.name, "renamed_cmd");
+    assert_eq!(info.args[0].invoke_key(), "userId");
+}
+
+#[test]
+fn injected_framework_args_are_skipped_even_with_paths_in_generics() {
+    let info = with_injected__schema();
+    let names: Vec<&str> = info.args.iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(names, ["page_size"]);
+    assert_eq!(info.args[0].invoke_key(), "pageSize");
+}

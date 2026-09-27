@@ -1,8 +1,68 @@
 use std::sync::Arc;
-use tauri::{Runtime, State};
+use tauri::{Manager, Runtime, State};
 use victauri_core::{IpcCall, WindowState};
 
 use crate::VictauriState;
+
+/// Id prefix for evals started by page JS through these Tauri commands (vs. by an agent). The
+/// full id is `page:<uuid>:<window label>` (the uuid is fixed-length, so any label parses back).
+pub const PAGE_EVAL_PREFIX: &str = "page:";
+/// Pending-eval slots page-originated evals may hold at once, across all windows. They share
+/// the pending map with the agent's (MCP) evals; without their own small budget, page script
+/// could park never-resolving evals in every slot and starve the agent with "too many
+/// concurrent evals".
+pub const MAX_PAGE_PENDING_EVALS: usize = 25;
+/// Page-originated eval slots ONE window may hold, so one window cannot starve the others.
+pub const MAX_PAGE_PENDING_EVALS_PER_WINDOW: usize = 10;
+
+/// The window a page-originated eval id belongs to.
+fn page_eval_window(id: &str) -> Option<&str> {
+    let rest = id.strip_prefix(PAGE_EVAL_PREFIX)?;
+    rest.get(36..)?.strip_prefix(':')
+}
+
+/// Reserve a pending-eval slot for a page-originated eval from window `label`, within the
+/// per-window budget, the page budget and the global ceiling. The slot is released when the
+/// returned guard drops.
+pub async fn reserve_page_eval(
+    state: &VictauriState,
+    label: &str,
+    tx: tokio::sync::oneshot::Sender<String>,
+) -> Result<crate::PendingSlot, String> {
+    let id = format!("{PAGE_EVAL_PREFIX}{}:{label}", uuid::Uuid::new_v4());
+    let mut pending = state.pending_evals.lock().await;
+    let mut page_pending = 0;
+    let mut window_pending = 0;
+    for key in pending.keys().filter(|k| k.starts_with(PAGE_EVAL_PREFIX)) {
+        page_pending += 1;
+        if page_eval_window(key) == Some(label) {
+            window_pending += 1;
+        }
+    }
+    if window_pending >= MAX_PAGE_PENDING_EVALS_PER_WINDOW {
+        return Err(format!(
+            "too many concurrent page-originated evals from window '{label}' \
+             (limit {MAX_PAGE_PENDING_EVALS_PER_WINDOW})"
+        ));
+    }
+    if page_pending >= MAX_PAGE_PENDING_EVALS {
+        return Err(format!(
+            "too many concurrent page-originated evals (limit {MAX_PAGE_PENDING_EVALS})"
+        ));
+    }
+    if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
+        return Err(format!(
+            "too many concurrent evals (limit {})",
+            crate::mcp::MAX_PENDING_EVALS
+        ));
+    }
+    Ok(crate::PendingSlot::insert(
+        &state.pending_evals,
+        &mut pending,
+        id,
+        tx,
+    ))
+}
 
 #[tauri::command]
 pub async fn victauri_eval_js<R: Runtime>(
@@ -10,35 +70,24 @@ pub async fn victauri_eval_js<R: Runtime>(
     state: State<'_, Arc<VictauriState>>,
     code: String,
 ) -> Result<String, String> {
-    let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-
-    {
-        // Same ceiling the MCP eval path enforces: page JS can reach these commands, and
-        // never-resolving evals must not be able to fill the shared map and starve every
-        // agent eval with "too many concurrent" errors.
-        let mut pending = state.pending_evals.lock().await;
-        if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
-            return Err(format!(
-                "too many concurrent evals (limit {})",
-                crate::mcp::MAX_PENDING_EVALS
-            ));
-        }
-        pending.insert(id.clone(), tx);
-    }
+    // Released on every exit, including this future being dropped mid-wait.
+    let slot = reserve_page_eval(&state, webview.label(), tx).await?;
+    let id = serde_json::to_string(slot.id()).map_err(|e| e.to_string())?;
 
     let inject = format!(
         r"
         (async () => {{
             try {{
-                const __result = await (async () => {{ {code} }})();
+                const __result = await (async () => {{ {code}
+ }})();
                 await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: '{id}',
+                    id: {id},
                     result: JSON.stringify(__result)
                 }});
             }} catch (e) {{
                 await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: '{id}',
+                    id: {id},
                     result: JSON.stringify({{ __error: e.message }})
                 }});
             }}
@@ -46,26 +95,29 @@ pub async fn victauri_eval_js<R: Runtime>(
         "
     );
 
-    if let Err(e) = webview.eval(&inject) {
-        state.pending_evals.lock().await.remove(&id);
+    // Through the bridge, i.e. on the main thread and serialized with every other
+    // round trip — not a direct `webview.eval` from this tokio worker thread.
+    if let Err(e) = crate::bridge::WebviewBridge::eval_webview(
+        webview.app_handle(),
+        Some(webview.label()),
+        &inject,
+    ) {
         return Err(format!("eval failed: {e}"));
     }
 
     match tokio::time::timeout(state.eval_timeout, rx).await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(_)) => Err("eval callback channel closed".to_string()),
-        Err(_) => {
-            state.pending_evals.lock().await.remove(&id);
-            Err(format!(
-                "eval timed out after {}s",
-                state.eval_timeout.as_secs()
-            ))
-        }
+        Err(_) => Err(format!(
+            "eval timed out after {}s",
+            state.eval_timeout.as_secs()
+        )),
     }
 }
 
 #[tauri::command]
-pub async fn victauri_eval_callback(
+pub async fn victauri_eval_callback<R: Runtime>(
+    webview: tauri::Webview<R>,
     state: State<'_, Arc<VictauriState>>,
     id: String,
     result: String,
@@ -75,6 +127,13 @@ pub async fn victauri_eval_callback(
             .bridge_ready
             .store(true, std::sync::atomic::Ordering::Release);
         state.bridge_notify.notify_waiters();
+        // A (re)initialized bridge means this window loaded a new page: any eval still pending
+        // in its previous page can never answer. The signal carries the new page's nonce; the
+        // label comes from Tauri (the calling webview), so page script cannot touch another
+        // window's record. (A forged signal from the same page is weeded out by the eval,
+        // which asks the page for its current nonce before treating a signal as a reload.)
+        let nonce = (!result.is_empty()).then_some(result.as_str());
+        state.page_loads.record_load(webview.label(), nonce);
         return Ok(());
     }
     if let Some(tx) = state.pending_evals.lock().await.remove(&id) {
@@ -88,22 +147,10 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
     webview: tauri::WebviewWindow<R>,
     state: State<'_, Arc<VictauriState>>,
 ) -> Result<String, String> {
-    let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
-
-    {
-        // Same ceiling the MCP eval path enforces: page JS can reach these commands, and
-        // never-resolving evals must not be able to fill the shared map and starve every
-        // agent eval with "too many concurrent" errors.
-        let mut pending = state.pending_evals.lock().await;
-        if pending.len() >= crate::mcp::MAX_PENDING_EVALS {
-            return Err(format!(
-                "too many concurrent evals (limit {})",
-                crate::mcp::MAX_PENDING_EVALS
-            ));
-        }
-        pending.insert(id.clone(), tx);
-    }
+    // Released on every exit, including this future being dropped mid-wait.
+    let slot = reserve_page_eval(&state, webview.label(), tx).await?;
+    let id = serde_json::to_string(slot.id()).map_err(|e| e.to_string())?;
 
     let inject = format!(
         r"
@@ -111,12 +158,12 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
             try {{
                 const snapshot = window.__VICTAURI__?.snapshot();
                 await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: '{id}',
+                    id: {id},
                     result: JSON.stringify(snapshot)
                 }});
             }} catch (e) {{
                 await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: '{id}',
+                    id: {id},
                     result: JSON.stringify({{ __error: e.message }})
                 }});
             }}
@@ -124,21 +171,23 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
         "
     );
 
-    if let Err(e) = webview.eval(&inject) {
-        state.pending_evals.lock().await.remove(&id);
+    // Through the bridge, i.e. on the main thread and serialized with every other
+    // round trip — not a direct `webview.eval` from this tokio worker thread.
+    if let Err(e) = crate::bridge::WebviewBridge::eval_webview(
+        webview.app_handle(),
+        Some(webview.label()),
+        &inject,
+    ) {
         return Err(format!("snapshot eval failed: {e}"));
     }
 
     match tokio::time::timeout(state.eval_timeout, rx).await {
         Ok(Ok(result)) => Ok(result),
         Ok(Err(_)) => Err("snapshot callback channel closed".to_string()),
-        Err(_) => {
-            state.pending_evals.lock().await.remove(&id);
-            Err(format!(
-                "snapshot timed out after {}s",
-                state.eval_timeout.as_secs()
-            ))
-        }
+        Err(_) => Err(format!(
+            "snapshot timed out after {}s",
+            state.eval_timeout.as_secs()
+        )),
     }
 }
 

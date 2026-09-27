@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 /// A short-lived handle to a DOM element, identified by a semantic ref rather than a CSS selector.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RefHandle {
     /// Unique ref identifier (e.g. "e3") assigned during DOM snapshot.
     pub id: String,
@@ -19,6 +20,7 @@ pub struct RefHandle {
 
 /// Memory usage delta measured before and after a command execution.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MemoryDelta {
     /// Allocated bytes before the command ran.
     pub before_bytes: i64,
@@ -35,18 +37,14 @@ pub struct MemoryDelta {
 /// # Examples
 ///
 /// ```
-/// use victauri_core::VerificationResult;
+/// use victauri_core::verify_state;
 /// use serde_json::json;
 ///
-/// let result = VerificationResult {
-///     passed: true,
-///     frontend_state: json!({"count": 1}),
-///     backend_state: json!({"count": 1}),
-///     divergences: vec![],
-/// };
+/// let result = verify_state(json!({"count": 1}), json!({"count": 1}));
 /// assert!(result.passed);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct VerificationResult {
     /// True if no divergences were found between frontend and backend state.
     pub passed: bool,
@@ -60,6 +58,7 @@ pub struct VerificationResult {
 
 /// A single mismatch between frontend and backend state at a specific JSON path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct Divergence {
     /// Dot-separated JSON path where the mismatch occurs (e.g. "settings.theme").
     pub path: String,
@@ -107,30 +106,13 @@ impl fmt::Display for Divergence {
 /// # Examples
 ///
 /// ```
-/// use victauri_core::{VerificationResult, Divergence, DivergenceSeverity};
+/// use victauri_core::verify_state;
 /// use serde_json::json;
 ///
-/// let passed = VerificationResult {
-///     passed: true,
-///     frontend_state: json!({}),
-///     backend_state: json!({}),
-///     divergences: vec![],
-/// };
+/// let passed = verify_state(json!({}), json!({}));
 /// assert_eq!(passed.to_string(), "verification passed");
 ///
-/// let failed = VerificationResult {
-///     passed: false,
-///     frontend_state: json!({"a": 1}),
-///     backend_state: json!({"a": 2}),
-///     divergences: vec![
-///         Divergence {
-///             path: "a".to_string(),
-///             frontend_value: json!(1),
-///             backend_value: json!(2),
-///             severity: DivergenceSeverity::Error,
-///         },
-///     ],
-/// };
+/// let failed = verify_state(json!({"a": 1}), json!({"a": 2}));
 /// assert_eq!(failed.to_string(), "verification failed: 1 divergence(s)");
 /// ```
 impl fmt::Display for VerificationResult {

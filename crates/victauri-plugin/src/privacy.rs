@@ -13,6 +13,7 @@ use crate::redaction::Redactor;
 /// | `Test` | Yes | Yes | Storage writes | No |
 /// | `FullControl` | Yes | Yes | Yes | Yes |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PrivacyProfile {
     /// Read-only observation. Snapshots, logs, registry, accessibility, performance,
     /// window state — but no clicks, no input, no eval, no screenshots, no mutations.
@@ -42,7 +43,11 @@ impl std::fmt::Display for PrivacyProfile {
 /// overrides: command allowlists/blocklists, per-tool disabling, and output redaction.
 ///
 /// **Precedence:** explicit `disabled_tools` overrides → profile matrix → allowlist/blocklist.
+///
+/// `#[non_exhaustive]`: start from [`PrivacyConfig::default()`] (or one of the
+/// profile presets) and assign the `pub` fields you need.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct PrivacyConfig {
     /// The active privacy profile tier.
     pub profile: PrivacyProfile,
@@ -150,7 +155,9 @@ impl PrivacyConfig {
 /// Naming convention: standalone tools use bare names (`"eval_js"`), compound tool
 /// actions use dot-qualified names (`"window.manage"`, `"input.fill"`).
 ///
-/// Everything not explicitly listed defaults to allowed (open-world for new tools).
+/// `FullControl` allows everything. `Test` and `Observe` are **deny-by-default**:
+/// only the tools/actions explicitly listed for that profile are allowed, so a new
+/// tool stays blocked under them until it is added here.
 #[must_use]
 fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool {
     match profile {
@@ -220,6 +227,9 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "logs.dialogs"
                 | "logs.events"
                 | "logs.slow_ipc"
+                | "logs.backend"
+                | "logs.backend_digest"
+                | "logs.stdout"
                 // logs.clear erases captured logs — a test-time mutation, allowed
                 // in Test/FullControl but NOT in read-only Observe.
                 | "logs.clear"
@@ -267,6 +277,9 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
                 | "logs.dialogs"
                 | "logs.events"
                 | "logs.slow_ipc"
+                | "logs.backend"
+                | "logs.backend_digest"
+                | "logs.stdout"
                 // NOTE: logs.clear is intentionally excluded — clearing logs erases
                 // observable evidence, which the read-only Observe profile forbids.
                 | "inspect"
@@ -289,6 +302,7 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
 
 /// Create a [`PrivacyConfig`] for the `Observe` profile with redaction enabled.
 #[must_use]
+#[doc(hidden)]
 pub fn observe_privacy_config() -> PrivacyConfig {
     PrivacyConfig {
         profile: PrivacyProfile::Observe,
@@ -303,6 +317,7 @@ pub fn observe_privacy_config() -> PrivacyConfig {
 
 /// Create a [`PrivacyConfig`] for the `Test` profile with redaction enabled.
 #[must_use]
+#[doc(hidden)]
 pub fn test_privacy_config() -> PrivacyConfig {
     PrivacyConfig {
         profile: PrivacyProfile::Test,
@@ -320,6 +335,7 @@ pub fn test_privacy_config() -> PrivacyConfig {
 /// This is an alias for [`observe_privacy_config()`] — strict mode maps to the
 /// `Observe` profile.
 #[must_use]
+#[doc(hidden)]
 pub fn strict_privacy_config() -> PrivacyConfig {
     observe_privacy_config()
 }

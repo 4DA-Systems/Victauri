@@ -8,91 +8,91 @@ use victauri_core::types::DivergenceSeverity;
 use victauri_core::verification::AssertionCondition;
 use victauri_core::*;
 
+/// Builds a `#[non_exhaustive]` output type (e.g. `DomSnapshot`, `VerificationResult`)
+/// from named fields. These types are produced by victauri, never constructed by
+/// consumers, so outside the crate the only way to fabricate one is through serde —
+/// exactly how a client receives them.
+macro_rules! lit {
+    ($t:path { $($f:ident : $v:expr),* $(,)? }) => {{
+        let mut map = serde_json::Map::new();
+        $( map.insert(stringify!($f).to_owned(), serde_json::to_value($v).expect("serialize field")); )*
+        serde_json::from_value::<$t>(serde_json::Value::Object(map)).expect("build literal")
+    }};
+}
+
 fn ipc(id: &str, cmd: &str) -> AppEvent {
-    AppEvent::Ipc(IpcCall {
-        id: id.to_string(),
-        command: cmd.to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(1),
-        result: IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    })
+    AppEvent::Ipc(IpcCall::new(
+        id.to_string(),
+        cmd.to_string(),
+        Utc::now(),
+        IpcResult::Ok(serde_json::json!("ok")),
+        Some(1),
+        0,
+        "main".to_string(),
+    ))
 }
 
 fn ipc_pending(id: &str, cmd: &str) -> AppEvent {
-    AppEvent::Ipc(IpcCall {
-        id: id.to_string(),
-        command: cmd.to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    })
+    AppEvent::Ipc(IpcCall::new(
+        id.to_string(),
+        cmd.to_string(),
+        Utc::now(),
+        IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    ))
 }
 
 fn ipc_err(id: &str, cmd: &str, err: &str) -> AppEvent {
-    AppEvent::Ipc(IpcCall {
-        id: id.to_string(),
-        command: cmd.to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(1),
-        result: IpcResult::Err(err.to_string()),
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    })
+    AppEvent::Ipc(IpcCall::new(
+        id.to_string(),
+        cmd.to_string(),
+        Utc::now(),
+        IpcResult::Err(err.to_string()),
+        Some(1),
+        0,
+        "main".to_string(),
+    ))
 }
 
 fn state_change(key: &str) -> AppEvent {
-    AppEvent::StateChange {
-        key: key.to_string(),
-        timestamp: Utc::now(),
-        caused_by: None,
-    }
+    AppEvent::state_change(key.to_string(), Utc::now(), None)
 }
 
 fn dom_mutation(count: u32) -> AppEvent {
-    AppEvent::DomMutation {
-        webview_label: "main".to_string(),
-        timestamp: Utc::now(),
-        mutation_count: count,
-    }
+    AppEvent::dom_mutation("main".to_string(), Utc::now(), count)
 }
 
 fn window_event(label: &str, event: &str) -> AppEvent {
-    AppEvent::WindowEvent {
-        label: label.to_string(),
-        event: event.to_string(),
-        timestamp: Utc::now(),
-    }
+    AppEvent::window_event(label.to_string(), event.to_string(), Utc::now())
 }
 
 fn dom_interaction(action: InteractionKind, selector: &str) -> AppEvent {
-    AppEvent::DomInteraction {
+    AppEvent::dom_interaction(
         action,
-        selector: selector.to_string(),
-        value: None,
-        timestamp: Utc::now(),
-        webview_label: "main".to_string(),
-    }
+        selector.to_string(),
+        None,
+        Utc::now(),
+        "main".to_string(),
+    )
 }
 
 fn element(ref_id: &str, tag: &str) -> DomElement {
-    DomElement {
+    lit!(DomElement {
         ref_id: ref_id.to_string(),
         tag: tag.to_string(),
-        role: None,
-        name: None,
-        text: None,
-        value: None,
+        role: Option::<()>::None,
+        name: Option::<()>::None,
+        text: Option::<()>::None,
+        value: Option::<()>::None,
         enabled: true,
         visible: true,
         focusable: false,
-        bounds: None,
-        children: vec![],
-        attributes: BTreeMap::new(),
-    }
+        bounds: Option::<()>::None,
+        children: Vec::<()>::new(),
+        attributes: BTreeMap::<String, String>::new(),
+    })
 }
 
 fn assertion(
@@ -100,11 +100,7 @@ fn assertion(
     cond: AssertionCondition,
     expected: serde_json::Value,
 ) -> SemanticAssertion {
-    SemanticAssertion {
-        label: label.to_string(),
-        condition: cond,
-        expected,
-    }
+    SemanticAssertion::new(label.to_string(), cond, expected)
 }
 
 // ── Group 1: EventLog Ring Buffer Adversarial ────────────────────────────
@@ -253,11 +249,7 @@ fn eventlog_snapshot_range_after_wraparound() {
 fn eventlog_since_returns_events_at_exact_timestamp() {
     let ts = Utc::now();
     let log = EventLog::new(100);
-    log.push(AppEvent::StateChange {
-        key: "exact".to_string(),
-        timestamp: ts,
-        caused_by: None,
-    });
+    log.push(AppEvent::state_change("exact".to_string(), ts, None));
     let result = log.since(ts);
     assert_eq!(result.len(), 1);
 }
@@ -427,18 +419,9 @@ fn registry_command_info_all_optional_fields() {
         .with_category("admin");
     cmd.plugin = Some("my_plugin".to_string());
     cmd.args = vec![
-        CommandArg {
-            name: "arg1".to_string(),
-            type_name: "String".to_string(),
-            required: true,
-            schema: Some(serde_json::json!({"type": "string"})),
-        },
-        CommandArg {
-            name: "arg2".to_string(),
-            type_name: "Option<u32>".to_string(),
-            required: false,
-            schema: None,
-        },
+        CommandArg::new("arg1".to_string(), "String".to_string(), true)
+            .with_schema(serde_json::json!({"type": "string"})),
+        CommandArg::new("arg2".to_string(), "Option<u32>".to_string(), false),
     ];
     cmd.return_type = Some("Result<(), Error>".to_string());
     cmd.is_async = true;
@@ -593,12 +576,7 @@ fn recorder_export_json_roundtrip() {
 #[test]
 fn recorder_import_invalid_session_empty() {
     let rec = EventRecorder::new(100);
-    let session = RecordedSession {
-        id: "empty".to_string(),
-        started_at: Utc::now(),
-        events: vec![],
-        checkpoints: vec![],
-    };
+    let session = RecordedSession::new("empty".to_string(), Utc::now(), vec![], vec![]);
     rec.import(session);
     assert!(rec.is_recording());
     assert_eq!(rec.event_count(), 0);
@@ -732,28 +710,16 @@ fn recorder_import_replaces_active() {
     let rec = EventRecorder::new(100);
     rec.start("original".to_string()).unwrap();
     rec.record_event(ipc("1", "orig_cmd"));
-    let session = RecordedSession {
-        id: "imported".to_string(),
-        started_at: Utc::now(),
-        events: vec![
-            RecordedEvent {
-                index: 0,
-                timestamp: Utc::now(),
-                event: ipc("10", "imp_a"),
-            },
-            RecordedEvent {
-                index: 1,
-                timestamp: Utc::now(),
-                event: ipc("11", "imp_b"),
-            },
-            RecordedEvent {
-                index: 2,
-                timestamp: Utc::now(),
-                event: ipc("12", "imp_c"),
-            },
+    let session = RecordedSession::new(
+        "imported".to_string(),
+        Utc::now(),
+        vec![
+            RecordedEvent::new(0, Utc::now(), ipc("10", "imp_a")),
+            RecordedEvent::new(1, Utc::now(), ipc("11", "imp_b")),
+            RecordedEvent::new(2, Utc::now(), ipc("12", "imp_c")),
         ],
-        checkpoints: vec![],
-    };
+        vec![],
+    );
     rec.import(session);
     assert_eq!(rec.event_count(), 3);
     let stopped = rec.stop().unwrap();
@@ -805,11 +771,14 @@ fn dom_deep_nesting_is_depth_bounded() {
         el
     }
     // 1000 levels > the 256 DOM cap (so the guard fires) but is safe to drop.
-    let snap = DomSnapshot {
+    // (Built empty then filled: serde can't round-trip 1000 levels, which is
+    // the very depth this test is about.)
+    let mut snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![build_nested(1000)],
-        ref_map: BTreeMap::new(),
-    };
+        elements: Vec::<()>::new(),
+        ref_map: BTreeMap::<String, String>::new(),
+    });
+    snap.elements = vec![build_nested(1000)];
     let text = snap.to_accessible_text(0); // guard prevents recursing past the cap
     assert!(
         text.contains("max DOM depth"),
@@ -835,11 +804,11 @@ fn dom_wide_tree_1000_children() {
     let mut root = element("root", "div");
     root.visible = true;
     root.children = children;
-    let snap = DomSnapshot {
+    let snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
         elements: vec![root],
-        ref_map: BTreeMap::new(),
-    };
+        ref_map: BTreeMap::<String, String>::new(),
+    });
     let text = snap.to_accessible_text(0);
     assert!(text.contains("Child 0"));
     assert!(text.contains("Child 999"));
@@ -847,17 +816,17 @@ fn dom_wide_tree_1000_children() {
 
 #[test]
 fn dom_empty_tree() {
-    let snap = DomSnapshot {
+    let snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![],
-        ref_map: BTreeMap::new(),
-    };
+        elements: Vec::<()>::new(),
+        ref_map: BTreeMap::<String, String>::new(),
+    });
     assert!(snap.to_accessible_text(0).is_empty());
 }
 
 #[test]
 fn dom_element_all_optional_fields() {
-    let el = DomElement {
+    let el = lit!(DomElement {
         ref_id: "e1".to_string(),
         tag: "input".to_string(),
         role: Some("textbox".to_string()),
@@ -867,25 +836,25 @@ fn dom_element_all_optional_fields() {
         enabled: true,
         visible: true,
         focusable: true,
-        bounds: Some(snapshot::ElementBounds {
+        bounds: Some(lit!(snapshot::ElementBounds {
             x: 10.0,
             y: 20.0,
             width: 200.0,
             height: 30.0,
-        }),
-        children: vec![],
+        })),
+        children: Vec::<()>::new(),
         attributes: {
             let mut m = BTreeMap::new();
             m.insert("type".to_string(), "email".to_string());
             m.insert("placeholder".to_string(), "Enter email".to_string());
             m
         },
-    };
-    let snap = DomSnapshot {
+    });
+    let snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
         elements: vec![el],
-        ref_map: BTreeMap::new(),
-    };
+        ref_map: BTreeMap::<String, String>::new(),
+    });
     let text = snap.to_accessible_text(0);
     assert!(text.contains("textbox"));
     assert!(text.contains("Email"));
@@ -895,11 +864,11 @@ fn dom_element_all_optional_fields() {
 #[test]
 fn dom_element_minimal() {
     let el = element("e0", "div");
-    let snap = DomSnapshot {
+    let snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
         elements: vec![el],
-        ref_map: BTreeMap::new(),
-    };
+        ref_map: BTreeMap::<String, String>::new(),
+    });
     let text = snap.to_accessible_text(0);
     assert!(text.contains("div"));
 }
@@ -917,11 +886,11 @@ fn dom_ref_handle_uniqueness() {
     let mut root = element("root", "div");
     root.visible = true;
     root.children = children;
-    let snap = DomSnapshot {
+    let snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
         elements: vec![root],
-        ref_map: BTreeMap::new(),
-    };
+        ref_map: BTreeMap::<String, String>::new(),
+    });
     let text = snap.to_accessible_text(0);
     for i in 0..100 {
         assert!(text.contains(&format!("[ref=e{i}]")));
@@ -930,24 +899,24 @@ fn dom_ref_handle_uniqueness() {
 
 #[test]
 fn dom_serde_roundtrip() {
-    let snap = DomSnapshot {
+    let snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
-        elements: vec![DomElement {
+        elements: vec![lit!(DomElement {
             ref_id: "e0".to_string(),
             tag: "div".to_string(),
             role: Some("main".to_string()),
             name: Some("Content".to_string()),
             text: Some("Hello".to_string()),
-            value: None,
+            value: Option::<()>::None,
             enabled: true,
             visible: true,
             focusable: false,
-            bounds: Some(snapshot::ElementBounds {
+            bounds: Some(lit!(snapshot::ElementBounds {
                 x: 0.0,
                 y: 0.0,
                 width: 1920.0,
                 height: 1080.0,
-            }),
+            })),
             children: vec![{
                 let mut child = element("e1", "button");
                 child.role = Some("button".to_string());
@@ -956,15 +925,15 @@ fn dom_serde_roundtrip() {
                 child.visible = true;
                 child
             }],
-            attributes: BTreeMap::new(),
-        }],
+            attributes: BTreeMap::<String, String>::new(),
+        })],
         ref_map: {
             let mut m = BTreeMap::new();
             m.insert("e0".to_string(), "div.main".to_string());
             m.insert("e1".to_string(), "button.click".to_string());
             m
         },
-    };
+    });
     let json = serde_json::to_string(&snap).unwrap();
     let roundtripped: DomSnapshot = serde_json::from_str(&json).unwrap();
     assert_eq!(roundtripped.webview_label, "main");
@@ -981,23 +950,23 @@ fn dom_invisible_parent_hides_subtree() {
     child.visible = true;
     child.name = Some("Hidden button".to_string());
     parent.children = vec![child];
-    let snap = DomSnapshot {
+    let snap = lit!(DomSnapshot {
         webview_label: "main".to_string(),
         elements: vec![parent],
-        ref_map: BTreeMap::new(),
-    };
+        ref_map: BTreeMap::<String, String>::new(),
+    });
     let text = snap.to_accessible_text(0);
     assert!(!text.contains("Hidden button"));
 }
 
 #[test]
 fn dom_element_bounds_serde() {
-    let bounds = snapshot::ElementBounds {
+    let bounds = lit!(snapshot::ElementBounds {
         x: -10.5,
         y: 0.0,
         width: 100.123,
         height: 50.999,
-    };
+    });
     let json = serde_json::to_string(&bounds).unwrap();
     let rt: snapshot::ElementBounds = serde_json::from_str(&json).unwrap();
     assert_eq!(rt.x, -10.5);
@@ -1264,18 +1233,16 @@ fn assertion_truthy_empty_object_is_truthy() {
 
 #[test]
 fn window_state_serde_roundtrip() {
-    let state = WindowState {
-        label: "main".to_string(),
-        title: "Test App".to_string(),
-        url: "https://example.com".to_string(),
-        visible: true,
-        focused: false,
-        maximized: true,
-        minimized: false,
-        fullscreen: false,
-        position: (100, 200),
-        size: (1920, 1080),
-    };
+    let state = WindowState::new("main".to_string())
+        .with_title("Test App".to_string())
+        .with_url("https://example.com".to_string())
+        .with_visible(true)
+        .with_focused(false)
+        .with_maximized(true)
+        .with_minimized(false)
+        .with_fullscreen(false)
+        .with_position(100, 200)
+        .with_size(1920, 1080);
     let json = serde_json::to_string(&state).unwrap();
     let rt: WindowState = serde_json::from_str(&json).unwrap();
     assert_eq!(rt, state);
@@ -1283,18 +1250,16 @@ fn window_state_serde_roundtrip() {
 
 #[test]
 fn window_state_extreme_values() {
-    let state = WindowState {
-        label: "".to_string(),
-        title: "".to_string(),
-        url: "".to_string(),
-        visible: false,
-        focused: false,
-        maximized: false,
-        minimized: false,
-        fullscreen: false,
-        position: (i32::MIN, i32::MAX),
-        size: (0, u32::MAX),
-    };
+    let state = WindowState::new("".to_string())
+        .with_title("".to_string())
+        .with_url("".to_string())
+        .with_visible(false)
+        .with_focused(false)
+        .with_maximized(false)
+        .with_minimized(false)
+        .with_fullscreen(false)
+        .with_position(i32::MIN, i32::MAX)
+        .with_size(0, u32::MAX);
     let json = serde_json::to_string(&state).unwrap();
     let rt: WindowState = serde_json::from_str(&json).unwrap();
     assert_eq!(rt.position, (i32::MIN, i32::MAX));
@@ -1303,20 +1268,20 @@ fn window_state_extreme_values() {
 
 #[test]
 fn ghost_command_report_serde_roundtrip() {
-    let report = GhostCommandReport {
-        frontend_only: vec![GhostCommand {
+    let report = lit!(GhostCommandReport {
+        frontend_only: vec![lit!(GhostCommand {
             name: "phantom_cmd".to_string(),
             source: GhostSource::FrontendOnly,
             description: Some("A ghost".to_string()),
-        }],
-        registry_only: vec![GhostCommand {
+        })],
+        registry_only: vec![lit!(GhostCommand {
             name: "unused_backend".to_string(),
             source: GhostSource::RegistryOnly,
-            description: None,
-        }],
+            description: Option::<()>::None,
+        })],
         total_frontend_commands: 5,
         total_registry_commands: 3,
-    };
+    });
     let json = serde_json::to_string(&report).unwrap();
     let rt: GhostCommandReport = serde_json::from_str(&json).unwrap();
     assert_eq!(rt, report);
@@ -1324,27 +1289,27 @@ fn ghost_command_report_serde_roundtrip() {
 
 #[test]
 fn ipc_integrity_report_serde_roundtrip() {
-    let report = verification::IpcIntegrityReport {
+    let report = lit!(verification::IpcIntegrityReport {
         total_calls: 100,
         completed: 90,
         pending: 5,
         errored: 5,
-        stale_calls: vec![verification::StaleCall {
+        stale_calls: vec![lit!(verification::StaleCall {
             id: "s1".to_string(),
             command: "slow_cmd".to_string(),
             timestamp: Utc::now(),
             age_ms: 10000,
             webview_label: "main".to_string(),
-        }],
-        error_calls: vec![verification::ErrorCall {
+        })],
+        error_calls: vec![lit!(verification::ErrorCall {
             id: "e1".to_string(),
             command: "bad_cmd".to_string(),
             timestamp: Utc::now(),
             error: "boom".to_string(),
             webview_label: "main".to_string(),
-        }],
+        })],
         healthy: false,
-    };
+    });
     let json = serde_json::to_string(&report).unwrap();
     let rt: verification::IpcIntegrityReport = serde_json::from_str(&json).unwrap();
     assert_eq!(rt.total_calls, 100);
@@ -1355,29 +1320,21 @@ fn ipc_integrity_report_serde_roundtrip() {
 
 #[test]
 fn recorded_session_serde_roundtrip() {
-    let session = RecordedSession {
-        id: "test-session".to_string(),
-        started_at: Utc::now(),
-        events: vec![
-            RecordedEvent {
-                index: 0,
-                timestamp: Utc::now(),
-                event: ipc("1", "cmd_a"),
-            },
-            RecordedEvent {
-                index: 1,
-                timestamp: Utc::now(),
-                event: state_change("k"),
-            },
+    let session = RecordedSession::new(
+        "test-session".to_string(),
+        Utc::now(),
+        vec![
+            RecordedEvent::new(0, Utc::now(), ipc("1", "cmd_a")),
+            RecordedEvent::new(1, Utc::now(), state_change("k")),
         ],
-        checkpoints: vec![StateCheckpoint {
+        vec![lit!(StateCheckpoint {
             id: "cp1".to_string(),
             label: Some("Midpoint".to_string()),
             timestamp: Utc::now(),
             state: serde_json::json!({"count": 42}),
             event_index: 1,
-        }],
-    };
+        })],
+    );
     let json = serde_json::to_string(&session).unwrap();
     let rt: RecordedSession = serde_json::from_str(&json).unwrap();
     assert_eq!(rt.id, "test-session");
@@ -1388,17 +1345,17 @@ fn recorded_session_serde_roundtrip() {
 
 #[test]
 fn verification_result_serde_roundtrip() {
-    let result = VerificationResult {
+    let result = lit!(VerificationResult {
         passed: false,
         frontend_state: serde_json::json!({"x": 1}),
         backend_state: serde_json::json!({"x": 2}),
-        divergences: vec![Divergence {
+        divergences: vec![lit!(Divergence {
             path: "x".to_string(),
             frontend_value: serde_json::json!(1),
             backend_value: serde_json::json!(2),
             severity: DivergenceSeverity::Error,
-        }],
-    };
+        })],
+    });
     let json = serde_json::to_string(&result).unwrap();
     let rt: VerificationResult = serde_json::from_str(&json).unwrap();
     assert_eq!(rt, result);
@@ -1406,11 +1363,11 @@ fn verification_result_serde_roundtrip() {
 
 #[test]
 fn semantic_assertion_serde_roundtrip() {
-    let a = SemanticAssertion {
-        label: "count check".to_string(),
-        condition: AssertionCondition::GreaterThan,
-        expected: serde_json::json!(10),
-    };
+    let a = SemanticAssertion::new(
+        "count check".to_string(),
+        AssertionCondition::GreaterThan,
+        serde_json::json!(10),
+    );
     let json = serde_json::to_string(&a).unwrap();
     let rt: SemanticAssertion = serde_json::from_str(&json).unwrap();
     assert_eq!(rt, a);
@@ -1418,13 +1375,13 @@ fn semantic_assertion_serde_roundtrip() {
 
 #[test]
 fn assertion_result_serde_roundtrip() {
-    let result = AssertionResult {
+    let result = lit!(AssertionResult {
         label: "test".to_string(),
         passed: false,
         actual: serde_json::json!(5),
         expected: serde_json::json!(10),
         message: Some("failed".to_string()),
-    };
+    });
     let json = serde_json::to_string(&result).unwrap();
     let rt: AssertionResult = serde_json::from_str(&json).unwrap();
     assert_eq!(rt, result);
@@ -1462,12 +1419,12 @@ fn app_event_all_variants_serde() {
 
 #[test]
 fn ref_handle_serde_roundtrip() {
-    let handle = RefHandle {
+    let handle = lit!(RefHandle {
         id: "e5".to_string(),
         selector: "button.submit".to_string(),
         role: Some("button".to_string()),
         name: Some("Submit".to_string()),
-    };
+    });
     let json = serde_json::to_string(&handle).unwrap();
     let rt: RefHandle = serde_json::from_str(&json).unwrap();
     assert_eq!(rt, handle);
@@ -1475,12 +1432,12 @@ fn ref_handle_serde_roundtrip() {
 
 #[test]
 fn memory_delta_serde_roundtrip() {
-    let delta = types::MemoryDelta {
+    let delta = lit!(types::MemoryDelta {
         before_bytes: 1024,
         after_bytes: 2048,
         delta_bytes: 1024,
         command: "allocate".to_string(),
-    };
+    });
     let json = serde_json::to_string(&delta).unwrap();
     let rt: types::MemoryDelta = serde_json::from_str(&json).unwrap();
     assert_eq!(rt, delta);
@@ -1698,43 +1655,43 @@ fn concurrent_eventlog_clear_during_push() {
 
 #[test]
 fn display_verification_result_passed() {
-    let result = VerificationResult {
+    let result = lit!(VerificationResult {
         passed: true,
         frontend_state: serde_json::json!({}),
         backend_state: serde_json::json!({}),
-        divergences: vec![],
-    };
+        divergences: Vec::<()>::new(),
+    });
     assert_eq!(result.to_string(), "verification passed");
 }
 
 #[test]
 fn display_verification_result_failed() {
-    let result = VerificationResult {
+    let result = lit!(VerificationResult {
         passed: false,
         frontend_state: serde_json::json!({}),
         backend_state: serde_json::json!({}),
-        divergences: vec![Divergence {
+        divergences: vec![lit!(Divergence {
             path: "x".to_string(),
             frontend_value: serde_json::json!(1),
             backend_value: serde_json::json!(2),
             severity: DivergenceSeverity::Error,
-        }],
-    };
+        })],
+    });
     assert_eq!(result.to_string(), "verification failed: 1 divergence(s)");
 }
 
 #[test]
 fn display_ghost_command_report() {
-    let report = GhostCommandReport {
-        frontend_only: vec![GhostCommand {
+    let report = lit!(GhostCommandReport {
+        frontend_only: vec![lit!(GhostCommand {
             name: "phantom".to_string(),
             source: GhostSource::FrontendOnly,
-            description: None,
-        }],
-        registry_only: vec![],
+            description: Option::<()>::None,
+        })],
+        registry_only: Vec::<()>::new(),
         total_frontend_commands: 2,
         total_registry_commands: 1,
-    };
+    });
     assert_eq!(
         report.to_string(),
         "1 ghost command(s) (2 frontend, 1 registry)"
@@ -1743,29 +1700,29 @@ fn display_ghost_command_report() {
 
 #[test]
 fn display_ipc_integrity_healthy() {
-    let report = verification::IpcIntegrityReport {
+    let report = lit!(verification::IpcIntegrityReport {
         total_calls: 10,
         completed: 10,
         pending: 0,
         errored: 0,
-        stale_calls: vec![],
-        error_calls: vec![],
+        stale_calls: Vec::<()>::new(),
+        error_calls: Vec::<()>::new(),
         healthy: true,
-    };
+    });
     assert_eq!(report.to_string(), "IPC healthy: 10/10 completed");
 }
 
 #[test]
 fn display_ipc_integrity_unhealthy() {
-    let report = verification::IpcIntegrityReport {
+    let report = lit!(verification::IpcIntegrityReport {
         total_calls: 10,
         completed: 7,
         pending: 2,
         errored: 1,
-        stale_calls: vec![],
-        error_calls: vec![],
+        stale_calls: Vec::<()>::new(),
+        error_calls: Vec::<()>::new(),
         healthy: false,
-    };
+    });
     assert!(report.to_string().contains("unhealthy"));
 }
 
@@ -1794,15 +1751,15 @@ fn display_ipc_result() {
 
 #[test]
 fn display_ipc_call() {
-    let call = IpcCall {
-        id: "42".to_string(),
-        command: "save".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
-        result: IpcResult::Ok(serde_json::json!("ok")),
-        arg_size_bytes: 10,
-        webview_label: "main".to_string(),
-    };
+    let call = IpcCall::new(
+        "42".to_string(),
+        "save".to_string(),
+        Utc::now(),
+        IpcResult::Ok(serde_json::json!("ok")),
+        Some(5),
+        10,
+        "main".to_string(),
+    );
     let s = call.to_string();
     assert!(s.contains("save"));
     assert!(s.contains("[42]"));
@@ -1810,10 +1767,10 @@ fn display_ipc_call() {
 
 #[test]
 fn display_scored_command() {
-    let sc = ScoredCommand {
+    let sc = lit!(ScoredCommand {
         command: CommandInfo::new("test_cmd"),
         score: 5.75,
-    };
+    });
     let s = sc.to_string();
     assert!(s.contains("test_cmd"));
     assert!(s.contains("5.75"));
@@ -1977,15 +1934,15 @@ fn error_display_messages() {
 
 #[test]
 fn ipc_call_into_app_event() {
-    let call = IpcCall {
-        id: "1".to_string(),
-        command: "test".to_string(),
-        timestamp: Utc::now(),
-        duration_ms: None,
-        result: IpcResult::Pending,
-        arg_size_bytes: 0,
-        webview_label: "main".to_string(),
-    };
+    let call = IpcCall::new(
+        "1".to_string(),
+        "test".to_string(),
+        Utc::now(),
+        IpcResult::Pending,
+        None,
+        0,
+        "main".to_string(),
+    );
     let event: AppEvent = call.into();
     assert!(matches!(event, AppEvent::Ipc(_)));
 }
@@ -1994,37 +1951,25 @@ fn ipc_call_into_app_event() {
 fn app_event_timestamp_all_variants() {
     let ts = Utc::now();
     let events = vec![
-        AppEvent::Ipc(IpcCall {
-            id: "1".to_string(),
-            command: "cmd".to_string(),
-            timestamp: ts,
-            duration_ms: None,
-            result: IpcResult::Pending,
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        }),
-        AppEvent::StateChange {
-            key: "k".to_string(),
-            timestamp: ts,
-            caused_by: None,
-        },
-        AppEvent::DomMutation {
-            webview_label: "main".to_string(),
-            timestamp: ts,
-            mutation_count: 1,
-        },
-        AppEvent::DomInteraction {
-            action: InteractionKind::Click,
-            selector: "#x".to_string(),
-            value: None,
-            timestamp: ts,
-            webview_label: "main".to_string(),
-        },
-        AppEvent::WindowEvent {
-            label: "main".to_string(),
-            event: "focus".to_string(),
-            timestamp: ts,
-        },
+        AppEvent::Ipc(IpcCall::new(
+            "1".to_string(),
+            "cmd".to_string(),
+            ts,
+            IpcResult::Pending,
+            None,
+            0,
+            "main".to_string(),
+        )),
+        AppEvent::state_change("k".to_string(), ts, None),
+        AppEvent::dom_mutation("main".to_string(), ts, 1),
+        AppEvent::dom_interaction(
+            InteractionKind::Click,
+            "#x".to_string(),
+            None,
+            ts,
+            "main".to_string(),
+        ),
+        AppEvent::window_event("main".to_string(), "focus".to_string(), ts),
     ];
     for event in &events {
         assert_eq!(event.timestamp(), ts);
@@ -2097,16 +2042,12 @@ fn record_event_after_max_index_import_does_not_panic() {
     // debug / wrap in release (audit #18 — the saturating_add belongs in
     // record_event, not only in import).
     let rec = EventRecorder::new(100);
-    let session = RecordedSession {
-        id: "evil".to_string(),
-        started_at: Utc::now(),
-        events: vec![RecordedEvent {
-            index: usize::MAX,
-            timestamp: Utc::now(),
-            event: ipc("m", "cmd"),
-        }],
-        checkpoints: vec![],
-    };
+    let session = RecordedSession::new(
+        "evil".to_string(),
+        Utc::now(),
+        vec![RecordedEvent::new(usize::MAX, Utc::now(), ipc("m", "cmd"))],
+        vec![],
+    );
     rec.import(session);
     rec.record_event(ipc("after", "cmd")); // must not panic
     assert!(rec.event_count() >= 1);

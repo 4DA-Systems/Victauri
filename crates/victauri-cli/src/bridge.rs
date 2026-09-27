@@ -400,15 +400,37 @@ fn may_replay(msg: &Value, err: &anyhow::Error) -> bool {
         .is_some_and(reqwest::Error::is_connect)
 }
 
+/// Whole-request HTTP timeout for a forwarded message that sets no longer wait of its own.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Headroom on top of a tool call's own `timeout_ms`: before its wait starts the server may
+/// wait for the bridge, probe it (up to 2s) and make main-thread round trips (up to 10s each).
+const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(40);
+/// The server's ceiling for any per-call `timeout_ms` (`invoke_command`; `wait_for` caps lower).
+const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
+
+/// HTTP timeout for forwarding `msg`. A tool call that blocks server-side for a caller-chosen
+/// `timeout_ms` (`invoke_command` up to 300s, `wait_for` up to 120s) must outlast that wait;
+/// with the fixed 120s timeout such calls failed at the bridge while the command kept running.
+fn request_timeout_for(msg: &Value) -> Duration {
+    msg.pointer("/params/arguments/timeout_ms")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_REQUEST_TIMEOUT, |ms| {
+            DEFAULT_REQUEST_TIMEOUT
+                .max(Duration::from_millis(ms.min(MAX_TOOL_TIMEOUT_MS)) + TOOL_TIMEOUT_HEADROOM)
+        })
+}
+
 /// Error text for a tool call that was (probably) delivered but got no response.
-fn undelivered_response_message(err: &anyhow::Error, app_still_up: bool) -> String {
+fn undelivered_response_message(msg: &Value, err: &anyhow::Error, app_still_up: bool) -> String {
     let timed_out = err
         .downcast_ref::<reqwest::Error>()
         .is_some_and(reqwest::Error::is_timeout);
     let what = if timed_out {
-        "the tool call was sent to the app but no response arrived before the bridge's \
-         120s timeout"
-            .to_string()
+        format!(
+            "the tool call was sent to the app but no response arrived before the bridge's \
+             {}s timeout",
+            request_timeout_for(msg).as_secs()
+        )
     } else if app_still_up {
         "the tool call was sent to the app but the connection closed before a response \
          arrived (the app is still running — it may have restarted or reloaded while handling \
@@ -674,7 +696,7 @@ async fn forward_with_retries(
                     return ForwardResult::Payloads(vec![error_for_request(
                         msg,
                         -32000,
-                        &undelivered_response_message(&e, still_up),
+                        &undelivered_response_message(msg, &e, still_up),
                     )]);
                 }
                 if attempt + 1 < MAX_RETRIES {
@@ -706,8 +728,9 @@ async fn forward_with_retries(
 }
 
 fn build_client() -> Result<reqwest::Client> {
+    // The default; `post_message` sets each request's own (see `request_timeout_for`).
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(DEFAULT_REQUEST_TIMEOUT)
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(Into::into)
@@ -739,6 +762,7 @@ async fn post_message(
     let url = format!("http://127.0.0.1:{port}/mcp");
     let mut req = http
         .post(&url)
+        .timeout(request_timeout_for(msg))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(t) = token {
@@ -834,9 +858,9 @@ async fn scan_once(app: Option<&str>) -> Selection {
         });
     }
 
-    // Liveness-FIRST (batched), then health. `alive_pids` snapshots every live PID in ONE OS
-    // call (~60ms), so a machine with many stale discovery dirs (dead dev sessions) is filtered
-    // for ~free instead of one process spawn PER dir. Crucially we then health-check ONLY the
+    // Liveness-FIRST, then health. On Unix `alive_pids` snapshots our user's live PIDs in ONE
+    // `ps` call, so many stale discovery dirs cost one spawn, not one each; on Windows each PID
+    // is checked in-process (no spawn at all). Crucially we then health-check ONLY the
     // live-pid entries: a stale dir whose long-dead port was reused by some other service is
     // never probed (that mis-order made a down-state scan hang on an unresponsive reused port).
     // When the app is down there are zero live entries, so zero health probes — the poller
@@ -849,6 +873,12 @@ async fn scan_once(app: Option<&str>) -> Selection {
     // binding the freed port, could still pass liveness+health+identity and receive the token.
     // Re-resolving on every forward (audit #1) shrinks this to a per-call coincidence rather than
     // a cache-lifetime one; fully closing it needs mutual auth on `/health` (a plugin-side change).
+    let entries = discover_entries();
+    // Nothing discovered (the app is down): nothing to check, so no process enumeration —
+    // the availability poller runs this every 1.5 s.
+    if entries.is_empty() {
+        return Selection::None;
+    }
     let alive = alive_pids();
     let is_alive = |pid: u32| {
         alive
@@ -856,7 +886,7 @@ async fn scan_once(app: Option<&str>) -> Selection {
             .map_or_else(|| is_process_alive(pid), |set| set.contains(&pid))
     };
     let mut live = Vec::new();
-    for (pid, s) in discover_entries() {
+    for (pid, s) in entries {
         if is_alive(pid) && health_ok(s.port).await {
             live.push(s);
         }
@@ -917,6 +947,33 @@ enum Selection {
     Ambiguous(Vec<String>),
 }
 
+/// One trusted-discovery scan for other CLI commands (`victauri logs`): the live backend
+/// matching `app` (or the only one) as `(port, token, label)`.
+///
+/// # Errors
+/// Returns a message naming the running apps when the choice is ambiguous, or saying none
+/// is reachable.
+pub async fn resolve_backend(
+    app: Option<&str>,
+) -> std::result::Result<(u16, Option<String>, String), String> {
+    let app = app.map(str::to_string).or_else(|| {
+        std::env::var("VICTAURI_APP")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+    match scan_once(app.as_deref()).await {
+        Selection::One(s) => Ok((s.port, s.token.clone(), s.label())),
+        Selection::None => Err(match app {
+            Some(a) => format!("no running Victauri app matches '{a}'"),
+            None => "no running Victauri app found".to_string(),
+        }),
+        Selection::Ambiguous(labels) => Err(format!(
+            "several Victauri apps are running — pick one with --app <identifier>:\n  {}",
+            labels.join("\n  ")
+        )),
+    }
+}
+
 /// Pick the server matching `app`, or the sole running server.
 fn select(live: &[ServerInfo], app: Option<&str>) -> Selection {
     if live.is_empty() {
@@ -967,15 +1024,57 @@ fn select(live: &[ServerInfo], app: Option<&str>) -> Selection {
 /// filter in [`scan_once`], which is what keeps a down-state scan fast: a dead/stale port
 /// refuses the connection instantly, so no process enumeration runs at all.
 fn discover_entries() -> Vec<(u32, ServerInfo)> {
-    let root = std::env::temp_dir().join("victauri");
     let mut out = Vec::new();
+    for root in discovery_roots() {
+        discover_entries_in(&root, &mut out);
+    }
+    out
+}
+
+/// The discovery roots the plugin may have written to, most specific first (mirrors the
+/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
+/// that directory is private to us, else `<temp>/victauri-<euid>` — and the legacy shared
+/// `<temp>/victauri` is still read (a pre-0.9 plugin writes there) when it passes the same
+/// ownership check. Other platforms use `<temp>/victauri` (a per-user temp dir).
+fn discovery_roots() -> Vec<std::path::PathBuf> {
+    let legacy = std::env::temp_dir().join("victauri");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut roots = Vec::new();
+        if let Some(euid) = current_euid() {
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(std::path::PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .filter(|dir| {
+                    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                        m.file_type().is_dir()
+                            && m.uid() == euid
+                            && m.permissions().mode() & 0o077 == 0
+                    })
+                })
+            {
+                roots.push(runtime.join("victauri"));
+            }
+            roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+        }
+        roots.push(legacy);
+        roots
+    }
+    #[cfg(not(unix))]
+    {
+        vec![legacy]
+    }
+}
+
+fn discover_entries_in(root: &std::path::Path, out: &mut Vec<(u32, ServerInfo)>) {
     // The root itself is security-sensitive: its owner can rename a trusted PID
     // directory after our child check and swap in attacker-controlled files.
-    if !dir_is_trusted(&root) {
-        return out;
+    if !dir_is_trusted(root) {
+        return;
     }
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return out;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
     };
     for entry in entries.filter_map(Result::ok) {
         let pid_str = entry.file_name().to_string_lossy().to_string();
@@ -1017,6 +1116,11 @@ fn discover_entries() -> Vec<(u32, ServerInfo)> {
                         .map(String::from),
                 )
             });
+        // A pid already found under a more specific root counts once (a stale legacy entry
+        // can carry a reused live pid).
+        if out.iter().any(|(seen, _)| *seen == pid) {
+            continue;
+        }
         out.push((
             pid,
             ServerInfo {
@@ -1027,7 +1131,6 @@ fn discover_entries() -> Vec<(u32, ServerInfo)> {
             },
         ));
     }
-    out
 }
 
 /// The discovered backends as `ServerInfo` (dropping the pid) — for callers that only need
@@ -1091,13 +1194,10 @@ async fn health_ok(port: u16) -> bool {
         .is_ok_and(|r| r.status().is_success())
 }
 
-/// Resolve a System32 executable from `%SystemRoot%` instead of `PATH`, so an attacker-writable
-/// `PATH` entry cannot shadow it. The availability poller spawns `tasklist` repeatedly, so this
-/// PATH-hijack surface is continuous — always invoke it by absolute path.
-#[cfg(windows)]
-fn system32_exe(name: &str) -> String {
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    format!("{root}\\System32\\{name}")
+/// No batched process enumeration on this platform: callers fall back to per-pid checks.
+#[cfg(not(any(unix, windows)))]
+fn alive_pids() -> Option<HashSet<u32>> {
+    None
 }
 
 /// Resolve a core utility to an absolute path (defeats `PATH`-hijack of the poller's repeated
@@ -1113,38 +1213,26 @@ fn abs_bin(name: &str) -> String {
     name.to_string()
 }
 
-/// Snapshot the set of currently-live PIDs in ONE OS call, so discovery cost stays O(1)
-/// process spawns regardless of how many (possibly stale) discovery directories exist.
-/// Returns `None` if enumeration fails or is empty, in which case callers fall back to the
-/// per-pid `is_process_alive` (never worse than the previous behavior).
+/// Windows: no batched enumeration — each discovered PID is checked in-process by
+/// [`is_process_alive`] (microseconds, no spawn). The `tasklist` snapshot this replaced cost
+/// ~0.5 s per poll on an idle machine and spiked past 10 s under load, which stalled the
+/// bridge's own replies; its per-PID fallback also substring-matched (PID 12 "matched" 123)
+/// and counted other users' processes.
 #[cfg(windows)]
 fn alive_pids() -> Option<HashSet<u32>> {
-    // One `tasklist` in CSV form (~60ms) lists every process; column 2 is the PID.
-    let out = std::process::Command::new(system32_exe("tasklist.exe"))
-        .args(["/FO", "CSV", "/NH"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let set: HashSet<u32> = text
-        .lines()
-        .filter_map(|line| {
-            // Rows look like: "name","pid","session","sessname","mem"
-            line.split("\",\"")
-                .nth(1)
-                .and_then(|f| f.trim_matches('"').trim().parse::<u32>().ok())
-        })
-        .collect();
-    (!set.is_empty()).then_some(set)
+    None
 }
 
-/// One `ps` lists every PID on both Linux and macOS (portable; `/proc` is Linux-only).
-#[cfg(not(windows))]
+/// One `ps` lists the PIDs on both Linux and macOS (portable; `/proc` is Linux-only) — only
+/// OUR OWN user's processes. `ps -A` counted every user's, so on a shared machine a stale
+/// discovery entry whose PID had been recycled by ANOTHER user's process looked alive, and a
+/// port squatter could then receive the token and feed forged tool results to the agent. The
+/// per-pid fallback (`kill -0`) was already own-user only.
+#[cfg(unix)]
 fn alive_pids() -> Option<HashSet<u32>> {
+    let uid = current_euid()?.to_string();
     let out = std::process::Command::new(abs_bin("ps"))
-        .args(["-A", "-o", "pid="])
+        .args(["-U", uid.as_str(), "-o", "pid="])
         .output()
         .ok()?;
     if !out.status.success() {
@@ -1158,16 +1246,11 @@ fn alive_pids() -> Option<HashSet<u32>> {
     (!set.is_empty()).then_some(set)
 }
 
+/// A live process owned by the current user — exact PID, own-user only (the cross-user PID
+/// reuse fix `ps -U` gave Unix, audit R2-7).
 #[cfg(windows)]
 fn is_process_alive(pid: u32) -> bool {
-    use std::process::Command;
-    Command::new(system32_exe("tasklist.exe"))
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .is_ok_and(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.contains(&pid.to_string())
-        })
+    victauri_test::process::is_own_live_process(pid)
 }
 
 #[cfg(not(windows))]
@@ -1257,6 +1340,17 @@ fn dir_is_trusted(_path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit N6: the per-user root is scanned first; the legacy shared root is last.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_roots_are_per_user_first() {
+        let roots = discovery_roots();
+        let euid = current_euid().unwrap();
+        assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
+        assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
+        assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+    }
 
     // ── Cold-start handshake: the bridge must answer `initialize` itself so the MCP server
     //    is connected even with no app running (the fix for the 30s handshake timeout). ──
@@ -1389,15 +1483,59 @@ mod tests {
     #[test]
     fn undelivered_message_says_the_call_likely_ran_when_the_app_exited() {
         let err = anyhow::anyhow!("connection reset");
-        let gone = undelivered_response_message(&err, false);
+        let gone = undelivered_response_message(&call("tools/call"), &err, false);
         assert!(gone.contains("exited before responding"), "{gone}");
         assert!(gone.contains("NOT retried"));
         assert!(
             !gone.contains("not reachable"),
             "must not claim the app was never reached"
         );
-        let up = undelivered_response_message(&err, true);
+        let up = undelivered_response_message(&call("tools/call"), &err, true);
         assert!(up.contains("still running"), "{up}");
+    }
+
+    #[test]
+    fn liveness_is_exact_and_own_user_only() {
+        assert!(is_process_alive(std::process::id()));
+        // The old Windows check substring-matched tasklist output, and counted every
+        // account's processes. PID 4 (System) is live but never ours.
+        #[cfg(windows)]
+        assert!(!is_process_alive(4));
+    }
+
+    #[test]
+    fn a_tool_call_timeout_outlasts_the_servers_own_wait() {
+        let tool = |args: Value| {
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                   "params": {"name": "invoke_command", "arguments": args}})
+        };
+        assert_eq!(
+            request_timeout_for(&call("tools/list")),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&tool(json!({}))),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": 5_000}))),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        // invoke_command at its 300s ceiling, and wait_for at its 120s one, finish at the
+        // server before the bridge gives up on them.
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": 300_000}))),
+            Duration::from_secs(340)
+        );
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": 120_000}))),
+            Duration::from_secs(160)
+        );
+        // Values past the server's ceiling are clamped the way the server clamps them.
+        assert_eq!(
+            request_timeout_for(&tool(json!({"timeout_ms": u64::MAX}))),
+            Duration::from_secs(340)
+        );
     }
 
     #[test]
@@ -1504,7 +1642,8 @@ mod tests {
     #[test]
     fn discover_servers_reads_real_metadata_and_selects() {
         let pid = std::process::id(); // alive → passes is_process_alive
-        let dir = std::env::temp_dir().join("victauri").join(pid.to_string());
+        // The plugin's primary (per-user on Unix) root — audit N6.
+        let dir = discovery_roots()[0].join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         // Make ownership/permissions deterministic so `dir_is_trusted` passes regardless of
         // the runner's umask (a umask of 002 would otherwise leave the dir group-writable

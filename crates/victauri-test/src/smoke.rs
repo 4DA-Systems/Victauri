@@ -34,6 +34,7 @@ use crate::error::TestError;
 
 /// Result of a single smoke check with timing.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SmokeCheckResult {
     /// Human-readable name of the check.
     pub name: String,
@@ -47,22 +48,19 @@ pub struct SmokeCheckResult {
 
 /// Aggregate report from [`VictauriClient::smoke_test()`].
 ///
-/// ```
-/// use victauri_test::smoke::{SmokeCheckResult, SmokeReport};
-/// use std::time::Duration;
-///
-/// let report = SmokeReport {
-///     checks: vec![SmokeCheckResult {
-///         name: "eval works".to_string(),
-///         passed: true,
-///         detail: String::new(),
-///         duration: Duration::from_millis(50),
-///     }],
-///     duration: Duration::from_millis(50),
-/// };
-/// assert!(report.all_passed());
+/// ```no_run
+/// # async fn demo() -> Result<(), victauri_test::TestError> {
+/// let mut client = victauri_test::VictauriClient::discover().await?;
+/// let report = client.smoke_test().await?;
+/// for failed in report.failures() {
+///     eprintln!("{}: {}", failed.name, failed.detail);
+/// }
+/// assert!(report.all_passed(), "{}", report.to_summary());
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct SmokeReport {
     /// Individual check results in execution order.
     pub checks: Vec<SmokeCheckResult>,

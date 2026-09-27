@@ -439,10 +439,15 @@ jobs:
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v4.7.1
+      # No Codecov upload: without a token it failed on every run (tokenless upload
+      # refused) while reporting green, and the action ran an unverified `latest`
+      # CLI. The report is kept as an artifact instead.
+      - name: Keep the coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          files: lcov.info
+          name: lcov
+          path: lcov.info
+          retention-days: 14
 
   semver:
     name: Semver Checks
@@ -466,27 +471,24 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       # Prebuilt binary — avoids ~3 min compiling cargo-semver-checks from source.
+      # Pinned: the version this action pin defaults to (0.48) cannot read the rustdoc JSON of
+      # current stable ("unsupported rustdoc format v60"), and failed before checking anything.
       - uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.50.0
 
-      # INFORMATIONAL — not a required gate (removed from ci-success). cargo-semver-
-      # checks builds rustdoc and is currently broken in CI in two INDEPENDENT ways,
-      # neither of which is an API break:
-      #   - victauri-plugin: rustdoc hits an upstream E0119 ("conflicting
-      #     implementations of From<HourBase>") compiling `time` (pulled by
-      #     tauri → cookie) on every stable toolchain tested (1.93.1, 1.95) and the
-      #     latest time (0.3.48). The baseline build uses fresh crates.io resolution,
-      #     so pinning our lock can't fix it.
-      #   - victauri-core: cargo-semver-checks' fresh baseline resolution fails in CI
-      #     (passes locally only with a warm cache).
-      # A plain `cargo doc --workspace` succeeds, so these are tooling/toolchain
-      # issues, not semver violations. Keep it running for signal; use local
-      # `cargo semver-checks` as the pre-release gate. Re-add to ci-success once the
-      # upstream time/rustdoc bug is fixed.
+      # INFORMATIONAL — not a required gate: a new stable rustdoc JSON format can outrun
+      # the pinned cargo-semver-checks, which is a tooling failure, not an API break. With
+      # 0.50.0 on Rust 1.97 the full check runs (core, plugin, test: 0.8.8 -> 0.9.0 passes as
+      # the intended major bump). A failure is surfaced as a warning annotation below, never
+      # swallowed silently; RELEASING.md makes the local run the pre-release gate.
       - name: Check semver (informational)
+        id: semver
         continue-on-error: true
         run: cargo semver-checks check-release --workspace
+      - name: Surface a semver-checks failure
+        if: steps.semver.outcome == 'failure'
+        run: echo "::warning title=Semver Checks::cargo semver-checks failed (API break, or a toolchain/tool mismatch) — read the log above"
 
   e2e:
     name: E2E Integration (${{ matrix.os }})
@@ -601,7 +603,7 @@ jobs:
   # Listing ~15 matrix legs as required checks is brittle (a renamed job
   # silently stops being required). This job depends on all of them and fails
   # if any FAILED or was CANCELLED — a SKIPPED job (a conditional leg that
-  # legitimately did not apply, e.g. `semver` on push or `e2e` on a PR) passes.
+  # legitimately did not apply, e.g. `semver` on a push to main) passes.
   # Require ONLY "CI Success" in branch protection.
   # ─────────────────────────────────────────────────────────────────────
   ci-success:

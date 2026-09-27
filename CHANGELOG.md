@@ -7,8 +7,243 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Full-surface audit (three review lenses + a live sweep of 4DA), every finding verified against
-the code before fixing. Additive/bugfix only — no public API removed or changed.
+### Added — backend (Rust) log capture: the app's debug console, for agents
+
+Victauri's log tools saw only the webview; the Rust backend's own diagnostics — what a
+developer watches in the debug console — were invisible to an agent. Now:
+
+- **`logs {action:"backend"}`** — structured Rust log entries (typed fields, span context,
+  thread, file:line) with level / target-prefix / text filters and a `since_seq` cursor.
+- **`logs {action:"backend_digest"}`** — counts per level, noisiest targets, repeated messages
+  collapsed into templates, recent warnings/errors and every panic, in one call.
+- **`wait_for {condition:"log"}`** — block until a matching backend line is logged (edge-triggered:
+  wakes within a fraction of a millisecond; `since_ms` look-back).
+- **`invoke_command {with_logs:true}`** — the result plus the backend lines logged during the call.
+- **`logs {action:"stdout"}`** + **`victauri run -- <cmd>`** — an out-of-process launcher that
+  captures raw stdout/stderr (zero app changes; any logger, `println!`, C libraries, `tauri dev`
+  build errors) and records how the process exited (code / signal / NTSTATUS, decoded, with its last
+  stderr lines). A crash's last words survive the crash — measured 20/20, vs 0/20 for an in-process
+  capture after `abort()`.
+- **`victauri logs`** CLI — digest, filters, `--follow` (one line per event; monitor-friendly;
+  re-probes a busy app instead of declaring it gone; hands off to the crash capture if it dies).
+- **Capture sources:** a zero-config panic hook (debug builds; chains to the previous hook;
+  `VictauriBuilder::capture_panics(false)` to opt out), `victauri_plugin::log_layer()` for
+  `tracing` apps, `log_logger()` / `wrap_logger()` for `log` apps (incl. `tauri-plugin-log` via
+  `TargetKind::Dispatch`). All no-ops in release builds. Victauri's own and the embedded
+  `rmcp` SDK's lines are excluded (`VICTAURI_LOG_INTERNAL=1` keeps them).
+- `victauri-test`: `backend_logs`, `backend_digest`, `wait_for_log`.
+
+### Changed — the MCP server runs on its own runtime
+
+The embedded server now runs on a dedicated two-thread Tokio runtime instead of Tauri's shared
+one. An app that blocks its async workers no longer takes Victauri down with it: measured on the
+demo app, `/health` went from ~9 s to ~75 ms under that load, and backend tools kept answering.
+
+## [0.9.0] - 2026-09-27
+
+A correctness-and-hardening release built from three audit rounds: a full-surface review (three
+lenses + a live sweep of 4DA), a five-lens pre-audit red team (auth/network boundary, new-code
+correctness, data access & injection, supply chain, semver & claim honesty), and a six-lens
+adversarial audit (network/auth, hostile page, data access, local attacker/CLI, concurrency,
+release/supply chain) whose every finding was reproduced before it was fixed. **0.9.0 is a
+deliberate, one-time semver break** (see below and MIGRATION.md) so that future field additions to
+the data types are never breaking again. (The option/config structs `CodegenOptions`,
+`SmokeConfig`, `VisualOptions`, `MaskRegion` and the `Junit*` report types deliberately stay
+exhaustive so struct-update syntax keeps working.)
+
+### Breaking — public data types are now `#[non_exhaustive]`
+
+Output/data types across `victauri-core`, `victauri-plugin` and `victauri-test` (e.g. `IpcCall`,
+`WindowState`, `DomSnapshot`, `VerificationResult`, `RecordedSession`, `VictauriState`,
+`CommandTimingStats`, `PluginInfo`, `SmokeReport`, `AppEvent`'s struct variants, and several enums)
+are `#[non_exhaustive]`. Code that *reads* them is unaffected; code that *builds* them by struct
+literal uses the new constructors/builders instead (`IpcCall::new`, `WindowState::new(label)
+.with_*(..)`, `CommandInfo::new(..).with_*(..)`, `AppEvent::console(..)`, …). `#[inspectable]` now
+expands to those builders, so it keeps working unchanged. Internal-only modules and helpers
+(`filmstrip`, `parse_bridge_event_from`, …) are no longer public API. `WebviewBridge` gained two
+default-implemented methods (`try_list_window_labels`, `eval_webview_resolved`) and documents that
+future additions will always have defaults.
+
+### Security — adversarial audit round 3 (every finding reproduced before its fix)
+
+- **High — compound-tool permission gate bypass.** The gate read `action` only when it was a JSON
+  string and otherwise gated on the bare tool name, while serde still parsed
+  `{"action": {"go_to": null}}` (and, over REST, a positional array body) into the real action. In
+  the `Test` profile, which allows the bare `navigate`, `navigate.go_to` (FullControl-only) ran;
+  with FullControl, any per-action `disabled_tools` entry could be bypassed the same way. Proven
+  end to end against 0.9.0-pre: both bodies returned 200 and the webview navigated. A non-string
+  `action` or non-object body is now refused before dispatch, a disabled tool is reported first,
+  and a test reads every action enum's variants from its schema and requires each to have a
+  capability, so the bare-name gate can never cover an action the parser accepts.
+- **Recording replay could run a command in the wrong window, or one that never ran.** Page script
+  could add a route that fulfils `http://ipc.localhost/<cmd>` and have it recorded as a successful
+  IPC call; `recording replay` then invoked it for real — in the main window, whatever window
+  recorded it (a window's Tauri capabilities are its own). Mocked/blocked calls are now recorded
+  as such and never replayed, and each call replays in the window that recorded it (or not at all).
+- **Page script could still observe or forge eval results** (the round-2 claim that ids never leak
+  was wrong): hooking `Map.prototype.set` / `Set.prototype.add` / `window.String` exposed pending
+  eval ids, and an `Object.prototype.toJSON` rewrote every result and log entry. Eval state is now
+  null-prototype tables behind closures, ids are coerced without page-replaceable globals, and the
+  bridge's stringify ignores a `toJSON` inherited from `Object.prototype`/`Array.prototype`. Logs
+  hand out deep copies. (Same-window page script remains a documented residual; see SECURITY.md.)
+- **Agent-only bridge controls were callable by the page** (clear logs/routes, dialog auto-answers,
+  animation scrub/sweep state). They are now reachable only with a per-process key the plugin
+  embeds in its own evals.
+- **Compact snapshot lines could still be forged** through `role` and quote-stripped attribute
+  values; every field is now encoded and each element yields exactly one well-formed line.
+- **Windows discovery liveness** substring-matched `tasklist` output (PID 12 "matched" 123) and
+  counted other users' processes (the cross-user PID-reuse fix had reached only Unix). It is now an
+  in-process own-user check (`OpenProcess` + exit code + token SID), in the CLI bridge, the test
+  client and the watchdog; the bridge no longer spawns `tasklist` every 1.5 s (measured 0.5–40 s
+  under load, which stalled its own replies).
+- **Browser requests and flooding.** Any web page could loop `<img src="http://127.0.0.1:7373/health">`
+  (no `Origin` header) and drain the shared rate-limit bucket, 429-ing the agent. Requests with a
+  `Sec-Fetch-Site` other than `none`, an unreadable `Origin`, or a `tauri://` origin are now refused
+  before the limiter; authenticated callers have their own bucket; no `Access-Control-Allow-Origin`
+  header is sent at all.
+- **Connection exhaustion.** `axum::serve` set no hyper timer: a client trickling request headers
+  held a connection forever, and with `auth_disabled` 64 slow bodies held every request slot. The
+  server now runs HTTP/1.1 with a 30 s header deadline, a 30 s / 2 MiB body deadline read after
+  authentication, and a 256-connection cap; `/mcp` bodies are capped at 2 MiB like every route.
+- **Discovery could be blocked by another local user** on Unix (shared `/tmp/victauri`, which the
+  owner check then refused). The root is per-user (`$XDG_RUNTIME_DIR/victauri` or
+  `<temp>/victauri-<euid>`); readers also scan the owner-checked legacy root.
+- **Existence oracles and resource bombs in the data tools.** A symlink inside an app directory plus
+  `..` revealed whether files outside it exist; "missing" and "outside" now answer identically. A
+  2000-column row of 1 MB blobs built gigabytes before `query_db`'s result cap applied (now charged
+  per cell, 256-column cap); a single `LIKE`/`replace`/`instr` step ignored the 5 s deadline for
+  15–22 s (patterns capped at 1000 bytes, calls deadlined and limited to two at once);
+  `list_app_dir` walked unbounded trees on the async executor.
+- **Release supply chain:** the crates.io token was in the publish job's environment while every
+  dependency's build script compiled; publishing now verifies tokenlessly and uploads `--no-verify`
+  from the one step holding the token. `require-ci-green` counts only a push run on `main`.
+
+### Fixed — adversarial audit round 3 (correctness)
+
+- **High — an eval could be reported as a syntax error and then run anyway**: a retried
+  `invoke_command` executed twice. The 750 ms parse watchdog is gone: the code is delivered first
+  and a check script right after it (webview evals run in order), and every outcome is settled
+  exactly once.
+- **Reload detection**: a reload within 250 ms of injection waited the full timeout, and a
+  same-page ready signal delayed >250 ms discarded a real result. Each page load now carries a
+  nonce; only a ready signal from a *different* page aborts an eval, and page script cannot forge
+  one.
+- **Dropped calls leaked pending-eval slots** (a REST client that disconnected mid-call); 100 of
+  them wedged every eval tool until restart. Slots are now released on drop everywhere.
+- **Recording drain**: an event stamped ahead of Rust's clock was re-recorded on every drain,
+  same-millisecond events were lost, a drain in flight across `stop`+`start` leaked old events
+  into the new recording, pending network requests stayed pending forever, and one lone UTF-16
+  surrogate in page text (a truncated emoji) stalled a window's recording. The drain is now keyed by
+  a per-page sequence, scoped to its recording, and page JSON is surrogate-sanitized before parsing.
+- **`#[inspectable]` advertised the wrong argument keys**: Tauri invokes commands with camelCase
+  keys by default (`size_kb` → `sizeKb`), so an agent following the registry got "missing required
+  key". `CommandArg` gains `key`; the macro honours `rename_all`/`rename`, raw identifiers, and
+  detects injected framework arguments (`State<'_, a::B>`, `Request`, scopes) by type.
+- **`victauri record` output**: bidi/control characters from page text made rustc reject the
+  generated test; `:has-text("…")` inside a test id masqueraded as a text selector; `#a.b` was
+  treated as the id `a.b`; scrolling to text passed the text as a CSS selector. Recorded selectors
+  are now CSS-escaped by the bridge and parsed by shape.
+- **`victauri-test`**: `Locator::check()`/`uncheck()` did nothing on React-controlled inputs
+  (measured on React 18: `onChange` fired 0 times); they now click and verify. A stale element
+  reference errors instead of reading as empty/unchecked. Visual baselines decode 16-bit, indexed
+  and grey+alpha PNGs.
+- **A panic in any tool handler** hung the MCP request until the client timed out (and reset the
+  REST connection): chrono overflows on huge `since_ms`/`seconds` values reached it live. Look-back
+  windows now saturate, and a panic boundary around both dispatchers returns an internal error.
+- App-state probes run on the blocking pool with a timeout; a busy UI thread is reported as busy
+  instead of "no windows"; relative DB paths resolve in a fixed root order for both `query_db` and
+  `db_health`; `read_app_file` keeps UTF-8 when truncating mid-character; duplicate result column
+  names keep every value; rmcp 3.4's `ServerInfo` deprecation no longer warns in consumers.
+- Chrono overflow panics on huge `since_ms`/`seconds` values, `wait_for` ignoring its deadline,
+  unserializable results reported as JavaScript errors, `dom_snapshot`/`find_elements` failing on
+  a numeric `.value` (`<li value=3>`, `<progress>`), the auto-`return` scanner silently dropping
+  statements (`i++ / 2; f()`, `obj.of\nf()`, …), bfcache restores disabling console capture,
+  busy-UI timeouts reported as "no windows", command-timing samples for calls that never ran, trace
+  start/stop races and unbounded `interval_ms`, and the CLI bridge's fixed 120 s timeout cutting
+  off `invoke_command` calls allowed up to 300 s.
+
+### CI / release / docs — round 3
+
+- Semver Checks pinned to cargo-semver-checks 0.50.0 (0.48 could not read current rustdoc and
+  passed without checking); failures are annotated. Codecov upload (failing silently on every run)
+  replaced by an artifact. jsdom bridge tests fail instead of silently skipping in CI/preflight.
+- MCP Registry name uses the case-sensitive GitHub login (`io.github.4DA-Systems/victauri`).
+- victauri-core's README example compiles again and is now a doctest; visual-regression docs use
+  the real API; crate/compat counts corrected.
+
+### Security — pre-audit red team (no Critical/High found)
+
+- **Hostile page content could forge or suppress eval results.** Pending eval ids lived on a
+  page-visible global (`window.__VIC_EVAL__`); the eval bookkeeping now lives in the bridge's
+  frozen closure, and serialization uses a `JSON.stringify` captured before any page script ran.
+- **The injected bridge's log getters returned its live internal arrays**, so page script could
+  plant a forged "successful" IPC call (which `recording replay` would then invoke), hide its own
+  traffic, or freeze the recording drain. They now return copies; drain watermarks are clamped.
+- **Page text could forge lines in the compact DOM snapshot** (a newline in an RSS title → a fake
+  `[eN] button "Save"` line steering an agent's click). Page-derived strings are now JSON-encoded.
+- **`query_db` is enforced by SQLite's authorizer.** The string checks missed table-valued pragma
+  functions (`SELECT * FROM pragma_optimize` ran) and the parenthesized write form
+  (`PRAGMA user_version(5)`). Connections also run with `trusted_schema=OFF` + defensive mode, and
+  `db_health` never counts virtual tables (counting runs module code).
+- **Browser-originated POSTs must be JSON** — with `auth_disabled()`, a page on any localhost origin
+  could fire CORS-simple (no-preflight) tool calls. The concurrency cap is now global (it was 64
+  per route).
+- `victauri bridge` counts only the current user's processes as alive (Unix); `query_db` absolute
+  paths no longer act as a file-existence oracle; page-originated evals get their own small
+  pending-eval budget so page script cannot starve the agent; the watchdog pins the app it watches
+  and trusts discovery dirs by owner, not permission bits alone.
+
+### Fixed — pre-audit correctness
+
+- The eval "window closed" detection no longer fires on a busy UI (a listing that timed out read
+  as "closed … it most likely ran — do not re-run it"), watches the exact window the script was
+  delivered to, and never stalls past its deadline. A trailing `// comment` in `eval_js` code no
+  longer turns the call into a parse error. ASI handling covers postfix `++`/`--`, regex literals,
+  keyword operators at line end and U+2028/2029.
+- Recording: the background drain and `recording flush` share one per-window watermark (they
+  re-recorded each other's events); a new or imported recording never pulls in page history; IPC
+  calls are keyed by completion time, so a command slower than the drain gap no longer stays
+  "pending" forever.
+- `trace` owns its recording by session id: restarting a trace no longer orphans the previous
+  recording, stopping one never stops a recording someone else started, and the 30-minute
+  auto-stop cannot stop a newer trace.
+- `db_health` costs ~0 ms per table instead of ~25 ms (it capped out at ~200 tables per budget),
+  budgets its metadata phase, and reports a failed count as incomplete.
+- Main-thread callers of the bridge (a sync command, a menu handler) run inline instead of risking
+  a deadlock on the dispatch lock; the Tauri-command eval paths go through the bridge (main thread,
+  serialized) instead of calling `webview.eval` from a worker thread.
+- `victauri-test`: rediscovery after an app restart pins the app's identity and never falls back to
+  a default port; it also rediscovers on a refused connection.
+- Tool annotations now match behavior (`recording`, `introspect`, `logs`, `window` are
+  destructive; `verify_state`/`wait_for`/`assert_semantic` run caller JS; `inspect`/`animation`
+  mutate the page), and several descriptions were corrected. The CLI's baked fallback tool list is
+  regenerated and pinned to the live tools by a test.
+
+### Found by the live 4DA verification (Victauri 0.9.0 inside the real app)
+
+- **An eval in flight when its page reloads now fails fast** ("window 'main' loaded a new page
+  while the call was in flight … check the app's state before re-running it") instead of waiting
+  out the 30s timeout. Every bridge (re)init records a per-window page load (label supplied by
+  Tauri, not the page); a 250ms grace keeps the page's own late ready signal from counting.
+  Live: the in-flight eval returned 50ms after the reload.
+- **`invoke_command` takes an optional `timeout_ms`** (max 300000) for legitimately slow commands
+  (4DA's `get_blind_spots` takes up to 57s cold); a timeout error now says so. Aborted calls
+  (timeout, app exit, closed window, reload) are no longer recorded as command durations.
+- **`find_elements` no longer reports a valid selector as "invalid"** while the page is
+  reloading (it validated against `document.body`, which is null mid-reload); it now says
+  "page not ready".
+
+### CI / release / docs
+
+- VS Code release: the build job holds no secrets and runs `npm ci --ignore-scripts`; publish
+  tokens are scoped to single steps. Surface Audit checks all six crates and fails on an unknown
+  registry answer. `e2e.yml` repaired. Crates now ship their LICENSE. `deny.toml` denies unknown
+  registries/git sources. `victauri init` writes a least-privilege CI workflow, builds `.mcp.json`
+  with a JSON serializer, and refuses to write through symlinks.
+- README/docs: action names regenerated from the real enums; latency and "identical on all
+  platforms" overclaims corrected; plugin-as-dev-dependency advice fixed.
+
+The remainder of this entry is the first (full-surface) audit round, merged in #71:
 
 ### Fixed — agent-visible correctness
 
@@ -63,8 +298,10 @@ the code before fixing. Additive/bugfix only — no public API removed or change
   names real tools.
 - `victauri-watchdog` discovers the app's actual port (and follows restarts) instead of assuming
   7373.
-- VS Code extension: DOM Explorer and Windows view showed nothing / junk; disconnection is now
-  detected.
+- VS Code extension (released separately on its own `vscode-v*` tag — these fixes are in the
+  repository, not in the published 0.8.8 extension; see `editors/vscode/CHANGELOG.md`): DOM
+  Explorer and Windows view showed nothing / junk; disconnection is now detected; discovery finds
+  0.9 apps in the per-user Unix root and no longer counts another user's process as live.
 - Surface Audit workflow had false-failed every week since July (crates.io 403s without a
   User-Agent); docs install pins, action refs and tool counts corrected.
 
@@ -1519,7 +1756,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.8.8...HEAD
+[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/4DA-Systems/victauri/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/4DA-Systems/victauri/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/4DA-Systems/victauri/compare/v0.8.6...v0.8.7
 [0.8.6]: https://github.com/4DA-Systems/victauri/compare/v0.8.5...v0.8.6

@@ -2,6 +2,8 @@
 //! CLI for Victauri — scaffold tests, diagnose running apps, and record sessions.
 
 mod bridge;
+mod logs;
+mod run;
 
 use std::path::{Path, PathBuf};
 
@@ -108,6 +110,53 @@ enum Commands {
         #[arg(long)]
         allow_empty_registry: bool,
     },
+    /// Launch an app (or its dev command) with stdout/stderr captured for agents — zero app
+    /// changes, survives crashes. e.g. `victauri run -- npm run tauri dev`
+    Run {
+        /// Write the capture here instead of `<temp>/victauri/console/<pid>-<ms>.jsonl`
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        /// The command to run, after `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Show (or follow) the running app's Rust backend logs; falls back to the latest
+    /// `victauri run` capture when the app is down
+    Logs {
+        /// Which app, when several are running (bundle identifier or product name)
+        #[arg(long)]
+        app: Option<String>,
+        /// Minimum level: trace, debug, info, warn, error
+        #[arg(short, long)]
+        level: Option<String>,
+        /// Target prefix(es), comma-separated (e.g. `app::db`)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Only lines containing this text (case-insensitive)
+        #[arg(short, long)]
+        grep: Option<String>,
+        /// How many recent lines to show first
+        #[arg(short = 'n', long, default_value_t = 100)]
+        limit: usize,
+        /// Keep printing new lines as they arrive (one line per event — monitor-friendly)
+        #[arg(short, long)]
+        follow: bool,
+        /// Print the digest: counts, repeated messages, recent problems, panics
+        #[arg(long)]
+        digest: bool,
+        /// Read raw stdout/stderr from the `victauri run` capture instead
+        #[arg(long)]
+        stdout: bool,
+        /// Read a specific capture file (implies --stdout)
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        /// Print raw JSON records instead of formatted lines
+        #[arg(long)]
+        json: bool,
+        /// Poll interval for --follow, in milliseconds
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+    },
 }
 
 #[tokio::main]
@@ -155,6 +204,40 @@ async fn main() -> Result<()> {
             allow_empty_registry,
         } => {
             cmd_coverage(threshold, junit.as_deref(), allow_empty_registry).await?;
+        }
+        Commands::Run { capture, command } => {
+            let code = tokio::task::spawn_blocking(move || run::run(&command, capture))
+                .await
+                .context("launcher task failed")??;
+            std::process::exit(code);
+        }
+        Commands::Logs {
+            app,
+            level,
+            target,
+            grep,
+            limit,
+            follow,
+            digest,
+            stdout,
+            capture,
+            json,
+            interval_ms,
+        } => {
+            logs::cmd_logs(logs::LogsOptions {
+                app,
+                level,
+                target,
+                grep,
+                limit,
+                follow,
+                digest,
+                stdout,
+                json,
+                capture,
+                interval_ms: interval_ms.max(50),
+            })
+            .await?;
         }
     }
 
@@ -218,8 +301,7 @@ fn cmd_init(root: &Path) -> Result<()> {
         }
     } else {
         let app_id = read_app_identifier(root.as_path());
-        std::fs::write(&mcp_json_path, generate_mcp_json(app_id.as_deref()))
-            .with_context(|| format!("failed to write {}", mcp_json_path.display()))?;
+        write_new_file(&mcp_json_path, &generate_mcp_json(app_id.as_deref()))?;
         match app_id {
             Some(id) => eprintln!("  [+] Created .mcp.json (bridge pinned to app '{id}')"),
             None => eprintln!("  [+] Created .mcp.json (AI agent configuration)"),
@@ -235,8 +317,7 @@ fn cmd_init(root: &Path) -> Result<()> {
         } else {
             std::fs::create_dir_all(&caps_dir)
                 .with_context(|| format!("failed to create {}", caps_dir.display()))?;
-            std::fs::write(&cap_path, generate_capability_json())
-                .with_context(|| format!("failed to write {}", cap_path.display()))?;
+            write_new_file(&cap_path, generate_capability_json())?;
             eprintln!("  [+] Created capabilities/victauri.json");
         }
         // Verify the effective grant covers every window — a capability scoped to
@@ -274,8 +355,7 @@ fn cmd_init(root: &Path) -> Result<()> {
     if smoke_path.exists() {
         eprintln!("  [=] tests/smoke.rs already exists");
     } else {
-        std::fs::write(&smoke_path, generate_smoke_test())
-            .with_context(|| format!("failed to write {}", smoke_path.display()))?;
+        write_new_file(&smoke_path, generate_smoke_test())?;
         eprintln!("  [+] Created tests/smoke.rs (smoke tests)");
     }
 
@@ -288,8 +368,7 @@ fn cmd_init(root: &Path) -> Result<()> {
         } else {
             generate_integration_test_with_commands(&discovered_commands)
         };
-        std::fs::write(&integration_path, &integration_content)
-            .with_context(|| format!("failed to write {}", integration_path.display()))?;
+        write_new_file(&integration_path, &integration_content)?;
         eprintln!("  [+] Created tests/integration.rs (integration test template)");
     }
 
@@ -309,8 +388,7 @@ fn cmd_init(root: &Path) -> Result<()> {
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| ".".to_string());
-        std::fs::write(&ci_path, generate_ci_workflow(&app_dir))
-            .with_context(|| format!("failed to write {}", ci_path.display()))?;
+        write_new_file(&ci_path, &generate_ci_workflow(&app_dir))?;
         eprintln!("  [+] Created .github/workflows/victauri.yml (CI pipeline)");
     }
 
@@ -324,20 +402,14 @@ fn cmd_init(root: &Path) -> Result<()> {
         if content.contains("VICTAURI:BEGIN") {
             eprintln!("  [=] CLAUDE.md already has the Victauri block (VICTAURI markers present)");
         } else {
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&claude_md_path)
-                .with_context(|| format!("failed to append to {}", claude_md_path.display()))?;
-            std::io::Write::write_all(&mut file, generate_claude_md_section().as_bytes())
-                .with_context(|| format!("failed to write to {}", claude_md_path.display()))?;
+            append_to_regular_file(&claude_md_path, generate_claude_md_section())?;
             eprintln!(
                 "  [+] Appended a Victauri block to CLAUDE.md (between <!-- VICTAURI:BEGIN --> and"
             );
             eprintln!("      <!-- VICTAURI:END --> markers — delete that block to opt out)");
         }
     } else {
-        std::fs::write(&claude_md_path, generate_claude_md_section())
-            .with_context(|| format!("failed to write {}", claude_md_path.display()))?;
+        write_new_file(&claude_md_path, generate_claude_md_section())?;
         eprintln!("  [+] Created CLAUDE.md with Victauri agent instructions");
     }
 
@@ -977,20 +1049,19 @@ async fn cmd_coverage(
     eprintln!("{summary}");
 
     if let Some(path) = junit_path {
-        let verify_report = victauri_test::VerifyReport {
-            results: vec![victauri_test::CheckResult {
-                description: format!(
+        let verify_report =
+            victauri_test::VerifyReport::new(vec![victauri_test::CheckResult::new(
+                format!(
                     "IPC coverage {:.1}% ({}/{})",
                     report.coverage_percentage, report.tested_commands, report.total_commands
                 ),
-                passed: threshold.is_none_or(|t| report.meets_threshold(t)),
-                detail: if report.untested.is_empty() {
+                threshold.is_none_or(|t| report.meets_threshold(t)),
+                if report.untested.is_empty() {
                     String::new()
                 } else {
                     format!("untested: {}", report.untested.join(", "))
                 },
-            }],
-        };
+            )]);
         let junit = verify_report.to_junit("victauri-coverage", std::time::Duration::from_secs(0));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -1260,14 +1331,24 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
             new_lines.push(&plugin_line);
             new_lines.extend_from_slice(&lines[idx..]);
 
-            let new_content = new_lines.join("\n");
+            // Keep the file's line endings: `lines()` drops them, and re-joining with "\n"
+            // turned a CRLF source file into a whole-file LF diff.
+            let eol = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let new_content = new_lines.join(eol);
             // Preserve trailing newline if original had one
             let new_content = if content.ends_with('\n') {
-                format!("{new_content}\n")
+                format!("{new_content}{eol}")
             } else {
                 new_content
             };
 
+            // Same rule as every file `init` creates: never write through a symlink (a cloned
+            // repo's `src/main.rs` could point at a file outside the project).
+            refuse_symlink(&path)?;
             std::fs::write(&path, new_content)
                 .with_context(|| format!("failed to write {}", path.display()))?;
             eprintln!(
@@ -1287,22 +1368,80 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
 ///
 /// No `--wait`: the bridge answers the MCP handshake locally and connects to the app lazily,
 /// so it never blocks startup whether or not the app is running yet (`--wait` is now a no-op).
+///
+/// Built with `serde_json` (never string interpolation): the identifier comes from the
+/// project's `tauri.conf.json`, and a value containing quotes, backslashes or control
+/// characters must be escaped, not spliced into the document.
 fn generate_mcp_json(app: Option<&str>) -> String {
-    let args = match app {
-        Some(id) => format!("[\"bridge\", \"--app\", \"{id}\"]"),
-        None => "[\"bridge\"]".to_string(),
+    let args: Vec<&str> = match app {
+        Some(id) => vec!["bridge", "--app", id],
+        None => vec!["bridge"],
     };
-    format!(
-        r#"{{
-  "mcpServers": {{
-    "victauri": {{
-      "command": "victauri",
-      "args": {args}
-    }}
-  }}
-}}
-"#
-    )
+    let doc = serde_json::json!({
+        "mcpServers": {
+            "victauri": {
+                "command": "victauri",
+                "args": args,
+            }
+        }
+    });
+    // Serializing a `Value` built from strings cannot fail; fall back defensively anyway.
+    let mut out = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| {
+        r#"{"mcpServers":{"victauri":{"command":"victauri","args":["bridge"]}}}"#.to_string()
+    });
+    out.push('\n');
+    out
+}
+
+/// Refuse to operate on `path` if it is a symbolic link.
+///
+/// `victauri init` writes into a project directory that may come from an untrusted clone; a
+/// planted symlink (e.g. `CLAUDE.md -> ~/.bashrc`) would otherwise make `fs::write` /
+/// append follow it and modify a file outside the project. A missing path is fine.
+fn refuse_symlink(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+            "refusing to write {}: it is a symbolic link (victauri init never writes through symlinks)",
+            path.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Create a NEW file with `contents`, never following or clobbering anything already at
+/// `path`. `create_new` is atomic (`O_EXCL` / `CREATE_NEW`): it fails if *anything* exists there,
+/// including a dangling symlink, so a link planted between the existence check and the write
+/// cannot redirect it.
+fn write_new_file(path: &Path, contents: &str) -> Result<()> {
+    refuse_symlink(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(())
+}
+
+/// Append `contents` to an existing regular file, refusing if `path` is a symlink.
+fn append_to_regular_file(path: &Path, contents: &str) -> Result<()> {
+    refuse_symlink(path)?;
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "refusing to append to {}: not a regular file",
+            path.display()
+        );
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to append to {}", path.display()))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())
+        .with_context(|| format!("failed to write to {}", path.display()))?;
+    Ok(())
 }
 
 /// Read the Tauri bundle identifier from the project's `tauri.conf.json` so the generated
@@ -1330,8 +1469,8 @@ that gives full-stack access to the webview DOM, IPC layer, Rust backend, and na
 windows. Available when the app is running in debug mode.
 
 **Use Victauri MCP tools for all app inspection and testing tasks.** Victauri runs inside
-the app process with sub-ms response times and direct AppHandle access — it sees
-everything, not just the webview.
+the app process with direct AppHandle access (Rust-side tools answer in well under a
+millisecond; webview tools are a JS round trip) — it sees everything, not just the webview.
 
 Key Victauri tools (the read-only backend/DB introspection below has no CDP/Playwright
 equivalent — and on macOS/Linux CDP can't attach to a Tauri webview at all):
@@ -1392,7 +1531,35 @@ immediately (often `null`) while the real work runs. Don't poll by hand or sprin
   is still caught: `wait_for { condition: "event", value: "analysis-complete" }`. (Custom events
   must be registered via `VictauriBuilder::listen_events(&["…"])`.)
 
-The robust pattern is `invoke_command(...)` then `wait_for(expression|event, ...)` — never a bare sleep.
+- **Completion log line:** `wait_for` with `condition: "log"` blocks until the Rust backend
+  logs a line containing `value` (optional minimum `level`) — it wakes the instant the line is
+  logged: `wait_for { condition: "log", value: "sync complete" }`. Works for any app whose
+  backend log Victauri captures (see below).
+
+The robust pattern is `invoke_command(...)` then `wait_for(expression|event|log, ...)` — never a bare sleep.
+
+### The Rust backend's log (what the app prints to its console)
+
+The `logs` tool reads the **Rust side** too — the debug console a human would watch:
+- `logs { action: "backend_digest" }` — **start here** when something is off: per-level counts,
+  repeated messages collapsed into templates, recent warnings/errors, and every captured panic
+  (including panics on background threads that otherwise only reach stderr).
+- `logs { action: "backend", level: "warn", target: "my_app::db", filter: "timeout" }` —
+  structured entries (typed fields, span context, thread, file:line). Page forward with the
+  returned `next_seq` → `since_seq`.
+- `invoke_command { command, args, with_logs: true }` — the command's result **plus** the backend
+  log lines emitted while it ran, in one call.
+- `logs { action: "stdout" }` — raw stdout/stderr when the app was started with
+  `victauri run -- <dev command>`; after a crash, `victauri logs --stdout` (terminal) shows the
+  last words and the decoded exit status even though the app is gone.
+- Live monitoring from a terminal: `victauri logs --follow --level warn` prints one line per new
+  warning/error — hand it to a line-streaming monitor to be notified as they happen.
+
+Panics are captured automatically. Structured capture needs one line in the app's logging setup
+(`.with(victauri_plugin::log_layer())` on a `tracing_subscriber` registry, or
+`victauri_plugin::log_logger()` chained into `tauri-plugin-log`/fern); without it, launch the app
+via `victauri run` to capture its raw console with zero code changes. If `backend*` returns a
+`hint` saying no source is active, relay that one-line fix rather than grepping log files.
 
 ### Reading app-specific backend state
 
@@ -1711,6 +1878,7 @@ fn add_dependencies(cargo_toml_path: &Path) -> Result<bool> {
     }
 
     if changed {
+        refuse_symlink(cargo_toml_path)?;
         std::fs::write(cargo_toml_path, doc.to_string())?;
     }
     Ok(changed)
@@ -1963,11 +2131,17 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -2006,6 +2180,10 @@ jobs:
           xvfb-run -a "$TARGET_DIR/debug/$BIN" &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
 
+      # Pinned to the release TAG that matches your victauri-cli. Tags are mutable: for
+      # supply-chain hardening, replace `@v__VICTAURI_VERSION__` with the full 40-character
+      # commit SHA that tag points to (keep the tag as a trailing comment), e.g.
+      #   git ls-remote https://github.com/4DA-Systems/victauri refs/tags/v__VICTAURI_VERSION__
       - name: Victauri smoke tests
         uses: 4DA-Systems/victauri/.github/actions/victauri-test@v__VICTAURI_VERSION__
         with:
@@ -2143,6 +2321,27 @@ mod tests {
     }
 
     #[test]
+    fn patch_tauri_builder_keeps_crlf_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "fn main() {\r\n    tauri::Builder::default()\r\n        .run(tauri::generate_context!())\r\n        .unwrap();\r\n}\r\n",
+        )
+        .unwrap();
+        assert!(try_patch_tauri_builder(&src).unwrap());
+        let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        assert!(content.contains("victauri_plugin::init()"));
+        assert_eq!(
+            content.matches('\n').count(),
+            content.matches("\r\n").count(),
+            "every line ending stays CRLF: {content:?}"
+        );
+        assert!(content.ends_with("}\r\n"));
+    }
+
+    #[test]
     fn patch_tauri_builder_skips_if_already_present() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -2214,6 +2413,108 @@ mod tests {
         let args = parsed["mcpServers"]["victauri"]["args"].as_array().unwrap();
         assert!(args.iter().any(|a| a.as_str() == Some("--app")));
         assert!(args.iter().any(|a| a.as_str() == Some("com.4da.app")));
+    }
+
+    #[test]
+    fn mcp_json_escapes_hostile_identifier() {
+        // A tauri.conf.json identifier is attacker-controllable in a cloned repo. It must be
+        // escaped as ONE JSON string, never able to inject extra args or keys.
+        let hostile = "x\", \"--evil\"], \"command\": \"sh\\\n";
+        let content = generate_mcp_json(Some(hostile));
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let server = &parsed["mcpServers"]["victauri"];
+        assert_eq!(server["command"].as_str(), Some("victauri"));
+        let args = server["args"].as_array().unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[2].as_str(), Some(hostile));
+        assert_eq!(server.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn write_new_file_creates_and_never_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        write_new_file(&path, "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        // A second write must fail rather than overwrite.
+        assert!(write_new_file(&path, "other").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn append_refuses_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(append_to_regular_file(dir.path(), "x").is_err());
+        let f = dir.path().join("CLAUDE.md");
+        std::fs::write(&f, "a").unwrap();
+        append_to_regular_file(&f, "b").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "ab");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_patches_never_follow_a_symlinked_source_or_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.rs");
+        let original = "fn main() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n";
+        std::fs::write(&outside, original).unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("main.rs")).unwrap();
+        assert!(try_patch_tauri_builder(&src).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+
+        let manifest = dir.path().join("outside.toml");
+        std::fs::write(&manifest, "[package]\nname = \"x\"\n\n[dependencies]\n").unwrap();
+        let link = dir.path().join("Cargo.toml");
+        std::os::unix::fs::symlink(&manifest, &link).unwrap();
+        assert!(add_dependencies(&link).is_err());
+        assert!(
+            !std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("victauri")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_writes_refuse_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "original").unwrap();
+
+        // Symlink to an existing file: append must refuse and leave the target untouched.
+        let claude_md = dir.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink(&outside, &claude_md).unwrap();
+        assert!(append_to_regular_file(&claude_md, "INJECTED").is_err());
+        assert!(write_new_file(&claude_md, "INJECTED").is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+
+        // Dangling symlink: `exists()` is false, so init would try to create it — the
+        // create must refuse instead of following the link to create the target.
+        let target = dir.path().join("created-through-link.txt");
+        let mcp = dir.path().join(".mcp.json");
+        std::os::unix::fs::symlink(&target, &mcp).unwrap();
+        assert!(!mcp.exists());
+        assert!(write_new_file(&mcp, "{}").is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_init_refuses_symlinked_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntauri = \"2\"\n",
+        )
+        .unwrap();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("CLAUDE.md")).unwrap();
+        let err = cmd_init(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
     }
 
     #[test]
@@ -2344,6 +2645,11 @@ mod tests {
         assert!(content.contains("working-directory: src-tauri"));
         assert!(content.contains("\"src-tauri -> target\""));
         assert!(!content.contains("__APP_DIR__"));
+        // Least-privilege token + no persisted checkout credentials.
+        assert!(content.contains("permissions:\n  contents: read"));
+        assert!(content.contains("persist-credentials: false"));
+        // The tag-pinned action ref carries SHA-pinning guidance.
+        assert!(content.contains("full 40-character"));
     }
 
     #[test]
