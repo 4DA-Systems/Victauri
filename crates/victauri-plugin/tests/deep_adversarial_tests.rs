@@ -1244,7 +1244,7 @@ async fn privacy_disable_all_tools() {
             "window" => json!({"action": "list"}),
             "recording" => json!({"action": "start"}),
             "logs" => json!({"action": "console"}),
-            "inspect" => json!({"action": "performance"}),
+            "inspect" => json!({"action": "get_performance"}),
             "css" => json!({"action": "inject", "css": "body{}"}),
             "interact" => json!({"action": "click", "ref_id": "e1"}),
             "input" => json!({"action": "fill", "ref_id": "e1", "value": "x"}),

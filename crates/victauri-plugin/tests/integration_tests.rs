@@ -4217,13 +4217,15 @@ async fn mcp_logs_unknown_action_returns_error() {
     )
     .await;
 
+    // Since the capability gate refuses unmappable actions (c978510), an unknown action is
+    // an invalid-params error naming the action and tool, before any handler runs.
     assert!(
-        body.contains("unknown variant"),
-        "logs with unknown action should return deserialization error, got: {body}"
+        body.contains("unknown action 'nonexistent' for tool 'logs'"),
+        "logs with unknown action should be refused as invalid params, got: {body}"
     );
     assert!(
-        body.contains("console"),
-        "error should list valid actions including 'console', got: {body}"
+        body.contains("-32602"),
+        "expected invalid params, got: {body}"
     );
 }
 
@@ -4315,13 +4317,15 @@ async fn mcp_interact_unknown_action_returns_structured_error() {
     )
     .await;
 
+    // Since the capability gate refuses unmappable actions (c978510), an unknown action is
+    // an invalid-params error naming the action and tool, before any handler runs.
     assert!(
-        body.contains("unknown variant"),
-        "interact with unknown action should return deserialization error, got: {body}"
+        body.contains("unknown action 'nonexistent' for tool 'interact'"),
+        "interact with unknown action should be refused as invalid params, got: {body}"
     );
     assert!(
-        body.contains("click"),
-        "error should list valid actions including 'click', got: {body}"
+        body.contains("-32602"),
+        "expected invalid params, got: {body}"
     );
 }
 

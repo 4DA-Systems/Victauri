@@ -5802,8 +5802,18 @@ mod tests {
         std::fs::File::create(&outside).unwrap();
         symlink(&outside, root.join("linked.db")).unwrap();
 
-        let err = VictauriMcpHandler::resolve_existing_db_path(&[root], "linked.db").unwrap_err();
-        assert!(err.contains("path traversal"), "unexpected error: {err}");
+        let err =
+            VictauriMcpHandler::resolve_existing_db_path(&[root.clone()], "linked.db").unwrap_err();
+        // Audit F6: an escape answers exactly like a miss (no existence oracle).
+        let miss = VictauriMcpHandler::resolve_existing_db_path(&[root], "absent.db").unwrap_err();
+        assert!(
+            err.contains("database not found"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            err.replace("linked.db", "X"),
+            miss.replace("absent.db", "X")
+        );
     }
 
     #[cfg(feature = "sqlite")]
