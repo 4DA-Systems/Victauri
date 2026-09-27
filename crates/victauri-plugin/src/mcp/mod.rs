@@ -27,9 +27,9 @@ use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
-    ServerInfo, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+    InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ServerCapabilities, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_router};
@@ -4987,13 +4987,13 @@ app_state (app-defined backend state probes), \
 get_memory_stats, get_plugin_info, get_diagnostics.";
 
 impl ServerHandler for VictauriMcpHandler {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> InitializeResult {
         // NOTE: we advertise `resources` (read) but NOT `resources.subscribe`. A real
         // server-initiated `notifications/resources/updated` push was never implemented
         // (subscribe/unsubscribe only record intent in memory; nothing emits updates), and
         // the default stateless transport has no SSE channel to push over anyway. Advertising
         // a subscribe capability we cannot honour misleads clients — read resources on demand.
-        ServerInfo::new(
+        InitializeResult::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
