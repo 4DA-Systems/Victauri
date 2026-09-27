@@ -488,9 +488,9 @@ impl VictauriMcpHandler {
     #[tool(
         description = "Compare frontend state (evaluated via JS expression) against backend state to detect divergences. Returns a VerificationResult with any mismatches.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -648,9 +648,9 @@ impl VictauriMcpHandler {
     #[tool(
         description = "Wait for a condition to be met. Polls at regular intervals until satisfied or timeout. Conditions: text (text appears), text_gone (text disappears), selector (CSS selector matches), selector_gone, url (URL contains value), ipc_idle (no pending IPC calls), network_idle (no pending network requests), expression (poll a JS expression in `value` until truthy or until it equals `expected` — may `await`, e.g. await a fire-and-forget command's status), event (block until the Tauri event named in `value` fires, with `since_ms` look-back). Use expression/event to await async backend work to true completion instead of guessing with a fixed sleep.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -814,9 +814,9 @@ impl VictauriMcpHandler {
     #[tool(
         description = "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -1677,8 +1677,8 @@ impl VictauriMcpHandler {
         description = "Window management. Actions: get_state (window positions/sizes/visibility), list (all window labels), manage (minimize/maximize/close/focus/show/hide/fullscreen/always_on_top), resize, move_to, set_title, introspectability (probe every window and report which Victauri can actually see — a visible window that comes back introspectable:false is almost always missing the \"victauri:default\" capability; run this FIRST when eval_js/dom_snapshot/animation return nothing for a multi-window app).",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -1940,7 +1940,7 @@ impl VictauriMcpHandler {
         description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments — their side effects happen again; calls that had arguments, failed, or never completed are skipped because recordings do not capture arguments), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = false
         )
@@ -2198,7 +2198,7 @@ impl VictauriMcpHandler {
     #[tool(
         description = "CSS and visual inspection. Actions: get_styles (computed CSS for element), get_bounding_boxes (layout rects), highlight (debug overlay), clear_highlights, audit_accessibility (a11y audit), get_performance (timing/heap/DOM metrics).",
         annotations(
-            read_only_hint = true,
+            read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
@@ -2449,10 +2449,14 @@ impl VictauriMcpHandler {
             into a ring buffer, forming a visual timeline that pairs with `recording` (events) and \
             `logs` (network/console). Actions:\n\
             - `start`: begin capturing (`interval_ms` default 500, `max_frames` default 60). Set \
-              `with_events=true` to also start the event recorder.\n\
-            - `stop`: stop and return a summary (frame count, duration, timestamps).\n\
+              `with_events=true` to also start the event recorder. Hidden windows are skipped \
+              (no frame), the buffer is capped at 256 MB, and an abandoned trace auto-stops \
+              after 30 minutes.\n\
+            - `stop`: stop and return a summary (frame count, duration, timestamps); also stops \
+              the recording that `with_events` started (never one started separately).\n\
             - `status`: active flag + buffered frame count.\n\
-            - `frames`: return captured frames as base64 PNGs (`limit` caps how many).",
+            - `frames`: return captured frames as base64 PNGs, newest first up to a 25 MB \
+              response (`limit` caps how many).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2624,9 +2628,9 @@ impl VictauriMcpHandler {
             NOTE: an animation only appears while it is running or pending — trigger it (e.g. show the \
             notification) just before calling `list`/`scrub`, or arm `sample` before triggering.",
         annotations(
-            read_only_hint = true,
+            read_only_hint = false,
             destructive_hint = false,
-            idempotent_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -2786,10 +2790,10 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls).",
+        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation).",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
+            read_only_hint = false,
+            destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
         )
@@ -2936,16 +2940,19 @@ impl VictauriMcpHandler {
             - `contract_clear`: Clear all recorded contract baselines.\n\
             - `startup_timing`: Victauri plugin initialization phase-by-phase timing breakdown.\n\
             - `capabilities`: Enumerate Tauri v2 capabilities, security config (CSP, freeze_prototype), configured plugins, and window definitions.\n\
-            - `db_health`: Read-only SQLite database diagnostics (journal mode, WAL presence, page stats).\n\
+            - `db_health`: Read-only SQLite diagnostics: journal mode, page stats, freelist, \
+              per-table row counts, and SQLite `quick_check` — each phase budgeted; a phase that \
+              runs out is reported (`row_counts_complete`, `integrity_check: \"not completed…\"`) \
+              instead of failing.\n\
             - `plugin_state`: Snapshot of the Victauri plugin's internal state (event log, registry, faults, recording, timings, etc.).\n\
             - `processes`: Enumerate the host process and all child processes (sidecars, background workers) with PID, name, and memory usage.\n\
             - `plugin_tasks`: List Victauri's own spawned async tasks (MCP server, event drain) with status.\n\
             - `event_bus`: List captured Tauri events + app events (auto-intercepted via listen_any — no app opt-in needed). Returns the newest events per category (default 100) so the full buffers (up to ~11k events / megabytes) never overflow the result; `count` is the true total and `truncated` flags a capped slice. Scope via the `args` object: `{\"action\":\"event_bus\",\"args\":{\"limit\":500,\"since_ms\":5000}}`.\n\
             - `event_bus_clear`: Clear the event bus capture buffer.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -3463,7 +3470,11 @@ impl VictauriMcpHandler {
             which runs below the layer Victauri can reach. Use this to test a handler's error path when \
             YOU drive it; it does not reproduce a failure a user clicking the UI would see.\n\n\
             Actions:\n\
-            - `inject`: Add a fault rule (requires `command`, `fault_type`). Optional: `delay_ms`, `error_message`, `max_triggers`.\n\
+            - `inject`: Add a fault rule (requires `command`, `fault_type`). Optional: `delay_ms` \
+              (max 120000), `error_message`, `max_triggers`. `delay` sleeps then runs the command; \
+              `error` returns the error without running it; `drop` returns `{}` without running \
+              it; `corrupt` runs it and replaces the response with a fixed \
+              `{\"__corrupted\":true,…}` marker. Rules expire after 15 minutes.\n\
             - `list`: List all active fault injection rules.\n\
             - `clear`: Remove a specific fault rule (requires `command`).\n\
             - `clear_all`: Remove all fault rules.",
@@ -3564,7 +3575,9 @@ impl VictauriMcpHandler {
             + window events across the Rust backend and webview simultaneously.\n\n\
             Actions:\n\
             - `summary`: High-level activity summary for the last N seconds (default 30). \
-              Counts IPC calls, DOM mutations, console entries, network requests, errors.\n\
+              Counts IPC calls, DOM mutations, console entries, state changes (incl. network \
+              requests), errors. With no recording active it reads the window's live event \
+              stream (`webview_label`, default main).\n\
             - `last_action`: Correlate the most recent burst of events into a causal timeline \
               (e.g. 'IPC call → DOM update → console.log').\n\
             - `diff`: What changed in the last N seconds — event counts, errors, new IPC commands.",
@@ -4108,6 +4121,22 @@ impl VictauriMcpHandler {
     ) -> Result<std::path::PathBuf, String> {
         let candidate = std::path::Path::new(requested);
         if candidate.is_absolute() {
+            // Decide containment LEXICALLY first, before touching the requested path: checking
+            // existence first answered "does X exist?" for any path on disk ("not found" vs
+            // "not within an allowed directory"). The canonical check below still catches
+            // symlink escapes for paths that are lexically inside a root.
+            let normalized = lexically_normalize(candidate);
+            let lexically_inside = roots.iter().any(|root| {
+                normalized.starts_with(lexically_normalize(root))
+                    || std::fs::canonicalize(root)
+                        .is_ok_and(|canon_root| normalized.starts_with(canon_root))
+            });
+            if !lexically_inside {
+                return Err(format!(
+                    "absolute path '{requested}' is not within an allowed directory; \
+                     register its parent via VictauriBuilder::db_search_paths"
+                ));
+            }
             if !candidate.exists() {
                 return Err(format!("database not found: {requested}"));
             }
@@ -5147,6 +5176,21 @@ const STMT_STARTS: &[&str] = &[
     "debugger",
 ];
 
+/// Resolve `.` and `..` components without touching the filesystem.
+fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// A line ending in one of these continues onto the next line (no ASI).
 const ASI_CONTINUES_AFTER: &[u8] = b"+-*/%&|^!=<>?:,.([{~";
 /// A line starting with one of these continues the previous line (no ASI) — including `(`,
@@ -5203,84 +5247,94 @@ fn should_prepend_return(code: &str) -> bool {
     let mut depth: i32 = 0;
     let mut state = ScanState::Code;
 
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
     // Is there a top-level `return` token starting at byte `i` (word-bounded)?
     let is_return_token = |i: usize| -> bool {
-        let prev_ok = i == 0 || !is_ident(bytes[i - 1]);
+        let prev_ok = i == 0 || !is_js_ident(bytes[i - 1]);
         prev_ok
             && code[i..].starts_with("return")
-            && bytes.get(i + 6).copied().is_none_or(|b| !is_ident(b))
+            && bytes.get(i + 6).copied().is_none_or(|b| !is_js_ident(b))
     };
 
-    // Last significant (non-whitespace, non-comment) byte seen in code — for the ASI check.
+    // The last two significant (non-whitespace, non-comment) bytes seen in code, and where the
+    // last one is — for the ASI and regex-vs-division decisions.
     let mut last_sig: Option<u8> = None;
+    let mut prev_sig: Option<u8> = None;
+    let mut last_sig_idx = 0usize;
 
     while i < bytes.len() {
         let c = bytes[i];
-        if state == Code && !c.is_ascii_whitespace() && c != b'/' {
-            last_sig = Some(c);
+        // U+2028 / U+2029 are JavaScript line terminators too.
+        let line_sep = c == 0xE2
+            && bytes.get(i + 1) == Some(&0x80)
+            && matches!(bytes.get(i + 2), Some(&0xA8 | &0xA9));
+        if state == Code && (c == b'\n' || line_sep) {
+            let next_start = if line_sep { i + 3 } else { i + 1 };
+            if depth <= 0 && asi_ends_statement(code, next_start, last_sig, prev_sig, last_sig_idx)
+            {
+                return false;
+            }
+            i = next_start;
+            continue;
         }
         match state {
-            Code => match c {
-                // A top-level newline ends the statement (ASI) unless the expression visibly
-                // continues across it. `foo()\nbar()` with `return` prepended would return
-                // `foo()` and silently never run `bar()`.
-                b'\n' if depth <= 0 => {
-                    let rest = strip_leading_js_comments(&code[i + 1..]);
-                    if let Some(&next) = rest.as_bytes().first()
-                        && !last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p))
-                        && !ASI_CONTINUES_BEFORE.contains(&next)
-                    {
+            Code => {
+                match c {
+                    b'\'' => state = SingleQuote,
+                    b'"' => state = DoubleQuote,
+                    b'`' => state = Template,
+                    b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                        while i < bytes.len() && bytes[i] != b'\n' {
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                        i += 2;
+                        while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                            i += 1;
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    b'/' if slash_starts_regex(code, last_sig, last_sig_idx) => {
+                        // A regex literal: skip it whole (a quote or newline-like character
+                        // inside it must not be read as code), then its flags.
+                        i = skip_regex_literal(bytes, i);
+                        prev_sig = last_sig;
+                        last_sig = Some(b')'); // an operand, like a closed group
+                        last_sig_idx = i.saturating_sub(1);
+                        continue;
+                    }
+                    b'(' | b'[' | b'{' => depth += 1,
+                    b')' | b']' | b'}' => depth -= 1,
+                    // A top-level `;` with more CODE after it (not just a comment) is a
+                    // multi-statement block.
+                    b';' if depth <= 0 && !strip_leading_js_comments(&code[i + 1..]).is_empty() => {
                         return false;
                     }
+                    // An explicit top-level `return` token means the code already returns.
+                    b'r' if depth <= 0 && is_return_token(i) => return false,
+                    _ => {}
                 }
-                b'/' if !(i + 1 < bytes.len() && matches!(bytes[i + 1], b'/' | b'*')) => {
-                    last_sig = Some(b'/');
-                }
-                b'\'' => state = SingleQuote,
-                b'"' => state = DoubleQuote,
-                b'`' => state = Template,
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                    continue;
-                }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                    i += 2;
-                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                        i += 1;
-                    }
-                    i += 2;
-                    continue;
-                }
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                // A top-level `;` with more code after it == multi-statement.
-                b';' if depth <= 0 && !code[i + 1..].trim().is_empty() => return false,
-                // An explicit top-level `return` token means the code already returns.
-                b'r' if depth <= 0 && is_return_token(i) => return false,
-                _ => {}
-            },
-            SingleQuote => {
-                if c == b'\\' {
-                    i += 1;
-                } else if c == b'\'' {
-                    state = Code;
+                if !c.is_ascii_whitespace() {
+                    prev_sig = last_sig;
+                    last_sig = Some(c);
+                    last_sig_idx = i;
                 }
             }
-            DoubleQuote => {
+            SingleQuote | DoubleQuote | Template => {
+                let close = match state {
+                    SingleQuote => b'\'',
+                    DoubleQuote => b'"',
+                    _ => b'`',
+                };
                 if c == b'\\' {
                     i += 1;
-                } else if c == b'"' {
+                } else if c == close {
                     state = Code;
-                }
-            }
-            Template => {
-                if c == b'\\' {
-                    i += 1;
-                } else if c == b'`' {
-                    state = Code;
+                    prev_sig = last_sig;
+                    last_sig = Some(c);
+                    last_sig_idx = i;
                 }
             }
         }
@@ -5288,6 +5342,103 @@ fn should_prepend_return(code: &str) -> bool {
     }
 
     true
+}
+
+fn is_js_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+}
+
+/// The identifier that ends at byte `end` (inclusive), if `code[end]` is an identifier byte.
+fn js_word_ending_at(code: &str, end: usize) -> &str {
+    let bytes = code.as_bytes();
+    if !bytes.get(end).copied().is_some_and(is_js_ident) {
+        return "";
+    }
+    let mut start = end;
+    while start > 0 && is_js_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+    &code[start..=end]
+}
+
+/// Keywords after which an expression (not a statement end) must follow.
+const EXPR_KEYWORDS: &[&str] = &[
+    "instanceof",
+    "in",
+    "typeof",
+    "void",
+    "delete",
+    "new",
+    "await",
+    "yield",
+    "return",
+    "case",
+    "do",
+    "else",
+    "of",
+    "throw",
+];
+
+/// Does a line break just before `next_start` end the statement (JavaScript ASI)? Only
+/// consulted at bracket depth 0.
+fn asi_ends_statement(
+    code: &str,
+    next_start: usize,
+    last_sig: Option<u8>,
+    prev_sig: Option<u8>,
+    last_sig_idx: usize,
+) -> bool {
+    let rest = strip_leading_js_comments(&code[next_start.min(code.len())..]);
+    let Some(&next) = rest.as_bytes().first() else {
+        return false; // nothing follows
+    };
+    // Restricted production: `a\n++b` is `a; ++b`.
+    if rest.starts_with("++") || rest.starts_with("--") {
+        return true;
+    }
+    // A line ending in POSTFIX `++`/`--` is complete, even though `+`/`-` normally continue.
+    let postfix = matches!(
+        (prev_sig, last_sig),
+        (Some(b'+'), Some(b'+')) | (Some(b'-'), Some(b'-'))
+    );
+    let continues_after = !postfix
+        && (last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p))
+            || EXPR_KEYWORDS.contains(&js_word_ending_at(code, last_sig_idx)));
+    !(continues_after || ASI_CONTINUES_BEFORE.contains(&next))
+}
+
+/// Whether a `/` (not starting a comment) begins a regex literal rather than division:
+/// true where an operand is expected — at the start, after an operator or opening
+/// punctuation, or after a keyword such as `return`/`typeof`.
+fn slash_starts_regex(code: &str, last_sig: Option<u8>, last_sig_idx: usize) -> bool {
+    match last_sig {
+        None => true,
+        Some(b) if b"(,=:[!&|?{};+-*%<>~^".contains(&b) => true,
+        Some(b) if is_js_ident(b) => EXPR_KEYWORDS.contains(&js_word_ending_at(code, last_sig_idx)),
+        Some(_) => false,
+    }
+}
+
+/// Skip a regex literal starting at the `/` at `start`; returns the index after its flags.
+fn skip_regex_literal(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    let mut in_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'/' if !in_class => break,
+            b'\n' => return i, // unterminated: let the newline be scanned normally
+            _ => {}
+        }
+        i += 1;
+    }
+    i += 1;
+    while i < bytes.len() && is_js_ident(bytes[i]) {
+        i += 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -5478,6 +5629,108 @@ mod tests {
         assert!(should_prepend_return("[1, 2].map(x =>\n  x * 2)"));
         assert!(should_prepend_return("`line1\nline2`"));
         assert!(should_prepend_return("document.title\n"));
+    }
+
+    /// The live tool list (name + description), in router order — the source of truth for the
+    /// CLI bridge's baked `tools_fallback.json` (what an agent sees while the app is down).
+    fn live_tool_manifest() -> serde_json::Value {
+        let mut tools = VictauriMcpHandler::tool_router().list_all();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        serde_json::Value::Array(
+            tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name.as_ref(),
+                        "description": t.description.as_deref().unwrap_or_default(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn fallback_manifest_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../victauri-cli/src/tools_fallback.json")
+    }
+
+    #[test]
+    fn cli_fallback_tool_manifest_matches_the_live_tools() {
+        // Names AND descriptions: a stale description shown while the app is down misleads an
+        // agent just as much as a missing tool. Regenerate with:
+        //   VICTAURI_WRITE_FALLBACK=1 cargo test -p victauri-plugin --lib cli_fallback
+        let path = fallback_manifest_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return; // packaged crate: the CLI source is not alongside
+        };
+        let live = live_tool_manifest();
+        if std::env::var_os("VICTAURI_WRITE_FALLBACK").is_some() {
+            let pretty = serde_json::to_string_pretty(&live).unwrap() + "\n";
+            std::fs::write(&path, pretty).unwrap();
+            return;
+        }
+        let mut baked: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+        baked.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        assert_eq!(
+            serde_json::Value::Array(baked),
+            live,
+            "crates/victauri-cli/src/tools_fallback.json is stale — regenerate it with \
+             VICTAURI_WRITE_FALLBACK=1 cargo test -p victauri-plugin --lib cli_fallback"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn db_path_outside_roots_gives_no_existence_oracle() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let outside_existing = std::env::current_exe().unwrap();
+        let outside_missing = outside_existing.with_file_name("definitely-not-here-7f3a.db");
+        let e1 = VictauriMcpHandler::resolve_existing_db_path(
+            &roots,
+            outside_existing.to_str().unwrap(),
+        )
+        .unwrap_err();
+        let e2 =
+            VictauriMcpHandler::resolve_existing_db_path(&roots, outside_missing.to_str().unwrap())
+                .unwrap_err();
+        assert!(e1.contains("not within an allowed directory"), "{e1}");
+        assert!(e2.contains("not within an allowed directory"), "{e2}");
+        assert!(!e1.contains("not found") && !e2.contains("not found"));
+        // `..` cannot climb out lexically either.
+        let climb = root.path().join("..").join("x.db");
+        let e3 = VictauriMcpHandler::resolve_existing_db_path(&roots, climb.to_str().unwrap())
+            .unwrap_err();
+        assert!(e3.contains("not within an allowed directory"), "{e3}");
+    }
+
+    #[test]
+    fn prepend_return_handles_the_red_team_asi_cases() {
+        // Two statements that must NOT be wrapped (the second line would silently never run).
+        for code in [
+            "window.x++\nwindow.x",
+            "window.x--\nwindow.x",
+            "a\n++b",
+            "/re/.test(s)\nfoo()",
+            "s.replace(/\"/g, '')\nfoo()",
+            "foo()\u{2028}bar()",
+            "foo()\u{2029}bar()",
+        ] {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+        // Valid single expressions spanning lines, which must still be wrapped.
+        for code in [
+            "a instanceof\nB",
+            "typeof\nx",
+            "await\nfoo()",
+            "new\nFoo()",
+            "a /\nb",
+            "s.split(/,/)\n.length",
+            "document.title; // trailing note",
+            "document.title // trailing note",
+        ] {
+            assert!(should_prepend_return(code), "must wrap: {code:?}");
+        }
     }
 
     #[test]

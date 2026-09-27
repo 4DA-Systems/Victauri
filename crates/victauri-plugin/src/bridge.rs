@@ -4,6 +4,12 @@ use victauri_core::WindowState;
 /// Runtime-erased interface for webview and backend access, allowing the MCP
 /// server to interact with Tauri windows and the application backend without
 /// generic parameters.
+///
+/// Victauri implements this for `tauri::AppHandle`; it is public so tests (and embedders) can
+/// supply a mock. **Stability contract:** any method added to this trait in a future release
+/// will have a default implementation, so implementing it does not pin you to an exact
+/// version. [`WindowState`] is `#[non_exhaustive]` — build one with
+/// `WindowState::new(label).with_*(..)`.
 pub trait WebviewBridge: Send + Sync {
     /// Execute JavaScript in the target webview (defaults to "main" or first visible window).
     ///

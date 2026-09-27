@@ -5,7 +5,7 @@ use axum::extract::DefaultBodyLimit;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tauri::Runtime;
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::VictauriState;
 use crate::bridge::WebviewBridge;
@@ -229,9 +229,11 @@ fn build_app_full_inner(
     // The concurrency cap and body limit wrap only the API routes registered so far — NOT
     // `/health`. A liveness probe must never queue behind 64 slow tool calls (long `wait_for`s,
     // injected fault delays): the watchdog would then report a live app as dead.
+    // `GlobalConcurrencyLimitLayer`: ONE shared semaphore. A plain `ConcurrencyLimitLayer` is
+    // instantiated per route by axum, which gave `/mcp` and `/api/tools/*` 64 slots EACH.
     router = router
         .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
-        .layer(ConcurrencyLimitLayer::new(64));
+        .layer(GlobalConcurrencyLimitLayer::new(64));
 
     // `/health` is registered AFTER the auth layer (so liveness probes stay unauthenticated)
     // but BEFORE the rate limiter below, so it is still throttled. Axum applies a `.layer` only
@@ -249,9 +251,42 @@ fn build_app_full_inner(
     ));
 
     router
+        .layer(axum::middleware::from_fn(require_json_from_browsers))
         .layer(axum::middleware::from_fn(crate::auth::security_headers))
         .layer(axum::middleware::from_fn(crate::auth::origin_guard))
         .layer(axum::middleware::from_fn(crate::auth::dns_rebinding_guard))
+}
+
+/// Refuse a browser-originated request body that is not JSON (415).
+///
+/// A browser can send a cross-origin POST with a "simple" content type (`text/plain`,
+/// form-encoded, multipart) and NO CORS preflight, so a page on any localhost origin could
+/// fire tool calls blind at an `auth_disabled()` server (with auth on, the `Authorization`
+/// header already forces a preflight that fails). Every legitimate caller sends JSON, and
+/// non-browser clients (curl, scripts, the CLI) send no `Origin` header, so they are unaffected.
+async fn require_json_from_browsers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{Method, StatusCode, header};
+    use axum::response::IntoResponse;
+    let has_body_method = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if has_body_method && req.headers().contains_key(header::ORIGIN) {
+        let is_json = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|ct| ct.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+        if !is_json {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "browser-originated requests must send Content-Type: application/json",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 #[doc(hidden)]

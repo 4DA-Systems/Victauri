@@ -2455,3 +2455,46 @@ async fn app_state_lists_empty_when_no_probes() {
         "app_state with no probes should still return a probes list: {list}"
     );
 }
+
+// Red-team M2: a browser page on any localhost origin could fire a cross-origin "simple"
+// (text/plain, no-preflight) POST at an auth-disabled server. Browser-originated bodies must be
+// JSON; non-browser clients (no Origin header) are unaffected.
+#[tokio::test]
+async fn browser_simple_post_is_refused_but_json_and_curl_work() {
+    let base = start_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/tools/get_plugin_info");
+
+    let simple = client
+        .post(&url)
+        .header("Origin", "http://localhost:3000")
+        .header("Content-Type", "text/plain")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        simple.status(),
+        415,
+        "CORS-simple POST from a page must be refused"
+    );
+
+    let json = client
+        .post(&url)
+        .header("Origin", "http://localhost:3000")
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json.status(), 200);
+
+    let curl_like = client
+        .post(&url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(curl_like.status(), 200, "non-browser clients keep working");
+}

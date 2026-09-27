@@ -1100,6 +1100,12 @@ fn system32_exe(name: &str) -> String {
     format!("{root}\\System32\\{name}")
 }
 
+/// No batched process enumeration on this platform: callers fall back to per-pid checks.
+#[cfg(not(any(unix, windows)))]
+fn alive_pids() -> Option<HashSet<u32>> {
+    None
+}
+
 /// Resolve a core utility to an absolute path (defeats `PATH`-hijack of the poller's repeated
 /// `ps`/`kill` spawns), falling back to the bare name only if neither canonical location exists.
 #[cfg(not(windows))]
@@ -1140,11 +1146,16 @@ fn alive_pids() -> Option<HashSet<u32>> {
     (!set.is_empty()).then_some(set)
 }
 
-/// One `ps` lists every PID on both Linux and macOS (portable; `/proc` is Linux-only).
-#[cfg(not(windows))]
+/// One `ps` lists the PIDs on both Linux and macOS (portable; `/proc` is Linux-only) — only
+/// OUR OWN user's processes. `ps -A` counted every user's, so on a shared machine a stale
+/// discovery entry whose PID had been recycled by ANOTHER user's process looked alive, and a
+/// port squatter could then receive the token and feed forged tool results to the agent. The
+/// per-pid fallback (`kill -0`) was already own-user only.
+#[cfg(unix)]
 fn alive_pids() -> Option<HashSet<u32>> {
+    let uid = current_euid()?.to_string();
     let out = std::process::Command::new(abs_bin("ps"))
-        .args(["-A", "-o", "pid="])
+        .args(["-U", uid.as_str(), "-o", "pid="])
         .output()
         .ok()?;
     if !out.status.success() {
