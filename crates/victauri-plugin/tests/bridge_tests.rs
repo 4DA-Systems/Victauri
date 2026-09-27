@@ -4995,6 +4995,172 @@ fn ipc_encoded_command_names() {
     );
 }
 
+// ── Recording drain: sequence watermark, completion keying, mocked flag ──────
+
+fn drain_case(name: &str, code: &str) -> TestCase {
+    TestCase {
+        name: name.into(),
+        code: code.into(),
+        setup_html: None,
+        // jsdom has no Response; a route `fulfill` needs one.
+        setup_js: Some(
+            r"window.Response = function(body, init) { this.status = init.status; this.body = body; };"
+                .into(),
+        ),
+    }
+}
+
+// C5/V-10, C13, V-3 (bridge side). The drain used a wall-clock watermark clamped to the Rust
+// clock: an event stamped ahead of it was re-read on every drain and same-millisecond events
+// pushed after the read were lost; plain network requests were keyed by start and emitted while
+// pending; and a route-mocked IPC call was indistinguishable from a real one.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn recording_drain_reads_each_event_exactly_once() {
+    let def = TestDef {
+        bridge_script: bridge_script(),
+        setup_html: default_html(),
+        setup_js: None,
+        tests: vec![
+            drain_case(
+                "a future-dated event is drained once",
+                r"
+                    var realNow = Date.now;
+                    Date.now = function() { return realNow() + 3600000; };
+                    console.log('from the future');
+                    Date.now = realNow;
+                    var v = window.__VICTAURI__;
+                    var d1 = v.drainEvents(0, null, 0);
+                    var d2 = v.drainEvents(d1.seq, d1.instance, 0);
+                    var d3 = v.drainEvents(d2.seq, d2.instance, 0);
+                    function n(d) { return d.events.filter(function(e) { return e.message === 'from the future'; }).length; }
+                    return [n(d1), n(d2), n(d3)];
+                ",
+            ),
+            drain_case(
+                "events in the same millisecond as the previous read are kept",
+                r"
+                    var realNow = Date.now;
+                    Date.now = function() { return 5000; };
+                    var v = window.__VICTAURI__;
+                    console.log('a');
+                    var d1 = v.drainEvents(0, null, 0);
+                    console.log('b');
+                    var d2 = v.drainEvents(d1.seq, d1.instance, 0);
+                    console.log('c');
+                    var d3 = v.drainEvents(d2.seq, d2.instance, 0);
+                    Date.now = realNow;
+                    function msgs(d) { return d.events.filter(function(e) { return e.type === 'console'; }).map(function(e) { return e.message; }); }
+                    return [msgs(d1), msgs(d2), msgs(d3)];
+                ",
+            ),
+            drain_case(
+                "a slow plain network request is drained once, when it completes",
+                r"
+                    var v = window.__VICTAURI__;
+                    var p = fetch('http://example.test/slow', { headers: { 'x-vtest-delay-ms': '80' } });
+                    var d1 = v.drainEvents(0, null, 0);
+                    var excl = v.getEventStream(0, true).filter(function(e) { return e.type === 'network'; }).length;
+                    await p;
+                    await new Promise(function(r) { setTimeout(r, 20); });
+                    var d2 = v.drainEvents(d1.seq, d1.instance, 0);
+                    var d3 = v.drainEvents(d2.seq, d2.instance, 0);
+                    function net(d) { return d.events.filter(function(e) { return e.type === 'network'; }); }
+                    return { during: net(d1).length, excl_during: excl, after: net(d2).map(function(e) { return e.status; }), again: net(d3).length };
+                ",
+            ),
+            drain_case(
+                "a route-mocked IPC call is marked mocked in the stream and the drain",
+                r"
+                    var v = window.__VICTAURI__;
+                    v.addRoute({ pattern: 'http://ipc.localhost/quit_app', match_type: 'exact', action: 'fulfill', status: 200, body: 'null' });
+                    await fetch('http://ipc.localhost/quit_app', { method: 'POST' });
+                    v.clearRoutes();
+                    await fetch('http://ipc.localhost/real_cmd', { method: 'POST', body: '{}' });
+                    await new Promise(function(r) { setTimeout(r, 20); });
+                    function pick(evs) {
+                        return evs.filter(function(e) { return e.type === 'ipc'; })
+                            .map(function(e) { return [e.command, e.status, e.mocked === true]; });
+                    }
+                    return { drained: pick(v.drainEvents(0, null, 0).events), stream: pick(v.getEventStream()) };
+                ",
+            ),
+            drain_case(
+                "a sequence from another page instance reads from the start; the floor applies to a first read",
+                r"
+                    var v = window.__VICTAURI__;
+                    console.log('one');
+                    console.log('two');
+                    var d1 = v.drainEvents(0, null, 0);
+                    var other = v.drainEvents(d1.seq, 'another-page-load', 0);
+                    var floored = v.drainEvents(0, null, Date.now() + 60000);
+                    function c(d) { return d.events.filter(function(e) { return e.type === 'console'; }).length; }
+                    return { first: c(d1), other: c(other),
+                             floored: floored.events.length, seq_moves: floored.seq >= d1.seq,
+                             instance_is_string: typeof d1.instance === 'string' && d1.instance.length > 8 };
+                ",
+            ),
+            drain_case(
+                "the drain reply is serialized with the bridge's own JSON.stringify, not the page's",
+                r"
+                    var sent = [];
+                    window.__TAURI_INTERNALS__ = { invoke: function(cmd, args) { sent.push(args); return Promise.resolve(null); } };
+                    console.log('real');
+                    JSON.stringify = function() { return '[]'; };
+                    // Exactly what the Rust drain injects: drainEvents, delivered via _evalSettle.
+                    var v = window.__VICTAURI__;
+                    v._evalSettle('drain-id', v.drainEvents(0, null, 0));
+                    var body = JSON.parse(sent[0].result);
+                    return body.events.filter(function(e) { return e.message === 'real'; }).length;
+                ",
+            ),
+        ],
+    };
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = |i: usize| results[i].result.clone().unwrap();
+    assert_eq!(
+        r(5),
+        1,
+        "a page's JSON.stringify must not shape the drain reply"
+    );
+
+    assert_eq!(
+        r(0),
+        serde_json::json!([1, 0, 0]),
+        "a future-dated event must be read exactly once"
+    );
+    assert_eq!(
+        r(1),
+        serde_json::json!([["a"], ["b"], ["c"]]),
+        "same-millisecond events must each be read exactly once"
+    );
+    let n = r(2);
+    assert_eq!(n["during"], 0, "a pending request is not drained");
+    assert_eq!(n["excl_during"], 0, "nor emitted in watermark mode");
+    assert_eq!(n["after"], serde_json::json!([200]));
+    assert_eq!(n["again"], 0);
+    let m = r(3);
+    for key in ["drained", "stream"] {
+        assert_eq!(
+            m[key],
+            serde_json::json!([["quit_app", "ok", true], ["real_cmd", "ok", false]]),
+            "{key}"
+        );
+    }
+    let i = r(4);
+    assert_eq!(i["first"], 2);
+    assert_eq!(
+        i["other"], 2,
+        "another instance's sequence means from the start"
+    );
+    assert_eq!(i["floored"], 0, "entries before the floor are skipped");
+    assert_eq!(i["seq_moves"], true);
+    assert_eq!(i["instance_is_string"], true);
+}
+
 // ── Hardening regressions (bounded capture, never-throw hooks, ref reuse) ────
 
 fn case(name: &str, code: &str) -> TestCase {

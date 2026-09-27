@@ -7,9 +7,12 @@
 mod authz;
 mod backend_params;
 mod compound_params;
+#[cfg(test)]
+mod drain_tests;
 mod helpers;
 mod introspection_params;
 mod other_params;
+pub(crate) mod page_json;
 mod rest;
 mod server;
 mod verification_params;
@@ -1974,7 +1977,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments — their side effects happen again; calls that had arguments, failed, or never completed are skipped because recordings do not capture arguments), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
+        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, or were answered by a route rule are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1992,9 +1995,10 @@ impl VictauriMcpHandler {
                 let session_id = params
                     .session_id
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                match self.state.recorder.start(session_id.clone()) {
-                    Ok(()) => {
-                        self.reset_drain_floor();
+                let floor_ms = now_ms();
+                match self.state.recorder.start_session(session_id.clone()) {
+                    Ok(generation) => {
+                        self.state.drain_watermarks.reset(floor_ms, generation);
                         let result = serde_json::json!({
                             "started": true,
                             "session_id": session_id,
@@ -2081,14 +2085,6 @@ impl VictauriMcpHandler {
                         Err(e) => return tool_error(format!("invalid session JSON: {e}")),
                     };
 
-                // Import REPLACES the active recording. Doing that silently threw away an
-                // in-progress recording, so require it to be stopped (and saved) first.
-                if self.state.recorder.is_recording() {
-                    return tool_error(
-                        "a recording is in progress — import would discard it. Stop it first \
-                         (recording action=stop, or export it), then import.",
-                    );
-                }
                 let result = serde_json::json!({
                     "imported": true,
                     "session_id": session.id,
@@ -2099,8 +2095,19 @@ impl VictauriMcpHandler {
                     "note": "the imported session is now the ACTIVE recording: live events are \
                              appended to it until you call recording action=stop",
                 });
-                self.reset_drain_floor();
-                self.state.recorder.import(session);
+                // Import REPLACES the active recording. Doing that silently threw away an
+                // in-progress recording, so require it to be stopped (and saved) first — checked
+                // and replaced in one step, so a recording started concurrently is never lost.
+                let floor_ms = now_ms();
+                match self.state.recorder.import_if_idle(session) {
+                    Ok(generation) => self.state.drain_watermarks.reset(floor_ms, generation),
+                    Err(_) => {
+                        return tool_error(
+                            "a recording is in progress — import would discard it. Stop it first \
+                             (recording action=stop, or export it), then import.",
+                        );
+                    }
+                }
                 CallToolResult::success(vec![ContentBlock::text(result.to_string())])
             }
             RecordingAction::Flush => {
@@ -2152,13 +2159,30 @@ impl VictauriMcpHandler {
                     // command with none. Re-running a call that took arguments is guaranteed
                     // wrong (it fails, or worse, runs with defaults), and re-running a call
                     // that failed or never completed reproduces nothing — skip both, loudly.
+                    // A call a route rule answered in the page never reached the backend:
+                    // replaying it would turn a fake (possibly page-forged) success into a real
+                    // invocation.
                     let skip_reason = match &call.result {
-                        victauri_core::IpcResult::Ok(_) if call.arg_size_bytes > 0 => {
-                            Some("the original call had arguments, which recordings do not capture")
+                        _ if call.mocked => Some(
+                            "the original call was answered by a route rule in the page, not the backend".to_string(),
+                        ),
+                        victauri_core::IpcResult::Ok(_) if call.arg_size_bytes > 0 => Some(
+                            "the original call had arguments, which recordings do not capture".to_string(),
+                        ),
+                        victauri_core::IpcResult::Ok(_) => params
+                            .webview_label
+                            .as_deref()
+                            .filter(|only| *only != call.webview_label)
+                            .map(|only| {
+                                format!(
+                                    "recorded in window '{}'; replay was limited to '{only}'",
+                                    call.webview_label
+                                )
+                            }),
+                        victauri_core::IpcResult::Err(_) => {
+                            Some("the original call failed".to_string())
                         }
-                        victauri_core::IpcResult::Ok(_) => None,
-                        victauri_core::IpcResult::Err(_) => Some("the original call failed"),
-                        _ => Some("the original call never completed"),
+                        _ => Some("the original call never completed".to_string()),
                     };
                     if let Some(reason) = skip_reason {
                         replay_results.push(serde_json::json!({
@@ -2185,8 +2209,12 @@ impl VictauriMcpHandler {
                         "return window.__TAURI_INTERNALS__.invoke({})",
                         js_string(&call.command)
                     );
+                    // Replay each call in the window that made it — never a default window: a
+                    // command recorded in a low-privilege window must not run with main's
+                    // capabilities. A window that no longer exists fails the call (an explicit
+                    // label never falls back to another window).
                     let outcome = match self
-                        .eval_with_return(&code, params.webview_label.as_deref())
+                        .eval_with_return(&code, Some(call.webview_label.as_str()))
                         .await
                     {
                         Ok(result_str) => {
@@ -2195,6 +2223,7 @@ impl VictauriMcpHandler {
                             let shape = crate::introspection::JsonShape::from_value(&value);
                             serde_json::json!({
                                 "command": call.command,
+                                "webview_label": call.webview_label,
                                 "status": "ok",
                                 "response_type": shape.type_name(),
                             })
@@ -2223,8 +2252,9 @@ impl VictauriMcpHandler {
                     "failed": replayed - passed,
                     "skipped": skipped,
                     "note": "commands are re-invoked WITHOUT arguments (recordings do not capture \
-                             them) and their side effects happen again; calls that had arguments, \
-                             failed, or never completed are skipped",
+                             them), each in the window that recorded it, and their side effects \
+                             happen again; calls that had arguments, failed, never completed, or \
+                             were answered by a route rule are skipped",
                     "results": replay_results,
                 });
                 json_result(&result)
@@ -2515,43 +2545,54 @@ impl VictauriMcpHandler {
                 // A trace started over a running one supersedes it: end the recording the
                 // previous trace started (if it is still the active one), or it would be left
                 // running with no owner (and the per-second drain loop with it).
-                if let Some(prev) = self.state.screencast.take_owned_recording() {
-                    let _ = self.state.recorder.stop_if_session(&prev);
+                let (generation, superseded) =
+                    self.state
+                        .screencast
+                        .start(interval, max_frames, label.clone());
+                if let Some(prev) = superseded {
+                    let _ = self.state.recorder.stop_if_generation(prev);
                 }
-                let generation = self
-                    .state
-                    .screencast
-                    .start(interval, max_frames, label.clone());
 
                 let mut events_started = false;
                 if params.with_events.unwrap_or(false) {
                     let session_id = uuid::Uuid::new_v4().to_string();
-                    if self.state.recorder.start(session_id.clone()).is_ok() {
-                        self.reset_drain_floor();
-                        events_started = true;
-                        // Only a recording THIS trace started is stopped with it — by session
-                        // id, so a recording the agent starts later is never stopped by us.
-                        self.state.screencast.set_owned_recording(Some(session_id));
+                    let floor_ms = now_ms();
+                    if let Ok(recording) = self.state.recorder.start_session(session_id) {
+                        self.state.drain_watermarks.reset(floor_ms, recording);
+                        // Only a recording THIS trace started is stopped with it — by recorder
+                        // generation, so a recording started later (even under the same session
+                        // id) is never stopped by us. If this trace was already stopped or
+                        // superseded meanwhile, nothing would ever stop the recording: do it now.
+                        if self
+                            .state
+                            .screencast
+                            .set_owned_recording(generation, recording)
+                        {
+                            events_started = true;
+                        } else {
+                            let _ = self.state.recorder.stop_if_generation(recording);
+                        }
                     }
                 }
 
                 // Background capture task: snapshot the window each interval until the
                 // screencast is stopped, superseded by a newer start, or hits the max duration.
+                // The guard ends the trace (and its recording) however the task exits — the
+                // max-duration break, or a panic.
                 let handler = self.clone();
                 let screencast = self.state.screencast.clone();
+                let guard = crate::screencast::CaptureTaskGuard {
+                    screencast: Arc::clone(&screencast),
+                    recorder: self.state.recorder.clone(),
+                    generation,
+                };
                 tokio::spawn(async move {
+                    let _guard = guard;
                     let t0 = std::time::Instant::now();
-                    while screencast.is_active() && screencast.generation() == generation {
-                        if t0.elapsed() >= MAX_TRACE_DURATION {
-                            // An abandoned trace must not capture (and burn CPU) forever.
-                            // Atomic: only if no newer trace has started in the meantime.
-                            if screencast.stop_if_generation(generation)
-                                && let Some(owned) = screencast.take_owned_recording()
-                            {
-                                let _ = handler.state.recorder.stop_if_session(&owned);
-                            }
-                            break;
-                        }
+                    // An abandoned trace must not capture (and burn CPU) forever: past the max
+                    // duration the loop ends and the guard stops it (only if no newer trace has
+                    // started in the meantime).
+                    while screencast.is_current(generation) && t0.elapsed() < MAX_TRACE_DURATION {
                         // Same visible-target rule as `screenshot`: a hidden window yields
                         // stale or another window's pixels, so skip the frame instead.
                         if let Ok(target) = handler.resolve_visible_capture_target(label.as_deref())
@@ -2576,23 +2617,23 @@ impl VictauriMcpHandler {
 
                 json_result(&serde_json::json!({
                     "started": true,
-                    "interval_ms": interval.max(50),
+                    "interval_ms": self.state.screencast.interval_ms(),
                     "max_frames": max_frames.clamp(1, 600),
                     "with_events": events_started,
                 }))
             }
             TraceAction::Stop => {
-                let frame_count = self.state.screencast.stop();
+                let (frame_count, owned) = self.state.screencast.stop();
                 let timestamps = self.state.screencast.frame_timestamps();
                 let duration_ms = timestamps.last().copied().unwrap_or(0);
                 // Stop the recording `with_events` started, so the recorder (and the
                 // per-second drain loop it enables) does not outlive the trace. The session
                 // stays readable via recording get_events/export (last stopped session).
-                let event_count = match self.state.screencast.take_owned_recording() {
+                let event_count = match owned {
                     Some(owned) => self
                         .state
                         .recorder
-                        .stop_if_session(&owned)
+                        .stop_if_generation(owned)
                         .map_or(0, |session| session.events.len()),
                     None => self.state.recorder.event_count(),
                 };
@@ -3017,7 +3058,7 @@ impl VictauriMcpHandler {
                     .eval_with_return(&code, params.webview_label.as_deref())
                     .await
                 {
-                    Ok(json_str) => serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+                    Ok(json_str) => page_json::parse_page_json::<Vec<serde_json::Value>>(&json_str)
                         .map(|entries| ipc_timing_stats(&entries))
                         .unwrap_or_default(),
                     Err(_) => Vec::new(),
@@ -3063,13 +3104,15 @@ impl VictauriMcpHandler {
                         .eval_with_return(&code, params.webview_label.as_deref())
                         .await
                     {
-                        Ok(json_str) => match serde_json::from_str::<Vec<String>>(&json_str) {
-                            Ok(names) => {
-                                let count = names.len();
-                                (names.into_iter().collect(), count)
+                        Ok(json_str) => {
+                            match page_json::parse_page_json::<Vec<String>>(&json_str) {
+                                Ok(names) => {
+                                    let count = names.len();
+                                    (names.into_iter().collect(), count)
+                                }
+                                Err(_) => (std::collections::HashSet::new(), 0),
                             }
-                            Err(_) => (std::collections::HashSet::new(), 0),
-                        },
+                        }
                         Err(_) => (std::collections::HashSet::new(), 0),
                     };
 
@@ -3128,7 +3171,7 @@ impl VictauriMcpHandler {
                     .eval_with_return(&code, params.webview_label.as_deref())
                     .await
                 {
-                    Ok(json_str) => serde_json::from_str(&json_str).unwrap_or_default(),
+                    Ok(json_str) => page_json::parse_page_json(&json_str).unwrap_or_default(),
                     Err(e) => return tool_error(format!("failed to read IPC log: {e}")),
                 };
 
@@ -4248,7 +4291,7 @@ impl VictauriMcpHandler {
         };
         let label = webview_label.unwrap_or("main");
         let mut events: Vec<victauri_core::AppEvent> =
-            serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+            page_json::parse_page_json::<Vec<serde_json::Value>>(&raw)
                 .unwrap_or_default()
                 .iter()
                 .filter_map(|ev| crate::mcp::server::parse_bridge_event_from(ev, label))
@@ -4256,15 +4299,6 @@ impl VictauriMcpHandler {
                 .collect();
         events.sort_by_key(victauri_core::AppEvent::timestamp);
         events
-    }
-
-    /// Begin a new recording epoch for the drain: events at or before now are never pulled
-    /// into the recording (an imported session's old start time used to pull in the page's
-    /// whole history).
-    fn reset_drain_floor(&self) {
-        #[allow(clippy::cast_precision_loss)]
-        let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-        self.state.drain_watermarks.reset(now_ms);
     }
 
     /// Resolve the EXACT window a native capture (`screenshot`, `trace`) should target, and
@@ -5170,6 +5204,15 @@ fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
     )
 }
 
+/// Wall-clock epoch milliseconds: the floor a new recording epoch's drain reads from. Taken
+/// BEFORE the recording starts, so nothing logged after the start falls below it. (An imported
+/// session's old start time used to pull in the page's whole history.)
+fn now_ms() -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let ms = chrono::Utc::now().timestamp_millis() as f64;
+    ms
+}
+
 /// Unwrap the `{"__victauri_ok": <val>, "__victauri_type": <t>}` (or
 /// `{"__victauri_err": <msg>}`) envelope produced by the eval bridge into the
 /// value/error string returned to callers.
@@ -5181,7 +5224,9 @@ fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
 /// string slicing (no recursion) so the actual value is still returned rather
 /// than leaking the raw envelope string.
 fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
-    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&raw) {
+    // Page JSON: sanitize lone surrogates first, or one truncated emoji in a result sends it
+    // down the raw-string fallback below (and every consumer's own parse of it fails too).
+    if let Ok(envelope) = page_json::parse_page_json::<serde_json::Value>(&raw) {
         if let Some(err) = envelope.get("__victauri_err") {
             return Err(format!(
                 "JavaScript error: {}",
@@ -6324,7 +6369,7 @@ mod authz_dispatch_tests {
     /// positional array body used to be gated as the bare tool name, which the Test
     /// profile allows for `navigate` — the handler then parsed and ran `go_to`. Both
     /// shapes must now be refused as invalid params before any handler runs, in every
-    /// profile (FullControl with the action disabled is the other half of the bypass).
+    /// profile (`FullControl` with the action disabled is the other half of the bypass).
     #[tokio::test]
     async fn non_string_action_cannot_slip_past_the_gate() {
         let mut full_minus_go_to = PrivacyConfig::default();

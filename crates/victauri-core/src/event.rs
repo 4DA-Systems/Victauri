@@ -25,6 +25,11 @@ pub struct IpcCall {
     pub arg_size_bytes: usize,
     /// Label of the webview that initiated the call.
     pub webview_label: String,
+    /// The call never reached the backend: a `route` rule fulfilled or blocked it in the
+    /// webview. `recording replay` skips such calls — replaying a mocked call would turn a
+    /// fake success into a real invocation.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mocked: bool,
 }
 
 /// Outcome of an IPC call: pending, success with a JSON value, or error.
@@ -80,7 +85,15 @@ impl IpcCall {
             result,
             arg_size_bytes,
             webview_label: webview_label.into(),
+            mocked: false,
         }
+    }
+
+    /// Mark the call as answered by a route rule instead of the backend.
+    #[must_use]
+    pub fn with_mocked(mut self, mocked: bool) -> Self {
+        self.mocked = mocked;
+        self
     }
 }
 

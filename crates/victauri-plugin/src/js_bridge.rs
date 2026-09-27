@@ -313,6 +313,68 @@ const INIT_SCRIPT_BODY: &str = r#"
         return out;
     }
 
+    // ── Event stream (shared by getEventStream and the recording drain) ─────
+    //
+    // Calls `emit(event, keyTime, entry)` for every loggable entry. IPC and plain network
+    // entries are keyed by COMPLETION time: keyed by start, a call still pending at one drain
+    // tick fell behind the watermark and stayed "pending" in recordings forever. With
+    // `skipPending` a pending call is not emitted at all (it is emitted once it completes).
+    // `mocked` marks a request a route rule answered (fulfill) or refused (block) in the page —
+    // it never reached the backend, so it must never be replayed as a real call.
+    var DRAIN_INSTANCE = (function() {
+        try {
+            var b = new Uint32Array(4);
+            window.crypto.getRandomValues(b);
+            return Array.prototype.map.call(b, function(x) { return x.toString(36); }).join('-');
+        } catch (e) {
+            return Date.now().toString(36) + '-' + Math.random().toString(36).slice(2);
+        }
+    })();
+    var drainSeq = 0;
+    var drainSeqs = new WeakMap();
+    var IPC_VICTAURI_PREFIX = 'plugin%3Avictauri%7C';
+    function forEachStreamEvent(skipPending, emit) {
+        consoleLogs.forEach(function(l) {
+            emit({ type: 'console', level: l.level, message: l.message, timestamp: l.timestamp }, l.timestamp, l);
+        });
+        mutationLog.forEach(function(m) {
+            emit({ type: 'dom_mutation', count: m.count, timestamp: m.timestamp }, m.timestamp, m);
+        });
+        networkLog.forEach(function(n) {
+            var isPending = n.status === 'pending';
+            if (isPending && skipPending) return;
+            var key = isPending ? n.timestamp : n.timestamp + (n.duration_ms || 0);
+            var mocked = n.mocked === true || n.blocked === true;
+            var raw = ipcCommandPath(n.url);
+            if (raw === null) {
+                // Plain network traffic. IPC requests are emitted once, as `ipc` events —
+                // not a second time as `network`.
+                var nev = { type: 'network', method: n.method, url: n.url, status: n.status, duration_ms: n.duration_ms, timestamp: n.timestamp, seq_ts: key };
+                if (mocked) nev.mocked = true;
+                emit(nev, key, n);
+                return;
+            }
+            if (raw.indexOf(IPC_VICTAURI_PREFIX) === 0) return;
+            var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
+            // Same classification as getIpcLog: HTTP 200 with a
+            // `Tauri-Response: error` header is a failed command.
+            var st;
+            if (isPending) st = 'pending';
+            else if (n.status !== 200 && n.status !== 'ok') st = 'error';
+            else if (n.ipc_response === 'error') st = 'error';
+            else st = 'ok';
+            var iev = { type: 'ipc', command: cmd, status: st, duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp, seq_ts: key };
+            if (mocked) iev.mocked = true;
+            emit(iev, key, n);
+        });
+        navigationLog.forEach(function(n) {
+            emit({ type: 'navigation', url: n.url, nav_type: n.type, timestamp: n.timestamp }, n.timestamp, n);
+        });
+        interactionLog.forEach(function(i) {
+            emit({ type: 'dom_interaction', action: i.action, selector: i.selector, value: i.value, timestamp: i.timestamp }, i.timestamp, i);
+        });
+    }
+
     // ── Public API ───────────────────────────────────────────────────────────
 
     window.__VICTAURI__ = {
@@ -949,64 +1011,40 @@ const INIT_SCRIPT_BODY: &str = r#"
             var ts = since || 0;
             var excl = exclusive === true;
             function inRange(t) { return excl ? t > ts : t >= ts; }
-
-            consoleLogs.forEach(function(l) {
-                if (inRange(l.timestamp)) {
-                    events.push({ type: 'console', level: l.level, message: l.message, timestamp: l.timestamp });
-                }
+            forEachStreamEvent(excl, function(ev, key) {
+                if (inRange(key)) events.push(ev);
             });
-
-            mutationLog.forEach(function(m) {
-                if (inRange(m.timestamp)) {
-                    events.push({ type: 'dom_mutation', count: m.count, timestamp: m.timestamp });
-                }
-            });
-
-            var victauriPrefix = 'plugin%3Avictauri%7C';
-            networkLog.forEach(function(n) {
-                var raw = ipcCommandPath(n.url);
-                if (raw === null) {
-                    // Plain network traffic. IPC requests are emitted once, as `ipc`
-                    // events above/below — not a second time as `network`.
-                    if (!inRange(n.timestamp)) return;
-                    events.push({ type: 'network', method: n.method, url: n.url, status: n.status, duration_ms: n.duration_ms, timestamp: n.timestamp });
-                    return;
-                }
-                if (raw.indexOf(victauriPrefix) === 0) return;
-                // IPC calls are keyed by COMPLETION time (`seq_ts`), not start time. Keyed by
-                // start, a call still pending at one drain tick fell behind the watermark and was
-                // never read again — so every command slower than the drain gap stayed "pending"
-                // forever in recordings. In exclusive (watermark) mode a pending call is skipped
-                // and emitted once, when it completes.
-                var isPending = n.status === 'pending';
-                if (isPending && excl) return;
-                var seq = isPending ? n.timestamp : n.timestamp + (n.duration_ms || 0);
-                if (!inRange(seq)) return;
-                var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
-                // Same classification as getIpcLog: HTTP 200 with a
-                // `Tauri-Response: error` header is a failed command.
-                var st;
-                if (n.status === 'pending') st = 'pending';
-                else if (n.status !== 200 && n.status !== 'ok') st = 'error';
-                else if (n.ipc_response === 'error') st = 'error';
-                else st = 'ok';
-                events.push({ type: 'ipc', command: cmd, status: st, duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp, seq_ts: seq });
-            });
-
-            navigationLog.forEach(function(n) {
-                if (inRange(n.timestamp)) {
-                    events.push({ type: 'navigation', url: n.url, nav_type: n.type, timestamp: n.timestamp });
-                }
-            });
-
-            interactionLog.forEach(function(i) {
-                if (inRange(i.timestamp)) {
-                    events.push({ type: 'dom_interaction', action: i.action, selector: i.selector, value: i.value, timestamp: i.timestamp });
-                }
-            });
-
             events.sort(function(a, b) { return a.timestamp - b.timestamp; });
             return events;
+        },
+
+        // The recording drain's read: every event not yet handed to the drain, exactly once.
+        // Keyed by a per-page monotonic SEQUENCE, not a wall-clock watermark — a watermark on
+        // `Date.now()` re-read an event stamped ahead of the Rust clock (a page overriding
+        // `Date.now`, fake timers, an NTP step back) on every drain, and lost events logged in
+        // the same millisecond as the watermark after the read. An entry is sequenced the first
+        // time a drain sees it complete (so IPC and network calls are keyed by completion and
+        // never emitted while pending), and `instance` identifies this page load: after a
+        // reload the counter restarts, so a sequence from another instance means "from the
+        // start". `floorMs` (only on the first read of a recording) skips entries that
+        // completed before the recording began. Returns `{ instance, seq, events }`; `seq` is
+        // the next `afterSeq`.
+        drainEvents: function(afterSeq, instance, floorMs) {
+            var after = (instance === DRAIN_INSTANCE && typeof afterSeq === 'number') ? afterSeq : 0;
+            var floor = (after === 0 && typeof floorMs === 'number') ? floorMs : 0;
+            var events = [];
+            forEachStreamEvent(true, function(ev, key, entry) {
+                var seq = drainSeqs.get(entry);
+                if (seq === undefined) {
+                    seq = ++drainSeq;
+                    drainSeqs.set(entry, seq);
+                }
+                if (seq <= after) return;
+                if (floor > 0 && !(key > floor)) return;
+                events.push(ev);
+            });
+            events.sort(function(a, b) { return a.timestamp - b.timestamp; });
+            return { instance: DRAIN_INSTANCE, seq: drainSeq, events: events };
         },
 
         // ── Wait ─────────────────────────────────────────────────────────────

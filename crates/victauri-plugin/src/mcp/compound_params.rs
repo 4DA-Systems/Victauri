@@ -463,7 +463,8 @@ pub struct RecordingParams {
     pub since_index: Option<usize>,
     /// JSON string of a previously exported `RecordedSession` (for import).
     pub session_json: Option<String>,
-    /// Target webview label (for replay).
+    /// Target webview label: the window to flush, or for replay, replay only the calls
+    /// recorded in this window (each call always runs in the window that recorded it).
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
@@ -710,7 +711,7 @@ impl fmt::Display for TraceAction {
 pub struct TraceParams {
     /// Action: start, stop, status, frames.
     pub action: TraceAction,
-    /// Capture interval in milliseconds (for start). Default 500, min 50.
+    /// Capture interval in milliseconds (for start). Default 500, clamped to 50..=60000.
     pub interval_ms: Option<u64>,
     /// Maximum frames to retain in the ring buffer (for start). Default 60, max 600.
     pub max_frames: Option<usize>,

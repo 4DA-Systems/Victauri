@@ -118,6 +118,11 @@ impl TimingSamples {
     }
 }
 
+/// Maximum distinct commands tracked. The map is keyed by the caller-supplied command name, so
+/// without a cap an agent (or a loop) invoking ever-new names grows it forever. Once full, new
+/// names are not tracked; commands already tracked keep accumulating.
+const MAX_TIMED_COMMANDS: usize = 1024;
+
 /// Thread-safe store for per-command timing data.
 pub struct CommandTimings {
     inner: RwLock<HashMap<String, TimingSamples>>,
@@ -138,7 +143,11 @@ impl CommandTimings {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.entry(command.to_string()).or_default().record(duration);
+        if let Some(samples) = map.get_mut(command) {
+            samples.record(duration);
+        } else if map.len() < MAX_TIMED_COMMANDS {
+            map.entry(command.to_string()).or_default().record(duration);
+        }
     }
 
     /// Get stats for all commands, sorted by total time descending.
@@ -1286,13 +1295,17 @@ impl PageLoads {
 }
 // ── Recording drain watermarks ─────────────────────────────────────────────
 
-/// Per-window high-water marks for pulling the JS bridge's event stream into a recording,
+/// Per-window drain positions for pulling the JS bridge's event stream into a recording,
 /// shared by the background drain loop and `recording flush`.
 ///
 /// Each kept its own watermark before, so a flush re-recorded what the drain had captured
-/// (and vice versa). The floor is reset whenever a recording starts or is imported, so the
-/// page's pre-recording history is never pulled in. A per-window async lock serializes the
-/// two readers for the same window.
+/// (and vice versa). A position is the bridge's per-page event SEQUENCE (plus the page
+/// instance it belongs to), not a wall-clock timestamp: a timestamp watermark clamped to the
+/// Rust clock re-read an event stamped ahead of it on every drain, and lost events pushed in
+/// the same millisecond after a read. Positions are reset whenever a recording starts or is
+/// imported — the new epoch is the recorder generation, and a window's first read in it skips
+/// the page's pre-recording history by the `floor_ms` timestamp. A per-window async lock
+/// serializes the two readers for the same window.
 #[derive(Default)]
 pub struct DrainWatermarks {
     inner: std::sync::Mutex<WatermarkState>,
@@ -1301,8 +1314,30 @@ pub struct DrainWatermarks {
 #[derive(Default)]
 struct WatermarkState {
     floor_ms: f64,
-    per_label: HashMap<String, f64>,
+    epoch: u64,
+    per_label: HashMap<String, DrainMark>,
     locks: HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// How far a window's event stream has been drained: the bridge's page `instance` and the
+/// last sequence number read from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrainMark {
+    /// Identifies one page load of the window (the sequence restarts on reload).
+    pub instance: String,
+    /// The last sequence number read from that page.
+    pub seq: u64,
+}
+
+/// Where the next drain of a window starts, captured in one step.
+#[derive(Debug, Clone)]
+pub struct DrainCursor {
+    /// The recording epoch (recorder generation) this position belongs to.
+    pub epoch: u64,
+    /// Entries completed at or before this time predate the recording (first read only).
+    pub floor_ms: f64,
+    /// The window's position, or `None` if it has not been read in this epoch.
+    pub mark: Option<DrainMark>,
 }
 
 impl DrainWatermarks {
@@ -1312,30 +1347,35 @@ impl DrainWatermarks {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The exclusive watermark to read `label`'s stream from.
+    /// Where to read `label`'s stream from.
     #[must_use]
-    pub fn since(&self, label: &str) -> f64 {
+    pub fn cursor(&self, label: &str) -> DrainCursor {
         let s = self.state();
-        s.per_label
-            .get(label)
-            .copied()
-            .unwrap_or(s.floor_ms)
-            .max(s.floor_ms)
-    }
-
-    /// Advance `label`'s watermark to `ms` (never moves backwards).
-    pub fn advance(&self, label: &str, ms: f64) {
-        let mut s = self.state();
-        let entry = s.per_label.entry(label.to_string()).or_insert(ms);
-        if ms > *entry {
-            *entry = ms;
+        DrainCursor {
+            epoch: s.epoch,
+            floor_ms: s.floor_ms,
+            mark: s.per_label.get(label).cloned(),
         }
     }
 
-    /// Start a new recording epoch: nothing at or before `floor_ms` is ever read.
-    pub fn reset(&self, floor_ms: f64) {
+    /// Record that `label` was read up to `mark`, if `epoch` is still the current one (a read
+    /// that straddled a reset must not plant an old position in the new epoch). Returns
+    /// whether the position was stored.
+    pub fn advance(&self, label: &str, epoch: u64, mark: DrainMark) -> bool {
+        let mut s = self.state();
+        if s.epoch != epoch {
+            return false;
+        }
+        s.per_label.insert(label.to_string(), mark);
+        true
+    }
+
+    /// Start recording epoch `epoch`: every window is read afresh, skipping entries at or
+    /// before `floor_ms`.
+    pub fn reset(&self, floor_ms: f64, epoch: u64) {
         let mut s = self.state();
         s.floor_ms = floor_ms;
+        s.epoch = epoch;
         s.per_label.clear();
     }
 
@@ -1355,6 +1395,19 @@ impl DrainWatermarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // C15e: the map is keyed by the caller-chosen command name, so it must be bounded.
+    #[test]
+    fn command_timings_bound_distinct_commands() {
+        let t = CommandTimings::new();
+        for i in 0..(MAX_TIMED_COMMANDS + 100) {
+            t.record(&format!("cmd-{i}"), Duration::from_millis(1));
+        }
+        assert_eq!(t.all_stats().len(), MAX_TIMED_COMMANDS);
+        // Commands already tracked keep accumulating once the cap is reached.
+        t.record("cmd-0", Duration::from_millis(1));
+        assert_eq!(t.stats_for("cmd-0").unwrap().count, 2);
+    }
 
     #[test]
     fn p95_is_nearest_rank_not_max_for_small_samples() {

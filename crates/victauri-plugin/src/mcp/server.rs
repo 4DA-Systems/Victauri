@@ -1013,23 +1013,26 @@ pub(super) fn parse_bridge_event_from(
                 .get("command")
                 .and_then(|c| c.as_str())
                 .unwrap_or("unknown");
-            AppEvent::Ipc(victauri_core::IpcCall::new(
-                uuid::Uuid::new_v4().to_string(),
-                cmd.to_string(),
-                now,
-                match ev.get("status").and_then(|s| s.as_str()) {
-                    Some("ok") => victauri_core::IpcResult::Ok(serde_json::Value::Null),
-                    Some("error") => victauri_core::IpcResult::Err("error".to_string()),
-                    _ => victauri_core::IpcResult::Pending,
-                },
-                ev.get("duration_ms")
-                    .and_then(serde_json::Value::as_f64)
-                    .map(|d| d as u64),
-                ev.get("arg_size_bytes")
-                    .and_then(serde_json::Value::as_u64)
-                    .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
-                label.to_string(),
-            ))
+            AppEvent::Ipc(
+                victauri_core::IpcCall::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    cmd.to_string(),
+                    now,
+                    match ev.get("status").and_then(|s| s.as_str()) {
+                        Some("ok") => victauri_core::IpcResult::Ok(serde_json::Value::Null),
+                        Some("error") => victauri_core::IpcResult::Err("error".to_string()),
+                        _ => victauri_core::IpcResult::Pending,
+                    },
+                    ev.get("duration_ms")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|d| d as u64),
+                    ev.get("arg_size_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+                    label.to_string(),
+                )
+                .with_mocked(ev.get("mocked").and_then(serde_json::Value::as_bool) == Some(true)),
+            )
         }
         "network" => AppEvent::state_change(
             format!(
@@ -1096,7 +1099,7 @@ async fn event_drain_loop(
         }
 
         // Only drain while a time-travel recording is active. Draining evals
-        // `getEventStream` in EVERY window every second, and each eval injects JS that
+        // `drainEvents` in EVERY window every second, and each eval injects JS that
         // calls back via `victauri_eval_callback` — an IPC request. That constant
         // background IPC churn (for a 3-window app: ~3 callbacks/sec, forever) AMPLIFIES a
         // Tauri-runtime `Rc<Webview>` use-after-free that fires when an IPC request hits
@@ -1132,10 +1135,10 @@ async fn event_drain_loop(
     }
 }
 
-/// Drain one window's new events (strictly after its shared watermark) into the event log and
-/// recorder, then advance the watermark. Serialized per window, so the background drain and
-/// `recording flush` never ingest the same window's events twice. Returns how many events were
-/// recorded, or `None` if the window could not be drained this time (the watermark is left
+/// Drain one window's new events (everything after its shared drain position) into the event
+/// log and recorder, then advance the position. Serialized per window, so the background drain
+/// and `recording flush` never ingest the same window's events twice. Returns how many events
+/// were recorded, or `None` if the window could not be drained this time (the position is left
 /// unchanged, so a transient failure just re-reads the same range next time).
 pub async fn drain_window_into_recording(
     state: &Arc<VictauriState>,
@@ -1144,24 +1147,40 @@ pub async fn drain_window_into_recording(
 ) -> Option<usize> {
     let lock = state.drain_watermarks.lock_for(label);
     let _serialized = lock.lock().await;
-    let since = state.drain_watermarks.since(label);
-    let (newest, recorded) = drain_window(state, bridge, label, since).await?;
-    state.drain_watermarks.advance(label, newest);
+    // Pin the recording this read is for BEFORE the (slow) read: a drain in flight across
+    // `recording stop` + `start` used to append the old recording's events to the new one.
+    let Some(generation) = state.recorder.generation() else {
+        return Some(0);
+    };
+    let cursor = state.drain_watermarks.cursor(label);
+    if cursor.epoch != generation {
+        // The recording has started but its drain epoch is not reset yet (start and reset are
+        // two steps); reading now would use the previous recording's positions. The next tick
+        // reads it.
+        return Some(0);
+    }
+    let (mark, recorded) = drain_window(state, bridge, label, &cursor, generation).await?;
+    state.drain_watermarks.advance(label, cursor.epoch, mark);
     Some(recorded)
 }
-/// Read one window's event stream strictly after `since` into the event log / recorder.
-/// Returns the newest watermark value seen and how many events were recorded, or `None` if
-/// nothing was drained (pending-eval saturation, eval-injection failure, callback timeout, or
-/// an unparseable result).
+
+/// Read one window's event stream after `cursor` into the event log / recorder (only while
+/// recording `generation` is still the active one). Returns the new drain position and how many
+/// events were recorded, or `None` if nothing was drained (pending-eval saturation,
+/// eval-injection failure, callback timeout, or an unparseable reply).
 async fn drain_window(
     state: &Arc<VictauriState>,
     bridge: &Arc<dyn WebviewBridge>,
     label: &str,
-    since: f64,
-) -> Option<(f64, usize)> {
-    // `true` = exclusive: `since` is our own watermark (the newest timestamp already
-    // ingested), so an inclusive read re-ingested the newest event on every tick.
-    let code = format!("return window.__VICTAURI__?.getEventStream({since}, true)");
+    cursor: &crate::introspection::DrainCursor,
+    generation: u64,
+) -> Option<(crate::introspection::DrainMark, usize)> {
+    // Only a window's first read in a recording skips pre-recording history by timestamp;
+    // later reads are purely by sequence (a page clock that is off never drops or repeats).
+    let (after_seq, instance_js, floor_ms) = match &cursor.mark {
+        Some(m) => (m.seq, super::helpers::js_string(&m.instance), 0.0),
+        None => (0, "null".to_string(), cursor.floor_ms),
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
@@ -1173,22 +1192,19 @@ async fn drain_window(
         pending.insert(id.clone(), tx);
     }
 
+    // Delivered through the bridge's frozen `_evalSettle`, which serializes with the
+    // `JSON.stringify` captured at bridge init — not the page's own, which page script can
+    // replace to forge or break every drained event.
     let id_js = super::helpers::js_string(&id);
     let inject = format!(
         r"
-        (async () => {{
-            try {{
-                const __result = await (async () => {{ {code} }})();
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id_js},
-                    result: JSON.stringify(__result)
-                }});
-            }} catch (e) {{
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id_js},
-                    result: JSON.stringify({{ __error: e.message }})
-                }});
-            }}
+        (function() {{
+            var v = window.__VICTAURI__;
+            if (!v) return;
+            var r;
+            try {{ r = v.drainEvents({after_seq}, {instance_js}, {floor_ms}); }}
+            catch (e) {{ r = {{ __error: String(e && e.message) }}; }}
+            v._evalSettle({id_js}, r);
         }})();
         "
     );
@@ -1203,36 +1219,27 @@ async fn drain_window(
         return None;
     };
 
-    let events: Vec<serde_json::Value> = serde_json::from_str(&result).ok()?;
-
-    // Watermark = newest `seq_ts` (IPC completion time) or `timestamp`, clamped to now: a
-    // bogus far-future timestamp must never jump the watermark past all real events (it would
-    // silently stop this window's recording for the rest of the session).
-    #[allow(clippy::cast_precision_loss)]
-    let now_ms = chrono::Utc::now().timestamp_millis() as f64;
-    let mut newest = since;
+    // Page JSON: a lone surrogate (a truncated emoji, or a hostile `console.log('\ud800')`)
+    // must not make the whole reply unparseable — that stalled the window's recording.
+    let reply: serde_json::Value = super::page_json::parse_page_json(&result).ok()?;
+    let mark = crate::introspection::DrainMark {
+        instance: reply.get("instance")?.as_str()?.to_string(),
+        seq: reply.get("seq")?.as_u64()?,
+    };
     let mut recorded = 0usize;
-    for ev in &events {
-        let ts = ev
-            .get("seq_ts")
-            .or_else(|| ev.get("timestamp"))
-            .and_then(serde_json::Value::as_f64)
-            .filter(|t| t.is_finite())
-            .unwrap_or(0.0)
-            .min(now_ms);
-        if ts > newest {
-            newest = ts;
-        }
-
-        if let Some(app_event) = parse_bridge_event_from(ev, label) {
-            state.event_log.push(app_event.clone());
-            if state.recorder.is_recording() {
-                state.recorder.record_event(app_event);
-                recorded += 1;
-            }
+    // The position comes from the bridge's counter, not from the entries: an entry that fails
+    // to parse is skipped without holding the window's recording back.
+    for ev in reply.get("events")?.as_array()? {
+        if let Some(app_event) = parse_bridge_event_from(ev, label)
+            && state
+                .recorder
+                .record_event_if(generation, app_event.clone())
+        {
+            state.event_log.push(app_event);
+            recorded += 1;
         }
     }
-    Some((newest, recorded))
+    Some((mark, recorded))
 }
 
 #[cfg(test)]
