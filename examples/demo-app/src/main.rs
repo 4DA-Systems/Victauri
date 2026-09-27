@@ -452,10 +452,12 @@ fn saturate_async_runtime(seconds: u64) -> u64 {
     // One task per core (Tokio's default worker count) plus spare, each doing a
     // blocking sleep on an async worker — every worker is stuck until they finish.
     let workers = std::thread::available_parallelism().map_or(8, std::num::NonZero::get) as u64 * 2;
+    tracing::info!(target: "demo::runtime", tasks = workers, seconds, "saturating the async runtime");
     for i in 0..workers {
         tauri::async_runtime::spawn(async move {
             tracing::warn!(target: "demo::runtime", task = i, seconds, "blocking an async worker");
             std::thread::sleep(std::time::Duration::from_secs(seconds.min(60)));
+            tracing::info!(target: "demo::runtime", task = i, "released an async worker");
         });
     }
     workers

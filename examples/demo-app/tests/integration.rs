@@ -871,6 +871,9 @@ e2e_test!(
         // precisely when an agent needs to look inside. (Before the isolated runtime:
         // /health took ~9 s here.) The triggering invoke itself may time out: its reply
         // travels through the app's own, now-blocked runtime.
+        let cursor = client.backend_logs(json!({"limit": 1})).await.unwrap()["next_seq"]
+            .as_u64()
+            .unwrap();
         let _ = client
         .call_tool(
             "invoke_command",
@@ -891,19 +894,36 @@ e2e_test!(
             page["entries"].as_array().is_some_and(|e| !e.is_empty()),
             "the blocking tasks' own warnings are visible while they block: {page}"
         );
-        // Don't leave a pinned runtime to the next test: the demo spawns 2x cores
-        // blocking tasks (two waves), so wait until the app's own IPC answers again.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        // Don't leave a pinned runtime to the next test. The command logs how many
+        // blocking tasks it spawned and each logs when it lets go of its worker — so
+        // wait (on the backend log itself) until every one has been released.
+        let planned = client
+            .wait_for_log_since(cursor, "saturating the async runtime", None, Some(10_000))
+            .await
+            .unwrap()["entry"]["fields"]["tasks"]
+            .as_u64()
+            .expect("the command logs its task count");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
-            let r = client
-                .call_tool(
-                    "invoke_command",
-                    json!({"command": "get_counter", "timeout_ms": 1000}),
-                )
-                .await;
-            if r.is_ok() || std::time::Instant::now() > deadline {
+            let released = client
+                .backend_logs(json!({
+                    "since_seq": cursor,
+                    "target": "demo::runtime",
+                    "filter": "released an async worker",
+                    "limit": 500,
+                }))
+                .await
+                .unwrap()["total_matched"]
+                .as_u64()
+                .unwrap_or(0);
+            if released >= planned {
                 break;
             }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "runtime never drained: {released}/{planned} workers released"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
     }
 );
