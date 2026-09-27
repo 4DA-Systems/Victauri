@@ -58,6 +58,7 @@ const VALID_CLIENT_METHODS: &[&str] = &[
     "select_option_by_id",
     "select_by_id",
     "scroll_to_by_id",
+    "scroll_to_by_text",
     // By-text variants
     "click_by_text",
     "double_click_by_text",
