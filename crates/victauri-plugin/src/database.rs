@@ -23,14 +23,21 @@ impl InterruptGuard {
         let done = Arc::new(AtomicBool::new(false));
         let interrupt = conn.get_interrupt_handle();
         let done_for_thread = done.clone();
-        let poll = Duration::from_millis(25).min(deadline.max(Duration::from_millis(1)));
+        // The watchdog PARKS until the deadline and is unparked on drop, so disarming is
+        // immediate. (It used to sleep in fixed 25ms steps that the drop then joined — ~25ms
+        // per guard however fast the guarded query was, which capped db_health at ~200 tables
+        // per 5s budget even on a tiny database.)
         let handle = std::thread::spawn(move || {
             let start = Instant::now();
-            while start.elapsed() < deadline {
+            loop {
                 if done_for_thread.load(Ordering::Acquire) {
                     return;
                 }
-                std::thread::sleep(poll);
+                let elapsed = start.elapsed();
+                if elapsed >= deadline {
+                    break;
+                }
+                std::thread::park_timeout(deadline - elapsed);
             }
             if !done_for_thread.load(Ordering::Acquire) {
                 interrupt.interrupt();
@@ -48,6 +55,7 @@ impl Drop for InterruptGuard {
     fn drop(&mut self) {
         self.done.store(true, Ordering::Release);
         if let Some(h) = self.handle.take() {
+            h.thread().unpark();
             let _ = h.join();
         }
     }
@@ -112,91 +120,119 @@ const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
 
 /// Read-only health report for one `SQLite` database, in budgeted phases.
 ///
-/// The cheap metadata PRAGMAs always run. The two phases that scale with database size —
-/// per-table `count(*)` and `quick_check` — each get their own budget; a phase that runs out
-/// is REPORTED (`row_count: null` / `integrity_check: "not completed …"`) instead of failing
-/// the whole call. Before this, `quick_check` on a multi-GB database exhausted a single shared
-/// deadline and the tool returned only "timed out", discarding every cheap result with it.
+/// Every phase runs under its own budget, and a phase that runs out is REPORTED instead of
+/// failing the whole call: the metadata PRAGMAs + table listing, the per-table `count(*)`s,
+/// and `SQLite`'s `quick_check` (a full-file scan that dominates on large databases). Before
+/// this, `quick_check` on a multi-GB database exhausted one shared deadline and the tool
+/// returned only "timed out", discarding every cheap result with it.
+///
+/// The database file is treated as untrusted input: the connection is opened read-only with
+/// `trusted_schema=OFF` and `SQLite`'s defensive mode, and virtual tables are listed but never
+/// counted (counting one runs its module's code).
 #[cfg(feature = "sqlite")]
 pub(crate) fn db_health_report(
     path: &str,
     count_budget: Duration,
     check_budget: Duration,
 ) -> Result<serde_json::Value, String> {
-    let conn =
-        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .map_err(|e| format!("cannot open database: {e}"))?;
+    let conn = open_untrusted_read_only(path)?;
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
         MAX_DB_HEALTH_CELL_BYTES,
     );
 
-    let pragma_i64 = |name: &str| -> i64 {
-        conn.pragma_query_value(None, name, |r| r.get(0))
-            .unwrap_or(0)
+    // Phase 0: metadata + the (bounded) table listing.
+    let meta = run_bounded(&conn, DB_HEALTH_META_BUDGET, |c| {
+        let text = |name: &str| c.pragma_query_value(None, name, |r| r.get::<_, String>(0));
+        let int = |name: &str| c.pragma_query_value(None, name, |r| r.get::<_, i64>(0));
+        let journal_mode = text("journal_mode")?;
+        let page_count = int("page_count")?;
+        let page_size = int("page_size")?;
+        let freelist_count = int("freelist_count")?;
+        let mut stmt = c.prepare(
+            "SELECT name, (sql LIKE 'CREATE VIRTUAL%') FROM sqlite_master \
+             WHERE type='table' ORDER BY name",
+        )?;
+        let mut names: Vec<(String, bool)> = Vec::new();
+        let mut table_bytes = 0usize;
+        let mut truncated = false;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(0)?;
+            let is_virtual: bool = row.get::<_, Option<bool>>(1)?.unwrap_or(false);
+            if names.len() >= MAX_DB_HEALTH_TABLES
+                || table_bytes.saturating_add(name.len()) > MAX_DB_HEALTH_TABLE_BYTES
+            {
+                truncated = true;
+                break;
+            }
+            table_bytes = table_bytes.saturating_add(name.len());
+            names.push((name, is_virtual));
+        }
+        Ok((
+            journal_mode,
+            page_count,
+            page_size,
+            freelist_count,
+            names,
+            truncated,
+        ))
+    });
+    let (journal_mode, page_count, page_size, freelist_count, names, tables_truncated) = match meta
+    {
+        Bounded::Done(m) => m,
+        Bounded::TimedOut => {
+            return Err(format!(
+                "database metadata did not load within {} ms",
+                DB_HEALTH_META_BUDGET.as_millis()
+            ));
+        }
+        Bounded::Failed(e) => return Err(format!("cannot read database metadata: {e}")),
     };
-    let journal_mode: String = conn
-        .pragma_query_value(None, "journal_mode", |r| r.get(0))
-        .unwrap_or_else(|_| "unknown".to_string());
-    let page_count = pragma_i64("page_count");
-    let page_size = pragma_i64("page_size");
-    let freelist_count = pragma_i64("freelist_count");
     let wal_checkpoint = if journal_mode == "wal" {
         "not run (read-only diagnostics)"
     } else {
         "n/a (not WAL mode)"
     };
-    let db_size_mb = (page_count * page_size) as f64 / (1024.0 * 1024.0);
+    #[allow(clippy::cast_precision_loss)]
+    let db_size_mb = page_count.saturating_mul(page_size) as f64 / (1024.0 * 1024.0);
 
-    // Phase 1: table names (bounded listing) + row counts under a shared count budget.
-    let mut names = Vec::new();
-    let mut tables_truncated = false;
-    {
-        let mut table_bytes = 0usize;
-        let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-            .map_err(|e| format!("cannot list tables: {e}"))?;
-        let rows = stmt
-            .query_map([], |r| r.get::<_, String>(0))
-            .map_err(|e| format!("cannot list tables: {e}"))?;
-        for name in rows.flatten() {
-            if names.len() >= MAX_DB_HEALTH_TABLES
-                || table_bytes.saturating_add(name.len()) > MAX_DB_HEALTH_TABLE_BYTES
-            {
-                tables_truncated = true;
-                break;
-            }
-            table_bytes = table_bytes.saturating_add(name.len());
-            names.push(name);
-        }
-    }
+    // Phase 1: per-table row counts under a shared count budget.
     let counts_started = Instant::now();
-    let mut row_counts_complete = true;
+    let mut budget_exhausted = false;
+    let mut all_counted = true;
     let mut tables = Vec::with_capacity(names.len());
-    for name in names {
-        let remaining = count_budget.saturating_sub(counts_started.elapsed());
-        let count = if !row_counts_complete || remaining.is_zero() {
-            row_counts_complete = false;
-            None
+    for (name, is_virtual) in names {
+        let mut entry = serde_json::json!({ "name": name, "row_count": null });
+        if is_virtual {
+            entry["virtual"] = serde_json::json!(true);
+            all_counted = false;
         } else {
-            let sql = format!("SELECT count(*) FROM {}", quote_sqlite_identifier(&name));
-            match run_bounded(&conn, remaining, |c| {
-                c.query_row(&sql, [], |r| r.get::<_, i64>(0))
-            }) {
-                Bounded::Done(n) => Some(n),
-                Bounded::TimedOut => {
-                    row_counts_complete = false;
-                    None
+            let remaining = count_budget.saturating_sub(counts_started.elapsed());
+            if budget_exhausted || remaining.is_zero() {
+                budget_exhausted = true;
+                all_counted = false;
+            } else {
+                let sql = format!("SELECT count(*) FROM {}", quote_sqlite_identifier(&name));
+                match run_bounded(&conn, remaining, |c| {
+                    c.query_row(&sql, [], |r| r.get::<_, i64>(0))
+                }) {
+                    Bounded::Done(n) => entry["row_count"] = serde_json::json!(n),
+                    Bounded::TimedOut => {
+                        budget_exhausted = true;
+                        all_counted = false;
+                    }
+                    Bounded::Failed(e) => {
+                        entry["count_error"] = serde_json::json!(e);
+                        all_counted = false;
+                    }
                 }
-                // A per-table failure (e.g. a virtual table whose module is not loaded) is
-                // not a budget problem — report no count for that table and keep going.
-                Bounded::Failed(_) => None,
             }
-        };
-        tables.push(serde_json::json!({ "name": name, "row_count": count }));
+        }
+        tables.push(entry);
     }
 
-    // Phase 2: integrity, on its own budget — a full-file scan that dominates on large DBs.
+    // Phase 2: integrity, on its own budget.
     let integrity = match run_bounded(&conn, check_budget, |c| {
         c.pragma_query_value(None, "quick_check", |r| r.get::<_, String>(0))
     }) {
@@ -219,12 +255,34 @@ pub(crate) fn db_health_report(
         "freelist_count": freelist_count,
         "wal_checkpoint": wal_checkpoint,
         "integrity_check": integrity,
+        "integrity_check_kind": "quick_check",
         "tables": tables,
         "tables_truncated": tables_truncated,
-        "row_counts_complete": row_counts_complete,
+        // Every listed table has a row count (false if the budget ran out, a count failed, or a
+        // table is virtual and deliberately not counted).
+        "row_counts_complete": all_counted,
+        "row_count_budget_exhausted": budget_exhausted,
     }))
 }
 
+/// Budget for the metadata PRAGMAs + table listing in [`db_health_report`].
+#[cfg(feature = "sqlite")]
+const DB_HEALTH_META_BUDGET: Duration = Duration::from_secs(3);
+
+/// Open a database file Victauri did not create as read-only UNTRUSTED input: with
+/// `trusted_schema=OFF` (schema-embedded SQL functions / virtual tables cannot run with side
+/// effects) and `SQLite`'s defensive mode (no writes to shadow tables / schema corruption).
+#[cfg(feature = "sqlite")]
+pub(crate) fn open_untrusted_read_only(path: &str) -> Result<rusqlite::Connection, String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| format!("cannot open database: {e}"))?;
+    conn.pragma_update(None, "trusted_schema", false)
+        .map_err(|e| format!("cannot harden database connection: {e}"))?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(|e| format!("cannot harden database connection: {e}"))?;
+    Ok(conn)
+}
 /// Quote an arbitrary table name as a `SQLite` identifier (`"…"`, embedded quotes doubled).
 #[cfg(feature = "sqlite")]
 pub(crate) fn quote_sqlite_identifier(name: &str) -> String {
@@ -364,6 +422,51 @@ static SAFE_PRAGMAS: &[&str] = &[
     "quick_check",
     "stats",
 ];
+
+/// PRAGMAs on [`SAFE_PRAGMAS`] whose argument selects WHAT to read (a table, an index, a row
+/// limit) rather than setting a value. Every other PRAGMA given an argument is a write
+/// (`PRAGMA user_version(5)` is the same as `PRAGMA user_version = 5`).
+#[cfg(feature = "sqlite")]
+static READ_PRAGMAS_WITH_ARG: &[&str] = &[
+    "table_info",
+    "table_xinfo",
+    "table_list",
+    "index_list",
+    "index_info",
+    "index_xinfo",
+    "foreign_key_list",
+    "foreign_key_check",
+    "integrity_check",
+    "quick_check",
+];
+
+/// `SQLite` authorizer for agent-supplied `query_db` SQL: default-deny. Reads, SQL functions,
+/// recursive CTEs, and allowlisted read-only PRAGMAs are permitted; everything else (writes,
+/// ATTACH, schema changes, transactions, setter PRAGMAs) is refused before it runs.
+#[cfg(feature = "sqlite")]
+fn query_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
+    use rusqlite::hooks::{AuthAction, Authorization};
+    match ctx.action {
+        AuthAction::Select
+        | AuthAction::Read { .. }
+        | AuthAction::Function { .. }
+        | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Pragma {
+            pragma_name,
+            pragma_value,
+        } => {
+            let name = pragma_name.to_ascii_lowercase();
+            let allowed = SAFE_PRAGMAS.contains(&name.as_str())
+                && (pragma_value.is_none() || READ_PRAGMAS_WITH_ARG.contains(&name.as_str()));
+            if allowed {
+                Authorization::Allow
+            } else {
+                Authorization::Deny
+            }
+        }
+        _ => Authorization::Deny,
+    }
+}
 
 /// Extract the lowercased PRAGMA name from a `PRAGMA [schema.]name ...` statement,
 /// tolerating an optional `schema.` qualifier. Returns `None` for a non-PRAGMA or
@@ -691,6 +794,15 @@ fn query_with_limits(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| format!("failed to open database: {e}"))?;
+    // The database is untrusted input (see `open_untrusted_read_only`), and the query is
+    // agent-supplied: SQLite's own AUTHORIZER is the enforcement point, not string parsing.
+    // It sees every PRAGMA SQLite is about to run — statement form, `PRAGMA name(arg)`, and
+    // table-valued `pragma_*()` functions alike (the string checks above missed the last two).
+    conn.pragma_update(None, "trusted_schema", false)
+        .map_err(|e| format!("failed to harden database connection: {e}"))?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
+        .map_err(|e| format!("failed to harden database connection: {e}"))?;
+    conn.authorizer(Some(query_authorizer));
 
     // Limit lock waits separately from the CPU deadline enforced below.
     conn.busy_timeout(std::time::Duration::from_secs(5))
@@ -905,6 +1017,93 @@ mod tests {
         let r = db_health_report(&path, Duration::from_secs(5), Duration::from_secs(5)).unwrap();
         println!("elapsed: {:?}", started.elapsed());
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
+    }
+
+    #[test]
+    fn authorizer_blocks_pragma_function_and_parenthesized_writes() {
+        let (_f, path) = create_test_db();
+        // Table-valued pragma functions went through the SELECT prefix check unchecked.
+        let err = query(&path, "SELECT * FROM pragma_optimize", &[], None).unwrap_err();
+        assert!(
+            err.contains("not authorized") || err.contains("prohibited"),
+            "{err}"
+        );
+        // `PRAGMA name(arg)` is the write form for setter pragmas, with no `=` to catch.
+        for sql in ["PRAGMA user_version(5)", "PRAGMA journal_mode(DELETE)"] {
+            assert!(query(&path, sql, &[], None).is_err(), "must block: {sql}");
+        }
+        // Legitimate read forms still work — statement, argument, and function forms.
+        assert!(query(&path, "PRAGMA table_info(users)", &[], None).is_ok());
+        assert!(query(&path, "PRAGMA user_version", &[], None).is_ok());
+        let r = query(
+            &path,
+            "SELECT name FROM pragma_table_info('users')",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(r["row_count"], 3);
+        assert!(query(&path, "SELECT count(*) FROM users", &[], None).is_ok());
+    }
+
+    #[test]
+    fn db_health_counts_hundreds_of_tables_within_budget() {
+        // Each count used to cost a fixed ~25ms (the interrupt watchdog's sleep step, joined
+        // on drop), capping a 5s budget at ~200 tables even on a tiny database.
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        let mut ddl = String::new();
+        for i in 0..400 {
+            ddl.push_str(&format!(
+                "CREATE TABLE t{i} (x INTEGER); INSERT INTO t{i} VALUES (1);"
+            ));
+        }
+        conn.execute_batch(&ddl).unwrap();
+        drop(conn);
+        let started = Instant::now();
+        let r = db_health_report(
+            file.path().to_str().unwrap(),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(r["tables"].as_array().unwrap().len(), 400);
+        assert_eq!(r["row_counts_complete"], true, "{r}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "400 trivial counts took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn db_health_lists_but_never_counts_virtual_tables() {
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let conn = rusqlite::Connection::open(file.path()).unwrap();
+        conn.execute_batch("CREATE TABLE plain (x); INSERT INTO plain VALUES (1);")
+            .unwrap();
+        if conn
+            .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+            .is_err()
+        {
+            return; // this SQLite build has no FTS5; nothing to test
+        }
+        drop(conn);
+        let long = Duration::from_secs(10);
+        let r = db_health_report(file.path().to_str().unwrap(), long, long).unwrap();
+        let docs = r["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "docs")
+            .expect("virtual table is listed");
+        assert_eq!(docs["virtual"], true);
+        assert!(
+            docs["row_count"].is_null(),
+            "virtual tables are never counted"
+        );
+        assert_eq!(r["row_counts_complete"], false);
+        assert_eq!(r["integrity_check_kind"], "quick_check");
     }
 
     #[test]
