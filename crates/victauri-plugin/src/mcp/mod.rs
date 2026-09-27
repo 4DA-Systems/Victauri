@@ -3928,6 +3928,10 @@ impl VictauriMcpHandler {
         // Centralized authorization: resolve the canonical `tool.action` capability
         // and gate on it BEFORE dispatch, so every compound action is checked
         // uniformly (not just the ones whose handler remembers to). See `authz`.
+        // A disabled tool reports "disabled" whatever its arguments look like.
+        if self.state.privacy.disabled_tools.contains(name) {
+            return Ok(tool_disabled(name));
+        }
         let capability =
             authz::resolve_capability(name, &args).map_err(rest::ToolCallError::InvalidParams)?;
         if !self.state.privacy.is_call_allowed(name, &capability) {
@@ -4934,6 +4938,10 @@ impl ServerHandler for VictauriMcpHandler {
         // Centralized authorization: gate on the canonical `tool.action` capability
         // resolved from the call arguments, matching the REST path in `execute_tool`.
         let args_value = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
+        // A disabled tool reports "disabled" whatever its arguments look like.
+        if self.state.privacy.disabled_tools.contains(&tool_name) {
+            return Ok(tool_disabled(&tool_name).into());
+        }
         let capability = authz::resolve_capability(&tool_name, &args_value)
             .map_err(|msg| ErrorData::invalid_params(msg, None))?;
         if !self.state.privacy.is_call_allowed(&tool_name, &capability) {
@@ -6241,6 +6249,74 @@ mod authz_dispatch_tests {
         match h.execute_tool(tool, args).await {
             Ok(r) => r,
             Err(_) => panic!("dispatch returned a transport error (arg parse failure)"),
+        }
+    }
+
+    /// The action strings a params type's `action` enum accepts, from its JSON schema.
+    fn schema_actions<T: schemars::JsonSchema>() -> Vec<String> {
+        fn collect(v: &serde_json::Value, out: &mut Vec<String>) {
+            if let Some(values) = v.get("enum").and_then(serde_json::Value::as_array) {
+                out.extend(values.iter().filter_map(|x| x.as_str().map(String::from)));
+            }
+            if let Some(c) = v.get("const").and_then(serde_json::Value::as_str) {
+                out.push(c.to_string());
+            }
+            for key in ["oneOf", "anyOf"] {
+                for sub in v
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    collect(sub, out);
+                }
+            }
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(T)).unwrap();
+        let mut action = schema["properties"]["action"].clone();
+        if let Some(target) = action.get("$ref").and_then(serde_json::Value::as_str) {
+            let name = target.rsplit('/').next().unwrap();
+            action = schema["$defs"][name].clone();
+        }
+        let mut out = Vec::new();
+        collect(&action, &mut out);
+        out
+    }
+
+    /// `resolve_capability` gates an unknown STRING action as the bare tool name,
+    /// trusting the typed parse to reject it. That holds only if every action the parse
+    /// ACCEPTS is mapped to its own capability — pinned here from the enums themselves,
+    /// so a new variant cannot silently fall back to the bare-name gate.
+    #[test]
+    fn every_action_variant_has_a_capability() {
+        let tools: &[(&str, Vec<String>)] = &[
+            ("interact", schema_actions::<InteractParams>()),
+            ("input", schema_actions::<InputParams>()),
+            ("window", schema_actions::<WindowParams>()),
+            ("storage", schema_actions::<StorageParams>()),
+            ("navigate", schema_actions::<NavigateParams>()),
+            ("recording", schema_actions::<RecordingParams>()),
+            ("inspect", schema_actions::<InspectParams>()),
+            ("css", schema_actions::<CssParams>()),
+            ("route", schema_actions::<RouteParams>()),
+            ("trace", schema_actions::<TraceParams>()),
+            ("animation", schema_actions::<AnimationParams>()),
+            ("logs", schema_actions::<LogsParams>()),
+            ("introspect", schema_actions::<IntrospectParams>()),
+            ("fault", schema_actions::<FaultParams>()),
+            ("explain", schema_actions::<ExplainParams>()),
+        ];
+        for (tool, actions) in tools {
+            assert!(
+                !actions.is_empty(),
+                "{tool}: no actions read from its schema"
+            );
+            for action in actions {
+                assert!(
+                    authz::action_capability(tool, action).is_some(),
+                    "{tool}.{action} is accepted by the parser but has no capability"
+                );
+            }
         }
     }
 

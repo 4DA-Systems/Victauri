@@ -57,17 +57,21 @@ pub fn is_compound_tool(tool: &str) -> bool {
 /// For standalone tools this is the bare tool name. For compound tools it is the
 /// dot-qualified `tool.action` identity that the privacy matrix is keyed on.
 ///
-/// The gate and the handler must agree on WHICH action runs, so anything the gate
-/// cannot map to exactly one action is refused rather than gated on the bare tool
-/// name: serde also accepts an enum written as `{"go_to": null}` (externally-tagged
-/// unit variant) and a REST body written as a positional array, and both used to
-/// resolve to the bare name here — which the Test profile allows for `navigate` —
-/// while the handler still parsed and ran `go_to` (audit N1).
+/// The gate and the handler must agree on WHICH action runs. serde also accepts an
+/// enum written as `{"go_to": null}` (externally-tagged unit variant) and a REST body
+/// written as a positional array; both used to be gated as the bare tool name —
+/// which the Test profile allows for `navigate` — while the handler still parsed and
+/// ran `go_to` (audit N1). So a non-object body or a non-string `action` is refused.
+///
+/// A missing or unknown STRING action is gated as the bare tool name, as before: the
+/// handler's typed parse rejects it (listing the valid actions) before anything runs.
+/// That is sound only while every action variant is mapped here, which
+/// `every_action_variant_has_a_capability` pins for each compound tool's enum.
 ///
 /// # Errors
 ///
-/// Returns a human-readable message when the arguments are not a JSON object, or
-/// when a compound tool's `action` is missing, not a string, or not a known action.
+/// Returns a human-readable message when the arguments are not a JSON object, or a
+/// compound tool's `action` is present but not a string.
 pub fn resolve_capability(tool: &str, args: &Value) -> Result<String, String> {
     if !args.is_object() {
         return Err(format!("arguments for '{tool}' must be a JSON object"));
@@ -76,10 +80,11 @@ pub fn resolve_capability(tool: &str, args: &Value) -> Result<String, String> {
         return Ok(tool.to_string());
     }
     match args.get("action") {
-        Some(Value::String(action)) => action_capability(tool, action)
-            .ok_or_else(|| format!("unknown action '{action}' for tool '{tool}'")),
+        Some(Value::String(action)) => {
+            Ok(action_capability(tool, action).unwrap_or_else(|| tool.to_string()))
+        }
+        None => Ok(tool.to_string()),
         Some(_) => Err(format!("`action` for tool '{tool}' must be a string")),
-        None => Err(format!("tool '{tool}' requires a string `action`")),
     }
 }
 
@@ -260,10 +265,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_or_unknown_action_is_refused() {
-        assert!(resolve_capability("route", &json!({})).is_err());
-        assert!(resolve_capability("route", &json!({"action": "nonsense"})).is_err());
-        assert!(resolve_capability("introspect", &json!({"action": "nonsense"})).is_err());
+    fn missing_or_unknown_string_action_is_gated_as_the_bare_tool() {
+        // The handler's typed parse then rejects it before anything runs.
+        assert_eq!(canonical_capability("route", &json!({})), "route");
+        assert_eq!(
+            canonical_capability("route", &json!({"action": "nonsense"})),
+            "route"
+        );
+        assert_eq!(
+            canonical_capability("introspect", &json!({"action": "nonsense"})),
+            "introspect"
+        );
     }
 
     /// Audit N1: serde parses `{"go_to": null}` into `NavigateAction::GoTo`, and a
