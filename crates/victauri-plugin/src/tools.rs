@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use tauri::{Runtime, State};
+use tauri::{Manager, Runtime, State};
 use victauri_core::{IpcCall, WindowState};
 
 use crate::VictauriState;
@@ -46,7 +46,13 @@ pub async fn victauri_eval_js<R: Runtime>(
         "
     );
 
-    if let Err(e) = webview.eval(&inject) {
+    // Through the bridge, i.e. on the main thread and serialized with every other
+    // round trip — not a direct `webview.eval` from this tokio worker thread.
+    if let Err(e) = crate::bridge::WebviewBridge::eval_webview(
+        webview.app_handle(),
+        Some(webview.label()),
+        &inject,
+    ) {
         state.pending_evals.lock().await.remove(&id);
         return Err(format!("eval failed: {e}"));
     }
@@ -124,7 +130,13 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
         "
     );
 
-    if let Err(e) = webview.eval(&inject) {
+    // Through the bridge, i.e. on the main thread and serialized with every other
+    // round trip — not a direct `webview.eval` from this tokio worker thread.
+    if let Err(e) = crate::bridge::WebviewBridge::eval_webview(
+        webview.app_handle(),
+        Some(webview.label()),
+        &inject,
+    ) {
         state.pending_evals.lock().await.remove(&id);
         return Err(format!("snapshot eval failed: {e}"));
     }

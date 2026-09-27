@@ -177,9 +177,24 @@ fn find_window<'a, R: Runtime>(
 /// Serializing costs effectively nothing: the closures already execute one at a time on the
 /// single main thread, so this only stops several round trips being in flight *around* it.
 ///
-/// NOTE: the lock is not reentrant. No `on_main` closure may itself call `on_main` — on the main
-/// thread `run_on_main_thread` runs inline, so that would self-deadlock.
+/// The lock is only taken OFF the main thread: a caller already on the main thread (including
+/// an `on_main` closure that calls back into the bridge) runs inline without it — see `on_main`.
 static MAIN_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The Tauri main (UI) thread, recorded by the plugin's `setup` (which Tauri runs there).
+static MAIN_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
+
+/// Record the calling thread as the Tauri main thread. Called once from plugin `setup`.
+pub(crate) fn record_main_thread() {
+    let _ = MAIN_THREAD.set(std::thread::current().id());
+}
+
+/// Whether the current thread is the recorded Tauri main thread (false if not yet recorded).
+fn is_main_thread() -> bool {
+    MAIN_THREAD
+        .get()
+        .is_some_and(|id| *id == std::thread::current().id())
+}
 
 /// Run `f` on the Tauri **main (UI) thread** and return its result.
 ///
@@ -216,6 +231,17 @@ where
 {
     use std::sync::atomic::{AtomicBool, Ordering};
     let timeout = std::time::Duration::from_secs(10);
+
+    // Already ON the main thread (a sync Tauri command, a menu handler, or an `on_main` closure
+    // that calls back into the bridge): run inline, WITHOUT the dispatch lock. Taking the lock
+    // here could deadlock — a background holder waits for its closure, which is queued behind
+    // us on this very thread — freezing the UI for the full timeout. Skipping it is safe: no
+    // other closure can execute on this thread concurrently, and the heap corruption the lock
+    // prevents needs several cross-thread round trips in flight, which an inline call is not.
+    if is_main_thread() {
+        return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(app)))
+            .map_err(|_| format!("{what} panicked on the main thread"));
+    }
 
     let round_trip = move || -> Result<T, String> {
         // One round trip at a time (see MAIN_DISPATCH_LOCK). The deadline covers the WAIT FOR
@@ -787,5 +813,32 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
             "SendInput delivered {sent}/{} mouse events",
             inputs.len()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_main_thread, record_main_thread};
+
+    #[test]
+    fn main_thread_is_recorded_once_and_only_that_thread_matches() {
+        // Record from a dedicated thread (standing in for Tauri's setup thread): only that
+        // thread is "main"; every other thread — including this test's — is not.
+        std::thread::spawn(|| {
+            record_main_thread();
+            assert!(is_main_thread(), "the recording thread is the main thread");
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !is_main_thread(),
+            "a different thread must not be treated as main"
+        );
+        std::thread::spawn(|| assert!(!is_main_thread()))
+            .join()
+            .unwrap();
+        // A second record from another thread must not move it (set-once).
+        std::thread::spawn(record_main_thread).join().unwrap();
+        assert!(!is_main_thread());
     }
 }

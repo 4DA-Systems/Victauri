@@ -733,6 +733,9 @@ impl VictauriBuilder {
 
             Ok(Builder::new("victauri")
                 .setup(move |app, _api| {
+                    // Tauri runs plugin setup on the main (UI) thread — record it so the bridge
+                    // can run main-thread callers inline instead of deadlocking on its lock.
+                    bridge::record_main_thread();
                     let startup_timeline = introspection::StartupTimeline::new();
                     let event_log = EventLog::new(event_capacity);
                     startup_timeline.mark("event_log_created");
