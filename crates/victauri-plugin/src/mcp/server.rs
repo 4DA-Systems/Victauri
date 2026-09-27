@@ -466,9 +466,49 @@ async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u1
 }
 
 fn discovery_dir() -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join("victauri")
-        .join(std::process::id().to_string())
+    discovery_root().join(std::process::id().to_string())
+}
+
+/// The directory holding every `<pid>/` discovery entry of this user.
+///
+/// On Unix it is per-user: `$XDG_RUNTIME_DIR/victauri` when that directory is private to us,
+/// else `<temp>/victauri-<euid>`. The old shared `/tmp/victauri` let any other local user
+/// pre-create it, after which the ownership check refused it and discovery was blocked for
+/// good. Windows and other platforms keep `<temp>/victauri` (their temp dir is per-user).
+/// Every reader (`victauri` CLI, `victauri-test`, `victauri-watchdog`) scans the same roots.
+fn discovery_root() -> std::path::PathBuf {
+    #[cfg(unix)]
+    {
+        discovery_root_from(std::env::var_os("XDG_RUNTIME_DIR"), current_euid())
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("victauri")
+    }
+}
+
+#[cfg(unix)]
+fn discovery_root_from(
+    xdg_runtime_dir: Option<std::ffi::OsString>,
+    euid: Option<u32>,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(euid) = euid else {
+        // Unknown uid: the legacy path, which the ownership checks then refuse (fail closed).
+        return std::env::temp_dir().join("victauri");
+    };
+    let private_runtime_dir = xdg_runtime_dir
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| {
+            std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                m.file_type().is_dir() && m.uid() == euid && m.permissions().mode() & 0o077 == 0
+            })
+        });
+    private_runtime_dir.map_or_else(
+        || std::env::temp_dir().join(format!("victauri-{euid}")),
+        |dir| dir.join("victauri"),
+    )
 }
 
 #[cfg(unix)]
@@ -1432,6 +1472,42 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Audit N6: the discovery root was the shared `/tmp/victauri`; another local user who
+    /// created it first blocked discovery for everyone else. It is per-user now.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_root_is_per_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let euid = current_euid().expect("euid");
+        let shared = std::env::temp_dir().join("victauri");
+        let fallback = std::env::temp_dir().join(format!("victauri-{euid}"));
+        assert_ne!(discovery_root(), shared);
+        assert_eq!(discovery_root_from(None, Some(euid)), fallback);
+
+        // A private XDG runtime dir is preferred …
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid)),
+            runtime.path().join("victauri")
+        );
+        // … but not one others can reach, one we do not own, or a relative path.
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid)),
+            fallback
+        );
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid.wrapping_add(1))),
+            std::env::temp_dir().join(format!("victauri-{}", euid.wrapping_add(1)))
+        );
+        assert_eq!(
+            discovery_root_from(Some("relative/run".into()), Some(euid)),
+            fallback
+        );
     }
 
     #[cfg(unix)]

@@ -967,15 +967,57 @@ fn select(live: &[ServerInfo], app: Option<&str>) -> Selection {
 /// filter in [`scan_once`], which is what keeps a down-state scan fast: a dead/stale port
 /// refuses the connection instantly, so no process enumeration runs at all.
 fn discover_entries() -> Vec<(u32, ServerInfo)> {
-    let root = std::env::temp_dir().join("victauri");
     let mut out = Vec::new();
+    for root in discovery_roots() {
+        discover_entries_in(&root, &mut out);
+    }
+    out
+}
+
+/// The discovery roots the plugin may have written to, most specific first (mirrors the
+/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
+/// that directory is private to us, else `<temp>/victauri-<euid>` — and the legacy shared
+/// `<temp>/victauri` is still read (a pre-0.9 plugin writes there) when it passes the same
+/// ownership check. Other platforms use `<temp>/victauri` (a per-user temp dir).
+fn discovery_roots() -> Vec<std::path::PathBuf> {
+    let legacy = std::env::temp_dir().join("victauri");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut roots = Vec::new();
+        if let Some(euid) = current_euid() {
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(std::path::PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .filter(|dir| {
+                    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                        m.file_type().is_dir()
+                            && m.uid() == euid
+                            && m.permissions().mode() & 0o077 == 0
+                    })
+                })
+            {
+                roots.push(runtime.join("victauri"));
+            }
+            roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+        }
+        roots.push(legacy);
+        roots
+    }
+    #[cfg(not(unix))]
+    {
+        vec![legacy]
+    }
+}
+
+fn discover_entries_in(root: &std::path::Path, out: &mut Vec<(u32, ServerInfo)>) {
     // The root itself is security-sensitive: its owner can rename a trusted PID
     // directory after our child check and swap in attacker-controlled files.
-    if !dir_is_trusted(&root) {
-        return out;
+    if !dir_is_trusted(root) {
+        return;
     }
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return out;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
     };
     for entry in entries.filter_map(Result::ok) {
         let pid_str = entry.file_name().to_string_lossy().to_string();
@@ -1017,6 +1059,11 @@ fn discover_entries() -> Vec<(u32, ServerInfo)> {
                         .map(String::from),
                 )
             });
+        // A pid already found under a more specific root counts once (a stale legacy entry
+        // can carry a reused live pid).
+        if out.iter().any(|(seen, _)| *seen == pid) {
+            continue;
+        }
         out.push((
             pid,
             ServerInfo {
@@ -1027,7 +1074,6 @@ fn discover_entries() -> Vec<(u32, ServerInfo)> {
             },
         ));
     }
-    out
 }
 
 /// The discovered backends as `ServerInfo` (dropping the pid) — for callers that only need
@@ -1268,6 +1314,17 @@ fn dir_is_trusted(_path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit N6: the per-user root is scanned first; the legacy shared root is last.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_roots_are_per_user_first() {
+        let roots = discovery_roots();
+        let euid = current_euid().unwrap();
+        assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
+        assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
+        assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+    }
 
     // ── Cold-start handshake: the bridge must answer `initialize` itself so the MCP server
     //    is connected even with no app running (the fix for the 30s handshake timeout). ──
@@ -1515,7 +1572,8 @@ mod tests {
     #[test]
     fn discover_servers_reads_real_metadata_and_selects() {
         let pid = std::process::id(); // alive → passes is_process_alive
-        let dir = std::env::temp_dir().join("victauri").join(pid.to_string());
+        // The plugin's primary (per-user on Unix) root — audit N6.
+        let dir = discovery_roots()[0].join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         // Make ownership/permissions deterministic so `dir_is_trusted` passes regardless of
         // the runner's umask (a umask of 002 would otherwise leave the dir group-writable
