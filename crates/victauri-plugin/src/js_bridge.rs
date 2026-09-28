@@ -72,8 +72,11 @@ pub fn agent_key() -> &'static str {
 }
 
 /// JS expression evaluating to the bridge's agent-only operations object (or `undefined` when
-/// the bridge is not loaded). Only valid inside scripts Victauri injects.
-pub(crate) fn agent_ops_js() -> String {
+/// the bridge is not loaded). Only valid inside scripts Victauri injects. `pub` only so the
+/// jsdom suite can build the real agent snippets.
+#[doc(hidden)]
+#[must_use]
+pub fn agent_ops_js() -> String {
     format!("window.__VICTAURI__?._agent(\"{}\")", agent_key())
 }
 
@@ -118,12 +121,23 @@ pub fn probe_answer_nonce(raw: &str) -> Option<String> {
 #[must_use]
 pub fn eval_wrapper_script(id: &str, code: &str) -> String {
     let id_js = js_literal(id);
+    // Code carrying the agent key (only Victauri's own agent-op snippets — the key is a
+    // per-process secret) runs in a STRICT wrapper. In a sloppy one a page hook on anything the
+    // snippet touches (a `then` getter consulted when the result settles, a built-in an op calls)
+    // reaches the wrapper through `hook.caller` or V8 stack-frame `getFunction()`, and its source
+    // holds the key (R4-JS2). Strict functions are censored from both. User code keeps sloppy
+    // semantics (implicit globals etc.), so strictness is applied only where the key is.
+    let strict = if code.contains(agent_key()) {
+        "'use strict';"
+    } else {
+        ""
+    };
     // `{code}` is followed by a NEWLINE so a trailing `// comment` in the user code cannot
     // comment out the rest of the wrapper (it used to turn every such eval into a parse error).
     // `_evalBegin` runs synchronously when the script is evaluated, before the parse check.
     format!(
         r"
-        (async () => {{
+        (async () => {{ {strict}
             const __vic = {{ id: {id_js}, bridge: window.__VICTAURI__ }};
             const __settle = (p) => (__vic.bridge && __vic.bridge._evalSettle)
                 ? __vic.bridge._evalSettle(__vic.id, p)
@@ -290,6 +304,15 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // Find the first active route rule matching url+method, or null.
     // Never matches Victauri's own internal IPC traffic.
+    // A route delay as setTimeout can honour it. Timers hold a signed 32-bit delay: anything
+    // above 2^31-1 ms (or Infinity) fires almost at once, so a "delay forever" rule silently
+    // became no delay (G-12). Clamp to the maximum; NaN / negative / non-numbers mean none.
+    var MAX_TIMER_DELAY_MS = 2147483647;
+    function clampTimerDelay(ms) {
+        if (typeof ms !== 'number' || !(ms > 0)) return 0;
+        return ms > MAX_TIMER_DELAY_MS ? MAX_TIMER_DELAY_MS : ms;
+    }
+
     function matchRoute(url, method) {
         if (!routeRules.length) return null;
         if (isVictauriInternalUrl(url)) return null;
@@ -408,6 +431,22 @@ const INIT_SCRIPT_BODY: &str = r#"
     var ARRAY_PROTO = Array.prototype;
     var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     var SET_TIMEOUT = window.setTimeout.bind(window);
+    var REFLECT_APPLY = Reflect.apply;
+    // Native `Request` getters. They brand-check (throw for anything but a genuine Request), so
+    // they tell a real Request apart from a look-alike object and read what fetch really uses —
+    // an own `url` property planted on a Request instance cannot shadow them.
+    var REQUEST_URL_GET = null;
+    var REQUEST_METHOD_GET = null;
+    try {
+        if (typeof window.Request === 'function') {
+            REQUEST_URL_GET = Object.getOwnPropertyDescriptor(window.Request.prototype, 'url').get;
+            REQUEST_METHOD_GET = Object.getOwnPropertyDescriptor(window.Request.prototype, 'method').get;
+        }
+    } catch (e) { REQUEST_URL_GET = null; REQUEST_METHOD_GET = null; }
+    // ECMAScript ToString — what fetch() / XMLHttpRequest.open() apply to a URL or method
+    // argument (it throws for a Symbol, as they do). Not `String(v)`: page script can replace
+    // `window.String`, and `String(symbol)` does not throw.
+    function toStringExact(v) { return `${v}`; }
     var AGENT_KEY = '__VICTAURI_AGENT_KEY__';
 
     // Page script can plant `toJSON` on Object.prototype / Array.prototype, which JSON.stringify
@@ -501,6 +540,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         evalDone.add(id);
     }
     function evalCallback(id, body) {
+        'use strict';
         try {
             return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
         } catch (e) { return null; }
@@ -604,6 +644,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // Called synchronously at the top of the eval wrapper. Returns false when the eval was
         // already settled (reported as never begun), in which case the wrapper must not run it.
         _evalBegin: function(id) {
+            'use strict';
             id = '' + id; // not String(id): page script can replace window.String
             if (evalDone.has(id)) return false;
             evalState.add(id);
@@ -614,6 +655,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // so a delayed delivery can never report a parse error for code that then runs. `nonce`
         // is the page the eval was armed in: a check that lands in another page stays silent.
         _evalCheck: function(id, nonce) {
+            'use strict';
             id = '' + id; // not String(id): page script can replace window.String
             if (nonce !== PAGE_NONCE || evalState.has(id) || evalDone.has(id)) return null;
             evalMarkDone(id);
@@ -621,6 +663,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
+            'use strict';
             id = '' + id; // not String(id): page script can replace window.String
             if (evalDone.has(id)) return null;
             evalMarkDone(id);
@@ -1095,7 +1138,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 headers: rule.headers || {},
                 body: (rule.body === undefined || rule.body === null) ? '' : rule.body,
                 content_type: rule.content_type || 'application/json',
-                delay_ms: typeof rule.delay_ms === 'number' ? rule.delay_ms : 0,
+                delay_ms: clampTimerDelay(rule.delay_ms),
                 times: typeof rule.times === 'number' ? rule.times : 0,
                 triggered: 0,
             };
@@ -1113,7 +1156,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         // this page-visible object: page script could otherwise silently remove the agent's
         // block/mock rules, erase captured evidence, or flip dialog auto-answers. They are
         // handed out only for the per-process key Victauri embeds in its own injected scripts.
+        //
+        // Strict, like every AGENT_OPS function and the `_eval*` plumbing: in sloppy mode a page
+        // hook on any built-in they call (`Array.prototype.filter`, `String.prototype.indexOf`,
+        // a `then` getter, ...) could walk `hook.caller` up to the injected script whose source
+        // holds the key (R4-JS2). A strict function is never exposed as a `.caller`.
         _agent: function(key) {
+            'use strict';
             return key === AGENT_KEY ? AGENT_OPS : null;
         },
 
@@ -2029,7 +2078,12 @@ const INIT_SCRIPT_BODY: &str = r#"
     var scrubState = null;
     var sweepState = null;
 
-    // See `_agent`: reachable only with the per-process agent key.
+    // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
+    // every op — and every callback an op creates — is strict: a page hook on a built-in an op
+    // calls then cannot reach the op through `.caller` (and call it without the key), nor the
+    // injected script beyond it whose source carries the key (R4-JS2).
+    var AGENT_OPS = (function() {
+    'use strict';
     var AGENT_OPS = OBJ_CREATE(null);
     AGENT_OPS.clearIpcLog = function() {
         for (var i = networkLog.length - 1; i >= 0; i--) {
@@ -2055,7 +2109,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         dialogAutoResponses[type] = { action: action, text: text };
         return { ok: true };
     };
-    Object.freeze(AGENT_OPS);
+    return Object.freeze(AGENT_OPS);
+    })();
 
     // ── Accessibility Helpers ────────────────────────────────────────────────
 
@@ -2589,9 +2644,33 @@ const INIT_SCRIPT_BODY: &str = r#"
         var origFetch = window.fetch;
         if (origFetch) {
             window.fetch = function(input, init) {
+                // Log exactly the request fetch will make (R4-JS3). A look-alike object's own
+                // `url`/`method` used to be logged although fetch requests `String(input)`, so a
+                // page could plant fake IPC entries (a "quit_app" call that never happened).
+                // A non-Request input is converted ONCE and fetch is handed that string, so a
+                // stateful `toString` cannot make the log and the request differ either.
+                var url, method, fetchInput = input;
+                try {
+                    var isRequest = false;
+                    if (REQUEST_URL_GET && input !== null && (typeof input === 'object' || typeof input === 'function')) {
+                        try {
+                            url = REFLECT_APPLY(REQUEST_URL_GET, input, []);
+                            method = REFLECT_APPLY(REQUEST_METHOD_GET, input, []);
+                            isRequest = true;
+                        } catch (e) { isRequest = false; }
+                    }
+                    if (!isRequest) {
+                        url = toStringExact(input);
+                        method = 'GET';
+                        fetchInput = url;
+                    }
+                    var initMethod = (init !== undefined && init !== null) ? init.method : undefined;
+                    if (initMethod !== undefined) method = toStringExact(initMethod);
+                } catch (e) {
+                    // fetch itself rejects this input: let it, with nothing logged.
+                    return REFLECT_APPLY(origFetch, this, [input, init]);
+                }
                 var id = ++networkCounter;
-                var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
-                var method = String((init && init.method) || (input && input.method) || 'GET');
                 var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isVictauriInternalUrl(url);
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
@@ -2685,7 +2764,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 return doRealFetch();
 
                 function doRealFetch() {
-                    return origFetch.call(self, input, init).then(function(response) {
+                    return REFLECT_APPLY(origFetch, self, [fetchInput, init]).then(function(response) {
                         entry.status = response.status;
                         entry.status_text = response.statusText;
                         entry.duration_ms = Date.now() - entry.timestamp;
@@ -2742,27 +2821,40 @@ const INIT_SCRIPT_BODY: &str = r#"
         // XMLHttpRequest
         var origOpen = XMLHttpRequest.prototype.open;
         var origSend = XMLHttpRequest.prototype.send;
+        // Per-request {method, url} as `open()` really received them, in a closure WeakMap —
+        // not an expando on the XHR, which page script could overwrite to forge the entry
+        // `send()` logs (R4-JS3). The WeakMap methods are captured before page script runs.
+        var xhrNet = new WeakMap();
+        var XHR_NET_GET = Function.prototype.call.bind(WeakMap.prototype.get);
+        var XHR_NET_SET = Function.prototype.call.bind(WeakMap.prototype.set);
+        var XHR_NET_DELETE = Function.prototype.call.bind(WeakMap.prototype.delete);
         XMLHttpRequest.prototype.open = function(method, url) {
-            // `url` may be a URL object (or anything with toString); coerce once
-            // here so send() can treat it as a string. Never throw into the app.
-            try {
-                this.__victauri_net = { method: String(method || 'GET'), url: String(url) };
-            } catch (e) {
-                this.__victauri_net = null;
-            }
-            return origOpen.apply(this, arguments);
+            XHR_NET_DELETE(xhrNet, this);
+            if (arguments.length < 2) return REFLECT_APPLY(origOpen, this, arguments);
+            // Convert ONCE, exactly as open() does (a URL object or anything with toString), and
+            // hand open() the converted strings: what is logged is what is requested. A
+            // conversion that throws is left for open() itself to throw.
+            var m, u;
+            try { m = toStringExact(method); u = toStringExact(url); }
+            catch (e) { return REFLECT_APPLY(origOpen, this, arguments); }
+            var args = [m, u];
+            for (var i = 2; i < arguments.length; i++) args[i] = arguments[i];
+            var ret = REFLECT_APPLY(origOpen, this, args);
+            XHR_NET_SET(xhrNet, this, { method: m, url: u });
+            return ret;
         };
         XMLHttpRequest.prototype.send = function() {
-            if (this.__victauri_net) {
-                var isVictauriInternal = isVictauriInternalUrl(this.__victauri_net.url);
+            var net = XHR_NET_GET(xhrNet, this);
+            if (net) {
+                var isVictauriInternal = isVictauriInternalUrl(net.url);
                 if (isVictauriInternal) {
-                    return origSend.apply(this, arguments);
+                    return REFLECT_APPLY(origSend, this, arguments);
                 }
                 var id = ++networkCounter;
                 var entry = {
                     id: id,
-                    method: this.__victauri_net.method.toUpperCase(),
-                    url: this.__victauri_net.url,
+                    method: net.method.toUpperCase(),
+                    url: net.url,
                     timestamp: Date.now(),
                     status: 'pending',
                     duration_ms: null,
@@ -2800,9 +2892,9 @@ const INIT_SCRIPT_BODY: &str = r#"
                 // Phase 1 routing for XHR: block + delay are supported here.
                 // `fulfill` (synthetic response) is fetch-only — faking the full
                 // XHR response surface is unreliable; document as a limitation.
-                var xroute = matchRoute(this.__victauri_net.url, this.__victauri_net.method);
+                var xroute = matchRoute(net.url, net.method);
                 if (xroute) {
-                    recordRouteMatch(xroute, this.__victauri_net.url, this.__victauri_net.method);
+                    recordRouteMatch(xroute, net.url, net.method);
                     if (xroute.action === 'block') {
                         entry.status = 'blocked';
                         entry.blocked = true;
@@ -2815,12 +2907,12 @@ const INIT_SCRIPT_BODY: &str = r#"
                     }
                     if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
                         var dArgs = arguments, dSelf = this;
-                        setTimeout(function() { origSend.apply(dSelf, dArgs); }, xroute.delay_ms);
+                        setTimeout(function() { REFLECT_APPLY(origSend, dSelf, dArgs); }, xroute.delay_ms);
                         return;
                     }
                 }
             }
-            return origSend.apply(this, arguments);
+            return REFLECT_APPLY(origSend, this, arguments);
         };
     })();
 
@@ -2866,9 +2958,13 @@ const INIT_SCRIPT_BODY: &str = r#"
     // restored as-is and the init script does NOT run again. Tearing capture down here left a
     // restored page with console and DOM-mutation capture permanently off. So a persisted
     // pagehide keeps everything, and `pageshow` re-installs whatever a teardown removed.
+    //
+    // Both listeners act ONLY on the browser's own (trusted) events. Page script can dispatch a
+    // synthetic `pagehide` at will (`isTrusted` is false and unforgeable); honouring one let a
+    // page wipe every captured log and switch console + mutation capture off for good (R4-JS1).
     var captureTornDown = false;
     window.addEventListener('pageshow', function(e) {
-        if (!e || !e.persisted || !captureTornDown) return;
+        if (!e || e.isTrusted !== true || !e.persisted || !captureTornDown) return;
         captureTornDown = false;
         hookConsole('log');
         hookConsole('warn');
@@ -2879,7 +2975,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     });
 
     window.addEventListener('pagehide', function(e) {
-        if (e && e.persisted) return;
+        if (!e || e.isTrusted !== true || e.persisted) return;
         captureTornDown = true;
         if (__mutationObserver) { __mutationObserver.disconnect(); __mutationObserver = null; }
         if (mutationBatchTimer) { clearTimeout(mutationBatchTimer); mutationBatchTimer = null; }
@@ -2932,7 +3028,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             });
         } catch(e) {}
     }
-    window.addEventListener('pageshow', function(e) { if (e && e.persisted) signalReady(); });
+    window.addEventListener('pageshow', function(e) { if (e && e.isTrusted === true && e.persisted) signalReady(); });
     signalReady();
 })();
 "#;

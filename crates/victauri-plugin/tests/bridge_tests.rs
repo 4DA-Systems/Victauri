@@ -5594,8 +5594,9 @@ fn bfcache_restore_keeps_console_and_mutation_capture() {
         tests: vec![case(
             "persisted pagehide/pageshow keeps capture; pageshow re-installs after a teardown",
             r"
+            // The browser's own (trusted) events: the bridge ignores synthetic ones (R4-JS1).
             function fire(type, persisted) {
-                window.dispatchEvent(new PageTransitionEvent(type, { persisted: persisted }));
+                window.__vtestTrustedPageTransition(type, persisted);
             }
             function logged(msg) {
                 return window.__VICTAURI__.getConsoleLogs().some(function(l) { return l.message === msg; });
@@ -5608,11 +5609,14 @@ fn bfcache_restore_keeps_console_and_mutation_capture() {
             var kept = { console: logged('after-bfcache'),
                          mutations: window.__VICTAURI__.getMutationLog().length > 0 };
             fire('pagehide', false);
+            // The non-persisted pagehide really tore capture down (the path under test).
+            var tornDown = window.__VICTAURI__.getConsoleLogs().length === 0
+                && window.__VICTAURI__.getMutationLog().length === 0;
             fire('pageshow', true);
             console.log('after-reinstall');
             document.body.appendChild(document.createElement('div'));
             await new Promise(function(r) { setTimeout(r, 150); });
-            return { kept: kept, reinstalled: { console: logged('after-reinstall'),
+            return { kept: kept, torn_down: tornDown, reinstalled: { console: logged('after-reinstall'),
                      mutations: window.__VICTAURI__.getMutationLog().length > 0 } };
         ",
         )],
@@ -5627,6 +5631,7 @@ fn bfcache_restore_keeps_console_and_mutation_capture() {
         serde_json::json!({"console": true, "mutations": true}),
         "{r}"
     );
+    assert_eq!(r["torn_down"], true, "{r}");
     assert_eq!(
         r["reinstalled"],
         serde_json::json!({"console": true, "mutations": true}),
