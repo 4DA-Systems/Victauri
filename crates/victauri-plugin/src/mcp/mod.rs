@@ -280,6 +280,9 @@ pub(crate) const COMMAND_TIMINGS_CAP: usize = 1024;
 
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
+
+/// Total time `recording stop` spends on its final flush of every window.
+const FINAL_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 /// How often a slow eval re-checks that its target window still exists (first check after
 /// one interval, so fast evals never pay for it).
 const EVAL_WINDOW_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -2215,10 +2218,35 @@ impl VictauriMcpHandler {
                     Err(e) => tool_error(e.to_string()),
                 }
             }
-            RecordingAction::Stop => match self.state.recorder.stop() {
-                Some(session) => json_result(&session),
-                None => tool_error("no recording is active"),
-            },
+            RecordingAction::Stop => {
+                // Final flush first: the background drain reads each window about once a second, so
+                // anything the page captured since its last tick would otherwise be lost — and under
+                // a busy UI no drain may have run at all. Best-effort and bounded; a window that
+                // cannot answer in time is REPORTED, never silently dropped.
+                let unreachable = if self.state.recorder.is_recording() {
+                    self.final_recording_flush().await
+                } else {
+                    Vec::new()
+                };
+                match self.state.recorder.stop() {
+                    Some(session) => {
+                        if unreachable.is_empty() {
+                            json_result(&session)
+                        } else {
+                            let mut value =
+                                serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
+                                    "final_flush_unreachable".to_string(),
+                                    serde_json::json!(unreachable),
+                                );
+                            }
+                            json_result(&value)
+                        }
+                    }
+                    None => tool_error("no recording is active"),
+                }
+            }
             RecordingAction::Checkpoint => {
                 // checkpoint_id is optional — auto-generate a short id when the
                 // caller just wants a positional marker. The id is echoed back in
@@ -4890,6 +4918,31 @@ impl VictauriMcpHandler {
                 None
             }
         }
+    }
+
+    /// Drain every window into the active recording one last time before `recording stop`,
+    /// within [`FINAL_FLUSH_BUDGET`] in total. Returns the windows that could not be read in time
+    /// (their not-yet-drained events are missing from the stopped session).
+    async fn final_recording_flush(&self) -> Vec<String> {
+        let Ok(labels) = self.bridge.try_list_window_labels() else {
+            return vec!["(window list unavailable: UI thread busy)".to_string()];
+        };
+        let mut pending = labels.clone();
+        let flushed = tokio::time::timeout(FINAL_FLUSH_BUDGET, async {
+            for label in &labels {
+                if crate::mcp::server::drain_window_into_recording(&self.state, &self.bridge, label)
+                    .await
+                    .is_some()
+                {
+                    pending.retain(|l| l != label);
+                }
+            }
+        })
+        .await;
+        if flushed.is_err() {
+            tracing::debug!("recording stop: final flush ran out of time");
+        }
+        pending
     }
 
     async fn eval_with_return_timeout(

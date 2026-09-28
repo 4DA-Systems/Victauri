@@ -368,3 +368,26 @@ async fn replay_runs_each_call_in_the_window_that_recorded_it() {
     );
     assert_eq!(page.invoked_in("main_cmd").len(), 2);
 }
+
+// Round 4: `recording stop` did not flush, so anything the page captured since the last 1 s drain
+// tick was dropped — under a busy UI no drain ran at all before the stop (4DA dogfood:
+// "recording lifecycle should capture events, got 0").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_flushes_events_the_drain_has_not_read_yet() {
+    let state = state();
+    let page = PageBridge::new(&state);
+    let bridge: Arc<dyn WebviewBridge> = Arc::new(page.clone());
+    let h = VictauriMcpHandler::new(state.clone(), Arc::clone(&bridge));
+    let _ = call(&h, "recording", json!({"action": "start"})).await;
+    page.push(&console_json(
+        "logged just before stop",
+        chrono::Utc::now().timestamp_millis(),
+    ));
+    let r = call(&h, "recording", json!({"action": "stop"})).await;
+    let body = text(&r);
+    assert!(
+        body.contains("logged just before stop"),
+        "the stopped session must include events captured before the stop: {body}"
+    );
+    assert!(!state.recorder.is_recording());
+}
