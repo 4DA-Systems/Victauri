@@ -2939,7 +2939,22 @@ impl VictauriMcpHandler {
                     Err(e) => tool_error(format!("animation list failed: {e}")),
                 }
             }
-            AnimationAction::Scrub => self.animation_scrub(params).await,
+            AnimationAction::Scrub => {
+                // `capture=true` takes native window screenshots (a filmstrip), so it needs the
+                // `screenshot` tool as well — like `trace` — or an operator who disabled
+                // screenshots would still get pixels through here. Refused before anything runs.
+                if params.capture.unwrap_or(false)
+                    && !self.state.privacy.is_tool_enabled("screenshot")
+                {
+                    return tool_error_with_hint(
+                        "animation scrub with capture=true takes native window screenshots, but \
+                         tool 'screenshot' is disabled by privacy configuration — call scrub \
+                         without `capture` to get the geometry curve only",
+                        RecoveryHint::ReportToUser,
+                    );
+                }
+                self.animation_scrub(params).await
+            }
             AnimationAction::Sample => {
                 let label = params.webview_label.as_deref();
                 let sel = params
@@ -7125,6 +7140,43 @@ mod authz_dispatch_tests {
             !is_privacy_blocked(&allowed),
             "route.list must remain allowed"
         );
+    }
+
+    /// R4-NET2: `animation scrub` with `capture=true` takes native window screenshots, so an
+    /// operator who disabled `screenshot` must not get pixels through it (`trace` already
+    /// required both). Without capture, scrub is a plain page read and stays allowed.
+    #[tokio::test]
+    async fn animation_scrub_capture_requires_the_screenshot_tool() {
+        let cfg = PrivacyConfig {
+            disabled_tools: HashSet::from(["screenshot".to_string()]),
+            ..Default::default()
+        };
+        let h = handler(cfg);
+        let r = call(
+            &h,
+            "animation",
+            serde_json::json!({"action": "scrub", "selector": "#toast", "capture": true}),
+        )
+        .await;
+        assert!(
+            is_privacy_blocked(&r),
+            "scrub capture must be refused while `screenshot` is disabled, got: {:?}",
+            r.content
+        );
+        assert!(
+            r.content
+                .iter()
+                .any(|c| matches!(c, ContentBlock::Text(t) if t.text.contains("screenshot"))),
+            "the refusal must name the screenshot tool: {:?}",
+            r.content
+        );
+        let r = call(
+            &h,
+            "animation",
+            serde_json::json!({"action": "scrub", "selector": "#toast"}),
+        )
+        .await;
+        assert!(!is_privacy_blocked(&r), "scrub without capture is allowed");
     }
 
     // Command-policy enforcement on invoke paths (A1/A2) and resource gating (B1)
