@@ -1403,9 +1403,14 @@ impl DrainWatermarks {
     }
 
     /// Start recording epoch `epoch`: every window is read afresh, skipping entries at or
-    /// before `floor_ms`.
+    /// before `floor_ms`. Monotonic: epochs are recorder generations (strictly increasing), so a
+    /// reset for an epoch at or below the current one is a stale caller — a `start` whose
+    /// handler ran late — and is ignored (R4-RACE1).
     pub fn reset(&self, floor_ms: f64, epoch: u64) {
         let mut s = self.state();
+        if epoch <= s.epoch {
+            return;
+        }
         s.floor_ms = floor_ms;
         s.epoch = epoch;
         s.per_label.clear();
@@ -1427,6 +1432,42 @@ impl DrainWatermarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R4-RACE1: a delayed reset for an OLDER recording generation moved the epoch backwards,
+    /// so the drain for the current recording (which captured the newer epoch) had every
+    /// `advance` refused and the recording silently captured no webview events.
+    #[test]
+    fn drain_watermark_reset_is_monotonic() {
+        let w = DrainWatermarks::default();
+        w.reset(200.0, 2);
+        let mark = DrainMark {
+            instance: "page-a".to_string(),
+            seq: 7,
+        };
+        assert!(w.advance("main", 2, mark.clone()));
+        // The reset for generation 1 (an earlier `start` whose handler was delayed) lands late.
+        w.reset(100.0, 1);
+        let c = w.cursor("main");
+        assert_eq!(
+            c.epoch, 2,
+            "a stale reset must not move the epoch backwards"
+        );
+        assert!((c.floor_ms - 200.0).abs() < f64::EPSILON);
+        assert_eq!(c.mark, Some(mark));
+        // The current recording's drain keeps advancing.
+        assert!(w.advance(
+            "main",
+            2,
+            DrainMark {
+                instance: "page-a".to_string(),
+                seq: 9,
+            }
+        ));
+        // A newer generation still resets.
+        w.reset(300.0, 3);
+        let c = w.cursor("main");
+        assert_eq!((c.epoch, c.mark), (3, None));
+    }
 
     // C15e: the map is keyed by the caller-chosen command name, so it must be bounded.
     #[test]
