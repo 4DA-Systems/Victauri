@@ -2675,6 +2675,14 @@ impl VictauriMcpHandler {
                     rule["content_type"] = serde_json::json!(ct);
                 }
                 if let Some(d) = params.delay_ms {
+                    // A delayed request is held this long in the page; cap it like a `fault`
+                    // delay rather than accept any u64.
+                    if d > MAX_FAULT_DELAY_MS {
+                        return tool_error_with_hint(
+                            format!("delay_ms {d} exceeds the maximum of {MAX_FAULT_DELAY_MS} ms"),
+                            RecoveryHint::CheckInput,
+                        );
+                    }
                     rule["delay_ms"] = serde_json::json!(d);
                 }
                 if let Some(t) = params.times {
@@ -8631,6 +8639,45 @@ mod command_policy_dispatch_tests {
         let text = result_text(&r);
         assert_eq!(r.is_error, Some(true), "{text}");
         assert!(text.contains("not focusable"), "key sent anyway: {text}");
+    }
+
+    /// G-12: `route add` forwarded any `delay_ms` (a u64) to the page, where a delayed request
+    /// is held that long. It is capped like a `fault` delay, refused before reaching the page.
+    #[tokio::test]
+    async fn route_delay_is_capped() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(&ok_envelope(&json!({"ok": true, "id": 1})));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+        let added = |b: &RecordingBridge| {
+            b.scripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|s| s.contains("addRoute("))
+                .count()
+        };
+        let r = call(
+            &h,
+            "route",
+            json!({"action": "add", "pattern": "/api", "behavior": "delay",
+                   "delay_ms": MAX_FAULT_DELAY_MS + 1}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("delay_ms"), "{text}");
+        assert_eq!(added(&bridge), 0, "the rule must not reach the page");
+        // At the cap it is accepted.
+        let r = call(
+            &h,
+            "route",
+            json!({"action": "add", "pattern": "/api", "behavior": "delay",
+                   "delay_ms": MAX_FAULT_DELAY_MS}),
+        )
+        .await;
+        assert_ne!(r.is_error, Some(true), "{}", result_text(&r));
+        assert_eq!(added(&bridge), 1);
     }
 
     /// The eval envelope for a page result `value`.
