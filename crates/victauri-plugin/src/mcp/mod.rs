@@ -46,8 +46,7 @@ use helpers::{
     RecoveryHint, build_ghost_report, ghost_ipc_outcomes_js, ghost_ipc_projection_js,
     ipc_catalog_projection_js, ipc_timing_projection_js, ipc_timing_stats, js_string, json_result,
     json_truthy, merge_command_catalog, missing_param, sanitize_css_color, sanitize_injected_css,
-    tool_disabled, tool_error, tool_error_with_hint, truncate_at_char_boundary,
-    trusted_click_probe_js, trusted_focus_probe_js, validate_url,
+    tool_disabled, tool_error, tool_error_with_hint, truncate_at_char_boundary, validate_url,
 };
 
 // MCP tool *parameter* types are an internal protocol surface: they are deserialized
@@ -58,6 +57,10 @@ use helpers::{
 // VictauriMcpHandler) is the public MCP surface consumers actually use.
 pub(crate) use backend_params::*;
 pub(crate) use compound_params::*;
+/// Page-side probes run before trusted (OS-level) input. Internal: public only so the
+/// crate's own integration tests can run them in a JS engine. Not part of the supported API.
+#[doc(hidden)]
+pub use helpers::{trusted_click_probe_js, trusted_focus_probe_js};
 pub(crate) use introspection_params::*;
 pub(crate) use other_params::{
     AppStateParams, DiagnosticsParams, FindElementsParams, ResolveCommandParams,
