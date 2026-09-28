@@ -132,7 +132,7 @@ let report = client.smoke_test().await?;
 report.assert_all_passed();
 ```
 
-Runs 11 checks: health, DOM snapshot, eval, IPC integrity, registry, window state, screenshot, memory, console errors, performance, ghost commands.
+Runs 11 checks: `eval_js` works, DOM snapshot valid, screenshot captures an image, windows exist, IPC integrity healthy, no uncaught errors, accessibility audit, DOM complete under the load budget, JS heap under the memory budget, recording lifecycle, and health endpoint hardened.
 
 ## Documentation
 
