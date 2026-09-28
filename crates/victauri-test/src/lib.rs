@@ -48,6 +48,8 @@ pub mod prelude;
 pub mod process;
 pub mod reporting;
 pub mod smoke;
+#[doc(hidden)]
+pub mod terminal;
 pub mod visual;
 
 pub use app::TestApp;
