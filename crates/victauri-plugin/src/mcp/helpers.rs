@@ -1269,11 +1269,22 @@ mod trusted_probe_js_tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(def.to_string().as_bytes()).unwrap();
         tmp.flush().unwrap();
-        let out = std::process::Command::new("node")
+        let out = match std::process::Command::new("node")
             .arg(runner_dir().join("run_tests.js"))
             .arg(tmp.path())
             .output()
-            .expect("run node");
+        {
+            Ok(out) => out,
+            Err(e) => {
+                assert!(
+                    std::env::var_os("CI").is_none()
+                        && std::env::var_os("VICTAURI_REQUIRE_JSDOM").is_none(),
+                    "node could not be run: {e}"
+                );
+                eprintln!("SKIP: node could not be run: {e}");
+                return None;
+            }
+        };
         let stdout = String::from_utf8_lossy(&out.stdout);
         let line = stdout
             .lines()

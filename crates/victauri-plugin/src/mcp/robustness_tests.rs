@@ -648,13 +648,17 @@ async fn a_blocking_file_read_returns_at_its_deadline() {
     let started = Instant::now();
     let r = tokio::time::timeout(
         Duration::from_secs(20),
-        h.read_regular_file_bounded(fifo, 16),
+        h.read_regular_file_bounded(fifo.clone(), 16),
     )
     .await
     .expect("a blocked read must return at its own deadline");
     let err = r.expect_err("a FIFO read cannot succeed");
     assert!(err.contains("did not finish"), "{err}");
     assert!(started.elapsed() < Duration::from_secs(10));
+    // Release the reader still blocked in `open` (the runtime waits for blocking threads on
+    // shutdown): a writer completes the rendezvous, and the opened FIFO is then refused as
+    // not a regular file.
+    drop(std::fs::OpenOptions::new().write(true).open(&fifo));
 }
 
 /// The OPENED file is checked: a directory (or FIFO/device) swapped in is refused.
