@@ -368,8 +368,27 @@ jobs:
             CHANGELOG=$(git log --pretty=format:"- %s (%h)" "${PREVIOUS_TAG}..${CURRENT_TAG}")
           fi
 
-          # Write to file to handle multiline
-          echo "$CHANGELOG" > /tmp/changelog.txt
+          # Release notes = this version's CHANGELOG.md section (what users need: breaking
+          # changes, migration, security fixes), then the commit list. The raw commit subjects
+          # alone were chores and merges with no migration guidance.
+          VER="${CURRENT_TAG#v}"
+          awk -v hdr="## [$VER]" 'index($0, hdr) == 1 { f = 1; next } f && /^## \[/ { exit } f' \
+            CHANGELOG.md > /tmp/section.txt
+          {
+            if [ -s /tmp/section.txt ]; then
+              cat /tmp/section.txt
+            else
+              echo "::warning::CHANGELOG.md has no '## [$VER]' section; release notes list commits only" >&2
+            fi
+            echo
+            echo "See [MIGRATION.md](https://github.com/${GITHUB_REPOSITORY}/blob/${CURRENT_TAG}/MIGRATION.md) for upgrade steps. Binaries: verify with \`sha256sum -c SHA256SUMS\`."
+            echo
+            echo "<details><summary>Commits</summary>"
+            echo
+            echo "$CHANGELOG"
+            echo
+            echo "</details>"
+          } > /tmp/changelog.txt
           echo "previous_tag=$PREVIOUS_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Download all artifacts
@@ -395,6 +414,9 @@ jobs:
           chmod +x release-assets/victauri-watchdog-linux-x86_64 || true
           chmod +x release-assets/victauri-watchdog-macos-x86_64 || true
           chmod +x release-assets/victauri-watchdog-macos-aarch64 || true
+
+          # Checksums for every released binary (users verify with `sha256sum -c SHA256SUMS`).
+          (cd release-assets && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
 
           ls -la release-assets/
 

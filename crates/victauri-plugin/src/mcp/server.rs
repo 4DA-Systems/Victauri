@@ -274,6 +274,10 @@ fn build_app_full_inner(
         .layer(axum::middleware::from_fn(crate::auth::security_headers))
         .layer(axum::middleware::from_fn(crate::auth::origin_guard))
         .layer(axum::middleware::from_fn(crate::auth::dns_rebinding_guard))
+        // Outermost: every refusal above (and the rate limiter's 429) also closes its connection.
+        .layer(axum::middleware::from_fn(
+            super::hardening::close_on_rejection,
+        ))
 }
 
 /// Refuse a browser-originated request body that is not JSON (415).

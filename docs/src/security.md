@@ -139,11 +139,17 @@ A token-bucket rate limiter prevents abuse, even from authenticated clients:
   that cannot authenticate (a local flood, a web page hammering `/health`) cannot exhaust
   the agent's budget
 - **Bucket refill:** Continuous (not windowed)
-- **Response on limit:** HTTP 429 Too Many Requests
+- **Response on limit:** HTTP 429 Too Many Requests (Victauri's own clients treat a `429` from
+  `/health` as "alive", so a flood never makes them report a running app as down)
+- **With `auth_disabled()`** there is no token to tell the agent apart, so every caller shares the
+  public bucket and a local process can rate-limit the agent. Keep auth on (the default) wherever
+  other local software runs.
 
 The server speaks HTTP/1.1 only, closes a connection whose request head has not arrived within
 30 s, reads each request body under a 30 s / 2 MiB deadline (after authentication — an
-unauthenticated body is never buffered), and accepts at most 256 concurrent connections.
+unauthenticated body is never buffered), and accepts at most 256 concurrent connections. A request
+the guards refuse (401 / 403 / 415 / 429) also closes its connection, so refused requests cannot
+park connection slots.
 
 ## Privacy Layer
 
@@ -216,6 +222,12 @@ Disabled tools:
 - Are omitted from tool discovery listings
 - Cannot be re-enabled at runtime
 
+A bare tool name disables every action of that tool **and** its MCP resource
+(`logs` → `victauri://ipc-log`, `window` → `victauri://windows`). A single action is disabled as
+`tool.action`, e.g. `inspect.get_styles` (the capability spelling `inspect.styles` works too).
+Disabling `screenshot` also refuses `animation scrub capture=true` and `trace`, which capture the
+window. An entry that matches no tool, action or capability is logged as a warning at startup.
+
 ### Output Redaction
 
 Automatically scrub sensitive data from all tool responses:
@@ -286,6 +298,12 @@ All HTTP responses include security headers:
 - **Malicious code on the same machine with the auth token** — If an attacker has the token and localhost access, they have the same privileges as the legitimate agent. This is inherent to any localhost-based development tool.
 - **Memory inspection of the process** — A sufficiently privileged attacker on the same machine could read process memory directly. Victauri does not add encryption at rest for in-process data.
 - **Prompt injection via captured content** — Victauri cannot stop a prompt-injection payload embedded in app-sourced data (DOM, logs, DB rows) from influencing the agent it feeds. This is an operational risk you mitigate through agent configuration — see [Untrusted Content & Prompt Injection](#untrusted-content--prompt-injection) below.
+- **Transient memory of a very wide query** — `query_db` caps a result at 5 MB, 256 columns and
+  1 MB per cell, but SQLite materialises a row before it is charged: one `SELECT` of 256 × 1 MB
+  columns raised a debug host's peak working set by about 0.5 GB for that call (measured). At most
+  two database calls run at once. Every tighter bound either refuses legitimate wide or large-cell
+  queries or uses SQLite's process-global heap limit, which would also throttle the app's own
+  database, so the bound stays where it is.
 - **Path-resolution TOCTOU by a same-privilege local attacker** — `read_app_file` and `query_db` validate a path is contained within an allowed root (lexically and by canonical containment), then open the canonical validated path. An attacker who already has *write access inside that root* could, in a microsecond race, swap a validated regular file for a symlink/junction after the canonicalize and before the open. This requires local filesystem write access at the app's own privilege — such an attacker can read those files directly anyway, so Victauri adds no privilege. The blocking file/DB IO runs on a worker thread (so a swapped FIFO can't stall the server), and the canonical-path open closes the trivial (non-racing) version. A fully race-free fix needs OS-level `openat2(RESOLVE_BENEATH)` / `O_NOFOLLOW`, which is out of scope.
 
 ## Recommendations

@@ -169,6 +169,29 @@ pub struct SplitRateLimit {
 
 /// Axum middleware applying [`SplitRateLimit`]: 429 with `Retry-After: 1` when the caller's
 /// bucket is empty.
+/// Close the connection after a guard refuses a request (401 / 403 / 415 / 429).
+///
+/// A refused request costs the server microseconds, but its keep-alive connection then held one
+/// of the capped connection slots until the header deadline. A web page (cheap no-cors fetches
+/// across `*.localhost` names) or a local process could park every slot that way and lock the
+/// agent out (round-4 C4). Callers that are refused get nothing from keeping the connection.
+pub async fn close_on_rejection(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    if matches!(
+        response.status(),
+        StatusCode::UNAUTHORIZED
+            | StatusCode::FORBIDDEN
+            | StatusCode::UNSUPPORTED_MEDIA_TYPE
+            | StatusCode::TOO_MANY_REQUESTS
+    ) {
+        response.headers_mut().insert(
+            axum::http::header::CONNECTION,
+            axum::http::HeaderValue::from_static("close"),
+        );
+    }
+    response
+}
+
 pub async fn split_rate_limit(
     State(limits): State<Arc<SplitRateLimit>>,
     request: Request,
@@ -374,6 +397,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Round-4 C4: a guard-refused request left its connection open and idle until the header
+    /// deadline, so a page (no-cors fetches across `*.localhost` names) or a local process could
+    /// park every connection slot with requests that were refused in microseconds.
+    #[tokio::test]
+    async fn a_refused_request_closes_its_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve_hardened(
+            listener,
+            test_app(Arc::new(RateLimiterState::new(100))),
+            ServeLimits {
+                max_connections: 8,
+                header_read_timeout: Duration::from_secs(30),
+            },
+            std::future::pending::<()>(),
+        ));
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(
+            b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nSec-Fetch-Site: cross-site\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let reply = read_to_close(&mut conn, Duration::from_secs(3)).await;
+        let reply = String::from_utf8_lossy(&reply);
+        assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
     }
 
     /// Audit N3, end to end: a page-initiated `GET /health` is refused and spends no token.

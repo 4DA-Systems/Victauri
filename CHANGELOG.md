@@ -108,7 +108,11 @@ app probes are bounded; page-callable window queries are budgeted; drain-waterma
 races fixed; the main-thread lock stays held while an abandoned closure still runs; fault,
 contract and page-load maps are capped; panicked background tasks are reported finished; WGC
 capture runs on one COM thread with a bounded wait; `Locator::check()` works on ARIA checkboxes;
-`victauri check` lists ghost names; tool-reference, MIGRATION and README corrections.
+`victauri check` lists ghost names; a request the guards refuse (401/403/415/429) closes its
+connection, so refused requests (a web page's no-cors fetches, a local script) cannot park the
+256 connection slots; GitHub Release notes are the version's CHANGELOG section (not raw commit
+subjects) and the binaries ship with `SHA256SUMS`; tool-reference, MIGRATION, README and security
+docs corrections.
 
 **Disproved in round 4** (tested, not defects): eval ids leaking via `.caller` (V8 blocks the
 second hop); `PRAGMA quick_check` overrunning its deadline on a 1.47 GB database (3.8 s); discovery
@@ -116,8 +120,11 @@ dirs left behind on a clean exit (removed on 0.8.8 and 0.9.0); Windows child pro
 Victauri's sockets (tokio/mio sockets are not inheritable: close seen in µs, port rebindable);
 Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
 
-**Residual, measured:** a 256-column × 1 MB `query_db` row raises the host's peak memory by
-~0.5 GB for that one call (at most two run at once; the result is still capped at 5 MB).
+**Residuals, measured:** a 256-column × 1 MB `query_db` row raises the host's peak memory by
+~0.5 GB for that one call (at most two run at once; the result is still capped at 5 MB). With
+`auth_disabled()` there is no token to separate the agent from other local callers, so a local
+`/health` flood can still rate-limit the agent (with auth on, the default, it cannot: verified on
+4DA, 100,547 × 429 while every agent call succeeded).
 
 ### Security — adversarial audit round 3 (every finding reproduced before its fix)
 

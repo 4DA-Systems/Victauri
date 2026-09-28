@@ -186,7 +186,25 @@ Standalone binary. Monitors the MCP server health endpoint.
 
 ## Current State (2026-09-27)
 
-### v0.9.0 — two audit rounds + a one-time `#[non_exhaustive]` break (release-prepped, NOT published)
+### v0.9.0 round 4 — adversarial audit + live E2E of the candidate (2026-09-28/29)
+
+Eight red-team lenses against candidate `43b7561` (incl. the CLI/local-attacker lens round 3
+never got back, and a regression hunt over every round-3 fix), then live runs on the demo, the
+gauntlet (Windows, real display) and 4DA on its real 1.47 GB DB, plus a before/after baseline
+against the operator's 0.8.8 4DA. **No Critical/High.** 14 Mediums confirmed (4 live, 2 by V8
+PoC) and fixed in four isolated lanes with fail-first tests, then re-verified live — notably: a
+synthetic `pagehide` wiped the agent's evidence and killed capture; the agent key leaked via
+`Function.caller`; a `/health` flood made the bridge/watchdog call a healthy app dead; three
+round-3 CHANGELOG claims were false (key unreadable, reload abort unforgeable, scanner never drops
+a statement); **apps on rusqlite > 0.32 could not add the plugin at all** (now a `>=0.32, <0.41`
+range with fail-closed setup across every version — `SetupOutcome` in database.rs; a required CI
+job tests the newest end). Also verified against rmcp 3.5.0 / tauri 2.12.0 (tauri 2.12's default
+static VC runtime breaks *other* crates' doctests in a Windows workspace — upstream).
+Disproved with evidence (don't re-raise): eval-id `.caller` leak, quick_check overrun, discovery
+dirs left on clean exit, Windows socket inheritance by child processes, missing tauri `rename`.
+PR #73 (backend logs) is deferred to 0.9.1. Report: https://claude.ai/artifact/Wfmx9d2khAuCesB7SFu8ge
+
+### v0.9.0 — rounds 1-2 + a one-time `#[non_exhaustive]` break (release-prepped, NOT published)
 
 Triggered by an in-the-wild failure: a 4DA session ran `invoke_command quit_app` through the
 bridge, the app quit, and the agent was told **"backend not reachable"** — the bridge had
