@@ -2866,9 +2866,13 @@ const INIT_SCRIPT_BODY: &str = r#"
     // restored as-is and the init script does NOT run again. Tearing capture down here left a
     // restored page with console and DOM-mutation capture permanently off. So a persisted
     // pagehide keeps everything, and `pageshow` re-installs whatever a teardown removed.
+    //
+    // Both listeners act ONLY on the browser's own (trusted) events. Page script can dispatch a
+    // synthetic `pagehide` at will (`isTrusted` is false and unforgeable); honouring one let a
+    // page wipe every captured log and switch console + mutation capture off for good (R4-JS1).
     var captureTornDown = false;
     window.addEventListener('pageshow', function(e) {
-        if (!e || !e.persisted || !captureTornDown) return;
+        if (!e || e.isTrusted !== true || !e.persisted || !captureTornDown) return;
         captureTornDown = false;
         hookConsole('log');
         hookConsole('warn');
@@ -2879,7 +2883,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     });
 
     window.addEventListener('pagehide', function(e) {
-        if (e && e.persisted) return;
+        if (!e || e.isTrusted !== true || e.persisted) return;
         captureTornDown = true;
         if (__mutationObserver) { __mutationObserver.disconnect(); __mutationObserver = null; }
         if (mutationBatchTimer) { clearTimeout(mutationBatchTimer); mutationBatchTimer = null; }
@@ -2932,7 +2936,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             });
         } catch(e) {}
     }
-    window.addEventListener('pageshow', function(e) { if (e && e.persisted) signalReady(); });
+    window.addEventListener('pageshow', function(e) { if (e && e.isTrusted === true && e.persisted) signalReady(); });
     signalReady();
 })();
 "#;

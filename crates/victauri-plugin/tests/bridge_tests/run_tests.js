@@ -21,6 +21,7 @@ const { JSDOM } = require("jsdom");
 const { fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
 const { implForWrapper } = require("jsdom/lib/jsdom/living/generated/utils.js");
 const MouseEventIface = require("jsdom/lib/jsdom/living/generated/MouseEvent.js");
+const { fireAPageTransitionEvent } = require("jsdom/lib/jsdom/living/helpers/page-transition-event.js");
 
 const testDefPath = process.argv[2];
 if (!testDefPath) {
@@ -314,6 +315,12 @@ async function run() {
         bubbles: true,
         cancelable: true,
       });
+    };
+
+    // Dispatch a TRUSTED pagehide / pageshow on the window, as the browser does on a real
+    // unload or back/forward-cache restore (page script can only dispatch untrusted ones).
+    window.__vtestTrustedPageTransition = function (type, persisted) {
+      fireAPageTransitionEvent(type, window, !!persisted);
     };
 
     // Inject the bridge script
