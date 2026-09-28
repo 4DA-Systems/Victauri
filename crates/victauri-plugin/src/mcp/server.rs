@@ -707,13 +707,97 @@ fn token_sid(class: windows::Win32::Security::TOKEN_INFORMATION_CLASS) -> Option
 /// process creates are owned by that group, not the user. Accepting either is what makes
 /// the ownership check correct under elevation (where it would otherwise reject every
 /// directory we create and break discovery entirely).
+///
+/// Also `BUILTIN\Administrators` when this account is a member of it (enabled or deny-only):
+/// an app started from an elevated PowerShell/cmd creates the discovery root owned by that
+/// group, while a later app of the SAME user started from Git Bash (whose runtime sets the
+/// default owner to the user) or unelevated has only the user as owner — it refused the root
+/// and silently never registered for discovery until the directory was deleted by hand
+/// (round 4, reproduced on this machine). `%TEMP%` is per-user, and every member of that group
+/// can already read everything in it, so accepting the group concedes nothing.
 #[cfg(windows)]
 fn acceptable_owner_sids() -> Vec<OwnedSid> {
     use windows::Win32::Security::{TokenOwner, TokenUser};
-    [TokenUser, TokenOwner]
+    let mut sids: Vec<OwnedSid> = [TokenUser, TokenOwner]
         .into_iter()
         .filter_map(token_sid)
-        .collect()
+        .collect();
+    sids.extend(builtin_administrators_sid_if_member());
+    sids
+}
+
+/// The `BUILTIN\Administrators` SID when the current token lists it among its groups, with
+/// any attributes (an unelevated admin holds it deny-only; it is still this account's group).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn builtin_administrators_sid_if_member() -> Option<OwnedSid> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, SECURITY_MAX_SID_SIZE,
+        TOKEN_GROUPS, TOKEN_QUERY, TokenGroups, WinBuiltinAdministratorsSid,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from `OpenProcessToken` and is closed exactly once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut admins = vec![0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut admins_len = SECURITY_MAX_SID_SIZE;
+    // SAFETY: `admins` is writable for `admins_len` bytes, the documented maximum SID size.
+    unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            None,
+            Some(PSID(admins.as_mut_ptr().cast::<core::ffi::c_void>())),
+            &raw mut admins_len,
+        )
+        .ok()?;
+    }
+    admins.truncate(admins_len as usize);
+    let admins = OwnedSid(admins);
+
+    let mut token = HANDLE::default();
+    // SAFETY: pseudo-handle for the current process; `token` is a writable out-param, closed by
+    // `TokenGuard` on success.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token).ok()? };
+    let _guard = TokenGuard(token);
+    let mut len = 0_u32;
+    // SAFETY: size probe (null buffer); fails with ERROR_INSUFFICIENT_BUFFER, setting `len`.
+    unsafe {
+        let _ = GetTokenInformation(token, TokenGroups, None, 0, &raw mut len);
+    }
+    if (len as usize) < std::mem::size_of::<TOKEN_GROUPS>() {
+        return None;
+    }
+    // u64-backed so the TOKEN_GROUPS header (u32 count + pointer-aligned array) is aligned.
+    let mut buf = vec![0_u64; (len as usize).div_ceil(8)];
+    // SAFETY: `buf` is writable for at least `len` bytes; on success it holds a TOKEN_GROUPS.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            Some(buf.as_mut_ptr().cast::<core::ffi::c_void>()),
+            len,
+            &raw mut len,
+        )
+        .ok()?;
+    }
+    // SAFETY: `buf` holds a TOKEN_GROUPS whose `Groups` array has `GroupCount` entries, all
+    // within the buffer the call filled.
+    let member = unsafe {
+        let groups = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
+        std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+            .iter()
+            .any(|g| EqualSid(g.Sid, admins.as_psid()).is_ok())
+    };
+    member.then_some(admins)
 }
 
 /// True iff `path` exists and its owner SID is one this process would create objects as
