@@ -267,9 +267,29 @@ impl FaultConfig {
     }
 }
 
+/// Most fault rules held at once (G-10). Rules are keyed by the caller-chosen command name; at
+/// the cap, injecting a rule for a NEW command evicts the oldest-injected rule.
+pub(crate) const MAX_FAULT_RULES: usize = 256;
+
 /// Thread-safe registry of active fault injection rules.
 pub struct FaultRegistry {
-    inner: RwLock<HashMap<String, FaultConfig>>,
+    inner: RwLock<FaultRules>,
+}
+
+#[derive(Default)]
+struct FaultRules {
+    /// Injection order, so eviction at the cap is deterministic (oldest first).
+    next_seq: u64,
+    map: HashMap<String, (u64, FaultConfig)>,
+}
+
+impl FaultRules {
+    /// Drop rules past [`FAULT_TTL`]: they can never trigger again, and were kept (and listed)
+    /// forever before (G-10).
+    fn evict_expired(&mut self, now: Instant) {
+        self.map
+            .retain(|_, (_, c)| now.saturating_duration_since(c.created_at) < FAULT_TTL);
+    }
 }
 
 impl FaultRegistry {
@@ -277,27 +297,42 @@ impl FaultRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(FaultRules::default()),
         }
     }
 
-    /// Register a fault for a command.
+    /// Register a fault for a command (replacing any rule for the same command). Expired rules
+    /// are evicted first; if the registry still holds its maximum (256) rules, the
+    /// oldest-injected rule is evicted to make room.
     pub fn inject(&self, config: FaultConfig) {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(config.command.clone(), config);
+        rules.evict_expired(Instant::now());
+        if !rules.map.contains_key(&config.command) && rules.map.len() >= MAX_FAULT_RULES {
+            let oldest = rules
+                .map
+                .iter()
+                .min_by_key(|(_, (seq, _))| *seq)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                rules.map.remove(&oldest);
+            }
+        }
+        let seq = rules.next_seq;
+        rules.next_seq += 1;
+        rules.map.insert(config.command.clone(), (seq, config));
     }
 
     /// Look up and optionally trigger a fault for a command.
     /// Returns the fault type if one is active and should trigger.
     pub fn check_and_trigger(&self, command: &str) -> Option<FaultType> {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(config) = map.get_mut(command)
+        if let Some((_, config)) = rules.map.get_mut(command)
             && config.should_trigger()
         {
             config.trigger_count += 1;
@@ -306,33 +341,34 @@ impl FaultRegistry {
         None
     }
 
-    /// List all active fault rules.
+    /// List the fault rules that have not expired (expired ones are evicted here too).
     #[must_use]
     pub fn list(&self) -> Vec<FaultConfig> {
-        let map = self
+        let mut rules = self
             .inner
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.values().cloned().collect()
+        rules.evict_expired(Instant::now());
+        rules.map.values().map(|(_, c)| c.clone()).collect()
     }
 
     /// Remove a fault rule for a command.
     pub fn clear(&self, command: &str) -> bool {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.remove(command).is_some()
+        rules.map.remove(command).is_some()
     }
 
     /// Remove all fault rules.
     pub fn clear_all(&self) -> usize {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = map.len();
-        map.clear();
+        let count = rules.map.len();
+        rules.map.clear();
         count
     }
 }
@@ -553,9 +589,20 @@ fn diff_shapes_inner(
     }
 }
 
+/// Most contract baselines held at once (G-10). At the cap, recording a baseline for a NEW
+/// command evicts the least recently recorded one (the store never refuses a recording).
+pub(crate) const MAX_CONTRACT_BASELINES: usize = 1024;
+
 /// Thread-safe store for IPC contract baselines.
 pub struct ContractStore {
-    inner: RwLock<HashMap<String, ContractBaseline>>,
+    inner: RwLock<ContractBaselines>,
+}
+
+#[derive(Default)]
+struct ContractBaselines {
+    /// Recording order, so eviction at the cap is deterministic (least recently recorded).
+    next_seq: u64,
+    map: HashMap<String, (u64, ContractBaseline)>,
 }
 
 impl ContractStore {
@@ -563,47 +610,63 @@ impl ContractStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(ContractBaselines::default()),
         }
     }
 
-    /// Record a baseline for a command.
-    pub fn record(&self, baseline: ContractBaseline) {
-        let mut map = self
+    /// Record a baseline for a command, replacing (and refreshing) any earlier one for it. The
+    /// store holds at most 1024 baselines: at that cap, recording one for a new command evicts
+    /// the least recently recorded baseline, whose command is returned.
+    pub fn record(&self, baseline: ContractBaseline) -> Option<String> {
+        let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(baseline.command.clone(), baseline);
+        let mut evicted = None;
+        if !store.map.contains_key(&baseline.command) && store.map.len() >= MAX_CONTRACT_BASELINES {
+            evicted = store
+                .map
+                .iter()
+                .min_by_key(|(_, (seq, _))| *seq)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = &evicted {
+                store.map.remove(oldest);
+            }
+        }
+        let seq = store.next_seq;
+        store.next_seq += 1;
+        store.map.insert(baseline.command.clone(), (seq, baseline));
+        evicted
     }
 
     /// Get the baseline for a command.
     #[must_use]
     pub fn get(&self, command: &str) -> Option<ContractBaseline> {
-        let map = self
+        let store = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(command).cloned()
+        store.map.get(command).map(|(_, b)| b.clone())
     }
 
     /// Get all baselines.
     #[must_use]
     pub fn all(&self) -> Vec<ContractBaseline> {
-        let map = self
+        let store = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.values().cloned().collect()
+        store.map.values().map(|(_, b)| b.clone()).collect()
     }
 
     /// Clear all baselines.
     pub fn clear(&self) -> usize {
-        let mut map = self
+        let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = map.len();
-        map.clear();
+        let count = store.map.len();
+        store.map.clear();
         count
     }
 }
@@ -1288,6 +1351,10 @@ pub(crate) struct PageLoad {
 /// Longest nonce kept from a ready signal (the bridge's is a UUID; the signal is page-callable).
 const MAX_PAGE_NONCE_LEN: usize = 128;
 
+/// Most windows whose latest page load is remembered (G-10: an entry per window label ever seen
+/// was kept forever). At the cap, the window that loaded least recently is forgotten.
+const MAX_PAGE_LOAD_WINDOWS: usize = 256;
+
 impl PageLoads {
     /// Record that window `label` sent a ready signal for the page identified by `nonce`.
     pub fn record_load(&self, label: &str, nonce: Option<&str>) {
@@ -1299,6 +1366,15 @@ impl PageLoads {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             // Numbered under the lock, so a window's stored seq only ever grows.
             let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if !loads.contains_key(label) && loads.len() >= MAX_PAGE_LOAD_WINDOWS {
+                let oldest = loads
+                    .iter()
+                    .min_by_key(|(_, load)| load.seq)
+                    .map(|(k, _)| k.clone());
+                if let Some(oldest) = oldest {
+                    loads.remove(&oldest);
+                }
+            }
             loads.insert(label.to_string(), PageLoad { seq, nonce });
         }
         self.changed.notify_waiters();
@@ -1432,6 +1508,89 @@ impl DrainWatermarks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G-10: expired fault rules were never evicted, and nothing bounded the number of rules.
+    #[test]
+    fn fault_registry_evicts_expired_rules_and_is_bounded() {
+        let reg = FaultRegistry::new();
+        let mut expired = FaultConfig::new("old", FaultType::Drop, 0);
+        expired.created_at = Instant::now()
+            .checked_sub(FAULT_TTL + Duration::from_secs(1))
+            .expect("clock far enough from boot");
+        reg.inject(expired);
+        reg.inject(FaultConfig::new("fresh", FaultType::Drop, 0));
+        let listed: Vec<String> = reg.list().into_iter().map(|f| f.command).collect();
+        assert_eq!(
+            listed,
+            vec!["fresh".to_string()],
+            "expired rule still listed"
+        );
+        assert_eq!(
+            reg.inner.read().unwrap().map.len(),
+            1,
+            "expired rule still stored"
+        );
+
+        for i in 0..300 {
+            reg.inject(FaultConfig::new(format!("cmd-{i}"), FaultType::Drop, 0));
+        }
+        let stored = reg.inner.read().unwrap().map.len();
+        assert_eq!(stored, 256, "fault rules must be capped");
+        // The newest rule is kept; the oldest ones were evicted first.
+        assert!(reg.check_and_trigger("cmd-299").is_some());
+        assert!(reg.check_and_trigger("fresh").is_none());
+        // Re-injecting an existing command at the cap replaces it without evicting another.
+        reg.inject(FaultConfig::new("cmd-299", FaultType::Drop, 5));
+        assert_eq!(reg.inner.read().unwrap().map.len(), 256);
+    }
+
+    /// G-10: the contract store had no cap. At the cap the OLDEST baseline is evicted (and
+    /// named), rather than refusing the new one.
+    #[test]
+    fn contract_store_is_bounded_evicting_the_oldest() {
+        let store = ContractStore::new();
+        let baseline =
+            |c: &str| ContractBaseline::new(c, serde_json::Value::Null, JsonShape::Null, "", "t");
+        for i in 0..1030 {
+            store.record(baseline(&format!("cmd-{i}")));
+        }
+        assert_eq!(store.all().len(), 1024);
+        assert!(
+            store.get("cmd-0").is_none(),
+            "the oldest baseline goes first"
+        );
+        assert!(store.get("cmd-5").is_none());
+        assert!(store.get("cmd-6").is_some());
+        assert!(store.get("cmd-1029").is_some());
+        // Re-recording an existing command refreshes it in place: nothing is evicted.
+        store.record(baseline("cmd-6"));
+        assert_eq!(store.all().len(), 1024);
+        assert!(store.get("cmd-7").is_some());
+        // The refreshed baseline is now the newest, so the next eviction takes cmd-7.
+        store.record(baseline("cmd-new"));
+        assert!(store.get("cmd-6").is_some());
+        assert!(store.get("cmd-7").is_none());
+    }
+
+    /// G-10: `PageLoads` kept an entry for every window label ever seen.
+    #[test]
+    fn page_loads_are_bounded_keeping_the_most_recent_windows() {
+        let loads = PageLoads::default();
+        for i in 0..300 {
+            loads.record_load(&format!("win-{i}"), Some("n"));
+        }
+        assert_eq!(loads.last_load.lock().unwrap().len(), 256);
+        assert!(loads.latest("win-299").is_some());
+        assert!(
+            loads.latest("win-0").is_none(),
+            "the least recently loaded window goes first"
+        );
+        // A window that loads again becomes the most recent and survives the next eviction.
+        loads.record_load("win-44", Some("n2"));
+        loads.record_load("win-new", None);
+        assert!(loads.latest("win-44").is_some());
+        assert!(loads.latest("win-45").is_none());
+    }
 
     /// R4-RACE1: a delayed reset for an OLDER recording generation moved the epoch backwards,
     /// so the drain for the current recording (which captured the newer epoch) had every
