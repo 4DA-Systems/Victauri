@@ -326,17 +326,15 @@ fn dir_is_trusted(path: &Path) -> bool {
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     static EUID: OnceLock<Option<u32>> = OnceLock::new();
-    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
     *EUID.get_or_init(|| {
         for _ in 0..16 {
-            let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+            // Unpredictable name (R4-DISC2): a guessable `<pid>_<seq>` name in the shared
+            // temp dir let another user pre-create every probe path and deny us our uid.
             let probe = std::env::temp_dir().join(format!(
-                ".victauri_watchdog_uidprobe_{}_{}",
-                std::process::id(),
-                sequence
+                ".victauri_watchdog_uidprobe_{}",
+                unpredictable_suffix()
             ));
             if let Some(uid) = uid_from_exclusive_probe(&probe) {
                 return Some(uid);
@@ -344,6 +342,25 @@ fn current_euid() -> Option<u32> {
         }
         None
     })
+}
+
+/// 128 bits another local user cannot predict, without a new dependency: two `SipHash`
+/// outputs keyed by `RandomState` (seeded from the OS RNG per process), mixed with the time.
+#[cfg(unix)]
+fn unpredictable_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let word = |salt: u64| {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.write_u64(salt);
+        h.write_u32(std::process::id());
+        h.finish()
+    };
+    format!("{:016x}{:016x}", word(1), word(2))
 }
 
 /// Create a UID probe without following a pre-planted symlink in the shared temp dir
@@ -372,17 +389,31 @@ fn dir_is_trusted(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// Whether `pid` is a live process owned by the current user (exact PID, own user; see
-/// `process.rs`). The old Windows check substring-matched `tasklist` output, so a crashed app
-/// whose PID was a prefix of a live one looked alive and was never restarted.
-fn is_process_alive(pid: u32) -> bool {
-    process::is_own_live_process(pid)
+/// Whether a discovery entry's owner may be the app to watch: anything not known to be gone.
+/// The watchdog only reads the entry's PORT (never its token), so an owner whose liveness
+/// could not be checked — no `kill` binary on NixOS/Guix/minimal images, an elevated app
+/// whose token is unreadable — is still followed (R4-DISC1); `/health` decides from there.
+fn may_be_alive(pid: u32) -> bool {
+    !is_gone(process::liveness(pid))
+}
+
+/// Whether a watched process has definitely exited (or its PID now belongs to another
+/// account, i.e. was recycled). "Could not tell" is NOT gone: before R4-DISC1 a missing
+/// `/bin/kill` made every PID read dead, and the watchdog fired its recovery command on a
+/// healthy app. (Exact PID, own user; see `process.rs` — the old Windows check
+/// substring-matched `tasklist` output, so a crashed app whose PID was a prefix of a live one
+/// looked alive and was never restarted.)
+fn is_gone(liveness: process::Liveness) -> bool {
+    matches!(
+        liveness,
+        process::Liveness::Dead | process::Liveness::OtherUser
+    )
 }
 
 /// Resolve the app to watch from discovery, logging an ambiguous outcome. Returns `None`
 /// when discovery yields no single matching app.
 fn discover_app(selector: &Selector) -> Option<DiscoveredApp> {
-    match discover_in_roots(&discovery_roots(), selector, is_process_alive) {
+    match discover_in_roots(&discovery_roots(), selector, may_be_alive) {
         Discovery::Found(app) => Some(app),
         Discovery::None => None,
         Discovery::Ambiguous(apps) => {
@@ -576,7 +607,9 @@ async fn main() -> anyhow::Result<()> {
         port = target.as_ref().map(|t| t.port),
         interval_secs = config.interval.as_secs(),
         max_failures = config.max_failures,
-        on_failure = config.on_failure_cmd.as_deref().unwrap_or("(none)"),
+        // Program name only (R4-WD1): the full command line may carry secrets, tokens or
+        // sensitive paths — see the same rule at the recovery site below.
+        on_failure = on_failure_label(config.on_failure_cmd.as_deref()),
         "Victauri watchdog started"
     );
 
@@ -590,35 +623,8 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(config.interval).await;
 
-        // A watched pid that died is a crash even if some other app now answers on the
-        // same port — never let a different app mask it.
-        let watched_pid_dead = target
-            .as_ref()
-            .and_then(|t| t.pid)
-            .is_some_and(|pid| !is_process_alive(pid));
-
-        let health = match &target {
-            None => Err(
-                "the selected Victauri app is not running (no matching discovery entry)"
-                    .to_string(),
-            ),
-            Some(_) if watched_pid_dead => Err("the watched app process has exited".to_string()),
-            Some(t) => Ok(client
-                .get(format!("http://127.0.0.1:{}/health", t.port))
-                .send()
-                .await),
-        };
-
-        match health {
-            Err(reason) => {
-                consecutive_failures += 1;
-                tracing::warn!(
-                    failure_count = consecutive_failures,
-                    reason,
-                    "Victauri app down"
-                );
-            }
-            Ok(Ok(resp)) if resp.status().is_success() => {
+        match poll_health(&client, target.as_ref(), process::liveness).await {
+            Ok(()) => {
                 if consecutive_failures > 0 {
                     tracing::info!(
                         after_failures = consecutive_failures,
@@ -628,20 +634,12 @@ async fn main() -> anyhow::Result<()> {
                     action_fired = false;
                 }
             }
-            Ok(Ok(resp)) => {
+            Err(reason) => {
                 consecutive_failures += 1;
                 tracing::warn!(
-                    status = %resp.status(),
                     failure_count = consecutive_failures,
-                    "Health check returned non-success status"
-                );
-            }
-            Ok(Err(e)) => {
-                consecutive_failures += 1;
-                tracing::warn!(
-                    error = %e,
-                    failure_count = consecutive_failures,
-                    "Health check failed"
+                    reason,
+                    "Victauri app down"
                 );
             }
         }
@@ -694,6 +692,52 @@ async fn main() -> anyhow::Result<()> {
             action_fired = true;
         }
     }
+}
+
+/// Whether an HTTP status from `GET /health` proves the Victauri server is alive: a `2xx`,
+/// or `429 Too Many Requests`. `/health` is unauthenticated and shares the public
+/// rate-limit bucket, so any local process can flood it into 429s — and a rate-limited reply
+/// is still the server answering. Counting 429 as a failure let that flood make the watchdog
+/// run its recovery command against a healthy app (R4-NET1).
+fn health_status_means_alive(status: u16) -> bool {
+    (200..300).contains(&status) || status == 429
+}
+
+/// One poll: `Ok` when the watched app is up, else why it is not.
+///
+/// A watched pid that has exited is a crash even if some other app now answers on the same
+/// port — never let a different app mask it. A pid whose liveness cannot be determined is
+/// not treated as exited; `/health` decides.
+async fn poll_health(
+    client: &reqwest::Client,
+    target: Option<&Target>,
+    liveness: impl Fn(u32) -> process::Liveness,
+) -> Result<(), String> {
+    let Some(target) = target else {
+        return Err(
+            "the selected Victauri app is not running (no matching discovery entry)".to_string(),
+        );
+    };
+    if target.pid.is_some_and(|pid| is_gone(liveness(pid))) {
+        return Err("the watched app process has exited".to_string());
+    }
+    match client
+        .get(format!("http://127.0.0.1:{}/health", target.port))
+        .send()
+        .await
+    {
+        Ok(resp) if health_status_means_alive(resp.status().as_u16()) => Ok(()),
+        Ok(resp) => Err(format!(
+            "health check returned non-success status {}",
+            resp.status()
+        )),
+        Err(e) => Err(format!("health check failed: {e}")),
+    }
+}
+
+/// What the startup log says about the recovery command: its program name only.
+fn on_failure_label(cmd: Option<&str>) -> &str {
+    cmd.map_or("(none)", recovery_program_name)
 }
 
 /// Extract the program name (first whitespace-delimited token) from a recovery
@@ -1185,6 +1229,107 @@ mod tests {
         assert_eq!(recovery_program_name("echo"), "echo");
         assert_eq!(recovery_program_name("   "), "(empty)");
         assert_eq!(recovery_program_name(""), "(empty)");
+    }
+
+    /// A minimal HTTP server answering every request with `status`, on an ephemeral port.
+    fn fixed_status_server(status: u16) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut sock in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        port
+    }
+
+    fn target(port: u16, pid: Option<u32>) -> Target {
+        Target { port, pid }
+    }
+
+    #[test]
+    fn a_rate_limited_health_answer_means_alive() {
+        assert!(health_status_means_alive(200));
+        assert!(health_status_means_alive(429));
+        assert!(!health_status_means_alive(401));
+        assert!(!health_status_means_alive(503));
+    }
+
+    #[tokio::test]
+    async fn a_health_flood_429_is_not_a_failure() {
+        // R4-NET1: an unauthenticated /health flood (→ 429) used to count as a failure and,
+        // after VICTAURI_MAX_FAILURES polls, ran the recovery command against a healthy app.
+        let client = reqwest::Client::new();
+        let own = |_| process::Liveness::Own;
+        let limited = fixed_status_server(429);
+        assert_eq!(
+            poll_health(&client, Some(&target(limited, None)), own).await,
+            Ok(())
+        );
+        let broken = fixed_status_server(503);
+        let err = poll_health(&client, Some(&target(broken, None)), own)
+            .await
+            .unwrap_err();
+        assert!(err.contains("503"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_undeterminable_pid_is_not_a_crash() {
+        // R4-DISC1: with no working `kill`, every PID read dead and the watchdog fired
+        // recovery on a healthy app. Unknown/unverified liveness must defer to /health.
+        let client = reqwest::Client::new();
+        let port = fixed_status_server(200);
+        for liveness in [process::Liveness::Unknown, process::Liveness::Unverified] {
+            assert_eq!(
+                poll_health(&client, Some(&target(port, Some(42))), |_| liveness).await,
+                Ok(()),
+                "{liveness:?}"
+            );
+        }
+        // A pid that is definitely gone (or recycled by another user) is still a crash, even
+        // though something answers on the port.
+        for liveness in [process::Liveness::Dead, process::Liveness::OtherUser] {
+            let err = poll_health(&client, Some(&target(port, Some(42))), |_| liveness)
+                .await
+                .unwrap_err();
+            assert!(err.contains("exited"), "{liveness:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn discovery_follows_an_owner_whose_liveness_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7374", Some("com.a"));
+        assert!(may_be_alive(std::process::id()));
+        assert_eq!(
+            discover_in(tmp.path(), &Selector::Any, |_| !is_gone(
+                process::Liveness::Unknown
+            )),
+            Discovery::Found(app(100, 7374, Some("com.a")))
+        );
+    }
+
+    #[test]
+    fn startup_log_names_only_the_recovery_program() {
+        // R4-WD1: the startup INFO line logged the full recovery command line.
+        let label = on_failure_label(Some("restart-app --token=SECRET --path /home/u"));
+        assert_eq!(label, "restart-app");
+        assert!(!label.contains("SECRET"));
+        assert_eq!(on_failure_label(None), "(none)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uid_probe_names_are_unpredictable() {
+        let (a, b) = (unpredictable_suffix(), unpredictable_suffix());
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
     }
 
     #[tokio::test]

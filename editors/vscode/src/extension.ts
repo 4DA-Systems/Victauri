@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { VictauriClient } from "./client";
-import { discoverServer } from "./discovery";
+import { resolveConnection, scanServers } from "./discovery";
 import { AppStateProvider } from "./appStateView";
 import { DomExplorerProvider } from "./domExplorerView";
 import { IpcLogProvider } from "./ipcLogView";
@@ -56,15 +56,30 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("victauri.connect", async () => {
       const config = vscode.workspace.getConfiguration("victauri");
       const port = config.get<number>("port", 7373);
-      const configToken = config.get<string>("authToken", "");
+      const configToken = config.get<string>("authToken", "").trim();
+      // Was `victauri.port` actually SET (vs. its 7373 default)? A configured token is only
+      // sent to an explicitly configured port, or to the running app that owns it — never
+      // to whatever process holds the default port (R4-TOK1).
+      const inspected = config.inspect<number>("port");
+      const portExplicit =
+        inspected?.globalValue !== undefined ||
+        inspected?.workspaceValue !== undefined ||
+        inspected?.workspaceFolderValue !== undefined;
 
-      // A configured token is an explicit credential for the configured port.
-      // Never send it to a different auto-discovered localhost service.
-      const discovered = configToken
-        ? { port, token: undefined }
-        : await discoverServer(port);
-      const actualPort = discovered.port;
-      const token = configToken || discovered.token || undefined;
+      const resolution = resolveConnection(
+        { port: portExplicit ? port : undefined, token: configToken || undefined },
+        await scanServers(),
+        port
+      );
+      if (!resolution.ok) {
+        vscode.window.showErrorMessage(`Victauri: ${resolution.message}`);
+        return;
+      }
+      if (resolution.warning) {
+        vscode.window.showWarningMessage(`Victauri: ${resolution.warning}`);
+      }
+      const actualPort = resolution.port;
+      const token = resolution.token;
 
       try {
         await client.connect(actualPort, token);

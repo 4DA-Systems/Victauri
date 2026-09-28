@@ -104,7 +104,17 @@ runs:
 
         elapsed=0
         echo "Waiting for Victauri server on port ${VICTAURI_PORT}..."
-        until curl -sf "http://127.0.0.1:${VICTAURI_PORT}/health" > /dev/null 2>&1; do
+        # A 2xx — or a 429: /health is rate-limited from the public bucket, and a
+        # rate-limited answer still proves the server is up (R4-NET1).
+        server_answers() {
+          local code
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${VICTAURI_PORT}/health" 2>/dev/null) || true
+          case "$code" in
+            2??|429) return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+        until server_answers; do
           if [ "$elapsed" -ge "$HEALTH_TIMEOUT" ]; then
             echo "::error::Victauri server did not become healthy within ${HEALTH_TIMEOUT}s on port ${VICTAURI_PORT}"
             exit 1

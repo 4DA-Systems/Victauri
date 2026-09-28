@@ -25,6 +25,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 png = "0.17"
 base64 = "0.22"
+# Unpredictable names for the UID-probe files created in the shared temp dir (R4-DISC2).
+uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # Process liveness + owner check for discovery (`process.rs`), instead of spawning tasklist.
@@ -32,7 +34,6 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 
 [dev-dependencies]
 axum = { workspace = true }
-uuid = { workspace = true }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 tokio = { workspace = true }

@@ -106,7 +106,14 @@ impl SmokeReport {
             .failures()
             .iter()
             .enumerate()
-            .map(|(i, f)| format!("  {}. {} — {}", i + 1, f.name, f.detail))
+            .map(|(i, f)| {
+                format!(
+                    "  {}. {} — {}",
+                    i + 1,
+                    crate::terminal::single_line(&f.name),
+                    crate::terminal::single_line(&f.detail)
+                )
+            })
             .collect();
         panic!(
             "smoke_test failed ({}/{} passed):\n{}",
@@ -133,6 +140,11 @@ impl SmokeReport {
     }
 
     /// Formats as a human-readable summary.
+    ///
+    /// Check names and failure details are rendered on ONE line each with every control
+    /// character escaped: details can carry page-controlled text (console / uncaught-error
+    /// messages), and a raw newline followed by `::error` would otherwise become a forged
+    /// GitHub Actions annotation in a CI log (R4-TERM1).
     #[must_use]
     pub fn to_summary(&self) -> String {
         let mut out = String::with_capacity(1024);
@@ -146,11 +158,14 @@ impl SmokeReport {
             let status = if check.passed { "PASS" } else { "FAIL" };
             out.push_str(&format!(
                 "  [{status}] {} ({:.0}ms)\n",
-                check.name,
+                crate::terminal::single_line(&check.name),
                 check.duration.as_millis(),
             ));
             if !check.passed && !check.detail.is_empty() {
-                out.push_str(&format!("         {}\n", check.detail));
+                out.push_str(&format!(
+                    "         {}\n",
+                    crate::terminal::single_line(&check.detail)
+                ));
             }
         }
         out
@@ -366,10 +381,11 @@ impl VictauriClient {
                 return Err(TestError::Assertion(format!(
                     "{} uncaught error(s): {}",
                     uncaught.len(),
+                    // Page-controlled text: never carry raw control characters onward.
                     uncaught
                         .iter()
                         .take(3)
-                        .copied()
+                        .map(|msg| crate::terminal::single_line(msg))
                         .collect::<Vec<_>>()
                         .join("; ")
                 )));
@@ -682,5 +698,28 @@ mod tests {
         assert_eq!(failures.len(), 2);
         assert_eq!(failures[0].name, "bad1");
         assert_eq!(failures[1].name, "bad2");
+    }
+
+    // ── R4-TERM1: page-controlled text in the summary ──
+
+    #[test]
+    fn page_text_cannot_forge_ci_annotations_in_the_summary() {
+        let report = SmokeReport {
+            checks: vec![SmokeCheckResult {
+                name: "no uncaught errors".to_string(),
+                passed: false,
+                detail:
+                    "1 uncaught error(s): [uncaught] x\n::error file=src/main.rs::forged\u{1b}[2J"
+                        .to_string(),
+                duration: Duration::from_millis(1),
+            }],
+            duration: Duration::from_millis(1),
+        };
+        let summary = report.to_summary();
+        assert!(
+            !summary.lines().any(|l| l.trim_start().starts_with("::")),
+            "a page-controlled line became a GitHub workflow command:\n{summary}"
+        );
+        assert!(!summary.contains('\u{1b}'), "raw ESC reached the terminal");
     }
 }

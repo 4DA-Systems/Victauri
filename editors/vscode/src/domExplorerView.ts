@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { DomNode, VictauriClient } from "./client";
+import { generateElementTest } from "./rustCodegen";
 
 export class DomExplorerProvider
   implements vscode.TreeDataProvider<DomNode>
@@ -44,31 +45,8 @@ export class DomExplorerProvider
   }
 
   generateTestCode(node: DomNode): string {
-    const lines: string[] = [];
-    lines.push('e2e_test!(test_element, |client| async move {');
-
-    if (node.ref_id) {
-      if (node.tag === "input" || node.tag === "textarea") {
-        lines.push(
-          `    client.fill("${node.ref_id}", "test value").await.unwrap();`
-        );
-      } else if (node.tag === "button" || node.tag === "a") {
-        lines.push(
-          `    client.click("${node.ref_id}").await.unwrap();`
-        );
-      } else if (node.name) {
-        lines.push(
-          `    Locator::text("${node.name}")`,
-          `        .expect(&mut client)`,
-          `        .to_be_visible()`,
-          `        .await`,
-          `        .unwrap();`
-        );
-      }
-    }
-
-    lines.push("});");
-    return lines.join("\n");
+    // Page-controlled names and ref ids are escaped into the Rust literals (R4-VSC1).
+    return generateElementTest(node);
   }
 
   private formatLabel(node: DomNode): string {

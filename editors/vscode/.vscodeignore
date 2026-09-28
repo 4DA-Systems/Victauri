@@ -9,3 +9,5 @@ tsconfig.json
 **/*.ts
 media/logo-concepts/**
 media/screenshots/**
+test/**
+out-test/**

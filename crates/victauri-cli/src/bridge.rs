@@ -64,6 +64,8 @@ const LOCAL_INIT_INSTRUCTIONS: &str = "Victauri MCP bridge. Tools act on a runni
 /// A discovered, live Victauri backend.
 #[derive(Clone, Debug)]
 struct ServerInfo {
+    /// Owning process, when known from discovery (`None` for a `VICTAURI_PORT` override).
+    pid: Option<u32>,
     port: u16,
     token: Option<String>,
     identifier: Option<String>,
@@ -77,7 +79,23 @@ impl ServerInfo {
             .as_deref()
             .or(self.product_name.as_deref())
             .unwrap_or("<unknown app>");
-        format!("{name} (port {})", self.port)
+        match self.pid {
+            Some(pid) => format!("{name} (port {}, pid {pid})", self.port),
+            None => format!("{name} (port {})", self.port),
+        }
+    }
+
+    /// `--app` matches the bundle identifier or the product name EXACTLY (ASCII
+    /// case-insensitive) — never a substring (R4-CLI2: `--app com.example` bound
+    /// `com.example.victauri-demo`, contradicting "never a silent wrong-app binding").
+    fn matches_app(&self, app: &str) -> bool {
+        self.identifier
+            .as_deref()
+            .is_some_and(|i| i.eq_ignore_ascii_case(app))
+            || self
+                .product_name
+                .as_deref()
+                .is_some_and(|p| p.eq_ignore_ascii_case(app))
     }
 }
 
@@ -400,8 +418,13 @@ fn may_replay(msg: &Value, err: &anyhow::Error) -> bool {
         .is_some_and(reqwest::Error::is_connect)
 }
 
-/// Whole-request HTTP timeout for a forwarded message that sets no longer wait of its own.
+/// Whole-request HTTP timeout for a forwarded protocol message (lists, reads, …).
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// Whole-request HTTP timeout for a `tools/call` that sets no `timeout_ms`: the app's own
+/// eval timeout (`VICTAURI_EVAL_TIMEOUT` / `eval_timeout`) can be up to 300 s, plus the
+/// server's pre-wait headroom — a 120 s cut-off failed such calls at the bridge while the
+/// app kept running them (R4-CLIT).
+const TOOL_CALL_DEFAULT_TIMEOUT: Duration = Duration::from_secs(330);
 /// Headroom on top of a tool call's own `timeout_ms`: before its wait starts the server may
 /// wait for the bridge, probe it (up to 2s) and make main-thread round trips (up to 10s each).
 const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(40);
@@ -412,9 +435,15 @@ const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 /// `timeout_ms` (`invoke_command` up to 300s, `wait_for` up to 120s) must outlast that wait;
 /// with the fixed 120s timeout such calls failed at the bridge while the command kept running.
 fn request_timeout_for(msg: &Value) -> Duration {
+    let is_tool_call = msg.get("method").and_then(Value::as_str) == Some("tools/call");
+    let fallback = if is_tool_call {
+        TOOL_CALL_DEFAULT_TIMEOUT
+    } else {
+        DEFAULT_REQUEST_TIMEOUT
+    };
     msg.pointer("/params/arguments/timeout_ms")
         .and_then(Value::as_u64)
-        .map_or(DEFAULT_REQUEST_TIMEOUT, |ms| {
+        .map_or(fallback, |ms| {
             DEFAULT_REQUEST_TIMEOUT
                 .max(Duration::from_millis(ms.min(MAX_TOOL_TIMEOUT_MS)) + TOOL_TIMEOUT_HEADROOM)
         })
@@ -566,11 +595,7 @@ async fn forward_with_retries(
         }
         Selection::Ambiguous(labels) => {
             *locked(connection) = None;
-            return ForwardResult::Unreachable(format!(
-                "Multiple Victauri apps are running:\n  {}\nSelect one with \
-                 `--app <bundle-identifier>` or the VICTAURI_APP env var.",
-                labels.join("\n  ")
-            ));
+            return ForwardResult::Unreachable(ambiguous_message(&labels));
         }
         Selection::None => {
             *locked(connection) = None;
@@ -843,10 +868,11 @@ async fn post_message(
 async fn scan_once(app: Option<&str>) -> Selection {
     // Explicit env override wins (a developer pinning a specific port).
     if let Ok(p) = std::env::var("VICTAURI_PORT")
-        && let Ok(port) = p.parse::<u16>()
+        && let Ok(port) = p.trim().parse::<u16>()
         && health_ok(port).await
     {
         return Selection::One(ServerInfo {
+            pid: None,
             port,
             // An EMPTY/whitespace `VICTAURI_AUTH_TOKEN` is "not configured", NOT "send an
             // empty Bearer" — it must fall through to the discovered token for this exact
@@ -928,17 +954,22 @@ async fn discover_and_select(wait: bool, app: Option<&str>) -> Result<ServerInfo
                 );
             }
             Selection::Ambiguous(labels) => {
-                bail!(
-                    "Multiple Victauri apps are running:\n  {}\n\
-                     Specify which one with `victauri bridge --app <identifier>` (or set \
-                     VICTAURI_APP). The identifier is your Tauri bundle identifier.",
-                    labels.join("\n  ")
-                );
+                bail!("{}", ambiguous_message(&labels));
             }
         }
     }
 
     bail!("Could not connect to a matching Victauri server")
+}
+
+/// Several live apps match: name each (`identifier (port N, pid P)`) and how to pick one.
+fn ambiguous_message(labels: &[String]) -> String {
+    format!(
+        "Multiple Victauri apps are running:\n  {}\nSelect one with `--app <bundle-identifier>` \
+         or the VICTAURI_APP env var (an exact bundle identifier or product name). If two apps \
+         share that identifier, stop one or pin the port with VICTAURI_PORT.",
+        labels.join("\n  ")
+    )
 }
 
 enum Selection {
@@ -947,47 +978,18 @@ enum Selection {
     Ambiguous(Vec<String>),
 }
 
-/// Pick the server matching `app`, or the sole running server.
+/// Pick the server matching `app` exactly, or the sole running server. Several matches —
+/// no selector with several apps up, or two apps sharing an identifier — are ambiguous,
+/// never "the first one".
 fn select(live: &[ServerInfo], app: Option<&str>) -> Selection {
-    if live.is_empty() {
-        return Selection::None;
-    }
-    if let Some(app) = app {
-        let needle = app.to_ascii_lowercase();
-        // Prefer an exact identifier/product_name match, then a substring match.
-        let exact = live.iter().find(|s| {
-            s.identifier
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-                == Some(&needle)
-                || s.product_name
-                    .as_deref()
-                    .map(str::to_ascii_lowercase)
-                    .as_deref()
-                    == Some(&needle)
-        });
-        if let Some(s) = exact {
-            return Selection::One(s.clone());
-        }
-        let partial = live.iter().find(|s| {
-            s.identifier
-                .as_deref()
-                .is_some_and(|i| i.to_ascii_lowercase().contains(&needle))
-                || s.product_name
-                    .as_deref()
-                    .is_some_and(|p| p.to_ascii_lowercase().contains(&needle))
-        });
-        return match partial {
-            Some(s) => Selection::One(s.clone()),
-            None => Selection::None,
-        };
-    }
-    // No app specified: fine if exactly one is running; ambiguous otherwise.
-    if live.len() == 1 {
-        Selection::One(live[0].clone())
-    } else {
-        Selection::Ambiguous(live.iter().map(ServerInfo::label).collect())
+    let matching: Vec<&ServerInfo> = live
+        .iter()
+        .filter(|s| app.is_none_or(|app| s.matches_app(app)))
+        .collect();
+    match matching.as_slice() {
+        [] => Selection::None,
+        [one] => Selection::One((*one).clone()),
+        many => Selection::Ambiguous(many.iter().map(|s| s.label()).collect()),
     }
 }
 
@@ -1009,7 +1011,26 @@ fn discover_entries() -> Vec<(u32, ServerInfo)> {
 /// that directory is private to us, else `<temp>/victauri-<euid>` — and the legacy shared
 /// `<temp>/victauri` is still read (a pre-0.9 plugin writes there) when it passes the same
 /// ownership check. Other platforms use `<temp>/victauri` (a per-user temp dir).
+#[cfg(not(test))]
 fn discovery_roots() -> Vec<std::path::PathBuf> {
+    real_discovery_roots()
+}
+
+/// Unit tests never read the machine's REAL discovery directories (a developer's running
+/// apps and their tokens live there): every discovery path resolves against one private,
+/// process-wide root instead.
+#[cfg(test)]
+fn discovery_roots() -> Vec<std::path::PathBuf> {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    vec![
+        ROOT.get_or_init(|| tempfile::tempdir().expect("isolated discovery root"))
+            .path()
+            .to_path_buf(),
+    ]
+}
+
+#[cfg_attr(all(test, not(unix)), allow(dead_code))]
+fn real_discovery_roots() -> Vec<std::path::PathBuf> {
     let legacy = std::env::temp_dir().join("victauri");
     #[cfg(unix)]
     {
@@ -1097,6 +1118,7 @@ fn discover_entries_in(root: &std::path::Path, out: &mut Vec<(u32, ServerInfo)>)
         out.push((
             pid,
             ServerInfo {
+                pid: Some(pid),
                 port,
                 token,
                 identifier,
@@ -1106,10 +1128,23 @@ fn discover_entries_in(root: &std::path::Path, out: &mut Vec<(u32, ServerInfo)>)
     }
 }
 
-/// The discovered backends as `ServerInfo` (dropping the pid) — for callers that only need
-/// the server list, e.g. token lookup for a `VICTAURI_PORT` override.
-fn discover_servers() -> Vec<ServerInfo> {
-    discover_entries().into_iter().map(|(_, s)| s).collect()
+/// The discovered backends whose owning process is alive and ours — for token lookup for a
+/// `VICTAURI_PORT` override (no health check: the caller already probed that port).
+fn discover_live_servers() -> Vec<ServerInfo> {
+    let entries = discover_entries();
+    if entries.is_empty() {
+        return Vec::new();
+    }
+    let alive = alive_pids();
+    entries
+        .into_iter()
+        .filter(|(pid, _)| {
+            alive
+                .as_ref()
+                .map_or_else(|| is_process_alive(*pid), |set| set.contains(pid))
+        })
+        .map(|(_, s)| s)
+        .collect()
 }
 
 /// Normalize a configured `VICTAURI_AUTH_TOKEN` value: an empty or whitespace-only
@@ -1128,16 +1163,21 @@ fn normalize_env_token(raw: Option<String>) -> Option<String> {
 
 /// Token belonging to the exact server selected by a `VICTAURI_PORT` override.
 ///
-/// Never send a token discovered for one app to an unrelated localhost port.
+/// Never send a token discovered for one app to an unrelated localhost port: only the token
+/// of the ONE live, trusted discovery entry advertising that port is used (R4-DISC2). A
+/// stale entry of a dead app that once held the port — or two entries claiming it — yields
+/// no token, rather than the first match's.
 fn discover_token_for_port(port: u16) -> Option<String> {
-    token_for_port(&discover_servers(), port)
+    token_for_port(&discover_live_servers(), port)
 }
 
 fn token_for_port(servers: &[ServerInfo], port: u16) -> Option<String> {
-    servers
-        .iter()
-        .find(|server| server.port == port)
-        .and_then(|server| server.token.clone())
+    let mut matching = servers.iter().filter(|server| server.port == port);
+    let server = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    server.token.clone()
 }
 
 /// Shared, warm HTTP client for `/health` probes. Built ONCE (rebuilding per call incurred
@@ -1158,13 +1198,18 @@ fn health_client() -> &'static reqwest::Client {
     })
 }
 
+/// Whether a Victauri server answers on `port`. A `429` counts: `/health` is unauthenticated
+/// and rate-limited from the public bucket, so any local process can flood it, and a
+/// rate-limited reply still proves the server is up. Requiring a 2xx let such a flood make
+/// every tool call fail with "backend not reachable — start the app" (R4-NET1, reproduced:
+/// 88k × 429 → 3/3 bridge tool calls refused). The token is NOT sent on `/health`.
 async fn health_ok(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/health");
     health_client()
         .get(&url)
         .send()
         .await
-        .is_ok_and(|r| r.status().is_success())
+        .is_ok_and(|r| victauri_test::health_status_means_alive(r.status().as_u16()))
 }
 
 /// No batched process enumeration on this platform: callers fall back to per-pid checks.
@@ -1262,15 +1307,12 @@ fn dir_is_trusted(path: &std::path::Path) -> bool {
 
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
     for _ in 0..16 {
-        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+        // Unpredictable name (R4-DISC2): a guessable `<pid>_<seq>` name in the shared temp
+        // dir let another user pre-create every probe path and deny us our own uid.
         let probe = std::env::temp_dir().join(format!(
-            ".victauri_bridge_uidprobe_{}_{}",
-            std::process::id(),
-            sequence
+            ".victauri_bridge_uidprobe_{}",
+            uuid::Uuid::new_v4().simple()
         ));
         if let Some(uid) = uid_from_exclusive_probe(&probe) {
             return Some(uid);
@@ -1318,7 +1360,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discovery_roots_are_per_user_first() {
-        let roots = discovery_roots();
+        let roots = real_discovery_roots();
         let euid = current_euid().unwrap();
         assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
         assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
@@ -1486,10 +1528,13 @@ mod tests {
             request_timeout_for(&call("tools/list")),
             DEFAULT_REQUEST_TIMEOUT
         );
+        // R4-CLIT: with no `timeout_ms`, a tool call is bounded only by the app's eval
+        // timeout (up to 300 s) — the bridge must not cut it off at 120 s.
         assert_eq!(
             request_timeout_for(&tool(json!({}))),
-            DEFAULT_REQUEST_TIMEOUT
+            TOOL_CALL_DEFAULT_TIMEOUT
         );
+        assert!(TOOL_CALL_DEFAULT_TIMEOUT >= Duration::from_secs(330));
         assert_eq!(
             request_timeout_for(&tool(json!({"timeout_ms": 5_000}))),
             DEFAULT_REQUEST_TIMEOUT
@@ -1539,6 +1584,7 @@ mod tests {
 
     fn srv(id: &str, name: &str, port: u16) -> ServerInfo {
         ServerInfo {
+            pid: Some(u32::from(port)),
             port,
             token: None,
             identifier: Some(id.to_string()),
@@ -1600,22 +1646,95 @@ mod tests {
         assert_eq!(token_for_port(&servers, 7999), None);
     }
 
+    /// R4-CLI2 — this test used to assert the opposite (`--app demo` bound
+    /// `com.victauri.demo` by substring). That was the bug: `--app com.example` silently bound
+    /// `com.example.victauri-demo`. An exact identifier or product name still matches.
     #[test]
-    fn substring_identifier_match() {
-        let live = vec![srv("com.victauri.demo", "Demo", 7373)];
-        match select(&live, Some("demo")) {
-            Selection::One(s) => assert_eq!(s.port, 7373),
-            _ => panic!("substring of product/identifier should match"),
+    fn app_selector_is_exact_never_substring() {
+        let live = vec![srv("com.victauri.demo", "Demo App", 7373)];
+        assert!(matches!(select(&live, Some("demo")), Selection::None));
+        assert!(matches!(
+            select(&live, Some("com.victauri")),
+            Selection::None
+        ));
+        let live = vec![srv("com.example.victauri-demo", "Demo", 7373)];
+        assert!(matches!(
+            select(&live, Some("com.example")),
+            Selection::None
+        ));
+        assert!(matches!(
+            select(&live, Some("com.example.victauri-demo")),
+            Selection::One(s) if s.port == 7373
+        ));
+        assert!(matches!(select(&live, Some("demo")), Selection::One(_)));
+    }
+
+    #[test]
+    fn duplicate_identifiers_are_ambiguous_with_pids_and_ports() {
+        let live = vec![
+            srv("com.dup.app", "Dup", 7373),
+            srv("com.dup.app", "Dup", 7374),
+        ];
+        match select(&live, Some("com.dup.app")) {
+            Selection::Ambiguous(labels) => {
+                assert_eq!(labels.len(), 2);
+                assert!(labels[0].contains("port 7373") && labels[0].contains("pid 7373"));
+                assert!(labels[1].contains("port 7374"));
+                let msg = ambiguous_message(&labels);
+                assert!(
+                    msg.contains("--app") && msg.contains("VICTAURI_PORT"),
+                    "{msg}"
+                );
+            }
+            _ => panic!("two apps sharing an identifier must be ambiguous, not first-wins"),
         }
     }
 
-    // End-to-end against REAL discovery files: the plugin writes port/token/metadata.json
-    // under `<temp>/victauri/<pid>/`; this proves the bridge parses those real files and can
-    // select the right app by identity — even amid the many stale dirs left by dead processes.
+    #[test]
+    fn port_override_token_needs_one_live_entry_on_that_port() {
+        // R4-DISC2: a VICTAURI_PORT override used the token of ANY discovery entry that once
+        // advertised that port (first match), e.g. a dead app's stale entry.
+        let mut stale = srv("com.dead.app", "Dead", 7374);
+        stale.token = Some("stale-token".to_string());
+        let mut live = srv("com.live.app", "Live", 7374);
+        live.token = Some("live-token".to_string());
+        assert_eq!(token_for_port(&[stale, live.clone()], 7374), None);
+        assert_eq!(token_for_port(&[live], 7374).as_deref(), Some("live-token"));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_health_endpoint_is_alive() {
+        // R4-NET1: an unauthenticated /health flood (→ 429) made every bridge tool call fail
+        // with "backend not reachable — start the app".
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async { axum::http::StatusCode::TOO_MANY_REQUESTS }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert!(
+            health_ok(port).await,
+            "a 429 from /health proves the server is alive"
+        );
+
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        assert!(!health_ok(port).await);
+    }
+
+    // End-to-end against real-format discovery files: the plugin writes
+    // port/token/metadata.json under `<root>/<pid>/`; this proves the bridge parses those
+    // files and can select the right app by identity. (In unit tests `discovery_roots()` is a
+    // private temp root — never the machine's real one.)
     #[test]
     fn discover_servers_reads_real_metadata_and_selects() {
         let pid = std::process::id(); // alive → passes is_process_alive
-        // The plugin's primary (per-user on Unix) root — audit N6.
         let dir = discovery_roots()[0].join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         // Make ownership/permissions deterministic so `dir_is_trusted` passes regardless of
@@ -1634,7 +1753,7 @@ mod tests {
         )
         .unwrap();
 
-        let servers = discover_servers();
+        let servers = discover_live_servers();
         let mine = servers
             .iter()
             .find(|s| s.identifier.as_deref() == Some("com.test.discover"))

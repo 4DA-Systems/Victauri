@@ -111,8 +111,9 @@ let opts = VisualOptions {
     ..Default::default()
 };
 
+// Errors with `TestError::VisualRegression` when the screenshot differs beyond the threshold.
 let diff = client.screenshot_visual("dashboard", &opts).await?;
-assert!(diff.is_match);
+assert!(diff.is_match(opts.threshold_percent));
 ```
 
 ## IPC Coverage
