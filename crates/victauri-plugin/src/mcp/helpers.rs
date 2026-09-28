@@ -503,6 +503,85 @@ pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+/// Page-side probe run before trusted (OS-level) keystrokes: focus element `ref_id`, then
+/// report `{found, focused}` — whether focus actually LANDED on it. OS keystrokes go to
+/// whatever holds focus, and `focus()` can silently not take (a non-focusable or inert
+/// element) or be moved on by a focus handler, so existence is not enough (R4-IN1).
+///
+/// The deep active element is followed from the top document through open shadow roots
+/// (a host reports its shadow root's `activeElement`) and same-origin frames (a frame
+/// element reports its document's `activeElement`). A closed shadow root or a cross-origin
+/// frame cannot be looked into, so an element behind one reads as not focused.
+pub fn trusted_focus_probe_js(ref_id: &str) -> String {
+    format!(
+        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
+         if(!__e) return {{found:false,focused:false}}; \
+         __e.focus(); \
+         var __a=document.activeElement; \
+         for(var __i=0;__a&&__i<64;__i++){{ \
+           if(__a===__e) return {{found:true,focused:true}}; \
+           var __n=null; \
+           if(__a.shadowRoot&&__a.shadowRoot.activeElement){{__n=__a.shadowRoot.activeElement;}} \
+           else if(__a.tagName==='IFRAME'||__a.tagName==='FRAME'){{ \
+             try{{var __d=__a.contentDocument; __n=__d&&__d.activeElement;}}catch(__x){{__n=null;}} }} \
+           if(!__n||__n===__a) break; \
+           __a=__n; \
+         }} \
+         return {{found:true,focused:false}}",
+        js_string(ref_id)
+    )
+}
+
+/// Page-side probe run before a trusted (OS-level) click on element `ref_id`: returns the
+/// click point `{x, y}` in the TOP window's viewport (CSS pixels), `{error}` when the
+/// element cannot take a real click there, or `null` when the ref is unknown (R4-IN2).
+///
+/// A real OS click lands on whatever is on screen at the point, so the point must be one
+/// where the element is actually hit: it runs the same checks as the bridge's
+/// actionability check for synthetic clicks (connected, enabled, visible, non-zero size,
+/// `pointer-events`, not covered at its center — the covering test is stricter: the hit
+/// element must be the element or inside it) and then walks up through same-origin frames,
+/// adding each frame's content offset and requiring the point to stay inside every
+/// viewport on the way and the frame itself to be the element hit there. Layout is page
+/// data, so the native side clamps the point to the window's client area as well.
+pub fn trusted_click_probe_js(ref_id: &str) -> String {
+    format!(
+        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
+         if(!__e) return null; \
+         function __no(m){{return {{error:m}};}} \
+         function __in(w,x,y){{return x>=0&&y>=0&&x<w.innerWidth&&y<w.innerHeight;}} \
+         if(!__e.isConnected) return __no('element is detached from the DOM'); \
+         __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
+         var __d=__e.ownerDocument||document, __w=__d.defaultView||window; \
+         if(__e.disabled||(__e.getAttribute&&__e.getAttribute('aria-disabled')==='true')) \
+           return __no('element is disabled'); \
+         var __s=__w.getComputedStyle(__e); \
+         if(__s.display==='none'||__s.visibility==='hidden'||parseFloat(__s.opacity)<0.01) \
+           return __no('element is not visible'); \
+         if(__s.pointerEvents==='none') return __no('element has pointer-events: none'); \
+         var __b=__e.getBoundingClientRect(); \
+         if(!(__b.width>0&&__b.height>0)) return __no('element has zero size'); \
+         var __x=__b.left+__b.width/2, __y=__b.top+__b.height/2; \
+         if(!__in(__w,__x,__y)) return __no('element center is outside the viewport'); \
+         var __t=__d.elementFromPoint(__x,__y); \
+         if(!__t||(__t!==__e&&!__e.contains(__t))) \
+           return __no('element is covered at its center point'+(__t&&__t.tagName?' by <'+__t.tagName.toLowerCase()+'>':'')); \
+         for(var __f=__w,__i=0;__f!==__f.top&&__i<32;__i++){{ \
+           var __fe=null; try{{__fe=__f.frameElement;}}catch(__x2){{__fe=null;}} \
+           if(!__fe) return __no('element is inside a cross-origin frame'); \
+           var __p=__f.parent, __r=__fe.getBoundingClientRect(), __c=__p.getComputedStyle(__fe); \
+           __x+=__r.left+(__fe.clientLeft||0)+(parseFloat(__c.paddingLeft)||0); \
+           __y+=__r.top+(__fe.clientTop||0)+(parseFloat(__c.paddingTop)||0); \
+           if(!__in(__p,__x,__y)) return __no('element center is outside the viewport (clipped by its frame)'); \
+           if(__p.document.elementFromPoint(__x,__y)!==__fe) \
+             return __no('the frame holding the element is covered at the click point'); \
+           __f=__p; \
+         }} \
+         return {{x:__x, y:__y}}",
+        js_string(ref_id)
+    )
+}
+
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
@@ -1131,5 +1210,239 @@ mod ghost_report_tests {
         registry.register(CommandInfo::new("known_cmd"));
         let v = build_ghost_report(&[outcome("known_cmd", false, Some("oops"))], &registry);
         assert!(v["frontend_only"].as_array().unwrap().is_empty());
+    }
+}
+
+/// The trusted-input probes run in a real JS engine (jsdom, via the bridge test runner in
+/// `tests/bridge_tests/`) against the real bridge script: what they report decides whether
+/// OS-level input is sent at all, so their page-side logic is what these tests pin.
+#[cfg(test)]
+mod trusted_probe_js_tests {
+    use super::{trusted_click_probe_js, trusted_focus_probe_js};
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn runner_dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("bridge_tests")
+    }
+
+    /// One case: (name, page html, setup js, `findElements` query for the target, probe).
+    type Case<'a> = (&'a str, &'a str, &'a str, &'a str, String);
+
+    /// Each probe is built for the placeholder ref `__VREF__` and run after resolving the
+    /// real ref of the first element the case's query matches. Returns each case's result,
+    /// or `None` when jsdom is not installed (and nothing requires it).
+    fn run(cases: &[Case<'_>]) -> Option<Vec<serde_json::Value>> {
+        if !runner_dir().join("node_modules").join("jsdom").exists() {
+            assert!(
+                std::env::var_os("CI").is_none()
+                    && std::env::var_os("VICTAURI_REQUIRE_JSDOM").is_none(),
+                "jsdom is not installed: `npm ci` in crates/victauri-plugin/tests/bridge_tests/"
+            );
+            eprintln!("SKIP: jsdom not installed");
+            return None;
+        }
+        let tests: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(name, html, setup_js, find_query, probe)| {
+                let code = format!(
+                    "var __found = window.__VICTAURI__.findElements({find_query}); \
+                     if (!__found.length) throw new Error('fixture element not found'); \
+                     var __vref = __found[0].ref_id;\n{}",
+                    probe.replace("\"__VREF__\"", "__vref")
+                );
+                serde_json::json!({
+                    "name": name, "code": code,
+                    "setup_html": html, "setup_js": setup_js,
+                })
+            })
+            .collect();
+        let def = serde_json::json!({
+            "bridge_script": crate::js_bridge::init_script(
+                &crate::js_bridge::BridgeCapacities::default()
+            ),
+            "setup_html": "<html><body></body></html>",
+            "tests": tests,
+        });
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(def.to_string().as_bytes()).unwrap();
+        tmp.flush().unwrap();
+        let out = std::process::Command::new("node")
+            .arg(runner_dir().join("run_tests.js"))
+            .arg(tmp.path())
+            .output()
+            .expect("run node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("VICTAURI_RESULTS:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no results: {stdout}\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            });
+        let results: Vec<serde_json::Value> = serde_json::from_str(line).unwrap();
+        Some(
+            results
+                .into_iter()
+                .map(|r| {
+                    assert_eq!(r["passed"], true, "{}: {}", r["name"], r["error"]);
+                    r["result"].clone()
+                })
+                .collect(),
+        )
+    }
+
+    const FORM: &str = r#"<html><body>
+        <input id="target" placeholder="target">
+        <input id="other" placeholder="other">
+        <div id="plain">not focusable</div>
+        <div id="host"></div>
+    </body></html>"#;
+
+    /// R4-IN1: the focus probe must report whether focus LANDED on the element, not
+    /// whether the element exists — keys go to whatever holds focus.
+    #[test]
+    fn focus_probe_reports_where_focus_actually_landed() {
+        let probe = trusted_focus_probe_js("__VREF__");
+        let shadow_setup = "var r = document.getElementById('host').attachShadow({mode:'open'}); \
+                            r.innerHTML = '<input placeholder=\"in-shadow\">';";
+        let Some(results) = run(&[
+            (
+                "plain input",
+                FORM,
+                "",
+                "{placeholder:'target'}",
+                probe.clone(),
+            ),
+            (
+                "a focus handler moves focus elsewhere",
+                FORM,
+                "document.getElementById('target').addEventListener('focus', function () { \
+                   document.getElementById('other').focus(); });",
+                "{placeholder:'target'}",
+                probe.clone(),
+            ),
+            (
+                "element that cannot take focus",
+                FORM,
+                "",
+                "{css:'#plain'}",
+                probe.clone(),
+            ),
+            (
+                "input inside an open shadow root",
+                FORM,
+                shadow_setup,
+                "{placeholder:'in-shadow'}",
+                probe.clone(),
+            ),
+        ]) else {
+            return;
+        };
+        let focused = |v: &serde_json::Value| v["focused"] == true && v["found"] == true;
+        assert!(focused(&results[0]), "plain input: {}", results[0]);
+        assert!(!focused(&results[1]), "focus moved away: {}", results[1]);
+        assert_eq!(results[1]["found"], true, "{}", results[1]);
+        assert!(!focused(&results[2]), "not focusable: {}", results[2]);
+        assert!(focused(&results[3]), "shadow input: {}", results[3]);
+    }
+
+    const PAGE: &str = r#"<html><body>
+        <button id="btn">Go</button>
+        <button id="off" disabled>Off</button>
+        <div id="cover">cover</div>
+        <div id="frame-host"></div>
+    </body></html>"#;
+
+    /// A hit-test for jsdom (which has no layout): the element under any point is `#btn`,
+    /// unless a case replaces `window.__hit`.
+    const HIT_TEST: &str = "window.__hit = function (doc) { \
+                            return doc.getElementById('btn') || doc.body; }; \
+                            document.elementFromPoint = function (x, y) { \
+                            return window.__hit(document, x, y); };";
+
+    /// R4-IN2: the trusted-click probe takes coordinates from page-controlled layout, so it
+    /// must refuse a point that is off-screen, covered or on a disabled element (the OS click
+    /// would land on something else), and must add a same-origin frame's offset.
+    #[test]
+    fn click_probe_refuses_unclickable_points_and_offsets_frames() {
+        let probe = trusted_click_probe_js("__VREF__");
+        let off_screen = format!(
+            "{HIT_TEST} var b = document.getElementById('btn'); \
+             b.getBoundingClientRect = function () {{ return {{left: 5000, top: 10, \
+             width: 80, height: 32, right: 5080, bottom: 42, x: 5000, y: 10}}; }};"
+        );
+        let covered = format!(
+            "{HIT_TEST} window.__hit = function (doc) {{ return doc.getElementById('cover'); }};"
+        );
+        let in_frame = "var f = document.createElement('iframe'); \
+             document.getElementById('frame-host').appendChild(f); \
+             var fw = f.contentWindow, fd = f.contentDocument; \
+             fd.body.innerHTML = '<button id=\"inner\">In frame</button>'; \
+             var baseRect = window.HTMLElement.prototype.getBoundingClientRect; \
+             fw.HTMLElement.prototype.getBoundingClientRect = baseRect; \
+             fw.HTMLElement.prototype.scrollIntoView = function () {}; \
+             window.HTMLElement.prototype.getBoundingClientRect = function () { \
+               if (this.tagName === 'IFRAME') return {left: 100, top: 200, width: 300, \
+                 height: 150, right: 400, bottom: 350, x: 100, y: 200}; \
+               return baseRect.call(this); }; \
+             fd.elementFromPoint = function () { return fd.getElementById('inner'); }; \
+             document.elementFromPoint = function () { return f; };";
+        let Some(results) = run(&[
+            (
+                "visible button",
+                PAGE,
+                HIT_TEST,
+                "{css:'#btn'}",
+                probe.clone(),
+            ),
+            (
+                "button laid out off-screen",
+                PAGE,
+                &off_screen,
+                "{css:'#btn'}",
+                probe.clone(),
+            ),
+            (
+                "button covered by another element",
+                PAGE,
+                &covered,
+                "{css:'#btn'}",
+                probe.clone(),
+            ),
+            (
+                "disabled button",
+                PAGE,
+                HIT_TEST,
+                "{css:'#off'}",
+                probe.clone(),
+            ),
+            (
+                "button in a same-origin iframe",
+                PAGE,
+                in_frame,
+                "{tag:'button', text:'In frame'}",
+                probe.clone(),
+            ),
+        ]) else {
+            return;
+        };
+        // jsdom's stub lays every BUTTON out at (10,10) 80×32: center (50, 26).
+        assert_eq!(results[0]["x"], 50.0, "{}", results[0]);
+        assert_eq!(results[0]["y"], 26.0, "{}", results[0]);
+        for (i, why) in [(1, "off-screen"), (2, "covered"), (3, "disabled")] {
+            assert!(
+                results[i]["error"].is_string() && results[i].get("x").is_none(),
+                "{why}: {}",
+                results[i]
+            );
+        }
+        // Frame content origin (100, 200) + the button's center inside the frame (50, 26).
+        assert_eq!(results[4]["x"], 150.0, "{}", results[4]);
+        assert_eq!(results[4]["y"], 226.0, "{}", results[4]);
     }
 }
