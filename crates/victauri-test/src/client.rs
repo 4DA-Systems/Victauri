@@ -44,16 +44,19 @@ const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 /// caller-chosen `timeout_ms` (e.g. `wait_for`, which accepts up to 120 000 ms)
 /// need the HTTP timeout to outlast that wait; otherwise the client gives up at
 /// the fixed 60 s default while the server is still legitimately waiting.
+///
+/// A tool call WITHOUT `timeout_ms` is bounded server-side by the app's configured eval timeout,
+/// which can be up to 300 s; the client must not give up first, or a retry would run a
+/// side-effecting call twice (round-4 review — the same class `victauri bridge` fixed). The
+/// server still answers as soon as the call finishes, so this never slows a normal call.
 fn request_timeout_for(arguments: &Value) -> Duration {
-    arguments
+    let ms = arguments
         .get("timeout_ms")
         .and_then(Value::as_u64)
-        .map_or(DEFAULT_REQUEST_TIMEOUT, |ms| {
-            DEFAULT_REQUEST_TIMEOUT.max(
-                Duration::from_millis(ms.min(MAX_TOOL_TIMEOUT_MS))
-                    .saturating_add(TOOL_TIMEOUT_HEADROOM),
-            )
-        })
+        .unwrap_or(MAX_TOOL_TIMEOUT_MS);
+    DEFAULT_REQUEST_TIMEOUT.max(
+        Duration::from_millis(ms.min(MAX_TOOL_TIMEOUT_MS)).saturating_add(TOOL_TIMEOUT_HEADROOM),
+    )
 }
 
 /// Whether an HTTP status from `GET /health` proves the Victauri server is alive.
@@ -2563,7 +2566,9 @@ mod transport_tests {
 
     #[test]
     fn request_timeout_outlasts_tool_wait() {
-        assert_eq!(request_timeout_for(&json!({})), DEFAULT_REQUEST_TIMEOUT);
+        // No `timeout_ms`: the server bounds the call by the app's eval timeout (up to 300 s),
+        // so the client must outlast that ceiling, not give up at 60 s and invite a retry.
+        assert_eq!(request_timeout_for(&json!({})), Duration::from_secs(340));
         assert_eq!(
             request_timeout_for(&json!({"timeout_ms": 5_000})),
             DEFAULT_REQUEST_TIMEOUT

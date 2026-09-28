@@ -388,7 +388,16 @@ where
     // (it started, then outlived that caller's timeout + grace). Wait for it — bounded by this
     // caller's own deadline, so callers never stack into N * timeout — before putting a second
     // round trip in flight beside it.
+    // The previous closure usually finishes a few instructions after its caller was answered
+    // (its in-flight guard drops just after the result is sent), so yield briefly before
+    // falling back to sleeping — a 2 ms sleep costs up to ~15 ms on Windows' timer.
+    let mut spins = 0u32;
     while gate.in_flight.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        if spins < 256 {
+            spins += 1;
+            std::thread::yield_now();
+            continue;
+        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(format!(
@@ -851,7 +860,10 @@ fn client_point_verdict(x: f64, y: f64, client_w: i32, client_h: i32) -> Result<
         Ok(())
     } else {
         Err(format!(
-            "refusing trusted click: ({x}, {y}) lies outside the window's content area              ({client_w}x{client_h} physical px), so it would land on the title bar, a caption              button or the border. Scroll the element into view and retry, or omit `trusted` to              use a synthetic click."
+            "refusing trusted click: ({x}, {y}) lies outside the window's content area \
+             ({client_w}x{client_h} physical px), so it would land on the title bar, a caption \
+             button or the border. Scroll the element into view and retry, or omit `trusted` to \
+             use a synthetic click."
         ))
     }
 }

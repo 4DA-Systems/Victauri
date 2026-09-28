@@ -46,8 +46,14 @@ hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "
 rusqlite = { workspace = true, optional = true }
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "bundled-sqlite"]
+# `query_db` / `introspect db_health`.
 sqlite = ["dep:rusqlite"]
+# Compile SQLite into the binary (rusqlite `bundled`). Because cargo unifies the plugin's
+# rusqlite with the app's, this also switches the APP's rusqlite to bundled SQLite. An app that
+# links a system SQLite or SQLCipher keeps its own with
+# `default-features = false, features = ["sqlite"]`.
+bundled-sqlite = ["sqlite", "rusqlite?/bundled"]
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }

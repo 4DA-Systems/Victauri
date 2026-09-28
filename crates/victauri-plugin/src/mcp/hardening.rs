@@ -167,8 +167,6 @@ pub struct SplitRateLimit {
     pub authenticated: Arc<RateLimiterState>,
 }
 
-/// Axum middleware applying [`SplitRateLimit`]: 429 with `Retry-After: 1` when the caller's
-/// bucket is empty.
 /// Close the connection after a guard refuses a request (401 / 403 / 415 / 429).
 ///
 /// A refused request costs the server microseconds, but its keep-alive connection then held one
@@ -192,6 +190,8 @@ pub async fn close_on_rejection(request: Request, next: Next) -> Response {
     response
 }
 
+/// Axum middleware applying [`SplitRateLimit`]: 429 with `Retry-After: 1` when the caller's
+/// bucket is empty.
 pub async fn split_rate_limit(
     State(limits): State<Arc<SplitRateLimit>>,
     request: Request,

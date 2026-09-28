@@ -18,7 +18,7 @@ tauri = { workspace = true, features = ["wry", "x11"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Seeds demo.db so query_db / introspect db_health have a real application database.
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [dev-dependencies]
 victauri-test = { workspace = true }

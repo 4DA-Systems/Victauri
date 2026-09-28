@@ -95,17 +95,31 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   database calls are already running. "database not found" also covers a path resolving outside
   the allowed roots.
 - **rusqlite**: `victauri-plugin` now accepts rusqlite `>=0.32, <0.41` instead of exactly 0.32,
-  so an app on a newer rusqlite can add it (cargo unifies onto the app's version). Nothing to do.
+  so an app on a newer rusqlite can add it (cargo unifies onto the app's version). Because it is
+  the SAME rusqlite, the plugin's default `bundled-sqlite` feature also compiles SQLite into the
+  app's rusqlite. An app that links a system SQLite or SQLCipher keeps its own with
+  `victauri-plugin = { version = "0.9", default-features = false, features = ["sqlite"] }`.
 - **Discovery (`victauri-test`, CLI):** when several Victauri apps run and nothing selects one,
   `VictauriClient::discover()` and the CLI commands return an error naming each app instead of
   silently connecting to :7373. Select with `VICTAURI_APP=<identifier>` (or
   `VictauriClient::discover_app(Some(..))`, or `--app` on any CLI command) or `VICTAURI_PORT`.
   `victauri bridge --app` matches the identifier exactly (it used to fall back to a substring).
 - **`VICTAURI_AUTH_TOKEN` without `VICTAURI_PORT`** is sent only to the running app whose own
-  discovery token matches it; otherwise the client refuses and asks for `VICTAURI_PORT`.
+  discovery token matches it; otherwise the client refuses and asks for `VICTAURI_PORT` — set it
+  when the app's discovery directory is not visible to the client (the app runs in WSL or a
+  container, or elevated on Windows).
 - `is_alive()` (and the bridge / watchdog health checks) treat a `429` from `/health` as alive.
 - Trusted input is refused unless focus actually landed on the element (`type_text`,
-  `press_key`), or the click point is actionable and inside the window's client area (`click`).
+  `press_key` — a non-focusable child of a `contenteditable` editor is refused; target the editor
+  itself), or the click point is actionable and inside the window's client area (`click`).
+- `interact click` (synthetic and trusted) now reaches elements inside OPEN shadow roots (web
+  components); it used to refuse every one of them as "covered by <host>".
+- `victauri-test`: a tool call without `timeout_ms` now waits up to the server's 300 s ceiling
+  (+40 s) instead of 60 s — the server still answers as soon as the call finishes; this only
+  stops the client abandoning (and a retry re-running) a call the app is still executing.
+- VS Code: an explicitly set `victauri.port` (even `7373`) now selects that port instead of being
+  ignored in favour of discovery; a `429` on the authenticated `/info` probe is reported (the
+  token was probably not accepted) instead of showing "connected".
 - `route add` refuses `delay_ms` above 120000; `read_app_file` gives up after 15 s and refuses a
   non-regular file; at most 4 app-state probes, 4 file reads and 4 page-originated window queries
   run at once (the next one is told "busy").

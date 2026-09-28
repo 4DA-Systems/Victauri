@@ -6,7 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { healthStatusMeansAlive } from "../src/client";
+import { authProbeVerdict, healthStatusMeansAlive } from "../src/client";
 import {
   DiscoveredServer,
   pidLiveness,
@@ -103,4 +103,11 @@ test("a rate-limited /health means the server is alive", () => {
   assert.equal(healthStatusMeansAlive(429), true);
   assert.equal(healthStatusMeansAlive(401), false);
   assert.equal(healthStatusMeansAlive(503), false);
+});
+
+test("an authenticated /info 429 is not a successful auth probe", () => {
+  assert.equal(authProbeVerdict(200), "ok");
+  assert.equal(authProbeVerdict(401), "unauthorized");
+  assert.equal(authProbeVerdict(429), "rate-limited");
+  assert.equal(authProbeVerdict(500), "error");
 });

@@ -302,6 +302,25 @@ const INIT_SCRIPT_BODY: &str = r#"
         return new RegExp('^' + re + '$');
     }
 
+    // The element actually hit at (x, y), descending into open shadow roots (which
+    // `elementFromPoint` retargets to their host). Closed shadow roots stay at the host.
+    function deepElementFromPoint(doc, x, y) {
+        var hit = doc.elementFromPoint(x, y);
+        for (var depth = 0; hit && hit.shadowRoot && depth < 32; depth++) {
+            var inner = hit.shadowRoot.elementFromPoint(x, y);
+            if (!inner || inner === hit) break;
+            hit = inner;
+        }
+        return hit;
+    }
+    // `a` contains `b` across shadow boundaries (the composed tree), or is `b`.
+    function composedContains(a, b) {
+        for (var n = b; n; n = n.parentNode || n.host) {
+            if (n === a) return true;
+        }
+        return false;
+    }
+
     // Find the first active route rule matching url+method, or null.
     // Never matches Victauri's own internal IPC traffic.
     // A route delay as setTimeout can honour it. Timers hold a signed 32-bit delay: anything
@@ -371,8 +390,11 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         var cx = rect.left + rect.width / 2;
         var cy = rect.top + rect.height / 2;
-        var topEl = doc.elementFromPoint(cx, cy);
-        if (topEl && topEl !== el && !el.contains(topEl) && !topEl.contains(el)) {
+        // Hit-test THROUGH open shadow roots: `elementFromPoint` reports anything inside a
+        // shadow tree as its host, and `Node.contains` never crosses a shadow boundary, so every
+        // element in a web component (Lit, Shoelace, Ionic, ...) read as "covered by <host>".
+        var topEl = deepElementFromPoint(doc, cx, cy);
+        if (topEl && topEl !== el && !composedContains(el, topEl) && !composedContains(topEl, el)) {
             var tag = topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
             var info = tag;
             if (topEl.id) info += '#' + topEl.id;
@@ -2827,9 +2849,9 @@ const INIT_SCRIPT_BODY: &str = r#"
         var xhrNet = new WeakMap();
         var XHR_NET_GET = Function.prototype.call.bind(WeakMap.prototype.get);
         var XHR_NET_SET = Function.prototype.call.bind(WeakMap.prototype.set);
-        var XHR_NET_DELETE = Function.prototype.call.bind(WeakMap.prototype.delete);
         XMLHttpRequest.prototype.open = function(method, url) {
-            XHR_NET_DELETE(xhrNet, this);
+            // No early delete: an open() that throws leaves the previous request intact (spec),
+            // and a successful one replaces this entry below.
             if (arguments.length < 2) return REFLECT_APPLY(origOpen, this, arguments);
             // Convert ONCE, exactly as open() does (a URL object or anything with toString), and
             // hand open() the converted strings: what is logged is what is requested. A

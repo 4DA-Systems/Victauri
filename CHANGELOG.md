@@ -114,6 +114,18 @@ connection, so refused requests (a web page's no-cors fetches, a local script) c
 subjects) and the binaries ship with `SHA256SUMS`; tool-reference, MIGRATION, README and security
 docs corrections.
 
+**From the regression review of the round-4 fixes** (an independent lens over the fix commits;
+no Critical/High): `interact click` refused every element inside an open shadow root as
+"covered by <host>" — synthetic clicks since the actionability check was added, trusted clicks
+since round 4 (reproduced live on WebView2; the hit test now descends into open shadow roots and
+compares along the composed tree); the quote-aware SQL scanner missed SQLite's Tcl-style
+parameters (`$a(')`… is one token) and passed one stacked query the old checker refused; the
+rusqlite range forced `bundled` onto the app's rusqlite (now a separate default feature,
+`bundled-sqlite`, with an opt-out); `victauri-test` cut tool calls without `timeout_ms` off at
+60 s while the server allows 300 s; the VS Code extension counted a 429 on the authenticated probe
+as success; plus a garbled error message, a stray doc comment, a lost XHR log entry after a
+throwing `open()`, and a spurious up-to-15 ms wait between main-thread round trips on Windows.
+
 **Disproved in round 4** (tested, not defects): eval ids leaking via `.caller` (V8 blocks the
 second hop); `PRAGMA quick_check` overrunning its deadline on a 1.47 GB database (3.8 s); discovery
 dirs left behind on a clean exit (removed on 0.8.8 and 0.9.0); Windows child processes inheriting

@@ -246,4 +246,74 @@ mod trusted_probe_js {
         assert_eq!(results[4]["x"], 150.0, "{}", results[4]);
         assert_eq!(results[4]["y"], 226.0, "{}", results[4]);
     }
+
+    /// A button inside an OPEN shadow root, hit-tested the way a browser does:
+    /// `document.elementFromPoint` reports the shadow HOST (retargeting); only the shadow root's
+    /// own `elementFromPoint` sees the button. `cover_inner` makes something else inside the
+    /// shadow tree the hit element instead.
+    fn shadow_setup(cover_inner: bool) -> String {
+        format!(
+            "var h = document.createElement('div'); h.id = 'host'; document.body.appendChild(h); \
+             var sr = h.attachShadow({{mode: 'open'}}); \
+             sr.innerHTML = '<button id=\"sb\">Shadow Go</button><span id=\"sc\">cover</span>'; \
+             document.elementFromPoint = function () {{ return h; }}; \
+             sr.elementFromPoint = function () {{ return sr.getElementById('{}'); }};",
+            if cover_inner { "sc" } else { "sb" }
+        )
+    }
+
+    /// Round 4 (regression review): `elementFromPoint` retargets to the shadow host and
+    /// `Node.contains` never crosses a shadow boundary, so EVERY element inside a web component
+    /// read as "covered by <host>" — refused for trusted clicks and, since the actionability
+    /// check was added, for synthetic `interact click` too (reproduced live on `WebView2`).
+    #[test]
+    fn clicks_reach_elements_inside_open_shadow_roots() {
+        let probe = trusted_click_probe_js("__VREF__");
+        let synthetic = "return await window.__VICTAURI__.click(\"__VREF__\")".to_string();
+        let open = shadow_setup(false);
+        let covered = shadow_setup(true);
+        let find = "{text:'Shadow Go'}";
+        let Some(results) = run(&[
+            ("trusted: shadow button", PAGE, &open, find, probe.clone()),
+            (
+                "trusted: covered inside the shadow tree",
+                PAGE,
+                &covered,
+                find,
+                probe,
+            ),
+            (
+                "synthetic: shadow button",
+                PAGE,
+                &open,
+                find,
+                synthetic.clone(),
+            ),
+            (
+                "synthetic: covered inside the shadow tree",
+                PAGE,
+                &covered,
+                find,
+                synthetic,
+            ),
+        ]) else {
+            return;
+        };
+        assert!(
+            results[0]["x"].is_number(),
+            "trusted shadow click: {}",
+            results[0]
+        );
+        assert!(
+            results[1]["error"].is_string(),
+            "trusted covered: {}",
+            results[1]
+        );
+        assert_eq!(
+            results[2]["ok"], true,
+            "synthetic shadow click: {}",
+            results[2]
+        );
+        assert_eq!(results[3]["ok"], false, "synthetic covered: {}", results[3]);
+    }
 }

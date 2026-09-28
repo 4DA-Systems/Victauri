@@ -397,6 +397,40 @@ fn scan_sql(sql: &str) -> SqlScan {
     let mut chars = sql.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
+            // A named parameter (`$a`, `:a`, `@a`, `#a`). SQLite's tokenizer also accepts a
+            // Tcl-style `$a(…)` suffix and reads it as part of the SAME token up to `)` or
+            // whitespace, so a quote inside it does not open a string. Treating that quote as
+            // one let `SELECT $a(') ; DELETE …'` pass as a single statement (round-4 review).
+            '$' | ':' | '@' | '#'
+                if chars
+                    .peek()
+                    .is_some_and(|n| n.is_alphanumeric() || *n == '_' || *n == '$') =>
+            {
+                cleaned.push(c);
+                masked.push(c);
+                while let Some(&n) = chars.peek() {
+                    if n.is_alphanumeric() || n == '_' || n == '$' || (n == ':' && c == '$') {
+                        chars.next();
+                        cleaned.push(n);
+                        masked.push(n);
+                    } else {
+                        break;
+                    }
+                }
+                if chars.peek() == Some(&'(') {
+                    while let Some(&n) = chars.peek() {
+                        if n.is_whitespace() {
+                            break;
+                        }
+                        chars.next();
+                        cleaned.push(n);
+                        masked.push(if n == '(' || n == ')' { n } else { '_' });
+                        if n == ')' {
+                            break;
+                        }
+                    }
+                }
+            }
             '-' if chars.peek() == Some(&'-') => {
                 for n in chars.by_ref() {
                     if n == '\n' {
@@ -1855,6 +1889,32 @@ mod tests {
             "SELECT 1 /* ; */",
             "PRAGMA table_info('a;b')",
             "PRAGMA table_info([a=b])",
+        ] {
+            assert_eq!(validate_query(sql), Ok(()), "must allow: {sql}");
+        }
+    }
+
+    /// Round-4 review: `SQLite` reads a Tcl-style parameter `$a(...)` (also `:a(`, `@a(`, `#a(`)
+    /// as ONE token up to `)` or whitespace, so a quote inside it is not a string — the quote-
+    /// aware scanner treated it as one and let a real second statement through. Verified
+    /// against `SQLite`: `SELECT $a(') ; DELETE FROM users --'` is two statements.
+    #[test]
+    fn tcl_style_parameters_do_not_hide_a_stacked_statement() {
+        for sql in [
+            "SELECT $a(') ; DELETE FROM users --'",
+            "SELECT :a(') ; DELETE FROM users --'",
+            "SELECT @a(') ; DELETE FROM users --'",
+            "SELECT #a(') ; DELETE FROM users --'",
+        ] {
+            let err = validate_query(sql).expect_err(sql);
+            assert!(err.contains("stacked queries"), "{sql}: {err}");
+        }
+        for sql in [
+            "SELECT * FROM t WHERE id = :id",
+            "SELECT * FROM t WHERE a = $a AND b = @b",
+            "SELECT $a(x) FROM t",
+            "SELECT '$a(' || x FROM t",
+            "SELECT '#1;2' AS s",
         ] {
             assert_eq!(validate_query(sql), Ok(()), "must allow: {sql}");
         }

@@ -56,6 +56,21 @@ export function healthStatusMeansAlive(status: number): boolean {
   return (status >= 200 && status < 300) || status === 429;
 }
 
+/** What an `/info` answer says about the auth probe. */
+export type AuthProbeVerdict = "ok" | "unauthorized" | "rate-limited" | "error";
+
+/**
+ * Classify the authenticated `/info` probe's status. A `429` is NOT a pass: a request carrying
+ * the correct token draws from its own rate-limit bucket, which an unauthenticated flood cannot
+ * drain, so a 429 here most likely means the token was not accepted (round-4 review) — the
+ * caller retries and then reports it instead of showing "connected".
+ */
+export function authProbeVerdict(status: number): AuthProbeVerdict {
+  if (status === 401) return "unauthorized";
+  if (status === 429) return "rate-limited";
+  return status >= 200 && status < 300 ? "ok" : "error";
+}
+
 export class VictauriClient {
   private baseUrl = "";
   private token = "";
@@ -123,10 +138,21 @@ export class VictauriClient {
    * Throws on a network error, a 401, or any non-2xx status.
    */
   async probeAuthenticated(): Promise<void> {
-    const resp = await this.fetch("/info");
-    // Rate-limited: the server answered, so it is alive — don't report a disconnect because
-    // a local process is flooding the public rate-limit bucket (R4-NET1).
-    if (resp.status === 429) return;
+    let resp = await this.fetch("/info");
+    // A 429 is transient only for a caller whose token is accepted (its own bucket); retry a
+    // few times, honouring Retry-After, and then say so rather than claim "connected".
+    for (let attempt = 0; attempt < 3 && authProbeVerdict(resp.status) === "rate-limited"; attempt++) {
+      const wait = Math.min(5, Number(resp.headers.get("retry-after")) || 1);
+      await new Promise((r) => setTimeout(r, wait * 1000));
+      resp = await this.fetch("/info");
+    }
+    if (authProbeVerdict(resp.status) === "rate-limited") {
+      throw new Error(
+        "Rate-limited (429) on an authenticated request: the auth token was probably not " +
+          "accepted (a correct token has its own rate-limit bucket). Check `victauri.authToken` " +
+          "or the app's discovery token."
+      );
+    }
     if (resp.status === 401) {
       throw new Error(
         "Unauthorized (401): the auth token is missing or wrong. Auth is on by " +
