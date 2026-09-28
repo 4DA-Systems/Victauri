@@ -488,6 +488,21 @@ fn attach_registry_metadata(
     }
 }
 
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a character
+/// boundary. Byte-slicing app/page text (`&s[..n]`) panics when byte `n` falls inside a
+/// multi-byte character, so every length cap on such text goes through here.
+#[must_use]
+pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
@@ -727,6 +742,38 @@ mod json_truthy_tests {
         assert!(json_truthy(&json!("ready")));
         assert!(json_truthy(&json!([1])));
         assert!(json_truthy(&json!({ "k": "v" })));
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_at_char_boundary;
+
+    #[test]
+    fn a_cut_inside_a_multibyte_character_backs_off_to_its_start() {
+        // `"` + 3000 × `é`: byte 4096 is the second byte of an `é`.
+        let s = format!("\"{}", "é".repeat(3000));
+        assert!(!s.is_char_boundary(4096));
+        let cut = truncate_at_char_boundary(&s, 4096);
+        assert_eq!(cut.len(), 4095);
+        assert!(cut.ends_with('é'));
+        // 4-byte characters, every offset.
+        let emoji = "🦀".repeat(10);
+        for max in 0..=emoji.len() + 2 {
+            let cut = truncate_at_char_boundary(&emoji, max);
+            assert!(
+                cut.len() <= max && cut.len() % 4 == 0,
+                "{max}: {}",
+                cut.len()
+            );
+        }
+    }
+
+    #[test]
+    fn short_and_ascii_text_is_unchanged_or_cut_exactly() {
+        assert_eq!(truncate_at_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_at_char_boundary("abcdef", 3), "abc");
+        assert_eq!(truncate_at_char_boundary("", 0), "");
     }
 }
 

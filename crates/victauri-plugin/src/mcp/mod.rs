@@ -46,7 +46,7 @@ use helpers::{
     RecoveryHint, build_ghost_report, ghost_ipc_outcomes_js, ghost_ipc_projection_js,
     ipc_catalog_projection_js, ipc_timing_projection_js, ipc_timing_stats, js_string, json_result,
     json_truthy, merge_command_catalog, missing_param, sanitize_css_color, sanitize_injected_css,
-    tool_disabled, tool_error, tool_error_with_hint, validate_url,
+    tool_disabled, tool_error, tool_error_with_hint, truncate_at_char_boundary, validate_url,
 };
 
 // MCP tool *parameter* types are an internal protocol surface: they are deserialized
@@ -3429,7 +3429,10 @@ impl VictauriMcpHandler {
                             .unwrap_or(serde_json::Value::String(result_str.clone()));
                         let shape = crate::introspection::JsonShape::from_value(&value);
                         let sample = if result_str.len() > 4096 {
-                            format!("{}...(truncated)", &result_str[..4096])
+                            format!(
+                                "{}...(truncated)",
+                                truncate_at_char_boundary(&result_str, 4096)
+                            )
                         } else {
                             result_str
                         };
@@ -8224,6 +8227,41 @@ mod command_policy_dispatch_tests {
             bridge.invoked("get_settings"),
             "positive control failed: contract_record did not invoke an allowed command"
         );
+    }
+
+    /// R4-PANIC1: the stored sample was cut with `&s[..4096]`, which panics when byte 4096
+    /// falls inside a multi-byte character — any non-ASCII response over 4 KiB.
+    #[tokio::test]
+    async fn contract_record_samples_a_large_non_ascii_response_without_panicking() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        // The result text is `"ééé…"`: the opening quote puts every `é` on an odd byte
+        // offset, so byte 4096 is the second byte of a character.
+        let payload = "é".repeat(3000);
+        bridge.answer_evals_with(
+            &json!({"__victauri_ok": payload, "__victauri_type": "string"}).to_string(),
+        );
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let r = call(
+            &h,
+            "introspect",
+            json!({"action": "contract_record", "command": "get_notes"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_ne!(r.is_error, Some(true), "{text}");
+        let baseline = state
+            .contract_store
+            .all()
+            .into_iter()
+            .find(|b| b.command == "get_notes")
+            .expect("baseline recorded");
+        assert!(
+            baseline.sample.ends_with("...(truncated)"),
+            "{}",
+            baseline.sample
+        );
+        assert!(baseline.sample.len() <= 4096 + "...(truncated)".len());
     }
 
     // ── pending-eval concurrency ceiling (audit: TOCTOU race) ────────────────
