@@ -270,6 +270,11 @@ const READ_APP_FILE_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(15)
 };
 
+/// Distinct command names `CommandTimings` tracks (its private `MAX_TIMED_COMMANDS`, mirrored
+/// here — a test pins the two together). Once that many are tracked, new names are dropped and
+/// `introspect command_timings` reports `saturated: true`.
+pub(crate) const COMMAND_TIMINGS_CAP: usize = 1024;
+
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
 /// How often a slow eval re-checks that its target window still exists (first check after
@@ -3290,6 +3295,9 @@ impl VictauriMcpHandler {
                 let result = serde_json::json!({
                     "commands": stats,
                     "total_commands_profiled": driven_count,
+                    // The store stops tracking NEW command names at its cap; say so rather
+                    // than let a missing command look like one that never ran.
+                    "saturated": driven_count >= COMMAND_TIMINGS_CAP,
                     "ipc_traffic": ipc_traffic,
                     "ipc_commands_observed": ipc_traffic.len(),
                     "slow_threshold_ms": params.slow_threshold_ms,

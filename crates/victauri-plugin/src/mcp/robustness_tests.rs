@@ -685,3 +685,40 @@ async fn a_refused_query_is_refused_before_any_database_is_resolved() {
         assert!(text(&r).contains(expect), "{sql}: {}", text(&r));
     }
 }
+
+/// B-L8: the timings map stops tracking NEW command names at its cap; the output says so.
+#[tokio::test]
+async fn command_timings_reports_when_its_command_cap_is_hit() {
+    let h = handler(TestBridge::default());
+    h.state
+        .command_timings
+        .record("one", Duration::from_millis(1));
+    let r = json(
+        &call(
+            &h,
+            "introspect",
+            serde_json::json!({"action": "command_timings"}),
+        )
+        .await,
+    );
+    assert_eq!(r["saturated"], false, "{r}");
+    for i in 0..super::COMMAND_TIMINGS_CAP + 50 {
+        h.state
+            .command_timings
+            .record(&format!("cmd-{i}"), Duration::from_millis(1));
+    }
+    // The cap mirrored here is the one `CommandTimings` enforces.
+    assert_eq!(
+        h.state.command_timings.all_stats().len(),
+        super::COMMAND_TIMINGS_CAP
+    );
+    let r = json(
+        &call(
+            &h,
+            "introspect",
+            serde_json::json!({"action": "command_timings"}),
+        )
+        .await,
+    );
+    assert_eq!(r["saturated"], true, "{r}");
+}
