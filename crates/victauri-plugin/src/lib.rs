@@ -458,8 +458,19 @@ impl VictauriBuilder {
     }
 
     /// Disable specific MCP tools by name (e.g., `["eval_js", "screenshot"]`).
+    ///
+    /// Accepts a bare tool name (disables every action of a compound tool) or a single
+    /// action as `tool.action` (e.g. `"window.manage"`, `"inspect.get_styles"`). A name that
+    /// matches no tool or action disables nothing, so it is logged as a warning.
     #[must_use]
     pub fn disable_tools(mut self, tools: &[&str]) -> Self {
+        for unknown in mcp::authz::unknown_names(tools.iter().copied()) {
+            tracing::warn!(
+                name = unknown,
+                "disable_tools: {unknown:?} is not a Victauri tool, `tool.action`, or capability \
+                 name, so it disables nothing (check the spelling against the tool list)"
+            );
+        }
         self.disabled_tools = tools.iter().map(std::string::ToString::to_string).collect();
         self
     }

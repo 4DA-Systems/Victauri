@@ -45,6 +45,199 @@ const COMPOUND_TOOLS: &[&str] = &[
     "explain",
 ];
 
+/// The standalone (non-compound) tools — gated by their bare name.
+pub(crate) const STANDALONE_TOOLS: &[&str] = &[
+    "eval_js",
+    "dom_snapshot",
+    "find_elements",
+    "invoke_command",
+    "screenshot",
+    "verify_state",
+    "detect_ghost_commands",
+    "check_ipc_integrity",
+    "wait_for",
+    "assert_semantic",
+    "resolve_command",
+    "get_registry",
+    "app_state",
+    "get_memory_stats",
+    "get_plugin_info",
+    "get_diagnostics",
+    "app_info",
+    "list_app_dir",
+    "read_app_file",
+    "query_db",
+];
+
+/// Every compound tool's actions, spelled as its `action` parameter accepts them.
+const COMPOUND_ACTIONS: &[(&str, &[&str])] = &[
+    (
+        "interact",
+        &[
+            "click",
+            "double_click",
+            "hover",
+            "focus",
+            "scroll_into_view",
+            "select_option",
+        ],
+    ),
+    ("input", &["fill", "type_text", "press_key"]),
+    (
+        "window",
+        &[
+            "get_state",
+            "list",
+            "manage",
+            "resize",
+            "move_to",
+            "set_title",
+            "introspectability",
+        ],
+    ),
+    ("storage", &["get", "set", "delete", "get_cookies"]),
+    (
+        "navigate",
+        &[
+            "go_to",
+            "go_back",
+            "get_history",
+            "set_dialog_response",
+            "get_dialog_log",
+        ],
+    ),
+    (
+        "recording",
+        &[
+            "start",
+            "stop",
+            "checkpoint",
+            "list_checkpoints",
+            "get_events",
+            "events_between",
+            "get_replay",
+            "export",
+            "import",
+            "replay",
+            "flush",
+        ],
+    ),
+    (
+        "inspect",
+        &[
+            "get_styles",
+            "get_bounding_boxes",
+            "highlight",
+            "clear_highlights",
+            "audit_accessibility",
+            "get_performance",
+        ],
+    ),
+    ("css", &["inject", "remove"]),
+    ("route", &["add", "list", "clear", "clear_all", "matches"]),
+    ("trace", &["start", "stop", "status", "frames"]),
+    ("animation", &["list", "scrub", "sample"]),
+    (
+        "logs",
+        &[
+            "console",
+            "network",
+            "ipc",
+            "navigation",
+            "dialogs",
+            "events",
+            "slow_ipc",
+            "clear",
+        ],
+    ),
+    (
+        "introspect",
+        &[
+            "command_timings",
+            "coverage",
+            "command_catalog",
+            "contract_record",
+            "contract_check",
+            "contract_list",
+            "contract_clear",
+            "startup_timing",
+            "capabilities",
+            "db_health",
+            "plugin_state",
+            "processes",
+            "plugin_tasks",
+            "event_bus",
+            "event_bus_clear",
+        ],
+    ),
+    ("fault", &["inject", "list", "clear", "clear_all"]),
+    ("explain", &["summary", "last_action", "diff"]),
+];
+
+/// Older names some handlers (and the profile matrix) still check as defense in depth, so
+/// `disabled_tools` honors them too (e.g. `"fill"` disables `input.fill`).
+const LEGACY_NAMES: &[&str] = &[
+    "fill",
+    "type_text",
+    "set_storage",
+    "delete_storage",
+    "get_storage",
+    "get_cookies",
+    "inject_css",
+    "set_dialog_response",
+    "get_window_state",
+    "list_windows",
+];
+
+/// Capability ids whose action is spelled differently: `(capability id, tool.action)`.
+/// Either spelling in `disabled_tools` disables the action (R4-NET4).
+const CAPABILITY_ALIASES: &[(&str, &str)] = &[
+    ("inspect.styles", "inspect.get_styles"),
+    ("inspect.bounds", "inspect.get_bounding_boxes"),
+    ("inspect.audit_a11y", "inspect.audit_accessibility"),
+    ("inspect.performance", "inspect.get_performance"),
+];
+
+/// The other spelling of a capability whose id differs from its `tool.action` name —
+/// `inspect.styles` ↔ `inspect.get_styles` — or `None` for every other name.
+#[must_use]
+pub(crate) fn capability_alias(name: &str) -> Option<&'static str> {
+    CAPABILITY_ALIASES.iter().find_map(|&(id, action)| {
+        if name == id {
+            Some(action)
+        } else if name == action {
+            Some(id)
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether `name` is something `disabled_tools` can match: a tool, a `tool.action` (either
+/// spelling), a capability id, or a legacy handler name. A name that is none of these
+/// disables nothing — almost always a typo.
+#[must_use]
+pub(crate) fn is_known_name(name: &str) -> bool {
+    if STANDALONE_TOOLS.contains(&name)
+        || COMPOUND_TOOLS.contains(&name)
+        || LEGACY_NAMES.contains(&name)
+        || capability_alias(name).is_some()
+    {
+        return true;
+    }
+    let Some((tool, action)) = name.split_once('.') else {
+        return false;
+    };
+    COMPOUND_ACTIONS
+        .iter()
+        .any(|(t, actions)| *t == tool && actions.contains(&action))
+}
+
+/// The entries of `names` that match no tool, action or capability (see [`is_known_name`]).
+pub(crate) fn unknown_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    names.into_iter().filter(|n| !is_known_name(n)).collect()
+}
+
 /// Returns `true` if `tool` is a compound tool (dispatches on an `action` field).
 #[must_use]
 pub fn is_compound_tool(tool: &str) -> bool {
@@ -660,6 +853,103 @@ mod tests {
             assert!(
                 full.is_tool_enabled(expected_cap),
                 "FullControl must permit {expected_cap}"
+            );
+        }
+    }
+
+    /// `COMPOUND_ACTIONS` (what `disabled_tools` validation accepts) lists exactly the
+    /// actions in the authorization spec, and every spelling of each is a known name.
+    #[test]
+    fn known_names_cover_every_action_in_both_spellings() {
+        let mut listed: Vec<(&str, &str)> = COMPOUND_ACTIONS
+            .iter()
+            .flat_map(|(t, actions)| actions.iter().map(move |a| (*t, *a)))
+            .collect();
+        let mut spec: Vec<(&str, &str)> = AUTHZ_SPEC.iter().map(|(t, a, ..)| (*t, *a)).collect();
+        listed.sort_unstable();
+        spec.sort_unstable();
+        assert_eq!(listed, spec);
+        for (tool, action, capability, ..) in AUTHZ_SPEC {
+            assert!(is_known_name(tool), "{tool}");
+            assert!(
+                is_known_name(&format!("{tool}.{action}")),
+                "{tool}.{action}"
+            );
+            assert!(is_known_name(capability), "{capability}");
+        }
+        for tool in STANDALONE_TOOLS {
+            assert!(is_known_name(tool), "{tool}");
+        }
+    }
+
+    #[test]
+    fn typos_and_unknown_names_are_reported() {
+        for typo in [
+            "inspect.get_style",
+            "evaljs",
+            "screenshots",
+            "logs.ipcs",
+            "",
+            "inspect.",
+            ".styles",
+            "window.list.extra",
+        ] {
+            assert!(!is_known_name(typo), "{typo:?} must be reported as unknown");
+        }
+        assert_eq!(
+            unknown_names(["eval_js", "inspect.get_style", "logs", "nope"]),
+            vec!["inspect.get_style", "nope"]
+        );
+    }
+
+    #[test]
+    fn capability_aliases_are_symmetric() {
+        for (id, action) in CAPABILITY_ALIASES {
+            assert_eq!(capability_alias(id), Some(*action));
+            assert_eq!(capability_alias(action), Some(*id));
+            // The alias really is the resolved capability of that action.
+            let (tool, act) = action.split_once('.').unwrap();
+            assert_eq!(action_capability(tool, act).as_deref(), Some(*id));
+        }
+        assert_eq!(capability_alias("inspect.highlight"), None);
+        assert_eq!(capability_alias("eval_js"), None);
+    }
+
+    /// Every name a handler or the profile matrix checks is one `disabled_tools` accepts
+    /// without a warning — otherwise an operator copying it would be told it is a typo.
+    #[test]
+    fn every_name_the_code_checks_is_known() {
+        let quoted_after = |src: &str, marker: &str| -> Vec<String> {
+            src.match_indices(marker)
+                .filter_map(|(at, _)| {
+                    let rest = &src[at + marker.len()..];
+                    rest.find('"').map(|end| rest[..end].to_string())
+                })
+                .collect()
+        };
+        let handler_names = quoted_after(include_str!("mod.rs"), "is_tool_enabled(\"");
+        assert!(handler_names.len() > 20, "{handler_names:?}");
+        let privacy = include_str!("../privacy.rs");
+        let matrix_start = privacy.find("fn is_allowed_by_profile").expect("matrix fn");
+        let matrix_len = privacy[matrix_start..]
+            .find("\n}\n")
+            .expect("matrix fn end");
+        let matrix = &privacy[matrix_start..matrix_start + matrix_len];
+        let matrix_names: Vec<String> = matrix
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_string)
+            .collect();
+        assert!(matrix_names.len() > 50, "{matrix_names:?}");
+        for name in handler_names.iter().chain(&matrix_names) {
+            // `"x"` appears in a doc example in mod.rs.
+            if name == "x" {
+                continue;
+            }
+            assert!(
+                is_known_name(name),
+                "{name:?} is checked but not a known name"
             );
         }
     }

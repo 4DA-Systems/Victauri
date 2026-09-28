@@ -4,7 +4,7 @@
 // structs are already factored into sub-modules (webview_params, window_params,
 // etc.) to keep this file focused on dispatch logic.
 
-mod authz;
+pub(crate) mod authz;
 mod backend_params;
 mod bounded;
 mod compound_params;
@@ -6919,6 +6919,28 @@ mod authz_dispatch_tests {
         }
     }
 
+    /// The names `disable_tools` validates against are the live tool surface: every
+    /// registered tool is either a compound tool or in `STANDALONE_TOOLS`, and nothing else.
+    #[test]
+    fn disable_tools_name_list_matches_the_live_tools() {
+        let mut live: Vec<String> = VictauriMcpHandler::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|n| !authz::is_compound_tool(n))
+            .collect();
+        let mut listed: Vec<String> = authz::STANDALONE_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        live.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(live, listed);
+        for t in VictauriMcpHandler::tool_router().list_all() {
+            assert!(authz::is_known_name(&t.name), "{}", t.name);
+        }
+    }
+
     /// Audit N1: `{"action": {"go_to": null}}` (a tag-shaped enum serde accepts) and a
     /// positional array body used to be gated as the bare tool name, which the Test
     /// profile allows for `navigate` — the handler then parsed and ran `go_to`. Both
@@ -7182,6 +7204,34 @@ mod authz_dispatch_tests {
         )
         .await;
         assert!(!is_privacy_blocked(&r), "scrub without capture is allowed");
+    }
+
+    /// R4-NET4: the action spelling of an `inspect` capability disables it at dispatch.
+    #[tokio::test]
+    async fn disabling_an_inspect_action_by_its_action_name_is_honored() {
+        let cfg = PrivacyConfig {
+            disabled_tools: HashSet::from(["inspect.get_styles".to_string()]),
+            ..Default::default()
+        };
+        let h = handler(cfg);
+        let r = call(
+            &h,
+            "inspect",
+            serde_json::json!({"action": "get_styles", "ref_id": "e1"}),
+        )
+        .await;
+        assert!(
+            is_privacy_blocked(&r),
+            "inspect.get_styles must be blocked, got: {:?}",
+            r.content
+        );
+        let r = call(
+            &h,
+            "inspect",
+            serde_json::json!({"action": "get_bounding_boxes", "ref_ids": ["e1"]}),
+        )
+        .await;
+        assert!(!is_privacy_blocked(&r), "a sibling action stays allowed");
     }
 
     // Command-policy enforcement on invoke paths (A1/A2) and resource gating (B1)
