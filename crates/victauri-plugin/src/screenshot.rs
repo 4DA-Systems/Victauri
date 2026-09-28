@@ -237,6 +237,10 @@ fn blank_frame_reason(pixels: &[u8]) -> Option<&'static str> {
 #[cfg(windows)]
 const WGC_FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Longest a caller waits for its job on the shared COM worker thread.
+#[cfg(windows)]
+const COM_JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Poll cadence for `TryGetNextFrame` while waiting for the first frame.
 #[cfg(windows)]
 const WGC_FRAME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -313,10 +317,19 @@ where
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .send(job)
         .map_err(|_| anyhow::anyhow!("the COM worker thread is not running"))?;
-    match result_rx.recv() {
+    // Bounded: captures share the one COM thread, so a capture stuck in a synchronous COM call
+    // would otherwise block every later caller for good. The frame wait itself is capped at
+    // `WGC_FIRST_FRAME_TIMEOUT`; this backstop only fires if WGC itself hangs.
+    match result_rx.recv_timeout(COM_JOB_TIMEOUT) {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(_panic)) => anyhow::bail!("the capture panicked on the COM worker thread"),
-        Err(_) => anyhow::bail!("the COM worker thread dropped the capture"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => anyhow::bail!(
+            "the capture did not finish within {}s on the COM worker thread",
+            COM_JOB_TIMEOUT.as_secs()
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("the COM worker thread dropped the capture")
+        }
     }
 }
 

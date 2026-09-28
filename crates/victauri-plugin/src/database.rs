@@ -69,10 +69,47 @@ pub(crate) enum Bounded<T> {
     Failed(String),
 }
 
+/// Victauri accepts a RANGE of rusqlite versions (`>=0.32, <0.41`) so it unifies with the app's
+/// own rusqlite instead of forcing a second `libsqlite3-sys` (`links = "sqlite3"` allows only
+/// one per build). Across that range several connection setters changed return type — `()` or
+/// `i32` on older versions, `rusqlite::Result` on newer ones (`set_limit` from 0.33,
+/// `authorizer`/`progress_handler` from 0.38). They install SECURITY bounds (the authorizer,
+/// deadlines, size limits), so a failure must fail CLOSED on every version: this normalizes all
+/// three shapes into one `Result` for `?`, instead of a version-dependent `let _ =` that would
+/// silently drop a failed install.
+#[cfg(feature = "sqlite")]
+trait SetupOutcome {
+    fn into_setup(self) -> Result<(), String>;
+}
+
+#[cfg(feature = "sqlite")]
+impl SetupOutcome for () {
+    fn into_setup(self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl SetupOutcome for i32 {
+    fn into_setup(self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl<T> SetupOutcome for rusqlite::Result<T> {
+    fn into_setup(self) -> Result<(), String> {
+        self.map(|_| ()).map_err(|e| e.to_string())
+    }
+}
+
 /// Run `f` under its OWN wall-clock budget: a progress handler plus a hard [`InterruptGuard`],
 /// both scoped to this call and removed afterwards, so one slow phase cannot poison the phases
 /// that follow it on the same connection.
 #[cfg(feature = "sqlite")]
+// `unit_arg`: on rusqlite 0.32 some setters return `()`; `.into_setup()` on that unit is the
+// point (see `SetupOutcome`), so one source compiles fail-closed across the supported range.
+#[allow(clippy::unit_arg)]
 pub(crate) fn run_bounded<T>(
     conn: &rusqlite::Connection,
     budget: Duration,
@@ -81,21 +118,31 @@ pub(crate) fn run_bounded<T>(
     let started = Instant::now();
     let timed_out = Arc::new(AtomicBool::new(false));
     let marker = Arc::clone(&timed_out);
-    conn.progress_handler(
-        DB_HEALTH_PROGRESS_OPS,
-        Some(move || {
-            let expired = started.elapsed() >= budget;
-            if expired {
-                marker.store(true, Ordering::Relaxed);
-            }
-            expired
-        }),
-    );
+    // The per-phase deadline is a security bound: if it cannot be installed, the phase fails
+    // rather than running unbounded.
+    if let Err(e) = conn
+        .progress_handler(
+            DB_HEALTH_PROGRESS_OPS,
+            Some(move || {
+                let expired = started.elapsed() >= budget;
+                if expired {
+                    marker.store(true, Ordering::Relaxed);
+                }
+                expired
+            }),
+        )
+        .into_setup()
+    {
+        return Bounded::Failed(format!("failed to install the phase deadline: {e}"));
+    }
     let result = {
         let _interrupt = InterruptGuard::arm(conn, budget);
         f(conn)
     };
-    conn.progress_handler(DB_HEALTH_PROGRESS_OPS, None::<fn() -> bool>);
+    // Removing it can only fail harmlessly (the next phase installs its own deadline).
+    let _ = conn
+        .progress_handler(DB_HEALTH_PROGRESS_OPS, None::<fn() -> bool>)
+        .into_setup();
     match result {
         Ok(v) => Bounded::Done(v),
         Err(e)
@@ -139,12 +186,16 @@ pub(crate) fn db_health_report(
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
         MAX_DB_HEALTH_CELL_BYTES,
-    );
+    )
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
     // The metadata phase runs `LIKE` against schema SQL the database file supplies.
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH,
         MAX_LIKE_PATTERN_BYTES,
-    );
+    )
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
 
     // Phase 0: metadata + the (bounded) table listing.
     let meta = run_bounded(&conn, DB_HEALTH_META_BUDGET, |c| {
@@ -857,6 +908,9 @@ pub fn validate_query(sql: &str) -> Result<(), String> {
 }
 
 #[cfg(feature = "sqlite")]
+// `unit_arg`: on rusqlite 0.32 some setters return `()`; `.into_setup()` on that unit is the
+// point (see `SetupOutcome`), so one source compiles fail-closed across the supported range.
+#[allow(clippy::unit_arg)]
 fn query_with_limits(
     db_path: &Path,
     sql: &str,
@@ -882,7 +936,9 @@ fn query_with_limits(
         .map_err(|e| format!("failed to harden database connection: {e}"))?;
     conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(|e| format!("failed to harden database connection: {e}"))?;
-    conn.authorizer(Some(query_authorizer));
+    conn.authorizer(Some(query_authorizer))
+        .into_setup()
+        .map_err(|e| format!("failed to harden database connection: {e}"))?;
 
     // Limit lock waits separately from the CPU deadline enforced below.
     conn.busy_timeout(QUERY_BUSY_TIMEOUT)
@@ -893,20 +949,28 @@ fn query_with_limits(
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
         MAX_QUERY_CELL_BYTES,
-    );
+    )
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH,
         MAX_QUERY_SQL_BYTES as i32,
-    );
+    )
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LIKE_PATTERN_LENGTH,
         MAX_LIKE_PATTERN_BYTES,
-    );
+    )
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
     let started = Instant::now();
     conn.progress_handler(
         QUERY_PROGRESS_OPS,
         Some(move || started.elapsed() >= query_timeout),
-    );
+    )
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
     // Hard wall-clock backstop: the progress handler under-samples a single long op, so also
     // arm an interrupt-handle watchdog. Lives until the query completes (drops/joins on every
     // return path, including `?` errors below).
@@ -922,7 +986,9 @@ fn query_with_limits(
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_COLUMN,
         MAX_QUERY_COLUMNS,
-    );
+    )
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
 
     let mut stmt = conn
         .prepare(sql)
@@ -1751,6 +1817,21 @@ mod tests {
         let (_f, path) = create_test_db();
         let err = query(&path, "SELECT 1; DROP TABLE users", &[], None).unwrap_err();
         assert!(err.contains("stacked queries"));
+    }
+
+    /// R4-DEP1: the setters that install the authorizer, deadlines and size limits return `()`,
+    /// `i32` or `rusqlite::Result` depending on the rusqlite version in the supported range. A
+    /// failed install must surface as an error on every version, never be dropped.
+    #[test]
+    fn a_failed_security_setup_is_an_error_on_every_rusqlite_shape() {
+        assert_eq!(().into_setup(), Ok(()));
+        assert_eq!(0_i32.into_setup(), Ok(()));
+        assert_eq!(Ok::<i32, rusqlite::Error>(7).into_setup(), Ok(()));
+        assert!(
+            Err::<(), _>(rusqlite::Error::InvalidQuery)
+                .into_setup()
+                .is_err()
+        );
     }
 
     /// R4-DB1: the pre-checks were quote-unaware — a `;`, `--` or `/*` inside a string literal

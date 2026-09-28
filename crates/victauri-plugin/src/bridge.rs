@@ -392,7 +392,8 @@ where
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(format!(
-                "{what} did not complete on the main thread: timed out waiting for an earlier                  main-thread call that is still running (it will not run)"
+                "{what} did not complete on the main thread: timed out waiting for an earlier \
+                 main-thread call that is still running (it will not run)"
             ));
         }
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
