@@ -460,3 +460,45 @@ fn r4_js3_network_log_records_the_real_request_target() {
     assert_eq!(q["ipc"], serde_json::json!(["real_cmd"]), "{q}");
     assert_eq!(result(&results, 1), "PATCH");
 }
+
+// ── G-12: an over-large route delay must not fire immediately ────────────────
+
+#[test]
+fn g12_route_delay_is_clamped_to_the_timer_maximum() {
+    let def = def(
+        None,
+        vec![case(
+            "delay_ms above 2^31-1 is clamped, not wrapped to ~0",
+            r"
+            var V = window.__VICTAURI__;
+            var big = V.addRoute({ pattern: 'slow.test', action: 'delay', delay_ms: 4294967296 + 5 });
+            var fbig = V.addRoute({ pattern: 'mock.test', action: 'fulfill', delay_ms: 2147483648, body: 'x' });
+            var inf = V.addRoute({ pattern: 'inf.test', action: 'delay', delay_ms: Infinity });
+            var nan = V.addRoute({ pattern: 'nan.test', action: 'delay', delay_ms: NaN });
+            var neg = V.addRoute({ pattern: 'neg.test', action: 'delay', delay_ms: -5 });
+            var settled = [];
+            fetch('http://slow.test/').then(function() { settled.push('delay'); }, function() { settled.push('delay-err'); });
+            fetch('http://mock.test/').then(function() { settled.push('fulfill'); }, function() { settled.push('fulfill-err'); });
+            await new Promise(function(r) { setTimeout(r, 150); });
+            return { settled: settled, rules: V.getRouteRules().map(function(r) { return r.delay_ms; }) };
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    assert_eq!(r["settled"], serde_json::json!([]), "{r}");
+    assert_eq!(
+        r["rules"],
+        serde_json::json!([
+            2_147_483_647_u32,
+            2_147_483_647_u32,
+            2_147_483_647_u32,
+            0,
+            0
+        ]),
+        "{r}"
+    );
+}

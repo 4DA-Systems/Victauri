@@ -304,6 +304,15 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // Find the first active route rule matching url+method, or null.
     // Never matches Victauri's own internal IPC traffic.
+    // A route delay as setTimeout can honour it. Timers hold a signed 32-bit delay: anything
+    // above 2^31-1 ms (or Infinity) fires almost at once, so a "delay forever" rule silently
+    // became no delay (G-12). Clamp to the maximum; NaN / negative / non-numbers mean none.
+    var MAX_TIMER_DELAY_MS = 2147483647;
+    function clampTimerDelay(ms) {
+        if (typeof ms !== 'number' || !(ms > 0)) return 0;
+        return ms > MAX_TIMER_DELAY_MS ? MAX_TIMER_DELAY_MS : ms;
+    }
+
     function matchRoute(url, method) {
         if (!routeRules.length) return null;
         if (isVictauriInternalUrl(url)) return null;
@@ -1129,7 +1138,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 headers: rule.headers || {},
                 body: (rule.body === undefined || rule.body === null) ? '' : rule.body,
                 content_type: rule.content_type || 'application/json',
-                delay_ms: typeof rule.delay_ms === 'number' ? rule.delay_ms : 0,
+                delay_ms: clampTimerDelay(rule.delay_ms),
                 times: typeof rule.times === 'number' ? rule.times : 0,
                 triggered: 0,
             };
