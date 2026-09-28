@@ -2,8 +2,10 @@
 //!
 //! Victauri servers write discovery files to `<temp>/victauri/<pid>/` with
 //! port, token, and metadata. This module scans those directories and returns
-//! the live server(s). Stale directories from dead processes are cleaned up
-//! by checking TCP connectivity on the advertised port.
+//! the live server(s). A directory is deleted only when its owning process is
+//! definitely dead — never merely because its port did not answer a probe (a
+//! live-but-busy app writes its entry once, so deleting it would make the app
+//! undiscoverable for the rest of its life).
 
 use std::path::PathBuf;
 
@@ -13,7 +15,26 @@ use std::path::PathBuf;
 /// could be pre-created by another user, blocking discovery) — and the legacy
 /// `<temp>/victauri` is still read, subject to the same ownership check, for pre-0.9 plugins.
 /// Other platforms use `<temp>/victauri` (a per-user temp dir).
+#[cfg(not(test))]
 fn discovery_roots() -> Vec<PathBuf> {
+    real_discovery_roots()
+}
+
+/// Unit tests never read (or prune) the machine's REAL discovery directories — a developer's
+/// running apps live there. Every discovery path in this crate's unit tests resolves against
+/// one private, empty, process-wide root instead.
+#[cfg(test)]
+fn discovery_roots() -> Vec<PathBuf> {
+    static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    vec![
+        ROOT.get_or_init(|| tempfile::tempdir().expect("isolated discovery root"))
+            .path()
+            .to_path_buf(),
+    ]
+}
+
+#[cfg_attr(all(test, not(unix)), allow(dead_code))]
+fn real_discovery_roots() -> Vec<PathBuf> {
     let legacy = std::env::temp_dir().join("victauri");
     #[cfg(unix)]
     {
@@ -69,15 +90,12 @@ fn dir_is_trusted(path: &std::path::Path) -> bool {
 /// `#![forbid(unsafe_code)]`): exclusively create a file and read back its owner uid.
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
     for _ in 0..16 {
-        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
+        // Unpredictable name (R4-DISC2): a guessable `<pid>_<seq>` name in the shared temp
+        // dir let another user pre-create every probe path and deny us our own uid.
         let probe = std::env::temp_dir().join(format!(
-            ".victauri_uidprobe_{}_{}",
-            std::process::id(),
-            sequence
+            ".victauri_uidprobe_{}",
+            uuid::Uuid::new_v4().simple()
         ));
         if let Some(uid) = uid_from_exclusive_probe(&probe) {
             return Some(uid);
@@ -108,11 +126,6 @@ fn dir_is_trusted(_path: &std::path::Path) -> bool {
     true
 }
 
-/// Discover one unambiguous live server, keeping its port and token together.
-pub fn scan_discovery_dirs_for_connection() -> Option<(u16, Option<String>)> {
-    unique_connection(&find_live_servers())
-}
-
 /// Return a discovery token only when exactly one live entry advertises `port`.
 pub fn scan_discovery_dirs_for_token_on_port(port: u16) -> Option<String> {
     unique_token_for_port(&find_live_servers(), port)
@@ -133,47 +146,141 @@ pub fn scan_discovery_dir_for_pid(pid: u32) -> Option<(u16, Option<String>)> {
 pub fn configured_port() -> Option<u16> {
     std::env::var("VICTAURI_PORT")
         .ok()
-        .and_then(|value| value.parse::<u16>().ok())
+        .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port != 0)
 }
 
 fn configured_token() -> Option<String> {
     std::env::var("VICTAURI_AUTH_TOKEN")
         .ok()
-        .filter(|token| !token.trim().is_empty())
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
 }
 
-/// Resolve a connection without ever pairing a token with a different port.
+/// The app selector from `VICTAURI_APP` (a Tauri bundle identifier), if set.
+pub fn configured_app() -> Option<String> {
+    std::env::var("VICTAURI_APP")
+        .ok()
+        .map(|app| app.trim().to_string())
+        .filter(|app| !app.is_empty())
+}
+
+/// Resolve a connection without ever pairing a token with a different port, falling back
+/// to the default port with NO token when discovery cannot pick one app. Prefer
+/// [`try_resolve_connection`], which explains an ambiguous or refused resolution.
 pub fn resolve_connection() -> (u16, Option<String>) {
-    let explicit_port = configured_port();
-    let explicit_token = configured_token();
+    try_resolve_connection(None).unwrap_or((DEFAULT_PORT, None))
+}
 
+/// The port a Victauri app binds when nothing else is configured.
+const DEFAULT_PORT: u16 = 7373;
+
+/// Resolve the endpoint to connect to from `VICTAURI_PORT` / `VICTAURI_AUTH_TOKEN` /
+/// `VICTAURI_APP` (or `app`, which overrides `VICTAURI_APP`) and the live discovery entries.
+///
+/// # Errors
+///
+/// A human-readable explanation when several apps match and nothing selects one, when the
+/// selected app is not running, or when an explicit token matches no running app (it is
+/// then sent nowhere rather than to whatever process holds the default port).
+pub fn try_resolve_connection(app: Option<&str>) -> Result<(u16, Option<String>), String> {
+    let app = app.map(str::to_string).or_else(configured_app);
+    let port = configured_port();
+    let token = configured_token();
+    // Only scan when the answer depends on discovery (an explicit port + token does not).
+    let servers = if port.is_some() && token.is_some() {
+        Vec::new()
+    } else {
+        find_live_servers()
+    };
+    resolve_from(port, token, app.as_deref(), &servers)
+}
+
+/// Pure core of [`try_resolve_connection`].
+fn resolve_from(
+    explicit_port: Option<u16>,
+    explicit_token: Option<String>,
+    app: Option<&str>,
+    servers: &[DiscoveredServer],
+) -> Result<(u16, Option<String>), String> {
+    // An explicit port is the caller naming the endpoint: pair it with the explicit token,
+    // else with the token of the one live entry on exactly that port.
     if let Some(port) = explicit_port {
-        let token = explicit_token.or_else(|| scan_discovery_dirs_for_token_on_port(port));
-        return (port, token);
+        let token = explicit_token.or_else(|| unique_token_for_port(servers, port));
+        return Ok((port, token));
     }
 
-    // A configured token is an explicit credential for the default endpoint. Do not
-    // send it to an arbitrary auto-discovered server.
+    let candidates: Vec<&DiscoveredServer> = servers
+        .iter()
+        .filter(|server| app.is_none_or(|app| server.matches_app(app)))
+        .collect();
+
+    // An explicit token WITHOUT an explicit port (R4-TOK1): it used to be sent to whatever
+    // listened on 7373 — on a shared machine, a squatter there received it and could replay
+    // it against the real app. Send it only to the unique live, trusted app whose own
+    // discovery token IS that token.
     if let Some(token) = explicit_token {
-        return (7373, Some(token));
+        let owners: Vec<&&DiscoveredServer> = candidates
+            .iter()
+            .filter(|server| server.token.as_deref() == Some(token.as_str()))
+            .collect();
+        return match owners.as_slice() {
+            [owner] => Ok((owner.port, Some(token))),
+            [] => Err(
+                "VICTAURI_AUTH_TOKEN is set, but no running Victauri app's discovery entry \
+                 carries that token, so it was not sent anywhere (without VICTAURI_PORT it \
+                 would have gone to whatever process holds the default port). Set \
+                 VICTAURI_PORT to the app's port to use this token explicitly, or unset \
+                 VICTAURI_AUTH_TOKEN to use the discovered one."
+                    .to_string(),
+            ),
+            many => Err(ambiguity_message(many.iter().map(|s| **s))),
+        };
     }
 
-    scan_discovery_dirs_for_connection().unwrap_or((7373, None))
+    match (candidates.as_slice(), app) {
+        ([one], _) => Ok((one.port, one.token.clone())),
+        ([], Some(app)) => {
+            let running = if servers.is_empty() {
+                " No Victauri app is running.".to_string()
+            } else {
+                let labels: Vec<String> = servers.iter().map(DiscoveredServer::label).collect();
+                format!(" Running apps:\n  {}", labels.join("\n  "))
+            };
+            Err(format!(
+                "No running Victauri app matches the app selector '{app}' (VICTAURI_APP / \
+                 --app: an exact bundle identifier or product name).{running}"
+            ))
+        }
+        // Nothing discovered: the legacy default endpoint, with no token.
+        ([], None) => Ok((DEFAULT_PORT, None)),
+        (many, _) => Err(ambiguity_message(many.iter().copied())),
+    }
+}
+
+/// "Several apps match" — names each as `identifier (port N, pid P)` and how to pick one
+/// (the same guidance `victauri bridge` gives).
+fn ambiguity_message<'a>(servers: impl Iterator<Item = &'a DiscoveredServer>) -> String {
+    let labels: Vec<String> = servers.map(DiscoveredServer::label).collect();
+    format!(
+        "Multiple Victauri apps are running:\n  {}\nSelect one with `--app <bundle-identifier>` \
+         (victauri CLI) or the VICTAURI_APP env var, or pin the port with VICTAURI_PORT.",
+        labels.join("\n  ")
+    )
 }
 
 /// Re-resolve the endpoint of a previously discovered client, pinned to its app.
 ///
 /// Explicit configuration (`VICTAURI_PORT` / `VICTAURI_AUTH_TOKEN`) is honored exactly
-/// as [`resolve_connection`] does — the caller named the endpoint. Otherwise only a live
-/// discovery entry whose app `identifier` equals `expected_identifier` is accepted; when
-/// the identity is unknown (`None`, e.g. a plugin too old to report one) the single live
-/// server is accepted as before. Returns `None` — never the default port — when nothing
-/// (or more than one server) matches, so a restarted client cannot silently bind to a
-/// different app that happens to hold the shared default port.
+/// as [`try_resolve_connection`] does — the caller named the endpoint. Otherwise only a
+/// live discovery entry whose app `identifier` equals `expected_identifier` is accepted;
+/// when the identity is unknown (`None`, e.g. a plugin too old to report one) the single
+/// live server is accepted as before. Returns `None` — never the default port — when
+/// nothing (or more than one server) matches, so a restarted client cannot silently bind
+/// to a different app that happens to hold the shared default port.
 pub fn resolve_rediscovery(expected_identifier: Option<&str>) -> Option<(u16, Option<String>)> {
     if configured_port().is_some() || configured_token().is_some() {
-        return Some(resolve_connection());
+        return try_resolve_connection(expected_identifier).ok();
     }
     select_for_identity(&find_live_servers(), expected_identifier)
 }
@@ -291,7 +398,7 @@ pub fn diagnose_discovery() -> DiscoveryStatus {
         any_dir = true;
         // A dead owner process is stale even if the advertised (shared default) port is
         // reachable — that reachability is a different live app, not this one.
-        if !is_process_alive(pid) {
+        if !crate::process::is_own_live_process(pid) {
             stale.push((pid, port));
             continue;
         }
@@ -319,6 +426,32 @@ struct DiscoveredServer {
     token: Option<String>,
     /// Tauri app identifier from `metadata.json`, when the plugin recorded one.
     identifier: Option<String>,
+    /// Tauri product name from `metadata.json`, when the plugin recorded one.
+    product_name: Option<String>,
+}
+
+impl DiscoveredServer {
+    /// An app selector matches the bundle identifier or the product name EXACTLY (ASCII
+    /// case-insensitive, like `victauri bridge --app`) — never a substring, so `com.example`
+    /// can't silently bind `com.example.other`.
+    fn matches_app(&self, app: &str) -> bool {
+        let is = |field: &Option<String>| {
+            field
+                .as_deref()
+                .is_some_and(|v| v.eq_ignore_ascii_case(app))
+        };
+        is(&self.identifier) || is(&self.product_name)
+    }
+
+    /// `identifier (port N, pid P)` — the label `victauri bridge` prints, plus the pid.
+    fn label(&self) -> String {
+        let name = self
+            .identifier
+            .as_deref()
+            .or(self.product_name.as_deref())
+            .unwrap_or("<unknown app>");
+        format!("{name} (port {}, pid {})", self.port, self.pid)
+    }
 }
 
 fn unique_connection(servers: &[DiscoveredServer]) -> Option<(u16, Option<String>)> {
@@ -340,7 +473,7 @@ fn unique_token_for_port(servers: &[DiscoveredServer], port: u16) -> Option<Stri
 fn find_live_servers() -> Vec<DiscoveredServer> {
     let mut servers: Vec<DiscoveredServer> = Vec::new();
     for root in discovery_roots() {
-        for server in find_live_servers_in(&root, is_process_alive, port_is_reachable) {
+        for server in find_live_servers_in(&root, crate::process::liveness, port_is_reachable) {
             // A pid already found under a more specific root counts once.
             if !servers.iter().any(|seen| seen.pid == server.pid) {
                 servers.push(server);
@@ -350,21 +483,28 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
     servers
 }
 
-/// Testable core of [`find_live_servers`]: scan `base`, keep only entries whose OWNING
-/// PROCESS is alive and whose advertised port is reachable, and prune the rest.
+/// Testable core of [`find_live_servers`]: scan `base` and keep only entries whose OWNING
+/// PROCESS is alive and ours, and whose advertised port is reachable.
 ///
 /// Liveness is gated on the owning **pid**, not just port reachability — because every
 /// Victauri app registers on the SAME default port (7373). A crashed app's stale entry
 /// still advertises 7373, and a *different* live app now holding 7373 makes that port
 /// probe succeed, so a reachability-only check keeps the dead entry and pairs its stale
 /// token with the live server → 401. Checking the pid distinguishes them: a dead owner
-/// means the entry is stale even when the shared port answers. (The MCP-bridge discovery
-/// path already did this; this brings the test/CLI path in line.)
+/// means the entry is stale even when the shared port answers.
+///
+/// An entry is DELETED only when its owner is definitely dead (R4-DISC1). A live owner
+/// whose port did not answer one short probe (busy, still starting, mid-rebuild) is skipped
+/// for now but kept — the plugin writes its entry once, so deleting it made a live app
+/// undiscoverable for its whole lifetime. An owner whose liveness could not be established
+/// (no working `kill`, an unreadable elevated process) is likewise skipped, never deleted.
 fn find_live_servers_in(
     base: &std::path::Path,
-    is_alive: impl Fn(u32) -> bool,
+    liveness: impl Fn(u32) -> crate::process::Liveness,
     is_reachable: impl Fn(u16) -> bool,
 ) -> Vec<DiscoveredServer> {
+    use crate::process::Liveness;
+
     if !dir_is_trusted(base) {
         return Vec::new();
     }
@@ -389,42 +529,50 @@ fn find_live_servers_in(
         if !dir_is_trusted(&path) {
             continue;
         }
-        // A dead owner process means this entry is stale — even if its advertised port is
-        // reachable, that is a DIFFERENT live app now holding the shared default port, not
-        // this one. Reachability can't tell them apart, so gate on the pid.
-        if !is_alive(pid) {
-            let _ = std::fs::remove_dir_all(&path);
-            continue;
+        match liveness(pid) {
+            Liveness::Own => {}
+            // Definitely gone: the entry is stale even if its advertised (shared default)
+            // port answers — that is a DIFFERENT live app. Clean it up.
+            Liveness::Dead => {
+                let _ = std::fs::remove_dir_all(&path);
+                continue;
+            }
+            // Alive but not verifiably ours, or unknowable: never use its token, never
+            // delete it.
+            _ => continue,
         }
-        let port_path = path.join("port");
-        let Ok(port_str) = std::fs::read_to_string(&port_path) else {
+        let Ok(port_str) = std::fs::read_to_string(path.join("port")) else {
             continue;
         };
         let Ok(port) = port_str.trim().parse::<u16>() else {
             continue;
         };
-        // Live owner but unreachable port = mid-rebuild / not listening yet — not usable now.
+        // Live owner but unreachable port = busy / not listening yet — not usable NOW, but
+        // the entry stays for the next scan.
         if !is_reachable(port) {
-            let _ = std::fs::remove_dir_all(&path);
             continue;
         }
         let token = std::fs::read_to_string(path.join("token"))
             .ok()
             .map(|t| t.trim().to_string())
             .filter(|t| !t.is_empty());
-        let identifier = std::fs::read_to_string(path.join("metadata.json"))
+        let metadata = std::fs::read_to_string(path.join("metadata.json"))
             .ok()
-            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-            .and_then(|meta| {
-                meta.get("identifier")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            });
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let field = |key: &str| {
+            metadata
+                .as_ref()
+                .and_then(|meta| meta.get(key))
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
         servers.push(DiscoveredServer {
             pid,
             port,
             token,
-            identifier,
+            identifier: field("identifier"),
+            product_name: field("product_name"),
         });
     }
     servers
@@ -438,22 +586,16 @@ fn port_is_reachable(port: u16) -> bool {
     .is_ok()
 }
 
-/// Whether `pid` is a live process owned by the current user (see [`crate::process`]).
-/// Used to prune discovery entries whose owning app has exited even when a different app
-/// holds the same shared port.
-fn is_process_alive(pid: u32) -> bool {
-    crate::process::is_own_live_process(pid)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::Liveness;
 
     /// Audit N6: the per-user root is scanned first; the legacy shared root is last.
     #[cfg(unix)]
     #[test]
     fn discovery_roots_are_per_user_first() {
-        let roots = discovery_roots();
+        let roots = real_discovery_roots();
         let euid = current_euid().unwrap();
         assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
         assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
@@ -509,6 +651,7 @@ mod tests {
             port: 7374,
             token: Some("token-b".to_string()),
             identifier: None,
+            product_name: None,
         }];
         assert_eq!(
             unique_connection(&servers),
@@ -524,12 +667,14 @@ mod tests {
                 port: 7373,
                 token: Some("token-a".to_string()),
                 identifier: None,
+                product_name: None,
             },
             DiscoveredServer {
                 pid: 11,
                 port: 7374,
                 token: Some("token-b".to_string()),
                 identifier: None,
+                product_name: None,
             },
         ];
         assert_eq!(
@@ -544,12 +689,14 @@ mod tests {
                 port: 7373,
                 token: Some("old-token".to_string()),
                 identifier: None,
+                product_name: None,
             },
             DiscoveredServer {
                 pid: 13,
                 port: 7373,
                 token: Some("new-token".to_string()),
                 identifier: None,
+                product_name: None,
             },
         ];
         assert_eq!(unique_token_for_port(&duplicate, 7373), None);
@@ -570,7 +717,17 @@ mod tests {
             std::fs::write(dir.join("token"), token).unwrap();
         }
         // pid 2 alive, pid 1 dead; the shared port answers for both.
-        let servers = find_live_servers_in(base.path(), |pid| pid == 2, |_port| true);
+        let servers = find_live_servers_in(
+            base.path(),
+            |pid| {
+                if pid == 2 {
+                    Liveness::Own
+                } else {
+                    Liveness::Dead
+                }
+            },
+            |_port| true,
+        );
 
         assert_eq!(
             servers.len(),
@@ -601,6 +758,7 @@ mod tests {
             port,
             token: Some(token.to_string()),
             identifier: identifier.map(str::to_string),
+            product_name: None,
         }
     }
 
@@ -658,7 +816,7 @@ mod tests {
             r#"{"pid":77,"port":7380,"identifier":"com.meta.app","product_name":"Meta"}"#,
         )
         .unwrap();
-        let servers = find_live_servers_in(base.path(), |_| true, |_| true);
+        let servers = find_live_servers_in(base.path(), |_| Liveness::Own, |_| true);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].identifier.as_deref(), Some("com.meta.app"));
         assert_eq!(
@@ -668,21 +826,143 @@ mod tests {
     }
 
     #[test]
-    fn live_owner_with_unreachable_port_is_pruned() {
-        // A live owning process whose port isn't listening yet (mid-rebuild) is not usable now.
+    fn live_owner_with_unreachable_port_is_skipped_but_kept() {
+        // A live owning process whose port did not answer one short probe (busy, starting,
+        // mid-rebuild) is not usable NOW — but its entry must survive: the plugin writes it
+        // once, so deleting it made the app undiscoverable for its whole life (R4-DISC1).
+        // (This test used to assert the deletion — that was the bug.)
         let base = tempfile::tempdir().unwrap();
         let dir = base.path().join("4242");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("port"), "7373").unwrap();
         std::fs::write(dir.join("token"), "tok").unwrap();
-        let servers = find_live_servers_in(base.path(), |_pid| true, |_port| false);
+        let servers = find_live_servers_in(base.path(), |_pid| Liveness::Own, |_port| false);
         assert!(
             servers.is_empty(),
             "unreachable port => not a usable server"
         );
         assert!(
-            !base.path().join("4242").exists(),
-            "the unreachable dir is pruned"
+            base.path().join("4242").exists(),
+            "a live app's discovery entry must never be deleted"
         );
+        // The next scan, once the app answers, finds it.
+        let servers = find_live_servers_in(base.path(), |_pid| Liveness::Own, |_port| true);
+        assert_eq!(servers.len(), 1);
+    }
+
+    #[test]
+    fn unverifiable_or_unknown_owners_are_neither_used_nor_deleted() {
+        // R4-DISC1: an alive-but-unreadable owner (elevated app on Windows) or an owner whose
+        // liveness could not be checked at all (no `kill` binary) must not lose its entry,
+        // and must not have its token used.
+        let base = tempfile::tempdir().unwrap();
+        for pid in ["10", "11", "12"] {
+            let dir = base.path().join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("port"), "7373").unwrap();
+            std::fs::write(dir.join("token"), format!("tok-{pid}")).unwrap();
+        }
+        let servers = find_live_servers_in(
+            base.path(),
+            |pid| match pid {
+                10 => Liveness::Unverified,
+                11 => Liveness::Unknown,
+                _ => Liveness::OtherUser,
+            },
+            |_| true,
+        );
+        assert!(
+            servers.is_empty(),
+            "no token may be used from these entries"
+        );
+        for pid in ["10", "11", "12"] {
+            assert!(base.path().join(pid).exists(), "entry {pid} must survive");
+        }
+    }
+
+    fn named(
+        pid: u32,
+        port: u16,
+        token: &str,
+        identifier: &str,
+        product: &str,
+    ) -> DiscoveredServer {
+        DiscoveredServer {
+            pid,
+            port,
+            token: Some(token.to_string()),
+            identifier: Some(identifier.to_string()),
+            product_name: Some(product.to_string()),
+        }
+    }
+
+    #[test]
+    fn an_explicit_token_without_a_port_goes_only_to_the_app_that_owns_it() {
+        // R4-TOK1: VICTAURI_AUTH_TOKEN with no VICTAURI_PORT used to resolve to
+        // (7373, token) — handing the token to whoever squats the default port.
+        let servers = vec![
+            named(20, 7373, "squatter-sees-nothing", "com.other.app", "Other"),
+            named(21, 7374, "my-token", "com.mine.app", "Mine"),
+        ];
+        assert_eq!(
+            resolve_from(None, Some("my-token".into()), None, &servers),
+            Ok((7374, Some("my-token".to_string())))
+        );
+        // No running app carries it: refuse (never the default port), and say how to fix.
+        let err = resolve_from(None, Some("my-token".into()), None, &servers[..1]).unwrap_err();
+        assert!(err.contains("VICTAURI_PORT"), "{err}");
+        let err = resolve_from(None, Some("my-token".into()), None, &[]).unwrap_err();
+        assert!(err.contains("not sent anywhere"), "{err}");
+        // Explicit port + explicit token keeps the old behaviour exactly.
+        assert_eq!(
+            resolve_from(Some(7373), Some("t".into()), None, &servers),
+            Ok((7373, Some("t".to_string())))
+        );
+    }
+
+    #[test]
+    fn several_live_apps_are_an_error_naming_each_and_how_to_select() {
+        // R4-CLI1: with two apps and no selector, the CLI silently fell back to
+        // (7373, no token) and then blamed a 401 on a stale CLI.
+        let servers = vec![
+            named(20, 7373, "a", "com.a.app", "A"),
+            named(21, 7374, "b", "com.b.app", "B"),
+        ];
+        let err = resolve_from(None, None, None, &servers).unwrap_err();
+        assert!(err.contains("com.a.app (port 7373"), "{err}");
+        assert!(err.contains("com.b.app (port 7374"), "{err}");
+        assert!(
+            err.contains("VICTAURI_APP") && err.contains("--app"),
+            "{err}"
+        );
+        assert!(err.contains("VICTAURI_PORT"), "{err}");
+        // A selector picks one, by exact identifier or exact product name.
+        assert_eq!(
+            resolve_from(None, None, Some("com.b.app"), &servers),
+            Ok((7374, Some("b".to_string())))
+        );
+        assert_eq!(
+            resolve_from(None, None, Some("A"), &servers),
+            Ok((7373, Some("a".to_string())))
+        );
+        // Never a substring match.
+        let err = resolve_from(None, None, Some("com.b"), &servers).unwrap_err();
+        assert!(err.contains("No running Victauri app matches"), "{err}");
+        // One app, or none, behaves as before.
+        assert_eq!(
+            resolve_from(None, None, None, &servers[..1]),
+            Ok((7373, Some("a".to_string())))
+        );
+        assert_eq!(resolve_from(None, None, None, &[]), Ok((7373, None)));
+    }
+
+    #[test]
+    fn duplicate_identifiers_are_ambiguous_not_first_wins() {
+        let servers = vec![
+            named(20, 7373, "a", "com.dup.app", "Dup"),
+            named(21, 7374, "b", "com.dup.app", "Dup"),
+        ];
+        let err = resolve_from(None, None, Some("com.dup.app"), &servers).unwrap_err();
+        assert!(err.contains("pid 20") && err.contains("pid 21"), "{err}");
     }
 }

@@ -55,6 +55,8 @@ pub use assertions::{
     CheckResult, VerifyBuilder, VerifyReport, assert_ipc_called, assert_ipc_called_with,
     assert_ipc_not_called,
 };
+#[doc(hidden)]
+pub use client::health_status_means_alive;
 pub use client::{
     MemoryStats, PluginInfo, PluginToolInfo, VictauriClient, WaitForBuilder, assert_ipc_healthy,
     assert_json_eq, assert_json_truthy, assert_no_a11y_violations, assert_performance_budget,

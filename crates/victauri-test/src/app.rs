@@ -168,7 +168,8 @@ impl TestApp {
                 reason: format!("health check failed: {e}"),
             })?;
 
-        if !resp.status().is_success() {
+        // A 429 is the server answering (rate-limited): alive (R4-NET1).
+        if !crate::client::health_status_means_alive(resp.status().as_u16()) {
             return Err(TestError::Connection {
                 host: "127.0.0.1".into(),
                 port,
@@ -240,7 +241,7 @@ impl TestApp {
             let url = format!("http://127.0.0.1:{port}/health");
 
             if let Ok(resp) = http.get(&url).send().await
-                && resp.status().is_success()
+                && crate::client::health_status_means_alive(resp.status().as_u16())
             {
                 self.port = port;
                 self.token = token;
@@ -278,10 +279,13 @@ impl TestApp {
         if self.port != 0 {
             let token = std::env::var("VICTAURI_AUTH_TOKEN")
                 .ok()
-                .filter(|value| !value.trim().is_empty())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
                 .or_else(|| crate::discovery::scan_discovery_dirs_for_token_on_port(self.port));
             return (self.port, token);
         }
+        // Never pairs an explicit token with the default port (R4-TOK1); an ambiguous or
+        // refused resolution polls the default port without a token until it resolves.
         crate::discovery::resolve_connection()
     }
 }

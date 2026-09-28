@@ -32,8 +32,13 @@ async fn wait_past_ipc_checkpoint_ms(checkpoint_ms: u64) {
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Headroom added on top of a tool's own `timeout_ms` so the HTTP request never
-/// times out before the server-side wait it is waiting on has finished.
-const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(10);
+/// times out before the server-side wait it is waiting on has finished. Before that wait
+/// starts the server may wait for the webview bridge (up to 5 s), probe it (up to 2 s) and
+/// make main-thread round trips — the same allowance `victauri bridge` uses.
+const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(40);
+
+/// The server's ceiling for any per-call `timeout_ms` (`invoke_command`).
+const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 
 /// Per-request HTTP timeout for a tool call. Tools that block server-side for a
 /// caller-chosen `timeout_ms` (e.g. `wait_for`, which accepts up to 120 000 ms)
@@ -44,9 +49,23 @@ fn request_timeout_for(arguments: &Value) -> Duration {
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .map_or(DEFAULT_REQUEST_TIMEOUT, |ms| {
-            DEFAULT_REQUEST_TIMEOUT
-                .max(Duration::from_millis(ms).saturating_add(TOOL_TIMEOUT_HEADROOM))
+            DEFAULT_REQUEST_TIMEOUT.max(
+                Duration::from_millis(ms.min(MAX_TOOL_TIMEOUT_MS))
+                    .saturating_add(TOOL_TIMEOUT_HEADROOM),
+            )
         })
+}
+
+/// Whether an HTTP status from `GET /health` proves the Victauri server is alive.
+///
+/// A `2xx` does, and so does `429 Too Many Requests`: `/health` shares the public rate-limit
+/// bucket, so anyone on the machine can flood it, and a rate-limited reply is still the
+/// server answering. Treating 429 as "down" let an unauthenticated flood make every client
+/// report a live app as unreachable (round-4 audit R4-NET1).
+#[doc(hidden)]
+#[must_use]
+pub fn health_status_means_alive(status: u16) -> bool {
+    (200..300).contains(&status) || status == 429
 }
 
 /// Truncate `text` to at most `max_chars` characters without splitting a UTF-8
@@ -518,21 +537,39 @@ impl VictauriClient {
     /// Auto-discover a running Victauri server via temp files.
     ///
     /// Discovery priority:
-    /// 1. `VICTAURI_PORT` / `VICTAURI_AUTH_TOKEN` env vars (explicit override)
-    /// 2. Per-process discovery directory: `<temp>/victauri/<pid>/port`
-    /// 3. Default: port 7373, no auth
+    /// 1. `VICTAURI_PORT` (+ optional `VICTAURI_AUTH_TOKEN`) — the explicit endpoint
+    /// 2. Per-process discovery directories (`<root>/<pid>/{port,token,metadata.json}`),
+    ///    narrowed by `VICTAURI_APP` (exact bundle identifier or product name) when set
+    /// 3. Default: port 7373, no auth — only when no Victauri app is discovered at all
+    ///
+    /// A `VICTAURI_AUTH_TOKEN` without `VICTAURI_PORT` is only sent to the running app whose
+    /// own discovery token equals it — never to whatever holds the default port.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Connection`] if the server is unreachable or
-    /// returns a non-success status. Returns [`TestError::Request`] on
-    /// HTTP transport failures.
+    /// Returns [`TestError::Other`] when discovery cannot pick one app (several are running
+    /// and nothing selects one, the selected app is not running, or an explicit token
+    /// matches no running app) — the message names the running apps and how to select one.
+    /// Returns [`TestError::Connection`] if the server is unreachable or returns a
+    /// non-success status. Returns [`TestError::Request`] on HTTP transport failures.
     pub async fn discover() -> Result<Self, TestError> {
-        // Classify the discovery directory BEFORE `discover_port` runs — that path
-        // deletes stale (unreachable) discovery dirs as a side effect, so the
-        // diagnosis must be captured first to explain a subsequent failure.
+        Self::discover_app(None).await
+    }
+
+    /// [`Self::discover`], selecting the app by its exact Tauri bundle identifier (or
+    /// product name) when several Victauri apps are running. `None` falls back to the
+    /// `VICTAURI_APP` env var, then to "the single running app".
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::discover`].
+    pub async fn discover_app(app: Option<&str>) -> Result<Self, TestError> {
+        // Classify the discovery directory BEFORE resolving — resolution deletes the
+        // entries of dead apps as a side effect, so the diagnosis must be captured first
+        // to explain a subsequent failure.
         let diagnosis = crate::discovery::diagnose_discovery();
-        let (port, token) = crate::discovery::resolve_connection();
+        let (port, token) =
+            crate::discovery::try_resolve_connection(app).map_err(TestError::Other)?;
         match Self::connect_with_token(port, token.as_deref()).await {
             Ok(mut client) => {
                 client.discovered = true;
@@ -558,14 +595,17 @@ impl VictauriClient {
 
     /// Check whether the server is still reachable.
     ///
-    /// Sends a GET to `/health` and returns `true` if the response is 200 OK.
+    /// Sends a GET to `/health` and returns `true` if the server answered with a success
+    /// status — or with `429 Too Many Requests`: a rate-limited answer still proves the
+    /// server is alive (an unauthenticated `/health` flood must not make a live app look
+    /// dead, R4-NET1).
     #[must_use]
     pub async fn is_alive(&self) -> bool {
         self.http
             .get(format!("{}/health", self.base_url))
             .send()
             .await
-            .is_ok_and(|r| r.status().is_success())
+            .is_ok_and(|r| health_status_means_alive(r.status().as_u16()))
     }
 
     /// Re-establish an MCP session after the app restarts.
@@ -600,7 +640,7 @@ impl VictauriClient {
                     .get(format!("http://{}:{port}/health", self.host))
                     .send()
                     .await
-                    .is_ok_and(|r| r.status().is_success()),
+                    .is_ok_and(|r| health_status_means_alive(r.status().as_u16())),
                 None => false,
             };
             if alive && let Some((port, token)) = endpoint {
@@ -1046,6 +1086,9 @@ impl VictauriClient {
 
     /// Invoke a Tauri command by name with optional arguments.
     ///
+    /// Uses the server's default command timeout; for a slow command use
+    /// [`Self::invoke_command_with_timeout`].
+    ///
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
@@ -1054,11 +1097,28 @@ impl VictauriClient {
         command: &str,
         args: Option<Value>,
     ) -> Result<Value, TestError> {
-        let mut params = json!({"command": command});
-        if let Some(a) = args {
-            params["args"] = a;
-        }
-        self.call_tool("invoke_command", params).await
+        self.call_tool("invoke_command", invoke_command_params(command, args, None))
+            .await
+    }
+
+    /// [`Self::invoke_command`] with an explicit server-side timeout (`timeout_ms`, capped
+    /// by the server at 300 000 ms) — the option the server's own timeout error tells you to
+    /// set for a slow command. The HTTP request timeout is extended to outlast it.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn invoke_command_with_timeout(
+        &mut self,
+        command: &str,
+        args: Option<Value>,
+        timeout_ms: u64,
+    ) -> Result<Value, TestError> {
+        self.call_tool(
+            "invoke_command",
+            invoke_command_params(command, args, Some(timeout_ms)),
+        )
+        .await
     }
 
     /// Get the IPC call log.
@@ -2201,6 +2261,18 @@ impl VictauriClient {
     }
 }
 
+/// `invoke_command` tool arguments.
+fn invoke_command_params(command: &str, args: Option<Value>, timeout_ms: Option<u64>) -> Value {
+    let mut params = json!({"command": command});
+    if let Some(a) = args {
+        params["args"] = a;
+    }
+    if let Some(ms) = timeout_ms {
+        params["timeout_ms"] = json!(ms);
+    }
+    params
+}
+
 fn save_screenshot_to_file(
     base64_data: &str,
     path: &std::path::Path,
@@ -2498,8 +2570,83 @@ mod transport_tests {
         );
         assert_eq!(
             request_timeout_for(&json!({"timeout_ms": 120_000})),
-            Duration::from_secs(130)
+            Duration::from_secs(160)
         );
+        // Clamped the way the server clamps it.
+        assert_eq!(
+            request_timeout_for(&json!({"timeout_ms": u64::MAX})),
+            Duration::from_secs(340)
+        );
+    }
+
+    #[test]
+    fn invoke_command_with_timeout_sends_timeout_ms_and_outlasts_it() {
+        // R4-TC1: the server tells a slow command's caller to set `timeout_ms`, but the
+        // client had no way to send it.
+        let params = invoke_command_params("slow", Some(json!({"n": 1})), Some(200_000));
+        assert_eq!(params["command"], "slow");
+        assert_eq!(params["args"]["n"], 1);
+        assert_eq!(params["timeout_ms"], 200_000);
+        assert!(request_timeout_for(&params) > Duration::from_millis(200_000));
+        // The plain form is unchanged.
+        assert_eq!(
+            invoke_command_params("fast", None, None),
+            json!({"command": "fast"})
+        );
+    }
+
+    /// A minimal HTTP server answering every request with `status` and an empty body, which
+    /// records the JSON bodies it received.
+    async fn fixed_status_server(
+        status: u16,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let record = std::sync::Arc::clone(&record);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    let reply = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    #[test]
+    fn a_rate_limited_health_answer_means_alive() {
+        // R4-NET1.
+        assert!(health_status_means_alive(200));
+        assert!(health_status_means_alive(204));
+        assert!(health_status_means_alive(429));
+        assert!(!health_status_means_alive(401));
+        assert!(!health_status_means_alive(404));
+        assert!(!health_status_means_alive(500));
+        assert!(!health_status_means_alive(503));
+    }
+
+    #[tokio::test]
+    async fn is_alive_treats_a_rate_limited_server_as_alive() {
+        // R4-NET1: an unauthenticated /health flood (→ 429) must not make a live app look dead.
+        let (port, _) = fixed_status_server(429).await;
+        assert!(client_at(port, false, None).is_alive().await);
+        let (port, _) = fixed_status_server(503).await;
+        assert!(!client_at(port, false, None).is_alive().await);
     }
 
     #[test]
