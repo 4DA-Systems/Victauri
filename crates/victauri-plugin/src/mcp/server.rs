@@ -1231,7 +1231,7 @@ async fn event_drain_loop(
 /// and `recording flush` never ingest the same window's events twice. Returns how many events
 /// were recorded, or `None` if the window could not be drained this time (the position is left
 /// unchanged, so a transient failure just re-reads the same range next time).
-pub async fn drain_window_into_recording(
+pub(super) async fn drain_window_into_recording(
     state: &Arc<VictauriState>,
     bridge: &Arc<dyn WebviewBridge>,
     label: &str,

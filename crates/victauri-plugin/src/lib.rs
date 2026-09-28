@@ -263,11 +263,9 @@ pub struct VictauriState {
     /// Registered through [`VictauriBuilder::probe`].
     pub probes: introspection::AppStateProbes,
     /// Shared per-window watermarks for draining JS events into a recording.
-    #[doc(hidden)]
-    pub drain_watermarks: introspection::DrainWatermarks,
+    pub(crate) drain_watermarks: introspection::DrainWatermarks,
     /// Per-window page-load generations (bumped by each bridge ready signal).
-    #[doc(hidden)]
-    pub page_loads: introspection::PageLoads,
+    pub(crate) page_loads: introspection::PageLoads,
 }
 
 impl VictauriState {

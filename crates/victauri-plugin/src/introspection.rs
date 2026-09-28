@@ -1269,7 +1269,7 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
 /// DIFFERENT page lets the caller fail fast ("the page reloaded while the call was in flight")
 /// instead of waiting out the full timeout.
 #[derive(Default)]
-pub struct PageLoads {
+pub(crate) struct PageLoads {
     last_load: std::sync::Mutex<HashMap<String, PageLoad>>,
     seq: std::sync::atomic::AtomicU64,
     changed: tokio::sync::Notify,
@@ -1277,7 +1277,7 @@ pub struct PageLoads {
 
 /// One recorded ready signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PageLoad {
+pub(crate) struct PageLoad {
     /// Increases with every ready signal (from any window), so a caller can tell "a new signal
     /// since I looked" from "the same one".
     pub seq: u64,
@@ -1339,7 +1339,7 @@ impl PageLoads {
 /// the page's pre-recording history by the `floor_ms` timestamp. A per-window async lock
 /// serializes the two readers for the same window.
 #[derive(Default)]
-pub struct DrainWatermarks {
+pub(crate) struct DrainWatermarks {
     inner: std::sync::Mutex<WatermarkState>,
 }
 
@@ -1354,7 +1354,7 @@ struct WatermarkState {
 /// How far a window's event stream has been drained: the bridge's page `instance` and the
 /// last sequence number read from it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DrainMark {
+pub(crate) struct DrainMark {
     /// Identifies one page load of the window (the sequence restarts on reload).
     pub instance: String,
     /// The last sequence number read from that page.
@@ -1363,7 +1363,7 @@ pub struct DrainMark {
 
 /// Where the next drain of a window starts, captured in one step.
 #[derive(Debug, Clone)]
-pub struct DrainCursor {
+pub(crate) struct DrainCursor {
     /// The recording epoch (recorder generation) this position belongs to.
     pub epoch: u64,
     /// Entries completed at or before this time predate the recording (first read only).
