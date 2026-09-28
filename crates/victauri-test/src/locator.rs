@@ -456,16 +456,7 @@ impl Locator {
         client: &mut VictauriClient,
         want: bool,
     ) -> Result<Value, TestError> {
-        let state = if want { "checked" } else { "unchecked" };
-        let body = format!(
-            "var want = {want}; \
-             if (!want && el.type === 'radio' && el.checked) return {{ {ERROR_KEY}: \
-               'a checked radio button cannot be unchecked; check another option' }}; \
-             if (!!el.checked !== want) el.click(); \
-             return !!el.checked === want ? true : {{ {ERROR_KEY}: \
-               'the element did not become {state} (disabled, or a handler prevented it)' }};"
-        );
-        self.eval_on_element(client, &body).await
+        self.eval_on_element(client, &set_checked_js(want)).await
     }
 
     // ── Query methods ───────────────────────────────────────────────────
@@ -532,7 +523,8 @@ impl Locator {
     ///
     /// Returns [`TestError::ElementNotFound`] if no element matches.
     pub async fn is_checked(&self, client: &mut VictauriClient) -> Result<bool, TestError> {
-        let val = self.eval_on_element(client, "return !!el.checked;").await?;
+        let body = format!("{CHECKED_STATE_JS} return isOn();");
+        let val = self.eval_on_element(client, &body).await?;
         Ok(val.as_bool().unwrap_or(false))
     }
 
@@ -1525,10 +1517,48 @@ async fn check_checked(locator: &Locator, client: &mut VictauriClient) -> Result
     let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
     let code = format!(
         "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-         if (!el) return false; return !!el.checked; }})()"
+         if (!el) return false; {CHECKED_STATE_JS} return isOn(); }})()"
     );
     let val = client.eval_js(&code).await?;
     Ok(val.as_bool().unwrap_or(false))
+}
+
+/// JS (sees the element as `el`) defining `isOn()`: the checked state of a native
+/// checkbox/radio (`el.checked`), else of an ARIA checkbox/radio/switch/menuitemcheckbox
+/// (`aria-checked`, as Radix/Mantine/Headless UI render them on a `<button>`), else of an
+/// ARIA toggle button (`aria-pressed`). `"mixed"` counts as not checked.
+const CHECKED_STATE_JS: &str = "var isOn = function() { \
+     if (el.type === 'checkbox' || el.type === 'radio') return !!el.checked; \
+     var aria = el.getAttribute && el.getAttribute('aria-checked'); \
+     if (aria !== null && aria !== undefined) return aria === 'true'; \
+     var pressed = el.getAttribute && el.getAttribute('aria-pressed'); \
+     if (pressed !== null && pressed !== undefined) return pressed === 'true'; \
+     return !!el.checked; };";
+
+/// The body of [`Locator::check`] / [`Locator::uncheck`] (B-L9).
+///
+/// Clicks only when the state differs, like a user. A native input updates synchronously; an
+/// ARIA checkbox's `aria-checked` is re-rendered by its framework, possibly after the click
+/// returns (React schedules it), so the result is awaited — briefly polled — rather than read
+/// once. Reading `el.checked` alone (the old code) saw `undefined` on an ARIA checkbox: `check()`
+/// clicked, then reported failure, and a retry toggled it back; `uncheck()` did nothing.
+fn set_checked_js(want: bool) -> String {
+    let state = if want { "checked" } else { "unchecked" };
+    format!(
+        "{CHECKED_STATE_JS} var want = {want}; \
+         var radio = el.type === 'radio' || \
+           (el.getAttribute && el.getAttribute('role') === 'radio'); \
+         if (!want && radio && isOn()) return {{ {ERROR_KEY}: \
+           'a checked radio button cannot be unchecked; check another option' }}; \
+         if (isOn() !== want) el.click(); \
+         if (isOn() === want) return true; \
+         return new Promise(function(resolve) {{ var tries = 0; \
+           (function poll() {{ \
+             if (isOn() === want) return resolve(true); \
+             if (++tries > 25) return resolve({{ {ERROR_KEY}: \
+               'the element did not become {state} (disabled, or a handler prevented it)' }}); \
+             setTimeout(poll, 20); }})(); }});"
+    )
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -2000,5 +2030,121 @@ mod tests {
             value: None,
             bounds: None,
         }
+    }
+
+    // ── B-L9: check()/uncheck() on ARIA checkboxes, executed in Node ──
+
+    /// Run `set_checked_js(want)` against fake elements in Node and return one JSON line per
+    /// scenario: `{name, result, on}` (`on` = the element's state afterwards). `None` (test
+    /// skipped) when `node` is not installed.
+    fn run_set_checked_scenarios() -> Option<Vec<serde_json::Value>> {
+        let check = set_checked_js(true);
+        let uncheck = set_checked_js(false);
+        let program = format!(
+            r"
+function aria(role, attr, initial, delayMs, disabled) {{
+  var attrs = {{ role: role }}; attrs[attr] = String(initial);
+  return {{
+    type: undefined,
+    getAttribute: function(k) {{ return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null; }},
+    click: function() {{
+      if (disabled) return;
+      var flip = function() {{ attrs[attr] = String(attrs[attr] !== 'true'); }};
+      if (delayMs) setTimeout(flip, delayMs); else flip();
+    }},
+    on: function() {{ return attrs[attr] === 'true'; }}
+  }};
+}}
+function native(type, initial) {{
+  var el = {{ type: type, checked: initial, getAttribute: function() {{ return null; }},
+             click: function() {{ el.checked = type === 'radio' ? true : !el.checked; }},
+             on: function() {{ return el.checked; }} }};
+  return el;
+}}
+var ERR = '{ERROR_KEY}';
+async function run(name, el, want) {{
+  var result = await (want ? (function() {{ {check} }})() : (function() {{ {uncheck} }})());
+  if (result && typeof result === 'object' && ERR in result) result = 'error: ' + result[ERR];
+  console.log(JSON.stringify({{ name: name, result: result, on: el.on() }}));
+}}
+(async function() {{
+  var el;
+  el = aria('checkbox', 'aria-checked', false); await run('aria check', el, true);
+  el = aria('checkbox', 'aria-checked', true); await run('aria uncheck', el, false);
+  el = aria('checkbox', 'aria-checked', true); await run('aria check when already on', el, true);
+  el = aria('checkbox', 'aria-checked', false, 40); await run('aria async check', el, true);
+  el = aria('switch', 'aria-checked', true, 40); await run('aria async uncheck', el, false);
+  el = aria('button', 'aria-pressed', false); await run('pressed toggle', el, true);
+  el = aria('radio', 'aria-checked', true); await run('aria radio uncheck', el, false);
+  el = aria('checkbox', 'aria-checked', false, 0, true); await run('aria disabled', el, true);
+  el = native('checkbox', false); await run('native check', el, true);
+  el = native('checkbox', true); await run('native uncheck', el, false);
+}})();
+"
+        );
+        let out = match std::process::Command::new("node")
+            .args(["-e", &program])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("skipping: node is not available ({e})");
+                return None;
+            }
+        };
+        assert!(
+            out.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("scenario JSON"))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn check_and_uncheck_work_on_aria_checkboxes() {
+        let Some(results) = run_set_checked_scenarios() else {
+            return;
+        };
+        let by_name = |name: &str| {
+            results
+                .iter()
+                .find(|r| r["name"] == name)
+                .unwrap_or_else(|| panic!("no scenario {name}: {results:?}"))
+                .clone()
+        };
+        for (name, on) in [
+            ("aria check", true),
+            ("aria uncheck", false),
+            ("aria check when already on", true),
+            ("aria async check", true),
+            ("aria async uncheck", false),
+            ("pressed toggle", true),
+            ("native check", true),
+            ("native uncheck", false),
+        ] {
+            let r = by_name(name);
+            assert_eq!(r["result"], serde_json::json!(true), "{name}: {r}");
+            assert_eq!(r["on"], serde_json::json!(on), "{name}: {r}");
+        }
+        let radio = by_name("aria radio uncheck");
+        assert!(
+            radio["result"]
+                .as_str()
+                .is_some_and(|s| s.contains("radio")),
+            "{radio}"
+        );
+        assert_eq!(radio["on"], serde_json::json!(true));
+        let disabled = by_name("aria disabled");
+        assert!(
+            disabled["result"]
+                .as_str()
+                .is_some_and(|s| s.contains("did not become checked")),
+            "{disabled}"
+        );
     }
 }
