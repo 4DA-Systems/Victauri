@@ -4986,10 +4986,16 @@ impl VictauriMcpHandler {
             Some(target.as_str())
         };
         let check = crate::js_bridge::eval_check_script(&id, armed_nonce.as_deref());
-        if let Err(e) = self.bridge.eval_webview(deliver_to, &check) {
-            // Only the fast parse-error report is lost; the code itself was delivered.
-            tracing::debug!("eval parse check not delivered: {e}");
-        }
+        // The check only runs when the page reported a nonce (see `eval_check_script`) and the
+        // script reached it; only then can a timeout rule out a parse error.
+        let parse_check_armed = match self.bridge.eval_webview(deliver_to, &check) {
+            Ok(()) => armed_nonce.is_some(),
+            Err(e) => {
+                // Only the fast parse-error report is lost; the code itself was delivered.
+                tracing::debug!("eval parse check not delivered: {e}");
+                false
+            }
+        };
 
         // While waiting, watch for the ways a call ends with NO callback ever coming: the
         // target window was destroyed, it loaded a new page, or the app began shutting down.
@@ -5100,15 +5106,27 @@ impl VictauriMcpHandler {
                 // if the bridge is gone (reloaded/crashed) the next call fails in
                 // ~2s instead of blocking the full timeout again.
                 self.timed_out_labels.lock().await.insert(label_key.clone());
+                let (began, parse_note) = if parse_check_armed {
+                    (
+                        "the code began executing but never resolved",
+                        "(A syntax/parse error is reported immediately, so this is NOT a parse \
+                         error.) Common causes",
+                    )
+                } else {
+                    (
+                        "no result arrived",
+                        "(The fast syntax-error check could not run for this call, so a parse \
+                         error could not be ruled out — check the code's syntax.) Other causes",
+                    )
+                };
                 Err(EvalFailure::new(
                     Aborted,
                     format!(
-                        "eval timed out after {} — the code began executing but never resolved. \
-                         (A syntax/parse error is reported immediately, so this is NOT a parse \
-                         error.) Common causes: an unresolved promise, an infinite loop, an \
-                         `await` on something that never settles, or the webview reloaded / the \
-                         app stopped responding mid-eval. If the app may have navigated or \
-                         crashed, retry (the next call fails fast if the bridge is gone).",
+                        "eval timed out after {} — {began}. {parse_note}: an unresolved \
+                         promise, an infinite loop, an `await` on something that never settles, \
+                         or the webview reloaded / the app stopped responding mid-eval. If the \
+                         app may have navigated or crashed, retry (the next call fails fast if \
+                         the bridge is gone).",
                         format_timeout(timeout)
                     ),
                 ))
@@ -8271,6 +8289,72 @@ mod command_policy_dispatch_tests {
             "aborted on no evidence: {text}"
         );
         assert!(text.contains("timed out"), "{text}");
+    }
+
+    /// B-L5: the timeout message rules out a parse error only when the fast parse check was
+    /// actually armed (the page reported a nonce) and delivered; otherwise it cannot know.
+    #[tokio::test]
+    async fn a_timeout_claims_no_parse_error_only_when_the_parse_check_ran() {
+        let state = eval_state_with_timeout(300);
+        // No nonce from the probe: the parse check is disabled.
+        let h = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(RecordingBridge::answering(state.pending_evals.clone())),
+        );
+        let (text, _) = hanging_eval(&h).await;
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains("NOT a parse"), "unfounded claim: {text}");
+        assert!(text.contains("could not be ruled out"), "{text}");
+        // Armed and delivered: the claim holds.
+        let h = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(RecordingBridge::in_page(state.pending_evals.clone(), "p1")),
+        );
+        let (text, _) = hanging_eval(&h).await;
+        assert!(text.contains("NOT a parse error"), "{text}");
+        // Armed but the check could not be delivered.
+        let h = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(CheckNotDeliveredBridge(RecordingBridge::in_page(
+                state.pending_evals.clone(),
+                "p1",
+            ))),
+        );
+        let (text, _) = hanging_eval(&h).await;
+        assert!(!text.contains("NOT a parse"), "unfounded claim: {text}");
+    }
+
+    /// Delivers everything but the eval's parse-check script.
+    struct CheckNotDeliveredBridge(RecordingBridge);
+
+    impl WebviewBridge for CheckNotDeliveredBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            if script.contains("_evalCheck") {
+                return Err("window busy".to_string());
+            }
+            self.0.eval_webview(label, script)
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            vec!["main".to_string()]
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
     }
 
     /// A page that answers WITHOUT the armed nonce (the bridge that armed the eval is gone)
