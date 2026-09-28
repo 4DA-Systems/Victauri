@@ -275,20 +275,29 @@ const RESOURCE_URI_STATE: &str = "victauri://state";
 /// only honors TTLs re-syncs within minutes of an app rebuild on the same port.
 const LIST_RESULT_TTL_MS: u64 = 300_000;
 
-/// Map an MCP resource URI to the privacy capability that gates its
-/// tool-equivalent read. Resources are served outside the tool dispatcher, so
-/// this lets `read_resource`/`subscribe` apply the same privacy matrix (audit
-/// B1). Returns `None` for an unknown URI (handled as not-found downstream).
-fn resource_required_capability(uri: &str) -> Option<&'static str> {
+/// Map an MCP resource URI to the tool call it mirrors: `(bare tool, capability)`.
+/// Resources are served outside the tool dispatcher, so `read_resource`/`subscribe` apply
+/// the same gate as a call of that tool action (audit B1) — including a disable of the
+/// whole tool by its bare name (R4-NET3). Returns `None` for an unknown URI (handled as
+/// not-found downstream).
+fn resource_required_capability(uri: &str) -> Option<(&'static str, &'static str)> {
     match uri {
         // Reading the IPC log via a resource == the `logs ipc` tool action.
-        RESOURCE_URI_IPC_LOG => Some("logs.ipc"),
+        RESOURCE_URI_IPC_LOG => Some(("logs", "logs.ipc")),
         // Window states == the `window list` action.
-        RESOURCE_URI_WINDOWS => Some("window.list"),
+        RESOURCE_URI_WINDOWS => Some(("window", "window.list")),
         // The state summary == reading plugin info.
-        RESOURCE_URI_STATE => Some("get_plugin_info"),
+        RESOURCE_URI_STATE => Some(("get_plugin_info", "get_plugin_info")),
         _ => None,
     }
+}
+
+/// Whether the privacy configuration permits reading (or subscribing to) resource `uri`:
+/// exactly when it permits the tool call the resource mirrors. An unknown URI is not gated
+/// here (it is reported as not found).
+fn resource_allowed(privacy: &crate::privacy::PrivacyConfig, uri: &str) -> bool {
+    resource_required_capability(uri)
+        .is_none_or(|(tool, capability)| privacy.is_call_allowed(tool, capability))
 }
 
 const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -5318,9 +5327,7 @@ impl ServerHandler for VictauriMcpHandler {
         // Resources bypass the tool dispatcher, so they must apply the same privacy
         // gate themselves (audit B1): a strict profile that blocks log/window reads
         // as tools must not be able to read the same data via a resource.
-        if let Some(cap) = resource_required_capability(uri.as_str())
-            && !self.state.privacy.is_tool_enabled(cap)
-        {
+        if !resource_allowed(&self.state.privacy, uri.as_str()) {
             return Err(ErrorData::invalid_request(
                 format!("resource {uri} is not permitted by the current privacy configuration"),
                 None,
@@ -5392,9 +5399,7 @@ impl ServerHandler for VictauriMcpHandler {
         let uri = &request.uri;
         // Same privacy gate as read_resource (audit B1) — don't let a blocked
         // resource be subscribed to for push updates.
-        if let Some(cap) = resource_required_capability(uri.as_str())
-            && !self.state.privacy.is_tool_enabled(cap)
-        {
+        if !resource_allowed(&self.state.privacy, uri.as_str()) {
             return Err(ErrorData::invalid_request(
                 format!("resource {uri} is not permitted by the current privacy configuration"),
                 None,
@@ -8411,9 +8416,14 @@ mod command_policy_dispatch_tests {
             RESOURCE_URI_WINDOWS,
             RESOURCE_URI_STATE,
         ] {
-            let cap = resource_required_capability(uri).expect("resource maps to a capability");
+            let (_, cap) =
+                resource_required_capability(uri).expect("resource maps to a capability");
             assert!(
                 !cfg.is_tool_enabled(cap),
+                "disabling capability {cap} must gate resource {uri} (audit B1)"
+            );
+            assert!(
+                !resource_allowed(&cfg, uri),
                 "disabling capability {cap} must gate resource {uri} (audit B1)"
             );
         }
@@ -8424,8 +8434,67 @@ mod command_policy_dispatch_tests {
             RESOURCE_URI_WINDOWS,
             RESOURCE_URI_STATE,
         ] {
-            assert!(full.is_tool_enabled(resource_required_capability(uri).unwrap()));
+            assert!(full.is_tool_enabled(resource_required_capability(uri).unwrap().1));
+            assert!(resource_allowed(&full, uri));
         }
+    }
+
+    /// One JSON-RPC request to `/mcp` (legacy protocol, so the legacy subscribe method is
+    /// routed); returns the response body text.
+    async fn mcp_body(privacy: PrivacyConfig, method: &str, params: serde_json::Value) -> String {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let app = build_app(state_with(privacy), Arc::new(RecordingBridge::default()));
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let req = axum::http::Request::post("/mcp")
+            .header("host", "127.0.0.1:7373")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(20), app.oneshot(req))
+            .await
+            .expect("an MCP request must be answered")
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// R4-NET3: a resource mirrors a tool action, and disabling the TOOL by its bare name
+    /// (`disable_tools(["logs"])`) blocks every one of its actions — so it must block the
+    /// resource too. The gate checked only the capability (`logs.ipc`), so the bare-name
+    /// disable was ignored for resources (read and the legacy subscribe).
+    #[tokio::test]
+    async fn a_bare_tool_disable_also_blocks_its_resources() {
+        for (disabled, uri) in [
+            ("logs", RESOURCE_URI_IPC_LOG),
+            ("window", RESOURCE_URI_WINDOWS),
+            ("get_plugin_info", RESOURCE_URI_STATE),
+        ] {
+            let cfg = || PrivacyConfig {
+                disabled_tools: HashSet::from([disabled.to_string()]),
+                ..Default::default()
+            };
+            for method in ["resources/read", "resources/subscribe"] {
+                let body = mcp_body(cfg(), method, json!({"uri": uri})).await;
+                assert!(
+                    body.contains("not permitted by the current privacy configuration"),
+                    "disable_tools([{disabled:?}]) must block {method} {uri}: {body}"
+                );
+            }
+        }
+        // Positive control: nothing disabled, the resource reads.
+        let body = mcp_body(
+            PrivacyConfig::default(),
+            "resources/read",
+            json!({"uri": RESOURCE_URI_WINDOWS}),
+        )
+        .await;
+        assert!(
+            body.contains("\"contents\"") && !body.contains("not permitted"),
+            "{body}"
+        );
     }
 
     // ── empty/whitespace auth token collapses to NO auth (audit B2) ───────────
