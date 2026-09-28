@@ -5656,12 +5656,44 @@ const ASI_CONTINUES_AFTER: &[u8] = b"+-*/%&|^!=<>?:,.([{~";
 /// `[` and a template literal, which JavaScript itself treats as a continuation.
 const ASI_CONTINUES_BEFORE: &[u8] = b".?)]}+-*/%&|^=<>,:([`";
 
-/// Strip leading whitespace and `//` / `/* */` comments.
+/// Length of the JavaScript line terminator at byte `i` — LF, CR, CRLF (2), or U+2028 /
+/// U+2029 (3) — or 0 when there is none there.
+fn line_terminator_len(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i) {
+        Some(b'\n') => 1,
+        Some(b'\r') => 1 + usize::from(bytes.get(i + 1) == Some(&b'\n')),
+        Some(0xE2)
+            if bytes.get(i + 1) == Some(&0x80) && matches!(bytes.get(i + 2), Some(0xA8 | 0xA9)) =>
+        {
+            3
+        }
+        _ => 0,
+    }
+}
+
+/// Index of the first line terminator at or after byte `from`, if any.
+fn find_line_terminator(bytes: &[u8], from: usize) -> Option<usize> {
+    (from..bytes.len()).find(|&i| line_terminator_len(bytes, i) > 0)
+}
+
+/// `code` after the rest of its current line (and that line's terminator); `""` if none.
+fn after_line(code: &str) -> &str {
+    let bytes = code.as_bytes();
+    find_line_terminator(bytes, 0).map_or("", |n| &code[n + line_terminator_len(bytes, n)..])
+}
+
+/// Strip leading whitespace and comments: `//`, `/* */`, and the HTML-like `<!--` / `-->`
+/// line comments (the code starts a line). Every JavaScript line terminator ends a line
+/// comment — CR and U+2028/U+2029 as well as LF.
 fn strip_leading_js_comments(mut code: &str) -> &str {
     loop {
         code = code.trim_start();
-        if let Some(rest) = code.strip_prefix("//") {
-            code = rest.find('\n').map_or("", |n| &rest[n + 1..]);
+        if let Some(rest) = code
+            .strip_prefix("//")
+            .or_else(|| code.strip_prefix("<!--"))
+            .or_else(|| code.strip_prefix("-->"))
+        {
+            code = after_line(rest);
         } else if let Some(rest) = code.strip_prefix("/*") {
             code = rest.find("*/").map_or("", |n| &rest[n + 2..]);
         } else {
@@ -5725,12 +5757,10 @@ fn should_prepend_return(code: &str) -> bool {
 
     while i < bytes.len() {
         let c = bytes[i];
-        // U+2028 / U+2029 are JavaScript line terminators too.
-        let line_sep = c == 0xE2
-            && bytes.get(i + 1) == Some(&0x80)
-            && matches!(bytes.get(i + 2), Some(&0xA8 | &0xA9));
-        if state == Code && (c == b'\n' || line_sep) {
-            let next_start = if line_sep { i + 3 } else { i + 1 };
+        // LF, CR, CRLF and U+2028 / U+2029 are all JavaScript line terminators.
+        let terminator = line_terminator_len(bytes, i);
+        if state == Code && terminator > 0 {
+            let next_start = i + terminator;
             if depth <= 0 && asi_ends_statement(code, next_start, last_sig, prev_sig, last_sig_idx)
             {
                 return false;
@@ -5742,13 +5772,12 @@ fn should_prepend_return(code: &str) -> bool {
         match state {
             Code => {
                 // HTML-like comments (Script goal): `<!--` anywhere, and `-->` at the start of
-                // a line, comment out the rest of the line.
-                if bytes[i..].starts_with(b"<!--")
+                // a line, comment out the rest of the line — up to ANY line terminator.
+                let line_comment = bytes[i..].starts_with(b"<!--")
                     || (at_line_start && bytes[i..].starts_with(b"-->"))
-                {
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
+                    || bytes[i..].starts_with(b"//");
+                if line_comment {
+                    i = find_line_terminator(bytes, i).unwrap_or(bytes.len());
                     continue;
                 }
                 if !c.is_ascii_whitespace() {
@@ -5758,24 +5787,28 @@ fn should_prepend_return(code: &str) -> bool {
                     b'\'' => state = SingleQuote,
                     b'"' => state = DoubleQuote,
                     b'`' => state = Template,
-                    b'/' if bytes.get(i + 1) == Some(&b'/') => {
-                        while i < bytes.len() && bytes[i] != b'\n' {
-                            i += 1;
-                        }
-                        continue;
-                    }
                     b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                        i += 2;
-                        while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                            i += 1;
+                        let body_start = i + 2;
+                        let end = code[body_start..]
+                            .find("*/")
+                            .map_or(bytes.len(), |n| body_start + n);
+                        i = (end + 2).min(bytes.len());
+                        // A block comment spanning a line break IS a line break for ASI:
+                        // `a = 1 /*\n*/ b = 2` is two statements.
+                        if find_line_terminator(&bytes[..end], body_start).is_some() {
+                            if depth <= 0
+                                && asi_ends_statement(code, i, last_sig, prev_sig, last_sig_idx)
+                            {
+                                return false;
+                            }
+                            at_line_start = true;
                         }
-                        i += 2;
                         continue;
                     }
                     // After `}` a `/` is division if the brace closed an object literal, and a
                     // regex if it closed a block — undecidable here, so run the code as-is.
                     b'/' if last_sig == Some(b'}') => return false,
-                    b'/' if slash_starts_regex(code, last_sig, prev_sig, last_sig_idx) => {
+                    b'/' if slash_starts_regex(code, last_sig, prev_sig, last_sig_idx, depth) => {
                         // A regex literal: skip it whole (a quote or newline-like character
                         // inside it must not be read as code), then its flags.
                         i = skip_regex_literal(bytes, i);
@@ -5862,6 +5895,10 @@ fn js_keyword_ending_at(code: &str, end: usize) -> &str {
 }
 
 /// Keywords after which an expression (not a statement end) must follow.
+///
+/// NOT listed: `yield`, which is a plain identifier inside the async-arrow wrapper eval code
+/// runs in (it is a keyword only in generators and strict code), and `of`, which is a keyword
+/// only inside a `for (… of …)` head — see [`is_expr_keyword`].
 const EXPR_KEYWORDS: &[&str] = &[
     "instanceof",
     "in",
@@ -5870,14 +5907,36 @@ const EXPR_KEYWORDS: &[&str] = &[
     "delete",
     "new",
     "await",
-    "yield",
     "return",
     "case",
     "do",
     "else",
-    "of",
     "throw",
 ];
+
+/// Whether `word`, found at bracket depth `depth`, is a keyword after which an operand must
+/// follow. `of` is one only inside brackets (a `for (x of …)` head); at depth 0 it is an
+/// identifier (`of` then a new line then `foo()` is two statements).
+fn is_expr_keyword(word: &str, depth: i32) -> bool {
+    (word == "of" && depth > 0) || EXPR_KEYWORDS.contains(&word)
+}
+
+/// Is the `.` at byte `dot` the end of a numeric literal (`1.`) — a complete operand — rather
+/// than a member access? Only a plain decimal integer (digits and `_`, not itself after a `.`)
+/// qualifies: `a1.`, `x.`, `0x1.`, `1e3.`, `1n.` and `1.5.` are member accesses. A misread
+/// only matters in one direction: reading a member access as a complete number merely skips
+/// the `return` prepend, which is always safe.
+fn dot_completes_number(code: &str, dot: usize) -> bool {
+    let bytes = code.as_bytes();
+    let mut start = dot;
+    while start > 0 && is_js_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+    let word = &bytes[start..dot];
+    word.first().is_some_and(u8::is_ascii_digit)
+        && word.iter().all(|b| b.is_ascii_digit() || *b == b'_')
+        && !(start > 0 && bytes[start - 1] == b'.')
+}
 
 /// A line (or operand) ending in POSTFIX `++`/`--`.
 fn ends_in_postfix(last_sig: Option<u8>, prev_sig: Option<u8>) -> bool {
@@ -5910,8 +5969,12 @@ fn asi_ends_statement(
     if ends_in_postfix(last_sig, prev_sig) {
         return true;
     }
-    let continues_after = last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p))
-        || EXPR_KEYWORDS.contains(&js_keyword_ending_at(code, last_sig_idx));
+    // A line ending in `1.` ends in a complete number, not a member access: `1.` then a new
+    // line then `f()` is two statements.
+    let number_dot = last_sig == Some(b'.') && dot_completes_number(code, last_sig_idx);
+    let continues_after = (!number_dot
+        && last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p)))
+        || is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), 0);
     !(continues_after || ASI_CONTINUES_BEFORE.contains(&next))
 }
 
@@ -5924,6 +5987,7 @@ fn slash_starts_regex(
     last_sig: Option<u8>,
     prev_sig: Option<u8>,
     last_sig_idx: usize,
+    depth: i32,
 ) -> bool {
     if ends_in_postfix(last_sig, prev_sig) {
         return false;
@@ -5932,7 +5996,7 @@ fn slash_starts_regex(
         None => true,
         Some(b) if b"(,=:[!&|?{};+-*%<>~^".contains(&b) => true,
         Some(b) if is_js_ident(b) => {
-            EXPR_KEYWORDS.contains(&js_keyword_ending_at(code, last_sig_idx))
+            is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), depth)
         }
         Some(_) => false,
     }
@@ -5948,7 +6012,8 @@ fn skip_regex_literal(bytes: &[u8], start: usize) -> usize {
             b'[' => in_class = true,
             b']' => in_class = false,
             b'/' if !in_class => break,
-            b'\n' => return i, // unterminated: let the newline be scanned normally
+            // Unterminated at a line terminator (any of them): let it be scanned normally.
+            _ if line_terminator_len(bytes, i) > 0 => return i,
             _ => {}
         }
         i += 1;
@@ -6350,6 +6415,92 @@ mod tests {
         "typeof x / 2; f()",
     ];
 
+    /// Multi-statement snippets from the 0.9 round-4 audit (R4-EVAL2): each was wrapped with
+    /// `return` and silently lost everything after its first statement.
+    const ASI_ROUND4_STATEMENT_CASES: &[&str] = &[
+        // (a) a block comment spanning a line break is a line break
+        "x = 1 /*\n*/ f()",
+        "x = 1 /*\r*/ f()",
+        "x = 1 /*\u{2028}*/ f()",
+        "x = 1 /* a\n b */ f()",
+        // (b) a lone CR (and CRLF) is a line terminator everywhere
+        "x = 1\rf()",
+        "x = 1\r\nf()",
+        "x = 1 // note\rf()",
+        "x = 1 // note\u{2028}f()",
+        "f() <!-- c\rf()",
+        "f()\r--> c\rf()",
+        "x = /a/g\rf()",
+        // (c) a number ending in `.` is a complete operand
+        "x = 1.\nf()",
+        "x = 1_0.\rf()",
+        "x = 10.\n\nf()",
+        // (d) `yield` is an identifier in the eval wrapper; `of` is one at depth 0
+        "x = typeof yield\nf()",
+        "x = typeof of\nf()",
+    ];
+
+    /// Table for R4-EVAL2: `(code, wrap?)` — every shape the fix touches, both ways.
+    #[test]
+    fn prepend_return_round4_shapes() {
+        for code in ASI_ROUND4_STATEMENT_CASES {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+        for code in [
+            "x /* no line break */ + 1",
+            "x /*\n*/ + 1",
+            "x +\r1",
+            "x\r.toString()",
+            "a instanceof\r\nB",
+            "1.5\n.toFixed(1)",
+            "obj.of.\nlength",
+            "0x10.\ntoString()",
+            "1e3.\ntoFixed(0)",
+            "(1).\ntoFixed(0)",
+            "document.title // trailing note\r",
+            "-->x\ndocument.title",
+            "<!-- x\rdocument.title",
+            "// lead\u{2028}document.title",
+            "[1].map(y => { for (const z of\n[2]) {} })",
+        ] {
+            assert!(should_prepend_return(code), "must wrap: {code:?}");
+        }
+    }
+
+    #[test]
+    fn line_terminators_and_number_dots_are_recognized() {
+        for (s, at, len) in [
+            ("a\nb", 1, 1),
+            ("a\rb", 1, 1),
+            ("a\r\nb", 1, 2),
+            ("a\u{2028}b", 1, 3),
+            ("a\u{2029}b", 1, 3),
+            ("a b", 1, 0),
+            ("a\u{2027}b", 1, 0),
+        ] {
+            assert_eq!(line_terminator_len(s.as_bytes(), at), len, "{s:?}");
+        }
+        for (code, complete) in [
+            ("1.", true),
+            ("x = 10.", true),
+            ("1_000.", true),
+            ("a1.", false),
+            ("x.", false),
+            ("0x1.", false),
+            ("1e3.", false),
+            ("1n.", false),
+            ("1.5.", false),
+            ("(1).", false),
+            ("1 .", false),
+        ] {
+            assert_eq!(
+                dot_completes_number(code, code.len() - 1),
+                complete,
+                "{code:?}"
+            );
+        }
+    }
+
     /// Run each `(code, expected_return, expected_log)` through the REAL eval wrapper shape
     /// (the code inlined in an async arrow, prepended with `return` exactly when
     /// [`should_prepend_return`] says so) in Node, and check every statement ran and the
@@ -6358,6 +6509,7 @@ mod tests {
     fn prepend_return_decisions_run_every_statement_in_node() {
         let mut cases: Vec<(&str, &str, Vec<&str>)> = ASI_ROUND2_STATEMENT_CASES
             .iter()
+            .chain(ASI_ROUND4_STATEMENT_CASES)
             .map(|c| {
                 let n = c.matches("f()").count() + c.matches("(f)()").count();
                 (*c, "undefined", vec!["f"; n])
@@ -6372,6 +6524,11 @@ mod tests {
             ("f() <!-- trailing html comment", "1", vec!["f"]),
             ("f()\n+ 1", "2", vec!["f"]),
             ("document", "\"doc\"", vec![]),
+            ("x +\r1", "1", vec![]),
+            ("x /*\n*/ + 1", "1", vec![]),
+            ("obj.of.\nlength", "2", vec![]),
+            ("0x10.\ntoString()", "\"16\"", vec![]),
+            ("-->x\ndocument", "\"doc\"", vec![]),
         ]);
         let bodies: Vec<String> = cases
             .iter()
