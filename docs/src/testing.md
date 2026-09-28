@@ -686,7 +686,7 @@ async fn smoke() {
 }
 ```
 
-The 11 checks: health endpoint, eval, DOM snapshot, screenshot, window state, IPC integrity, memory, accessibility (violations), accessibility (warnings), performance, and health endpoint hardening.
+The 11 checks: `eval_js` works, DOM snapshot valid, screenshot captures an image, windows exist, IPC integrity healthy, no uncaught errors, accessibility audit, DOM complete under the load budget (`--max-load-ms`), JS heap under the memory budget (`--max-heap-mb`), recording lifecycle, and health endpoint hardened.
 
 Reports include timing data and can export to JUnit XML for CI integration.
 

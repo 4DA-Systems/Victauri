@@ -27,9 +27,19 @@ Exhaustive `match`es on the now-`#[non_exhaustive]` enums (`InteractionKind`, `C
 `FaultType`, `JsonShape`, `PrivacyProfile`, `ThresholdPreset`) need a `_ =>` arm, and patterns on
 `AppEvent`'s struct variants need `..`.
 
-**No longer public API:** `victauri_plugin::filmstrip`, `mcp::parse_bridge_event_from`; the
-`js_bridge`, `screencast`, `database` modules and a few helpers are `#[doc(hidden)]` (reachable for
-tests, not covered by semver).
+**No longer public API:** `victauri_plugin::filmstrip`; the `js_bridge`, `screencast`, `database`
+modules, `mcp::build_app_stateful` and a few helpers are `#[doc(hidden)]` (reachable for tests, not
+covered by semver — `Screencast::start`/`stop` also changed signature).
+
+**Types you can read but not build.** Some newly `#[non_exhaustive]` output types have no public
+constructor because nothing outside Victauri should create them: `DomSnapshot`, `DomElement`,
+`VerificationResult`, `StateCheckpoint`, `SmokeReport`, `CoverageReport` and similar reports. If a
+test needs one (e.g. a `StateCheckpoint` for `RecordedSession::new`), deserialize it from JSON with
+`serde_json::from_value`.
+
+**`WebviewBridge` implementors (mock bridges):** three methods were added, all with default
+implementations, so existing impls compile unchanged — `try_get_window_states`,
+`try_list_window_labels` and `eval_webview_resolved`. Future additions will also have defaults.
 
 **Behavior changes to be aware of:**
 
@@ -65,8 +75,12 @@ tests, not covered by semver).
 - The compact `dom_snapshot` line format quotes non-trivial `role` and attribute values; recorded
   selectors are CSS-escaped (`#\:r0\:`).
 - `#[inspectable]` registers each argument's IPC `key` (camelCase by default); a command using
-  `#[tauri::command(rename_all = "snake_case")]` or `rename = "…"` should repeat the option on
-  `#[inspectable(...)]` (or put `#[inspectable]` above `#[tauri::command(...)]`).
+  `#[tauri::command(rename_all = "snake_case")]` or `rename = "…"` (`rename` needs tauri-macros 2.6+,
+  i.e. Tauri 2.11+) should repeat the option on `#[inspectable(...)]` (or put `#[inspectable]` above
+  `#[tauri::command(...)]`).
+- Trusted (OS-level) input — `interact`/`input` with `trusted: true`, Windows only — now requires the
+  app window to be in the foreground (Windows refuses to move focus away from the terminal an agent
+  runs in, so the call fails clearly instead of typing into another app).
 - `victauri-test`: `Locator::check()`/`uncheck()` click the element (and verify it changed), and a
   stale element reference is `ElementNotFound` instead of an empty/false value.
 - The server speaks HTTP/1.1 only and refuses browser-originated requests (any `Origin`, a

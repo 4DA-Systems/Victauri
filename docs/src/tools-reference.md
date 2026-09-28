@@ -4,6 +4,8 @@ Victauri exposes 35 MCP tools organized into standalone tools (one action per ca
 
 All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
 
+> **Common parameters.** Every tool that touches a webview accepts `webview_label` (aliases `window`, `window_label`) to pick the window; without it the default window is used (`main`, else the first visible one). Every compound tool takes a required `action` string naming the operation.
+
 ## Backend Tools
 
 These tools access the Rust backend directly — no webview proxy, no JavaScript evaluation.
@@ -137,6 +139,7 @@ Capture a full accessible DOM tree with ref handles for every element.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `webview_label` | string | no | Target webview |
+| `format` | string | no | `compact` (default, accessible text, ~70-80% fewer tokens) or `json` (full tree) |
 
 **Returns:** Tree of elements with `ref`, `role`, `name`, `children`, and bounding box data. Descends into open shadow DOM and **same-origin iframes** (cross-origin frames are marked and skipped).
 
@@ -153,6 +156,16 @@ Search for elements by CSS selector or text content. Returns an MCP error for in
 | `text` | string | no | Text content to search for |
 | `role` | string | no | ARIA role to filter by |
 | `webview_label` | string | no | Target webview |
+| `test_id` | string | no | Exact `data-testid` value |
+| `name` | string | no | Accessible name (aria-label, title, placeholder; case-insensitive substring) |
+| `tag` | string | no | Tag name, e.g. `button` |
+| `placeholder` | string | no | Placeholder text (case-insensitive substring) |
+| `alt` | string | no | Alt text (case-insensitive substring) |
+| `title_attr` | string | no | `title` attribute (case-insensitive substring) |
+| `label` | string | no | Associated `<label>` text (finds inputs by their label) |
+| `exact` | boolean | no | Exact instead of substring text matching |
+| `enabled` | boolean | no | Filter by enabled state |
+| `max_results` | integer | no | Maximum results (default 10) |
 
 **Examples:**
 ```json
@@ -172,6 +185,7 @@ Invoke a Tauri command from the backend.
 |------|------|----------|-------------|
 | `command` | string | yes | Command name |
 | `args` | object | no | Arguments to pass |
+| `timeout_ms` | integer | no | How long to wait for the result (default: the plugin eval timeout, 30 s; max 300000). Raise it for legitimately slow commands. `victauri-test`: `invoke_command_with_timeout` |
 
 **Example:**
 ```json
@@ -207,6 +221,8 @@ Compare frontend and backend state to detect drift.
 |------|------|----------|-------------|
 | `frontend_expr` | string | no | JS expression for frontend state |
 | `backend_state` | object | no | Expected backend state to compare |
+| `backend_command` | string | no | Tauri command whose result is the backend state (instead of `backend_state`) |
+| `backend_args` | object | no | Arguments for `backend_command` |
 
 **Example:**
 ```json
@@ -220,11 +236,14 @@ Compare frontend and backend state to detect drift.
 
 ### detect_ghost_commands
 
-Find commands invoked by the frontend that are not registered in the backend registry.
+Classify every command the frontend invoked by its observed outcome: a command that succeeded at least once provably has a handler (counted in `verified_handlers`); one that only ever failed with "not found" is listed in `confirmed_ghosts`; `plugin:*` built-ins are `excluded_builtins`; `frontend_only` is the weak tier (absent from the `#[inspectable]` registry, which is a subset of the real handler set). Read `reliability` and `note` before treating `frontend_only` as a bug list.
 
-**Parameters:** None required.
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `since_ms` | integer | no | Only consider commands invoked within the last N ms (scopes detection to the current test without clearing the IPC log) |
 
-**Returns:** List of ghost commands with invocation counts.
+**Returns:** `confirmed_ghosts` (each `{name, error}`), `verified_handlers` (a count), `frontend_only`, `excluded_builtins`, `registry_only`, `total_frontend_commands`, `total_registry_commands`, `reliability` (`none`/`low`/`high`) and `note`.
 
 ---
 
@@ -232,7 +251,10 @@ Find commands invoked by the frontend that are not registered in the backend reg
 
 Verify the health of IPC communication.
 
-**Parameters:** None required.
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `stale_threshold_ms` | integer | no | Age after which a pending IPC call counts as stale (default 5000) |
 
 **Returns:** `{healthy, total_calls, pending_count, stale_count, error_count, stale_calls, errored_calls, warning}`
 
@@ -309,6 +331,7 @@ Assert a condition about the application state using JS expressions.
 | `expression` | string | yes | JS expression to evaluate |
 | `condition` | string | yes | One of: `equals`, `not_equals`, `contains`, `greater_than`, `less_than`, `truthy`, `falsy` |
 | `expected` | any | no | Expected value (not needed for truthy/falsy) |
+| `label` | string | no | Human-readable name for the assertion (default empty) |
 
 **Example:**
 ```json
@@ -329,6 +352,7 @@ Resolve a natural language description to registered commands.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `query` | string | yes | Natural language description |
+| `limit` | integer | no | Maximum results (default 5) |
 
 **Example:**
 ```json
@@ -341,7 +365,10 @@ Resolve a natural language description to registered commands.
 
 List all registered commands with their metadata.
 
-**Parameters:** None.
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query` | string | no | Filter commands by name or description |
 
 Each argument lists its Rust `name`, and — when it differs — the `key` the frontend invokes it
 by: Tauri camelCases argument names by default (`size_kb` → `sizeKb`), so pass `key` (or
@@ -393,6 +420,9 @@ across frame boundaries).
 | `focus` | `ref_id` | Focus an element |
 | `scroll_into_view` | `ref_id` | Scroll element into viewport |
 | `select_option` | `ref_id`, `value` or `values` | Select option(s) in a `<select>` |
+| `trusted` | boolean | no | `click`: deliver a real OS mouse click (`isTrusted: true`) at the element's centre. Refused if the point is outside the window's client area. Windows only; the app window must be in the foreground |
+| `x` | number | no | `scroll_into_view` without `ref_id`: horizontal scroll position in px |
+| `y` | number | no | `scroll_into_view` without `ref_id`: vertical scroll position in px |
 
 **Trusted (OS-level) clicks:** add `"trusted": true` to `click` to deliver a
 real OS mouse event (`isTrusted: true`) at the element's center, instead of a
@@ -419,6 +449,7 @@ Text input and keyboard operations.
 | `fill` | `ref_id`, `value` | Set input value directly |
 | `type_text` | `ref_id`, `text` | Type character-by-character |
 | `press_key` | `key` | Press a keyboard key |
+| `trusted` | boolean | no | `type_text`/`press_key`: deliver real OS keyboard input (`isTrusted: true`). The element is focused first and the call is refused if focus does not land on it. Windows only; the app window must be in the foreground |
 
 **Trusted (OS-level) input:** add `"trusted": true` to `type_text` or `press_key` to
 deliver real OS keystrokes (`isTrusted: true`) into the focused element instead
@@ -558,6 +589,7 @@ CSS inspection, accessibility, and performance profiling.
 | `clear_highlights` | — | Remove all debug overlays |
 | `audit_accessibility` | — | Run WCAG accessibility audit |
 | `get_performance` | — | Get performance metrics |
+| `label` | string | no | `highlight`: text shown above the overlay |
 
 **Example:**
 ```json
@@ -581,6 +613,7 @@ CSS injection for debugging and prototyping.
 |--------|-----------|-------------|
 | `inject` | `css` | Inject custom CSS (replaces previous) |
 | `remove` | — | Remove injected CSS |
+| `allow_remote` | boolean | no | Allow `@import` and remote `url(...)` in injected CSS (default false: blocked, because remote references turn `css inject` into an exfiltration channel) |
 
 **Example:**
 ```json
@@ -604,6 +637,8 @@ Access all captured logs from the application.
 | `events` | `since` | Event stream |
 | `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
 | `clear` | — | Clear the IPC + network logs (per-test isolation) |
+| `filter` | string | no | `network`: URL substring filter |
+| `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |
 
 **Example:**
 ```json
@@ -631,6 +666,7 @@ page-scoped (cleared on reload).
 | `clear` | `id` | Remove a rule by id |
 | `clear_all` | — | Remove all rules |
 | `matches` | `limit` | Log of intercepted requests |
+| `status_text` | string | no | `fulfill`: mock response status text |
 
 **`add` parameters:**
 
@@ -844,6 +880,9 @@ Quantitative, deterministic, cross-platform access to the webview's animation en
 | `list` | `webview_label` | `getAnimations()` introspection: declared timing (duration/delay/easing/iterations), computed progress, keyframes, play state, and the animating target. An animation only appears while running/pending — trigger it first. |
 | `scrub` | `selector`, `points`, `capture`, `webview_label` | Pauses the target's animation and seeks it to N evenly-spaced points (`await animation.ready` + double-rAF freezes each frame), returning the exact geometry curve (rect + transform + opacity per point). With `capture: true`, also returns a single contact-sheet **filmstrip PNG** of the whole arc plus a manifest. **CSS-driven animations only** (JS/rAF animations are not seekable — errors clearly and suggests `sample`). |
 | `sample` | `record`, `selector`, `webview_label` | Real-time `requestAnimationFrame` recorder, decoupled from the blocking eval so event-triggered sweeps are catchable: `record: true` arms a watcher, trigger the animation, then `record: false` reads the measured per-frame curve, jank stats (dropped frames, max frame gap), and declared-vs-measured duration. Works for **any** animation including JS/rAF-driven ones. |
+| `restore` | boolean | no | `scrub`: resume the animation afterwards (default true); false leaves it paused at the last point |
+| `cols` | integer | no | `scrub` with `capture`: filmstrip grid columns (default ≈ √points) |
+| `clear` | boolean | no | `sample` read: clear the recorded sessions after returning them |
 
 **Parameters:**
 | Name | Type | Required | Description |
