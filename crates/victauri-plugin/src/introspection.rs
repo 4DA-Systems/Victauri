@@ -992,6 +992,14 @@ impl TaskTracker {
         finished
     }
 
+    /// Register a new task and return a guard that marks it finished when DROPPED — at the end
+    /// of the task body, when the task panics (the drop runs during unwinding), or when its
+    /// future is dropped unfinished. Setting the flag by hand after the body left a panicked
+    /// task reported active forever (G-9).
+    pub(crate) fn track_guarded(&self, name: &str) -> TaskFinishedGuard {
+        TaskFinishedGuard(self.track(name))
+    }
+
     /// List all tracked tasks with their current status.
     #[must_use]
     pub fn list(&self) -> Vec<TrackedTaskInfo> {
@@ -1027,6 +1035,17 @@ impl TaskTracker {
 impl Default for TaskTracker {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Marks a tracked task finished when dropped (see [`TaskTracker::track_guarded`]). Move it
+/// into the spawned task and hold it for the task's whole body.
+#[must_use = "the task is marked finished as soon as the guard is dropped"]
+pub(crate) struct TaskFinishedGuard(std::sync::Arc<AtomicBool>);
+
+impl Drop for TaskFinishedGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1736,6 +1755,32 @@ mod tests {
         });
         assert_eq!(bus.clear(), 1);
         assert!(bus.is_empty());
+    }
+
+    /// G-9: the finished flag was only set when a task body returned normally, so a panicked
+    /// task was reported active forever. The guard sets it on unwind (and on a dropped future).
+    #[test]
+    fn a_panicking_tracked_task_is_reported_finished() {
+        let tracker = std::sync::Arc::new(TaskTracker::new());
+        let guard = tracker.track_guarded("event_drain_loop");
+        let r = std::thread::spawn(move || {
+            let _finished = guard;
+            panic!("task blew up");
+        })
+        .join();
+        assert!(r.is_err());
+        assert_eq!(
+            tracker.active_count(),
+            0,
+            "a panicked task is still reported active"
+        );
+        assert!(tracker.list()[0].is_finished);
+
+        // A task that is still running stays active until its guard goes.
+        let running = tracker.track_guarded("mcp_server");
+        assert_eq!(tracker.active_count(), 1);
+        drop(running);
+        assert_eq!(tracker.active_count(), 0);
     }
 
     #[test]

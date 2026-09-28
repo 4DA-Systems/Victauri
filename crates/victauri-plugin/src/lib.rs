@@ -956,9 +956,10 @@ impl VictauriBuilder {
                     state.startup_timeline.mark("server_spawning");
                     let app_handle = app.clone();
                     let ready_state = state.clone();
-                    let server_finished = state.task_tracker.track("mcp_server");
+                    let server_finished = state.task_tracker.track_guarded("mcp_server");
                     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
                     tauri::async_runtime::spawn(async move {
+                        let _finished = server_finished;
                         match mcp::start_server_reporting_port(
                             app_handle,
                             state,
@@ -976,15 +977,15 @@ impl VictauriBuilder {
                                 tracing::error!("Victauri MCP server failed: {e}");
                             }
                         }
-                        server_finished.store(true, std::sync::atomic::Ordering::Relaxed);
                     });
 
                     // The banner and `on_ready` report the port the server actually BOUND. They
                     // used the preferred port, and probing it by connecting could reach another
                     // process squatting on it — or report it after the 5s probe gave up even
                     // though nothing of ours was listening.
-                    let ready_finished = ready_state.task_tracker.track("on_ready_probe");
+                    let ready_finished = ready_state.task_tracker.track_guarded("on_ready_probe");
                     tauri::async_runtime::spawn(async move {
+                        let _finished = ready_finished;
                         match tokio::time::timeout(std::time::Duration::from_secs(5), bound_rx)
                             .await
                         {
@@ -1002,7 +1003,6 @@ impl VictauriBuilder {
                                  on_ready not called"
                             ),
                         }
-                        ready_finished.store(true, std::sync::atomic::Ordering::Relaxed);
                     });
                     Ok(())
                 })
