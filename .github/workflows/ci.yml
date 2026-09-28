@@ -336,6 +336,43 @@ jobs:
           path: gauntlet.log
           if-no-files-found: ignore
 
+  # The VS Code extension: typecheck, bundle, and its unit tests (code generation escaping,
+  # discovery/connection resolution, health semantics) under plain Node.
+  vscode:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      # rustc lets the codegen test prove each generated literal lexes back to its input.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
+
+      - name: Install dependencies (no install scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
@@ -616,6 +653,7 @@ jobs:
         live-app,
         gauntlet,
         docs,
+        vscode,
         msrv,
         security,
         deny,
