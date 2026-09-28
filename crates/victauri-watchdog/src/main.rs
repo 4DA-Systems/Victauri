@@ -344,7 +344,7 @@ fn current_euid() -> Option<u32> {
     })
 }
 
-/// 128 bits another local user cannot predict, without a new dependency: two SipHash
+/// 128 bits another local user cannot predict, without a new dependency: two `SipHash`
 /// outputs keyed by `RandomState` (seeded from the OS RNG per process), mixed with the time.
 #[cfg(unix)]
 fn unpredictable_suffix() -> String {

@@ -28,6 +28,8 @@ pub enum Liveness {
     OtherUser,
     /// The process exists, but its owner could not be verified — e.g. an elevated app seen
     /// from a non-elevated client on Windows. Not trusted for token use, never deleted.
+    /// (Only the Windows probe produces it.)
+    #[cfg_attr(not(windows), allow(dead_code))]
     Unverified,
     /// The process is definitely not running.
     Dead,
