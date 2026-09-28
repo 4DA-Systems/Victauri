@@ -841,7 +841,7 @@ mod truncate_tests {
         for max in 0..=emoji.len() + 2 {
             let cut = truncate_at_char_boundary(&emoji, max);
             assert!(
-                cut.len() <= max && cut.len() % 4 == 0,
+                cut.len() <= max && cut.len().is_multiple_of(4),
                 "{max}: {}",
                 cut.len()
             );

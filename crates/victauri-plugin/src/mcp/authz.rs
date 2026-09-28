@@ -46,7 +46,7 @@ const COMPOUND_TOOLS: &[&str] = &[
 ];
 
 /// The standalone (non-compound) tools — gated by their bare name.
-pub(crate) const STANDALONE_TOOLS: &[&str] = &[
+pub const STANDALONE_TOOLS: &[&str] = &[
     "eval_js",
     "dom_snapshot",
     "find_elements",
@@ -201,7 +201,7 @@ const CAPABILITY_ALIASES: &[(&str, &str)] = &[
 /// The other spelling of a capability whose id differs from its `tool.action` name —
 /// `inspect.styles` ↔ `inspect.get_styles` — or `None` for every other name.
 #[must_use]
-pub(crate) fn capability_alias(name: &str) -> Option<&'static str> {
+pub fn capability_alias(name: &str) -> Option<&'static str> {
     CAPABILITY_ALIASES.iter().find_map(|&(id, action)| {
         if name == id {
             Some(action)
@@ -217,7 +217,7 @@ pub(crate) fn capability_alias(name: &str) -> Option<&'static str> {
 /// spelling), a capability id, or a legacy handler name. A name that is none of these
 /// disables nothing — almost always a typo.
 #[must_use]
-pub(crate) fn is_known_name(name: &str) -> bool {
+pub fn is_known_name(name: &str) -> bool {
     if STANDALONE_TOOLS.contains(&name)
         || COMPOUND_TOOLS.contains(&name)
         || LEGACY_NAMES.contains(&name)
@@ -234,7 +234,7 @@ pub(crate) fn is_known_name(name: &str) -> bool {
 }
 
 /// The entries of `names` that match no tool, action or capability (see [`is_known_name`]).
-pub(crate) fn unknown_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+pub fn unknown_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     names.into_iter().filter(|n| !is_known_name(n)).collect()
 }
 

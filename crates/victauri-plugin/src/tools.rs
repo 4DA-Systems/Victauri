@@ -20,11 +20,11 @@ pub const MAX_PAGE_PENDING_EVALS_PER_WINDOW: usize = 10;
 /// other one (the agent's included); without a budget page script could queue hundreds and
 /// starve the agent. Beyond it a query is refused at once, like a page eval over its budget.
 pub const MAX_PAGE_WINDOW_QUERIES: usize = 4;
-pub(crate) static PAGE_WINDOW_QUERY_SLOTS: tokio::sync::Semaphore =
+pub static PAGE_WINDOW_QUERY_SLOTS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_PAGE_WINDOW_QUERIES);
 
 /// Run page-originated window query `f` within [`MAX_PAGE_WINDOW_QUERIES`].
-pub(crate) fn page_window_query<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+pub fn page_window_query<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     let _slot = PAGE_WINDOW_QUERY_SLOTS.try_acquire().map_err(|_| {
         format!(
             "too many concurrent page-originated window queries (limit \
