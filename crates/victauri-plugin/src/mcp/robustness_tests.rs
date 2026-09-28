@@ -560,6 +560,116 @@ async fn app_state_probes_are_bounded_and_panic_isolated() {
     assert_eq!(r["depth"], 3);
 }
 
+/// R4-BLK1: a hung probe leaves its blocking thread running past the deadline, so repeated
+/// calls to it used to pile up one leaked thread each. Probe executions are capped: once every
+/// slot is held by a still-running probe, a call is refused at once instead of leaking another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hung_probes_cannot_pile_up_blocking_threads() {
+    let state = VictauriState::for_tests();
+    state.probes.register(
+        "stuck",
+        Arc::new(|| {
+            std::thread::sleep(Duration::from_secs(3));
+            serde_json::json!({"late": true})
+        }),
+    );
+    let h = Arc::new(handler_with(TestBridge::default(), state));
+    let calls: Vec<_> = (0..super::MAX_CONCURRENT_PROBES + 2)
+        .map(|_| {
+            let h = Arc::clone(&h);
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let r = call(&h, "app_state", serde_json::json!({"probe": "stuck"})).await;
+                (text(&r), started.elapsed())
+            })
+        })
+        .collect();
+    let mut busy = 0;
+    for c in calls {
+        let (t, took) = c.await.unwrap();
+        if t.contains("busy") {
+            busy += 1;
+            assert!(
+                took < Duration::from_millis(500),
+                "a refusal must be immediate: {took:?}"
+            );
+        } else {
+            assert!(t.contains("did not finish"), "{t}");
+        }
+    }
+    assert_eq!(busy, 2, "calls beyond the cap must be refused");
+}
+
+/// R4-BLK1: `read_app_file` reads under a deadline and a small concurrency cap, so a read that
+/// blocks (a FIFO or device swapped in after the checks) cannot hang the call or pile up threads.
+#[tokio::test]
+async fn read_app_file_is_refused_while_every_read_slot_is_held() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("notes.txt"), "hello").unwrap();
+    let h = handler(TestBridge {
+        data: Some(root.path().to_path_buf()),
+        ..TestBridge::default()
+    });
+    let held: Vec<_> = (0..super::MAX_CONCURRENT_FILE_READS)
+        .map(|_| Arc::clone(&h.file_slots).try_acquire_owned().unwrap())
+        .collect();
+    let r = call(
+        &h,
+        "read_app_file",
+        serde_json::json!({"path": "notes.txt"}),
+    )
+    .await;
+    assert!(text(&r).contains("busy"), "{}", text(&r));
+    drop(held);
+    let r = json(
+        &call(
+            &h,
+            "read_app_file",
+            serde_json::json!({"path": "notes.txt"}),
+        )
+        .await,
+    );
+    assert_eq!(r["content"], "hello");
+}
+
+/// A read that blocks (here: a FIFO with no writer, which `open` waits on) returns at the
+/// deadline instead of hanging the call.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_blocking_file_read_returns_at_its_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let fifo = root.path().join("pipe");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    if !made.is_ok_and(|s| s.success()) {
+        eprintln!("SKIP: mkfifo unavailable");
+        return;
+    }
+    let h = handler(TestBridge::default());
+    let started = Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(20),
+        h.read_regular_file_bounded(fifo.clone(), 16),
+    )
+    .await
+    .expect("a blocked read must return at its own deadline");
+    let err = r.expect_err("a FIFO read cannot succeed");
+    assert!(err.contains("did not finish"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // Release the reader still blocked in `open` (the runtime waits for blocking threads on
+    // shutdown): a writer completes the rendezvous, and the opened FIFO is then refused as
+    // not a regular file.
+    drop(std::fs::OpenOptions::new().write(true).open(&fifo));
+}
+
+/// The OPENED file is checked: a directory (or FIFO/device) swapped in is refused.
+#[cfg(unix)]
+#[test]
+fn a_non_regular_file_is_refused_after_open() {
+    let root = tempfile::tempdir().unwrap();
+    let err = super::read_regular_file(root.path(), 16).expect_err("a directory is not a file");
+    assert!(err.contains("not a regular file"), "{err}");
+}
+
 /// A refused query is refused for what it is, before any database is looked up. Seen live on
 /// Windows: the demo app has no application database, so a DELETE came back as "only `WebView`
 /// internal databases were found" instead of "read-only" (the adversarial E2E suite, which CI
@@ -578,4 +688,41 @@ async fn a_refused_query_is_refused_before_any_database_is_resolved() {
         assert_eq!(r.is_error, Some(true), "{sql}");
         assert!(text(&r).contains(expect), "{sql}: {}", text(&r));
     }
+}
+
+/// B-L8: the timings map stops tracking NEW command names at its cap; the output says so.
+#[tokio::test]
+async fn command_timings_reports_when_its_command_cap_is_hit() {
+    let h = handler(TestBridge::default());
+    h.state
+        .command_timings
+        .record("one", Duration::from_millis(1));
+    let r = json(
+        &call(
+            &h,
+            "introspect",
+            serde_json::json!({"action": "command_timings"}),
+        )
+        .await,
+    );
+    assert_eq!(r["saturated"], false, "{r}");
+    for i in 0..super::COMMAND_TIMINGS_CAP + 50 {
+        h.state
+            .command_timings
+            .record(&format!("cmd-{i}"), Duration::from_millis(1));
+    }
+    // The cap mirrored here is the one `CommandTimings` enforces.
+    assert_eq!(
+        h.state.command_timings.all_stats().len(),
+        super::COMMAND_TIMINGS_CAP
+    );
+    let r = json(
+        &call(
+            &h,
+            "introspect",
+            serde_json::json!({"action": "command_timings"}),
+        )
+        .await,
+    );
+    assert_eq!(r["saturated"], true, "{r}");
 }

@@ -15,6 +15,25 @@ pub const MAX_PAGE_PENDING_EVALS: usize = 25;
 /// Page-originated eval slots ONE window may hold, so one window cannot starve the others.
 pub const MAX_PAGE_PENDING_EVALS_PER_WINDOW: usize = 10;
 
+/// Page-callable window queries (`victauri_list_windows` / `victauri_get_window_state`) allowed
+/// in flight at once, across all windows. Each is a main-thread round trip serialized with every
+/// other one (the agent's included); without a budget page script could queue hundreds and
+/// starve the agent. Beyond it a query is refused at once, like a page eval over its budget.
+pub const MAX_PAGE_WINDOW_QUERIES: usize = 4;
+pub static PAGE_WINDOW_QUERY_SLOTS: tokio::sync::Semaphore =
+    tokio::sync::Semaphore::const_new(MAX_PAGE_WINDOW_QUERIES);
+
+/// Run page-originated window query `f` within [`MAX_PAGE_WINDOW_QUERIES`].
+pub fn page_window_query<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    let _slot = PAGE_WINDOW_QUERY_SLOTS.try_acquire().map_err(|_| {
+        format!(
+            "too many concurrent page-originated window queries (limit \
+             {MAX_PAGE_WINDOW_QUERIES}); retry when one has finished"
+        )
+    })?;
+    Ok(f())
+}
+
 /// The window a page-originated eval id belongs to.
 fn page_eval_window(id: &str) -> Option<&str> {
     let rest = id.strip_prefix(PAGE_EVAL_PREFIX)?;
@@ -196,17 +215,14 @@ pub async fn victauri_get_window_state<R: Runtime>(
     app: tauri::AppHandle<R>,
     label: Option<String>,
 ) -> Result<Vec<WindowState>, String> {
-    Ok(crate::bridge::WebviewBridge::get_window_states(
-        &app,
-        label.as_deref(),
-    ))
+    page_window_query(|| crate::bridge::WebviewBridge::get_window_states(&app, label.as_deref()))
 }
 
 #[tauri::command]
 pub async fn victauri_list_windows<R: Runtime>(
     app: tauri::AppHandle<R>,
 ) -> Result<Vec<String>, String> {
-    Ok(crate::bridge::WebviewBridge::list_window_labels(&app))
+    page_window_query(|| crate::bridge::WebviewBridge::list_window_labels(&app))
 }
 
 #[tauri::command]
@@ -273,4 +289,33 @@ pub async fn victauri_check_ipc_integrity(
     let threshold = stale_threshold_ms.unwrap_or(5000);
     let report = victauri_core::check_ipc_integrity(&state.event_log, threshold);
     serde_json::to_value(report).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// G-2: `victauri_list_windows` / `victauri_get_window_state` are callable by page script
+    /// and each is a main-thread round trip serialized with every other; without a budget a
+    /// page could queue hundreds and starve the agent's calls. Beyond the budget a query is
+    /// refused at once, and a slot is released when its query finishes.
+    #[test]
+    fn page_window_queries_are_budgeted() {
+        let held: Vec<_> = (0..MAX_PAGE_WINDOW_QUERIES)
+            .map(|_| PAGE_WINDOW_QUERY_SLOTS.try_acquire().unwrap())
+            .collect();
+        let refused = page_window_query(|| 1);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|e| e.contains("page-originated window queries")),
+            "{refused:?}"
+        );
+        drop(held);
+        assert_eq!(page_window_query(|| 7), Ok(7));
+        assert_eq!(
+            PAGE_WINDOW_QUERY_SLOTS.available_permits(),
+            MAX_PAGE_WINDOW_QUERIES
+        );
+    }
 }

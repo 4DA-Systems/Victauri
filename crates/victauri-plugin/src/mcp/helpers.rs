@@ -488,6 +488,102 @@ fn attach_registry_metadata(
     }
 }
 
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a character
+/// boundary. Byte-slicing app/page text (`&s[..n]`) panics when byte `n` falls inside a
+/// multi-byte character, so every length cap on such text goes through here.
+#[must_use]
+pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Page-side probe run before trusted (OS-level) keystrokes: focus element `ref_id`, then
+/// report `{found, focused}` — whether focus actually LANDED on it. OS keystrokes go to
+/// whatever holds focus, and `focus()` can silently not take (a non-focusable or inert
+/// element) or be moved on by a focus handler, so existence is not enough (R4-IN1).
+///
+/// The deep active element is followed from the top document through open shadow roots
+/// (a host reports its shadow root's `activeElement`) and same-origin frames (a frame
+/// element reports its document's `activeElement`). A closed shadow root or a cross-origin
+/// frame cannot be looked into, so an element behind one reads as not focused.
+#[must_use]
+pub fn trusted_focus_probe_js(ref_id: &str) -> String {
+    format!(
+        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
+         if(!__e) return {{found:false,focused:false}}; \
+         __e.focus(); \
+         var __a=document.activeElement; \
+         for(var __i=0;__a&&__i<64;__i++){{ \
+           if(__a===__e) return {{found:true,focused:true}}; \
+           var __n=null; \
+           if(__a.shadowRoot&&__a.shadowRoot.activeElement){{__n=__a.shadowRoot.activeElement;}} \
+           else if(__a.tagName==='IFRAME'||__a.tagName==='FRAME'){{ \
+             try{{var __d=__a.contentDocument; __n=__d&&__d.activeElement;}}catch(__x){{__n=null;}} }} \
+           if(!__n||__n===__a) break; \
+           __a=__n; \
+         }} \
+         return {{found:true,focused:false}}",
+        js_string(ref_id)
+    )
+}
+
+/// Page-side probe run before a trusted (OS-level) click on element `ref_id`: returns the
+/// click point `{x, y}` in the TOP window's viewport (CSS pixels), `{error}` when the
+/// element cannot take a real click there, or `null` when the ref is unknown (R4-IN2).
+///
+/// A real OS click lands on whatever is on screen at the point, so the point must be one
+/// where the element is actually hit: it runs the same checks as the bridge's
+/// actionability check for synthetic clicks (connected, enabled, visible, non-zero size,
+/// `pointer-events`, not covered at its center — the covering test is stricter: the hit
+/// element must be the element or inside it) and then walks up through same-origin frames,
+/// adding each frame's content offset and requiring the point to stay inside every
+/// viewport on the way and the frame itself to be the element hit there. Layout is page
+/// data, so the native side clamps the point to the window's client area as well.
+#[must_use]
+pub fn trusted_click_probe_js(ref_id: &str) -> String {
+    format!(
+        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
+         if(!__e) return null; \
+         function __no(m){{return {{error:m}};}} \
+         function __in(w,x,y){{return x>=0&&y>=0&&x<w.innerWidth&&y<w.innerHeight;}} \
+         if(!__e.isConnected) return __no('element is detached from the DOM'); \
+         __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
+         var __d=__e.ownerDocument||document, __w=__d.defaultView||window; \
+         if(__e.disabled||(__e.getAttribute&&__e.getAttribute('aria-disabled')==='true')) \
+           return __no('element is disabled'); \
+         var __s=__w.getComputedStyle(__e); \
+         if(__s.display==='none'||__s.visibility==='hidden'||parseFloat(__s.opacity)<0.01) \
+           return __no('element is not visible'); \
+         if(__s.pointerEvents==='none') return __no('element has pointer-events: none'); \
+         var __b=__e.getBoundingClientRect(); \
+         if(!(__b.width>0&&__b.height>0)) return __no('element has zero size'); \
+         var __x=__b.left+__b.width/2, __y=__b.top+__b.height/2; \
+         if(!__in(__w,__x,__y)) return __no('element center is outside the viewport'); \
+         var __t=__d.elementFromPoint(__x,__y); \
+         if(!__t||(__t!==__e&&!__e.contains(__t))) \
+           return __no('element is covered at its center point'+(__t&&__t.tagName?' by <'+__t.tagName.toLowerCase()+'>':'')); \
+         for(var __f=__w,__i=0;__f!==__f.top&&__i<32;__i++){{ \
+           var __fe=null; try{{__fe=__f.frameElement;}}catch(__x2){{__fe=null;}} \
+           if(!__fe) return __no('element is inside a cross-origin frame'); \
+           var __p=__f.parent, __r=__fe.getBoundingClientRect(), __c=__p.getComputedStyle(__fe); \
+           __x+=__r.left+(__fe.clientLeft||0)+(parseFloat(__c.paddingLeft)||0); \
+           __y+=__r.top+(__fe.clientTop||0)+(parseFloat(__c.paddingTop)||0); \
+           if(!__in(__p,__x,__y)) return __no('element center is outside the viewport (clipped by its frame)'); \
+           if(__p.document.elementFromPoint(__x,__y)!==__fe) \
+             return __no('the frame holding the element is covered at the click point'); \
+           __f=__p; \
+         }} \
+         return {{x:__x, y:__y}}",
+        js_string(ref_id)
+    )
+}
+
 pub fn json_result(value: &impl serde::Serialize) -> CallToolResult {
     match serde_json::to_string_pretty(value) {
         Ok(json) => CallToolResult::success(vec![ContentBlock::text(json)]),
@@ -727,6 +823,38 @@ mod json_truthy_tests {
         assert!(json_truthy(&json!("ready")));
         assert!(json_truthy(&json!([1])));
         assert!(json_truthy(&json!({ "k": "v" })));
+    }
+}
+
+#[cfg(test)]
+mod truncate_tests {
+    use super::truncate_at_char_boundary;
+
+    #[test]
+    fn a_cut_inside_a_multibyte_character_backs_off_to_its_start() {
+        // `"` + 3000 × `é`: byte 4096 is the second byte of an `é`.
+        let s = format!("\"{}", "é".repeat(3000));
+        assert!(!s.is_char_boundary(4096));
+        let cut = truncate_at_char_boundary(&s, 4096);
+        assert_eq!(cut.len(), 4095);
+        assert!(cut.ends_with('é'));
+        // 4-byte characters, every offset.
+        let emoji = "🦀".repeat(10);
+        for max in 0..=emoji.len() + 2 {
+            let cut = truncate_at_char_boundary(&emoji, max);
+            assert!(
+                cut.len() <= max && cut.len().is_multiple_of(4),
+                "{max}: {}",
+                cut.len()
+            );
+        }
+    }
+
+    #[test]
+    fn short_and_ascii_text_is_unchanged_or_cut_exactly() {
+        assert_eq!(truncate_at_char_boundary("abc", 10), "abc");
+        assert_eq!(truncate_at_char_boundary("abcdef", 3), "abc");
+        assert_eq!(truncate_at_char_boundary("", 0), "");
     }
 }
 
