@@ -833,6 +833,28 @@ fn click_target_verdict(target_root: isize, point_root: isize) -> Result<(), Str
     }
 }
 
+/// A trusted click must land inside the target window's CLIENT area (physical pixels, client
+/// coordinates). Checking only that the point's top-level window is ours accepted the title
+/// bar, the caption buttons (close!) and the resize border, all of which belong to the same
+/// top-level window (R4-IN2). Non-finite coordinates are refused before any `as i32` cast,
+/// which would turn `NaN` into 0 and saturate huge values.
+#[cfg(any(windows, test))]
+fn client_point_verdict(x: f64, y: f64, client_w: i32, client_h: i32) -> Result<(), String> {
+    let inside = x.is_finite()
+        && y.is_finite()
+        && x >= 0.0
+        && y >= 0.0
+        && x < f64::from(client_w)
+        && y < f64::from(client_h);
+    if inside {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing trusted click: ({x}, {y}) lies outside the window's content area              ({client_w}x{client_h} physical px), so it would land on the title bar, a caption              button or the border. Scroll the element into view and retry, or omit `trusted` to              use a synthetic click."
+        ))
+    }
+}
+
 /// The top-level window `hwnd` belongs to (0 for none).
 #[allow(unsafe_code)]
 #[cfg(windows)]
@@ -1010,6 +1032,7 @@ fn win_send_key(key: &str) -> Result<(), String> {
 #[cfg(windows)]
 fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
     use windows::Win32::Foundation::POINT;
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -1017,18 +1040,24 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
         MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        GetClientRect, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN, WindowFromPoint,
     };
     let h = win_hwnd(hwnd);
-    // SAFETY: GetDpiForWindow/GetSystemMetrics/ClientToScreen are safe to call
-    // with a valid HWND; ClientToScreen writes into our stack POINT.
+    // SAFETY: GetDpiForWindow/GetClientRect/GetSystemMetrics/ClientToScreen are safe to call
+    // with a valid HWND; GetClientRect and ClientToScreen write into our stack RECT/POINT.
     let (nx, ny) = unsafe {
         let dpi = GetDpiForWindow(h);
         let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
+        let (px, py) = (x * scale, y * scale);
+        // Client coordinates: the client rect's origin is always (0, 0).
+        let mut client = RECT::default();
+        GetClientRect(h, &mut client)
+            .map_err(|e| format!("refusing trusted click: cannot read the client area: {e}"))?;
+        client_point_verdict(px, py, client.right, client.bottom)?;
         let mut pt = POINT {
-            x: (x * scale) as i32,
-            y: (y * scale) as i32,
+            x: px as i32,
+            y: py as i32,
         };
         let _ = ClientToScreen(h, &mut pt);
         // The click goes to the topmost window at the point, whichever app that is.
@@ -1225,6 +1254,31 @@ mod tests {
             ran.load(Ordering::SeqCst),
             0,
             "a caller that gave up ran its job"
+        );
+    }
+
+    /// R4-IN2: a trusted click was only checked for landing on OUR top-level window — which
+    /// includes its title bar and close button. It must land inside the client area.
+    #[test]
+    fn trusted_click_must_land_inside_the_client_area() {
+        use super::client_point_verdict;
+        assert!(client_point_verdict(0.0, 0.0, 800, 600).is_ok());
+        assert!(client_point_verdict(799.9, 599.9, 800, 600).is_ok());
+        for (x, y) in [
+            (-1.0, 10.0),  // left of the client area (window border)
+            (10.0, -30.0), // above it: the title bar / caption buttons
+            (800.0, 10.0), // right edge is exclusive
+            (10.0, 600.0),
+            (f64::NAN, 10.0), // `NaN as i32` is 0: would silently click the corner
+            (10.0, f64::INFINITY),
+            (1e12, 10.0), // `as i32` saturates to i32::MAX
+        ] {
+            let err = client_point_verdict(x, y, 800, 600).unwrap_err();
+            assert!(err.contains("outside"), "({x}, {y}): {err}");
+        }
+        assert!(
+            client_point_verdict(0.0, 0.0, 0, 0).is_err(),
+            "empty client area"
         );
     }
 
