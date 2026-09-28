@@ -4795,6 +4795,16 @@ impl VictauriMcpHandler {
     /// nonce is the eval's own page announcing itself late (under load that can take seconds);
     /// any other is confirmed by asking the page for its CURRENT nonce, because page script can
     /// send a ready signal itself and must not be able to abort the agent's calls with it.
+    ///
+    /// Only POSITIVE evidence aborts: the page answering the probe with a nonce other than the
+    /// armed one (its bridge's nonce is frozen, so it cannot change without a new page — and a
+    /// page answering with no nonce where one was armed has lost the bridge that armed the
+    /// eval). A probe that fails (a busy UI thread, a full slot map) proves nothing, so the
+    /// eval keeps waiting — its own timeout still bounds it — and the signal is re-checked on
+    /// the next watch tick. Aborting on a failed probe let page script (a forged signal while
+    /// the UI is busy) cut an agent's call short and invited a retry that ran code twice.
+    /// With no armed nonce (a page without the Victauri bridge) only a page that now HAS a
+    /// nonce is evidence of a change.
     async fn page_replaced(
         &self,
         label: Option<&str>,
@@ -4806,17 +4816,27 @@ impl VictauriMcpHandler {
         if load.seq <= *seen {
             return None;
         }
+        let previously_seen = *seen;
         *seen = load.seq;
         if armed.is_some() && load.nonce.as_deref() == armed {
             return None;
         }
         match self.probe_bridge(Some(label)).await {
-            Ok(current) if armed.is_some() && current.as_deref() == armed => None,
-            _ => Some(format!(
+            Ok(current) if current.as_deref() != armed => Some(format!(
                 "window '{label}' loaded a new page (a reload or navigation) while the call was \
                  in flight, so no result will arrive. The code may or may not have run before \
                  the reload — check the app's state before re-running it."
             )),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!(
+                    window = label,
+                    "ready signal not confirmed ({e}); the eval keeps waiting"
+                );
+                // Unconfirmed: look at this signal again on the next watch tick.
+                *seen = previously_seen;
+                None
+            }
         }
     }
 
@@ -7322,6 +7342,8 @@ mod command_policy_dispatch_tests {
         eval_answer: Arc<StdMutex<Option<String>>>,
         /// Every trusted (OS-level) input delivered, e.g. `click 50,26` / `type hi` / `key Enter`.
         natives: Arc<StdMutex<Vec<String>>>,
+        /// While set, the liveness probe is never answered (a busy or wedged UI thread).
+        probe_silent: Arc<AtomicBool>,
     }
 
     /// Extract the 36-char eval id from a probe script of the form `…id:"<uuid>"…`.
@@ -7407,6 +7429,9 @@ mod command_policy_dispatch_tests {
             // test `eval_timeout` — we only care WHICH scripts reached the bridge,
             // never the eval's return value.
             let answer = if script.contains("probe_ok") {
+                if self.probe_silent.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
                 extract_probe_id(script).map(|id| {
                     let nonce = self
                         .page_nonce
@@ -8065,6 +8090,51 @@ mod command_policy_dispatch_tests {
         let (text, _) = hanging_eval(&h).await;
         assert!(!text.contains("loaded a new page"), "forged reload: {text}");
         assert!(text.contains("timed out"), "{text}");
+    }
+
+    /// R4-EVAL1: a ready signal whose confirming probe FAILS (a busy UI thread, a full slot
+    /// map) is no evidence of a new page. The eval used to abort as "loaded a new page" — which
+    /// page script can provoke with a forged signal while the UI is busy, and which invites a
+    /// retry that runs side-effecting code twice. It must keep waiting (its own timeout bounds
+    /// it).
+    #[tokio::test]
+    async fn an_unconfirmed_ready_signal_does_not_abort_an_eval() {
+        let state = eval_state_with_timeout(4_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
+        let signal = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            inner.probe_silent.store(true, Ordering::SeqCst); // the UI stops answering
+            ready_signal(&signal, "main", "forged");
+        });
+        let (text, _) = hanging_eval(&h).await;
+        assert!(
+            !text.contains("loaded a new page"),
+            "aborted on no evidence: {text}"
+        );
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    /// A page that answers WITHOUT the armed nonce (the bridge that armed the eval is gone)
+    /// is positive evidence of a new page.
+    #[tokio::test]
+    async fn a_page_without_the_armed_nonce_is_a_reload() {
+        let state = eval_state_with_timeout(20_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
+        let reloader = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            *inner
+                .page_nonce
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            ready_signal(&reloader, "main", "whatever");
+        });
+        let (text, took) = hanging_eval(&h).await;
+        assert!(text.contains("loaded a new page"), "{text}");
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
     }
 
     #[tokio::test]
