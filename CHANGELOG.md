@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.9.0] - 2026-09-27
 
-A correctness-and-hardening release built from three audit rounds: a full-surface review (three
+A correctness-and-hardening release built from four audit rounds: a full-surface review (three
 lenses + a live sweep of 4DA), a five-lens pre-audit red team (auth/network boundary, new-code
 correctness, data access & injection, supply chain, semver & claim honesty), and a six-lens
 adversarial audit (network/auth, hostile page, data access, local attacker/CLI, concurrency,
-release/supply chain) whose every finding was reproduced before it was fixed. **0.9.0 is a
+release/supply chain) whose every finding was reproduced before it was fixed, and a round-4
+adversarial audit + live end-to-end verification (demo, gauntlet, 4DA) of that candidate. **0.9.0 is a
 deliberate, one-time semver break** (see below and MIGRATION.md) so that future field additions to
 the data types are never breaking again. (The option/config structs `CodegenOptions`,
 `SmokeConfig`, `VisualOptions`, `MaskRegion` and the `Junit*` report types deliberately stay
@@ -28,9 +29,95 @@ are `#[non_exhaustive]`. Code that *reads* them is unaffected; code that *builds
 literal uses the new constructors/builders instead (`IpcCall::new`, `WindowState::new(label)
 .with_*(..)`, `CommandInfo::new(..).with_*(..)`, `AppEvent::console(..)`, …). `#[inspectable]` now
 expands to those builders, so it keeps working unchanged. Internal-only modules and helpers
-(`filmstrip`, `parse_bridge_event_from`, …) are no longer public API. `WebviewBridge` gained two
-default-implemented methods (`try_list_window_labels`, `eval_webview_resolved`) and documents that
-future additions will always have defaults.
+(`filmstrip`, the recording-drain plumbing, …) are no longer public API. `WebviewBridge` gained three
+default-implemented methods (`try_get_window_states`, `try_list_window_labels`,
+`eval_webview_resolved`) and documents that future additions will always have defaults.
+
+### Round 4 — adversarial audit + live verification of the 0.9.0 candidate
+
+Eight red-team lenses (including the CLI/local-attacker lens that never reported in round 3, and a
+regression hunt over every round-3 fix) against candidate `43b7561`, then live runs on the demo,
+the gauntlet (Windows, real display) and 4DA against its real 1.47 GB database. Every Medium was
+reproduced live or in a V8 proof of concept, every fix has a test that failed first, and claims
+that did not survive testing are listed under "Disproved" below. No Critical or High.
+
+**Security / correctness (Medium)**
+
+- **Page script could still erase the agent's evidence.** A synthetic `pagehide` (the bridge
+  ignored `isTrusted`) wiped every captured log and switched console + DOM capture off for the
+  life of the page; recordings then captured 0 events and the smoke suite failed. Only the
+  browser's own page-transition events are honoured now.
+- **The agent key leaked through `Function.caller`** (the round-3 claim that page script cannot
+  read it was wrong): a page hook on `Array.prototype.filter`, a `then` getter or
+  `Error.prepareStackTrace` reached the injected snippet holding the key. Agent ops and the eval
+  plumbing are strict-mode, and a wrapper carrying the key is strict.
+- **An unauthenticated `/health` flood made a healthy app look dead**: the bridge's liveness probe
+  and the watchdog read the 429 as "down" (live: 88k × 429, every agent call "backend not
+  reachable", watchdog recovery fired). A 429 from `/health` now means alive.
+- **`animation scrub capture=true` took screenshots with `screenshot` disabled.**
+- **`introspect contract_record` panicked** on any non-ASCII response over 4 KiB.
+- **Trusted input** sent real keystrokes when focus had not landed on the element, and a trusted
+  click used an unchecked page-controlled point (the title bar / close button was reachable). Both
+  are verified now: focus through shadow roots and frames; actionability, iframe offsets and the
+  window's client area.
+- **Any probe error aborted an eval as "page reloaded"** (the round-3 claim that page script cannot
+  forge one was wrong), inviting a double-executing retry. Only a positively different page aborts.
+- **The `eval_js` auto-return scanner still dropped statements** (the round-3 "never drops a
+  statement" claim was wrong): a line break inside `/* */`, a lone CR, a line ending in `1.`, and
+  `of`/`yield` used as names. Differential check against node: 10,793 → 0 divergent of 35,459.
+- **`query_db` refused legitimate queries** with `;`, `--` or `/*` inside quotes (`LIKE '%;%'`,
+  present since 0.8.x), while `SELECT '--'; DELETE …` slipped past the stacked-query check. One
+  quote-aware lexer now drives every pre-check (the SQLite authorizer remains the security
+  boundary).
+- **Discovery readers deleted live apps' entries** after one failed 100 ms connect, for every PID
+  where `/bin/kill` is missing (NixOS/Guix/containers), and for an elevated app on Windows. Only a
+  definitely-dead owner's entry is removed now.
+- **A `VICTAURI_AUTH_TOKEN` without a port was sent to whoever held :7373** (a local squatter could
+  collect it). It is sent only to the live app that owns that token.
+- **VS Code "Generate test" pasted page text into Rust source unescaped** (code injection on
+  `cargo test`); it now escapes like the CLI codegen.
+- **Internal plumbing was public API** (`PageLoads`, `DrainWatermarks`, `DrainMark`, `DrainCursor`,
+  `VictauriState.page_loads`/`drain_watermarks`, `mcp::drain_window_into_recording`); hidden
+  before the tag, since hiding them later would be another break.
+- **Release pipeline:** package verification ran dependency build scripts on the same runner as
+  the step holding `CARGO_REGISTRY_TOKEN`. It now runs in its own secret-free job; the publish job
+  compiles nothing.
+
+**Compatibility**
+
+- **Apps on rusqlite newer than 0.32 could not add `victauri-plugin` at all** (`links = "sqlite3"`
+  conflict; current rusqlite is 0.40). The plugin now accepts rusqlite `>=0.32, <0.41`, so cargo
+  unifies onto the app's own version (verified for apps on 0.40, 0.36, 0.32 and sqlx 0.8). The
+  security setters whose return types changed across that range fail closed on every version, and
+  CI tests the newest end.
+- Verified against the dependency versions a fresh consumer resolves today (rmcp 3.5.0,
+  tauri 2.12.0): clippy clean and all functional tests pass. Note: tauri 2.12 needs Rust 1.90, and
+  its new default `staticVCRuntime` writes an `msvcrt.lib` stub that breaks *other* crates'
+  doctests in the same Windows workspace (upstream; not a Victauri issue).
+
+**Fixed (Low)**: resources honour a bare-name tool disable; both inspect action spellings work in
+`disable_tools` and unknown names are warned about; `--app` on every CLI command, with exact
+matching only (was substring); a clear error naming each app when several are running (was a
+silent fallback to :7373 with misleading advice); `invoke_command_with_timeout` in `victauri-test`;
+the bridge no longer cuts slow tools off at 120 s; the watchdog no longer logs its recovery
+command; page and repo text is sanitized before it reaches terminals and CI logs (no forged
+`::error` annotations); `init`/`record` refuse symlinked paths; the generated CLAUDE.md points at
+the per-user token root; unpredictable UID-probe names; the fetch/XHR logs record the request
+actually made (no planted IPC entries); route delays are clamped and capped; `read_app_file` and
+app probes are bounded; page-callable window queries are budgeted; drain-watermark and screencast
+races fixed; the main-thread lock stays held while an abandoned closure still runs; fault,
+contract and page-load maps are capped; panicked background tasks are reported finished; WGC
+capture runs on one COM thread with a bounded wait; `Locator::check()` works on ARIA checkboxes;
+`victauri check` lists ghost names; tool-reference, MIGRATION and README corrections.
+
+**Disproved in round 4** (tested, not defects): eval ids leaking via `.caller` (V8 blocks the
+second hop); `PRAGMA quick_check` overrunning its deadline on a 1.47 GB database (3.8 s); discovery
+dirs left behind on a clean exit (removed on 0.8.8 and 0.9.0); Windows child processes inheriting
+Victauri's sockets (tokio/mio sockets are not inheritable: close seen in µs, port rebindable);
+Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
+
+**Residual, measured:** a 256-column × 1 MB `query_db` row raises the host's peak memory by
+~0.5 GB for that one call (at most two run at once; the result is still capped at 5 MB).
 
 ### Security — adversarial audit round 3 (every finding reproduced before its fix)
 
@@ -84,7 +171,8 @@ future additions will always have defaults.
   `list_app_dir` walked unbounded trees on the async executor.
 - **Release supply chain:** the crates.io token was in the publish job's environment while every
   dependency's build script compiled; publishing now verifies tokenlessly and uploads `--no-verify`
-  from the one step holding the token. `require-ci-green` counts only a push run on `main`.
+  from the one step holding the token (round 4 moved verification to its own job: the same runner
+  was still reachable). `require-ci-green` counts only a push run on `main`.
 
 ### Fixed — adversarial audit round 3 (correctness)
 

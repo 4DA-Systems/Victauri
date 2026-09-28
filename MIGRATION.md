@@ -94,6 +94,26 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   names (`a`, `a:1`), refuses `LIKE`/`GLOB` patterns over 1000 bytes, and answers "busy" when two
   database calls are already running. "database not found" also covers a path resolving outside
   the allowed roots.
+- **rusqlite**: `victauri-plugin` now accepts rusqlite `>=0.32, <0.41` instead of exactly 0.32,
+  so an app on a newer rusqlite can add it (cargo unifies onto the app's version). Nothing to do.
+- **Discovery (`victauri-test`, CLI):** when several Victauri apps run and nothing selects one,
+  `VictauriClient::discover()` and the CLI commands return an error naming each app instead of
+  silently connecting to :7373. Select with `VICTAURI_APP=<identifier>` (or
+  `VictauriClient::discover_app(Some(..))`, or `--app` on any CLI command) or `VICTAURI_PORT`.
+  `victauri bridge --app` matches the identifier exactly (it used to fall back to a substring).
+- **`VICTAURI_AUTH_TOKEN` without `VICTAURI_PORT`** is sent only to the running app whose own
+  discovery token matches it; otherwise the client refuses and asks for `VICTAURI_PORT`.
+- `is_alive()` (and the bridge / watchdog health checks) treat a `429` from `/health` as alive.
+- Trusted input is refused unless focus actually landed on the element (`type_text`,
+  `press_key`), or the click point is actionable and inside the window's client area (`click`).
+- `route add` refuses `delay_ms` above 120000; `read_app_file` gives up after 15 s and refuses a
+  non-regular file; at most 4 app-state probes, 4 file reads and 4 page-originated window queries
+  run at once (the next one is told "busy").
+- `introspect command_timings` has an additive `saturated` flag; `ContractStore::record` returns the
+  command of a baseline it evicted (`Option<String>`); faults, contract baselines and page-load
+  records are capped (256 / 1024 / 256).
+- New in `victauri-test`: `invoke_command_with_timeout`, `discover_app`, the `terminal` sanitizer
+  module and `health_status_means_alive`.
 - The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
   `Junit*` report types stay exhaustive (struct-update syntax keeps working); a field added to one
   of them later will be called out as a breaking change.
