@@ -413,10 +413,10 @@ pub async fn start_server_reporting_port<R: Runtime>(
     let drain_state = state.clone();
     let drain_bridge = bridge;
     let drain_shutdown = state.shutdown_tx.subscribe();
-    let drain_finished = state.task_tracker.track("event_drain_loop");
+    let drain_finished = state.task_tracker.track_guarded("event_drain_loop");
     tokio::spawn(async move {
+        let _finished = drain_finished;
         event_drain_loop(drain_state, drain_bridge, drain_shutdown).await;
-        drain_finished.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
     let mut shutdown_rx2 = shutdown_rx.clone();
@@ -513,16 +513,20 @@ fn discovery_root_from(
 
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    current_euid_in(&std::env::temp_dir())
+}
 
-    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+#[cfg(unix)]
+fn current_euid_in(dir: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // An UNPREDICTABLE name (R4-DISC2): `<pid>_<sequence>` in the shared temp dir let another
+    // local user pre-plant every name we would try, making this fail — which disables
+    // discovery (the callers fail closed on an unknown uid).
     for _ in 0..16 {
-        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
-        let probe = std::env::temp_dir().join(format!(
-            ".victauri_plugin_uidprobe_{}_{}",
-            std::process::id(),
-            sequence
+        let probe = dir.join(format!(
+            ".victauri_plugin_uidprobe_{}",
+            uuid::Uuid::new_v4().simple()
         ));
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -1231,7 +1235,7 @@ async fn event_drain_loop(
 /// and `recording flush` never ingest the same window's events twice. Returns how many events
 /// were recorded, or `None` if the window could not be drained this time (the position is left
 /// unchanged, so a transient failure just re-reads the same range next time).
-pub async fn drain_window_into_recording(
+pub(super) async fn drain_window_into_recording(
     state: &Arc<VictauriState>,
     bridge: &Arc<dyn WebviewBridge>,
     label: &str,
@@ -1336,6 +1340,27 @@ async fn drain_window(
 mod tests {
     use super::*;
     use victauri_core::{AppEvent, InteractionKind, IpcResult};
+
+    /// R4-DISC2: the uid-probe file name (`.victauri_plugin_uidprobe_<pid>_<seq>`) was
+    /// predictable, so another user sharing `/tmp` could pre-plant it and make `current_euid`
+    /// fail — which disables discovery entirely (fail closed).
+    #[cfg(unix)]
+    #[test]
+    fn uid_probe_survives_pre_planted_probe_names() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        for seq in 0..4096 {
+            std::fs::create_dir(dir.path().join(format!(
+                ".victauri_plugin_uidprobe_{}_{seq}",
+                std::process::id()
+            )))
+            .unwrap();
+        }
+        let expected = std::fs::metadata(dir.path()).unwrap().uid();
+        assert_eq!(current_euid_in(dir.path()), Some(expected));
+        // The probe cleans up after itself: only the planted entries remain.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4096);
+    }
 
     // Round-4 audit blocker #4: a pre-planted explicit ACE for an arbitrary principal
     // (the auditor used BUILTIN\Guests) must NOT survive the discovery-dir hardening.

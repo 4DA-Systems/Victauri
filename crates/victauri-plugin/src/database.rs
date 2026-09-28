@@ -326,32 +326,96 @@ const QUERY_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 #[cfg(feature = "sqlite")]
 static READ_ONLY_PREFIXES: &[&str] = &["select", "pragma", "explain", "with"];
 
+/// One quote- and comment-aware pass over agent-supplied SQL (R4-DB1), following `SQLite`'s
+/// tokenizer: `'…'` strings (`''` escapes), `"…"` and `` `…` `` identifiers (doubled-quote
+/// escapes), `[…]` identifiers (no escape), `--` to end of line, and `/* … */` (not nested;
+/// an unterminated comment or quote runs to the end of input, as in `SQLite`).
 #[cfg(feature = "sqlite")]
-fn strip_sql_comments(sql: &str) -> String {
-    let mut result = String::with_capacity(sql.len());
-    let bytes = sql.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    while i < len {
-        if i + 1 < len && bytes[i] == b'-' && bytes[i + 1] == b'-' {
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
+struct SqlScan {
+    /// The SQL with every comment replaced by one space; quoted spans kept verbatim.
+    cleaned: String,
+    /// `cleaned` with the CONTENT of every quoted span replaced by `_` (the delimiters are
+    /// kept), so a search for `;` or `=` only ever sees code.
+    masked: String,
+}
+
+#[cfg(feature = "sqlite")]
+fn scan_sql(sql: &str) -> SqlScan {
+    let mut cleaned = String::with_capacity(sql.len());
+    let mut masked = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '-' if chars.peek() == Some(&'-') => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+                cleaned.push(' ');
+                masked.push(' ');
+                // Keep the line break so a line comment still separates tokens.
+                cleaned.push('\n');
+                masked.push('\n');
             }
-        } else if i + 1 < len && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                let mut prev = '\0';
+                for n in chars.by_ref() {
+                    if prev == '*' && n == '/' {
+                        break;
+                    }
+                    prev = n;
+                }
+                cleaned.push(' ');
+                masked.push(' ');
             }
-            if i + 1 < len {
-                i += 2;
+            '\'' | '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                // `[…]` has no escape; the other three double their closing quote.
+                let doubled_escape = c != '[';
+                cleaned.push(c);
+                masked.push(c);
+                while let Some(n) = chars.next() {
+                    if n == close {
+                        if doubled_escape && chars.peek() == Some(&close) {
+                            chars.next();
+                            cleaned.push(n);
+                            cleaned.push(n);
+                            masked.push_str("__");
+                            continue;
+                        }
+                        cleaned.push(n);
+                        masked.push(n);
+                        break;
+                    }
+                    cleaned.push(n);
+                    masked.push('_');
+                }
             }
-            result.push(' ');
-        } else {
-            result.push(bytes[i] as char);
-            i += 1;
+            _ => {
+                cleaned.push(c);
+                masked.push(c);
+            }
         }
     }
-    result
+    SqlScan { cleaned, masked }
+}
+
+#[cfg(feature = "sqlite")]
+fn strip_sql_comments(sql: &str) -> String {
+    scan_sql(sql).cleaned
+}
+
+/// Number of non-empty statements: the code between top-level `;` separators (a `;` inside a
+/// string, quoted identifier or comment is not a separator).
+#[cfg(feature = "sqlite")]
+fn statement_count(sql: &str) -> usize {
+    scan_sql(sql)
+        .masked
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+        .count()
 }
 
 #[cfg(feature = "sqlite")]
@@ -372,23 +436,9 @@ fn is_read_only(sql: &str) -> bool {
 /// is only significant when it appears outside of any quoted string.
 #[cfg(feature = "sqlite")]
 fn is_pragma_write(sql: &str) -> bool {
-    let cleaned = strip_sql_comments(sql);
-    let trimmed = cleaned.trim_start();
-    if !trimmed.to_lowercase().starts_with("pragma") {
-        return false;
-    }
-    let bytes = trimmed.as_bytes();
-    let mut in_single = false;
-    let mut in_double = false;
-    for &b in bytes {
-        match b {
-            b'\'' if !in_double => in_single = !in_single,
-            b'"' if !in_single => in_double = !in_double,
-            b'=' if !in_single && !in_double => return true,
-            _ => {}
-        }
-    }
-    false
+    let masked = scan_sql(sql).masked;
+    let trimmed = masked.trim_start();
+    trimmed.to_lowercase().starts_with("pragma") && trimmed.contains('=')
 }
 
 /// Read-only / introspection PRAGMAs permitted on the user-facing `query` path.
@@ -795,17 +845,13 @@ pub fn validate_query(sql: &str) -> Result<(), String> {
         );
     }
 
-    let cleaned = strip_sql_comments(sql);
-    if cleaned.contains(';') {
-        let parts: Vec<&str> = cleaned
-            .split(';')
-            .filter(|s| !s.trim().is_empty())
-            .collect();
-        if parts.len() > 1 {
-            return Err(
-                "stacked queries (multiple statements separated by ;) are not allowed".to_string(),
-            );
-        }
+    // A UX guard, not the security boundary (that is the authorizer + READ_ONLY open): rusqlite's
+    // `prepare` silently ignores a trailing statement, so a stacked query would otherwise run
+    // only its first statement with no error. Quote-aware, so `SELECT 'a;b'` is one statement.
+    if statement_count(sql) > 1 {
+        return Err(
+            "stacked queries (multiple statements separated by ;) are not allowed".to_string(),
+        );
     }
     Ok(())
 }
@@ -1705,6 +1751,103 @@ mod tests {
         let (_f, path) = create_test_db();
         let err = query(&path, "SELECT 1; DROP TABLE users", &[], None).unwrap_err();
         assert!(err.contains("stacked queries"));
+    }
+
+    /// R4-DB1: the pre-checks were quote-unaware — a `;`, `--` or `/*` inside a string literal
+    /// or quoted identifier was treated as a statement separator or comment. Reproduced live:
+    /// `SELECT 'a;b'` and a `LIKE '%;%'` filter were refused as "stacked queries".
+    #[test]
+    fn quoted_separators_and_comment_markers_are_not_code() {
+        for sql in [
+            "SELECT 'a;b'",
+            "SELECT name FROM t WHERE msg LIKE '%;%'",
+            "SELECT 'x--y'",
+            "SELECT '/* not a comment */;'",
+            "SELECT \"a;b\" FROM t",
+            "SELECT [a;b] FROM t",
+            "SELECT `a;b` FROM t",
+            "SELECT ''';'",
+            "SELECT \"x\"\";\" FROM t",
+            "SELECT 'héllo;wörld — ✓'",
+            "SELECT 'a;b';",
+            "SELECT 1 -- trailing ; comment",
+            "SELECT 1 /* ; */",
+            "PRAGMA table_info('a;b')",
+            "PRAGMA table_info([a=b])",
+        ] {
+            assert_eq!(validate_query(sql), Ok(()), "must allow: {sql}");
+        }
+    }
+
+    /// R4-DB1: the other direction — a comment marker inside a string made the old stripper
+    /// swallow a REAL second statement, so it passed the stacked-query check.
+    #[test]
+    fn real_stacked_statements_are_refused_even_after_quoted_markers() {
+        for sql in [
+            "SELECT 1; SELECT 2",
+            "SELECT 1; ATTACH 'x.db' AS y",
+            "SELECT 1 /* ; */ ; DELETE FROM users",
+            "SELECT 1; -- hidden\nDELETE FROM users",
+            "SELECT '--'; DELETE FROM users",
+            "SELECT '/*'; SELECT '*/'",
+            "SELECT ''';'; DROP TABLE users",
+            "SELECT \"--\"; DELETE FROM users",
+            "SELECT [/*]; DELETE FROM users",
+            "SELECT 'é'; DELETE FROM users",
+        ] {
+            let err = validate_query(sql).expect_err(sql);
+            assert!(err.contains("stacked queries"), "{sql}: {err}");
+        }
+        // Comment-hidden writes are still refused as writes.
+        for sql in [
+            "/* SELECT */ DELETE FROM users",
+            "-- SELECT\nDELETE FROM users",
+            "/*/ SELECT */ DELETE FROM users",
+        ] {
+            let err = validate_query(sql).expect_err(sql);
+            assert!(err.contains("read-only"), "{sql}: {err}");
+        }
+        // A write whose `=` hides after a quoted `--` is still a PRAGMA write.
+        let err = validate_query("PRAGMA user_version = '--'").unwrap_err();
+        assert!(err.contains("PRAGMA writes"), "{err}");
+    }
+
+    /// R4-DB1: the old stripper pushed `bytes[i] as char`, turning every non-ASCII byte into a
+    /// separate Latin-1 char in the validation copy.
+    #[test]
+    fn sql_scan_keeps_non_ascii_and_masks_only_quoted_content() {
+        let s = scan_sql("SELECT 'é;✓' /* ; */, \"ü\"\"x\" -- ü;\nFROM [t;1]");
+        assert_eq!(s.cleaned, "SELECT 'é;✓'  , \"ü\"\"x\"  \nFROM [t;1]");
+        assert_eq!(s.masked, "SELECT '___'  , \"____\"  \nFROM [___]");
+        assert_eq!(strip_sql_comments("SELECT 'naïve'"), "SELECT 'naïve'");
+        assert_eq!(statement_count("SELECT 1;"), 1);
+        assert_eq!(statement_count("SELECT 1;;  ;"), 1);
+        assert_eq!(statement_count("SELECT 1; SELECT 2"), 2);
+        assert_eq!(statement_count("SELECT 'unterminated; DROP"), 1);
+    }
+
+    /// R4-DB1 end to end: the live-failing queries run and return the literal intact.
+    #[test]
+    fn quoted_semicolons_run_against_a_real_database() {
+        let (_f, path) = create_test_db();
+        let r = query(
+            &path,
+            "SELECT 'a;b' AS v, 'x--y' AS w, 'é;✓' AS u",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(r["rows"][0]["v"], "a;b");
+        assert_eq!(r["rows"][0]["w"], "x--y");
+        assert_eq!(r["rows"][0]["u"], "é;✓");
+        let r = query(
+            &path,
+            "SELECT name FROM users WHERE name LIKE '%;%'",
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(r["row_count"], 0);
     }
 
     #[test]

@@ -228,7 +228,41 @@ fn find_window<'a, R: Runtime>(
 ///
 /// The lock is only taken OFF the main thread: a caller already on the main thread (including
 /// an `on_main` closure that calls back into the bridge) runs inline without it — see `on_main`.
-static MAIN_DISPATCH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static MAIN_DISPATCH_LOCK: DispatchGate = DispatchGate::new();
+
+/// The serialization state behind [`MAIN_DISPATCH_LOCK`] (a separate type so tests can use
+/// their own gate instead of the process-wide one).
+///
+/// The lock alone is not enough: a caller whose closure STARTED but outlived its timeout + grace
+/// returns "outcome unknown" and releases the lock while that closure is still executing on the
+/// main thread. `in_flight` counts dispatched closures that have reached the main thread and not
+/// yet finished, and the next lock holder also waits (within its own deadline) for it to reach
+/// zero — so there is still never more than one round trip in flight (R4-LOCK1).
+struct DispatchGate {
+    lock: std::sync::Mutex<()>,
+    in_flight: std::sync::atomic::AtomicUsize,
+}
+
+impl DispatchGate {
+    const fn new() -> Self {
+        Self {
+            lock: std::sync::Mutex::new(()),
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Decrements [`DispatchGate::in_flight`] when a dispatched closure finishes — including by
+/// unwinding, so a panicking closure can never wedge every later round trip.
+struct InFlightGuard(&'static DispatchGate);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
 
 /// The Tauri main (UI) thread, recorded by the plugin's `setup` (which Tauri runs there).
 static MAIN_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
@@ -292,41 +326,10 @@ where
     }
 
     let round_trip = move || -> Result<T, String> {
-        // One round trip at a time (see MAIN_DISPATCH_LOCK). The deadline covers the WAIT FOR
-        // THE LOCK as well as the round trip itself, so serializing cannot stack N callers into
-        // N * timeout when the UI wedges: each caller still gives up after `timeout` total,
-        // exactly as it did before this lock existed.
-        let deadline = std::time::Instant::now() + timeout;
-        let _serialize = loop {
-            match MAIN_DISPATCH_LOCK.try_lock() {
-                Ok(guard) => break guard,
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                    if remaining.is_zero() {
-                        return Err(format!(
-                            "{what} did not complete on the main thread: timed out waiting for the \
-                             main-thread dispatch lock"
-                        ));
-                    }
-                    std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
-                }
-            }
-        };
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(format!(
-                "{what} did not complete on the main thread: timed out waiting for the \
-                 main-thread dispatch lock"
-            ));
-        }
-
         let app_for_closure = app.clone();
-        // Returns with the lock still held until the closure has either run or been abandoned,
-        // so no second round trip is ever in flight beside a closure that may still start.
-        dispatch_and_wait(
+        serialized_round_trip(
+            &MAIN_DISPATCH_LOCK,
             what,
-            remaining,
             timeout,
             |job| {
                 app.run_on_main_thread(job)
@@ -344,6 +347,74 @@ where
         Ok(tokio::runtime::RuntimeFlavor::MultiThread) => tokio::task::block_in_place(round_trip),
         _ => round_trip(),
     }
+}
+
+/// One serialized round trip: take `gate`'s lock (see [`MAIN_DISPATCH_LOCK`]), then hand `f` to `post`
+/// and wait for it. `timeout` bounds the WHOLE call, including the wait for the lock, so
+/// serializing cannot stack N callers into N * timeout when the UI wedges: each caller still
+/// gives up after `timeout` total, exactly as it did before the lock existed.
+fn serialized_round_trip<T, F>(
+    gate: &'static DispatchGate,
+    what: &str,
+    timeout: std::time::Duration,
+    post: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
+    f: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    let lock_timeout = || {
+        format!(
+            "{what} did not complete on the main thread: timed out waiting for the main-thread \
+             dispatch lock"
+        )
+    };
+    let _serialize = loop {
+        match gate.lock.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(lock_timeout());
+                }
+                std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+            }
+        }
+    };
+    // An earlier caller may have given up on a closure that is STILL RUNNING on the main thread
+    // (it started, then outlived that caller's timeout + grace). Wait for it — bounded by this
+    // caller's own deadline, so callers never stack into N * timeout — before putting a second
+    // round trip in flight beside it.
+    while gate.in_flight.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(format!(
+                "{what} did not complete on the main thread: timed out waiting for an earlier                  main-thread call that is still running (it will not run)"
+            ));
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(2)));
+    }
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(lock_timeout());
+    }
+    // Count the closure from BEFORE it can start (the count is raised ahead of the
+    // queued->running transition inside `dispatch_and_wait`'s job), so once a caller has seen
+    // its job start, the next lock holder is guaranteed to see it in flight.
+    let counted_post = move |job: Box<dyn FnOnce() + Send>| {
+        post(Box::new(move || {
+            gate.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let _done = InFlightGuard(gate);
+            job();
+        }))
+    };
+    // Returns with the lock still held until the closure has either run or been abandoned,
+    // so no second round trip is ever in flight beside a closure that may still start.
+    dispatch_and_wait(what, remaining, timeout, counted_post, f)
 }
 
 /// A dispatched closure that has not started yet.
@@ -762,6 +833,28 @@ fn click_target_verdict(target_root: isize, point_root: isize) -> Result<(), Str
     }
 }
 
+/// A trusted click must land inside the target window's CLIENT area (physical pixels, client
+/// coordinates). Checking only that the point's top-level window is ours accepted the title
+/// bar, the caption buttons (close!) and the resize border, all of which belong to the same
+/// top-level window (R4-IN2). Non-finite coordinates are refused before any `as i32` cast,
+/// which would turn `NaN` into 0 and saturate huge values.
+#[cfg(any(windows, test))]
+fn client_point_verdict(x: f64, y: f64, client_w: i32, client_h: i32) -> Result<(), String> {
+    let inside = x.is_finite()
+        && y.is_finite()
+        && x >= 0.0
+        && y >= 0.0
+        && x < f64::from(client_w)
+        && y < f64::from(client_h);
+    if inside {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing trusted click: ({x}, {y}) lies outside the window's content area              ({client_w}x{client_h} physical px), so it would land on the title bar, a caption              button or the border. Scroll the element into view and retry, or omit `trusted` to              use a synthetic click."
+        ))
+    }
+}
+
 /// The top-level window `hwnd` belongs to (0 for none).
 #[allow(unsafe_code)]
 #[cfg(windows)]
@@ -939,6 +1032,7 @@ fn win_send_key(key: &str) -> Result<(), String> {
 #[cfg(windows)]
 fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
     use windows::Win32::Foundation::POINT;
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -946,18 +1040,24 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
         MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, SendInput,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+        GetClientRect, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
         SM_YVIRTUALSCREEN, WindowFromPoint,
     };
     let h = win_hwnd(hwnd);
-    // SAFETY: GetDpiForWindow/GetSystemMetrics/ClientToScreen are safe to call
-    // with a valid HWND; ClientToScreen writes into our stack POINT.
+    // SAFETY: GetDpiForWindow/GetClientRect/GetSystemMetrics/ClientToScreen are safe to call
+    // with a valid HWND; GetClientRect and ClientToScreen write into our stack RECT/POINT.
     let (nx, ny) = unsafe {
         let dpi = GetDpiForWindow(h);
         let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
+        let (px, py) = (x * scale, y * scale);
+        // Client coordinates: the client rect's origin is always (0, 0).
+        let mut client = RECT::default();
+        GetClientRect(h, &mut client)
+            .map_err(|e| format!("refusing trusted click: cannot read the client area: {e}"))?;
+        client_point_verdict(px, py, client.right, client.bottom)?;
         let mut pt = POINT {
-            x: (x * scale) as i32,
-            y: (y * scale) as i32,
+            x: px as i32,
+            y: py as i32,
         };
         let _ = ClientToScreen(h, &mut pt);
         // The click goes to the topmost window at the point, whichever app that is.
@@ -1071,6 +1171,115 @@ mod tests {
                 .contains("covered")
         );
         assert!(click_target_verdict(0, 0).is_err());
+    }
+
+    fn leaked_gate() -> &'static super::DispatchGate {
+        Box::leak(Box::new(super::DispatchGate::new()))
+    }
+
+    /// R4-LOCK1: a round trip whose closure STARTED but outlived timeout + grace returned
+    /// "outcome unknown" and released the dispatch lock while the closure was still running on
+    /// the main thread — so the next caller put a second round trip in flight beside it, the
+    /// exact condition `MAIN_DISPATCH_LOCK` exists to prevent (`WebKitGTK` heap corruption).
+    #[test]
+    fn a_job_outliving_its_caller_blocks_the_next_round_trip_until_it_finishes() {
+        use super::serialized_round_trip;
+        use std::time::Instant;
+        let gate = leaked_gate();
+        let first_end = Arc::new(std::sync::Mutex::new(None::<Instant>));
+        let fe = Arc::clone(&first_end);
+        let first = serialized_round_trip(
+            gate,
+            "first",
+            Duration::from_millis(50),
+            post_after(Duration::ZERO),
+            move || {
+                std::thread::sleep(Duration::from_millis(400));
+                *fe.lock().unwrap() = Some(Instant::now());
+            },
+        );
+        assert!(
+            first.unwrap_err().contains("outcome is unknown"),
+            "precondition: the first caller gave up while its job was running"
+        );
+        let second_start = serialized_round_trip(
+            gate,
+            "second",
+            Duration::from_secs(5),
+            post_after(Duration::ZERO),
+            Instant::now,
+        )
+        .expect("the second round trip runs once the first job is done");
+        let first_end = first_end
+            .lock()
+            .unwrap()
+            .expect("the first job finished before the second started");
+        assert!(
+            second_start >= first_end,
+            "second round trip started {:?} before the abandoned first job finished",
+            first_end - second_start
+        );
+    }
+
+    /// The wait for an earlier caller's still-running job is bounded by the caller's OWN
+    /// deadline (no N * timeout stacking), and a caller that gives up never runs its job.
+    #[test]
+    fn waiting_for_an_abandoned_job_is_bounded_by_the_callers_deadline() {
+        use super::serialized_round_trip;
+        let gate = leaked_gate();
+        let first = serialized_round_trip(
+            gate,
+            "first",
+            Duration::from_millis(30),
+            post_after(Duration::ZERO),
+            || std::thread::sleep(Duration::from_millis(1500)),
+        );
+        assert!(first.unwrap_err().contains("outcome is unknown"));
+        let ran = Arc::new(AtomicUsize::new(0));
+        let r = Arc::clone(&ran);
+        let started = std::time::Instant::now();
+        let second = serialized_round_trip(
+            gate,
+            "second",
+            Duration::from_millis(200),
+            post_after(Duration::ZERO),
+            move || r.fetch_add(1, Ordering::SeqCst),
+        );
+        let waited = started.elapsed();
+        let err = second.unwrap_err();
+        assert!(err.contains("still running"), "{err}");
+        assert!(waited < Duration::from_millis(1000), "waited {waited:?}");
+        std::thread::sleep(Duration::from_millis(1600));
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "a caller that gave up ran its job"
+        );
+    }
+
+    /// R4-IN2: a trusted click was only checked for landing on OUR top-level window — which
+    /// includes its title bar and close button. It must land inside the client area.
+    #[test]
+    fn trusted_click_must_land_inside_the_client_area() {
+        use super::client_point_verdict;
+        assert!(client_point_verdict(0.0, 0.0, 800, 600).is_ok());
+        assert!(client_point_verdict(799.9, 599.9, 800, 600).is_ok());
+        for (x, y) in [
+            (-1.0, 10.0),  // left of the client area (window border)
+            (10.0, -30.0), // above it: the title bar / caption buttons
+            (800.0, 10.0), // right edge is exclusive
+            (10.0, 600.0),
+            (f64::NAN, 10.0), // `NaN as i32` is 0: would silently click the corner
+            (10.0, f64::INFINITY),
+            (1e12, 10.0), // `as i32` saturates to i32::MAX
+        ] {
+            let err = client_point_verdict(x, y, 800, 600).unwrap_err();
+            assert!(err.contains("outside"), "({x}, {y}): {err}");
+        }
+        assert!(
+            client_point_verdict(0.0, 0.0, 0, 0).is_err(),
+            "empty client area"
+        );
     }
 
     #[test]
