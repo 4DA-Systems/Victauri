@@ -47,6 +47,15 @@ export interface DiagnosticsResult {
 
 export type ConnectionState = "disconnected" | "connecting" | "connected";
 
+/**
+ * Whether a `GET /health` status proves the server is alive: a 2xx, or a 429 — `/health` is
+ * unauthenticated and rate-limited from the public bucket, so any local process can flood it
+ * into 429s, and a rate-limited reply is still the server answering (R4-NET1).
+ */
+export function healthStatusMeansAlive(status: number): boolean {
+  return (status >= 200 && status < 300) || status === 429;
+}
+
 export class VictauriClient {
   private baseUrl = "";
   private token = "";
@@ -79,7 +88,7 @@ export class VictauriClient {
 
     try {
       const resp = await this.fetch("/health");
-      if (!resp.ok) {
+      if (!healthStatusMeansAlive(resp.status)) {
         throw new Error(`Health check failed: ${resp.status}`);
       }
       // `/health` is deliberately unauthenticated, so a green health check says
@@ -115,6 +124,9 @@ export class VictauriClient {
    */
   async probeAuthenticated(): Promise<void> {
     const resp = await this.fetch("/info");
+    // Rate-limited: the server answered, so it is alive — don't report a disconnect because
+    // a local process is flooding the public rate-limit bucket (R4-NET1).
+    if (resp.status === 429) return;
     if (resp.status === 401) {
       throw new Error(
         "Unauthorized (401): the auth token is missing or wrong. Auth is on by " +

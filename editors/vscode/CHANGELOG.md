@@ -2,7 +2,35 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
-## Unreleased
+## 0.9.0
+
+Version-synced with the Victauri 0.9.0 release. Extension changes:
+
+- **"Generate Test for Element" can no longer be used for code injection.** The DOM node's
+  accessible name (and ref id) — page-controlled text — was interpolated into the generated
+  Rust unescaped, so a page could break out of `Locator::text("…")` and add Rust that runs on
+  `cargo test`. Every interpolated value is now escaped exactly like the Rust recorder's
+  `escape_rust_str` (backslash, quote, control and bidi characters as `\u{…}`); a test proves
+  `rustc` reads each literal back as the original text. The command CodeLens generator uses
+  the same escaping.
+- **A configured `victauri.authToken` is never sent to whoever holds the default port.** With
+  a token set but `victauri.port` left at its default, the token went to `127.0.0.1:7373` — on
+  a shared machine, a squatter there received it. The token is now sent only to an explicitly
+  configured port, or to the running app whose own discovery token equals it; otherwise
+  connect fails with a message telling you to set `victauri.port`.
+- **Several running apps are named instead of silently skipped.** Auto-discovery with more
+  than one live app used to fall back to the default port with no token; it now lists each
+  app (`identifier (port N, pid P)`) and asks you to set `victauri.port`.
+- **An app whose process can't be verified is reported.** On Windows an `EPERM` from the
+  liveness probe (typically an app running elevated while VS Code is not) now produces a
+  warning explaining why nothing was found, instead of silence. Its token is still never used.
+- **A rate-limited server is not "disconnected".** `/health` and the auth probe treat
+  `429 Too Many Requests` as alive, so a local request flood can't make the extension drop a
+  live connection.
+- Unit tests (`npm test`) cover code generation, discovery/connection resolution and the
+  health check, runnable under plain Node.
+
+Earlier 0.9.0 changes:
 
 - **DOM Explorer now shows the tree.** It read a `body` key that `dom_snapshot` never
   returns (the tool returns `{ tree, stale_refs, format }`), so the view was always empty.
