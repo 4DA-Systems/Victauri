@@ -323,6 +323,14 @@ async function run() {
       fireAPageTransitionEvent(type, window, !!persisted);
     };
 
+    // Opt-in: expose Node's fetch-API classes (jsdom has none) BEFORE the bridge loads, so a
+    // test can exercise the bridge's handling of genuine `Request` objects.
+    if (test.node_web_api || testDef.node_web_api) {
+      window.Request = Request;
+      window.Response = Response;
+      window.Headers = Headers;
+    }
+
     // Inject the bridge script
     try {
       window.eval(testDef.bridge_script);

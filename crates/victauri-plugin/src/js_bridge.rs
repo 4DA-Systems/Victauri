@@ -422,6 +422,22 @@ const INIT_SCRIPT_BODY: &str = r#"
     var ARRAY_PROTO = Array.prototype;
     var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     var SET_TIMEOUT = window.setTimeout.bind(window);
+    var REFLECT_APPLY = Reflect.apply;
+    // Native `Request` getters. They brand-check (throw for anything but a genuine Request), so
+    // they tell a real Request apart from a look-alike object and read what fetch really uses —
+    // an own `url` property planted on a Request instance cannot shadow them.
+    var REQUEST_URL_GET = null;
+    var REQUEST_METHOD_GET = null;
+    try {
+        if (typeof window.Request === 'function') {
+            REQUEST_URL_GET = Object.getOwnPropertyDescriptor(window.Request.prototype, 'url').get;
+            REQUEST_METHOD_GET = Object.getOwnPropertyDescriptor(window.Request.prototype, 'method').get;
+        }
+    } catch (e) { REQUEST_URL_GET = null; REQUEST_METHOD_GET = null; }
+    // ECMAScript ToString — what fetch() / XMLHttpRequest.open() apply to a URL or method
+    // argument (it throws for a Symbol, as they do). Not `String(v)`: page script can replace
+    // `window.String`, and `String(symbol)` does not throw.
+    function toStringExact(v) { return `${v}`; }
     var AGENT_KEY = '__VICTAURI_AGENT_KEY__';
 
     // Page script can plant `toJSON` on Object.prototype / Array.prototype, which JSON.stringify
@@ -2619,9 +2635,33 @@ const INIT_SCRIPT_BODY: &str = r#"
         var origFetch = window.fetch;
         if (origFetch) {
             window.fetch = function(input, init) {
+                // Log exactly the request fetch will make (R4-JS3). A look-alike object's own
+                // `url`/`method` used to be logged although fetch requests `String(input)`, so a
+                // page could plant fake IPC entries (a "quit_app" call that never happened).
+                // A non-Request input is converted ONCE and fetch is handed that string, so a
+                // stateful `toString` cannot make the log and the request differ either.
+                var url, method, fetchInput = input;
+                try {
+                    var isRequest = false;
+                    if (REQUEST_URL_GET && input !== null && (typeof input === 'object' || typeof input === 'function')) {
+                        try {
+                            url = REFLECT_APPLY(REQUEST_URL_GET, input, []);
+                            method = REFLECT_APPLY(REQUEST_METHOD_GET, input, []);
+                            isRequest = true;
+                        } catch (e) { isRequest = false; }
+                    }
+                    if (!isRequest) {
+                        url = toStringExact(input);
+                        method = 'GET';
+                        fetchInput = url;
+                    }
+                    var initMethod = (init !== undefined && init !== null) ? init.method : undefined;
+                    if (initMethod !== undefined) method = toStringExact(initMethod);
+                } catch (e) {
+                    // fetch itself rejects this input: let it, with nothing logged.
+                    return REFLECT_APPLY(origFetch, this, [input, init]);
+                }
                 var id = ++networkCounter;
-                var url = typeof input === 'string' ? input : (input && input.url ? input.url : String(input));
-                var method = String((init && init.method) || (input && input.method) || 'GET');
                 var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isVictauriInternalUrl(url);
                 var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
@@ -2715,7 +2755,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 return doRealFetch();
 
                 function doRealFetch() {
-                    return origFetch.call(self, input, init).then(function(response) {
+                    return REFLECT_APPLY(origFetch, self, [fetchInput, init]).then(function(response) {
                         entry.status = response.status;
                         entry.status_text = response.statusText;
                         entry.duration_ms = Date.now() - entry.timestamp;
@@ -2772,27 +2812,40 @@ const INIT_SCRIPT_BODY: &str = r#"
         // XMLHttpRequest
         var origOpen = XMLHttpRequest.prototype.open;
         var origSend = XMLHttpRequest.prototype.send;
+        // Per-request {method, url} as `open()` really received them, in a closure WeakMap —
+        // not an expando on the XHR, which page script could overwrite to forge the entry
+        // `send()` logs (R4-JS3). The WeakMap methods are captured before page script runs.
+        var xhrNet = new WeakMap();
+        var XHR_NET_GET = Function.prototype.call.bind(WeakMap.prototype.get);
+        var XHR_NET_SET = Function.prototype.call.bind(WeakMap.prototype.set);
+        var XHR_NET_DELETE = Function.prototype.call.bind(WeakMap.prototype.delete);
         XMLHttpRequest.prototype.open = function(method, url) {
-            // `url` may be a URL object (or anything with toString); coerce once
-            // here so send() can treat it as a string. Never throw into the app.
-            try {
-                this.__victauri_net = { method: String(method || 'GET'), url: String(url) };
-            } catch (e) {
-                this.__victauri_net = null;
-            }
-            return origOpen.apply(this, arguments);
+            XHR_NET_DELETE(xhrNet, this);
+            if (arguments.length < 2) return REFLECT_APPLY(origOpen, this, arguments);
+            // Convert ONCE, exactly as open() does (a URL object or anything with toString), and
+            // hand open() the converted strings: what is logged is what is requested. A
+            // conversion that throws is left for open() itself to throw.
+            var m, u;
+            try { m = toStringExact(method); u = toStringExact(url); }
+            catch (e) { return REFLECT_APPLY(origOpen, this, arguments); }
+            var args = [m, u];
+            for (var i = 2; i < arguments.length; i++) args[i] = arguments[i];
+            var ret = REFLECT_APPLY(origOpen, this, args);
+            XHR_NET_SET(xhrNet, this, { method: m, url: u });
+            return ret;
         };
         XMLHttpRequest.prototype.send = function() {
-            if (this.__victauri_net) {
-                var isVictauriInternal = isVictauriInternalUrl(this.__victauri_net.url);
+            var net = XHR_NET_GET(xhrNet, this);
+            if (net) {
+                var isVictauriInternal = isVictauriInternalUrl(net.url);
                 if (isVictauriInternal) {
-                    return origSend.apply(this, arguments);
+                    return REFLECT_APPLY(origSend, this, arguments);
                 }
                 var id = ++networkCounter;
                 var entry = {
                     id: id,
-                    method: this.__victauri_net.method.toUpperCase(),
-                    url: this.__victauri_net.url,
+                    method: net.method.toUpperCase(),
+                    url: net.url,
                     timestamp: Date.now(),
                     status: 'pending',
                     duration_ms: null,
@@ -2830,9 +2883,9 @@ const INIT_SCRIPT_BODY: &str = r#"
                 // Phase 1 routing for XHR: block + delay are supported here.
                 // `fulfill` (synthetic response) is fetch-only — faking the full
                 // XHR response surface is unreliable; document as a limitation.
-                var xroute = matchRoute(this.__victauri_net.url, this.__victauri_net.method);
+                var xroute = matchRoute(net.url, net.method);
                 if (xroute) {
-                    recordRouteMatch(xroute, this.__victauri_net.url, this.__victauri_net.method);
+                    recordRouteMatch(xroute, net.url, net.method);
                     if (xroute.action === 'block') {
                         entry.status = 'blocked';
                         entry.blocked = true;
@@ -2845,12 +2898,12 @@ const INIT_SCRIPT_BODY: &str = r#"
                     }
                     if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
                         var dArgs = arguments, dSelf = this;
-                        setTimeout(function() { origSend.apply(dSelf, dArgs); }, xroute.delay_ms);
+                        setTimeout(function() { REFLECT_APPLY(origSend, dSelf, dArgs); }, xroute.delay_ms);
                         return;
                     }
                 }
             }
-            return origSend.apply(this, arguments);
+            return REFLECT_APPLY(origSend, this, arguments);
         };
     })();
 

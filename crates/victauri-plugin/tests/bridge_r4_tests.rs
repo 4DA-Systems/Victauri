@@ -331,3 +331,132 @@ fn r4_js2_agent_key_unreachable_from_page_hooks() {
         );
     }
 }
+
+// ── R4-JS3: logged fetch / XHR target is the one the request actually uses ───
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn r4_js3_network_log_records_the_real_request_target() {
+    let mut d = def(
+        None,
+        vec![
+            case(
+                "fetch: a non-Request object is requested (and logged) as String(input)",
+                r"
+                var V = window.__VICTAURI__;
+                var requested = [];
+                // Record what the underlying fetch is really asked for.
+                var fake = { url: 'http://ipc.localhost/quit_app', method: 'POST',
+                             toString: function() { return 'http://elsewhere.test/'; } };
+                await fetch(fake);
+                var log = V.getNetworkLog();
+                return { url: log[0].url, method: log[0].method,
+                         ipc: V.getIpcLog().map(function(e) { return e.command; }) };
+                ",
+            ),
+            case(
+                "fetch: a stateful toString cannot make the log differ from the request",
+                r"
+                var n = 0;
+                var seen = null;
+                var real = window.fetch;
+                var fake = { toString: function() { return (n++ === 0) ? 'http://ipc.localhost/quit_app' : 'http://elsewhere.test/'; } };
+                await fetch(fake);
+                var log = window.__VICTAURI__.getNetworkLog();
+                return { url: log[0].url, conversions: n,
+                         ipc: window.__VICTAURI__.getIpcLog().length };
+                ",
+            ),
+            case(
+                "fetch: a replaced window.String does not change the logged URL",
+                r"
+                window.String = function() { return 'http://ipc.localhost/forged'; };
+                await fetch({ toString: function() { return 'http://elsewhere.test/a'; } });
+                var log = window.__VICTAURI__.getNetworkLog();
+                return { url: log[0].url, ipc: window.__VICTAURI__.getIpcLog().length };
+                ",
+            ),
+            case(
+                "xhr: a planted __victauri_net / fake url object cannot forge the log",
+                r"
+                var V = window.__VICTAURI__;
+                V.addRoute({ pattern: 'http', action: 'block' }); // never really send
+                // (No window.String replacement here: jsdom's own XHR uses it internally.)
+                var x = new XMLHttpRequest();
+                x.open('GET', { toString: function() { return 'http://elsewhere.test/x'; } });
+                try { x.__victauri_net = { method: 'POST', url: 'http://ipc.localhost/quit_app' }; } catch (e) {}
+                x.send();
+                var log = V.getNetworkLog();
+                return { n: log.length, url: log[0] && log[0].url, method: log[0] && log[0].method,
+                         ipc: V.getIpcLog().length };
+                ",
+            ),
+            case(
+                "xhr: a send() on a never-opened request logs nothing",
+                r"
+                var x = new XMLHttpRequest();
+                try { x.__victauri_net = { method: 'POST', url: 'http://ipc.localhost/quit_app' }; } catch (e) {}
+                try { x.send(); } catch (e) {}
+                return { n: window.__VICTAURI__.getNetworkLog().length };
+                ",
+            ),
+        ],
+    );
+    let Some(results) = run_tests(&d) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r0 = result(&results, 0);
+    assert_eq!(r0["url"], "http://elsewhere.test/", "{r0}");
+    assert_eq!(r0["method"], "GET", "{r0}");
+    assert_eq!(r0["ipc"], serde_json::json!([]), "{r0}");
+    let r1 = result(&results, 1);
+    assert_eq!(r1["conversions"], 1, "input converted exactly once: {r1}");
+    assert_eq!(r1["ipc"], 1, "{r1}");
+    assert_eq!(r1["url"], "http://ipc.localhost/quit_app", "{r1}");
+    let r2 = result(&results, 2);
+    assert_eq!(r2["url"], "http://elsewhere.test/a", "{r2}");
+    assert_eq!(r2["ipc"], 0, "{r2}");
+    let r3 = result(&results, 3);
+    assert_eq!(r3["n"], 1, "{r3}");
+    assert_eq!(r3["url"], "http://elsewhere.test/x", "{r3}");
+    assert_eq!(r3["method"], "GET", "{r3}");
+    assert_eq!(r3["ipc"], 0, "{r3}");
+    assert_eq!(result(&results, 4)["n"], 0);
+
+    // Genuine `Request` objects (Node's fetch classes, exposed before the bridge loads).
+    d = def(
+        None,
+        vec![
+            case(
+                "fetch: a Request is logged from its real url/method, not shadowing props",
+                r"
+                var req = new Request('http://ipc.localhost/real_cmd', { method: 'PUT' });
+                Object.defineProperty(req, 'url', { value: 'http://ipc.localhost/quit_app' });
+                Object.defineProperty(req, 'method', { value: 'DELETE' });
+                await fetch(req);
+                var log = window.__VICTAURI__.getNetworkLog();
+                return { url: log[0].url, method: log[0].method,
+                         ipc: window.__VICTAURI__.getIpcLog().map(function(e) { return e.command; }) };
+                ",
+            ),
+            case(
+                "fetch: init.method overrides a Request's method, as fetch does",
+                r"
+                await fetch(new Request('http://x.test/'), { method: 'PATCH' });
+                return window.__VICTAURI__.getNetworkLog()[0].method;
+                ",
+            ),
+        ],
+    );
+    d.node_web_api = true;
+    let Some(results) = run_tests(&d) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let q = result(&results, 0);
+    assert_eq!(q["url"], "http://ipc.localhost/real_cmd", "{q}");
+    assert_eq!(q["method"], "PUT", "{q}");
+    assert_eq!(q["ipc"], serde_json::json!(["real_cmd"]), "{q}");
+    assert_eq!(result(&results, 1), "PATCH");
+}
