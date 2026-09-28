@@ -72,8 +72,11 @@ pub fn agent_key() -> &'static str {
 }
 
 /// JS expression evaluating to the bridge's agent-only operations object (or `undefined` when
-/// the bridge is not loaded). Only valid inside scripts Victauri injects.
-pub(crate) fn agent_ops_js() -> String {
+/// the bridge is not loaded). Only valid inside scripts Victauri injects. `pub` only so the
+/// jsdom suite can build the real agent snippets.
+#[doc(hidden)]
+#[must_use]
+pub fn agent_ops_js() -> String {
     format!("window.__VICTAURI__?._agent(\"{}\")", agent_key())
 }
 
@@ -118,12 +121,23 @@ pub fn probe_answer_nonce(raw: &str) -> Option<String> {
 #[must_use]
 pub fn eval_wrapper_script(id: &str, code: &str) -> String {
     let id_js = js_literal(id);
+    // Code carrying the agent key (only Victauri's own agent-op snippets — the key is a
+    // per-process secret) runs in a STRICT wrapper. In a sloppy one a page hook on anything the
+    // snippet touches (a `then` getter consulted when the result settles, a built-in an op calls)
+    // reaches the wrapper through `hook.caller` or V8 stack-frame `getFunction()`, and its source
+    // holds the key (R4-JS2). Strict functions are censored from both. User code keeps sloppy
+    // semantics (implicit globals etc.), so strictness is applied only where the key is.
+    let strict = if code.contains(agent_key()) {
+        "'use strict';"
+    } else {
+        ""
+    };
     // `{code}` is followed by a NEWLINE so a trailing `// comment` in the user code cannot
     // comment out the rest of the wrapper (it used to turn every such eval into a parse error).
     // `_evalBegin` runs synchronously when the script is evaluated, before the parse check.
     format!(
         r"
-        (async () => {{
+        (async () => {{ {strict}
             const __vic = {{ id: {id_js}, bridge: window.__VICTAURI__ }};
             const __settle = (p) => (__vic.bridge && __vic.bridge._evalSettle)
                 ? __vic.bridge._evalSettle(__vic.id, p)
@@ -501,6 +515,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         evalDone.add(id);
     }
     function evalCallback(id, body) {
+        'use strict';
         try {
             return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
         } catch (e) { return null; }
@@ -604,6 +619,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // Called synchronously at the top of the eval wrapper. Returns false when the eval was
         // already settled (reported as never begun), in which case the wrapper must not run it.
         _evalBegin: function(id) {
+            'use strict';
             id = '' + id; // not String(id): page script can replace window.String
             if (evalDone.has(id)) return false;
             evalState.add(id);
@@ -614,6 +630,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // so a delayed delivery can never report a parse error for code that then runs. `nonce`
         // is the page the eval was armed in: a check that lands in another page stays silent.
         _evalCheck: function(id, nonce) {
+            'use strict';
             id = '' + id; // not String(id): page script can replace window.String
             if (nonce !== PAGE_NONCE || evalState.has(id) || evalDone.has(id)) return null;
             evalMarkDone(id);
@@ -621,6 +638,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
+            'use strict';
             id = '' + id; // not String(id): page script can replace window.String
             if (evalDone.has(id)) return null;
             evalMarkDone(id);
@@ -1113,7 +1131,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         // this page-visible object: page script could otherwise silently remove the agent's
         // block/mock rules, erase captured evidence, or flip dialog auto-answers. They are
         // handed out only for the per-process key Victauri embeds in its own injected scripts.
+        //
+        // Strict, like every AGENT_OPS function and the `_eval*` plumbing: in sloppy mode a page
+        // hook on any built-in they call (`Array.prototype.filter`, `String.prototype.indexOf`,
+        // a `then` getter, ...) could walk `hook.caller` up to the injected script whose source
+        // holds the key (R4-JS2). A strict function is never exposed as a `.caller`.
         _agent: function(key) {
+            'use strict';
             return key === AGENT_KEY ? AGENT_OPS : null;
         },
 
@@ -2029,7 +2053,12 @@ const INIT_SCRIPT_BODY: &str = r#"
     var scrubState = null;
     var sweepState = null;
 
-    // See `_agent`: reachable only with the per-process agent key.
+    // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
+    // every op — and every callback an op creates — is strict: a page hook on a built-in an op
+    // calls then cannot reach the op through `.caller` (and call it without the key), nor the
+    // injected script beyond it whose source carries the key (R4-JS2).
+    var AGENT_OPS = (function() {
+    'use strict';
     var AGENT_OPS = OBJ_CREATE(null);
     AGENT_OPS.clearIpcLog = function() {
         for (var i = networkLog.length - 1; i >= 0; i--) {
@@ -2055,7 +2084,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         dialogAutoResponses[type] = { action: action, text: text };
         return { ok: true };
     };
-    Object.freeze(AGENT_OPS);
+    return Object.freeze(AGENT_OPS);
+    })();
 
     // ── Accessibility Helpers ────────────────────────────────────────────────
 

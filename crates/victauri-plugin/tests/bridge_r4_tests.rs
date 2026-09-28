@@ -10,7 +10,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 
-use victauri_plugin::js_bridge::{BridgeCapacities, init_script};
+use victauri_plugin::js_bridge::{
+    BridgeCapacities, agent_key, agent_ops_js, eval_wrapper_script, init_script,
+};
 
 #[derive(Serialize)]
 struct TestDef {
@@ -170,4 +172,162 @@ fn r4_js1_synthetic_pagehide_cannot_wipe_logs_or_unhook_capture() {
     let c = result(&results, 1);
     assert_eq!(c["cleared"], 0, "{c}");
     assert_eq!(c["after"], serde_json::json!(["restored"]), "{c}");
+}
+
+// ── R4-JS2: the agent key cannot be read through `.caller` / stack frames ────
+
+/// Sloppy page hooks that walk everything reachable from a hooked built-in: the `.caller`
+/// chain (and each frame's `.arguments`), and — V8 — `Error.prepareStackTrace` call sites'
+/// `getFunction()`. Every reachable function's source and argument list is recorded.
+const CALLER_PROBE_SETUP: &str = r"
+    window.__reach = [];
+    window.__hits = 0;
+    function __record(start) {
+        window.__hits++;
+        var f = start, hops = 0;
+        while (hops++ < 16) {
+            var next;
+            try { next = f.caller; } catch (e) { break; }
+            if (!next) break;
+            try { window.__reach.push('caller: ' + Function.prototype.toString.call(next)); } catch (e) {}
+            try {
+                var a = next.arguments;
+                if (a) for (var i = 0; i < a.length; i++) window.__reach.push('arg: ' + String(a[i]));
+            } catch (e) {}
+            f = next;
+        }
+        var prev = Error.prepareStackTrace;
+        try {
+            Error.prepareStackTrace = function(err, sites) {
+                return sites.map(function(s) {
+                    var fn = s.getFunction();
+                    return fn ? Function.prototype.toString.call(fn) : null;
+                });
+            };
+            var frames = new Error().stack;
+            if (Array.isArray(frames)) frames.forEach(function(src) { if (src) window.__reach.push('frame: ' + src); });
+        } catch (e) {} finally { Error.prepareStackTrace = prev; }
+    }
+    window.__restore = [];
+    function __hookMethod(proto, name) {
+        var orig = proto[name];
+        proto[name] = function hooked() { __record(hooked); return orig.apply(this, arguments); };
+        window.__restore.push(function() { proto[name] = orig; });
+    }
+    function __hookGetter(proto, name, value) {
+        var d = Object.getOwnPropertyDescriptor(proto, name);
+        Object.defineProperty(proto, name, { configurable: true, get: function g() { __record(g); return value; } });
+        window.__restore.push(function() { if (d) Object.defineProperty(proto, name, d); else delete proto[name]; });
+    }
+    function __run(s) { (0, eval)(s); }
+    window.__calls = [];
+";
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn r4_js2_agent_key_unreachable_from_page_hooks() {
+    let ops = agent_ops_js();
+    // The exact snippet shapes Victauri's route / logs / navigate tools send through the eval
+    // wrapper (mcp/mod.rs), delivered as a top-level script like webview.eval does.
+    let scripts = [
+        eval_wrapper_script("r4-1", &format!("return {ops}?.clearRoute(1)")),
+        eval_wrapper_script("r4-2", &format!("return {ops}?.clearRoutes()")),
+        eval_wrapper_script(
+            "r4-3",
+            &format!(
+                "return (function(){{ var b = {ops}; if (!b) return {{ ok:false, error:'bridge unavailable' }}; b.clearIpcLog(); b.clearNetworkLog(); return {{ ok:true, cleared:['ipc','network'] }}; }})()"
+            ),
+        ),
+        eval_wrapper_script(
+            "r4-4",
+            &format!("return {ops}?.setDialogAutoResponse(\"confirm\", \"accept\", undefined)"),
+        ),
+    ];
+    let mut setup = String::from(CALLER_PROBE_SETUP);
+    // The scripts (which carry the key) are defined at top level here, never inside a
+    // function the hooks could reach — only Victauri's own injected code carries the key.
+    setup.push_str(&format!(
+        "window.__S = {};\n",
+        serde_json::to_string(&scripts).unwrap()
+    ));
+    setup.push_str(
+        r"
+        window.__TAURI_INTERNALS__ = { invoke: function tauriInvoke(cmd, a) {
+            __record(tauriInvoke); window.__calls.push(a); return Promise.resolve(null);
+        } };
+        ",
+    );
+    let def = def(
+        Some(setup),
+        vec![case(
+            "hooked built-ins never reach the agent key or an agent-only op",
+            r"
+            var V = window.__VICTAURI__;
+            V.addRoute({ pattern: 'never-matches-1', action: 'block' });
+            V.addRoute({ pattern: 'never-matches-2', action: 'block' });
+            await fetch('http://ipc.localhost/some_cmd', { method: 'POST', body: '{}' });
+            __hookMethod(Array.prototype, 'filter');
+            __hookMethod(Array.prototype, 'splice');
+            __hookMethod(String.prototype, 'indexOf');
+            __hookMethod(String.prototype, 'substring');
+            __hookGetter(Object.prototype, 'then', undefined);
+            __hookGetter(Promise.prototype, 'constructor', Promise);
+            __run(window.__S[0]);
+            __run(window.__S[1]);
+            __run(window.__S[2]);
+            __run(window.__S[3]);
+            await new Promise(function(r) { setTimeout(r, 50); });
+            window.__restore.forEach(function(f) { f(); });
+            return {
+                hits: window.__hits,
+                reach: window.__reach,
+                routes_left: V.getRouteRules().length,
+                network_left: V.getNetworkLog().length,
+                results: window.__calls.map(function(c) { return c.id + '=' + c.result; }),
+            };
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    // The ops really ran (so the hooks were exercised on the privileged paths)...
+    assert_eq!(r["routes_left"], 0, "{r}");
+    assert_eq!(r["network_left"], 0, "{r}");
+    let settled = r["results"].to_string();
+    for id in ["r4-1", "r4-2", "r4-3", "r4-4"] {
+        assert!(settled.contains(id), "{id} never settled: {settled}");
+    }
+    assert!(
+        r["hits"].as_u64().unwrap_or(0) > 0,
+        "hooks never fired: {r}"
+    );
+    // ...yet nothing a hook could reach carries the key or is an agent-only op.
+    let key = agent_key();
+    let reach: Vec<String> = serde_json::from_value(r["reach"].clone()).unwrap();
+    let leaked: Vec<&String> = reach.iter().filter(|s| s.contains(key)).collect();
+    assert!(
+        leaked.is_empty(),
+        "agent key reachable from page hooks ({} of {} reached items):\n{}",
+        leaked.len(),
+        reach.len(),
+        leaked
+            .iter()
+            .map(|s| s.chars().take(160).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    for op_body in [
+        "routeRules = routeRules.filter",
+        "networkLog.splice(i, 1)",
+        "dialogAutoResponses[type]",
+        "key === AGENT_KEY",
+    ] {
+        assert!(
+            !reach.iter().any(|s| s.contains(op_body)),
+            "agent-only function reachable from page hooks: {op_body}"
+        );
+    }
 }
