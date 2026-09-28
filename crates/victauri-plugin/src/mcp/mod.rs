@@ -255,6 +255,21 @@ const PROBE_TIMEOUT: std::time::Duration = if cfg!(test) {
     std::time::Duration::from_secs(10)
 };
 
+/// App-registered probes allowed to run at once. A probe that hangs keeps its blocking thread
+/// past [`PROBE_TIMEOUT`]; the cap stops repeated calls to it from leaking a thread each.
+pub(crate) const MAX_CONCURRENT_PROBES: usize = 4;
+
+/// `read_app_file` reads allowed to run at once (a read blocked on a FIFO or slow device keeps
+/// its thread past [`READ_APP_FILE_TIMEOUT`]).
+pub(crate) const MAX_CONCURRENT_FILE_READS: usize = 4;
+
+/// How long `read_app_file` waits for its (bounded, at most 10 MB) read (shortened under test).
+const READ_APP_FILE_TIMEOUT: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_secs(1)
+} else {
+    std::time::Duration::from_secs(15)
+};
+
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
 /// How often a slow eval re-checks that its target window still exists (first check after
@@ -369,6 +384,10 @@ pub struct VictauriMcpHandler {
     /// Window keys whose previous eval timed out. Retained only to annotate the
     /// error on the *next* eval (the bridge is probed before every eval anyway).
     timed_out_labels: Arc<Mutex<HashSet<String>>>,
+    /// Slots for running app probes ([`MAX_CONCURRENT_PROBES`]); held by the probe's thread.
+    probe_slots: Arc<tokio::sync::Semaphore>,
+    /// Slots for `read_app_file` reads ([`MAX_CONCURRENT_FILE_READS`]); held by the read's thread.
+    file_slots: Arc<tokio::sync::Semaphore>,
 }
 
 #[tool_router]
@@ -1076,12 +1095,24 @@ impl VictauriMcpHandler {
         };
         if let Some(probe) = self.state.probes.get(&name) {
             // A probe is app code: run it off the async executor, bounded, and with a panic
-            // boundary (it used to run inline on a tokio worker with neither).
+            // boundary (it used to run inline on a tokio worker with neither). Its slot is
+            // held by the probe's thread, so a hung probe that outlives the deadline still
+            // counts against the cap and repeated calls cannot pile up leaked threads.
+            let Ok(slot) = Arc::clone(&self.probe_slots).try_acquire_owned() else {
+                return tool_error(format!(
+                    "probe '{name}' not run: app probes are busy ({MAX_CONCURRENT_PROBES} \
+                     still running — a probe that hangs keeps running past its timeout). \
+                     Retry shortly."
+                ));
+            };
             match bounded::run_blocking_bounded(
                 None,
                 &format!("probe '{name}'"),
                 PROBE_TIMEOUT,
-                move || Ok(probe()),
+                move || {
+                    let _slot = slot;
+                    Ok(probe())
+                },
             )
             .await
             {
@@ -1425,34 +1456,11 @@ impl VictauriMcpHandler {
             Ok(c) => c,
             Err(e) => return tool_error(format!("cannot resolve path: {e}")),
         };
-        #[allow(clippy::cast_possible_truncation)]
-        let read = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<u8>, usize, Option<u64>), String> {
-                use std::io::Read;
-                let metadata = std::fs::metadata(&canonical).ok();
-                let size = metadata.as_ref().map(|m| m.len() as usize);
-                let modified = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-                    t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                });
-                // Bounded read (audit B7): pull at most max_bytes+1 instead of slurping the
-                // whole file. The +1 detects truncation; the reported size comes from metadata.
-                let f = std::fs::File::open(&canonical).map_err(|e| e.to_string())?;
-                let mut buf = Vec::new();
-                f.take(max_bytes as u64 + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| e.to_string())?;
-                let reported = size.unwrap_or(buf.len());
-                Ok((buf, reported, modified))
-            },
-        )
-        .await;
-        let (mut bytes, original_size, modified) = match read {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return tool_error(format!("failed to read file: {e}")),
-            Err(e) => return tool_error(format!("file read task failed: {e}")),
-        };
+        let (mut bytes, original_size, modified) =
+            match self.read_regular_file_bounded(canonical, max_bytes).await {
+                Ok(v) => v,
+                Err(e) => return tool_error(format!("failed to read file: {e}")),
+            };
         let truncated = bytes.len() > max_bytes;
         if truncated {
             bytes.truncate(max_bytes);
@@ -4167,6 +4175,8 @@ impl VictauriMcpHandler {
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             bridge_checked: Arc::new(AtomicBool::new(false)),
             timed_out_labels: Arc::new(Mutex::new(HashSet::new())),
+            probe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES)),
+            file_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_READS)),
         }
     }
 
@@ -4378,6 +4388,29 @@ impl VictauriMcpHandler {
             }
         }
         result
+    }
+
+    /// Read at most `max_bytes` (+1, to detect truncation) of the regular file at `path` on
+    /// the blocking pool, within [`READ_APP_FILE_TIMEOUT`] and one of the
+    /// [`MAX_CONCURRENT_FILE_READS`] slots. A read that blocks (a FIFO or device swapped in
+    /// after the handler's checks) returns at the deadline; its thread keeps the slot until
+    /// it finishes, so such reads cannot pile up.
+    async fn read_regular_file_bounded(
+        &self,
+        path: std::path::PathBuf,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, usize, Option<u64>), String> {
+        let Ok(slot) = Arc::clone(&self.file_slots).try_acquire_owned() else {
+            return Err(format!(
+                "file reads are busy ({MAX_CONCURRENT_FILE_READS} still running — a read \
+                 blocked on a pipe or device keeps running past its timeout). Retry shortly."
+            ));
+        };
+        bounded::run_blocking_bounded(None, "file read", READ_APP_FILE_TIMEOUT, move || {
+            let _slot = slot;
+            read_regular_file(&path, max_bytes)
+        })
+        .await
     }
 
     fn resolve_app_dir(&self, dir: Option<AppDir>) -> Result<std::path::PathBuf, String> {
@@ -5650,6 +5683,33 @@ fn starts_with_statement(code: &str) -> bool {
     ident_len > 0
         && !code.as_bytes()[0].is_ascii_digit()
         && code[ident_len..].trim_start().starts_with(':')
+}
+
+/// Blocking: open `path`, refuse it unless the OPENED file is a regular file (the handler's
+/// earlier checks ran on the path, which can be swapped for a FIFO or device before the open),
+/// then read at most `max_bytes + 1` bytes (audit B7: never the whole file; the `+1` detects
+/// truncation). Returns the bytes, the file's size and its modification time (Unix seconds).
+pub(crate) fn read_regular_file(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, usize, Option<u64>), String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let metadata = f.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let modified = metadata.modified().ok().map(|t| {
+        t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    });
+    let mut buf = Vec::new();
+    f.take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    Ok((buf, size, modified))
 }
 
 /// Resolve `.` and `..` components without touching the filesystem.
