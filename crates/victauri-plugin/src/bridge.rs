@@ -388,16 +388,10 @@ where
     // (it started, then outlived that caller's timeout + grace). Wait for it — bounded by this
     // caller's own deadline, so callers never stack into N * timeout — before putting a second
     // round trip in flight beside it.
-    // The previous closure usually finishes a few instructions after its caller was answered
-    // (its in-flight guard drops just after the result is sent), so yield briefly before
-    // falling back to sleeping — a 2 ms sleep costs up to ~15 ms on Windows' timer.
-    let mut spins = 0u32;
+    // Deliberately a plain sleep, not a yield spin: re-dispatching the moment the previous
+    // closure's guard drops crashed the WebKitGTK host (heap corruption) in CI — a spin reverted
+    // in round 4 after CI crashed 2/2 with it and 2/2 passed without it (PR #74).
     while gate.in_flight.load(std::sync::atomic::Ordering::Acquire) != 0 {
-        if spins < 256 {
-            spins += 1;
-            std::thread::yield_now();
-            continue;
-        }
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Err(format!(

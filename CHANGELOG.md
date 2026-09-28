@@ -123,8 +123,10 @@ parameters (`$a(')`… is one token) and passed one stacked query the old checke
 rusqlite range forced `bundled` onto the app's rusqlite (now a separate default feature,
 `bundled-sqlite`, with an opt-out); `victauri-test` cut tool calls without `timeout_ms` off at
 60 s while the server allows 300 s; the VS Code extension counted a 429 on the authenticated probe
-as success; plus a garbled error message, a stray doc comment, a lost XHR log entry after a
-throwing `open()`, and a spurious up-to-15 ms wait between main-thread round trips on Windows.
+as success; plus a garbled error message, a stray doc comment, and a lost XHR log entry after a
+throwing `open()`. (A proposed yield spin to shave up to ~15 ms off back-to-back main-thread round
+trips on Windows was reverted: with it the Linux/WebKitGTK E2E host crashed with heap corruption in
+CI 2/2, without it passed — a latency nicety is not worth reopening that race.)
 
 **Disproved in round 4** (tested, not defects): eval ids leaking via `.caller` (V8 blocks the
 second hop); `PRAGMA quick_check` overrunning its deadline on a 1.47 GB database (3.8 s); discovery
