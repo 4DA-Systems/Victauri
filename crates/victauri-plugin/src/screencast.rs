@@ -172,12 +172,16 @@ impl Screencast {
 
     /// Append a frame only if `generation` is still current. The capture task checks the
     /// generation before a (slow) capture; re-checking at push time stops a stale task from
-    /// inserting a frame into a trace started after it.
+    /// inserting a frame into a trace started after it. The check and the push happen under
+    /// the trace lock (taken before the frames lock, the same order as [`start`](Self::start)),
+    /// so a `start` cannot clear the buffer between them and receive the stale frame (R4-RACE2).
     pub fn push_frame_if_current(&self, generation: u64, t_ms: u64, data_b64: String) -> bool {
-        if !self.is_current(generation) {
+        let t = self.trace();
+        if !(t.active && t.generation == generation) {
             return false;
         }
         self.push_frame(t_ms, data_b64);
+        drop(t);
         true
     }
 
@@ -446,6 +450,47 @@ mod tests {
         }
         stopper.join().unwrap();
         assert_eq!(orphaned, 0, "active trace with no capture task");
+    }
+
+    /// R4-RACE2: `push_frame_if_current` checked the generation, RELEASED the trace lock, then
+    /// pushed — so a `start` landing in between cleared the buffer and the stale task's frame
+    /// then landed in the NEW trace. Every frame is tagged with the generation that pushed it;
+    /// right after a `start` returns, the buffer may only hold frames of that generation.
+    #[test]
+    fn stale_frame_never_lands_in_a_newer_trace() {
+        let sc = std::sync::Arc::new(Screencast::default());
+        let (first, _) = sc.start(100, 600, None);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pushers: Vec<_> = (0..3)
+            .map(|_| {
+                let (sc, stop) = (std::sync::Arc::clone(&sc), std::sync::Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    let mut g = first;
+                    while !stop.load(Ordering::Relaxed) {
+                        if !sc.push_frame_if_current(g, 0, g.to_string()) {
+                            g = sc.generation();
+                        }
+                    }
+                })
+            })
+            .collect();
+        let mut leaked = 0;
+        for _ in 0..20_000 {
+            let (g, _) = sc.start(100, 600, None);
+            leaked += sc
+                .frames(0)
+                .iter()
+                .filter(|f| f.data_b64.parse::<u64>().unwrap() != g)
+                .count();
+        }
+        stop.store(true, Ordering::Relaxed);
+        for p in pushers {
+            p.join().unwrap();
+        }
+        assert_eq!(
+            leaked, 0,
+            "frames from a superseded trace leaked into a newer one"
+        );
     }
 
     #[test]
