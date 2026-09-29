@@ -941,7 +941,12 @@ async fn post_message(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = resp.text().await.unwrap_or_default();
+        // A body that fails mid-read (the app died or the connection dropped mid-SSE-stream,
+        // after the request was delivered — possibly after progress events) is a POST-SEND
+        // failure, so it propagates: the caller then never re-sends a tool call and tells the
+        // client it may already have run. Swallowing it (`unwrap_or_default`) reported a
+        // misleading "empty or non-JSON response" instead (R5-BR4).
+        let body = resp.text().await?;
 
         if !(200..300).contains(&status) {
             // Surface a JSON-RPC error for the original request id.

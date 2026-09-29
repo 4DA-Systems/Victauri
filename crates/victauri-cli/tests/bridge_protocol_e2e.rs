@@ -183,6 +183,35 @@ async fn stateless_mcp(
         b.malformed.fetch_add(1, Ordering::SeqCst);
     }
     match v.get("method").and_then(Value::as_str) {
+        Some("tools/call") if v.pointer("/params/name") == Some(&json!("broken_sse")) => {
+            b.tool_calls.fetch_add(1, Ordering::SeqCst);
+            // The call is running (a progress event is streamed), then the connection dies
+            // before the result: the command may well have executed.
+            let progress = format!(
+                "data: {}
+
+",
+                json!({"jsonrpc":"2.0","method":"notifications/progress",
+                       "params":{"progressToken":1,"progress":1}})
+            );
+            let body = futures_util::stream::unfold(0u8, move |step| {
+                let progress = progress.clone();
+                async move {
+                    match step {
+                        0 => Some((Ok::<_, std::io::Error>(progress), 1)),
+                        1 => {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            Some((Err(std::io::Error::other("app died mid-stream")), 2))
+                        }
+                        _ => None,
+                    }
+                }
+            });
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from_stream(body))
+                .unwrap()
+        }
         Some("tools/call") => {
             b.tool_calls.fetch_add(1, Ordering::SeqCst);
             axum::Json(json!({"jsonrpc":"2.0","id":id,
@@ -308,4 +337,32 @@ async fn a_client_response_is_forwarded_and_never_answered() {
     assert_eq!(invalid["id"], 13, "{invalid}");
     assert_eq!(invalid["error"]["code"], -32600, "{invalid}");
     assert_eq!(backend.malformed.load(Ordering::SeqCst), 0, "not forwarded");
+}
+
+/// R5-BR4: an SSE response that dies mid-stream (after a progress event) means the call was
+/// delivered and may have run. The client must be told exactly that — and the call must not
+/// be re-sent — instead of the misleading "empty or non-JSON response" (the body-read error
+/// used to be swallowed by `unwrap_or_default`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_tool_call_whose_sse_stream_dies_says_it_may_have_run() {
+    let backend = Backend::default();
+    let mut h = Harness::start(backend_routes(&backend), true, &[]).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":20,"method":"tools/call",
+        "params":{"name":"broken_sse","arguments":{}}}));
+    let r = h.recv_reply();
+    assert_eq!(r["id"], 20, "{r}");
+    let msg = r["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("error reply: {r}"));
+    assert!(
+        msg.contains("NOT retried") && msg.contains("may already have taken effect"),
+        "must say the call may have executed: {msg}"
+    );
+    assert!(!msg.contains("empty or non-JSON"), "{msg}");
+    assert_eq!(
+        backend.tool_calls.load(Ordering::SeqCst),
+        1,
+        "a possibly-executed tool call is never re-sent"
+    );
 }
