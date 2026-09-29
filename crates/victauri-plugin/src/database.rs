@@ -175,7 +175,13 @@ const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
 ///
 /// The database file is treated as untrusted input: the connection is opened read-only with
 /// `trusted_schema=OFF` and `SQLite`'s defensive mode, and virtual tables are listed but never
-/// counted (counting one runs its module's code).
+/// counted (counting one runs its module's code). That does not keep virtual-table module code
+/// out of the call entirely: `quick_check` connects every virtual table whose module is
+/// registered and (`SQLite` >= 3.44) runs its `xIntegrity` check. Victauri registers no module on
+/// this connection, so that is `SQLite`'s built-ins (FTS3/4/5, R-Tree) plus anything the host
+/// process installed as an auto-extension. Verified on
+/// 3.46: a corrupted FTS5 index reports `malformed inverted index for FTS5 table …`, and a
+/// broken one fails `quick_check` with `vtable constructor failed`.
 #[cfg(feature = "sqlite")]
 pub(crate) fn db_health_report(
     path: &str,
@@ -205,17 +211,31 @@ pub(crate) fn db_health_report(
         let page_count = int("page_count")?;
         let page_size = int("page_size")?;
         let freelist_count = int("freelist_count")?;
+        // Only a table whose definition is exactly SQLite's own `CREATE TABLE ` form is counted.
+        // SQLite writes every definition in canonical form (`CREATE TABLE <name>…` /
+        // `CREATE VIRTUAL TABLE <name>…`, one space each), so a legitimate file never differs;
+        // a crafted one can (via `writable_schema`) spell a virtual table `CREATE  VIRTUAL`,
+        // `CREATE/**/VIRTUAL`, … which a `LIKE 'CREATE VIRTUAL%'` test missed — and then
+        // `count(*)` ran the module's code. Anything not in canonical ordinary-table form is
+        // listed, never counted.
         let mut stmt = c.prepare(
-            "SELECT name, (sql LIKE 'CREATE VIRTUAL%') FROM sqlite_master \
-             WHERE type='table' ORDER BY name",
+            "SELECT name, substr(sql, 1, 13) IS 'CREATE TABLE ', \
+             instr(upper(substr(sql, 1, 256)), 'VIRTUAL') > 0 \
+             FROM sqlite_master WHERE type='table' ORDER BY name",
         )?;
-        let mut names: Vec<(String, bool)> = Vec::new();
+        let mut names: Vec<(String, TableKind)> = Vec::new();
         let mut table_bytes = 0usize;
         let mut truncated = false;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
             let name: String = row.get(0)?;
-            let is_virtual: bool = row.get::<_, Option<bool>>(1)?.unwrap_or(false);
+            let kind = if row.get::<_, Option<bool>>(1)?.unwrap_or(false) {
+                TableKind::Ordinary
+            } else if row.get::<_, Option<bool>>(2)?.unwrap_or(false) {
+                TableKind::Virtual
+            } else {
+                TableKind::Unrecognized
+            };
             if names.len() >= MAX_DB_HEALTH_TABLES
                 || table_bytes.saturating_add(name.len()) > MAX_DB_HEALTH_TABLE_BYTES
             {
@@ -223,7 +243,7 @@ pub(crate) fn db_health_report(
                 break;
             }
             table_bytes = table_bytes.saturating_add(name.len());
-            names.push((name, is_virtual));
+            names.push((name, kind));
         }
         Ok((
             journal_mode,
@@ -258,10 +278,14 @@ pub(crate) fn db_health_report(
     let mut budget_exhausted = false;
     let mut all_counted = true;
     let mut tables = Vec::with_capacity(names.len());
-    for (name, is_virtual) in names {
+    for (name, kind) in names {
         let mut entry = serde_json::json!({ "name": name, "row_count": null });
-        if is_virtual {
+        if kind == TableKind::Virtual {
             entry["virtual"] = serde_json::json!(true);
+            all_counted = false;
+        } else if kind == TableKind::Unrecognized {
+            entry["count_skipped"] =
+                serde_json::json!("definition is not in SQLite's canonical CREATE TABLE form");
             all_counted = false;
         } else {
             let remaining = count_budget.saturating_sub(counts_started.elapsed());
@@ -319,6 +343,18 @@ pub(crate) fn db_health_report(
         "row_counts_complete": all_counted,
         "row_count_budget_exhausted": budget_exhausted,
     }))
+}
+
+/// How [`db_health_report`] treats a `sqlite_master` table entry.
+#[cfg(feature = "sqlite")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TableKind {
+    /// Canonical `CREATE TABLE ` definition: counted.
+    Ordinary,
+    /// A virtual table (by any spelling): listed, not counted.
+    Virtual,
+    /// Neither: listed, not counted.
+    Unrecognized,
 }
 
 /// Budget for the metadata PRAGMAs + table listing in [`db_health_report`].
@@ -1383,6 +1419,69 @@ mod tests {
         );
         assert_eq!(r["row_counts_complete"], false);
         assert_eq!(r["integrity_check_kind"], "quick_check");
+    }
+
+    /// R5-DB1: virtual-table detection was `sql LIKE 'CREATE VIRTUAL%'`, which a crafted file
+    /// defeats with any other spelling `SQLite` still parses as a virtual table (planted through
+    /// `writable_schema`) — and then `count(*)` ran the module's code.
+    #[test]
+    fn db_health_does_not_count_a_disguised_virtual_table() {
+        for (i, disguise) in [
+            "CREATE  VIRTUAL TABLE",
+            "CREATE\tVIRTUAL TABLE",
+            "CREATE\nVIRTUAL TABLE",
+            "CREATE/**/VIRTUAL TABLE",
+            "CREATE -- c\nVIRTUAL TABLE",
+            "create virtual table",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+            let conn = rusqlite::Connection::open(file.path()).unwrap();
+            conn.execute_batch("CREATE TABLE plain (x); INSERT INTO plain VALUES (1);")
+                .unwrap();
+            if conn
+                .execute_batch("CREATE VIRTUAL TABLE docs USING fts5(body);")
+                .is_err()
+            {
+                return; // this SQLite build has no FTS5; nothing to test
+            }
+            conn.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE sqlite_master SET sql = replace(sql, 'CREATE VIRTUAL TABLE', ?1) \
+                     WHERE name = 'docs'",
+                    [disguise],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+            drop(conn);
+            // SQLite itself still reads it as the virtual table.
+            let check = rusqlite::Connection::open(file.path()).unwrap();
+            let sql: String = check
+                .query_row("SELECT sql FROM sqlite_master WHERE name='docs'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert!(sql.starts_with(disguise), "case {i}: {sql}");
+            check
+                .execute_batch("INSERT INTO docs(body) VALUES ('still fts5')")
+                .unwrap_or_else(|e| panic!("case {i}: not a working virtual table: {e}"));
+            drop(check);
+
+            let long = Duration::from_secs(10);
+            let r = db_health_report(file.path().to_str().unwrap(), long, long).unwrap();
+            let tables = r["tables"].as_array().unwrap();
+            let docs = tables.iter().find(|t| t["name"] == "docs").unwrap();
+            assert!(
+                docs["row_count"].is_null(),
+                "case {i} ({disguise:?}): a virtual table was counted: {docs}"
+            );
+            assert_eq!(docs["virtual"], true, "case {i}: {docs}");
+            let plain = tables.iter().find(|t| t["name"] == "plain").unwrap();
+            assert_eq!(plain["row_count"], 1, "case {i}: {plain}");
+        }
     }
 
     #[test]

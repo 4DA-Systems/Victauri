@@ -54,7 +54,12 @@ that did not survive testing are listed under "Disproved" below. No Critical or 
 - **An unauthenticated `/health` flood made a healthy app look dead**: the bridge's liveness probe
   and the watchdog read the 429 as "down" (live: 88k × 429, every agent call "backend not
   reachable", watchdog recovery fired). A 429 from `/health` now means alive.
-- **`animation scrub capture=true` took screenshots with `screenshot` disabled.**
+- **`animation scrub capture=true` took screenshots with `screenshot` disabled.** It also reported
+  `"captured": true` with no filmstrip when every capture failed or the sheet was too large to
+  compose (round 5): `captured` is now true only alongside a filmstrip, a capture failure is
+  returned as `capture_error`, a compose failure is an error, and a sheet over the 512 MiB limit
+  is refused after the first frame (with the largest `points` that fits) instead of after
+  accumulating every raw frame.
 - **`introspect contract_record` panicked** on any non-ASCII response over 4 KiB.
 - **Trusted input** sent real keystrokes when focus had not landed on the element, and a trusted
   click used an unchecked page-controlled point (the title bar / close button was reachable). Both
@@ -64,7 +69,14 @@ that did not survive testing are listed under "Disproved" below. No Critical or 
   forge one was wrong), inviting a double-executing retry. Only a positively different page aborts.
 - **The `eval_js` auto-return scanner still dropped statements** (the round-3 "never drops a
   statement" claim was wrong): a line break inside `/* */`, a lone CR, a line ending in `1.`, and
-  `of`/`yield` used as names. Differential check against node: 10,793 → 0 divergent of 35,459.
+  `of`/`yield` used as names. Differential check against node: 10,793 → 0 divergent of 35,459
+  generated snippets — a result for that corpus, not a proof. Round 5 found three more shapes it
+  did not cover, now fixed: a regex right after the `)` of an `if`/`while`/`for`/`with` head
+  (`if (a) /'/.test(s)` inside a function, then another statement), `of` used as a name inside
+  brackets (`L(of / 2); L(3)`), and a non-ASCII identifier ending in a keyword (`énew / 2; g()`).
+  A new node differential over 20,000 snippets built around these shapes: 1,771 → 0 divergent of
+  18,119 that parse. The scanner is a heuristic; when it cannot tell, it leaves the code unwrapped
+  (no auto-`return`), which is the safe direction.
 - **`query_db` refused legitimate queries** with `;`, `--` or `/*` inside quotes (`LIKE '%;%'`,
   present since 0.8.x), while `SELECT '--'; DELETE …` slipped past the stacked-query check. One
   quote-aware lexer now drives every pre-check (the SQLite authorizer remains the security
@@ -110,7 +122,12 @@ contract and page-load maps are capped; panicked background tasks are reported f
 capture runs on one COM thread with a bounded wait; `Locator::check()` works on ARIA checkboxes;
 `victauri check` lists ghost names; `recording stop` flushes every window first (events captured since the last 1 s drain tick were dropped; a window that cannot answer within 3 s is reported in `final_flush_unreachable`); a request the guards refuse (401/403/415/429) closes its
 connection, so refused requests (a web page's no-cors fetches, a local script) cannot park the
-256 connection slots; GitHub Release notes are the version's CHANGELOG section (not raw commit
+256 request slots, and a connection takes a request slot only once it has sent its first byte —
+a connection that sends nothing (a page's `<link rel=preconnect>` across `*.localhost` names
+never reaches a guard; measured in Edge: ~370 held, agent `/health` probes failing 17/30) waits
+in a separate pool of 1,024 and is closed after 3 s instead of holding a slot for the 30 s header
+deadline (round 5). Residual: a local process can still fill the 256 slots with started-but-stalled
+request heads until the header deadline (slow-loris is bounded, not prevented); GitHub Release notes are the version's CHANGELOG section (not raw commit
 subjects) and the binaries ship with `SHA256SUMS`; tool-reference, MIGRATION, README and security
 docs corrections.
 
@@ -302,7 +319,12 @@ Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
 - **`query_db` is enforced by SQLite's authorizer.** The string checks missed table-valued pragma
   functions (`SELECT * FROM pragma_optimize` ran) and the parenthesized write form
   (`PRAGMA user_version(5)`). Connections also run with `trusted_schema=OFF` + defensive mode, and
-  `db_health` never counts virtual tables (counting runs module code).
+  `db_health` never counts virtual tables (counting runs module code). (Round 5: that check was
+  `sql LIKE 'CREATE VIRTUAL%'`, which a crafted file defeats with `CREATE  VIRTUAL` — two spaces —
+  planted through `writable_schema`; only SQLite's canonical `CREATE TABLE ` form is counted now.
+  Note that `quick_check` still connects virtual tables and, on SQLite >= 3.44, runs their
+  modules' `xIntegrity` — SQLite's built-ins (FTS3/4/5, R-Tree) plus any auto-extension the host
+  process installed; Victauri registers none.)
 - **Browser-originated POSTs must be JSON** — with `auth_disabled()`, a page on any localhost origin
   could fire CORS-simple (no-preflight) tool calls. The concurrency cap is now global (it was 64
   per route).

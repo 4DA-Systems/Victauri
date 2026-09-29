@@ -16,9 +16,15 @@ pub const MAX_PAGE_PENDING_EVALS: usize = 25;
 pub const MAX_PAGE_PENDING_EVALS_PER_WINDOW: usize = 10;
 
 /// Page-callable window queries (`victauri_list_windows` / `victauri_get_window_state`) allowed
-/// in flight at once, across all windows. Each is a main-thread round trip serialized with every
-/// other one (the agent's included); without a budget page script could queue hundreds and
-/// starve the agent. Beyond it a query is refused at once, like a page eval over its budget.
+/// in flight at once, across all windows. Beyond it a query is refused at once, like a page eval
+/// over its budget.
+///
+/// While both are synchronous commands this budget never binds: Tauri runs a sync command on the
+/// main thread, the bridge then runs the query inline (`bridge::on_main` — no round trip, no
+/// dispatch lock), and the main thread runs one command at a time, so at most one slot is ever
+/// held. It is kept as a guard for the path it was written for (0.9.0 round 3, when these were
+/// `async` commands whose queries were main-thread round trips queued behind the agent's): should
+/// they ever run off the main thread again, a page cannot queue hundreds of them.
 pub const MAX_PAGE_WINDOW_QUERIES: usize = 4;
 pub static PAGE_WINDOW_QUERY_SLOTS: tokio::sync::Semaphore =
     tokio::sync::Semaphore::const_new(MAX_PAGE_WINDOW_QUERIES);
@@ -322,10 +328,10 @@ pub fn victauri_check_ipc_integrity(
 mod tests {
     use super::*;
 
-    /// G-2: `victauri_list_windows` / `victauri_get_window_state` are callable by page script
-    /// and each is a main-thread round trip serialized with every other; without a budget a
-    /// page could queue hundreds and starve the agent's calls. Beyond the budget a query is
-    /// refused at once, and a slot is released when its query finishes.
+    /// G-2: `victauri_list_windows` / `victauri_get_window_state` are callable by page script.
+    /// Beyond the budget a query is refused at once, and a slot is released when its query
+    /// finishes. (As sync commands they cannot contend for it today — see
+    /// [`MAX_PAGE_WINDOW_QUERIES`]; this pins the guard itself.)
     #[test]
     fn page_window_queries_are_budgeted() {
         let held: Vec<_> = (0..MAX_PAGE_WINDOW_QUERIES)
@@ -368,5 +374,91 @@ mod tests {
             source.contains("pub fn victauri_eval_callback<R: Runtime>("),
             "victauri_eval_callback must stay a synchronous command"
         );
+    }
+
+    /// Every `.rs` file under this crate's `src/`, as `(path, source)`.
+    fn crate_sources() -> Vec<(std::path::PathBuf, String)> {
+        fn walk(dir: &std::path::Path, out: &mut Vec<(std::path::PathBuf, String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    out.push((path, source));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut out,
+        );
+        out
+    }
+
+    /// The same rule from the other side: `#[tauri::command]` makes a `fn` an async
+    /// command without the `async` keyword, and a command defined outside this file would escape
+    /// the check above. So: no `#[tauri::command(…)]` attribute anywhere in the crate may mention
+    /// `async`, and every command the plugin registers is sync except the two page waiters.
+    #[test]
+    fn every_registered_command_is_sync_except_the_page_waiters() {
+        let sources = crate_sources();
+        for (path, source) in &sources {
+            for line in source.lines() {
+                let attr: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                if attr.starts_with("#[tauri::command(") {
+                    assert!(
+                        !attr.contains("async"),
+                        "{}: async command attribute `{}` — see \
+                         only_the_commands_that_wait_for_the_page_are_async",
+                        path.display(),
+                        line.trim()
+                    );
+                }
+            }
+        }
+
+        let lib = include_str!("lib.rs");
+        let start = lib
+            .find("generate_handler![")
+            .expect("lib.rs registers its commands with generate_handler!");
+        let list = &lib[start + "generate_handler![".len()..];
+        let list = &list[..list.find(']').expect("generate_handler! list is closed")];
+        let registered: Vec<&str> = list
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(registered.len() >= 10, "parsed {registered:?}");
+        for path in &registered {
+            let name = path.rsplit("::").next().unwrap_or(path);
+            let sync_def = format!("pub fn {name}");
+            let async_def = format!("pub async fn {name}");
+            let defs: Vec<bool> = sources
+                .iter()
+                .flat_map(|(_, s)| s.lines())
+                .map(str::trim_start)
+                .filter_map(|l| {
+                    let is_def = |d: &str| {
+                        l.strip_prefix(d)
+                            .is_some_and(|rest| rest.starts_with(['<', '(']))
+                    };
+                    if is_def(&async_def) {
+                        Some(true)
+                    } else if is_def(&sync_def) {
+                        Some(false)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(defs.len(), 1, "command {path}: expected one definition");
+            let may_be_async = matches!(name, "victauri_eval_js" | "victauri_dom_snapshot");
+            assert!(
+                !defs[0] || may_be_async,
+                "registered command {path} is async — only the page waiters may be"
+            );
+        }
     }
 }
