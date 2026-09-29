@@ -134,8 +134,16 @@ pub async fn victauri_eval_js<R: Runtime>(
     }
 }
 
+/// Deliberately a SYNCHRONOUS command. Every eval, drain tick, snapshot and bridge-ready signal
+/// comes back through here. Tauri runs an `async` command on a tokio worker and drops its
+/// resolver — which holds a `Webview`, i.e. a Tauri handle — there; on Linux that is an
+/// off-main-thread drop of a non-atomic `Rc` (see `bridge::on_main`), and at this call rate it
+/// corrupted the host's heap. A sync command runs on the main thread, where its `webview`
+/// argument and its resolver are created and dropped. Result delivery never blocks that thread:
+/// an uncontended map is updated in place, otherwise owned data (no Tauri handle) is handed to
+/// a tokio task.
 #[tauri::command]
-pub async fn victauri_eval_callback<R: Runtime>(
+pub fn victauri_eval_callback<R: Runtime>(
     webview: tauri::Webview<R>,
     state: State<'_, Arc<VictauriState>>,
     id: String,
@@ -155,10 +163,25 @@ pub async fn victauri_eval_callback<R: Runtime>(
         state.page_loads.record_load(webview.label(), nonce);
         return Ok(());
     }
-    if let Some(tx) = state.pending_evals.lock().await.remove(&id) {
-        let _ = tx.send(result);
-    }
+    deliver_eval_result(Arc::clone(state.inner()), id, result);
     Ok(())
+}
+
+/// Hand an eval result to the caller waiting on `id` without blocking the calling (main)
+/// thread: in place when the pending map is free, else from a tokio task holding only owned
+/// data.
+fn deliver_eval_result(state: Arc<VictauriState>, id: String, result: String) {
+    if let Ok(mut pending) = state.pending_evals.try_lock() {
+        if let Some(tx) = pending.remove(&id) {
+            let _ = tx.send(result);
+        }
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        if let Some(tx) = state.pending_evals.lock().await.remove(&id) {
+            let _ = tx.send(result);
+        }
+    });
 }
 
 #[tauri::command]
@@ -210,8 +233,14 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
     }
 }
 
+// The page-callable commands below are SYNCHRONOUS on purpose (none of them waits for anything):
+// Tauri runs an `async` command on a tokio worker and creates and drops its arguments and its
+// resolver there, and every Tauri handle among them carries a non-atomic `Rc` on Linux (see
+// `bridge::on_main`). As sync commands they run on the main thread, where those handles belong.
+// `victauri_eval_js` / `victauri_dom_snapshot` must stay `async` — they wait for the page's
+// callback — so a page that calls them still takes Tauri's async-command path.
 #[tauri::command]
-pub async fn victauri_get_window_state<R: Runtime>(
+pub fn victauri_get_window_state<R: Runtime>(
     app: tauri::AppHandle<R>,
     label: Option<String>,
 ) -> Result<Vec<WindowState>, String> {
@@ -219,14 +248,12 @@ pub async fn victauri_get_window_state<R: Runtime>(
 }
 
 #[tauri::command]
-pub async fn victauri_list_windows<R: Runtime>(
-    app: tauri::AppHandle<R>,
-) -> Result<Vec<String>, String> {
+pub fn victauri_list_windows<R: Runtime>(app: tauri::AppHandle<R>) -> Result<Vec<String>, String> {
     page_window_query(|| crate::bridge::WebviewBridge::list_window_labels(&app))
 }
 
 #[tauri::command]
-pub async fn victauri_get_ipc_log(
+pub fn victauri_get_ipc_log(
     state: State<'_, Arc<VictauriState>>,
     limit: Option<usize>,
 ) -> Result<Vec<IpcCall>, String> {
@@ -239,7 +266,7 @@ pub async fn victauri_get_ipc_log(
 }
 
 #[tauri::command]
-pub async fn victauri_get_registry(
+pub fn victauri_get_registry(
     state: State<'_, Arc<VictauriState>>,
     query: Option<String>,
 ) -> Result<serde_json::Value, String> {
@@ -251,12 +278,12 @@ pub async fn victauri_get_registry(
 }
 
 #[tauri::command]
-pub async fn victauri_get_memory_stats() -> Result<serde_json::Value, String> {
+pub fn victauri_get_memory_stats() -> Result<serde_json::Value, String> {
     Ok(crate::memory::current_stats())
 }
 
 #[tauri::command]
-pub async fn victauri_verify_state(
+pub fn victauri_verify_state(
     _state: State<'_, Arc<VictauriState>>,
     frontend_state: serde_json::Value,
     backend_state: serde_json::Value,
@@ -266,7 +293,7 @@ pub async fn victauri_verify_state(
 }
 
 #[tauri::command]
-pub async fn victauri_detect_ghost_commands(
+pub fn victauri_detect_ghost_commands(
     state: State<'_, Arc<VictauriState>>,
 ) -> Result<serde_json::Value, String> {
     let ipc_calls = state.event_log.ipc_calls();
@@ -282,7 +309,7 @@ pub async fn victauri_detect_ghost_commands(
 }
 
 #[tauri::command]
-pub async fn victauri_check_ipc_integrity(
+pub fn victauri_check_ipc_integrity(
     state: State<'_, Arc<VictauriState>>,
     stale_threshold_ms: Option<i64>,
 ) -> Result<serde_json::Value, String> {

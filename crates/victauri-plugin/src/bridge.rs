@@ -272,6 +272,32 @@ pub(crate) fn record_main_thread() {
     let _ = MAIN_THREAD.set(std::thread::current().id());
 }
 
+thread_local! {
+    /// An app handle owned by the main thread and only ever cloned or dropped there (installed
+    /// by [`install_main_app`] from plugin `setup`). `on_main` closures take their handle from
+    /// here instead of from a clone made on the calling thread — see [`on_main`] for why a
+    /// Tauri handle must never be cloned or dropped off the main thread.
+    static MAIN_APP: std::cell::RefCell<Option<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Keep a main-thread-owned clone of `app` for `on_main` closures. Must be called ON the main
+/// thread (plugin `setup`, which Tauri runs there); a call from any other thread stores into that
+/// thread's slot, which no closure ever reads.
+pub(crate) fn install_main_app<R: Runtime>(app: &tauri::AppHandle<R>) {
+    MAIN_APP.with(|slot| *slot.borrow_mut() = Some(Box::new(app.clone())));
+}
+
+/// The main thread's own app handle (a clone made HERE, on the main thread), if installed.
+fn main_app<R: Runtime>() -> Option<tauri::AppHandle<R>> {
+    MAIN_APP.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .and_then(|any| any.downcast_ref::<tauri::AppHandle<R>>())
+            .cloned()
+    })
+}
+
 /// Whether the current thread is the recorded Tauri main thread (false if not yet recorded).
 fn is_main_thread() -> bool {
     MAIN_THREAD
@@ -290,6 +316,20 @@ fn is_main_thread() -> bool {
 /// mutating a non-atomic `Rc` count corrupts it → use-after-free, which surfaces as
 /// `STATUS_*_BUFFER_OVERRUN` once Rust's debug `assert_unchecked` on `Rc::inc_strong`
 /// (1.78+) starts checking it. See Tauri issue #10001 for the identical crash class.
+///
+/// **The same applies to the `AppHandle` itself — never clone or drop one off the main thread.**
+/// On Linux every Tauri handle (`AppHandle`, `Webview`, `WebviewWindow`) carries
+/// tauri-runtime-wry's `Context`, which holds the main-thread `DispatcherMainThreadContext` BY
+/// VALUE, which holds tao's `EventLoopWindowTarget`, which holds `windows:
+/// Rc<RefCell<HashSet<WindowId>>>`. So cloning or dropping any handle bumps a NON-ATOMIC count
+/// that the main thread bumps all the time (IPC, window access). This function used to clone
+/// the `AppHandle` on the calling thread for every round trip; under concurrent introspection
+/// that corrupted the heap (glibc `corrupted double-linked list` / `unaligned fastbin chunk`) on
+/// Linux/WebKitGTK. Proven without Victauri: a bare Tauri app whose background threads only
+/// clone+drop its `AppHandle` while the page makes IPC calls aborted 3/3; 12 threads doing
+/// `run_on_main_thread` with an off-thread clone aborted 5/5, and 5/5 with an EMPTY closure.
+/// So the closure takes a handle cloned ON the main thread ([`install_main_app`]), and the
+/// caller only borrows `app` to post it (`AppHandle::run_on_main_thread` does not clone).
 ///
 /// `run_on_main_thread` marshals the closure onto the UI thread (and runs it inline if we are
 /// already on it), so all `Rc` access stays single-threaded. The closure's value comes back
@@ -326,7 +366,9 @@ where
     }
 
     let round_trip = move || -> Result<T, String> {
-        let app_for_closure = app.clone();
+        // No handle is cloned here, on the calling thread (see above): the closure takes the
+        // main thread's own handle, and `app` is only borrowed to post it.
+        let owned_what = what.to_string();
         serialized_round_trip(
             &MAIN_DISPATCH_LOCK,
             what,
@@ -335,8 +377,15 @@ where
                 app.run_on_main_thread(job)
                     .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))
             },
-            move || f(&app_for_closure),
-        )
+            move || {
+                main_app::<R>().map(|main| f(&main)).ok_or_else(|| {
+                    format!(
+                        "{owned_what}: the main-thread app handle is not installed (the plugin \
+                         setup has not run)"
+                    )
+                })
+            },
+        )?
     };
 
     // Blocking here must not park a tokio runtime worker — under a wedged UI that could
@@ -388,9 +437,9 @@ where
     // (it started, then outlived that caller's timeout + grace). Wait for it — bounded by this
     // caller's own deadline, so callers never stack into N * timeout — before putting a second
     // round trip in flight beside it.
-    // Deliberately a plain sleep, not a yield spin: re-dispatching the moment the previous
-    // closure's guard drops crashed the WebKitGTK host (heap corruption) in CI — a spin reverted
-    // in round 4 after CI crashed 2/2 with it and 2/2 passed without it (PR #74).
+    // A plain sleep. (Round 4 briefly tried a yield spin here and removed it while chasing a
+    // Linux heap abort; the abort's real cause was the off-main-thread `AppHandle` clone
+    // documented on `on_main`, not the wait.)
     while gate.in_flight.load(std::sync::atomic::Ordering::Acquire) != 0 {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
