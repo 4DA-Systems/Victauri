@@ -5798,10 +5798,10 @@ const STMT_KEYWORDS: &[&str] = &[
 /// `code` starts with the whole word `word` (not merely a longer identifier sharing its prefix).
 fn starts_with_word(code: &str, word: &str) -> bool {
     code.starts_with(word)
-        && code
-            .as_bytes()
-            .get(word.len())
-            .is_none_or(|&b| !is_js_ident(b))
+        && code[word.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_js_ident_char(c))
 }
 
 /// Does `code` begin with a statement (not an expression) — a statement keyword, a block, an
@@ -5815,7 +5815,11 @@ fn starts_with_statement(code: &str) -> bool {
         return true;
     }
     // A label: an identifier followed (after optional whitespace) by a single `:`.
-    let ident_len = code.bytes().take_while(|&b| is_js_ident(b)).count();
+    let ident_len: usize = code
+        .chars()
+        .take_while(|&c| is_js_ident_char(c))
+        .map(char::len_utf8)
+        .sum();
     ident_len > 0
         && !code.as_bytes()[0].is_ascii_digit()
         && code[ident_len..].trim_start().starts_with(':')
@@ -5916,6 +5920,16 @@ fn strip_leading_js_comments(mut code: &str) -> &str {
     }
 }
 
+/// What opened a bracket, for [`should_prepend_return`]: a `/` right after the `)` of an
+/// `if`/`while`/`for`/`with` head starts a regex (the statement body), not a division, and `of`
+/// is a keyword only directly inside a `for (…)` head.
+#[derive(PartialEq, Clone, Copy)]
+enum Bracket {
+    Plain,
+    ControlHead,
+    ForHead,
+}
+
 /// String/template/comment scan state for [`should_prepend_return`].
 #[derive(PartialEq, Clone, Copy)]
 enum ScanState {
@@ -5952,14 +5966,24 @@ fn should_prepend_return(code: &str) -> bool {
     let mut template_depths: Vec<i32> = Vec::new();
     // Only whitespace since the last line terminator (an HTML-like `-->` comment position).
     let mut at_line_start = true;
+    // Every open bracket (and `${`) and what opened it; the index of the last `)` that closed
+    // an `if`/`while`/`for`/`with` head.
+    let mut brackets: Vec<Bracket> = Vec::new();
+    let mut control_head_closed_at: Option<usize> = None;
 
     // Is there a top-level `return` token starting at byte `i` (word-bounded, and not a
     // property name such as `obj.return`)?
     let is_return_token = |i: usize| -> bool {
-        let prev_ok = i == 0 || !is_js_ident(bytes[i - 1]);
+        let prev_ok = code[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_js_ident_char(c));
         prev_ok
             && code[i..].starts_with("return")
-            && bytes.get(i + 6).copied().is_none_or(|b| !is_js_ident(b))
+            && code[i + 6..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_js_ident_char(c))
             && !preceded_by_dot(code, i)
     };
 
@@ -5994,9 +6018,25 @@ fn should_prepend_return(code: &str) -> bool {
                     i = find_line_terminator(bytes, i).unwrap_or(bytes.len());
                     continue;
                 }
+                // A non-ASCII character: JavaScript whitespace (NBSP, BOM, …) is skipped like
+                // any whitespace; anything else is read as part of an identifier (`énew` is a
+                // name, not the keyword `new`). Line terminators were handled above.
+                if c >= 0x80 {
+                    let ch = code.get(i..).and_then(|rest| rest.chars().next());
+                    let len = ch.map_or(1, char::len_utf8);
+                    if !ch.is_some_and(is_js_space) {
+                        at_line_start = false;
+                        prev_sig = last_sig;
+                        last_sig = Some(c);
+                        last_sig_idx = i + len - 1;
+                    }
+                    i += len;
+                    continue;
+                }
                 if !c.is_ascii_whitespace() {
                     at_line_start = false;
                 }
+                let in_for_head = brackets.last() == Some(&Bracket::ForHead);
                 match c {
                     b'\'' => state = SingleQuote,
                     b'"' => state = DoubleQuote,
@@ -6022,7 +6062,16 @@ fn should_prepend_return(code: &str) -> bool {
                     // After `}` a `/` is division if the brace closed an object literal, and a
                     // regex if it closed a block — undecidable here, so run the code as-is.
                     b'/' if last_sig == Some(b'}') => return false,
-                    b'/' if slash_starts_regex(code, last_sig, prev_sig, last_sig_idx, depth) => {
+                    b'/' if (last_sig == Some(b')')
+                        && control_head_closed_at == Some(last_sig_idx))
+                        || slash_starts_regex(
+                            code,
+                            last_sig,
+                            prev_sig,
+                            last_sig_idx,
+                            in_for_head,
+                        ) =>
+                    {
                         // A regex literal: skip it whole (a quote or newline-like character
                         // inside it must not be read as code), then its flags.
                         i = skip_regex_literal(bytes, i);
@@ -6031,9 +6080,20 @@ fn should_prepend_return(code: &str) -> bool {
                         last_sig_idx = i.saturating_sub(1);
                         continue;
                     }
-                    b'(' | b'[' | b'{' => depth += 1,
+                    b'(' | b'[' | b'{' => {
+                        depth += 1;
+                        let head = if c == b'(' {
+                            control_head_kind(code, last_sig, last_sig_idx)
+                        } else {
+                            Bracket::Plain
+                        };
+                        brackets.push(head);
+                    }
                     b')' | b']' | b'}' => {
                         depth -= 1;
+                        if brackets.pop().is_some_and(|b| b != Bracket::Plain) && c == b')' {
+                            control_head_closed_at = Some(i);
+                        }
                         if c == b'}' && template_depths.last() == Some(&depth) {
                             template_depths.pop();
                             state = Template;
@@ -6064,6 +6124,7 @@ fn should_prepend_return(code: &str) -> bool {
                     i += 1;
                 } else if state == Template && c == b'$' && bytes.get(i + 1) == Some(&b'{') {
                     template_depths.push(depth);
+                    brackets.push(Bracket::Plain);
                     depth += 1;
                     state = Code;
                     i += 1;
@@ -6081,8 +6142,64 @@ fn should_prepend_return(code: &str) -> bool {
     true
 }
 
+/// An identifier byte: ASCII letter/digit/`_`/`$`, or any byte of a non-ASCII character (the
+/// scanner steps over non-ASCII whitespace itself, so what remains is part of a name).
 fn is_js_ident(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+/// JavaScript whitespace outside ASCII: the Unicode space separators (NBSP, U+2000…), and BOM.
+fn is_js_space(c: char) -> bool {
+    c.is_whitespace() || c == '\u{feff}'
+}
+
+/// A character that can be part of an identifier (approximately: non-ASCII letters are not
+/// told apart from other non-ASCII symbols, which are syntax errors anyway).
+fn is_js_ident_char(c: char) -> bool {
+    if c.is_ascii() {
+        c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    } else {
+        !is_js_space(c) && !matches!(c, '\u{2028}' | '\u{2029}')
+    }
+}
+
+/// Start of the identifier that ends just before byte `end` (a char boundary); `end` if none.
+fn ident_start_before(code: &str, end: usize) -> usize {
+    let Some(head) = code.get(..end) else {
+        return end;
+    };
+    let mut start = end;
+    for (idx, c) in head.char_indices().rev() {
+        if !is_js_ident_char(c) {
+            break;
+        }
+        start = idx;
+    }
+    start
+}
+
+/// What a `(` opens, given the last significant token before it: an `if`/`while`/`with` head,
+/// a `for` (or `for await`) head, or anything else.
+fn control_head_kind(code: &str, last_sig: Option<u8>, last_sig_idx: usize) -> Bracket {
+    if !last_sig.is_some_and(is_js_ident) {
+        return Bracket::Plain;
+    }
+    match js_keyword_ending_at(code, last_sig_idx) {
+        "if" | "while" | "with" => Bracket::ControlHead,
+        "for" => Bracket::ForHead,
+        "await" => {
+            // `for await (`: the word before `await`.
+            let before = code[..=last_sig_idx]
+                .strip_suffix("await")
+                .unwrap_or("")
+                .trim_end();
+            match before.len().checked_sub(1) {
+                Some(end) if js_keyword_ending_at(code, end) == "for" => Bracket::ForHead,
+                _ => Bracket::Plain,
+            }
+        }
+        _ => Bracket::Plain,
+    }
 }
 
 /// Is the token starting at byte `start` a property name (`obj.of`, `a?.return`)? Such a
@@ -6095,14 +6212,11 @@ fn preceded_by_dot(code: &str, start: usize) -> bool {
 /// when `code[end]` is not an identifier byte or the word is a property name after `.`.
 fn js_keyword_ending_at(code: &str, end: usize) -> &str {
     let bytes = code.as_bytes();
-    if !bytes.get(end).copied().is_some_and(is_js_ident) {
+    if !bytes.get(end).copied().is_some_and(is_js_ident) || !code.is_char_boundary(end + 1) {
         return "";
     }
-    let mut start = end;
-    while start > 0 && is_js_ident(bytes[start - 1]) {
-        start -= 1;
-    }
-    if preceded_by_dot(code, start) {
+    let start = ident_start_before(code, end + 1);
+    if start > end || preceded_by_dot(code, start) {
         return "";
     }
     &code[start..=end]
@@ -6128,11 +6242,11 @@ const EXPR_KEYWORDS: &[&str] = &[
     "throw",
 ];
 
-/// Whether `word`, found at bracket depth `depth`, is a keyword after which an operand must
-/// follow. `of` is one only inside brackets (a `for (x of …)` head); at depth 0 it is an
-/// identifier (`of` then a new line then `foo()` is two statements).
-fn is_expr_keyword(word: &str, depth: i32) -> bool {
-    (word == "of" && depth > 0) || EXPR_KEYWORDS.contains(&word)
+/// Whether `word` is a keyword after which an operand must follow. `of` is one only directly
+/// inside a `for (…)` head (`in_for_head`); anywhere else it is an identifier (`f(of / 2)`, or
+/// `of` then a new line then `foo()`, which is two statements).
+fn is_expr_keyword(word: &str, in_for_head: bool) -> bool {
+    (word == "of" && in_for_head) || EXPR_KEYWORDS.contains(&word)
 }
 
 /// Is the `.` at byte `dot` the end of a numeric literal (`1.`) — a complete operand — rather
@@ -6142,10 +6256,7 @@ fn is_expr_keyword(word: &str, depth: i32) -> bool {
 /// the `return` prepend, which is always safe.
 fn dot_completes_number(code: &str, dot: usize) -> bool {
     let bytes = code.as_bytes();
-    let mut start = dot;
-    while start > 0 && is_js_ident(bytes[start - 1]) {
-        start -= 1;
-    }
+    let start = ident_start_before(code, dot);
     let word = &bytes[start..dot];
     word.first().is_some_and(u8::is_ascii_digit)
         && word.iter().all(|b| b.is_ascii_digit() || *b == b'_')
@@ -6188,20 +6299,21 @@ fn asi_ends_statement(
     let number_dot = last_sig == Some(b'.') && dot_completes_number(code, last_sig_idx);
     let continues_after = (!number_dot
         && last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p)))
-        || is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), 0);
+        || is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), false);
     !(continues_after || ASI_CONTINUES_BEFORE.contains(&next))
 }
 
 /// Whether a `/` (not starting a comment) begins a regex literal rather than division:
 /// true where an operand is expected — at the start, after an operator or opening
 /// punctuation, or after a keyword such as `return`/`typeof`. After a postfix `++`/`--`
-/// (a complete operand) it is division.
+/// (a complete operand) it is division. (After the `)` of a control-statement head it is a
+/// regex too; the caller decides that case.)
 fn slash_starts_regex(
     code: &str,
     last_sig: Option<u8>,
     prev_sig: Option<u8>,
     last_sig_idx: usize,
-    depth: i32,
+    in_for_head: bool,
 ) -> bool {
     if ends_in_postfix(last_sig, prev_sig) {
         return false;
@@ -6210,7 +6322,7 @@ fn slash_starts_regex(
         None => true,
         Some(b) if b"(,=:[!&|?{};+-*%<>~^".contains(&b) => true,
         Some(b) if is_js_ident(b) => {
-            is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), depth)
+            is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), in_for_head)
         }
         Some(_) => false,
     }
@@ -6654,6 +6766,52 @@ mod tests {
         "x = typeof of\nf()",
     ];
 
+    /// Multi-statement snippets from the 0.9 round-5 audit (R5-EVAL1): each was wrapped with
+    /// `return` and lost its second statement. (1) a regex right after the `)` of an
+    /// `if`/`while`/`for`/`with` head was read as division, so a quote or bracket inside it
+    /// broke the scan; (2) `of` was a keyword anywhere inside brackets; (3) a non-ASCII
+    /// identifier ending in a keyword (`énew`) was read as that keyword.
+    const ASI_ROUND5_STATEMENT_CASES: &[&str] = &[
+        "(function(){ if (a) /'/.test('q') })(); f()",
+        "(function(){ if (a) /\\(/.test('q') })(); f()",
+        "(function(){ if (a) /\"/.test('q') })(); f()",
+        "(function(){ if (a) /`/.test('q') })(); f()",
+        "(function(){ if (a) /[(]/.test('q') })(); f()",
+        "(function(){ if (a) /\\[/.test('q') })(); f()",
+        "(function(){ if (a) /\\{/.test('q') })(); f()",
+        "(function(){ if ((a)) /'/.test('q') })(); f()",
+        "(function(){ while (a) /'/.test('q') })(); f()",
+        "(function(){ for (;a;) /'/.test('q') })(); f()",
+        "(function(){ with (obj) /'/.test('q') })(); f()",
+        "(async function(){ for await (const q of []) /'/.test('q') })(); f()",
+        "(() => { if (a) /'/.test('q') })(); f()",
+        "Math.abs(of / 2); f()",
+        "Math.abs(of / 2); f() / 1",
+        "[of / 2]; f()",
+        "énew / 2; f() / 1",
+        "x = énew / 2; f()",
+        "x = \u{e9}typeof / 2; f()",
+    ];
+
+    #[test]
+    fn prepend_return_round5_shapes() {
+        for code in ASI_ROUND5_STATEMENT_CASES {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+        for code in [
+            "(x) / 2 / 1",
+            "f(x) / 2",
+            "f(of / 2)",
+            "[1, 2].map(of => of / 2)",
+            "énew / 2",
+            "if_ (a) / 2",
+            "obj.if (a) / 2",
+            "(a) / 2; ",
+        ] {
+            assert!(should_prepend_return(code), "must wrap: {code:?}");
+        }
+    }
+
     /// Table for R4-EVAL2: `(code, wrap?)` — every shape the fix touches, both ways.
     #[test]
     fn prepend_return_round4_shapes() {
@@ -6724,6 +6882,7 @@ mod tests {
         let mut cases: Vec<(&str, &str, Vec<&str>)> = ASI_ROUND2_STATEMENT_CASES
             .iter()
             .chain(ASI_ROUND4_STATEMENT_CASES)
+            .chain(ASI_ROUND5_STATEMENT_CASES)
             .map(|c| {
                 let n = c.matches("f()").count() + c.matches("(f)()").count();
                 (*c, "undefined", vec!["f"; n])
@@ -6770,7 +6929,7 @@ mod tests {
                 const log = [];
                 globalThis.__log = log;
                 const src = '(async () => { const log = globalThis.__log; const f = () => log.push(\'f\');'
-                  + ' let i = 1, x = 0, a; const document = \'doc\';'
+                  + ' let i = 1, x = 0, a, of = 4, énew = 2, étypeof = 3; const document = \'doc\';'
                   + ' const obj = { of: \'OF\', in: \'IN\', return: \'RET\' };\n' + body + '\n })()';
                 let ret, err = null;
                 try { ret = await vm.runInThisContext(src); } catch (e) { err = e.name + ': ' + e.message; }

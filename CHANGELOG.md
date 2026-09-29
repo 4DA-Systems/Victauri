@@ -69,7 +69,14 @@ that did not survive testing are listed under "Disproved" below. No Critical or 
   forge one was wrong), inviting a double-executing retry. Only a positively different page aborts.
 - **The `eval_js` auto-return scanner still dropped statements** (the round-3 "never drops a
   statement" claim was wrong): a line break inside `/* */`, a lone CR, a line ending in `1.`, and
-  `of`/`yield` used as names. Differential check against node: 10,793 → 0 divergent of 35,459.
+  `of`/`yield` used as names. Differential check against node: 10,793 → 0 divergent of 35,459
+  generated snippets — a result for that corpus, not a proof. Round 5 found three more shapes it
+  did not cover, now fixed: a regex right after the `)` of an `if`/`while`/`for`/`with` head
+  (`if (a) /'/.test(s)` inside a function, then another statement), `of` used as a name inside
+  brackets (`L(of / 2); L(3)`), and a non-ASCII identifier ending in a keyword (`énew / 2; g()`).
+  A new node differential over 20,000 snippets built around these shapes: 1,771 → 0 divergent of
+  18,119 that parse. The scanner is a heuristic; when it cannot tell, it leaves the code unwrapped
+  (no auto-`return`), which is the safe direction.
 - **`query_db` refused legitimate queries** with `;`, `--` or `/*` inside quotes (`LIKE '%;%'`,
   present since 0.8.x), while `SELECT '--'; DELETE …` slipped past the stacked-query check. One
   quote-aware lexer now drives every pre-check (the SQLite authorizer remains the security
