@@ -133,7 +133,12 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   page still gets a promise; nothing to change). This keeps Tauri handles on the main thread —
   cloning or dropping one elsewhere corrupted the heap on Linux (see CHANGELOG). If your own app
   clones an `AppHandle` / window / webview on background threads on Linux, the same Tauri race
-  applies to it.
+  applies to it. That includes moving an `AppHandle` into `std::thread::spawn` or
+  `tauri::async_runtime::spawn` to `emit` later, because the handle is then dropped on that
+  thread. Take one handle on the main thread in `setup` (`static APP: OnceLock<AppHandle>`,
+  `APP.set(app.handle().clone())`) and have background work borrow it (`APP.get()`; `emit` only
+  needs `&self`). The demo and gauntlet apps do this, and the docs'
+  [compatibility page](docs/src/compatibility.md) has the snippet.
 - **`victauri:default` no longer grants `victauri_eval_js` / `victauri_dom_snapshot`.** These two
   page-callable Tauri commands are the only async Victauri commands left (Tauri runs an async
   command's argument extraction on a tokio worker, the Linux handle race above), and

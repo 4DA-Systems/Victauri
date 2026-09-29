@@ -434,6 +434,13 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
   regardless of the app's CSP. Nothing in Victauri calls them (the bridge and every tool use only
   `victauri_eval_callback`). The individual `allow-`/`deny-` permissions remain, so an app can opt
   back in; see MIGRATION.md.
+- **The example apps dropped Tauri handles off the main thread**, the race MIGRATION.md tells apps
+  to avoid: the demo's `run_pipeline` moved an `AppHandle` into `std::thread::spawn` (run three times
+  by the integration tests) and the gauntlet's into `tauri::async_runtime::spawn`. A host death in
+  CI could therefore have been the example's fault rather than Victauri's. Both now take one handle
+  on the main thread in `setup` (`static APP: OnceLock<AppHandle>`) and background work only borrows
+  it. The pattern is documented for apps under "Linux: keep Tauri handles on the main thread" in the
+  compatibility docs.
 
 ## [0.8.8] - 2026-08-12
 
