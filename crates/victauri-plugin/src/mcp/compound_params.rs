@@ -598,7 +598,8 @@ impl fmt::Display for RouteAction {
 pub enum RouteMatchType {
     /// URL contains the pattern (default).
     Substring,
-    /// Glob with `*` wildcards.
+    /// Glob: `*` matches any run of characters; every other character (including `?`)
+    /// matches itself.
     Glob,
     /// JavaScript regular expression.
     Regex,
@@ -831,7 +832,8 @@ pub struct LogsParams {
     pub since: Option<f64>,
     /// Filter by URL substring (for network).
     pub filter: Option<String>,
-    /// Maximum number of entries to return (for ipc, network, `slow_ipc`).
+    /// Maximum number of entries to return; 0 returns none. Defaults: 100 for ipc and
+    /// network, 20 for `slow_ipc`, everything captured for the other actions.
     pub limit: Option<usize>,
     /// Threshold in milliseconds for slow IPC calls (for `slow_ipc`).
     pub threshold_ms: Option<u64>,

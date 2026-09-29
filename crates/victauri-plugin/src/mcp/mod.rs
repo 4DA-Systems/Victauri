@@ -61,6 +61,18 @@ pub(crate) use compound_params::*;
 /// crate's own integration tests can run them in a JS engine. Not part of the supported API.
 #[doc(hidden)]
 pub use helpers::{trusted_click_probe_js, trusted_focus_probe_js};
+
+/// The IPC-log JS the tools send to the page. Internal plumbing, `pub` only so the jsdom suite
+/// (`tests/bridge_r5_tests.rs`) can run it against the real bridge — from a test binary of its
+/// own, since a seconds-long `node` child spawned from the library tests can inherit (and hold
+/// open) another test's server socket on Windows.
+#[doc(hidden)]
+pub mod ipc_log_js {
+    pub use super::helpers::{
+        ghost_ipc_outcomes_js, ipc_catalog_projection_js, ipc_timing_projection_js,
+    };
+    pub use super::{ipc_integrity_js, slow_ipc_js, trimmed_log_js};
+}
 pub(crate) use introspection_params::*;
 pub(crate) use other_params::{
     AppStateParams, DiagnosticsParams, FindElementsParams, ResolveCommandParams,
@@ -816,36 +828,7 @@ impl VictauriMcpHandler {
         Parameters(params): Parameters<IpcIntegrityParams>,
     ) -> CallToolResult {
         let threshold = params.stale_threshold_ms.unwrap_or(5000);
-        let code = format!(
-            r"return (function() {{
-                var log = window.__VICTAURI__?.getIpcLog() || [];
-                var now = Date.now();
-                var threshold = {threshold};
-                var pending = log.filter(function(c) {{ return c.status === 'pending'; }});
-                var stale = pending.filter(function(c) {{ return (now - c.timestamp) > threshold; }});
-                var errored = log.filter(function(c) {{ return c.status === 'error'; }});
-                var net = window.__VICTAURI__?.getNetworkLog() || [];
-                var warning = null;
-                if (log.length === 0 && net.length > 5) {{
-                    warning = 'Zero IPC calls captured but ' + net.length + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
-                }}
-                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
-                // A command that completed with an Err is a HEALTHY round-trip (it returned)
-                // — every real app exercises error paths, so counting those as 'unhealthy'
-                // would cry wolf. The error_count/errored_calls surface them for visibility,
-                // but only stale calls flip `healthy`.
-                return {{
-                    healthy: stale.length === 0,
-                    total_calls: log.length,
-                    pending_count: pending.length,
-                    stale_count: stale.length,
-                    error_count: errored.length,
-                    stale_calls: stale.slice(0, 20),
-                    errored_calls: errored.slice(0, 20),
-                    warning: warning
-                }};
-            }})()"
-        );
+        let code = ipc_integrity_js(threshold);
         self.eval_bridge(&code, params.webview_label.as_deref())
             .await
     }
@@ -2754,6 +2737,10 @@ impl VictauriMcpHandler {
             }
             RouteAction::Matches => {
                 let limit = params.limit.unwrap_or(100);
+                // A maximum of 0 entries is none — not "all" (the bridge's falsy limit).
+                if limit == 0 {
+                    return CallToolResult::success(vec![ContentBlock::text("[]")]);
+                }
                 let code = format!("return window.__VICTAURI__?.getRouteMatches({limit})");
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
@@ -3203,6 +3190,22 @@ impl VictauriMcpHandler {
         )
     )]
     async fn logs(&self, Parameters(params): Parameters<LogsParams>) -> CallToolResult {
+        // `limit` is the maximum number of entries to return, so 0 returns none (R5-JS5). The
+        // page is not asked at all: `.slice(-0)` and the bridge's "falsy limit = everything"
+        // used to turn it into EVERY entry, bodies included.
+        if params.limit == Some(0)
+            && matches!(
+                params.action,
+                LogsAction::Console
+                    | LogsAction::Network
+                    | LogsAction::Ipc
+                    | LogsAction::Navigation
+                    | LogsAction::Dialogs
+                    | LogsAction::Events
+            )
+        {
+            return CallToolResult::success(vec![ContentBlock::text("[]")]);
+        }
         match params.action {
             LogsAction::Console => {
                 let since_arg = params.since.map(|ts| format!("{ts}")).unwrap_or_default();
@@ -3234,7 +3237,8 @@ impl VictauriMcpHandler {
                 let wait = params.wait_for_capture.unwrap_or(false);
                 let limit = params.limit.unwrap_or(DEFAULT_LOG_LIMIT);
                 if wait {
-                    let inner = trimmed_log_js("window.__VICTAURI__.getIpcLog()", limit);
+                    let inner =
+                        trimmed_log_js(&format!("window.__VICTAURI__.getIpcLog({limit})"), limit);
                     let code = format!(
                         r"return (async function() {{
                             await window.__VICTAURI__.waitForIpcComplete(500);
@@ -3250,7 +3254,8 @@ impl VictauriMcpHandler {
                         Err(e) => tool_error(e),
                     }
                 } else {
-                    let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", limit);
+                    let code =
+                        trimmed_log_js(&format!("window.__VICTAURI__?.getIpcLog({limit})"), limit);
                     self.eval_bridge(&code, params.webview_label.as_deref())
                         .await
                 }
@@ -3295,17 +3300,7 @@ impl VictauriMcpHandler {
                     return missing_param("threshold_ms", "slow_ipc");
                 };
                 let limit = params.limit.unwrap_or(20);
-                let trim_field = trim_field_js();
-                let code = format!(
-                    r"return (function() {{
-                        {trim_field}
-                        function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
-                        var log = window.__VICTAURI__?.getIpcLog() || [];
-                        var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold}; }});
-                        slow.sort(function(a, b) {{ return (b.duration_ms || 0) - (a.duration_ms || 0); }});
-                        return {{ threshold_ms: {threshold}, count: Math.min(slow.length, {limit}), calls: slow.slice(0, {limit}).map(trimEntry) }};
-                    }})()",
-                );
+                let code = slow_ipc_js(threshold, limit);
                 self.eval_bridge(&code, None).await
             }
             LogsAction::Clear => {
@@ -5568,7 +5563,10 @@ impl ServerHandler for VictauriMcpHandler {
                 // itself default-window-drained) — serving a subset that looks complete.
                 // trimmed_log_js bounds entries + truncates oversized fields so the
                 // resource stays correct under load. (Matches the `logs ipc` tool.)
-                let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", DEFAULT_LOG_LIMIT);
+                let code = trimmed_log_js(
+                    &format!("window.__VICTAURI__?.getIpcLog({DEFAULT_LOG_LIMIT})"),
+                    DEFAULT_LOG_LIMIT,
+                );
                 if let Ok(json) = self.eval_with_return(&code, None).await {
                     json
                 } else {
@@ -5681,13 +5679,88 @@ fn trim_field_js() -> String {
     )
 }
 
+/// JS for `check_ipc_integrity`. Classifies the calls from the body-free IPC view and fetches
+/// full entries (args + result) only for the <= 20 stale and <= 20 errored calls it lists:
+/// deep-copying every retained body just to count statuses froze the UI thread (R5-JS1).
+#[doc(hidden)]
+#[must_use]
+pub fn ipc_integrity_js(threshold_ms: i64) -> String {
+    format!(
+        r"return (function() {{
+                var V = window.__VICTAURI__;
+                var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
+                var now = Date.now();
+                var threshold = {threshold_ms};
+                var pending = log.filter(function(c) {{ return c.status === 'pending'; }});
+                var stale = pending.filter(function(c) {{ return (now - c.timestamp) > threshold; }});
+                var errored = log.filter(function(c) {{ return c.status === 'error'; }});
+                var netCount = (V?.getNetworkLog(null, 0, {{ bodies: false }}) || []).length;
+                var warning = null;
+                if (log.length === 0 && netCount > 5) {{
+                    warning = 'Zero IPC calls captured but ' + netCount + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
+                }}
+                function withBodies(list) {{
+                    list = list.slice(0, 20);
+                    if (!list.length) return list;
+                    var got = V.getIpcLog(0, {{ ids: list.map(function(c) {{ return c.id; }}) }}) || [];
+                    var byId = {{}};
+                    for (var i = 0; i < got.length; i++) byId[got[i].id] = got[i];
+                    return list.map(function(c) {{ return byId[c.id] || c; }});
+                }}
+                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
+                // A command that completed with an Err is a HEALTHY round-trip (it returned)
+                // — every real app exercises error paths, so counting those as 'unhealthy'
+                // would cry wolf. The error_count/errored_calls surface them for visibility,
+                // but only stale calls flip `healthy`.
+                return {{
+                    healthy: stale.length === 0,
+                    total_calls: log.length,
+                    pending_count: pending.length,
+                    stale_count: stale.length,
+                    error_count: errored.length,
+                    stale_calls: withBodies(stale),
+                    errored_calls: withBodies(errored),
+                    warning: warning
+                }};
+            }})()"
+    )
+}
+
+/// JS for `logs slow_ipc`: ranks the calls from the body-free IPC view, then fetches full
+/// (field-trimmed) entries only for the `limit` slowest it returns (R5-JS1).
+#[doc(hidden)]
+#[must_use]
+pub fn slow_ipc_js(threshold_ms: u64, limit: usize) -> String {
+    let trim_field = trim_field_js();
+    format!(
+        r"return (function() {{
+                {trim_field}
+                function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
+                var V = window.__VICTAURI__;
+                var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
+                var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold_ms}; }});
+                slow.sort(function(a, b) {{ return (b.duration_ms || 0) - (a.duration_ms || 0); }});
+                var top = slow.slice(0, {limit});
+                if (top.length) {{
+                    var got = V.getIpcLog(0, {{ ids: top.map(function(c) {{ return c.id; }}) }}) || [];
+                    var byId = {{}};
+                    for (var i = 0; i < got.length; i++) byId[got[i].id] = got[i];
+                    top = top.map(function(c) {{ return byId[c.id] || c; }});
+                }}
+                return {{ threshold_ms: {threshold_ms}, count: top.length, calls: top.map(trimEntry) }};
+            }})()",
+    )
+}
+
 /// Build a JS expression that takes an array of log entries (`source_expr`),
 /// keeps at most `limit` of the most recent, and truncates any per-entry field
 /// larger than [`MAX_LOG_FIELD_BYTES`]. This keeps IPC/network log results under
 /// the eval size cap on busy apps where individual entries carry large bodies.
 ///
 /// The returned code is a complete `return (...)` statement.
-fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
+#[doc(hidden)]
+#[must_use]
+pub fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
     let trim_field = trim_field_js();
     format!(
         r"return (function() {{
@@ -5699,7 +5772,7 @@ fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
                 return out;
             }}
             var arr = {source_expr} || [];
-            if (arr.length > {limit}) arr = arr.slice(-{limit});
+            if (arr.length > {limit}) arr = arr.slice(arr.length - {limit}); // not slice(-0): all
             return arr.map(trimEntry);
         }})()"
     )
@@ -8994,6 +9067,43 @@ mod command_policy_dispatch_tests {
     }
 
     /// The eval envelope for a page result `value`.
+    /// R5-JS5: `limit: 0` means "return at most zero entries". The log JS used `.slice(-0)`
+    /// (and the bridge treats a falsy limit as "all"), so it returned EVERY entry.
+    #[tokio::test]
+    async fn log_limit_zero_returns_no_entries() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(&ok_envelope(&json!([{"a": 1}, {"a": 2}])));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        for action in [
+            "console",
+            "network",
+            "ipc",
+            "navigation",
+            "dialogs",
+            "events",
+        ] {
+            let r = call(&h, "logs", json!({"action": action, "limit": 0})).await;
+            let text = result_text(&r);
+            assert_ne!(r.is_error, Some(true), "{action}: {text}");
+            let v: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{action}: not JSON ({e}): {text}"));
+            assert_eq!(
+                v,
+                json!([]),
+                "logs {action} limit=0 returned entries: {text}"
+            );
+        }
+        let r = call(&h, "route", json!({"action": "matches", "limit": 0})).await;
+        let text = result_text(&r);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        assert_eq!(
+            v,
+            json!([]),
+            "route matches limit=0 returned entries: {text}"
+        );
+    }
+
     fn ok_envelope(value: &serde_json::Value) -> String {
         json!({"__victauri_ok": value, "__victauri_type": "object"}).to_string()
     }

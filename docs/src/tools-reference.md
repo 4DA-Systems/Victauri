@@ -675,7 +675,7 @@ page-scoped (cleared on reload).
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `pattern` | string | yes | URL pattern to match |
-| `match_type` | string | no | `substring` (default), `glob`, `regex`, `exact` |
+| `match_type` | string | no | `substring` (default), `glob` (`*` matches any run of characters; every other character, including `?`, is literal), `regex`, `exact` |
 | `method` | string | no | Restrict to one HTTP method |
 | `behavior` | string | no | `block` (abort), `fulfill` (mock — default), `delay` |
 | `status` | number | no | Mock response status (fulfill, default 200) |

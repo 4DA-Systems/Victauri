@@ -91,7 +91,9 @@ fn js_literal(s: &str) -> String {
 }
 
 /// The pre-eval liveness probe: answers `"probe_ok:<page nonce>"` (just `"probe_ok"` without a
-/// bridge). The id follows `id:` with no space, unlike the wrapper's `id: `.
+/// bridge). The id follows `id:` with no space, unlike the wrapper's `id: `. The callback args
+/// have no prototype, so a page's `Object.prototype.toJSON` cannot break their serialization
+/// (R5-JS2).
 #[doc(hidden)]
 #[must_use]
 pub fn eval_probe_script(id: &str) -> String {
@@ -99,7 +101,7 @@ pub fn eval_probe_script(id: &str) -> String {
         "(async()=>{{var v=window.__VICTAURI__;\
          var n=(v&&typeof v._pageNonce==='string')?':'+v._pageNonce:'';\
          await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback',\
-         {{id:{},result:'\"probe_ok'+n+'\"'}});}})();",
+         Object.assign(Object.create(null),{{id:{},result:'\"probe_ok'+n+'\"'}}));}})();",
         js_literal(id)
     )
 }
@@ -296,9 +298,11 @@ const INIT_SCRIPT_BODY: &str = r#"
     var routeMatchLog = [];
     var CAP_ROUTE_MATCHES = 200;
 
-    // Convert a glob ("*" wildcard) to a RegExp. Other chars are escaped.
+    // Convert a glob to a RegExp. `*` (any run of characters) is the only wildcard; every other
+    // character matches itself — including `?`, which used to slip through unescaped as a regex
+    // quantifier, so `*/api/search?q=*` matched nothing (R5-JS4).
     function globToRegExp(glob) {
-        var re = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+        var re = glob.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
         return new RegExp('^' + re + '$');
     }
 
@@ -313,9 +317,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         return hit;
     }
-    // `a` contains `b` across shadow boundaries (the composed tree), or is `b`.
+    // `a` contains `b` in the flat tree (what is rendered and hit-tested), or is `b`: across
+    // shadow boundaries (host), and from slotted light-DOM content to the <slot> it renders in
+    // (assignedSlot). Without the slot step, a click on `<button><slot>` whose centre lands on
+    // the slotted text read as "covered by" that text (R5-JS3).
     function composedContains(a, b) {
-        for (var n = b; n; n = n.parentNode || n.host) {
+        for (var n = b; n; n = n.assignedSlot || n.parentNode || n.host) {
             if (n === a) return true;
         }
         return false;
@@ -561,11 +568,57 @@ const INIT_SCRIPT_BODY: &str = r#"
         evalState.delete(id);
         evalDone.add(id);
     }
+    // `body` is always a JSON string. The args object has NO prototype: Tauri serializes it with
+    // the page's JSON.stringify, which consults `toJSON` up the prototype chain, so a page that
+    // planted a throwing `Object.prototype.toJSON` blocked every outcome (R5-JS2). Only string
+    // primitives are inside, and JSON.stringify never looks up `toJSON` on a primitive.
     function evalCallback(id, body) {
         'use strict';
         try {
-            return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
+            var args = OBJ_CREATE(null);
+            args.id = id;
+            args.result = body;
+            return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', args);
         } catch (e) { return null; }
+    }
+    // A JSON string literal for `s`, built without serializing any object (see evalCallback).
+    function jsonStringLiteral(s) {
+        'use strict';
+        try { return NATIVE_STRINGIFY(typeof s === 'string' ? s : toStringExact(s)); }
+        catch (e) { return '"(unprintable)"'; }
+    }
+    function errorText(e) {
+        'use strict';
+        try {
+            var m = e && e.message;
+            return typeof m === 'string' ? m : toStringExact(e);
+        } catch (x) { return 'unknown error'; }
+    }
+    // The callback body for an eval outcome. Every envelope is assembled as a string around
+    // pristine-serialized parts, so nothing but the eval's own result value is serialized as an
+    // object — a page that breaks object serialization cannot also break the error report.
+    function evalOutcomeBody(payload) {
+        'use strict';
+        var type = payload && payload.__victauri_type;
+        if (type === 'value') {
+            // The code RAN; a result JSON cannot carry (circular, BigInt, a function, a
+            // throwing toJSON) is reported as exactly that, never as a JavaScript error.
+            var value = payload.__victauri_ok;
+            var json;
+            try { json = PRISTINE_STRINGIFY(value); }
+            catch (e) { return '{"__victauri_unserializable":' + jsonStringLiteral(errorText(e)) + '}'; }
+            if (json === undefined) {
+                return '{"__victauri_unserializable":' + jsonStringLiteral('the result is a ' + typeof value + ', which JSON cannot represent') + '}';
+            }
+            return '{"__victauri_ok":' + json + ',"__victauri_type":"value"}';
+        }
+        if (type === 'null' || type === 'undefined') {
+            return '{"__victauri_ok":null,"__victauri_type":"' + type + '"}';
+        }
+        if (payload && hasOwn(payload, '__victauri_err')) {
+            return '{"__victauri_err":' + jsonStringLiteral(payload.__victauri_err) + '}';
+        }
+        return PRISTINE_STRINGIFY(payload);
     }
 
     // The bridge's logs are handed out as per-entry COPIES. Returning the live internal arrays
@@ -591,6 +644,65 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
         }
         return out;
+    }
+
+    // A network-log entry's IPC command name, or null when it is not an app IPC call
+    // (plain network traffic, or Victauri's own `plugin:victauri|*` plumbing).
+    var IPC_LOG_VICTAURI_PREFIX = 'plugin%3Avictauri%7C';
+    function ipcCallCommand(n) {
+        var raw = ipcCommandPath(n.url);
+        if (raw === null || raw.indexOf(IPC_LOG_VICTAURI_PREFIX) === 0) return null;
+        try { return decodeURIComponent(raw); } catch (e) { return raw; }
+    }
+    // The newest app IPC call in the network log (the live entry — never hand it out).
+    function newestIpcCall() {
+        for (var i = networkLog.length - 1; i >= 0; i--) {
+            if (ipcCallCommand(networkLog[i]) !== null) return networkLog[i];
+        }
+        return null;
+    }
+    // The `getIpcLog` view of one IPC network entry: a fresh object whose nested values are
+    // deep copies, so the page cannot rewrite a logged call through it. Without `bodies`, the
+    // request args and result are left out and the error text is capped.
+    var MAX_IPC_ERROR_TEXT = 4096;
+    function ipcLogEntry(n, bodies) {
+        // Classify by COMMAND outcome, not just HTTP status. Tauri returns
+        // HTTP 200 for a failed command (incl. "command not found") and signals
+        // the real result via the `Tauri-Response` header captured as ipc_response.
+        // Precedence: pending > transport error (HTTP >= 400 / 'error') > command
+        // error (ipc_response 'error') > ok.
+        var st;
+        if (n.status === 'pending') { st = 'pending'; }
+        else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
+        else if (n.ipc_response === 'error') { st = 'error'; }
+        else { st = 'ok'; }
+        var errText = null;
+        if (st === 'error') {
+            if (n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
+                errText = 'HTTP ' + n.status;
+            } else if (n.response_body != null) {
+                // Command-level error: the body carries the error message.
+                errText = typeof n.response_body === 'string'
+                    ? n.response_body : PRISTINE_STRINGIFY(n.response_body);
+            } else {
+                errText = 'command error';
+            }
+            if (!bodies && typeof errText === 'string') errText = truncText(errText, MAX_IPC_ERROR_TEXT);
+        }
+        var e = {
+            id: n.id,
+            command: ipcCallCommand(n),
+            timestamp: n.timestamp,
+            status: st,
+            duration_ms: n.duration_ms,
+            error: errText,
+        };
+        if (bodies) {
+            e.args = cloneJson(n.request_args) || {};
+            // Nullish, not falsy: a command returning 0 / false / '' is a real result.
+            e.result = (n.response_body === undefined || n.response_body === null) ? null : cloneJson(n.response_body);
+        }
+        return e;
     }
 
     // ── Event stream (shared by getEventStream and the recording drain) ─────
@@ -681,7 +793,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             id = '' + id; // not String(id): page script can replace window.String
             if (nonce !== PAGE_NONCE || evalState.has(id) || evalDone.has(id)) return null;
             evalMarkDone(id);
-            return evalCallback(id, PRISTINE_STRINGIFY({ __victauri_not_run: 'the code did not begin executing — this almost always means a syntax/parse error in the submitted code' }));
+            return evalCallback(id, '{"__victauri_not_run":' + jsonStringLiteral('the code did not begin executing — this almost always means a syntax/parse error in the submitted code') + '}');
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
@@ -689,21 +801,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             id = '' + id; // not String(id): page script can replace window.String
             if (evalDone.has(id)) return null;
             evalMarkDone(id);
+            // Marked done first, so an outcome MUST be sent from here on: nothing below may
+            // throw past this point without one (R5-JS2).
             var body;
-            if (payload && payload.__victauri_type === 'value') {
-                // The code RAN; a result JSON cannot carry (circular, BigInt, a function) is
-                // reported as exactly that, never as a JavaScript error.
-                var json;
-                try { json = PRISTINE_STRINGIFY(payload.__victauri_ok); }
-                catch (e) { json = null; body = PRISTINE_STRINGIFY({ __victauri_unserializable: String((e && e.message) || e) }); }
-                if (body === undefined) {
-                    body = json === undefined
-                        ? PRISTINE_STRINGIFY({ __victauri_unserializable: 'the result is a ' + typeof payload.__victauri_ok + ', which JSON cannot represent' })
-                        : '{"__victauri_ok":' + json + ',"__victauri_type":"value"}';
-                }
-            } else {
-                try { body = PRISTINE_STRINGIFY(payload); }
-                catch (e) { body = PRISTINE_STRINGIFY({ __victauri_err: String((e && e.message) || e) }); }
+            try { body = evalOutcomeBody(payload); }
+            catch (e) { body = undefined; }
+            if (typeof body !== 'string') {
+                body = '{"__victauri_err":' + jsonStringLiteral('the eval outcome could not be serialized') + '}';
             }
             return evalCallback(id, body);
         },
@@ -1044,62 +1148,39 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         // ── IPC Log ──────────────────────────────────────────────────────────
 
-        getIpcLog: function(limit) {
-            var victauriPrefix = 'plugin%3Avictauri%7C';
-            var entries = [];
+        // The IPC calls in the network log, newest last. `limit` (> 0) keeps the newest
+        // `limit`; `opts.bodies === false` leaves out `args` / `result` (for callers that only
+        // need names, statuses and timings); `opts.ids` keeps only the calls with those ids.
+        // Calls are selected and limited FIRST and only the returned ones are deep-copied:
+        // copying every retained body (up to 1000 x 64 KB) and then discarding most of it
+        // froze the UI thread for ~1 s on every read (R5-JS1).
+        getIpcLog: function(limit, opts) {
+            var bodies = !(opts && opts.bodies === false);
+            var idSet = null;
+            if (opts && opts.ids) {
+                idSet = OBJ_CREATE(null);
+                for (var j = 0; j < opts.ids.length; j++) idSet['' + opts.ids[j]] = true;
+            }
+            var picked = [];
             for (var i = 0; i < networkLog.length; i++) {
                 var n = networkLog[i];
-                var raw = ipcCommandPath(n.url);
-                if (raw === null) continue;
-                if (raw.indexOf(victauriPrefix) === 0) continue;
-                var command;
-                try { command = decodeURIComponent(raw); } catch(e) { command = raw; }
-                // Classify by COMMAND outcome, not just HTTP status. Tauri returns
-                // HTTP 200 for a failed command (incl. "command not found") and signals
-                // the real result via the `Tauri-Response` header captured as ipc_response.
-                // Precedence: pending > transport error (HTTP >= 400 / 'error') > command
-                // error (ipc_response 'error') > ok.
-                var st;
-                if (n.status === 'pending') { st = 'pending'; }
-                else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
-                else if (n.ipc_response === 'error') { st = 'error'; }
-                else { st = 'ok'; }
-                var errText = null;
-                if (st === 'error') {
-                    if (n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
-                        errText = 'HTTP ' + n.status;
-                    } else if (n.response_body != null) {
-                        // Command-level error: the body carries the error message.
-                        errText = typeof n.response_body === 'string'
-                            ? n.response_body : PRISTINE_STRINGIFY(n.response_body);
-                    } else {
-                        errText = 'command error';
-                    }
-                }
-                entries.push({
-                    id: n.id,
-                    command: command,
-                    args: cloneJson(n.request_args) || {},
-                    timestamp: n.timestamp,
-                    status: st,
-                    duration_ms: n.duration_ms,
-                    // Nullish, not falsy: a command returning 0 / false / '' is a real result.
-                    // Deep copies: the page must not rewrite a logged call through this entry.
-                    result: (n.response_body === undefined || n.response_body === null) ? null : cloneJson(n.response_body),
-                    error: errText,
-                });
+                if (idSet && !idSet['' + n.id]) continue;
+                if (ipcCallCommand(n) === null) continue;
+                picked.push(n);
             }
-            if (limit) return entries.slice(-limit);
+            var start = (typeof limit === 'number' && limit > 0 && picked.length > limit) ? picked.length - limit : 0;
+            var entries = [];
+            for (var k = start; k < picked.length; k++) entries.push(ipcLogEntry(picked[k], bodies));
             return entries;
         },
 
         waitForIpcComplete: function(timeoutMs) {
-            var log = window.__VICTAURI__.getIpcLog();
-            if (log.length > 0) {
-                var last = log[log.length - 1];
-                if (last.duration_ms !== null && last.duration_ms !== undefined && last.result !== null) {
-                    return Promise.resolve(true);
-                }
+            // Inspect the newest IPC call in place: copying the whole log to read one entry
+            // cost as much as a full `getIpcLog()` (R5-JS1).
+            var last = newestIpcCall();
+            if (last && last.duration_ms !== null && last.duration_ms !== undefined
+                && last.response_body !== null && last.response_body !== undefined) {
+                return Promise.resolve(true);
             }
             return new Promise(function(resolve) {
                 var timer = setTimeout(function() {
@@ -1129,12 +1210,24 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         // ── Network ──────────────────────────────────────────────────────────
 
-        getNetworkLog: function(filter, limit) {
+        // Filtered and limited BEFORE copying (R5-JS1). `opts.bodies === false` leaves out
+        // the captured IPC request args / response bodies (e.g. to count entries cheaply).
+        getNetworkLog: function(filter, limit, opts) {
             var log = networkLog;
             if (filter) {
                 log = log.filter(function(e) { return e.url.indexOf(filter) !== -1; });
             }
-            if (limit) log = log.slice(-limit);
+            if (typeof limit === 'number' && limit > 0) log = log.slice(-limit);
+            if (opts && opts.bodies === false) {
+                var out = new Array(log.length);
+                for (var i = 0; i < log.length; i++) {
+                    var c = ASSIGN({}, log[i]);
+                    delete c.request_args;
+                    delete c.response_body;
+                    out[i] = c;
+                }
+                return copyEntries(out);
+            }
             return copyEntries(log);
         },
 
@@ -1143,7 +1236,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         // action ('block'|'fulfill'|'delay'), status, status_text, headers,
         // body, content_type, delay_ms, times }. Returns the assigned id.
         addRoute: function(rule) {
-            if (typeof rule === 'string') { try { rule = JSON.parse(rule); } catch (e) { return { ok: false, error: 'invalid rule JSON' }; } }
+            // The captured parse, not the page's: page script could rewrite every rule the agent adds.
+            if (typeof rule === 'string') { try { rule = PRISTINE_PARSE(rule); } catch (e) { return { ok: false, error: 'invalid rule JSON' }; } }
             if (!rule || !rule.pattern) return { ok: false, error: 'route rule requires a pattern' };
             if ((rule.action || 'fulfill') === 'fulfill' && typeof rule.status === 'number'
                 && (rule.status !== Math.floor(rule.status) || rule.status < 200 || rule.status > 599)) {
@@ -2457,6 +2551,17 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
     }
 
+    // Strip control characters and cap at MAX_CONSOLE_MSG, marking what was cut. Shared by
+    // console capture and uncaught-error capture (R5-JS5: the latter stored whole messages).
+    function capConsoleMessage(msg, skippedArgs) {
+        msg = msg.replace(CTRL_RE, '');
+        if (msg.length > MAX_CONSOLE_MSG) {
+            msg = truncText(msg, MAX_CONSOLE_MSG) + '…[+' + (msg.length - MAX_CONSOLE_MSG) + ' bytes truncated'
+                + (skippedArgs ? ', ' + skippedArgs + ' more args' : '') + ']';
+        }
+        return msg;
+    }
+
     function hookConsole(level) {
         console[level] = function() {
             try {
@@ -2467,12 +2572,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (i) msg += ' ';
                     msg += safeArgString(arguments[i]);
                 }
-                msg = msg.replace(CTRL_RE, '');
-                if (msg.length > MAX_CONSOLE_MSG) {
-                    msg = truncText(msg, MAX_CONSOLE_MSG) + '…[+' + (msg.length - MAX_CONSOLE_MSG) + ' bytes truncated'
-                        + (skippedArgs ? ', ' + skippedArgs + ' more args' : '') + ']';
-                }
-                consoleLogs.push({ level: level, message: msg, timestamp: Date.now() });
+                consoleLogs.push({ level: level, message: capConsoleMessage(msg, skippedArgs), timestamp: Date.now() });
                 if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
             } catch (e) {}
             // Always forward to the original method, whatever capture did.
@@ -2489,16 +2589,25 @@ const INIT_SCRIPT_BODY: &str = r#"
     // ── Global Error Capture ────────────────────────────────────────────────
 
     window.addEventListener('error', function(e) {
-        var msg = e.message || 'Unknown error';
-        if (e.filename) msg += ' at ' + e.filename + ':' + e.lineno + ':' + e.colno;
-        consoleLogs.push({ level: 'error', message: ('[uncaught] ' + msg).replace(CTRL_RE, ''), timestamp: Date.now() });
-        if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        try {
+            var msg = safeArgString(e.message || 'Unknown error');
+            if (e.filename) msg += ' at ' + safeArgString(e.filename) + ':' + e.lineno + ':' + e.colno;
+            consoleLogs.push({ level: 'error', message: capConsoleMessage('[uncaught] ' + msg, 0), timestamp: Date.now() });
+            if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        } catch (x) {}
     });
 
     window.addEventListener('unhandledrejection', function(e) {
-        var msg = e.reason ? (e.reason.message || String(e.reason)) : 'Unhandled promise rejection';
-        consoleLogs.push({ level: 'error', message: ('[unhandled rejection] ' + msg).replace(CTRL_RE, ''), timestamp: Date.now() });
-        if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        try {
+            var r = e.reason, msg;
+            if (!r) msg = 'Unhandled promise rejection';
+            else {
+                var m; try { m = r.message; } catch (x) { m = undefined; }
+                msg = safeArgString(m || r);
+            }
+            consoleLogs.push({ level: 'error', message: capConsoleMessage('[unhandled rejection] ' + msg, 0), timestamp: Date.now() });
+            if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        } catch (x) {}
     });
 
     // ── Interaction Observer (for record mode) ────────────────────────────────
@@ -3043,12 +3152,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     // load by its nonce. A page restored from the back/forward cache re-runs no init script, so
     // it re-announces itself: an eval armed in the page it replaced must not wait out its timeout.
     function signalReady() {
-        try {
-            window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {
-                id: '__victauri_bridge_ready__',
-                result: PAGE_NONCE
-            });
-        } catch(e) {}
+        evalCallback('__victauri_bridge_ready__', PAGE_NONCE);
     }
     window.addEventListener('pageshow', function(e) { if (e && e.isTrusted === true && e.persisted) signalReady(); });
     signalReady();
