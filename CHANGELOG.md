@@ -307,7 +307,12 @@ Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
 - **`query_db` is enforced by SQLite's authorizer.** The string checks missed table-valued pragma
   functions (`SELECT * FROM pragma_optimize` ran) and the parenthesized write form
   (`PRAGMA user_version(5)`). Connections also run with `trusted_schema=OFF` + defensive mode, and
-  `db_health` never counts virtual tables (counting runs module code).
+  `db_health` never counts virtual tables (counting runs module code). (Round 5: that check was
+  `sql LIKE 'CREATE VIRTUAL%'`, which a crafted file defeats with `CREATE  VIRTUAL` — two spaces —
+  planted through `writable_schema`; only SQLite's canonical `CREATE TABLE ` form is counted now.
+  Note that `quick_check` still connects virtual tables and, on SQLite >= 3.44, runs their
+  modules' `xIntegrity` — SQLite's built-ins (FTS3/4/5, R-Tree) plus any auto-extension the host
+  process installed; Victauri registers none.)
 - **Browser-originated POSTs must be JSON** — with `auth_disabled()`, a page on any localhost origin
   could fire CORS-simple (no-preflight) tool calls. The concurrency cap is now global (it was 64
   per route).
