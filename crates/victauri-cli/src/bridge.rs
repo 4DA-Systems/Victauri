@@ -99,6 +99,15 @@ impl ServerInfo {
     }
 }
 
+/// The effective app selector: `--app`, else `VICTAURI_APP`, each trimmed, and an empty or
+/// whitespace-only value treated as NOT SET — exactly as victauri-test and the watchdog read
+/// `VICTAURI_APP` (R5-BR2). A set-but-empty `VICTAURI_APP=` used to select an app named "",
+/// which matches nothing, so every call reported "backend not reachable" with the app running.
+fn resolve_app_selector(cli: Option<String>, env: Option<String>) -> Option<String> {
+    let normalize = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    normalize(cli).or_else(|| normalize(env))
+}
+
 /// Run the stdio bridge for MCP clients.
 ///
 /// Unlike a naive proxy, this NEVER blocks the MCP handshake on discovering a backend:
@@ -116,7 +125,7 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     // now a no-op: the handshake never blocks on discovery, so there is nothing to wait for.
     // Tool calls discover lazily and fail fast with an actionable message when the app is down.
     let _ = wait;
-    let app = app.or_else(|| std::env::var("VICTAURI_APP").ok());
+    let app = resolve_app_selector(app, std::env::var("VICTAURI_APP").ok());
     let http = build_client()?;
 
     // The live backend, discovered lazily. `None` until an app is found — the bridge starts
@@ -1799,6 +1808,21 @@ mod tests {
         assert!(!dir_is_trusted(&link), "symlinked dir must be rejected");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R5-BR2: blank selectors are "unset", matching victauri-test and the watchdog.
+    #[test]
+    fn app_selector_treats_blank_as_unset() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(resolve_app_selector(None, None), None);
+        assert_eq!(resolve_app_selector(None, s("")), None);
+        assert_eq!(resolve_app_selector(None, s(" \t")), None);
+        assert_eq!(resolve_app_selector(s(""), s("com.env")), s("com.env"));
+        assert_eq!(resolve_app_selector(None, s(" com.env ")), s("com.env"));
+        assert_eq!(
+            resolve_app_selector(s("com.cli"), s("com.env")),
+            s("com.cli")
+        );
     }
 
     // Round-4 audit, blocker #3 (CLI empty-token fallback): a blank `VICTAURI_AUTH_TOKEN`
