@@ -61,6 +61,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
+      # The workspace step above does NOT compile the plugin without SQLite: demo-app and
+      # gauntlet-app depend on victauri-plugin with default features, and cargo's feature
+      # unification keeps `sqlite` on for every member. Only a `-p victauri-plugin` build
+      # actually compiles the `not(feature = "sqlite")` paths a consumer with
+      # `default-features = false` gets.
+      - name: Clippy (plugin alone, no SQLite)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p victauri-plugin --all-targets --no-default-features -- -D warnings
+
+      - name: Plugin unit tests (no SQLite)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p victauri-plugin --no-default-features --lib
+
       - name: Clippy (release profile — incl. tests)
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --release -- -D warnings
@@ -414,8 +427,11 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
+      # --locked: check the committed lockfile's versions (the ones CI and a fresh
+      # `cargo install --locked` resolve), and fail if Cargo.lock is out of date instead of
+      # silently re-resolving.
       - name: Check MSRV
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
 
   # victauri-plugin accepts rusqlite `>=0.32, <0.41` so cargo unifies onto the app's own
   # rusqlite (`links = "sqlite3"` allows one libsqlite3-sys per build). The lockfile pins the
@@ -546,10 +562,13 @@ jobs:
           tool: cargo-semver-checks@0.50.0
 
       # INFORMATIONAL — not a required gate: a new stable rustdoc JSON format can outrun
-      # the pinned cargo-semver-checks, which is a tooling failure, not an API break. With
-      # 0.50.0 on Rust 1.97 the full check runs (core, plugin, test: 0.8.8 -> 0.9.0 passes as
-      # the intended major bump). A failure is surfaced as a warning annotation below, never
-      # swallowed silently; RELEASING.md makes the local run the pre-release gate.
+      # the pinned cargo-semver-checks, which is a tooling failure, not an API break. Note
+      # that for a 0.x MAJOR bump (0.8.8 -> 0.9.0) this step checks NOTHING: every lint is
+      # already permitted by a major bump, so it reports "0 checks … 254 skip" and passes.
+      # It only has teeth between patch releases of one 0.x line. RELEASING.md step 3 covers
+      # what to run for a major bump (`--release-type minor`, to list what actually broke).
+      # A failure is surfaced as a warning annotation below, never swallowed silently;
+      # RELEASING.md makes the local run the pre-release gate.
       - name: Check semver (informational)
         id: semver
         continue-on-error: true

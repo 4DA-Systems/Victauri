@@ -441,6 +441,14 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
   on the main thread in `setup` (`static APP: OnceLock<AppHandle>`) and background work only borrows
   it. The pattern is documented for apps under "Linux: keep Tauri handles on the main thread" in the
   compatibility docs.
+- **CI never compiled the plugin without SQLite.** The "no default features" clippy step ran over the
+  workspace, where the example apps' default-feature dependency on the plugin kept `sqlite` on
+  through feature unification. CI now also runs clippy and the unit tests for `victauri-plugin`
+  alone with `--no-default-features` (both clean locally). The MSRV job checks with `--locked`.
+  The semver job's comment claimed the 0.8.8 → 0.9.0 check "passes as the intended major bump";
+  for a 0.x major bump cargo-semver-checks runs no lints at all ("0 checks … 254 skip").
+  RELEASING.md now says to also run `--release-type minor` for a major bump to list what actually
+  changed.
 
 ## [0.8.8] - 2026-08-12
 

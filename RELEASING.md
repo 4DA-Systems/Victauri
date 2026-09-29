@@ -37,6 +37,11 @@ Two layers now prevent that:
    non-CI-green commit is refused, loudly, before the publish step.
 3. **Semver report (local)** — `cargo semver-checks check-release --workspace` before bumping.
    CI runs the same check but only as information; read its output rather than its colour.
+   **For a 0.x major bump (e.g. 0.8.x → 0.9.0) that command checks nothing**: a major bump
+   already permits every lint, so it prints "0 checks … N skip" and passes. Also run
+   `cargo semver-checks check-release --workspace --release-type minor` (or per crate with
+   `-p`) and read the failures: they are the list of what actually changed, and every item in it
+   must be covered by MIGRATION.md.
 4. **Publish runs verified-then-tokenless** — `release.yml` first runs
    `cargo publish --workspace --dry-run` with no token present, then uploads each crate with
    `--no-verify` in a step that alone holds the token, so no build script ever runs next to it.
