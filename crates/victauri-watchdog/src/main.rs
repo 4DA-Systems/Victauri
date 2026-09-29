@@ -117,15 +117,17 @@ impl Selector {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
         };
+        // Identity comparison is EXACT but ASCII case-insensitive — identical to the CLI
+        // bridge's `matches_app` and victauri-test's discovery (R5-WD1). A case-only mismatch
+        // must never read as "app down": that fires the recovery command against a healthy app.
+        let same =
+            |value: Option<&str>, want: &str| value.is_some_and(|v| v.eq_ignore_ascii_case(want));
         match self {
             Self::Any => true,
-            Self::App(want) => {
-                field("identifier") == Some(want.as_str())
-                    || field("product_name") == Some(want.as_str())
-            }
+            Self::App(want) => same(field("identifier"), want) || same(field("product_name"), want),
             Self::Pinned(id) => match field("identifier") {
-                Some(identifier) => identifier == id,
-                None => field("product_name") == Some(id.as_str()),
+                Some(identifier) => identifier.eq_ignore_ascii_case(id),
+                None => same(field("product_name"), id),
             },
             Self::Pid(p) => *p == pid,
         }
@@ -946,6 +948,35 @@ mod tests {
         assert!(pinned.matches(300, &same));
         // An already-pinned selector stays pinned.
         assert_eq!(pinned.pin(&app(9, 1, Some("com.z"))), pinned);
+    }
+
+    /// R5-WD1: `--app` must match exactly like the CLI bridge (`matches_app`) and
+    /// victauri-test discovery — ASCII case-insensitive, never a substring. A case-only
+    /// mismatch used to be read as "app down" and fire the recovery command in a loop
+    /// against a healthy app.
+    #[test]
+    fn app_selector_is_ascii_case_insensitive_like_the_bridge() {
+        let meta = serde_json::json!({"identifier": "com.Mock.App", "product_name": "Mock App"});
+        assert!(app_sel("com.mock.app").matches(1, &meta));
+        assert!(app_sel("COM.MOCK.APP").matches(1, &meta));
+        assert!(app_sel("mock app").matches(1, &meta));
+        // Still exact: no substring / prefix matches.
+        assert!(!app_sel("com.mock").matches(1, &meta));
+        assert!(!app_sel("mock").matches(1, &meta));
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7373", Some("com.Mock.App"));
+        assert_eq!(
+            discover_in(tmp.path(), &app_sel("com.mock.app"), |_| true),
+            Discovery::Found(app(100, 7373, Some("com.Mock.App")))
+        );
+
+        // The pinned identity follows the same rule (it is re-matched after a restart).
+        let pinned = Selector::Pinned("com.Mock.App".to_string());
+        let restarted = serde_json::json!({"identifier": "com.mock.app"});
+        assert!(pinned.matches(2, &restarted));
+        let other = serde_json::json!({"identifier": "com.mock.app.other"});
+        assert!(!pinned.matches(3, &other));
     }
 
     #[test]
