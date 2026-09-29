@@ -254,7 +254,7 @@ pub fn build_ghost_report(
 /// real app that easily exceeds the eval result cap, which silently returned an empty
 /// string and made `coverage`/`command_timings` report **zero** real traffic even
 /// while the app was making hundreds of calls. This minimal projection stays small.
-/// `since_ms` time-windows like [`ghost_ipc_projection_js`].
+/// `since_ms` time-windows like `ghost_ipc_projection_js`.
 #[must_use]
 pub fn ipc_timing_projection_js(since_ms: Option<i64>) -> String {
     let filter = match since_ms {

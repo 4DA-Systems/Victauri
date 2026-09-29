@@ -507,6 +507,45 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
   `screencast` items. It now lists every removed, hidden and newly `#[non_exhaustive]` item that
   `cargo semver-checks --release-type minor` reports against 0.8.8 for core, plugin and test.
   CONTRIBUTING.md no longer presents the hidden `acquire_*` helpers as API.
+- **Regression fixed: reading the IPC or network log froze the app's UI for about a second.**
+  Round 3 made every log read hand out deep copies, but `getIpcLog(limit)` / `getNetworkLog`
+  copied every retained entry (up to 1,000 calls with bodies) before applying the limit — 859 ms
+  per read with 1,000 × 56 KB bodies, against ~2 ms in 0.8.8, on the UI thread, for `logs ipc`,
+  `slow_ipc`, ghost detection, coverage, `command_timings`, `command_catalog`, the ipc-log resource
+  and `check_ipc_integrity` (which read both logs). Entries are now selected and limited first and
+  only the returned ones are copied (still copies, never the live objects); name/status/timing
+  projections use a body-free view; `waitForIpcComplete` reads the newest call in place.
+- **An eval could hang until its timeout** when page script made `Object.prototype.toJSON` throw:
+  the bridge marked the eval done and then failed to serialize both the result and its own error
+  fallback, and Tauri serializes callback arguments with the page's `JSON.stringify`. Outcomes (and
+  probe/ready signals) are now built from strings on prototype-less objects, and an unserializable
+  result comes back as `__victauri_unserializable`.
+- **Clicks on web-component content failed as "covered":** a hit point on slotted light-DOM
+  content was not recognised as inside its shadow host (bridge `composedContains` and the trusted-
+  click probe). Both now follow `assignedSlot`.
+- Route globs: `?` was an unescaped regex token, so `*/api/search?q=*` never matched; `*` is the
+  only wildcard and `?` now matches itself. Uncaught-error and unhandled-rejection messages are
+  capped at 4,096 characters like console messages; `route add` parses its rule with the pristine
+  `JSON.parse`; `logs … limit=0` returns no entries (it returned all of them).
+- **The watchdog's `--app` was case-sensitive** while the bridge and victauri-test match
+  identifiers ASCII case-insensitively, and a selector that matches nothing reads as "app down" —
+  so `--app com.mock.app` against a healthy `com.Mock.App` fired the recovery command in a loop. It
+  now matches exactly like the bridge.
+- CLI bridge: a JSON-RPC batch (a JSON array) is answered locally with one `-32600` error per
+  request (MCP removed batching in 2025-06-18; the server rejects batches without running them),
+  instead of being forwarded — re-sent after a post-send failure — with its reply dropped; a blank
+  `VICTAURI_APP=` / `--app ""` counts as unset (it selected an app named "" and every call said
+  "backend not reachable"); a client's JSON-RPC *response* is never answered with an invented
+  error; a tool call whose SSE response dies mid-stream now says it may already have run (it said
+  "empty or non-JSON response").
+- victauri-test: JUnit XML could contain characters XML 1.0 forbids (an ANSI escape in a page's
+  console error made the whole report unparseable); they are replaced and tab/LF/CR are kept as
+  character references. Page text in `verify()` check details, `assert_all_passed` panics and
+  Locator errors goes through the same terminal sanitizer as the smoke summary, so it cannot drive
+  the terminal or start a `::error` workflow command in a CI log.
+- VS Code extension (released separately): it no longer re-sends the Bearer token to a port its app
+  no longer owns (discovery is re-checked before every token-bearing request), and refresh polls
+  cannot overlap.
 
 ## [0.8.8] - 2026-08-12
 
