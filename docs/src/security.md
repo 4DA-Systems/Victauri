@@ -370,28 +370,51 @@ embedded third-party widgets, or user-generated content rendered in the DOM.
 ### What page script can and cannot do to the bridge
 
 Script running in the app's own page (an XSS, or content the app renders) shares the page's
-JavaScript realm with the injected bridge, so no in-page mechanism can fully isolate the two.
-Victauri narrows what such script can reach:
+JavaScript realm with the injected bridge, so no in-page mechanism can isolate the two. **Treat
+page script in the same webview as trusted for the integrity and confidentiality of that
+webview's eval results and probe answers.** Concretely: Tauri sends every IPC message, including
+the `victauri_eval_callback` that carries an eval result or a liveness-probe answer back to Rust,
+with the bare global `fetch(...)`, looked up when each call is made. Script that wraps
+`window.fetch` after the bridge loads sees every callback body (`{"id": …, "result": …}`) and can
+read it, rewrite it or drop it. That means same-window script can:
 
-- **Eval results and ids.** Eval bookkeeping lives in closures behind null-prototype tables, ids
-  are coerced without page-replaceable globals, and results are serialized with a `JSON.stringify`
-  captured at injection that ignores a `toJSON` planted on `Object.prototype`/`Array.prototype`.
-  Hooking `Map`/`Set`/`String`/`setTimeout`/`toJSON` no longer reveals pending ids or rewrites
-  results. **Residual:** Tauri's own IPC transport reads `window.__TAURI_INTERNALS__` and `fetch`
-  when each call is made, so same-window script can still observe or alter its own window's
-  results by wrapping them. Other windows' results, and Rust-side tools (`query_db`, `app_state`,
-  the registry, memory stats), are unaffected.
-- **Agent-only controls** — clearing logs and network routes, dialog auto-answers — are not on
-  the page-visible `window.__VICTAURI__`; they need a per-process key that only the plugin's own
-  injected scripts carry.
-- **Logs are copies.** Every log read hands out a deep copy, so page script cannot rewrite what was
-  captured through a returned reference.
-- **Replay never runs what did not run.** An IPC call fulfilled or blocked by a network route
-  (which page script can also add) is recorded as `mocked` and never replayed, and `recording
-  replay` runs each call in the window that recorded it (a window's Tauri capabilities are its
-  own) — or not at all if that window is gone.
-- **Reload detection** keys on a per-page nonce, so page script cannot forge "the page reloaded"
-  to abort the agent's evals.
+- change or suppress what `eval_js`, `dom_snapshot`, `find_elements`, the log tools and any other
+  webview tool report for **its own window** (a proof of concept returned an agent's
+  `return document.title` as a string of the page's choosing);
+- forge a liveness-probe answer, which makes the agent's in-flight eval abort as "the page was
+  replaced/reloaded";
+- rewrite the events the recording drain reads, so a recording (and therefore `recording replay`)
+  can contain IPC calls that never happened in that window.
+
+What it still cannot do:
+
+- **Read the agent key or call agent-only operations.** Clearing logs and network routes and
+  dialog auto-answers are not on the page-visible `window.__VICTAURI__`; they need a per-process
+  key that only the plugin's own injected scripts carry, and the functions that hold it are strict
+  mode so a page hook cannot reach them through `Function.caller`. (The animation `scrub` / `sample`
+  helpers — `scrubPrepare`, `scrubSeek`, `scrubRestore`, `installSweepRecorder`, `readSweep` — are
+  on the public `window.__VICTAURI__` and are **not** behind the key: page script can call them.)
+- **Reach other windows or out-of-process state.** Another window's results, and Rust-side tools
+  (`query_db`, `app_state`, the registry, memory stats, window state), do not pass through that
+  page, so they are unaffected.
+- **Observe pending eval ids or rewrite results through prototype hooks.** Eval bookkeeping lives
+  in closures behind null-prototype tables, ids are coerced without page-replaceable globals, and
+  results are serialized with a `JSON.stringify` captured at injection that ignores a `toJSON`
+  planted on `Object.prototype`/`Array.prototype`. (This closes the prototype-hook routes; the
+  `fetch` route above remains.)
+- **Rewrite captured logs through a returned reference.** Every log read hands out a deep copy.
+
+**Replay.** An IPC call fulfilled or blocked by a network route (which page script can also add)
+is recorded as `mocked` and never replayed, and `recording replay` runs each call in the window
+that recorded it (a window's Tauri capabilities are its own) — or not at all if that window is
+gone. Because same-window script can rewrite what the drain reads (above), this is not a guarantee
+that every replayed call really ran; what replay does guarantee is that a planted call only runs
+with no arguments, in the window whose script planted it, with that window's own capabilities —
+the same commands that script could already invoke directly.
+
+**Reload detection** keys on a per-page nonce, so script in *another* page
+cannot make the agent's eval abort; script in the same page can (by forging the probe answer, as
+above).
 
 ## Disclosure & Capture Notes
 

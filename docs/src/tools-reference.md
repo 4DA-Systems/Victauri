@@ -564,7 +564,9 @@ Each call is re-invoked **in the window that recorded it** — a window's Tauri 
 its own — and is skipped if that window no longer exists (it never falls back to `main`);
 `webview_label` only filters which recorded calls are replayed. Calls that were fulfilled or
 blocked by a network route (`route add`, which page script can also use) are recorded as
-`mocked` and never replayed: they never reached the backend.
+`mocked` and never replayed: they never reached the backend. (Script in the recording window
+can still rewrite what the recording captures from that window — see
+[Security](security.md#what-page-script-can-and-cannot-do-to-the-bridge).)
 
 **Example:**
 ```json
