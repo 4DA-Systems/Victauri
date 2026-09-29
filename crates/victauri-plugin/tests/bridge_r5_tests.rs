@@ -343,3 +343,84 @@ fn r5_js2_throwing_to_json_cannot_suppress_eval_outcomes() {
         );
     }
 }
+
+// ── R5-JS3: a slotted child of the target is not "covering" it ──────────────
+
+/// A `<button><slot></slot></button>` in a shadow root with light-DOM content slotted into it:
+/// the real engine's hit test at the button's centre returns the slotted `<span>`, which is a
+/// flat-tree descendant of the button but not a DOM (parentNode/host) one.
+const SLOT_SETUP: &str = r#"
+    document.body.innerHTML = '<div id="host"><span id="lbl">Save</span></div><span id="other">x</span>';
+    var sr = document.getElementById('host').attachShadow({ mode: 'open' });
+    sr.innerHTML = '<button id="inner"><slot></slot></button>';
+    window.__clicked = 0;
+    sr.getElementById('inner').addEventListener('click', function() { window.__clicked++; });
+    window.__hit = 'lbl';
+    document.elementFromPoint = function() { return document.getElementById(window.__hit); };
+"#;
+
+/// `composedContains` (bridge actionability) and `__within` (trusted-click probe) walked
+/// parentNode/host only, so a click on a shadow button whose centre lands on slotted text was
+/// refused as "covered by span#lbl". A node reachable through the flat tree (assignedSlot)
+/// is part of the target; an unrelated element still covers it.
+#[test]
+fn r5_js3_slotted_content_does_not_cover_its_slot_host() {
+    let probe =
+        victauri_plugin::mcp::trusted_click_probe_js("__VREF__").replace("\"__VREF__\"", "__vref");
+    let find = "var __vref = window.__VICTAURI__.findElements({ css: 'button' })[0].ref_id;";
+    let def = def(
+        Some(SLOT_SETUP.to_string()),
+        vec![
+            case(
+                "bridge click through slotted content",
+                &format!(
+                    "{find}\nvar r = await window.__VICTAURI__.click(__vref, 300);\n\
+                     return {{ r: r, clicked: window.__clicked }};"
+                ),
+            ),
+            case(
+                "bridge click refused when an unrelated element covers",
+                &format!(
+                    "{find}\nwindow.__hit = 'other';\n\
+                     var r = await window.__VICTAURI__.click(__vref, 300);\n\
+                     return {{ r: r, clicked: window.__clicked }};"
+                ),
+            ),
+            case(
+                "trusted-click probe through slotted content",
+                &format!("{find}\nreturn (function() {{ {probe} }})();"),
+            ),
+            case(
+                "trusted-click probe refused when an unrelated element covers",
+                &format!("{find}\nwindow.__hit = 'other';\nreturn (function() {{ {probe} }})();"),
+            ),
+        ],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let ok = result(&results, 0);
+    assert_eq!(ok["r"]["ok"], true, "{ok}");
+    assert_eq!(ok["clicked"], 1, "{ok}");
+    let covered = result(&results, 1);
+    assert_eq!(covered["r"]["ok"], false, "{covered}");
+    assert!(
+        covered["r"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("covered by span#other"),
+        "{covered}"
+    );
+    assert_eq!(covered["clicked"], 0, "{covered}");
+    let point = result(&results, 2);
+    assert!(
+        point["x"].is_number() && point["y"].is_number(),
+        "trusted-click probe must return a click point: {point}"
+    );
+    let refused = result(&results, 3);
+    assert!(
+        refused["error"].as_str().unwrap().contains("covered"),
+        "{refused}"
+    );
+}

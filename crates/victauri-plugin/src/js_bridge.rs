@@ -315,9 +315,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         return hit;
     }
-    // `a` contains `b` across shadow boundaries (the composed tree), or is `b`.
+    // `a` contains `b` in the flat tree (what is rendered and hit-tested), or is `b`: across
+    // shadow boundaries (host), and from slotted light-DOM content to the <slot> it renders in
+    // (assignedSlot). Without the slot step, a click on `<button><slot>` whose centre lands on
+    // the slotted text read as "covered by" that text (R5-JS3).
     function composedContains(a, b) {
-        for (var n = b; n; n = n.parentNode || n.host) {
+        for (var n = b; n; n = n.assignedSlot || n.parentNode || n.host) {
             if (n === a) return true;
         }
         return false;

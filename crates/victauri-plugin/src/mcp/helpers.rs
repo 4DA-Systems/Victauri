@@ -553,7 +553,8 @@ pub fn trusted_focus_probe_js(ref_id: &str) -> String {
 /// where the element is actually hit: it runs the same checks as the bridge's
 /// actionability check for synthetic clicks (connected, enabled, visible, non-zero size,
 /// `pointer-events`, not covered at its center — the covering test is stricter: the hit
-/// element must be the element or inside it; the hit test descends into open shadow roots,
+/// element must be the element or inside it in the flat tree — slotted light-DOM content
+/// counts as inside the `<slot>` it renders in; the hit test descends into open shadow roots,
 /// whose content `elementFromPoint` otherwise reports as the shadow host) and then walks up
 /// through same-origin frames,
 /// adding each frame's content offset and requiring the point to stay inside every
@@ -569,7 +570,7 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
          function __hit(d,x,y){{var h=d.elementFromPoint(x,y),g=0; \
            while(h&&h.shadowRoot&&g++<32){{var i=h.shadowRoot.elementFromPoint(x,y); \
              if(!i||i===h)break; h=i;}} return h;}} \
-         function __within(a,b){{for(var n=b;n;n=n.parentNode||n.host){{if(n===a)return true;}} \
+         function __within(a,b){{for(var n=b;n;n=n.assignedSlot||n.parentNode||n.host){{if(n===a)return true;}} \
            return false;}} \
          if(!__e.isConnected) return __no('element is detached from the DOM'); \
          __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
