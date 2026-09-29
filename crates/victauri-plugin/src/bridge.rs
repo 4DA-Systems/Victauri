@@ -1186,6 +1186,22 @@ mod tests {
         }
     }
 
+    /// A stand-in main thread that is guaranteed to have STARTED the posted job before `post`
+    /// returns (and so before the caller's deadline starts counting): it waits for the job to
+    /// signal `started`. A plain spawned thread can be scheduled late on a loaded machine, and
+    /// the caller then (correctly) abandons a job that never started — which turned tests
+    /// about a job that outlives its caller into flakes.
+    fn post_started(
+        started: std::sync::mpsc::Receiver<()>,
+    ) -> impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String> {
+        move |job| {
+            std::thread::spawn(job);
+            started
+                .recv_timeout(Duration::from_secs(60))
+                .map_err(|_| "the stand-in main thread never started the job".to_string())
+        }
+    }
+
     #[test]
     fn a_job_still_queued_at_the_deadline_never_runs() {
         let ran = Arc::new(AtomicUsize::new(0));
@@ -1206,12 +1222,14 @@ mod tests {
     fn a_job_running_at_the_deadline_reports_its_real_outcome() {
         // It started before the caller gave up, so its effects happen: reporting "timed out"
         // would tell the caller a window change / eval did not happen when it did.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let out = dispatch_and_wait(
             "eval_webview",
             Duration::from_millis(50),
             Duration::from_secs(5),
-            post_after(Duration::ZERO),
-            || {
+            post_started(started_rx),
+            move || {
+                let _ = started_tx.send(());
                 std::thread::sleep(Duration::from_millis(300));
                 7
             },
@@ -1251,13 +1269,18 @@ mod tests {
         let gate = leaked_gate();
         let first_end = Arc::new(std::sync::Mutex::new(None::<Instant>));
         let fe = Arc::clone(&first_end);
+        // The first job is known to have started before its caller's deadline, and it runs
+        // until released — no sleep decides either (both used to race a loaded scheduler).
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let first = serialized_round_trip(
             gate,
             "first",
             Duration::from_millis(50),
-            post_after(Duration::ZERO),
+            post_started(started_rx),
             move || {
-                std::thread::sleep(Duration::from_millis(400));
+                let _ = started_tx.send(());
+                let _ = release_rx.recv();
                 *fe.lock().unwrap() = Some(Instant::now());
             },
         );
@@ -1265,6 +1288,15 @@ mod tests {
             first.unwrap_err().contains("outcome is unknown"),
             "precondition: the first caller gave up while its job was running"
         );
+        // Release the first job only once the second caller holds the dispatch lock — it is
+        // then provably waiting on the still-running job, not merely about to start.
+        let releaser = std::thread::spawn(move || {
+            while gate.lock.try_lock().is_ok() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            release_tx.send(()).unwrap();
+        });
         let second_start = serialized_round_trip(
             gate,
             "second",
@@ -1273,6 +1305,7 @@ mod tests {
             Instant::now,
         )
         .expect("the second round trip runs once the first job is done");
+        releaser.join().unwrap();
         let first_end = first_end
             .lock()
             .unwrap()
@@ -1290,12 +1323,16 @@ mod tests {
     fn waiting_for_an_abandoned_job_is_bounded_by_the_callers_deadline() {
         use super::serialized_round_trip;
         let gate = leaked_gate();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         let first = serialized_round_trip(
             gate,
             "first",
             Duration::from_millis(30),
-            post_after(Duration::ZERO),
-            || std::thread::sleep(Duration::from_millis(1500)),
+            post_started(started_rx),
+            move || {
+                let _ = started_tx.send(());
+                std::thread::sleep(Duration::from_millis(1500));
+            },
         );
         assert!(first.unwrap_err().contains("outcome is unknown"));
         let ran = Arc::new(AtomicUsize::new(0));

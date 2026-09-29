@@ -273,12 +273,14 @@ impl EvalFailure {
 /// How [`unwrap_eval_envelope`] reports code that did not parse.
 const PARSE_ERROR_PREFIX: &str = "JavaScript parse error:";
 
-/// How long `app_state` waits for an app-registered probe closure (shortened under test).
-const PROBE_TIMEOUT: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_secs(10)
-};
+/// How long `app_state` waits for an app-registered probe closure.
+///
+/// This used to be 1 s under `cfg(test)` for EVERY probe call, so a test of a panicking or a
+/// normal probe raced a deadline shorter than the scheduling tail of a loaded machine (a fresh
+/// blocking-pool thread plus the panic hook and unwind measured ~0.4 s at 2x CPU
+/// oversubscription, more in a full parallel suite) and flaked as "did not finish". Tests that
+/// exercise the deadline itself shorten [`VictauriMcpHandler::probe_timeout`] on their handler.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// App-registered probes allowed to run at once. A probe that hangs keeps its blocking thread
 /// past [`PROBE_TIMEOUT`]; the cap stops repeated calls to it from leaking a thread each.
@@ -288,12 +290,9 @@ pub(crate) const MAX_CONCURRENT_PROBES: usize = 4;
 /// its thread past [`READ_APP_FILE_TIMEOUT`]).
 pub(crate) const MAX_CONCURRENT_FILE_READS: usize = 4;
 
-/// How long `read_app_file` waits for its (bounded, at most 10 MB) read (shortened under test).
-const READ_APP_FILE_TIMEOUT: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_secs(15)
-};
+/// How long `read_app_file` waits for its (bounded, at most 10 MB) read. Tests that exercise
+/// the deadline shorten [`VictauriMcpHandler::file_read_timeout`] (see [`PROBE_TIMEOUT`]).
+const READ_APP_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Distinct command names `CommandTimings` tracks (its private `MAX_TIMED_COMMANDS`, mirrored
 /// here — a test pins the two together). Once that many are tracked, new names are dropped and
@@ -424,6 +423,10 @@ pub struct VictauriMcpHandler {
     probe_slots: Arc<tokio::sync::Semaphore>,
     /// Slots for `read_app_file` reads ([`MAX_CONCURRENT_FILE_READS`]); held by the read's thread.
     file_slots: Arc<tokio::sync::Semaphore>,
+    /// Deadline for one app probe ([`PROBE_TIMEOUT`]; tests of the deadline shorten it).
+    probe_timeout: std::time::Duration,
+    /// Deadline for one `read_app_file` read ([`READ_APP_FILE_TIMEOUT`]; likewise).
+    file_read_timeout: std::time::Duration,
 }
 
 #[tool_router]
@@ -1120,7 +1123,7 @@ impl VictauriMcpHandler {
             match bounded::run_blocking_bounded(
                 None,
                 &format!("probe '{name}'"),
-                PROBE_TIMEOUT,
+                self.probe_timeout,
                 move || {
                     let _slot = slot;
                     Ok(probe())
@@ -4304,6 +4307,8 @@ impl VictauriMcpHandler {
             timed_out_labels: Arc::new(Mutex::new(HashSet::new())),
             probe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES)),
             file_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_READS)),
+            probe_timeout: PROBE_TIMEOUT,
+            file_read_timeout: READ_APP_FILE_TIMEOUT,
         }
     }
 
@@ -4533,7 +4538,7 @@ impl VictauriMcpHandler {
                  blocked on a pipe or device keeps running past its timeout). Retry shortly."
             ));
         };
-        bounded::run_blocking_bounded(None, "file read", READ_APP_FILE_TIMEOUT, move || {
+        bounded::run_blocking_bounded(None, "file read", self.file_read_timeout, move || {
             let _slot = slot;
             read_regular_file(&path, max_bytes)
         })
