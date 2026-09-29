@@ -379,3 +379,46 @@ fn init_suggestion_for_an_existing_mcp_json_pins_the_app() {
         "the suggestion must pin the app:\n{err}"
     );
 }
+
+/// R5B-PORTAPP1: with `VICTAURI_PORT` set, `--app` / `VICTAURI_APP` was silently ignored by
+/// victauri-test's discovery (so by every CLI command but the bridge) — the command drove
+/// whatever app held that port. Both set must agree; disagreement is a clear error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn victauri_port_with_a_different_app_selector_is_refused() {
+    let iso = IsolatedTemp::new();
+    let port = start_mock("com.test.portapp").await;
+    iso.write_entry(std::process::id(), port, "tok", "com.test.portapp");
+
+    // Discovery metadata for that port disagrees with the selector.
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw", "--app", "com.test.other"]);
+    cmd.env("VICTAURI_PORT", port.to_string());
+    let out = run(cmd).await;
+    let err = stderr(&out);
+    assert!(!out.status.success(), "must refuse:\n{err}");
+    assert!(
+        err.contains("VICTAURI_PORT") && err.contains("com.test.other"),
+        "{err}"
+    );
+    assert!(
+        !stdout(&out).contains("com.test.portapp"),
+        "drove the app anyway"
+    );
+
+    // No discovery entry for the port (explicit token too): `/info` still disagrees.
+    let other = start_mock("com.test.unlisted").await;
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw"]);
+    cmd.env("VICTAURI_PORT", other.to_string())
+        .env("VICTAURI_AUTH_TOKEN", "t")
+        .env("VICTAURI_APP", "com.test.portapp");
+    let out = run(cmd).await;
+    let err = stderr(&out);
+    assert!(!out.status.success(), "must refuse:\n{err}");
+    assert!(err.contains("com.test.unlisted"), "{err}");
+
+    // Agreeing selectors work.
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw", "--app", "com.test.portapp"]);
+    cmd.env("VICTAURI_PORT", port.to_string());
+    let out = run(cmd).await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("com.test.portapp"));
+}

@@ -196,8 +196,9 @@ pub fn try_resolve_connection(app: Option<&str>) -> Result<(u16, Option<String>)
     let app = app.map(str::to_string).or_else(configured_app);
     let port = configured_port();
     let token = configured_token();
-    // Only scan when the answer depends on discovery (an explicit port + token does not).
-    let servers = if port.is_some() && token.is_some() {
+    // Only scan when the answer depends on discovery (an explicit port + token with no app
+    // selector does not; a selector is checked against that port's entry — R5B-PORTAPP1).
+    let servers = if port.is_some() && token.is_some() && app.is_none() {
         Vec::new()
     } else {
         find_live_servers()
@@ -213,8 +214,17 @@ fn resolve_from(
     servers: &[DiscoveredServer],
 ) -> Result<(u16, Option<String>), String> {
     // An explicit port is the caller naming the endpoint: pair it with the explicit token,
-    // else with the token of the one live entry on exactly that port.
+    // else with the token of the one live entry on exactly that port. An app selector set as
+    // well must AGREE with that port's app (R5B-PORTAPP1) — it used to be silently ignored, so
+    // the client drove whatever app held the port. (The client re-checks `/info` on connect,
+    // which also covers a port with no discovery entry.)
     if let Some(port) = explicit_port {
+        if let (Some(app), Some(entry)) = (app, unique_server_on_port(servers, port))
+            && (entry.identifier.is_some() || entry.product_name.is_some())
+            && !entry.matches_app(app)
+        {
+            return Err(port_app_mismatch(port, &entry.label(), app));
+        }
         let token = explicit_token.or_else(|| unique_token_for_port(servers, port));
         return Ok((port, token));
     }
@@ -265,6 +275,16 @@ fn resolve_from(
         ([], None) => Ok((DEFAULT_PORT, None)),
         (many, _) => Err(ambiguity_message(many.iter().copied())),
     }
+}
+
+/// `VICTAURI_PORT` and an app selector name different apps.
+pub fn port_app_mismatch(port: u16, found: &str, app: &str) -> String {
+    format!(
+        "VICTAURI_PORT={port} is app {}, but the app selector (--app / VICTAURI_APP) is '{}'. \
+         Unset one of them, or point VICTAURI_PORT at that app's port.",
+        crate::terminal::single_line(found),
+        crate::terminal::single_line(app)
+    )
 }
 
 /// "Several apps match" — names each as `identifier (port N, pid P)` and how to pick one
@@ -444,12 +464,11 @@ impl DiscoveredServer {
     /// case-insensitive, like `victauri bridge --app`) — never a substring, so `com.example`
     /// can't silently bind `com.example.other`.
     fn matches_app(&self, app: &str) -> bool {
-        let is = |field: &Option<String>| {
-            field
-                .as_deref()
-                .is_some_and(|v| v.eq_ignore_ascii_case(app))
-        };
-        is(&self.identifier) || is(&self.product_name)
+        identity_matches(
+            self.identifier.as_deref(),
+            self.product_name.as_deref(),
+            app,
+        )
     }
 
     /// `identifier (port N, pid P)` — the label `victauri bridge` prints, plus the pid.
@@ -471,12 +490,24 @@ fn unique_connection(servers: &[DiscoveredServer]) -> Option<(u16, Option<String
 }
 
 fn unique_token_for_port(servers: &[DiscoveredServer], port: u16) -> Option<String> {
+    unique_server_on_port(servers, port)?.token.clone()
+}
+
+/// The ONE live entry advertising `port`; `None` when there is none, or several.
+fn unique_server_on_port(servers: &[DiscoveredServer], port: u16) -> Option<&DiscoveredServer> {
     let mut matching = servers.iter().filter(|server| server.port == port);
     let server = matching.next()?;
     if matching.next().is_some() {
         return None;
     }
-    server.token.clone()
+    Some(server)
+}
+
+/// Whether an app selector names this identity: the bundle identifier or the product name,
+/// EXACTLY (ASCII case-insensitive) — the rule discovery, `/info` checks and the CLI bridge share.
+pub fn identity_matches(identifier: Option<&str>, product_name: Option<&str>, app: &str) -> bool {
+    identifier.is_some_and(|v| v.eq_ignore_ascii_case(app))
+        || product_name.is_some_and(|v| v.eq_ignore_ascii_case(app))
 }
 
 fn find_live_servers() -> Vec<DiscoveredServer> {
@@ -963,6 +994,33 @@ mod tests {
             Ok((7373, Some("a".to_string())))
         );
         assert_eq!(resolve_from(None, None, None, &[]), Ok((7373, None)));
+    }
+
+    /// R5B-PORTAPP1: an explicit port and an app selector must agree.
+    #[test]
+    fn an_explicit_port_and_a_disagreeing_app_selector_are_refused() {
+        let servers = vec![
+            named(20, 7373, "a", "com.a.app", "A"),
+            named(21, 7374, "b", "com.b.app", "B"),
+        ];
+        let err = resolve_from(Some(7373), None, Some("com.b.app"), &servers).unwrap_err();
+        assert!(
+            err.contains("VICTAURI_PORT=7373") && err.contains("com.a.app"),
+            "{err}"
+        );
+        assert!(err.contains("com.b.app"), "{err}");
+        // With an explicit token too.
+        assert!(resolve_from(Some(7373), Some("t".into()), Some("com.b.app"), &servers).is_err());
+        // Agreeing (by identifier or product name, any case) is fine.
+        assert_eq!(
+            resolve_from(Some(7374), None, Some("b"), &servers),
+            Ok((7374, Some("b".to_string())))
+        );
+        // No discovery entry on the port: left to the client's `/info` check.
+        assert_eq!(
+            resolve_from(Some(7999), None, Some("com.b.app"), &servers),
+            Ok((7999, None))
+        );
     }
 
     #[test]

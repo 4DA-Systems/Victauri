@@ -1035,17 +1035,7 @@ async fn scan_once(app: Option<&str>) -> Selection {
         && let Ok(port) = p.trim().parse::<u16>()
         && health_ok(port).await
     {
-        return Selection::One(ServerInfo {
-            pid: None,
-            port,
-            // An EMPTY/whitespace `VICTAURI_AUTH_TOKEN` is "not configured", NOT "send an
-            // empty Bearer" — it must fall through to the discovered token for this exact
-            // port (see `normalize_env_token`).
-            token: normalize_env_token(std::env::var("VICTAURI_AUTH_TOKEN").ok())
-                .or_else(|| discover_token_for_port(port)),
-            identifier: None,
-            product_name: None,
-        });
+        return port_override(port, app).await;
     }
 
     // Liveness-FIRST, then health. On Unix `alive_pids` snapshots our user's live PIDs in ONE
@@ -1178,6 +1168,47 @@ async fn confirm_identity(
         _ => None,
     };
     outcome
+}
+
+/// The backend `VICTAURI_PORT` names. When an app selector (`--app` / `VICTAURI_APP`) is set
+/// too, the two must agree (R5B-PORTAPP1) — the selector used to be silently ignored, so the
+/// bridge drove whatever app held that port: first by the discovery metadata of the one live
+/// entry on that port (if any), then by the identity the server itself reports on `/info`.
+async fn port_override(port: u16, app: Option<&str>) -> Selection {
+    let live = discover_live_servers();
+    let entry = unique_entry_on_port(&live, port);
+    let refuse = |why: &str| {
+        Selection::Refused(format!(
+            "VICTAURI_PORT={port} {why}, but the app selector (--app / VICTAURI_APP) is '{}'.              Unset one of them, or point VICTAURI_PORT at that app's port.",
+            victauri_test::terminal::single_line(app.unwrap_or_default())
+        ))
+    };
+    if let (Some(app), Some(e)) = (app, entry)
+        && (e.identifier.is_some() || e.product_name.is_some())
+        && !e.matches_app(app)
+    {
+        return refuse(&format!(
+            "is app {}",
+            victauri_test::terminal::single_line(&e.label())
+        ));
+    }
+    let info = ServerInfo {
+        pid: entry.and_then(|e| e.pid),
+        port,
+        // An EMPTY/whitespace `VICTAURI_AUTH_TOKEN` is "not configured", NOT "send an empty
+        // Bearer" — it must fall through to the discovered token for this exact port (see
+        // `normalize_env_token`).
+        token: normalize_env_token(std::env::var("VICTAURI_AUTH_TOKEN").ok())
+            .or_else(|| entry.and_then(|e| e.token.clone())),
+        identifier: entry.and_then(|e| e.identifier.clone()),
+        product_name: entry.and_then(|e| e.product_name.clone()),
+    };
+    if let Some(app) = app
+        && let Err(why) = confirm_identity(&info, app, verified_backend()).await
+    {
+        return refuse(&why);
+    }
+    Selection::One(info)
 }
 
 /// A single non-blocking discovery attempt — `Some` iff exactly one matching live backend is
@@ -1425,23 +1456,26 @@ fn normalize_env_token(raw: Option<String>) -> Option<String> {
     raw.map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
-/// Token belonging to the exact server selected by a `VICTAURI_PORT` override.
+/// Token belonging to the exact server selected by a `VICTAURI_PORT` override (see
+/// [`unique_entry_on_port`]).
+#[cfg(test)]
+fn token_for_port(servers: &[ServerInfo], port: u16) -> Option<String> {
+    unique_entry_on_port(servers, port)?.token.clone()
+}
+
+/// The ONE live discovery entry advertising `port` — `None` when there is none, or several.
 ///
 /// Never send a token discovered for one app to an unrelated localhost port: only the token
 /// of the ONE live, trusted discovery entry advertising that port is used (R4-DISC2). A
 /// stale entry of a dead app that once held the port — or two entries claiming it — yields
-/// no token, rather than the first match's.
-fn discover_token_for_port(port: u16) -> Option<String> {
-    token_for_port(&discover_live_servers(), port)
-}
-
-fn token_for_port(servers: &[ServerInfo], port: u16) -> Option<String> {
+/// no token (and no identity), rather than the first match's.
+fn unique_entry_on_port(servers: &[ServerInfo], port: u16) -> Option<&ServerInfo> {
     let mut matching = servers.iter().filter(|server| server.port == port);
     let server = matching.next()?;
     if matching.next().is_some() {
         return None;
     }
-    server.token.clone()
+    Some(server)
 }
 
 /// Shared, warm HTTP client for `/health` probes. Built ONCE (rebuilding per call incurred

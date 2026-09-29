@@ -499,14 +499,24 @@ impl VictauriClient {
 
     /// Read the host app's identifier from the server's `/info` endpoint.
     async fn fetch_app_identifier(&self) -> Option<String> {
+        self.fetch_app_identity().await?.0
+    }
+
+    /// The host app's `(app_identifier, app_product_name)` from the server's `/info`
+    /// endpoint; `None` when it does not answer one.
+    async fn fetch_app_identity(&self) -> Option<(Option<String>, Option<String>)> {
         let mut req = self.http.get(format!("{}/info", self.base_url));
         if let Some(ref t) = self.auth_token {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
         let info: Value = req.send().await.ok()?.json().await.ok()?;
-        info.get("app_identifier")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        let field = |k: &str| {
+            info.get(k)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Some((field("app_identifier"), field("app_product_name")))
     }
 
     /// After a rediscovery re-handshake, confirm the server is still the app this
@@ -579,10 +589,41 @@ impl VictauriClient {
                 // Pin the app identity so a later rediscovery can only re-attach to
                 // this same app. `/info` is authoritative (it is the server we just
                 // reached); discovery metadata is the fallback for older plugins.
-                client.app_identifier = match client.fetch_app_identifier().await {
-                    Some(id) => Some(id),
-                    None => crate::discovery::identifier_for_port(port),
-                };
+                let (identifier, product_name) =
+                    client.fetch_app_identity().await.unwrap_or_default();
+                client.app_identifier =
+                    identifier.or_else(|| crate::discovery::identifier_for_port(port));
+                // An app selector must match the app actually reached — essential when
+                // `VICTAURI_PORT` names the endpoint (R5B-PORTAPP1), and a cheap re-check
+                // otherwise. An app whose identity is unknown (a pre-0.7.4 plugin) passes.
+                let selector = app
+                    .map(str::to_string)
+                    .or_else(crate::discovery::configured_app);
+                if let Some(selector) = selector
+                    && (client.app_identifier.is_some() || product_name.is_some())
+                    && !crate::discovery::identity_matches(
+                        client.app_identifier.as_deref(),
+                        product_name.as_deref(),
+                        &selector,
+                    )
+                {
+                    let found = client
+                        .app_identifier
+                        .clone()
+                        .or(product_name)
+                        .unwrap_or_default();
+                    let message = if crate::discovery::configured_port().is_some() {
+                        crate::discovery::port_app_mismatch(port, &found, &selector)
+                    } else {
+                        format!(
+                            "the server on port {port} is app '{}', not the selected '{}' — \
+                             refusing to drive a different app",
+                            crate::terminal::single_line(&found),
+                            crate::terminal::single_line(&selector)
+                        )
+                    };
+                    return Err(TestError::Other(message));
+                }
                 Ok(client)
             }
             Err(TestError::Connection { host, port, reason }) => {

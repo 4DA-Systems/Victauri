@@ -540,3 +540,61 @@ async fn an_app_whose_info_reports_another_identity_is_never_driven() {
         "nothing may be sent to a server that is not the selected app"
     );
 }
+
+/// R5B-PORTAPP1: with `VICTAURI_PORT` set, `--app` / `VICTAURI_APP` was silently ignored — the
+/// bridge drove whatever app held that port. When both are set they must agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn victauri_port_and_a_different_app_selector_are_refused_clearly() {
+    for (env, args) in [
+        (
+            &[("VICTAURI_PORT", "{port}")][..],
+            &["--app", "com.other.app"][..],
+        ),
+        (
+            &[
+                ("VICTAURI_PORT", "{port}"),
+                ("VICTAURI_APP", "com.other.app"),
+            ][..],
+            &[][..],
+        ),
+    ] {
+        let backend = Backend::default();
+        let mut h = Harness::start_with(
+            backend_routes(&backend),
+            Opts {
+                env,
+                args,
+                ..Opts::default()
+            },
+        )
+        .await;
+        h.send(&json!({"jsonrpc":"2.0","id":50,"method":"tools/call",
+            "params":{"name":"get_plugin_info","arguments":{}}}));
+        let r = h.recv_reply();
+        let msg = r["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("must refuse, got: {r}"));
+        assert!(
+            msg.contains("VICTAURI_PORT") && msg.contains("com.other.app"),
+            "{msg}"
+        );
+        assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Agreeing selectors still work.
+    let backend = Backend::default();
+    let mut h = Harness::start_with(
+        backend_routes(&backend),
+        Opts {
+            app_arg: true,
+            env: &[("VICTAURI_PORT", "{port}")],
+            ..Opts::default()
+        },
+    )
+    .await;
+    h.send(&json!({"jsonrpc":"2.0","id":51,"method":"tools/call",
+        "params":{"name":"get_plugin_info","arguments":{}}}));
+    let r = h.recv_reply();
+    assert!(r.get("result").is_some(), "{r}");
+    assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 1);
+}
