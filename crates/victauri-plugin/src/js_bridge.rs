@@ -298,9 +298,11 @@ const INIT_SCRIPT_BODY: &str = r#"
     var routeMatchLog = [];
     var CAP_ROUTE_MATCHES = 200;
 
-    // Convert a glob ("*" wildcard) to a RegExp. Other chars are escaped.
+    // Convert a glob to a RegExp. `*` (any run of characters) is the only wildcard; every other
+    // character matches itself — including `?`, which used to slip through unescaped as a regex
+    // quantifier, so `*/api/search?q=*` matched nothing (R5-JS4).
     function globToRegExp(glob) {
-        var re = glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+        var re = glob.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
         return new RegExp('^' + re + '$');
     }
 

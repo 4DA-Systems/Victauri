@@ -424,3 +424,43 @@ fn r5_js3_slotted_content_does_not_cover_its_slot_host() {
         "{refused}"
     );
 }
+
+// ── R5-JS4: a route glob's `?` is a literal character ─────────────────────────
+
+/// Route globs have one wildcard, `*`; every other character matches itself. `?` was left
+/// unescaped, so it became a regex quantifier and `*/api/search?q=*` matched nothing.
+#[test]
+fn r5_js4_route_glob_matches_a_literal_question_mark() {
+    let def = def(
+        None,
+        vec![case(
+            "glob with ?",
+            r"
+            var V = window.__VICTAURI__;
+            V.addRoute({ pattern: '*/api/search?q=*', match_type: 'glob', action: 'block' });
+            async function blocked(u) {
+                try { await fetch(u); return false; } catch (e) { return String(e.message).indexOf('blocked by route') !== -1; }
+            }
+            return {
+                query: await blocked('http://localhost:1420/api/search?q=abc'),
+                no_query: await blocked('http://localhost:1420/api/searchXq=abc'),
+                other: await blocked('http://localhost:1420/api/items?page=2'),
+                matches: V.getRouteMatches().map(function(m) { return m.url; }),
+            };
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    assert_eq!(r["query"], true, "`?` must match a literal '?': {r}");
+    assert_eq!(r["no_query"], false, "`?` is not a wildcard: {r}");
+    assert_eq!(r["other"], false, "{r}");
+    assert_eq!(
+        r["matches"],
+        serde_json::json!(["http://localhost:1420/api/search?q=abc"]),
+        "{r}"
+    );
+}

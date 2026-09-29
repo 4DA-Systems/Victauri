@@ -598,7 +598,8 @@ impl fmt::Display for RouteAction {
 pub enum RouteMatchType {
     /// URL contains the pattern (default).
     Substring,
-    /// Glob with `*` wildcards.
+    /// Glob: `*` matches any run of characters; every other character (including `?`)
+    /// matches itself.
     Glob,
     /// JavaScript regular expression.
     Regex,
