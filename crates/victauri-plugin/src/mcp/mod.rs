@@ -281,6 +281,9 @@ pub(crate) const COMMAND_TIMINGS_CAP: usize = 1024;
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
 
+/// Pixels between (and around) the cells of an `animation scrub` filmstrip.
+const FILMSTRIP_GAP: u32 = 4;
+
 /// Total time `recording stop` spends on its final flush of every window.
 const FINAL_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 /// How often a slow eval re-checks that its target window still exists (first check after
@@ -3050,9 +3053,18 @@ impl VictauriMcpHandler {
 
         let points = params.points.unwrap_or(20).clamp(2, 120);
         let capture = params.capture.unwrap_or(false);
+        let cols_for = |n: usize| {
+            params
+                .cols
+                .unwrap_or_else(|| crate::filmstrip::default_cols(n))
+        };
+        let resume = params.restore.unwrap_or(true);
+        let restore_code = format!("return window.__VICTAURI__.scrubRestore({resume})");
         let mut curve: Vec<serde_json::Value> = Vec::with_capacity(points);
         let mut frames: Vec<crate::filmstrip::Frame> = Vec::new();
         let mut manifest: Vec<serde_json::Value> = Vec::new();
+        // The first reason a frame could not be captured (reported, never swallowed).
+        let mut capture_error: Option<String> = None;
 
         // 2. Seek to each evenly-spaced point; capture the frozen frame if asked.
         for i in 0..points {
@@ -3063,18 +3075,51 @@ impl VictauriMcpHandler {
                 Ok(s) => {
                     let v = serde_json::from_str::<serde_json::Value>(&s)
                         .unwrap_or(serde_json::Value::Null);
-                    if capture
-                        && let Ok(handle) = self.bridge.get_native_handle(label)
-                        && let Ok((rgba, w, h)) =
-                            crate::screenshot::capture_window_raw(handle).await
-                        && let Some(frame) = crate::filmstrip::Frame::new(rgba, w, h)
-                    {
-                        manifest.push(serde_json::json!({
-                            "cell": frames.len(),
-                            "progress": progress,
-                            "t": v.get("t").cloned().unwrap_or(serde_json::Value::Null),
-                        }));
-                        frames.push(frame);
+                    if capture {
+                        match self.capture_scrub_frame(label).await {
+                            Ok(frame) => {
+                                // Before holding more frames: would the finished sheet be
+                                // composable at all? (Raw RGBA frames accumulate until then.)
+                                if frames.is_empty()
+                                    && let Err(e) = crate::filmstrip::check_sheet(
+                                        frame.w,
+                                        frame.h,
+                                        points,
+                                        cols_for(points),
+                                        FILMSTRIP_GAP,
+                                    )
+                                {
+                                    let _ = self.eval_with_return(&restore_code, label).await;
+                                    let fitting = (2..points).rev().find(|&n| {
+                                        crate::filmstrip::check_sheet(
+                                            frame.w,
+                                            frame.h,
+                                            n,
+                                            cols_for(n),
+                                            FILMSTRIP_GAP,
+                                        )
+                                        .is_ok()
+                                    });
+                                    let advice = fitting.map_or_else(
+                                        || "call scrub without `capture` for the geometry curve                                             (or shrink the window)"
+                                            .to_string(),
+                                        |n| format!("use `points` <= {n} (or more `cols`)"),
+                                    );
+                                    return tool_error(format!(
+                                        "animation scrub capture refused before capturing: {e};                                          {advice}"
+                                    ));
+                                }
+                                manifest.push(serde_json::json!({
+                                    "cell": frames.len(),
+                                    "progress": progress,
+                                    "t": v.get("t").cloned().unwrap_or(serde_json::Value::Null),
+                                }));
+                                frames.push(frame);
+                            }
+                            Err(e) => {
+                                capture_error.get_or_insert(e);
+                            }
+                        }
                     }
                     curve.push(v);
                 }
@@ -3083,8 +3128,6 @@ impl VictauriMcpHandler {
         }
 
         // 3. Restore (resume) or leave paused.
-        let resume = params.restore.unwrap_or(true);
-        let restore_code = format!("return window.__VICTAURI__.scrubRestore({resume})");
         let _ = self.eval_with_return(&restore_code, label).await;
 
         let mut meta = serde_json::json!({
@@ -3093,40 +3136,61 @@ impl VictauriMcpHandler {
             "duration_ms": prep_v.get("duration").cloned().unwrap_or(serde_json::Value::Null),
             "anim_count": prep_v.get("anim_count").cloned().unwrap_or(serde_json::Value::Null),
             "target": prep_v.get("target").cloned().unwrap_or(serde_json::Value::Null),
-            "captured": capture,
+            // True only when a filmstrip is returned with this result.
+            "captured": false,
             "curve": curve,
         });
+        if let Some(e) = &capture_error {
+            meta["capture_error"] = serde_json::json!(e);
+        }
 
         // 4. Compose the filmstrip if we captured frames.
         if capture && !frames.is_empty() {
-            let cols = params
-                .cols
-                .unwrap_or_else(|| crate::filmstrip::default_cols(frames.len()));
-            if let Some((rgba, w, h)) =
-                crate::filmstrip::compose(&frames, cols, 4, [20, 20, 20, 255])
-            {
-                match crate::screenshot::encode_png(w, h, &rgba) {
-                    Ok(png) => {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-                        meta["filmstrip"] = serde_json::json!({
-                            "cols": cols,
-                            "frame_count": frames.len(),
-                            "width": w,
-                            "height": h,
-                            "manifest": manifest,
-                        });
-                        return CallToolResult::success(vec![
-                            ContentBlock::image(b64, "image/png"),
-                            ContentBlock::text(meta.to_string()),
-                        ]);
-                    }
-                    Err(e) => return tool_error(format!("filmstrip encode failed: {e}")),
+            let cols = cols_for(frames.len());
+            let (rgba, w, h) =
+                match crate::filmstrip::compose(&frames, cols, FILMSTRIP_GAP, [20, 20, 20, 255]) {
+                    Ok(sheet) => sheet,
+                    Err(e) => return tool_error(format!("filmstrip compose failed: {e}")),
+                };
+            drop(frames);
+            match crate::screenshot::encode_png(w, h, &rgba) {
+                Ok(png) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+                    meta["captured"] = serde_json::json!(true);
+                    meta["filmstrip"] = serde_json::json!({
+                        "cols": cols,
+                        "frame_count": manifest.len(),
+                        "width": w,
+                        "height": h,
+                        "manifest": manifest,
+                    });
+                    return CallToolResult::success(vec![
+                        ContentBlock::image(b64, "image/png"),
+                        ContentBlock::text(meta.to_string()),
+                    ]);
                 }
+                Err(e) => return tool_error(format!("filmstrip encode failed: {e}")),
             }
         }
 
         json_result(&meta)
+    }
+
+    /// One native capture of the (frozen) scrub target window, as a filmstrip frame.
+    async fn capture_scrub_frame(
+        &self,
+        label: Option<&str>,
+    ) -> Result<crate::filmstrip::Frame, String> {
+        let handle = self
+            .bridge
+            .get_native_handle(label)
+            .map_err(|e| format!("no native window handle: {e}"))?;
+        let (rgba, w, h) = crate::screenshot::capture_window_raw(handle)
+            .await
+            .map_err(|e| format!("window capture failed: {e}"))?;
+        crate::filmstrip::Frame::new(rgba, w, h)
+            .ok_or_else(|| format!("window capture returned a malformed {w}x{h} frame"))
     }
 
     #[tool(
@@ -8734,6 +8798,40 @@ mod command_policy_dispatch_tests {
         .await;
         assert_ne!(r.is_error, Some(true), "{}", result_text(&r));
         assert_eq!(added(&bridge), 1);
+    }
+
+    /// R5-ANIM1: `animation scrub capture=true` reported `"captured": true` with no filmstrip
+    /// when no frame could be captured (here: no native window handle), hiding the failure.
+    #[tokio::test]
+    async fn animation_scrub_never_claims_a_capture_it_did_not_make() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(&ok_envelope(
+            &json!({"prepared": true, "duration": 100, "anim_count": 1, "t": 0}),
+        ));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(
+            &h,
+            "animation",
+            json!({"action": "scrub", "selector": "#toast", "points": 2, "capture": true}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_ne!(
+            r.is_error,
+            Some(true),
+            "the geometry curve is still returned: {text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["captured"], false, "{v}");
+        assert!(v.get("filmstrip").is_none(), "{v}");
+        assert!(
+            v["capture_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("no handle")),
+            "the capture failure must be surfaced: {v}"
+        );
+        assert_eq!(v["curve"].as_array().map(Vec::len), Some(2), "{v}");
     }
 
     /// The eval envelope for a page result `value`.

@@ -54,7 +54,12 @@ that did not survive testing are listed under "Disproved" below. No Critical or 
 - **An unauthenticated `/health` flood made a healthy app look dead**: the bridge's liveness probe
   and the watchdog read the 429 as "down" (live: 88k × 429, every agent call "backend not
   reachable", watchdog recovery fired). A 429 from `/health` now means alive.
-- **`animation scrub capture=true` took screenshots with `screenshot` disabled.**
+- **`animation scrub capture=true` took screenshots with `screenshot` disabled.** It also reported
+  `"captured": true` with no filmstrip when every capture failed or the sheet was too large to
+  compose (round 5): `captured` is now true only alongside a filmstrip, a capture failure is
+  returned as `capture_error`, a compose failure is an error, and a sheet over the 512 MiB limit
+  is refused after the first frame (with the largest `points` that fits) instead of after
+  accumulating every raw frame.
 - **`introspect contract_record` panicked** on any non-ASCII response over 4 KiB.
 - **Trusted input** sent real keystrokes when focus had not landed on the element, and a trusted
   click used an unchecked page-controlled point (the title bar / close button was reachable). Both
