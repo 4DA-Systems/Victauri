@@ -156,6 +156,10 @@ struct Backend {
     tool_calls: Arc<AtomicU64>,
     /// JSON arrays (batches) that reached the backend.
     batches: Arc<AtomicU64>,
+    /// Client->server JSON-RPC responses (no `method`) that reached the backend.
+    responses: Arc<AtomicU64>,
+    /// Messages with neither a `method` nor a `result`/`error` that reached the backend.
+    malformed: Arc<AtomicU64>,
 }
 
 async fn stateless_mcp(
@@ -170,6 +174,14 @@ async fn stateless_mcp(
         return axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
     let id = v.get("id").cloned();
+    if v.get("method").is_none() {
+        if v.get("result").is_some() || v.get("error").is_some() {
+            // A response to a server-initiated request: accepted, no body (as rmcp does).
+            b.responses.fetch_add(1, Ordering::SeqCst);
+            return axum::http::StatusCode::ACCEPTED.into_response();
+        }
+        b.malformed.fetch_add(1, Ordering::SeqCst);
+    }
     match v.get("method").and_then(Value::as_str) {
         Some("tools/call") => {
             b.tool_calls.fetch_add(1, Ordering::SeqCst);
@@ -263,4 +275,37 @@ async fn a_batch_is_rejected_locally_with_one_error_per_request() {
         "batches are never forwarded"
     );
     assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 0);
+}
+
+/// R5-BR3: a message with an `id` but no `method` is a client->server RESPONSE (to a
+/// server-initiated request such as sampling/elicitation/roots, which a stateful backend can
+/// send inside an SSE stream the bridge relays). It is forwarded, but JSON-RPC never replies to
+/// a response — the bridge used to answer the client's own reply with an invented error. A
+/// message with neither a method nor a result/error is an Invalid Request, answered locally.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_response_is_forwarded_and_never_answered() {
+    let backend = Backend::default();
+    let mut h = Harness::start(backend_routes(&backend), true, &[]).await;
+
+    h.send(&json!({"jsonrpc":"2.0","id":"srv-1","result":{"roots":[]}}));
+    h.send(&json!({"jsonrpc":"2.0","id":"srv-2","error":{"code":-1,"message":"declined"}}));
+    // The loop handles stdin in order, so the ping's reply is the next one — unless the
+    // bridge answered either response.
+    h.send(&json!({"jsonrpc":"2.0","id":12,"method":"ping"}));
+    let next = h.recv_reply();
+    assert_eq!(
+        next["id"], 12,
+        "a client response must never be answered: {next}"
+    );
+    assert_eq!(
+        backend.responses.load(Ordering::SeqCst),
+        2,
+        "responses are still forwarded to the backend"
+    );
+
+    h.send(&json!({"jsonrpc":"2.0","id":13}));
+    let invalid = h.recv_reply();
+    assert_eq!(invalid["id"], 13, "{invalid}");
+    assert_eq!(invalid["error"]["code"], -32600, "{invalid}");
+    assert_eq!(backend.malformed.load(Ordering::SeqCst), 0, "not forwarded");
 }

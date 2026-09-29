@@ -202,9 +202,53 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
             continue;
         }
 
+        // No `method`: a client->server RESPONSE, or an Invalid Request (R5-BR3).
+        if msg.get("method").is_none() {
+            if is_client_response(&msg) {
+                // A reply to a server-initiated request (sampling/elicitation/roots), which a
+                // stateful backend may send inside an SSE stream this bridge relays verbatim — so
+                // it must reach the backend. But JSON-RPC never answers a response: whatever the
+                // backend says (202, or an error body) is logged, never written to the client.
+                let outcome = forward_with_retries(
+                    &http,
+                    &connection,
+                    &session_id,
+                    &stateless,
+                    &cached_init,
+                    app.as_deref(),
+                    &msg,
+                )
+                .await;
+                match outcome {
+                    ForwardResult::Accepted => {}
+                    ForwardResult::Payloads(p) if p.is_empty() => {}
+                    ForwardResult::Payloads(p) => eprintln!(
+                        "victauri-bridge: backend answered a client response (not relayed): {}",
+                        p.join(" ")
+                    ),
+                    ForwardResult::Unreachable(e) => {
+                        eprintln!("victauri-bridge: could not deliver a client response: {e}");
+                    }
+                }
+            } else {
+                write_value(
+                    &stdout,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": msg.get("id").cloned().unwrap_or(Value::Null),
+                        "error": {
+                            "code": INVALID_REQUEST,
+                            "message": "invalid request: a JSON-RPC request needs a `method`"
+                        }
+                    }),
+                );
+            }
+            continue;
+        }
+
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
-        let is_notification = msg.get("id").is_none();
+        let is_notification = !expects_reply(&msg);
 
         match method {
             // ── Answered locally — never block on a backend ──────────────────────
@@ -307,6 +351,17 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     Ok(())
 }
 
+/// Whether `msg` is a JSON-RPC request the client is waiting on a reply to: it has both a
+/// `method` and an `id`. Notifications (no `id`) and responses (no `method`) never get one.
+fn expects_reply(msg: &Value) -> bool {
+    msg.get("method").is_some() && msg.get("id").is_some()
+}
+
+/// A client->server JSON-RPC response: no `method`, and a `result` or an `error`.
+fn is_client_response(msg: &Value) -> bool {
+    msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some())
+}
+
 /// JSON-RPC "Invalid Request" — used for a batch, which MCP does not support.
 const INVALID_REQUEST: i64 = -32600;
 const BATCH_UNSUPPORTED: &str = "batch requests are not supported: MCP removed JSON-RPC \
@@ -342,9 +397,7 @@ fn batch_rejection(items: &[Value]) -> Option<Value> {
                 return Some(error(Value::Null));
             };
             let is_notification = obj.contains_key("method") && !obj.contains_key("id");
-            let is_response = !obj.contains_key("method")
-                && (obj.contains_key("result") || obj.contains_key("error"));
-            if is_notification || is_response {
+            if is_notification || is_client_response(item) {
                 None
             } else {
                 Some(error(obj.get("id").cloned().unwrap_or(Value::Null)))
@@ -648,7 +701,9 @@ async fn forward_with_retries(
     app: Option<&str>,
     msg: &Value,
 ) -> ForwardResult {
-    let is_notification = msg.get("id").is_none();
+    // Only a request (method + id) is owed a reply; never synthesize one for a notification or
+    // for a client response (R5-BR3).
+    let is_notification = !expects_reply(msg);
 
     // SECURITY (audit #1): re-resolve the trusted backend on EVERY forward — never reuse a cached
     // `(port, token)` without re-confirming, right now, that the port still belongs to a live,
@@ -1867,6 +1922,20 @@ mod tests {
         assert!(!dir_is_trusted(&link), "symlinked dir must be rejected");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R5-BR3: only a request (method + id) is owed a reply.
+    #[test]
+    fn only_requests_expect_a_reply() {
+        assert!(expects_reply(&json!({"id": 1, "method": "tools/call"})));
+        assert!(!expects_reply(&json!({"method": "notifications/x"})));
+        assert!(!expects_reply(&json!({"id": 1, "result": {}})));
+        assert!(is_client_response(&json!({"id": 1, "result": {}})));
+        assert!(is_client_response(&json!({"id": 1, "error": {"code": 1}})));
+        assert!(!is_client_response(&json!({"id": 1})));
+        assert!(!is_client_response(
+            &json!({"id": 1, "method": "m", "result": {}})
+        ));
     }
 
     /// R5-BR1: a batch is rejected locally, one error per request element, per JSON-RPC §6.
