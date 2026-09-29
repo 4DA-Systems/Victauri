@@ -361,6 +361,29 @@ enum TableKind {
 #[cfg(feature = "sqlite")]
 pub(crate) const DB_HEALTH_META_BUDGET: Duration = Duration::from_secs(3);
 
+/// A hook run on each connection Victauri opens (tests only).
+#[cfg(all(test, feature = "sqlite"))]
+type OpenHook = Box<dyn Fn(&rusqlite::Connection)>;
+
+#[cfg(all(test, feature = "sqlite"))]
+thread_local! {
+    /// Test-only stand-in for what a host process can do to every connection `SQLite` opens
+    /// (`sqlite3_auto_extension`): register functions or virtual-table modules on it. Run right
+    /// after each of Victauri's connections is opened.
+    static ON_OPEN: std::cell::RefCell<Option<OpenHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "sqlite")]
+fn run_open_hook(_conn: &rusqlite::Connection) {
+    #[cfg(test)]
+    ON_OPEN.with(|hook| {
+        if let Some(hook) = hook.borrow().as_ref() {
+            hook(_conn);
+        }
+    });
+}
+
 /// Open a database file Victauri did not create as read-only UNTRUSTED input: with
 /// `trusted_schema=OFF` (schema-embedded SQL functions / virtual tables cannot run with side
 /// effects) and `SQLite`'s defensive mode (no writes to shadow tables / schema corruption).
@@ -369,6 +392,7 @@ pub(crate) fn open_untrusted_read_only(path: &str) -> Result<rusqlite::Connectio
     let conn =
         rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|e| format!("cannot open database: {e}"))?;
+    run_open_hook(&conn);
     conn.pragma_update(None, "trusted_schema", false)
         .map_err(|e| format!("cannot harden database connection: {e}"))?;
     conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
@@ -630,29 +654,363 @@ static READ_PRAGMAS_WITH_ARG: &[&str] = &[
     "quick_check",
 ];
 
-/// `SQLite` authorizer for agent-supplied `query_db` SQL: default-deny. Reads, SQL functions,
-/// recursive CTEs, and allowlisted read-only PRAGMAs are permitted; everything else (writes,
-/// ATTACH, schema changes, transactions, setter PRAGMAs) is refused before it runs.
+/// `SQLITE_DETERMINISTIC`, as reported in `pragma_function_list.flags`.
 #[cfg(feature = "sqlite")]
-fn query_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
+const SQLITE_DETERMINISTIC_FLAG: i64 = 0x800;
+
+/// Functions `SQLite`'s own compiled-in extensions register as NON-built-in (FTS3/4 and FTS5
+/// register their auxiliary functions as overload placeholders, and `MATCH` on any table is
+/// authorized as the function `match`; R-Tree and Geopoly register helpers). They are part of
+/// `SQLite`, so `query_db` allows them. FTS3's `optimize` (it merges index segments — a write)
+/// is deliberately absent.
+#[cfg(feature = "sqlite")]
+static SQLITE_EXTENSION_FUNCTIONS: &[&str] = &[
+    "match",
+    "snippet",
+    "offsets",
+    "matchinfo",
+    "bm25",
+    "highlight",
+    "fts5",
+    "fts5_source_id",
+    "fts5_get_locale",
+    "fts5_locale",
+    "fts5_insttoken",
+    "rtreenode",
+    "rtreedepth",
+    "rtreecheck",
+    "geopoly_area",
+    "geopoly_bbox",
+    "geopoly_blob",
+    "geopoly_ccw",
+    "geopoly_contains_point",
+    "geopoly_group_bbox",
+    "geopoly_json",
+    "geopoly_overlap",
+    "geopoly_regular",
+    "geopoly_svg",
+    "geopoly_within",
+    "geopoly_xform",
+];
+
+/// `SQLite`'s built-in SQL functions (core scalar / aggregate / window, date and time, JSON,
+/// math, percentile), used only when the connection cannot report its functions
+/// (`pragma_function_list` unavailable, e.g. `SQLITE_OMIT_INTROSPECTION_PRAGMAS`): then
+/// `query_db` allows exactly these plus [`SQLITE_EXTENSION_FUNCTIONS`] and nothing an app
+/// registered — fail closed.
+#[cfg(feature = "sqlite")]
+static SQLITE_BUILTIN_FUNCTIONS: &[&str] = &[
+    "->",
+    "->>",
+    "abs",
+    "acos",
+    "acosh",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "avg",
+    "ceil",
+    "ceiling",
+    "changes",
+    "char",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "cos",
+    "cosh",
+    "count",
+    "cume_dist",
+    "current_date",
+    "current_time",
+    "current_timestamp",
+    "date",
+    "datetime",
+    "degrees",
+    "dense_rank",
+    "exp",
+    "first_value",
+    "floor",
+    "format",
+    "glob",
+    "group_concat",
+    "hex",
+    "if",
+    "ifnull",
+    "iif",
+    "instr",
+    "json",
+    "json_array",
+    "json_array_insert",
+    "json_array_length",
+    "json_error_position",
+    "json_extract",
+    "json_group_array",
+    "json_group_object",
+    "json_insert",
+    "json_object",
+    "json_patch",
+    "json_pretty",
+    "json_quote",
+    "json_remove",
+    "json_replace",
+    "json_set",
+    "json_type",
+    "json_valid",
+    "jsonb",
+    "jsonb_array",
+    "jsonb_array_insert",
+    "jsonb_extract",
+    "jsonb_group_array",
+    "jsonb_group_object",
+    "jsonb_insert",
+    "jsonb_object",
+    "jsonb_patch",
+    "jsonb_remove",
+    "jsonb_replace",
+    "jsonb_set",
+    "julianday",
+    "lag",
+    "last_insert_rowid",
+    "last_value",
+    "lead",
+    "length",
+    "like",
+    "likelihood",
+    "likely",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "lower",
+    "ltrim",
+    "max",
+    "median",
+    "min",
+    "mod",
+    "nth_value",
+    "ntile",
+    "nullif",
+    "octet_length",
+    "percent_rank",
+    "percentile",
+    "percentile_cont",
+    "percentile_disc",
+    "pi",
+    "pow",
+    "power",
+    "printf",
+    "quote",
+    "radians",
+    "random",
+    "randomblob",
+    "rank",
+    "replace",
+    "round",
+    "row_number",
+    "rtrim",
+    "sign",
+    "sin",
+    "sinh",
+    "soundex",
+    "sqlite_compileoption_get",
+    "sqlite_compileoption_used",
+    "sqlite_log",
+    "sqlite_offset",
+    "sqlite_source_id",
+    "sqlite_version",
+    "sqrt",
+    "strftime",
+    "string_agg",
+    "substr",
+    "substring",
+    "subtype",
+    "sum",
+    "tan",
+    "tanh",
+    "time",
+    "timediff",
+    "total",
+    "total_changes",
+    "trim",
+    "trunc",
+    "typeof",
+    "unhex",
+    "unicode",
+    "unistr",
+    "unistr_quote",
+    "unixepoch",
+    "unlikely",
+    "upper",
+    "zeroblob",
+];
+
+/// Never allowed, even though built in: `load_extension` (disabled by default, but it would
+/// load arbitrary code).
+#[cfg(feature = "sqlite")]
+static DENIED_FUNCTIONS: &[&str] = &["load_extension"];
+
+/// What agent-supplied `query_db` SQL may do on one connection, computed from that connection
+/// before its authorizer is installed.
+#[cfg(feature = "sqlite")]
+#[derive(Default)]
+struct QueryPolicy {
+    /// SQL functions that may run (lowercase names).
+    functions: std::collections::HashSet<String>,
+    /// Shadow tables of the database's R-Tree / Geopoly virtual tables (lowercase). The R-Tree
+    /// module prepares its INSERT/UPDATE/DELETE statements when it connects, so preparing a
+    /// write on them must be allowed for an R-Tree table to be readable at all; the `READ_ONLY`
+    /// open still stops any write from executing.
+    rtree_shadow_tables: std::collections::HashSet<String>,
+    /// The first function refused, for a clear error.
+    refused_function: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(feature = "sqlite")]
+impl QueryPolicy {
+    /// The policy for `conn`: `SQLite`'s built-in functions, its own extension functions, and
+    /// functions registered DETERMINISTIC may run; any other function (an app can register a
+    /// side-effecting one on every connection with `sqlite3_auto_extension`) is refused.
+    fn for_connection(conn: &rusqlite::Connection) -> Self {
+        let mut functions = Self::listed_functions(conn).unwrap_or_else(|e| {
+            tracing::debug!(
+                "query_db: pragma_function_list unavailable ({e}); allowing only SQLite's                  built-in functions"
+            );
+            SQLITE_BUILTIN_FUNCTIONS
+                .iter()
+                .chain(SQLITE_EXTENSION_FUNCTIONS)
+                .map(|f| (*f).to_string())
+                .collect()
+        });
+        for denied in DENIED_FUNCTIONS {
+            functions.remove(*denied);
+        }
+        Self {
+            functions,
+            rtree_shadow_tables: Self::rtree_shadow_tables(conn),
+            refused_function: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Functions allowed per the connection's own `pragma_function_list`. A name is allowed only
+    /// if EVERY registration under it is built in, deterministic, or one of `SQLite`'s own
+    /// extension functions — a non-deterministic app function that overrides a built-in name is
+    /// what would actually run, so it taints the name.
+    fn listed_functions(
+        conn: &rusqlite::Connection,
+    ) -> rusqlite::Result<std::collections::HashSet<String>> {
+        let mut verdicts: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
+        let mut stmt = conn.prepare("SELECT name, builtin, flags FROM pragma_function_list")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name = row.get::<_, String>(0)?.to_ascii_lowercase();
+            let builtin = row.get::<_, Option<i64>>(1)?.unwrap_or(0) == 1;
+            let flags = row.get::<_, Option<i64>>(2)?.unwrap_or(0);
+            let ok = builtin
+                || flags & SQLITE_DETERMINISTIC_FLAG != 0
+                || SQLITE_EXTENSION_FUNCTIONS.contains(&name.as_str());
+            let verdict = verdicts.entry(name).or_insert(true);
+            *verdict = *verdict && ok;
+        }
+        Ok(verdicts
+            .into_iter()
+            .filter_map(|(name, ok)| ok.then_some(name))
+            .collect())
+    }
+
+    /// Shadow tables of the R-Tree / Geopoly virtual tables in `main`. Best effort: on any
+    /// error none are allowed (an R-Tree table is then unreadable, never writable).
+    fn rtree_shadow_tables(conn: &rusqlite::Connection) -> std::collections::HashSet<String> {
+        let names = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' \
+                 AND (substr(sql, 1, 512) LIKE 'CREATE VIRTUAL TABLE % USING rtree%' \
+                   OR substr(sql, 1, 512) LIKE 'CREATE VIRTUAL TABLE % USING geopoly%') \
+                 LIMIT 1000",
+            )
+            .and_then(|mut stmt| {
+                stmt.query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .unwrap_or_default();
+        names
+            .iter()
+            .flat_map(|name| {
+                let name = name.to_ascii_lowercase();
+                ["_node", "_rowid", "_parent"].map(|suffix| format!("{name}{suffix}"))
+            })
+            .collect()
+    }
+
+    fn allows_function(&self, name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        if self.functions.contains(&lower) {
+            return true;
+        }
+        let mut refused = self
+            .refused_function
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if refused.is_none() {
+            *refused = Some(name.to_string());
+        }
+        false
+    }
+
+    fn is_rtree_shadow(&self, database: Option<&str>, table: &str) -> bool {
+        database.is_some_and(|db| db.eq_ignore_ascii_case("main"))
+            && self
+                .rtree_shadow_tables
+                .contains(&table.to_ascii_lowercase())
+    }
+
+    /// The function this policy refused, if any (for the error message).
+    fn refused_function(&self) -> Option<String> {
+        self.refused_function
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// `SQLite` authorizer for agent-supplied `query_db` SQL: default-deny. Reads, recursive CTEs,
+/// the functions `policy` allows, and allowlisted read-only PRAGMAs are permitted; everything
+/// else (writes, ATTACH, schema changes, transactions, setter PRAGMAs, app-registered
+/// non-deterministic functions) is refused before it runs.
+#[cfg(feature = "sqlite")]
+fn query_authorizer(
+    policy: &QueryPolicy,
+    ctx: rusqlite::hooks::AuthContext<'_>,
+) -> rusqlite::hooks::Authorization {
     use rusqlite::hooks::{AuthAction, Authorization};
+    let allow = |ok: bool| {
+        if ok {
+            Authorization::Allow
+        } else {
+            Authorization::Deny
+        }
+    };
     match ctx.action {
-        AuthAction::Select
-        | AuthAction::Read { .. }
-        | AuthAction::Function { .. }
-        | AuthAction::Recursive => Authorization::Allow,
+        AuthAction::Select | AuthAction::Read { .. } | AuthAction::Recursive => {
+            Authorization::Allow
+        }
+        AuthAction::Function { function_name } => allow(policy.allows_function(function_name)),
+        AuthAction::Insert { table_name }
+        | AuthAction::Update { table_name, .. }
+        | AuthAction::Delete { table_name } => {
+            allow(policy.is_rtree_shadow(ctx.database_name, table_name))
+        }
         AuthAction::Pragma {
             pragma_name,
             pragma_value,
         } => {
             let name = pragma_name.to_ascii_lowercase();
-            let allowed = SAFE_PRAGMAS.contains(&name.as_str())
-                && (pragma_value.is_none() || READ_PRAGMAS_WITH_ARG.contains(&name.as_str()));
-            if allowed {
-                Authorization::Allow
-            } else {
-                Authorization::Deny
-            }
+            allow(
+                SAFE_PRAGMAS.contains(&name.as_str())
+                    && (pragma_value.is_none() || READ_PRAGMAS_WITH_ARG.contains(&name.as_str())),
+            )
         }
         _ => Authorization::Deny,
     }
@@ -998,6 +1356,7 @@ fn query_with_limits(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| format!("failed to open database: {e}"))?;
+    run_open_hook(&conn);
     // The database is untrusted input (see `open_untrusted_read_only`), and the query is
     // agent-supplied: SQLite's own AUTHORIZER is the enforcement point, not string parsing.
     // It sees every PRAGMA SQLite is about to run — statement form, `PRAGMA name(arg)`, and
@@ -1006,10 +1365,6 @@ fn query_with_limits(
         .map_err(|e| format!("failed to harden database connection: {e}"))?;
     conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
         .map_err(|e| format!("failed to harden database connection: {e}"))?;
-    conn.authorizer(Some(query_authorizer))
-        .into_setup()
-        .map_err(|e| format!("failed to harden database connection: {e}"))?;
-
     // Limit lock waits separately from the CPU deadline enforced below.
     conn.busy_timeout(QUERY_BUSY_TIMEOUT)
         .map_err(|e| format!("failed to set timeout: {e}"))?;
@@ -1060,9 +1415,27 @@ fn query_with_limits(
     .into_setup()
     .map_err(|e| format!("failed to harden database connection: {e}"))?;
 
+    // The authorizer is installed only now: with the schema loaded (a locked database fails
+    // once, at the load above, not again in each policy read) and before the agent's SQL is
+    // prepared.
+    let policy = Arc::new(QueryPolicy::for_connection(&conn));
+    let authorizer_policy = Arc::clone(&policy);
+    conn.authorizer(Some(move |ctx: rusqlite::hooks::AuthContext<'_>| {
+        query_authorizer(&authorizer_policy, ctx)
+    }))
+    .into_setup()
+    .map_err(|e| format!("failed to harden database connection: {e}"))?;
+
     let mut stmt = conn
         .prepare(sql)
-        .map_err(|e| sqlite_query_error("failed to prepare query", e, query_timeout))?;
+        .map_err(|e| match policy.refused_function() {
+            Some(name) => format!(
+                "failed to prepare query: the SQL function `{name}` is not allowed — query_db runs \
+             only SQLite's built-in functions and functions registered as deterministic (an \
+             app-registered function could have side effects)"
+            ),
+            None => sqlite_query_error("failed to prepare query", e, query_timeout),
+        })?;
 
     let column_names = unique_column_keys(&stmt.column_names());
     // `"key":` per column, sized once.
@@ -1359,6 +1732,178 @@ mod tests {
         .unwrap();
         assert_eq!(r["row_count"], 3);
         assert!(query(&path, "SELECT count(*) FROM users", &[], None).is_ok());
+    }
+
+    /// Register a variadic SQL function answering 42 on `conn` (as an app's
+    /// `sqlite3_auto_extension` would on every connection), through the C API so the test needs
+    /// no rusqlite feature beyond the plugin's own.
+    #[allow(unsafe_code)]
+    fn register_function(conn: &rusqlite::Connection, name: &str, deterministic: bool) {
+        use rusqlite::ffi;
+        unsafe extern "C" fn answer(
+            ctx: *mut ffi::sqlite3_context,
+            _argc: std::os::raw::c_int,
+            _argv: *mut *mut ffi::sqlite3_value,
+        ) {
+            // SAFETY: `ctx` is the live context SQLite passes to a scalar function.
+            unsafe { ffi::sqlite3_result_int(ctx, 42) };
+        }
+        let flags = ffi::SQLITE_UTF8
+            | if deterministic {
+                ffi::SQLITE_DETERMINISTIC
+            } else {
+                0
+            };
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: a valid open connection handle, a NUL-terminated name, and a callback with
+        // the signature SQLite expects; no user data or destructor.
+        let rc = unsafe {
+            ffi::sqlite3_create_function_v2(
+                conn.handle(),
+                name.as_ptr(),
+                -1,
+                flags,
+                std::ptr::null_mut(),
+                Some(answer),
+                None,
+                None,
+                None,
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK);
+    }
+
+    /// Run `f` with `hook` applied to every connection this thread opens.
+    fn with_open_hook<T>(
+        hook: impl Fn(&rusqlite::Connection) + 'static,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                ON_OPEN.with(|h| *h.borrow_mut() = None);
+            }
+        }
+        ON_OPEN.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        let _reset = Reset;
+        f()
+    }
+
+    /// R5B-SQLFN1: `query_db` allowed every SQL function, so a side-effecting function the host
+    /// registered process-wide (`sqlite3_auto_extension`) ran despite the read-only open. Only
+    /// built-in functions and ones registered DETERMINISTIC may run.
+    #[test]
+    fn app_registered_non_deterministic_functions_are_refused() {
+        let (_f, path) = create_test_db();
+        with_open_hook(
+            |c| {
+                register_function(c, "app_side_effect", false);
+                register_function(c, "app_pure", true);
+                // Overriding a built-in with a non-deterministic function runs the override.
+                register_function(c, "lower", false);
+            },
+            || {
+                let err = query(&path, "SELECT app_side_effect()", &[], None).unwrap_err();
+                assert!(err.contains("app_side_effect"), "{err}");
+                let err = query(&path, "SELECT lower('A')", &[], None).unwrap_err();
+                assert!(err.contains("lower"), "{err}");
+                // Hidden in a CTE it is still refused.
+                let err = query(
+                    &path,
+                    "WITH x AS (SELECT app_side_effect() AS v) SELECT v FROM x",
+                    &[],
+                    None,
+                )
+                .unwrap_err();
+                assert!(err.contains("app_side_effect"), "{err}");
+                let r = query(&path, "SELECT app_pure() AS v", &[], None).unwrap();
+                assert_eq!(r["rows"][0]["v"], 42);
+                assert!(query(&path, "SELECT upper('a'), abs(-1)", &[], None).is_ok());
+            },
+        );
+    }
+
+    /// The function policy must not break `SQLite`'s own functions: core scalar / aggregate /
+    /// window, date/time, JSON, and the FTS3/4, FTS5 and R-Tree extension functions (which
+    /// `SQLite` registers as non-built-in overloads).
+    #[test]
+    fn builtin_and_extension_functions_still_work() {
+        let (_f, path) = create_test_db();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let fts = conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE f5 USING fts5(body); INSERT INTO f5 VALUES ('hello world');
+                 CREATE VIRTUAL TABLE f4 USING fts4(body); INSERT INTO f4 VALUES ('hello there');",
+            )
+            .is_ok();
+        let rtree = conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE r USING rtree(id, x0, x1); INSERT INTO r VALUES (1, 0, 5);",
+            )
+            .is_ok();
+        drop(conn);
+        let mut sqls = vec![
+            "SELECT abs(-1), lower('A'), upper('a'), length('x'), substr('abc', 2), \
+             coalesce(NULL, 1), printf('%d', 5), hex('a'), typeof(1), round(1.5), \
+             replace('a', 'a', 'b'), instr('ab', 'b'), trim(' a '), random() IS NOT NULL",
+            "SELECT count(*), sum(score), avg(score), max(score), min(score), \
+             group_concat(name) FROM users",
+            "SELECT name, row_number() OVER (ORDER BY score), rank() OVER (ORDER BY score), \
+             lag(name) OVER (ORDER BY id) FROM users",
+            "SELECT date('now'), datetime('now'), julianday('now'), strftime('%Y', 'now'), \
+             unixepoch('now')",
+            "SELECT json_extract('{\"a\":1}', '$.a'), json_object('a', 1), json_array(1, 2), \
+             '{\"a\":1}' -> '$.a', '{\"a\":1}' ->> '$.a'",
+            "SELECT * FROM json_each('[1,2]')",
+        ];
+        if fts {
+            sqls.push(
+                "SELECT bm25(f5), highlight(f5, 0, '[', ']'), snippet(f5, 0, '[', ']', '..', 5) \
+                 FROM f5 WHERE f5 MATCH 'hello'",
+            );
+            sqls.push(
+                "SELECT snippet(f4), offsets(f4), matchinfo(f4) FROM f4 WHERE f4 MATCH 'hello'",
+            );
+        }
+        if rtree {
+            sqls.push("SELECT id FROM r WHERE x0 >= 0 AND x1 <= 10");
+        }
+        for sql in sqls {
+            let r = query(&path, sql, &[], None);
+            assert!(r.is_ok(), "{sql}: {r:?}");
+        }
+        // Still refused: loading an extension.
+        assert!(query(&path, "SELECT load_extension('x')", &[], None).is_err());
+    }
+
+    /// The fail-closed fallback list (used when a connection cannot report its functions) must
+    /// cover every function this `SQLite` reports as built in, and every non-built-in function
+    /// `SQLite`'s own extensions register must be known — so a newer `SQLite` that adds one fails
+    /// this test instead of silently refusing it in `query_db`.
+    #[test]
+    fn fallback_function_lists_cover_this_sqlite() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT name, builtin FROM pragma_function_list")
+            .unwrap();
+        let rows: Vec<(String, i64)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert!(rows.len() > 50, "{rows:?}");
+        let known_non_builtin = ["fts3_tokenizer", "optimize"];
+        for (name, builtin) in rows {
+            let known = if DENIED_FUNCTIONS.contains(&name.as_str()) {
+                true
+            } else if builtin == 1 {
+                SQLITE_BUILTIN_FUNCTIONS.contains(&name.as_str())
+            } else {
+                SQLITE_EXTENSION_FUNCTIONS.contains(&name.as_str())
+                    || known_non_builtin.contains(&name.as_str())
+            };
+            assert!(known, "function `{name}` (builtin={builtin}) is not listed");
+        }
     }
 
     #[test]
