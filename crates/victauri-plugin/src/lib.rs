@@ -871,11 +871,24 @@ impl VictauriBuilder {
 
             Ok(Builder::new("victauri")
                 .setup(move |app, _api| {
-                    // Tauri runs plugin setup on the main (UI) thread — record it so the bridge
-                    // can run main-thread callers inline instead of deadlocking on its lock, and
-                    // give the bridge a handle owned by that thread (see `bridge::on_main`).
-                    bridge::record_main_thread();
-                    bridge::install_main_app(app);
+                    // Record the main (UI) thread so the bridge can run main-thread callers
+                    // inline instead of deadlocking on its lock, and give the bridge a handle
+                    // owned by that thread (see `bridge::on_main`). Tauri runs setup there —
+                    // unless the app registered this plugin at runtime from a background thread
+                    // (`AppHandle::plugin`); then the adoption is posted to the main thread.
+                    match bridge::adopt_main_thread(app) {
+                        Ok(bridge::MainThreadAdoption::Inline) => {}
+                        Ok(bridge::MainThreadAdoption::Posted) => tracing::warn!(
+                            "Victauri: plugin setup ran off the main thread (registered at \
+                             runtime from a background thread?); the main-thread state is being \
+                             installed on the main thread — webview/window tools called before \
+                             it is will fail with \"not installed\""
+                        ),
+                        Err(e) => tracing::error!(
+                            "Victauri: could not reach the main thread to install its state \
+                             ({e}); webview and window tools will fail with \"not installed\""
+                        ),
+                    }
                     let startup_timeline = introspection::StartupTimeline::new();
                     let event_log = EventLog::new(event_capacity);
                     startup_timeline.mark("event_log_created");
