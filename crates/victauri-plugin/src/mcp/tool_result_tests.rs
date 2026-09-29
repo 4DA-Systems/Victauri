@@ -440,3 +440,31 @@ async fn logs_slow_ipc_honours_webview_label() {
         "slow_ipc read the wrong window"
     );
 }
+
+// ── R5B-EXPLAIN1: `explain diff` counts calls and lists each command once ──────────────────
+
+#[tokio::test]
+async fn explain_diff_counts_calls_and_lists_unique_commands() {
+    use victauri_core::{AppEvent, IpcCall, IpcResult};
+    let state = state();
+    state.recorder.start("s-1".to_string()).unwrap();
+    for (i, cmd) in ["zeta", "zeta", "alpha", "zeta", "mid", "alpha", "zeta"]
+        .iter()
+        .enumerate()
+    {
+        state.event_log.push(AppEvent::Ipc(IpcCall::new(
+            format!("c-{i}"),
+            (*cmd).to_string(),
+            chrono::Utc::now(),
+            IpcResult::Ok(json!(true)),
+            Some(1),
+            0,
+            "main".to_string(),
+        )));
+    }
+    let bridge = ScriptBridge::answering(&state, "null");
+    let h = handler(&state, &bridge);
+    let r = ok_json(&call(&h, "explain", json!({"action": "diff", "seconds": 60})).await);
+    assert_eq!(r["ipc_calls_made"], 7, "{r}");
+    assert_eq!(r["unique_commands"], json!(["zeta", "alpha", "mid"]), "{r}");
+}

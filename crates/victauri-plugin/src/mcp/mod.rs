@@ -4269,13 +4269,18 @@ impl VictauriMcpHandler {
                     }
                 }
 
-                ipc_commands.dedup();
+                // Every call counts; each command is listed once, in first-call order (a
+                // consecutive-only `dedup` used to undercount the calls and still list a
+                // command once per non-adjacent run).
+                let ipc_calls_made = ipc_commands.len();
+                let mut seen = HashSet::new();
+                ipc_commands.retain(|c| seen.insert(c.clone()));
 
                 let result = serde_json::json!({
                     "since": since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     "time_window_secs": secs,
                     "total_events": events.len(),
-                    "ipc_calls_made": ipc_commands.len(),
+                    "ipc_calls_made": ipc_calls_made,
                     "unique_commands": ipc_commands,
                     "dom_elements_changed": dom_changes,
                     "interactions": interaction_count,
