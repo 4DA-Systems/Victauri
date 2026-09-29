@@ -371,6 +371,11 @@ pub async fn start_server_reporting_port<R: Runtime>(
     bound: Option<tokio::sync::oneshot::Sender<Result<u16, String>>>,
 ) -> anyhow::Result<()> {
     let bridge: Arc<dyn WebviewBridge> = Arc::new(app_handle);
+    // The bridge IS a Tauri `AppHandle`, and the server's tasks end on tokio workers; dropping
+    // the last reference there would drop a Tauri handle off the main thread — the Linux `Rc`
+    // race documented on `bridge::on_main`. It lives for the process anyway, so keep one
+    // reference forever instead of letting shutdown free it on the wrong thread.
+    std::mem::forget(Arc::clone(&bridge));
     // Normalize once so the discovery-file token and the request gate agree (B2):
     // an empty token must not be written to the discovery file as if auth were on.
     let auth_token = normalize_auth_token(auth_token);
