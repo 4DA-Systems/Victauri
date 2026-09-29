@@ -3316,7 +3316,8 @@ impl VictauriMcpHandler {
                 };
                 let limit = params.limit.unwrap_or(20);
                 let code = slow_ipc_js(threshold, limit);
-                self.eval_bridge(&code, None).await
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
             }
             LogsAction::Clear => {
                 // Clearing the IPC/network logs erases captured evidence — a

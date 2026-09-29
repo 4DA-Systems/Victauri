@@ -412,3 +412,31 @@ async fn wait_for_with_a_zero_timeout_checks_once() {
         started.elapsed()
     );
 }
+
+// ── R5B-SLOWIPC1: `logs slow_ipc` reads the window it is asked about ───────────────────────
+
+#[tokio::test]
+async fn logs_slow_ipc_honours_webview_label() {
+    let state = state();
+    let bridge = ScriptBridge::answering(
+        &state,
+        &json!({"__victauri_ok": {"threshold_ms": 10, "count": 0, "calls": []},
+                "__victauri_type": "value"})
+        .to_string(),
+    );
+    let h = handler(&state, &bridge);
+    let r = ok_json(
+        &call(
+            &h,
+            "logs",
+            json!({"action": "slow_ipc", "threshold_ms": 10, "webview_label": "popup"}),
+        )
+        .await,
+    );
+    assert_eq!(r["count"], 0, "{r}");
+    assert_eq!(
+        bridge.labels_of("duration_ms || 0) > 10"),
+        vec![Some("popup".to_string())],
+        "slow_ipc read the wrong window"
+    );
+}
