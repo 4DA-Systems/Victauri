@@ -1346,17 +1346,25 @@ fn alive_pids() -> Option<HashSet<u32>> {
     None
 }
 
-/// Resolve a core utility to an absolute path (defeats `PATH`-hijack of the poller's repeated
-/// `ps`/`kill` spawns), falling back to the bare name only if neither canonical location exists.
-#[cfg(not(windows))]
-fn abs_bin(name: &str) -> String {
-    for base in ["/bin", "/usr/bin"] {
-        let p = format!("{base}/{name}");
-        if std::path::Path::new(&p).exists() {
-            return p;
-        }
-    }
-    name.to_string()
+/// Where core utilities live: the FHS locations, then the NixOS and Guix system profiles
+/// (which have no `/bin/ps`). Never `PATH`: a hijacked `PATH` would decide which PIDs look
+/// alive — and so where the Bearer token is sent (R5B-BR7).
+#[cfg(unix)]
+const BIN_DIRS: &[&str] = &[
+    "/bin",
+    "/usr/bin",
+    "/run/current-system/sw/bin",
+    "/run/current-system/profile/bin",
+];
+
+/// Resolve a core utility to an absolute path in [`BIN_DIRS`]; `None` when it is not
+/// installed there (the caller then uses the hardened per-PID check, never a bare name).
+#[cfg(unix)]
+fn abs_bin(name: &str) -> Option<String> {
+    BIN_DIRS
+        .iter()
+        .map(|dir| format!("{dir}/{name}"))
+        .find(|p| std::path::Path::new(p).is_file())
 }
 
 /// Windows: no batched enumeration — each discovered PID is checked in-process by
@@ -1377,7 +1385,7 @@ fn alive_pids() -> Option<HashSet<u32>> {
 #[cfg(unix)]
 fn alive_pids() -> Option<HashSet<u32>> {
     let uid = current_euid()?.to_string();
-    let out = std::process::Command::new(abs_bin("ps"))
+    let out = std::process::Command::new(abs_bin("ps")?)
         .args(["-U", uid.as_str(), "-o", "pid="])
         .output()
         .ok()?;
@@ -1392,25 +1400,13 @@ fn alive_pids() -> Option<HashSet<u32>> {
     (!set.is_empty()).then_some(set)
 }
 
-/// A live process owned by the current user — exact PID, own-user only (the cross-user PID
-/// reuse fix `ps -U` gave Unix, audit R2-7).
-#[cfg(windows)]
+/// A live process owned by the current user — exact PID, own-user only (audit R2-7) — via
+/// victauri-test's hardened check, the same one its discovery and (by copy) the watchdog use.
+/// On Unix that is `kill -0` from a fixed set of locations incl. NixOS/Guix, then a shell's
+/// builtin `kill`, then `/proc` — never a `PATH` lookup. The bridge's own old copy fell back to
+/// a bare `kill` on `PATH`, and found no app at all where no `kill` binary exists (R5B-BR7).
 fn is_process_alive(pid: u32) -> bool {
     victauri_test::process::is_own_live_process(pid)
-}
-
-#[cfg(not(windows))]
-fn is_process_alive(pid: u32) -> bool {
-    // Portable POSIX liveness check. `/proc` is Linux-only — on macOS it does not exist,
-    // so the old `/proc/{pid}` test always returned false and the bridge filtered out every
-    // discovery entry (it could find NO server on macOS). `kill -0` sends no signal but
-    // succeeds iff the process exists and is signalable by us — and discovery entries are
-    // our own user's processes. Works identically on macOS and Linux.
-    std::process::Command::new(abs_bin("kill"))
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 /// Trust a discovery directory only if it is a real directory (not a symlink), owned by the
@@ -1694,6 +1690,18 @@ mod tests {
                 set.contains(&std::process::id()),
                 "the live-pid snapshot must include our own running process"
             );
+        }
+    }
+
+    /// R5B-BR7: a utility missing from the canonical locations (NixOS/Guix/minimal images)
+    /// must never be resolved through `PATH` — a bare name lets a hijacked `PATH` decide which
+    /// PIDs look alive, i.e. where the Bearer token goes.
+    #[cfg(unix)]
+    #[test]
+    fn helper_binaries_are_never_resolved_through_path() {
+        assert_eq!(abs_bin("victauri-no-such-helper"), None);
+        if let Some(sh) = abs_bin("sh") {
+            assert!(std::path::Path::new(&sh).is_absolute(), "{sh}");
         }
     }
 
