@@ -33,6 +33,15 @@ fn discovery_roots() -> Vec<PathBuf> {
     ]
 }
 
+/// Where a running app's auth token lives, for error messages — the same roots
+/// [`discovery_roots`] scans, in the same order.
+#[cfg(unix)]
+pub const TOKEN_LOCATIONS: &str = "$XDG_RUNTIME_DIR/victauri/<pid>/token (when that \
+     directory is private to you), else <temp>/victauri-<uid>/<pid>/token";
+/// Where a running app's auth token lives, for error messages.
+#[cfg(not(unix))]
+pub const TOKEN_LOCATIONS: &str = r"%TEMP%\victauri\<pid>\token";
+
 #[cfg_attr(all(test, not(unix)), allow(dead_code))]
 fn real_discovery_roots() -> Vec<PathBuf> {
     let legacy = std::env::temp_dir().join("victauri");

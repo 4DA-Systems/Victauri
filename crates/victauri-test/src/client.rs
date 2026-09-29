@@ -860,10 +860,13 @@ impl VictauriClient {
                 return Ok(parsed);
             }
             let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
-                " — auth token missing or wrong (auth is on by default; the token is in \
-                 <temp>/victauri/<pid>/token, or set VICTAURI_AUTH_TOKEN)"
+                format!(
+                    " — auth token missing or wrong (auth is on by default; the app writes it to \
+                     {}; or set VICTAURI_AUTH_TOKEN)",
+                    crate::discovery::TOKEN_LOCATIONS
+                )
             } else {
-                ""
+                String::new()
             };
             return Err(TestError::Connection {
                 host: host.to_string(),
@@ -2550,6 +2553,36 @@ pub fn assert_state_matches(verification: &Value) {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    /// R5B-HINT1: the 401 hint named `<temp>/victauri/<pid>/token`, which 0.9 no longer writes
+    /// on Unix (per-user roots) — pointing a user at an empty directory.
+    #[tokio::test]
+    async fn unauthorized_hint_names_the_real_discovery_locations() {
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(401)
+                .body("unauthorized")
+                .unwrap(),
+        );
+        let Err(TestError::Connection { reason, .. }) =
+            VictauriClient::parse_response(resp, "127.0.0.1", 7373, 1).await
+        else {
+            panic!("a 401 must be a connection error");
+        };
+        assert!(
+            !reason.contains("<temp>/victauri/<pid>/token"),
+            "stale location: {reason}"
+        );
+        #[cfg(unix)]
+        assert!(
+            reason.contains("$XDG_RUNTIME_DIR/victauri/<pid>/token")
+                && reason.contains("victauri-<uid>/<pid>/token"),
+            "{reason}"
+        );
+        #[cfg(windows)]
+        assert!(reason.contains(r"%TEMP%\victauri\<pid>\token"), "{reason}");
+        assert!(reason.contains("VICTAURI_AUTH_TOKEN"), "{reason}");
+    }
 
     #[test]
     fn truncate_chars_never_splits_a_code_point() {
