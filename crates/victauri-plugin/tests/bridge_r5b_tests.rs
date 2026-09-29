@@ -484,3 +484,59 @@ fn r5b_fetch0_fetch_without_arguments_rejects_natively() {
     );
     assert_eq!(r["urls"], serde_json::json!(["/r5b/one"]), "{r}");
 }
+
+// ── R5B-DATAURL1: logged URLs are bounded ────────────────────────────────────
+
+/// The network log kept every request URL verbatim, so an app loading large `data:` URLs
+/// through fetch/XHR pinned up to 1000 × the URL size (1000 × 1 MB = 1 GB) in the log. Logged
+/// URLs are now capped with a length marker; route matching still sees the full URL.
+#[test]
+fn r5b_dataurl1_logged_urls_are_capped() {
+    let def = def(
+        None,
+        vec![case(
+            "1000 fetches of a 1 MB data: URL + an XHR; a route still matches the tail",
+            r"
+            var V = window.__VICTAURI__;
+            var big = 'data:text/plain,' + 'A'.repeat(1024 * 1024) + 'TAIL';
+            V.addRoute({ pattern: 'TAIL', action: 'block' });
+            var blocked = 0;
+            var ps = [];
+            for (var i = 0; i < 1000; i++) {
+                ps.push(fetch(big).then(function() {}, function(e) {
+                    if (/blocked by route/.test(e.message)) blocked++;
+                }));
+            }
+            await Promise.all(ps);
+            V._agent; // (no-op: keep the log)
+            var x = new XMLHttpRequest();
+            x.open('GET', 'data:text/plain,' + 'B'.repeat(200000));
+            await new Promise(function(r) { x.addEventListener('loadend', r); x.send(); });
+            var log = V.getNetworkLog(null, 2000);
+            var lens = log.map(function(e) { return e.url.length; });
+            var total = lens.reduce(function(a, b) { return a + b; }, 0);
+            return {
+                count: log.length, max_len: Math.max.apply(null, lens), total: total,
+                sample: log[0].url.slice(-40), xhr_tail: log[log.length - 1].url.slice(-40),
+                blocked: blocked,
+                matches_url_len: V.getRouteMatches(1)[0].url.length,
+            };
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    assert_eq!(r["count"], 1000, "{r}");
+    assert!(r["max_len"].as_u64().unwrap() <= 2200, "{r}");
+    assert!(r["total"].as_u64().unwrap() <= 1000 * 2200, "{r}");
+    assert!(
+        r["sample"].as_str().unwrap().contains("chars]"),
+        "the cut is marked: {r}"
+    );
+    assert!(r["xhr_tail"].as_str().unwrap().contains("chars]"), "{r}");
+    assert_eq!(r["blocked"], 1000, "matching still sees the full URL: {r}");
+    assert!(r["matches_url_len"].as_u64().unwrap() <= 2200, "{r}");
+}

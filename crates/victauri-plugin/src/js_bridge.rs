@@ -289,6 +289,16 @@ const INIT_SCRIPT_BODY: &str = r#"
         return null;
     }
     function isIpcUrl(url) { return ipcCommandPath(url) !== null; }
+    // The URL as stored in the network / route-match logs (R5B-DATAURL1). A log holds up to
+    // CAP_NETWORK entries, so keeping every URL verbatim let an app that fetches large `data:` /
+    // `blob:`-sized URLs pin CAP_NETWORK × their size (1000 × 1 MB = 1 GB). A longer URL is cut
+    // with a length marker; matching and IPC parsing always see the full URL.
+    var MAX_LOGGED_URL = 2048;
+    function loggedUrl(url) {
+        if (typeof url !== 'string' || url.length <= MAX_LOGGED_URL || isIpcUrl(url)) return url;
+        var head = truncText(url, MAX_LOGGED_URL);
+        return head + '…[+' + (url.length - head.length) + ' chars]';
+    }
     // Victauri's own IPC (plugin:victauri|*). Decided from the parsed IPC command path — NOT a
     // substring anywhere in the URL, which let any page request containing
     // "plugin%3Avictauri%7C" in a query string escape route rules and network logging.
@@ -359,9 +369,14 @@ const INIT_SCRIPT_BODY: &str = r#"
     // other. A rule is tested against: the absolute URL (resolved against the document base URL,
     // as fetch/XHR resolve it), the path + query + fragment when same-origin, and the string as
     // the app passed it. The URL built-ins are the ones captured at init.
+    // Resolution is skipped for schemes that have no relative or same-origin spelling (a large
+    // data: URL is common, and parsing it for nothing is pure cost) and for very long URLs.
+    var ROUTE_RESOLVE_MAX = 8192;
+    var OPAQUE_URL_RE = /^\s*(data|blob|javascript|about):/i;
     function routeUrlForms(url) {
         var forms = [url];
         if (!URL_CTOR || !URL_HREF_GET) return forms;
+        if (url.length > ROUTE_RESOLVE_MAX || OPAQUE_URL_RE.test(url)) return forms;
         try {
             var base = BASE_URI_GET ? REFLECT_APPLY(BASE_URI_GET, document, []) : window.location.href;
             var u = new URL_CTOR(url, base);
@@ -407,7 +422,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     function recordRouteMatch(rule, url, method) {
         rule.triggered = (rule.triggered || 0) + 1;
         routeMatchLog.push({
-            rule_id: rule.id, action: rule.action, url: url,
+            rule_id: rule.id, action: rule.action, url: loggedUrl(url),
             method: (method || 'GET').toUpperCase(), timestamp: Date.now(),
             trigger_count: rule.triggered,
         });
@@ -2876,7 +2891,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var id = ++networkCounter;
                 var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isVictauriInternalUrl(url);
-                var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
+                var entry = { id: id, method: method.toUpperCase(), url: loggedUrl(url), timestamp: Date.now(), status: 'pending', duration_ms: null };
 
                 if (isIpc && !isVictauriInternal) {
                     var reqBody = init ? init.body : null;
@@ -3121,7 +3136,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             var entry = {
                 id: ++networkCounter,
                 method: net.method.toUpperCase(),
-                url: net.url,
+                url: loggedUrl(net.url),
                 timestamp: Date.now(),
                 status: 'pending',
                 duration_ms: null,
