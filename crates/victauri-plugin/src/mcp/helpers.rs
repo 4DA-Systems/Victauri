@@ -64,7 +64,7 @@ pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog() || []){filter}\
+        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter}\
          .map(function(c){{ return (c && c.command) || null; }})\
          .filter(function(x){{ return x; }})"
     )
@@ -89,7 +89,7 @@ pub fn ghost_ipc_outcomes_js(since_ms: Option<i64>) -> String {
     };
     format!(
         "return (function() {{\
-         \n  var log = (window.__VICTAURI__?.getIpcLog() || []){filter};\
+         \n  var log = (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter};\
          \n  var byCmd = {{}};\
          \n  for (var i = 0; i < log.length; i++) {{\
          \n    var c = log[i]; if (!c || !c.command) continue;\
@@ -264,7 +264,7 @@ pub fn ipc_timing_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog() || []){filter}\
+        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter}\
          .map(function(c){{ return (c && c.command) ? {{ command: c.command, \
          duration_ms: (typeof c.duration_ms === 'number' ? c.duration_ms : null) }} : null; }})\
          .filter(function(x){{ return x; }})"
@@ -370,22 +370,34 @@ pub fn ipc_catalog_projection_js() -> String {
             }\
             return typeof v;\
         }\
-        var log = window.__VICTAURI__ && window.__VICTAURI__.getIpcLog ? (window.__VICTAURI__.getIpcLog() || []) : [];\
-        var cat = Object.create(null);\
+        var V = window.__VICTAURI__;\
+        var log = V && V.getIpcLog ? (V.getIpcLog(0, { bodies: false }) || []) : [];\
+        var cat = Object.create(null), meta = Object.create(null);\
         for (var i = 0; i < log.length; i++){\
             var e = log[i]; if (!e || !e.command) continue;\
-            var c = cat[e.command] || (cat[e.command] = { command: e.command, call_count: 0, error_count: 0, arg_shape: null, result_shape: null, last_status: null });\
+            var c = cat[e.command];\
+            if (!c){\
+                c = cat[e.command] = { command: e.command, call_count: 0, error_count: 0, arg_shape: null, result_shape: null, last_status: null };\
+                meta[e.command] = { first: e.id, ok: null };\
+            }\
             c.call_count++;\
             var isErr = (e.status && e.status !== 'ok') || (e.error != null);\
             if (isErr) c.error_count++;\
             c.last_status = e.status || (isErr ? 'error' : 'ok');\
-            if (c.arg_shape === null && e.args !== undefined) c.arg_shape = shape(e.args, 0);\
-            if (c.result_shape === null && !isErr && e.result !== undefined) c.result_shape = shape(e.result, 0);\
+            if (!isErr && meta[e.command].ok === null) meta[e.command].ok = e.id;\
         }\
-        for (var j = 0; j < log.length; j++){\
-            var e2 = log[j]; if (!e2 || !e2.command) continue;\
-            var c2 = cat[e2.command];\
-            if (c2 && c2.result_shape === null && e2.result !== undefined) c2.result_shape = shape(e2.result, 0);\
+        /* Bodies only for the <= 2 calls per command whose shapes are reported: the first \
+           call (args) and the first successful one (result; else the first call). */\
+        var ids = [];\
+        for (var m in meta){ ids.push(meta[m].first); if (meta[m].ok !== null) ids.push(meta[m].ok); }\
+        var full = ids.length ? (V.getIpcLog(0, { ids: ids }) || []) : [];\
+        var byId = Object.create(null);\
+        for (var j = 0; j < full.length; j++){ if (full[j]) byId[full[j].id] = full[j]; }\
+        for (var cmd in cat){\
+            var first = byId[meta[cmd].first], ok = meta[cmd].ok !== null ? byId[meta[cmd].ok] : null;\
+            if (first && first.args !== undefined) cat[cmd].arg_shape = shape(first.args, 0);\
+            var res = ok || first;\
+            if (res && res.result !== undefined) cat[cmd].result_shape = shape(res.result, 0);\
         }\
         return Object.keys(cat).map(function(k){ return cat[k]; });\
     })()"
@@ -872,7 +884,10 @@ mod ghost_projection_tests {
     #[test]
     fn projects_whole_log_when_since_absent() {
         let js = ghost_ipc_projection_js(None);
-        assert!(js.contains("getIpcLog()"));
+        assert!(
+            js.contains("getIpcLog(0, { bodies: false })"),
+            "body-free view: {js}"
+        );
         assert!(js.contains(".map("));
         // No time window applied.
         assert!(!js.contains("Date.now()"));

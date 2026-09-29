@@ -813,36 +813,7 @@ impl VictauriMcpHandler {
         Parameters(params): Parameters<IpcIntegrityParams>,
     ) -> CallToolResult {
         let threshold = params.stale_threshold_ms.unwrap_or(5000);
-        let code = format!(
-            r"return (function() {{
-                var log = window.__VICTAURI__?.getIpcLog() || [];
-                var now = Date.now();
-                var threshold = {threshold};
-                var pending = log.filter(function(c) {{ return c.status === 'pending'; }});
-                var stale = pending.filter(function(c) {{ return (now - c.timestamp) > threshold; }});
-                var errored = log.filter(function(c) {{ return c.status === 'error'; }});
-                var net = window.__VICTAURI__?.getNetworkLog() || [];
-                var warning = null;
-                if (log.length === 0 && net.length > 5) {{
-                    warning = 'Zero IPC calls captured but ' + net.length + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
-                }}
-                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
-                // A command that completed with an Err is a HEALTHY round-trip (it returned)
-                // — every real app exercises error paths, so counting those as 'unhealthy'
-                // would cry wolf. The error_count/errored_calls surface them for visibility,
-                // but only stale calls flip `healthy`.
-                return {{
-                    healthy: stale.length === 0,
-                    total_calls: log.length,
-                    pending_count: pending.length,
-                    stale_count: stale.length,
-                    error_count: errored.length,
-                    stale_calls: stale.slice(0, 20),
-                    errored_calls: errored.slice(0, 20),
-                    warning: warning
-                }};
-            }})()"
-        );
+        let code = ipc_integrity_js(threshold);
         self.eval_bridge(&code, params.webview_label.as_deref())
             .await
     }
@@ -3170,7 +3141,8 @@ impl VictauriMcpHandler {
                 let wait = params.wait_for_capture.unwrap_or(false);
                 let limit = params.limit.unwrap_or(DEFAULT_LOG_LIMIT);
                 if wait {
-                    let inner = trimmed_log_js("window.__VICTAURI__.getIpcLog()", limit);
+                    let inner =
+                        trimmed_log_js(&format!("window.__VICTAURI__.getIpcLog({limit})"), limit);
                     let code = format!(
                         r"return (async function() {{
                             await window.__VICTAURI__.waitForIpcComplete(500);
@@ -3186,7 +3158,8 @@ impl VictauriMcpHandler {
                         Err(e) => tool_error(e),
                     }
                 } else {
-                    let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", limit);
+                    let code =
+                        trimmed_log_js(&format!("window.__VICTAURI__?.getIpcLog({limit})"), limit);
                     self.eval_bridge(&code, params.webview_label.as_deref())
                         .await
                 }
@@ -3231,17 +3204,7 @@ impl VictauriMcpHandler {
                     return missing_param("threshold_ms", "slow_ipc");
                 };
                 let limit = params.limit.unwrap_or(20);
-                let trim_field = trim_field_js();
-                let code = format!(
-                    r"return (function() {{
-                        {trim_field}
-                        function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
-                        var log = window.__VICTAURI__?.getIpcLog() || [];
-                        var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold}; }});
-                        slow.sort(function(a, b) {{ return (b.duration_ms || 0) - (a.duration_ms || 0); }});
-                        return {{ threshold_ms: {threshold}, count: Math.min(slow.length, {limit}), calls: slow.slice(0, {limit}).map(trimEntry) }};
-                    }})()",
-                );
+                let code = slow_ipc_js(threshold, limit);
                 self.eval_bridge(&code, None).await
             }
             LogsAction::Clear => {
@@ -5504,7 +5467,10 @@ impl ServerHandler for VictauriMcpHandler {
                 // itself default-window-drained) — serving a subset that looks complete.
                 // trimmed_log_js bounds entries + truncates oversized fields so the
                 // resource stays correct under load. (Matches the `logs ipc` tool.)
-                let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", DEFAULT_LOG_LIMIT);
+                let code = trimmed_log_js(
+                    &format!("window.__VICTAURI__?.getIpcLog({DEFAULT_LOG_LIMIT})"),
+                    DEFAULT_LOG_LIMIT,
+                );
                 if let Ok(json) = self.eval_with_return(&code, None).await {
                     json
                 } else {
@@ -5614,6 +5580,75 @@ fn trim_field_js() -> String {
                 }}
                 return v;
             }}"
+    )
+}
+
+/// JS for `check_ipc_integrity`. Classifies the calls from the body-free IPC view and fetches
+/// full entries (args + result) only for the <= 20 stale and <= 20 errored calls it lists:
+/// deep-copying every retained body just to count statuses froze the UI thread (R5-JS1).
+fn ipc_integrity_js(threshold_ms: i64) -> String {
+    format!(
+        r"return (function() {{
+                var V = window.__VICTAURI__;
+                var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
+                var now = Date.now();
+                var threshold = {threshold_ms};
+                var pending = log.filter(function(c) {{ return c.status === 'pending'; }});
+                var stale = pending.filter(function(c) {{ return (now - c.timestamp) > threshold; }});
+                var errored = log.filter(function(c) {{ return c.status === 'error'; }});
+                var netCount = (V?.getNetworkLog(null, 0, {{ bodies: false }}) || []).length;
+                var warning = null;
+                if (log.length === 0 && netCount > 5) {{
+                    warning = 'Zero IPC calls captured but ' + netCount + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
+                }}
+                function withBodies(list) {{
+                    list = list.slice(0, 20);
+                    if (!list.length) return list;
+                    var got = V.getIpcLog(0, {{ ids: list.map(function(c) {{ return c.id; }}) }}) || [];
+                    var byId = {{}};
+                    for (var i = 0; i < got.length; i++) byId[got[i].id] = got[i];
+                    return list.map(function(c) {{ return byId[c.id] || c; }});
+                }}
+                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
+                // A command that completed with an Err is a HEALTHY round-trip (it returned)
+                // — every real app exercises error paths, so counting those as 'unhealthy'
+                // would cry wolf. The error_count/errored_calls surface them for visibility,
+                // but only stale calls flip `healthy`.
+                return {{
+                    healthy: stale.length === 0,
+                    total_calls: log.length,
+                    pending_count: pending.length,
+                    stale_count: stale.length,
+                    error_count: errored.length,
+                    stale_calls: withBodies(stale),
+                    errored_calls: withBodies(errored),
+                    warning: warning
+                }};
+            }})()"
+    )
+}
+
+/// JS for `logs slow_ipc`: ranks the calls from the body-free IPC view, then fetches full
+/// (field-trimmed) entries only for the `limit` slowest it returns (R5-JS1).
+fn slow_ipc_js(threshold_ms: u64, limit: usize) -> String {
+    let trim_field = trim_field_js();
+    format!(
+        r"return (function() {{
+                {trim_field}
+                function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
+                var V = window.__VICTAURI__;
+                var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
+                var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold_ms}; }});
+                slow.sort(function(a, b) {{ return (b.duration_ms || 0) - (a.duration_ms || 0); }});
+                var top = slow.slice(0, {limit});
+                if (top.length) {{
+                    var got = V.getIpcLog(0, {{ ids: top.map(function(c) {{ return c.id; }}) }}) || [];
+                    var byId = {{}};
+                    for (var i = 0; i < got.length; i++) byId[got[i].id] = got[i];
+                    top = top.map(function(c) {{ return byId[c.id] || c; }});
+                }}
+                return {{ threshold_ms: {threshold_ms}, count: top.length, calls: top.map(trimEntry) }};
+            }})()",
     )
 }
 
@@ -9496,5 +9531,170 @@ mod screenshot_visibility_tests {
             Some(Some("ghost".to_string())),
             "unknown label must be forwarded verbatim to get_native_handle"
         );
+    }
+}
+
+/// The IPC-log projections the tools send to the page, run against the REAL bridge in jsdom
+/// (the `tests/bridge_tests` runner). R5-JS1 made them read a body-free view and fetch bodies
+/// only for the entries they report, so their output is pinned end to end here.
+#[cfg(test)]
+mod ipc_projection_jsdom_tests {
+    use super::{
+        DEFAULT_LOG_LIMIT, ghost_ipc_outcomes_js, ipc_catalog_projection_js, ipc_integrity_js,
+        ipc_timing_projection_js, slow_ipc_js, trimmed_log_js,
+    };
+    use std::io::Write;
+
+    const TRAFFIC: &str = r#"
+        function call(cmd, args, headers) {
+            return fetch('http://ipc.localhost/' + cmd, { method: 'POST', body: JSON.stringify(args), headers: headers || {} });
+        }
+        await call('get_a', { x: 1 }, { 'x-vtest-body': '{"n":1,"s":"a"}' });
+        await call('get_a', { x: 2 }, { 'x-vtest-body': '{"n":2,"s":"b"}' });
+        await call('bad_cmd', {}, { 'x-vtest-tauri-response': 'error', 'x-vtest-body': '"command bad_cmd not found"' });
+        await call('delayed', { d: true }, { 'x-vtest-delay-ms': '80', 'x-vtest-body': '{"late":true}' });
+        call('stuck', { p: 1 }, { 'x-vtest-delay-ms': '1500' });
+        await new Promise(function(r) { setTimeout(r, 40); });
+    "#;
+
+    fn run(code: &str) -> Option<serde_json::Value> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("bridge_tests");
+        if !dir.join("node_modules").join("jsdom").exists() {
+            assert!(
+                std::env::var_os("CI").is_none()
+                    && std::env::var_os("VICTAURI_REQUIRE_JSDOM").is_none(),
+                "jsdom is not installed: `npm ci` in crates/victauri-plugin/tests/bridge_tests/"
+            );
+            eprintln!("SKIP: jsdom not installed");
+            return None;
+        }
+        let def = serde_json::json!({
+            "bridge_script": crate::js_bridge::init_script(
+                &crate::js_bridge::BridgeCapacities::default()
+            ),
+            "setup_html": "<html><body></body></html>",
+            "tests": [{ "name": "projection", "code": format!("{TRAFFIC}\nreturn (function() {{ {code} }})();") }],
+        });
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        tmp.write_all(def.to_string().as_bytes()).expect("write");
+        tmp.flush().expect("flush");
+        let out = std::process::Command::new("node")
+            .arg(dir.join("run_tests.js"))
+            .arg(tmp.path())
+            .output()
+            .expect("run node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("VICTAURI_RESULTS:"))
+            .unwrap_or_else(|| panic!("no results: {stdout}"));
+        let results: serde_json::Value = serde_json::from_str(line).expect("results json");
+        let r = &results[0];
+        assert_eq!(r["passed"], true, "projection threw: {r}");
+        Some(r["result"].clone())
+    }
+
+    #[test]
+    fn catalog_reports_first_arg_and_first_ok_result_shapes() {
+        let Some(v) = run(&ipc_catalog_projection_js()) else {
+            return;
+        };
+        let by = |c: &str| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["command"] == c)
+                .cloned()
+                .unwrap_or_else(|| panic!("{c} missing: {v}"))
+        };
+        let a = by("get_a");
+        assert_eq!(a["call_count"], 2, "{v}");
+        assert_eq!(a["arg_shape"], serde_json::json!({ "x": "number" }), "{v}");
+        assert_eq!(
+            a["result_shape"],
+            serde_json::json!({ "n": "number", "s": "string" }),
+            "{v}"
+        );
+        let bad = by("bad_cmd");
+        assert_eq!(bad["error_count"], 1, "{v}");
+        assert_eq!(bad["result_shape"], "string", "{v}");
+        let stuck = by("stuck");
+        assert_eq!(stuck["last_status"], "pending", "{v}");
+        assert_eq!(
+            stuck["arg_shape"],
+            serde_json::json!({ "p": "number" }),
+            "{v}"
+        );
+        assert_eq!(stuck["result_shape"], "null", "{v}");
+    }
+
+    #[test]
+    fn ghost_outcomes_and_timings_come_from_the_body_free_view() {
+        let Some(v) = run(&ghost_ipc_outcomes_js(None)) else {
+            return;
+        };
+        let bad = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["command"] == "bad_cmd")
+            .cloned()
+            .unwrap();
+        assert_eq!(bad["ok"], false, "{v}");
+        assert!(
+            bad["err"].as_str().unwrap().contains("not found"),
+            "the error sample must survive without bodies: {v}"
+        );
+        let Some(t) = run(&ipc_timing_projection_js(None)) else {
+            return;
+        };
+        assert_eq!(t.as_array().unwrap().len(), 5, "{t}");
+        assert!(t[3]["duration_ms"].as_f64().unwrap() >= 60.0, "{t}");
+    }
+
+    #[test]
+    fn integrity_lists_stale_and_errored_calls_with_their_bodies() {
+        let Some(v) = run(&ipc_integrity_js(10)) else {
+            return;
+        };
+        assert_eq!(v["healthy"], false, "{v}");
+        assert_eq!(v["total_calls"], 5, "{v}");
+        assert_eq!(v["stale_count"], 1, "{v}");
+        assert_eq!(v["error_count"], 1, "{v}");
+        assert_eq!(v["stale_calls"][0]["command"], "stuck", "{v}");
+        assert_eq!(v["stale_calls"][0]["args"]["p"], 1, "{v}");
+        assert_eq!(
+            v["errored_calls"][0]["result"], "command bad_cmd not found",
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn slow_ipc_returns_the_slowest_calls_with_their_bodies() {
+        let Some(v) = run(&slow_ipc_js(50, 20)) else {
+            return;
+        };
+        assert_eq!(v["count"], 1, "{v}");
+        assert_eq!(v["calls"][0]["command"], "delayed", "{v}");
+        assert_eq!(v["calls"][0]["args"]["d"], true, "{v}");
+        assert_eq!(v["calls"][0]["result"]["late"], true, "{v}");
+    }
+
+    #[test]
+    fn logs_ipc_source_keeps_the_newest_entries() {
+        let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog(2)", DEFAULT_LOG_LIMIT);
+        let Some(v) = run(&code) else {
+            return;
+        };
+        let cmds: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(cmds, ["delayed", "stuck"], "{v}");
+        assert_eq!(v[0]["result"]["late"], true, "{v}");
     }
 }

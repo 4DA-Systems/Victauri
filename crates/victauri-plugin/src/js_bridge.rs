@@ -593,6 +593,65 @@ const INIT_SCRIPT_BODY: &str = r#"
         return out;
     }
 
+    // A network-log entry's IPC command name, or null when it is not an app IPC call
+    // (plain network traffic, or Victauri's own `plugin:victauri|*` plumbing).
+    var IPC_LOG_VICTAURI_PREFIX = 'plugin%3Avictauri%7C';
+    function ipcCallCommand(n) {
+        var raw = ipcCommandPath(n.url);
+        if (raw === null || raw.indexOf(IPC_LOG_VICTAURI_PREFIX) === 0) return null;
+        try { return decodeURIComponent(raw); } catch (e) { return raw; }
+    }
+    // The newest app IPC call in the network log (the live entry — never hand it out).
+    function newestIpcCall() {
+        for (var i = networkLog.length - 1; i >= 0; i--) {
+            if (ipcCallCommand(networkLog[i]) !== null) return networkLog[i];
+        }
+        return null;
+    }
+    // The `getIpcLog` view of one IPC network entry: a fresh object whose nested values are
+    // deep copies, so the page cannot rewrite a logged call through it. Without `bodies`, the
+    // request args and result are left out and the error text is capped.
+    var MAX_IPC_ERROR_TEXT = 4096;
+    function ipcLogEntry(n, bodies) {
+        // Classify by COMMAND outcome, not just HTTP status. Tauri returns
+        // HTTP 200 for a failed command (incl. "command not found") and signals
+        // the real result via the `Tauri-Response` header captured as ipc_response.
+        // Precedence: pending > transport error (HTTP >= 400 / 'error') > command
+        // error (ipc_response 'error') > ok.
+        var st;
+        if (n.status === 'pending') { st = 'pending'; }
+        else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
+        else if (n.ipc_response === 'error') { st = 'error'; }
+        else { st = 'ok'; }
+        var errText = null;
+        if (st === 'error') {
+            if (n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
+                errText = 'HTTP ' + n.status;
+            } else if (n.response_body != null) {
+                // Command-level error: the body carries the error message.
+                errText = typeof n.response_body === 'string'
+                    ? n.response_body : PRISTINE_STRINGIFY(n.response_body);
+            } else {
+                errText = 'command error';
+            }
+            if (!bodies && typeof errText === 'string') errText = truncText(errText, MAX_IPC_ERROR_TEXT);
+        }
+        var e = {
+            id: n.id,
+            command: ipcCallCommand(n),
+            timestamp: n.timestamp,
+            status: st,
+            duration_ms: n.duration_ms,
+            error: errText,
+        };
+        if (bodies) {
+            e.args = cloneJson(n.request_args) || {};
+            // Nullish, not falsy: a command returning 0 / false / '' is a real result.
+            e.result = (n.response_body === undefined || n.response_body === null) ? null : cloneJson(n.response_body);
+        }
+        return e;
+    }
+
     // ── Event stream (shared by getEventStream and the recording drain) ─────
     //
     // Calls `emit(event, keyTime, entry)` for every loggable entry. IPC and plain network
@@ -1044,62 +1103,39 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         // ── IPC Log ──────────────────────────────────────────────────────────
 
-        getIpcLog: function(limit) {
-            var victauriPrefix = 'plugin%3Avictauri%7C';
-            var entries = [];
+        // The IPC calls in the network log, newest last. `limit` (> 0) keeps the newest
+        // `limit`; `opts.bodies === false` leaves out `args` / `result` (for callers that only
+        // need names, statuses and timings); `opts.ids` keeps only the calls with those ids.
+        // Calls are selected and limited FIRST and only the returned ones are deep-copied:
+        // copying every retained body (up to 1000 x 64 KB) and then discarding most of it
+        // froze the UI thread for ~1 s on every read (R5-JS1).
+        getIpcLog: function(limit, opts) {
+            var bodies = !(opts && opts.bodies === false);
+            var idSet = null;
+            if (opts && opts.ids) {
+                idSet = OBJ_CREATE(null);
+                for (var j = 0; j < opts.ids.length; j++) idSet['' + opts.ids[j]] = true;
+            }
+            var picked = [];
             for (var i = 0; i < networkLog.length; i++) {
                 var n = networkLog[i];
-                var raw = ipcCommandPath(n.url);
-                if (raw === null) continue;
-                if (raw.indexOf(victauriPrefix) === 0) continue;
-                var command;
-                try { command = decodeURIComponent(raw); } catch(e) { command = raw; }
-                // Classify by COMMAND outcome, not just HTTP status. Tauri returns
-                // HTTP 200 for a failed command (incl. "command not found") and signals
-                // the real result via the `Tauri-Response` header captured as ipc_response.
-                // Precedence: pending > transport error (HTTP >= 400 / 'error') > command
-                // error (ipc_response 'error') > ok.
-                var st;
-                if (n.status === 'pending') { st = 'pending'; }
-                else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
-                else if (n.ipc_response === 'error') { st = 'error'; }
-                else { st = 'ok'; }
-                var errText = null;
-                if (st === 'error') {
-                    if (n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
-                        errText = 'HTTP ' + n.status;
-                    } else if (n.response_body != null) {
-                        // Command-level error: the body carries the error message.
-                        errText = typeof n.response_body === 'string'
-                            ? n.response_body : PRISTINE_STRINGIFY(n.response_body);
-                    } else {
-                        errText = 'command error';
-                    }
-                }
-                entries.push({
-                    id: n.id,
-                    command: command,
-                    args: cloneJson(n.request_args) || {},
-                    timestamp: n.timestamp,
-                    status: st,
-                    duration_ms: n.duration_ms,
-                    // Nullish, not falsy: a command returning 0 / false / '' is a real result.
-                    // Deep copies: the page must not rewrite a logged call through this entry.
-                    result: (n.response_body === undefined || n.response_body === null) ? null : cloneJson(n.response_body),
-                    error: errText,
-                });
+                if (idSet && !idSet['' + n.id]) continue;
+                if (ipcCallCommand(n) === null) continue;
+                picked.push(n);
             }
-            if (limit) return entries.slice(-limit);
+            var start = (typeof limit === 'number' && limit > 0 && picked.length > limit) ? picked.length - limit : 0;
+            var entries = [];
+            for (var k = start; k < picked.length; k++) entries.push(ipcLogEntry(picked[k], bodies));
             return entries;
         },
 
         waitForIpcComplete: function(timeoutMs) {
-            var log = window.__VICTAURI__.getIpcLog();
-            if (log.length > 0) {
-                var last = log[log.length - 1];
-                if (last.duration_ms !== null && last.duration_ms !== undefined && last.result !== null) {
-                    return Promise.resolve(true);
-                }
+            // Inspect the newest IPC call in place: copying the whole log to read one entry
+            // cost as much as a full `getIpcLog()` (R5-JS1).
+            var last = newestIpcCall();
+            if (last && last.duration_ms !== null && last.duration_ms !== undefined
+                && last.response_body !== null && last.response_body !== undefined) {
+                return Promise.resolve(true);
             }
             return new Promise(function(resolve) {
                 var timer = setTimeout(function() {
@@ -1129,12 +1165,24 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         // ── Network ──────────────────────────────────────────────────────────
 
-        getNetworkLog: function(filter, limit) {
+        // Filtered and limited BEFORE copying (R5-JS1). `opts.bodies === false` leaves out
+        // the captured IPC request args / response bodies (e.g. to count entries cheaply).
+        getNetworkLog: function(filter, limit, opts) {
             var log = networkLog;
             if (filter) {
                 log = log.filter(function(e) { return e.url.indexOf(filter) !== -1; });
             }
-            if (limit) log = log.slice(-limit);
+            if (typeof limit === 'number' && limit > 0) log = log.slice(-limit);
+            if (opts && opts.bodies === false) {
+                var out = new Array(log.length);
+                for (var i = 0; i < log.length; i++) {
+                    var c = ASSIGN({}, log[i]);
+                    delete c.request_args;
+                    delete c.response_body;
+                    out[i] = c;
+                }
+                return copyEntries(out);
+            }
             return copyEntries(log);
         },
 
