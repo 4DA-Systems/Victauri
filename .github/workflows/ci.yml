@@ -454,9 +454,19 @@ jobs:
           toolchain: stable
 
       - name: Move rusqlite to the newest version the range allows
+        # Fails if the update did not reach the newest minor the workspace range allows
+        # (`>=0.32, <0.41` in Cargo.toml) — otherwise this job would silently keep testing 0.32.
+        # Widen NEWEST together with the range.
+        env:
+          NEWEST: "0.40."
         run: |
           cargo update -p rusqlite
-          grep -A1 '^name = "rusqlite"' Cargo.lock
+          resolved=$(grep -A1 '^name = "rusqlite"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          echo "rusqlite resolved to ${resolved:-<none>}"
+          case "$resolved" in
+            "$NEWEST"*) ;;
+            *) echo "::error::rusqlite resolved to '$resolved', expected $NEWEST* (the newest the range allows)"; exit 1 ;;
+          esac
 
       - name: Clippy (plugin, sqlite)
         run: cargo clippy -p victauri-plugin --all-targets --features sqlite -- -D warnings

@@ -5,7 +5,9 @@ Get Victauri running in your Tauri app in under 5 minutes.
 ## Prerequisites
 
 - A Tauri 2.0+ application
-- Rust toolchain (stable)
+- Rust toolchain (stable). Victauri's own MSRV is 1.88 (checked in CI against the committed
+  lockfile). Your app's dependency tree can raise that: a fresh project resolving tauri 2.12 needs
+  Rust 1.90.
 - An MCP client (Claude Code, VS Code, or any MCP-compatible tool)
 
 ## Step 1: Add the Dependency

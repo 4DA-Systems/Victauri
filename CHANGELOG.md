@@ -121,7 +121,9 @@ app probes are bounded; page-callable window queries are budgeted; drain-waterma
 races fixed; the main-thread lock stays held while an abandoned closure still runs; fault,
 contract and page-load maps are capped; panicked background tasks are reported finished; WGC
 capture runs on one COM thread with a bounded wait; `Locator::check()` works on ARIA checkboxes;
-`victauri check` lists ghost names; `recording stop` flushes every window first (events captured since the last 1 s drain tick were dropped; a window that cannot answer within 3 s is reported in `final_flush_unreachable`); a request the guards refuse (401/403/415/429) closes its
+`victauri check` lists ghost names; `recording stop` flushes every window first (events captured
+since the last 1 s drain tick were dropped; a window that cannot answer within 3 s is reported in
+`final_flush_unreachable`); a request the guards refuse (401/403/415/429) closes its
 connection, so refused requests (a web page's no-cors fetches, a local script) cannot park the
 256 request slots, and a connection takes a request slot only once it has sent its first byte —
 a connection that sends nothing (a page's `<link rel=preconnect>` across `*.localhost` names
