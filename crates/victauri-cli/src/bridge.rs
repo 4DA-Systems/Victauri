@@ -1632,16 +1632,21 @@ fn uid_from_exclusive_probe(probe: &std::path::Path) -> Option<u32> {
     uid
 }
 
-/// On Windows the default per-user temp dir (`%LOCALAPPDATA%\Temp`) is not world-writable, so the
-/// shared-temp planting attack that `dir_is_trusted` defends against on Unix does not apply; trust
-/// the directory.
-///
-/// HONEST CAVEAT (documented residual): this is an ASSUMPTION, not a verified ACL check. If a
-/// machine redirects `TEMP`/`TMP` to a shared location (e.g. `C:\Windows\Temp` or a multi-user
-/// spool), a cross-user discovery-dir planting attack is unguarded on Windows. Closing it would
-/// require a Windows ownership/ACL check here (non-trivial under `#![forbid(unsafe_code)]`);
-/// deferred as a non-default-config, Windows-only residual.
-#[cfg(not(unix))]
+/// Windows: trust a discovery directory only if it is a real directory (a symlink or junction
+/// is not `is_dir()` under `symlink_metadata`) OWNED by the current user — its owner SID is the
+/// token user, the token's default owner, or `BUILTIN\Administrators` when this token is a
+/// member, the plugin writer's own rule — via victauri-test's check (this crate forbids
+/// `unsafe`). `%TEMP%` is normally per-user, but a shared one (`C:\msys64\tmp` for an app
+/// launched from MSYS2, a redirected `C:\Windows\Temp`) let another user plant
+/// `victauri\<live pid>\` entries pointing at a port they control; the bridge then sent them
+/// the agent's calls and relayed forged results. That residual is closed (R5B-WINDISC1).
+#[cfg(windows)]
+fn dir_is_trusted(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && victauri_test::process::dir_owned_by_current_user(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn dir_is_trusted(_path: &std::path::Path) -> bool {
     true
 }
@@ -2192,6 +2197,40 @@ mod tests {
         assert!(!dir_is_trusted(&link), "symlinked dir must be rejected");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R5B-WINDISC1: a `<pid>` directory (or a whole root) owned by another account — SYSTEM
+    /// stands in, which needs an elevated run to set up — is never read.
+    #[cfg(windows)]
+    #[test]
+    fn windows_discovery_ignores_directories_owned_by_another_account() {
+        let give_to_system = |p: &std::path::Path| {
+            std::process::Command::new("icacls")
+                .arg(p)
+                .args(["/setowner", "*S-1-5-18", "/q"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let root = tempfile::tempdir().unwrap();
+        for pid in ["21", "22"] {
+            let dir = root.path().join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("port"), "7373").unwrap();
+            std::fs::write(dir.join("token"), format!("tok-{pid}")).unwrap();
+        }
+        if !give_to_system(&root.path().join("22")) {
+            eprintln!("skipped: cannot change a directory's owner (not elevated)");
+            return;
+        }
+        let mut out = Vec::new();
+        discover_entries_in(root.path(), &mut out);
+        let pids: Vec<u32> = out.iter().map(|(pid, _)| *pid).collect();
+        assert_eq!(pids, [21], "a planted entry's token must never be read");
+
+        assert!(give_to_system(root.path()));
+        let mut out = Vec::new();
+        discover_entries_in(root.path(), &mut out);
+        assert!(out.is_empty(), "nothing under a foreign root is trusted");
     }
 
     /// R5-BR3: only a request (method + id) is owed a reply.

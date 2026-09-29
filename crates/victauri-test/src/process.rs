@@ -58,16 +58,34 @@ pub fn is_own_live_process(pid: u32) -> bool {
     liveness(pid) == Liveness::Own
 }
 
+/// Windows: whether the directory at `path` is OWNED by the current user — its owner SID is
+/// the token user, the token's default owner, or `BUILTIN\Administrators` when this token is a
+/// member (the plugin writer's rule). Discovery readers trust a root or `<pid>` directory only
+/// when this holds: on a shared `TEMP` (e.g. `C:\msys64\tmp`) another user could otherwise
+/// plant `victauri\<live pid>\{port,token,metadata.json}` pointing at a port they control
+/// and receive agent calls (R5B-WINDISC1). `false` when the owner cannot be read.
+#[cfg(windows)]
+#[doc(hidden)]
+#[must_use]
+pub fn dir_owned_by_current_user(path: &std::path::Path) -> bool {
+    imp::dir_owned_by_current_user(path)
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod imp {
     use std::ffi::c_void;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, GetLastError, HANDLE,
-        STILL_ACTIVE,
+        CloseHandle, ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER, ERROR_SUCCESS, GetLastError,
+        HANDLE, LocalFree, STILL_ACTIVE,
     };
-    use windows_sys::Win32::Security::{EqualSid, GetTokenInformation, TOKEN_QUERY, TokenUser};
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION,
+        SECURITY_MAX_SID_SIZE, TOKEN_GROUPS, TOKEN_INFORMATION_CLASS, TOKEN_QUERY, TokenGroups,
+        TokenOwner, TokenUser, WinBuiltinAdministratorsSid,
+    };
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
         PROCESS_QUERY_LIMITED_INFORMATION,
@@ -118,6 +136,120 @@ mod imp {
         // SAFETY: `buf` holds a TOKEN_USER written by GetTokenInformation; its first field
         // is SID_AND_ATTRIBUTES, whose first field is the SID pointer (into `buf` itself).
         unsafe { *buf.as_ptr().cast::<*mut c_void>() }
+    }
+
+    /// The current process token's information of `class`, as a raw (8-aligned) buffer.
+    fn own_token_info(class: TOKEN_INFORMATION_CLASS) -> Option<Vec<u64>> {
+        let mut token: HANDLE = std::ptr::null_mut();
+        // SAFETY: the pseudo-handle of the current process is always valid; `token` is a valid
+        // out-pointer, closed by `Handle` below.
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let token = Handle(token);
+        let mut len = 0u32;
+        // SAFETY: a null buffer of length 0 is the documented size probe; `len` is valid.
+        unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut len) };
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        // SAFETY: `buf` is at least `len` bytes and 8-aligned (the structures hold pointers).
+        let ok = unsafe {
+            GetTokenInformation(
+                token.0,
+                class,
+                buf.as_mut_ptr().cast::<c_void>(),
+                len,
+                &mut len,
+            )
+        };
+        (ok != 0).then_some(buf)
+    }
+
+    /// Whether `owner` is a SID this process legitimately owns objects as — mirrors the plugin
+    /// writer's `acceptable_owner_sids` (incl. commit 659e353): the token USER, the token's
+    /// default OWNER (the `BUILTIN\Administrators` group under elevation), and
+    /// `BUILTIN\Administrators` whenever this token lists it among its groups (enabled or
+    /// deny-only) — an app started elevated creates the root owned by that group, and a later
+    /// unelevated app/client of the same user must still accept it.
+    fn is_acceptable_owner(owner: *mut c_void) -> bool {
+        let eq = |sid: *mut c_void| {
+            // SAFETY: both are valid SIDs for the duration of the call.
+            unsafe { EqualSid(owner, sid) != 0 }
+        };
+        // TOKEN_USER and TOKEN_OWNER both lead with the SID pointer.
+        if [TokenUser, TokenOwner]
+            .into_iter()
+            .filter_map(own_token_info)
+            .any(|buf| eq(sid(&buf)))
+        {
+            return true;
+        }
+        let mut admins = [0u8; SECURITY_MAX_SID_SIZE as usize];
+        let mut admins_len = SECURITY_MAX_SID_SIZE;
+        // SAFETY: `admins` is writable for `admins_len` bytes, the documented maximum SID size.
+        let created = unsafe {
+            CreateWellKnownSid(
+                WinBuiltinAdministratorsSid,
+                std::ptr::null_mut(),
+                admins.as_mut_ptr().cast::<c_void>(),
+                &mut admins_len,
+            )
+        };
+        if created == 0 || !eq(admins.as_mut_ptr().cast::<c_void>()) {
+            return false;
+        }
+        let Some(groups) = own_token_info(TokenGroups) else {
+            return false;
+        };
+        if groups.len() * 8 < std::mem::size_of::<TOKEN_GROUPS>() {
+            return false;
+        }
+        // SAFETY: `groups` holds a TOKEN_GROUPS whose `Groups` array has `GroupCount` entries,
+        // all within the buffer GetTokenInformation filled.
+        unsafe {
+            let tg = &*groups.as_ptr().cast::<TOKEN_GROUPS>();
+            std::slice::from_raw_parts(tg.Groups.as_ptr(), tg.GroupCount as usize)
+                .iter()
+                .any(|g| EqualSid(g.Sid, admins.as_mut_ptr().cast::<c_void>()) != 0)
+        }
+    }
+
+    /// Frees a `LocalAlloc`'d block on drop.
+    struct Local(*mut c_void);
+
+    impl Drop for Local {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was allocated by the OS for us (LocalAlloc) and is freed once.
+            unsafe { LocalFree(self.0) };
+        }
+    }
+
+    pub(super) fn dir_owned_by_current_user(path: &std::path::Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut owner: *mut c_void = std::ptr::null_mut();
+        let mut sd: *mut c_void = std::ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated; only the owner is requested; `owner` points into
+        // `sd`, which the OS allocates and `Local` frees.
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS || sd.is_null() {
+            return false;
+        }
+        let _sd = Local(sd);
+        !owner.is_null() && is_acceptable_owner(owner)
     }
 
     pub(super) fn liveness(pid: u32) -> Liveness {
@@ -330,6 +462,26 @@ mod tests {
             "a live process must never read as dead: {l:?}"
         );
         assert_ne!(l, Liveness::Own);
+    }
+
+    /// R5B-WINDISC1: the owner check accepts what this process creates and refuses a
+    /// directory owned by another account (SYSTEM stands in; needs elevation to set up).
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_owned_by_another_account_is_not_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(dir_owned_by_current_user(dir.path()));
+        assert!(!dir_owned_by_current_user(&dir.path().join("missing")));
+        let set = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/setowner", "*S-1-5-18", "/q"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !set {
+            eprintln!("skipped: cannot change a directory's owner (not elevated)");
+            return;
+        }
+        assert!(!dir_owned_by_current_user(dir.path()));
     }
 
     /// R4-DISC1: with no `kill` binary at all (NixOS/Guix/minimal containers), a live PID

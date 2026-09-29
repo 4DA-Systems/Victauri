@@ -383,10 +383,18 @@ fn uid_from_exclusive_probe(probe: &Path) -> Option<u32> {
     uid
 }
 
-/// Windows temp is per-user and the plugin restricts the discovery dir's ACL to the
-/// current user; still reject symlinks/junctions (a reparse point is not `is_dir()` under
-/// `symlink_metadata`).
-#[cfg(not(unix))]
+/// Windows: a real directory (a symlink or junction is not `is_dir()` under `symlink_metadata`)
+/// OWNED by the current user — the token user, the token's default owner, or
+/// `BUILTIN\Administrators` when this token is a member (the plugin writer's rule). `%TEMP%` is
+/// normally per-user, but a shared one (`C:\msys64\tmp`) let another user plant an entry that
+/// pointed the watchdog at a port they control (R5B-WINDISC1).
+#[cfg(windows)]
+fn dir_is_trusted(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && process::dir_owned_by_current_user(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn dir_is_trusted(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
@@ -1110,6 +1118,41 @@ mod tests {
             discover_in(base.path(), &Selector::Any, |_| true),
             Discovery::Found(_)
         ));
+    }
+
+    /// R5B-WINDISC1: a directory owned by another account (SYSTEM stands in; setting that
+    /// up needs an elevated run) is never followed.
+    #[cfg(windows)]
+    #[test]
+    fn windows_entries_owned_by_another_account_are_ignored() {
+        let give_to_system = |p: &Path| {
+            std::process::Command::new("icacls")
+                .arg(p)
+                .args(["/setowner", "*S-1-5-18", "/q"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7373", Some("com.a"));
+        if !give_to_system(&tmp.path().join("100")) {
+            eprintln!("skipped: cannot change a directory's owner (not elevated)");
+            return;
+        }
+        assert_eq!(
+            discover_in(tmp.path(), &Selector::Any, |_| true),
+            Discovery::None
+        );
+        let base = tempfile::tempdir().unwrap();
+        write_entry(base.path(), 300, "7375", Some("com.c"));
+        assert!(matches!(
+            discover_in(base.path(), &Selector::Any, |_| true),
+            Discovery::Found(_)
+        ));
+        assert!(give_to_system(base.path()));
+        assert_eq!(
+            discover_in(base.path(), &Selector::Any, |_| true),
+            Discovery::None
+        );
     }
 
     #[cfg(unix)]

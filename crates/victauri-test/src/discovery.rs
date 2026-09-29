@@ -78,8 +78,7 @@ fn real_discovery_roots() -> Vec<PathBuf> {
 /// root (e.g. `/tmp`) is world-writable, so an attacker can plant a fake `<pid>`
 /// dir pointing at a server they control to steal the token / forge results. We
 /// trust a dir only if it is a real directory (not a symlink), owned by the current
-/// effective user, and not group/other-writable. On Windows the temp dir is already
-/// per-user, and the writer restricts ACLs via `icacls`, so no extra check is needed.
+/// effective user, and not group/other-writable. (Windows has its own owner check below.)
 #[cfg(unix)]
 fn dir_is_trusted(path: &std::path::Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -130,7 +129,18 @@ fn uid_from_exclusive_probe(probe: &std::path::Path) -> Option<u32> {
     uid
 }
 
-#[cfg(not(unix))]
+/// Windows: a real directory (a symlink or junction is not `is_dir()` under
+/// `symlink_metadata`) OWNED by the current user (see
+/// [`crate::process::dir_owned_by_current_user`]). `%TEMP%` is normally per-user, but it can
+/// be shared (an app launched from MSYS2 uses `C:\msys64\tmp`), where another user could
+/// plant `victauri\<live pid>\` entries pointing at a port they control (R5B-WINDISC1).
+#[cfg(windows)]
+fn dir_is_trusted(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && crate::process::dir_owned_by_current_user(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn dir_is_trusted(_path: &std::path::Path) -> bool {
     true
 }
@@ -994,6 +1004,52 @@ mod tests {
             Ok((7373, Some("a".to_string())))
         );
         assert_eq!(resolve_from(None, None, None, &[]), Ok((7373, None)));
+    }
+
+    /// Hand `path` to `NT AUTHORITY\SYSTEM` — the stand-in for "another user" (needs an
+    /// elevated test run; `false` when that is not possible, and the caller skips).
+    #[cfg(windows)]
+    fn give_to_system(path: &std::path::Path) -> bool {
+        std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/setowner", "*S-1-5-18", "/q"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// R5B-WINDISC1: on a shared TEMP another user can plant `victauri\<live pid>\…`; the
+    /// readers must refuse a root or entry directory this user does not own.
+    #[cfg(windows)]
+    #[test]
+    fn windows_discovery_refuses_directories_owned_by_another_user() {
+        let write_entry = |base: &std::path::Path, pid: &str| {
+            let dir = base.join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("port"), "7373").unwrap();
+            std::fs::write(dir.join("token"), format!("tok-{pid}")).unwrap();
+            dir
+        };
+        // A planted entry in a root we own.
+        let base = tempfile::tempdir().unwrap();
+        write_entry(base.path(), "10");
+        let planted = write_entry(base.path(), "11");
+        if !give_to_system(&planted) {
+            eprintln!("skipped: cannot change a directory's owner (not elevated)");
+            return;
+        }
+        let servers = find_live_servers_in(base.path(), |_| Liveness::Own, |_| true);
+        let pids: Vec<u32> = servers.iter().map(|s| s.pid).collect();
+        assert_eq!(pids, [10], "the planted entry's token must never be used");
+        assert!(
+            planted.exists(),
+            "a foreign directory is never deleted either"
+        );
+
+        // A planted ROOT: nothing under it is trusted, even entries we own.
+        let root = tempfile::tempdir().unwrap();
+        write_entry(root.path(), "12");
+        assert!(give_to_system(root.path()));
+        assert!(find_live_servers_in(root.path(), |_| Liveness::Own, |_| true).is_empty());
     }
 
     /// R5B-PORTAPP1: an explicit port and an app selector must agree.

@@ -4,6 +4,7 @@
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs/promises";
+import { execFile } from "child_process";
 
 export interface DiscoveredServer {
   port: number;
@@ -50,21 +51,140 @@ export async function discoveryRoots(): Promise<string[]> {
   return roots;
 }
 
-// Whether a discovery dir is safe to trust (audit #9): on Unix it must be a real directory
-// (not a symlink), owned by the current user, and not group/other-writable. Windows temp is
-// per-user and the writer restricts the directory's ACL, so no extra check is needed there.
-export async function dirIsTrusted(dir: string): Promise<boolean> {
-  if (process.platform === "win32") return true;
-  try {
-    const st = await fs.lstat(dir);
-    if (!st.isDirectory()) return false;
-    const euid = typeof process.geteuid === "function" ? process.geteuid() : -1;
-    if (euid >= 0 && st.uid !== euid) return false;
-    if ((st.mode & 0o022) !== 0) return false;
-    return true;
-  } catch {
-    return false;
+// ── Windows: discovery-directory ownership (R5B-WINDISC1) ────────────────────────────────
+//
+// `%TEMP%` is normally per-user, but it can be shared — an app launched from MSYS2 uses
+// `C:\msys64\tmp` — and there another user can plant `victauri\<live pid>\{port,token,…}`
+// pointing at a port they control. The Rust readers compare the directory's owner SID with the
+// process token via Win32; the extension cannot call Win32 directly, so:
+//
+// - a directory inside the user's profile (`os.homedir()`, which is where the default
+//   `%LOCALAPPDATA%\Temp` lives) is trusted without a check: Windows grants only SYSTEM,
+//   Administrators and the user access to a profile, so no other non-admin user can plant
+//   anything there — the check would cost a PowerShell start for nothing;
+// - anywhere else, the owner is read with PowerShell's `Get-Acl` (one call for a batch of
+//   directories, 10 s timeout) and must be the current user, the token's default owner, or
+//   `BUILTIN\Administrators` when this token is a member — the plugin writer's own rule. The
+//   verdict is cached per directory identity (inode + birth time), so a recreated directory is
+//   checked again. It fails CLOSED: if PowerShell cannot run, such a directory is not trusted
+//   (set `victauri.port` + `victauri.authToken` explicitly in that environment).
+
+export interface OwnerCheckOptions {
+  /** The profile directory treated as private (default `os.homedir()`); tests override it. */
+  profileDir?: string;
+}
+
+const ownerVerdicts = new Map<string, { id: string; trusted: boolean }>();
+
+function isInside(child: string, parent: string): boolean {
+  const rel = path.relative(parent.toLowerCase(), child.toLowerCase());
+  return rel === "" || (!!rel && !rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+const OWNER_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  "$id = [Security.Principal.WindowsIdentity]::GetCurrent()",
+  "$ok = @($id.User.Value, $id.Owner.Value)",
+  // Group SIDs and deny-only SIDs are both claims; an unelevated admin holds 544 deny-only.
+  "if ($id.Claims | Where-Object { $_.Value -eq 'S-1-5-32-544' }) { $ok += 'S-1-5-32-544' }",
+  // No @(...) here: Windows PowerShell 5.1 emits a JSON array as ONE object, which @() would
+  // wrap instead of enumerate.
+  "$paths = ConvertFrom-Json $env:VICTAURI_OWNER_PATHS",
+  "$out = @(foreach ($p in $paths) { try { $ok -contains (Get-Acl -LiteralPath $p).GetOwner([Security.Principal.SecurityIdentifier]).Value } catch { $false } })",
+  "ConvertTo-Json -Compress -InputObject $out",
+].join("; ");
+
+/** Ask PowerShell whether each of `dirs` is owned by the current user; all-false on failure. */
+function queryOwners(dirs: string[]): Promise<boolean[]> {
+  const systemRoot = process.env.SystemRoot || "C:\\Windows";
+  const ps = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return new Promise((resolve) => {
+    execFile(
+      ps,
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", OWNER_SCRIPT],
+      {
+        env: { ...process.env, VICTAURI_OWNER_PATHS: JSON.stringify(dirs) },
+        timeout: 10_000,
+        windowsHide: true,
+      },
+      (err, stdout) => {
+        if (err) return resolve(dirs.map(() => false));
+        try {
+          const parsed: unknown = JSON.parse(String(stdout).trim());
+          const arr = Array.isArray(parsed) ? parsed : [parsed];
+          resolve(dirs.map((_, i) => arr[i] === true));
+        } catch {
+          resolve(dirs.map(() => false));
+        }
+      }
+    );
+  });
+}
+
+/** Windows: which of `dirs` (already known to be real directories) are owned by us. */
+async function windowsOwnedDirs(
+  dirs: string[],
+  opts: OwnerCheckOptions = {}
+): Promise<Set<string>> {
+  const profile = opts.profileDir ?? os.homedir();
+  const trusted = new Set<string>();
+  const pending: { dir: string; id: string }[] = [];
+  for (const dir of dirs) {
+    if (isInside(path.resolve(dir), profile)) {
+      trusted.add(dir);
+      continue;
+    }
+    let id: string;
+    try {
+      const st = await fs.lstat(dir, { bigint: true });
+      id = `${st.ino}:${st.birthtimeNs}`;
+    } catch {
+      continue;
+    }
+    const cached = ownerVerdicts.get(dir);
+    if (cached && cached.id === id) {
+      if (cached.trusted) trusted.add(dir);
+      continue;
+    }
+    pending.push({ dir, id });
   }
+  if (pending.length > 0) {
+    const verdicts = await queryOwners(pending.map((p) => p.dir));
+    pending.forEach(({ dir, id }, i) => {
+      ownerVerdicts.set(dir, { id, trusted: verdicts[i] });
+      if (verdicts[i]) trusted.add(dir);
+    });
+  }
+  return trusted;
+}
+
+// Whether a discovery dir is safe to trust (audit #9): it must be a real directory (not a
+// symlink or junction) owned by the current user. On Unix: owned by our euid and not
+// group/other-writable. On Windows: owned by us (see the ownership section above; R5B-WINDISC1).
+export async function dirIsTrusted(dir: string, opts: OwnerCheckOptions = {}): Promise<boolean> {
+  return (await trustedDirs([dir], opts)).has(dir);
+}
+
+// The subset of `dirs` that are trusted discovery directories — batched, so on Windows one
+// PowerShell call (at most) checks the owners of every uncached directory at once.
+async function trustedDirs(dirs: string[], opts: OwnerCheckOptions = {}): Promise<Set<string>> {
+  const real: string[] = [];
+  for (const dir of dirs) {
+    try {
+      const st = await fs.lstat(dir);
+      if (!st.isDirectory()) continue;
+      if (process.platform !== "win32") {
+        const euid = typeof process.geteuid === "function" ? process.geteuid() : -1;
+        if (euid >= 0 && st.uid !== euid) continue;
+        if ((st.mode & 0o022) !== 0) continue;
+      }
+      real.push(dir);
+    } catch {
+      // missing / unreadable
+    }
+  }
+  if (process.platform !== "win32") return new Set(real);
+  return windowsOwnedDirs(real, opts);
 }
 
 /**
@@ -134,27 +254,31 @@ export interface DiscoveryScan {
 // nothing is ever deleted.
 export async function scanServers(
   liveness: (pid: number) => Liveness = pidLiveness,
-  roots?: string[]
+  roots?: string[],
+  opts: OwnerCheckOptions = {}
 ): Promise<DiscoveryScan> {
   const byPid = new Map<string, DiscoveredServer>();
   const unverified: number[] = [];
   for (const root of roots ?? (await discoveryRoots())) {
     // The root owner can swap a previously checked child directory. Refuse a root's
     // whole tree unless the root itself is trusted.
-    if (!(await dirIsTrusted(root))) continue;
+    if (!(await dirIsTrusted(root, opts))) continue;
     let entries;
     try {
       entries = await fs.readdir(root, { withFileTypes: true });
     } catch {
       continue;
     }
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^\d+$/.test(entry.name) || byPid.has(entry.name)) continue;
-      const dir = path.join(root, entry.name);
-      // Only trust a discovery dir we own — never read a token from a dir a local
-      // attacker could have planted (audit #9).
-      if (!(await dirIsTrusted(dir))) continue;
-      const pid = parseInt(entry.name, 10);
+    const candidates = entries
+      .filter((e) => e.isDirectory() && /^\d+$/.test(e.name) && !byPid.has(e.name))
+      .map((e) => path.join(root, e.name));
+    // Only trust a discovery dir we own — never read a token from a dir a local
+    // attacker could have planted (audit #9, R5B-WINDISC1). One batched check per root.
+    const trusted = await trustedDirs(candidates, opts);
+    for (const dir of candidates) {
+      const name = path.basename(dir);
+      if (!trusted.has(dir) || byPid.has(name)) continue;
+      const pid = parseInt(name, 10);
       const state = liveness(pid);
       if (state === "unverified") {
         if (!unverified.includes(pid)) unverified.push(pid);
@@ -165,7 +289,7 @@ export async function scanServers(
       // discovery ambiguous.
       if (state !== "own") continue;
       const server = await readServer(dir, pid);
-      if (server) byPid.set(entry.name, server);
+      if (server) byPid.set(name, server);
     }
   }
   return { live: [...byPid.values()], unverified };
