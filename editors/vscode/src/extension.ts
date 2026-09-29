@@ -82,7 +82,20 @@ export function activate(context: vscode.ExtensionContext): void {
       const token = resolution.token;
 
       try {
-        await client.connect(actualPort, token);
+        // A discovered endpoint is re-checked against discovery before the token is sent
+        // again, and followed by identity if the app restarts (R5-VSC1). An explicitly
+        // configured port + token is the user's own choice and is used as given.
+        const vouched = resolution.vouchedBy;
+        await client.connect(
+          actualPort,
+          token,
+          vouched
+            ? {
+                identifier: vouched.identifier,
+                discover: async () => (await scanServers()).live,
+              }
+            : {}
+        );
         vscode.window.showInformationMessage(
           `Victauri: Connected on port ${actualPort}`
         );

@@ -99,6 +99,15 @@ impl ServerInfo {
     }
 }
 
+/// The effective app selector: `--app`, else `VICTAURI_APP`, each trimmed, and an empty or
+/// whitespace-only value treated as NOT SET — exactly as victauri-test and the watchdog read
+/// `VICTAURI_APP` (R5-BR2). A set-but-empty `VICTAURI_APP=` used to select an app named "",
+/// which matches nothing, so every call reported "backend not reachable" with the app running.
+fn resolve_app_selector(cli: Option<String>, env: Option<String>) -> Option<String> {
+    let normalize = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    normalize(cli).or_else(|| normalize(env))
+}
+
 /// Run the stdio bridge for MCP clients.
 ///
 /// Unlike a naive proxy, this NEVER blocks the MCP handshake on discovering a backend:
@@ -116,7 +125,7 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     // now a no-op: the handshake never blocks on discovery, so there is nothing to wait for.
     // Tool calls discover lazily and fail fast with an actionable message when the app is down.
     let _ = wait;
-    let app = app.or_else(|| std::env::var("VICTAURI_APP").ok());
+    let app = resolve_app_selector(app, std::env::var("VICTAURI_APP").ok());
     let http = build_client()?;
 
     // The live backend, discovered lazily. `None` until an app is found — the bridge starts
@@ -181,9 +190,65 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
             }
         };
 
+        // A JSON-RPC batch is answered here and NEVER forwarded (R5-BR1): see `batch_rejection`.
+        if let Value::Array(items) = &msg {
+            match batch_rejection(items) {
+                Some(reply) => write_value(&stdout, &reply),
+                None => eprintln!(
+                    "victauri-bridge: dropped a JSON-RPC batch of notifications/responses \
+                     (batching is not supported)"
+                ),
+            }
+            continue;
+        }
+
+        // No `method`: a client->server RESPONSE, or an Invalid Request (R5-BR3).
+        if msg.get("method").is_none() {
+            if is_client_response(&msg) {
+                // A reply to a server-initiated request (sampling/elicitation/roots), which a
+                // stateful backend may send inside an SSE stream this bridge relays verbatim — so
+                // it must reach the backend. But JSON-RPC never answers a response: whatever the
+                // backend says (202, or an error body) is logged, never written to the client.
+                let outcome = forward_with_retries(
+                    &http,
+                    &connection,
+                    &session_id,
+                    &stateless,
+                    &cached_init,
+                    app.as_deref(),
+                    &msg,
+                )
+                .await;
+                match outcome {
+                    ForwardResult::Accepted => {}
+                    ForwardResult::Payloads(p) if p.is_empty() => {}
+                    ForwardResult::Payloads(p) => eprintln!(
+                        "victauri-bridge: backend answered a client response (not relayed): {}",
+                        p.join(" ")
+                    ),
+                    ForwardResult::Unreachable(e) => {
+                        eprintln!("victauri-bridge: could not deliver a client response: {e}");
+                    }
+                }
+            } else {
+                write_value(
+                    &stdout,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": msg.get("id").cloned().unwrap_or(Value::Null),
+                        "error": {
+                            "code": INVALID_REQUEST,
+                            "message": "invalid request: a JSON-RPC request needs a `method`"
+                        }
+                    }),
+                );
+            }
+            continue;
+        }
+
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
-        let is_notification = msg.get("id").is_none();
+        let is_notification = !expects_reply(&msg);
 
         match method {
             // ── Answered locally — never block on a backend ──────────────────────
@@ -284,6 +349,62 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Whether `msg` is a JSON-RPC request the client is waiting on a reply to: it has both a
+/// `method` and an `id`. Notifications (no `id`) and responses (no `method`) never get one.
+fn expects_reply(msg: &Value) -> bool {
+    msg.get("method").is_some() && msg.get("id").is_some()
+}
+
+/// A client->server JSON-RPC response: no `method`, and a `result` or an `error`.
+fn is_client_response(msg: &Value) -> bool {
+    msg.get("method").is_none() && (msg.get("result").is_some() || msg.get("error").is_some())
+}
+
+/// JSON-RPC "Invalid Request" — used for a batch, which MCP does not support.
+const INVALID_REQUEST: i64 = -32600;
+const BATCH_UNSUPPORTED: &str = "batch requests are not supported: MCP removed JSON-RPC \
+     batching in protocol revision 2025-06-18; send each message as its own line";
+
+/// The local reply to a JSON-RPC batch (a JSON array on stdin), or `None` when nothing may be
+/// answered.
+///
+/// MCP removed batching in 2025-06-18 and the embedded server rejects a batch without executing
+/// it, so the bridge never forwards one: forwarding only produced an id-less error the client
+/// could not match (or, after a post-send failure, re-sent the whole batch). Instead it answers
+/// the way JSON-RPC 2.0 §6 prescribes for a batch: an ARRAY holding one `-32600` error per
+/// request element, each carrying that element's `id`, so every id the client is waiting on is
+/// resolved. Notifications and responses inside the batch get no entry (JSON-RPC never answers
+/// either); an element that is not an object gets an error with `id: null`. An empty array is
+/// itself an invalid request → a single error object with `id: null`. A batch of only
+/// notifications/responses → `None` (§6: "the Server MUST NOT return an empty Array").
+fn batch_rejection(items: &[Value]) -> Option<Value> {
+    let error = |id: Value| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": INVALID_REQUEST, "message": BATCH_UNSUPPORTED }
+        })
+    };
+    if items.is_empty() {
+        return Some(error(Value::Null));
+    }
+    let replies: Vec<Value> = items
+        .iter()
+        .filter_map(|item| {
+            let Some(obj) = item.as_object() else {
+                return Some(error(Value::Null));
+            };
+            let is_notification = obj.contains_key("method") && !obj.contains_key("id");
+            if is_notification || is_client_response(item) {
+                None
+            } else {
+                Some(error(obj.get("id").cloned().unwrap_or(Value::Null)))
+            }
+        })
+        .collect();
+    (!replies.is_empty()).then_some(Value::Array(replies))
 }
 
 /// The `initialize` reply the bridge synthesizes itself, so the MCP server is "connected"
@@ -580,7 +701,9 @@ async fn forward_with_retries(
     app: Option<&str>,
     msg: &Value,
 ) -> ForwardResult {
-    let is_notification = msg.get("id").is_none();
+    // Only a request (method + id) is owed a reply; never synthesize one for a notification or
+    // for a client response (R5-BR3).
+    let is_notification = !expects_reply(msg);
 
     // SECURITY (audit #1): re-resolve the trusted backend on EVERY forward — never reuse a cached
     // `(port, token)` without re-confirming, right now, that the port still belongs to a live,
@@ -818,7 +941,12 @@ async fn post_message(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = resp.text().await.unwrap_or_default();
+        // A body that fails mid-read (the app died or the connection dropped mid-SSE-stream,
+        // after the request was delivered — possibly after progress events) is a POST-SEND
+        // failure, so it propagates: the caller then never re-sends a tool call and tells the
+        // client it may already have run. Swallowing it (`unwrap_or_default`) reported a
+        // misleading "empty or non-JSON response" instead (R5-BR4).
+        let body = resp.text().await?;
 
         if !(200..300).contains(&status) {
             // Surface a JSON-RPC error for the original request id.
@@ -1799,6 +1927,68 @@ mod tests {
         assert!(!dir_is_trusted(&link), "symlinked dir must be rejected");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R5-BR3: only a request (method + id) is owed a reply.
+    #[test]
+    fn only_requests_expect_a_reply() {
+        assert!(expects_reply(&json!({"id": 1, "method": "tools/call"})));
+        assert!(!expects_reply(&json!({"method": "notifications/x"})));
+        assert!(!expects_reply(&json!({"id": 1, "result": {}})));
+        assert!(is_client_response(&json!({"id": 1, "result": {}})));
+        assert!(is_client_response(&json!({"id": 1, "error": {"code": 1}})));
+        assert!(!is_client_response(&json!({"id": 1})));
+        assert!(!is_client_response(
+            &json!({"id": 1, "method": "m", "result": {}})
+        ));
+    }
+
+    /// R5-BR1: a batch is rejected locally, one error per request element, per JSON-RPC §6.
+    #[test]
+    fn batch_rejection_answers_each_request_and_nothing_else() {
+        let reply = batch_rejection(&[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled"}),
+            json!({"jsonrpc":"2.0","id":"srv-1","result":{}}),
+            json!({"jsonrpc":"2.0","id":2}),
+            json!("junk"),
+        ])
+        .unwrap();
+        let ids: Vec<Value> = reply
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!(1), json!(2), Value::Null]);
+        assert!(
+            reply
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["error"]["code"] == INVALID_REQUEST)
+        );
+        let empty = batch_rejection(&[]).unwrap();
+        assert!(empty.is_object() && empty["id"].is_null());
+        assert_eq!(
+            batch_rejection(&[json!({"jsonrpc":"2.0","method":"notifications/x"})]),
+            None
+        );
+    }
+
+    /// R5-BR2: blank selectors are "unset", matching victauri-test and the watchdog.
+    #[test]
+    fn app_selector_treats_blank_as_unset() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(resolve_app_selector(None, None), None);
+        assert_eq!(resolve_app_selector(None, s("")), None);
+        assert_eq!(resolve_app_selector(None, s(" \t")), None);
+        assert_eq!(resolve_app_selector(s(""), s("com.env")), s("com.env"));
+        assert_eq!(resolve_app_selector(None, s(" com.env ")), s("com.env"));
+        assert_eq!(
+            resolve_app_selector(s("com.cli"), s("com.env")),
+            s("com.cli")
+        );
     }
 
     // Round-4 audit, blocker #3 (CLI empty-token fallback): a blank `VICTAURI_AUTH_TOKEN`

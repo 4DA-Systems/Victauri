@@ -5336,6 +5336,7 @@ dependencies = [
  "axum",
  "clap",
  "ctrlc",
+ "futures-util",
  "notify",
  "reqwest 0.12.28",
  "serde_json",

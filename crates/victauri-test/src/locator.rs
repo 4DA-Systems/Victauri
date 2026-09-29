@@ -848,7 +848,11 @@ fn element_result(val: Value, locator: &Locator) -> Result<Value, TestError> {
         )));
     }
     if let Some(msg) = val.get(ERROR_KEY).and_then(Value::as_str) {
-        return Err(TestError::Assertion(format!("{locator}: {msg}")));
+        // The message comes from the page: never let it drive a terminal or a CI log (R5-TERM2).
+        return Err(TestError::Assertion(format!(
+            "{locator}: {}",
+            crate::terminal::single_line(msg)
+        )));
     }
     Ok(val)
 }
@@ -1912,6 +1916,22 @@ mod tests {
         ];
         let picked = loc.pick_one(elements).unwrap();
         assert_eq!(picked.ref_id, "e2");
+    }
+
+    /// R5-TERM2: an element script's error message is page-controlled text.
+    #[test]
+    fn element_error_text_is_terminal_safe() {
+        let val = json!({ ERROR_KEY: "nope\n::error::forged\u{1b}[2J" });
+        let err = element_result(val, &Locator::css("p")).unwrap_err();
+        let TestError::Assertion(msg) = &err else {
+            panic!("expected an assertion error, got {err:?}");
+        };
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert!(msg.contains("nope") && msg.contains("forged"), "{msg}");
+        assert!(
+            !err.to_string().lines().any(|l| l.starts_with("::")),
+            "{err}"
+        );
     }
 
     #[test]
