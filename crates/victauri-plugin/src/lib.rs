@@ -716,6 +716,16 @@ impl VictauriBuilder {
     /// });
     /// # let _ = builder;
     /// ```
+    ///
+    /// # Threading
+    ///
+    /// The closure runs on tokio's **blocking pool** (under a deadline, with panics isolated),
+    /// never on the Tauri main thread. It must therefore not capture, clone or drop Tauri
+    /// handles (`AppHandle`, `Window`, `Webview`, `WebviewWindow`, …) nor call
+    /// `get_webview_window` / `webview_windows`: on Linux every Tauri handle carries a
+    /// non-atomic `Rc` owned by the main thread (tao's window set), and touching it from another
+    /// thread corrupts the host's heap. Read your own `Send + Sync` state (an `Arc`, a lock, an
+    /// atomic) instead, as above.
     #[must_use]
     pub fn probe<F>(mut self, name: impl Into<String>, probe: F) -> Self
     where
@@ -727,6 +737,16 @@ impl VictauriBuilder {
 
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
+    ///
+    /// # Threading
+    ///
+    /// The callback runs on a **tokio worker thread** (Tauri's async runtime), not on the main
+    /// thread, and blocks that worker while it runs — keep it short. Like a
+    /// [`probe`](Self::probe), it must not capture, clone or drop Tauri handles nor call
+    /// `get_webview_window` / `webview_windows` (on Linux that races the main thread's
+    /// non-atomic `Rc` and corrupts the heap) — moving a handle into the callback means it is
+    /// dropped on the worker. To act on the app, signal your own main-thread code instead (a
+    /// channel, an atomic, or state it reads).
     #[must_use]
     pub fn on_ready(mut self, f: impl FnOnce(u16) + Send + 'static) -> Self {
         self.on_ready = Some(Box::new(f));

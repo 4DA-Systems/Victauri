@@ -474,9 +474,17 @@ where
 }
 
 /// One serialized round trip: take `gate`'s lock (see [`MAIN_DISPATCH_LOCK`]), then hand `f` to `post`
-/// and wait for it. `timeout` bounds the WHOLE call, including the wait for the lock, so
-/// serializing cannot stack N callers into N * timeout when the UI wedges: each caller still
-/// gives up after `timeout` total, exactly as it did before the lock existed.
+/// and wait for it.
+///
+/// `timeout` is one deadline shared by everything BEFORE the closure starts — the wait for the
+/// lock, for an earlier abandoned closure still running, and for this closure to be picked up —
+/// so serializing cannot stack N callers into N * timeout when the UI wedges: a closure that has
+/// not started by the deadline is abandoned (it never runs) and the call returns at `timeout`.
+/// A closure that DID start before the deadline is waited for up to a further `timeout` (the
+/// `grace` passed to [`dispatch_and_wait`]) so its real outcome is reported rather than
+/// "timed out" for work that happened. So a call returns within `timeout` if its closure never
+/// started, and within about 2 × `timeout` in the worst case (it started just before the
+/// deadline and then ran long).
 fn serialized_round_trip<T, F>(
     gate: &'static DispatchGate,
     what: &str,
