@@ -49,6 +49,78 @@ const SENSITIVE_JSON_KEYS: &[&str] = &[
     "card_number",
 ];
 
+/// URL query/fragment parameters whose value is a credential. Matched only as a whole parameter
+/// name right after `?`, `&` or `#`, so `?keyboard=` or `&tokens_used=` are left alone.
+const SECRET_URL_PARAMS: &[&str] = &[
+    "access_token",
+    "access-token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "key",
+    "client_secret",
+    "secret",
+    "password",
+    "passwd",
+    "pwd",
+    "auth",
+    "sig",
+    "signature",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "x-goog-signature",
+    "x-goog-credential",
+];
+
+/// `?name=value` / `&name=value` / `#name=value` for a [`SECRET_URL_PARAMS`] name; the value runs
+/// to the next separator, whitespace, quote or backslash (the end of a JSON string).
+static URL_SECRET_PARAM_RE: std::sync::LazyLock<Option<regex::Regex>> =
+    std::sync::LazyLock::new(|| {
+        let names: Vec<String> = SECRET_URL_PARAMS.iter().map(|n| regex::escape(n)).collect();
+        compile_builtin(&format!(
+            r#"(?i)([?&#](?:{})=)[^&#\s"'<>\\]+"#,
+            names.join("|")
+        ))
+    });
+
+/// `"<key containing a sensitive word>": "<string>"` or `: <number>` in free text — JSON
+/// embedded in a non-JSON output, a truncated JSON fragment, or the content of a JSON string. A
+/// string value cut off by the end of the text (a truncated body) is redacted to the end.
+static TEXT_KEY_VALUE_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(
+    || {
+        let mut words: Vec<String> = SENSITIVE_JSON_KEYS
+            .iter()
+            .map(|k| regex::escape(&k.to_lowercase()))
+            .collect();
+        words.sort();
+        words.dedup();
+        compile_builtin(&format!(
+            r#"(?i)("[^"\\\n]{{0,64}}?(?:{})[^"\\\n]{{0,64}}?"\s*:\s*)("(?:[^"\\]|\\.)*(?:"|\z)|-?\d[\d.eE+-]*)"#,
+            words.join("|")
+        ))
+    },
+);
+
+/// Compile one of the built-in patterns; a failure is a bug, logged instead of panicking.
+fn compile_builtin(pattern: &str) -> Option<regex::Regex> {
+    regex::Regex::new(pattern)
+        .inspect_err(|e| tracing::error!("BUG: built-in redaction pattern failed to compile: {e}"))
+        .ok()
+}
+
+/// Replace the value of every sensitive `"key": value` pair found in free text.
+fn redact_text_key_values(text: &str) -> std::borrow::Cow<'_, str> {
+    match TEXT_KEY_VALUE_RE.as_ref() {
+        Some(re) => re.replace_all(text, r#"${1}"[REDACTED]""#),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
 /// Output redactor that scrubs API keys, tokens, emails, and sensitive JSON keys
 /// from MCP tool output. Applies built-in patterns plus optional custom regexes.
 pub struct Redactor {
@@ -143,9 +215,20 @@ impl Redactor {
     }
 
     /// Scrub sensitive data from `input` using regex patterns and JSON-key matching.
+    ///
+    /// Passes, in order: the value patterns (API keys, bearer tokens, JWTs, emails, … plus any
+    /// custom patterns); credential parameters in URLs (`?access_token=…`, `&sig=…`); then keys.
+    /// Key-based redaction applies to the whole output when it is JSON — including JSON carried
+    /// inside its string values (IPC/network bodies are JSON-encoded strings) — and otherwise to
+    /// `"key": value` pairs found in the text. Best effort: see the limits in `docs/src/security.md`.
     #[must_use]
     pub fn redact(&self, input: &str) -> String {
         let mut output = self.redact_regex(input);
+        if let Some(re) = URL_SECRET_PARAM_RE.as_ref()
+            && re.is_match(&output)
+        {
+            output = re.replace_all(&output, "${1}[REDACTED]").into_owned();
+        }
         output = self.redact_json_keys(&output);
         output
     }
@@ -176,68 +259,81 @@ impl Redactor {
     }
 
     fn redact_json_keys(&self, input: &str) -> String {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(input) {
-            if !json_has_sensitive_keys(&value) {
-                return input.to_string();
-            }
-            let redacted = redact_json_value(&value);
-            serde_json::to_string(&redacted).unwrap_or_else(|_| input.to_string())
-        } else {
-            input.to_string()
+        match serde_json::from_str::<serde_json::Value>(input) {
+            Ok(value) => match redact_json_value(&value, 0) {
+                Some(redacted) => {
+                    serde_json::to_string(&redacted).unwrap_or_else(|_| input.to_string())
+                }
+                None => input.to_string(),
+            },
+            // Not JSON as a whole: redact the `"key": value` pairs of any JSON inside the text.
+            Err(_) => redact_text_key_values(input).into_owned(),
         }
     }
 }
 
-fn json_has_sensitive_keys(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, val) in map {
-                let lower_key = key.to_lowercase();
-                if SENSITIVE_JSON_KEYS
-                    .iter()
-                    .any(|k| lower_key.contains(&k.to_lowercase()))
-                {
-                    return true;
-                }
-                if json_has_sensitive_keys(val) {
-                    return true;
-                }
-            }
-            false
-        }
-        serde_json::Value::Array(arr) => arr.iter().any(json_has_sensitive_keys),
-        _ => false,
-    }
+/// How deep JSON nested inside JSON strings is followed.
+const MAX_NESTED_JSON_DEPTH: usize = 4;
+
+fn is_sensitive_key(key: &str) -> bool {
+    let lower_key = key.to_lowercase();
+    SENSITIVE_JSON_KEYS
+        .iter()
+        .any(|k| lower_key.contains(&k.to_lowercase()))
 }
 
-fn redact_json_value(value: &serde_json::Value) -> serde_json::Value {
+/// `value` with every sensitive key's value redacted, or `None` if nothing needed redacting.
+/// A string value that holds JSON is redacted inside (and re-encoded); any other string has the
+/// `"key": value` pairs in its text redacted (a truncated JSON body, say).
+fn redact_json_value(value: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
     match value {
         serde_json::Value::Object(map) => {
+            let mut changed = false;
             let mut new_map = serde_json::Map::new();
             for (key, val) in map {
-                let lower_key = key.to_lowercase();
-                if SENSITIVE_JSON_KEYS
-                    .iter()
-                    .any(|k| lower_key.contains(&k.to_lowercase()))
-                {
-                    if val.is_string() || val.is_number() {
-                        new_map.insert(key.clone(), serde_json::Value::String("[REDACTED]".into()));
-                    } else if val.is_boolean() {
-                        // Booleans like has_api_key: true are safe — they indicate presence, not value
-                        new_map.insert(key.clone(), val.clone());
-                    } else {
-                        new_map.insert(key.clone(), serde_json::Value::String("[REDACTED]".into()));
-                    }
+                let new_val = if is_sensitive_key(key) && !val.is_boolean() {
+                    // Booleans like `has_api_key: true` only indicate presence — kept.
+                    Some(serde_json::Value::String("[REDACTED]".into()))
                 } else {
-                    new_map.insert(key.clone(), redact_json_value(val));
-                }
+                    redact_json_value(val, depth)
+                };
+                changed |= new_val.is_some();
+                new_map.insert(key.clone(), new_val.unwrap_or_else(|| val.clone()));
             }
-            serde_json::Value::Object(new_map)
+            changed.then_some(serde_json::Value::Object(new_map))
         }
         serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.iter().map(redact_json_value).collect())
+            let redacted: Vec<Option<serde_json::Value>> =
+                arr.iter().map(|v| redact_json_value(v, depth)).collect();
+            redacted.iter().any(Option::is_some).then(|| {
+                serde_json::Value::Array(
+                    redacted
+                        .into_iter()
+                        .zip(arr)
+                        .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                        .collect(),
+                )
+            })
         }
-        other => other.clone(),
+        serde_json::Value::String(text) => redact_json_string(text, depth),
+        _ => None,
+    }
+}
+
+fn redact_json_string(text: &str, depth: usize) -> Option<serde_json::Value> {
+    let trimmed = text.trim_start();
+    if depth < MAX_NESTED_JSON_DEPTH
+        && (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Ok(inner) = serde_json::from_str::<serde_json::Value>(text)
+    {
+        let redacted = redact_json_value(&inner, depth + 1)?;
+        return serde_json::to_string(&redacted)
+            .ok()
+            .map(serde_json::Value::String);
+    }
+    match redact_text_key_values(text) {
+        std::borrow::Cow::Owned(redacted) => Some(serde_json::Value::String(redacted)),
+        std::borrow::Cow::Borrowed(_) => None,
     }
 }
 
@@ -325,6 +421,67 @@ mod tests {
         assert!(output.contains("[REDACTED]"));
         assert!(output.contains("gpt-4"));
         assert!(!output.contains("sk-live-xxx"));
+    }
+
+    /// R5B-REDACT1: secrets in URL query strings were not matched (tokens ride in IPC/network
+    /// URLs), and key-based redaction only applied when the WHOLE output parsed as JSON.
+    #[test]
+    fn redacts_secret_query_parameters() {
+        let r = Redactor::default();
+        let out = r.redact(
+            "GET https://api.example.com/v1/items?user=7&access_token=abc123def&page=2              https://x.test/cb#id_token=eyJraWQ&state=s https://h.test/?API_KEY=k9k9k9              https://blob.test/f?sv=2024&sig=Zx%2Fq&se=1",
+        );
+        for secret in ["abc123def", "eyJraWQ", "k9k9k9", "Zx%2Fq"] {
+            assert!(!out.contains(secret), "{secret} survived: {out}");
+        }
+        for kept in ["user=7", "page=2", "state=s", "sv=2024", "se=1"] {
+            assert!(out.contains(kept), "{kept} was redacted: {out}");
+        }
+        // Not a secret parameter: only whole parameter names match.
+        let clean = "https://x.test/?keyboard=us&monkey=1&tokens_used=5";
+        assert_eq!(r.redact(clean), clean);
+        // Inside a JSON string, the URL is redacted and the JSON stays valid.
+        let json = r#"{"url":"https://x.test/a?token=zzz111&b=1"}"#;
+        let v: serde_json::Value = serde_json::from_str(&r.redact(json)).unwrap();
+        assert_eq!(v["url"], "https://x.test/a?token=[REDACTED]&b=1");
+    }
+
+    #[test]
+    fn redacts_sensitive_keys_in_json_embedded_in_text() {
+        let r = Redactor::default();
+        let out =
+            r.redact(r#"invoke login -> {"ok":true,"session_token":"s3cr3t-value","n":1} done"#);
+        assert!(!out.contains("s3cr3t-value"), "{out}");
+        assert!(out.contains(r#""ok":true"#), "{out}");
+        // A truncated JSON fragment (log fields are cut at 4 KB) still has its keys redacted.
+        let out = r.redact(r#"body: {"password": "hunter2", "data": "xxxxxxxx…(truncated"#);
+        assert!(!out.contains("hunter2"), "{out}");
+        // …including when the cut falls inside the secret itself.
+        let out = r.redact(r#"body: {"id": 1, "secret": "abcdefgh"#);
+        assert!(!out.contains("abcdefgh"), "{out}");
+        assert!(out.contains(r#""id": 1"#), "{out}");
+    }
+
+    #[test]
+    fn redacts_sensitive_keys_in_json_nested_inside_json_strings() {
+        let r = Redactor::default();
+        // IPC/network logs carry bodies as JSON-encoded strings inside the JSON result.
+        let input = serde_json::json!({
+            "command": "get_settings",
+            "response": "{\"llm\":{\"api_key\":\"sk-live-abc\",\"model\":\"m1\"}}",
+            "truncated_body": "{\"refresh_token\":\"rt-999\",\"x\":\"…"
+        })
+        .to_string();
+        let out = r.redact(&input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+        let response = v["response"].as_str().unwrap();
+        assert!(!response.contains("sk-live-abc"), "{out}");
+        assert!(response.contains("m1"), "{out}");
+        assert!(
+            !v["truncated_body"].as_str().unwrap().contains("rt-999"),
+            "{out}"
+        );
+        assert_eq!(v["command"], "get_settings");
     }
 
     #[test]
