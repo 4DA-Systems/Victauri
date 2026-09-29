@@ -421,6 +421,14 @@ fn is_main_thread() -> bool {
 ///
 /// Round trips are additionally serialized through [`MAIN_DISPATCH_LOCK`] — see there for the
 /// heap corruption that requires it and the bisect that established it.
+///
+/// **Blocking.** Off the main thread this call BLOCKS its thread until the closure's outcome is
+/// known — up to its 10 s deadline, or about 20 s when the closure started just before it (see
+/// [`serialized_round_trip`]). On a multi-threaded tokio runtime it runs under `block_in_place`,
+/// so the runtime keeps serving other tasks. On a **current-thread** runtime that is impossible
+/// (`block_in_place` panics there), so the whole runtime — every task on it — stalls for that
+/// long while the UI is wedged. Victauri's own server runs on a multi-threaded runtime; do not
+/// call bridge methods from a current-thread runtime you care about.
 fn on_main<R, T, F>(app: &tauri::AppHandle<R>, what: &str, f: F) -> Result<T, String>
 where
     R: Runtime,

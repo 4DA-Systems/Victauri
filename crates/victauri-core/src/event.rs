@@ -438,6 +438,55 @@ impl EventLog {
             .collect()
     }
 
+    /// Returns the newest `limit` IPC calls, oldest first.
+    ///
+    /// Unlike [`ipc_calls`](Self::ipc_calls) this clones only the calls it returns (a call
+    /// carries its whole request/response body), so its cost is bounded by `limit`, not by the
+    /// size of the log.
+    #[must_use]
+    pub fn recent_ipc_calls(&self, limit: usize) -> Vec<IpcCall> {
+        let events = crate::acquire_lock(&self.events, "EventLog");
+        let mut calls: Vec<IpcCall> = events
+            .iter()
+            .rev()
+            .filter_map(|e| match e {
+                AppEvent::Ipc(call) => Some(call),
+                _ => None,
+            })
+            .take(limit)
+            .cloned()
+            .collect();
+        drop(events);
+        calls.reverse();
+        calls
+    }
+
+    /// Returns the distinct command names of the IPC calls in the log, without cloning the
+    /// calls themselves.
+    #[must_use]
+    pub fn ipc_command_names(&self) -> std::collections::BTreeSet<String> {
+        let events = crate::acquire_lock(&self.events, "EventLog");
+        let mut names = std::collections::BTreeSet::new();
+        for event in events.iter() {
+            if let AppEvent::Ipc(call) = event
+                && !names.contains(call.command.as_str())
+            {
+                names.insert(call.command.clone());
+            }
+        }
+        names
+    }
+
+    /// Calls `f` on every IPC call in the log, in order, under the log's lock (so `f` must be
+    /// quick and must not touch the log). Nothing is cloned.
+    pub(crate) fn for_each_ipc_call(&self, mut f: impl FnMut(&IpcCall)) {
+        for event in crate::acquire_lock(&self.events, "EventLog").iter() {
+            if let AppEvent::Ipc(call) = event {
+                f(call);
+            }
+        }
+    }
+
     /// Returns IPC calls with a timestamp at or after the given time.
     #[must_use]
     pub fn ipc_calls_since(&self, timestamp: DateTime<Utc>) -> Vec<IpcCall> {

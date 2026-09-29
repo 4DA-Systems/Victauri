@@ -453,15 +453,17 @@ pub struct ErrorCall {
 #[must_use]
 pub fn check_ipc_integrity(event_log: &EventLog, stale_threshold_ms: i64) -> IpcIntegrityReport {
     let now = Utc::now();
-    let calls = event_log.ipc_calls();
-    let total_calls = calls.len();
+    let mut total_calls = 0usize;
     let mut completed = 0usize;
     let mut pending = 0usize;
     let mut errored = 0usize;
     let mut stale_calls = Vec::new();
     let mut error_calls = Vec::new();
 
-    for call in &calls {
+    // Scanned in place: cloning every call (each carries its whole request/response body) just
+    // to count them cost a full copy of the log per check.
+    event_log.for_each_ipc_call(|call| {
+        total_calls += 1;
         match &call.result {
             IpcResult::Ok(_) => completed += 1,
             IpcResult::Pending => {
@@ -488,7 +490,7 @@ pub fn check_ipc_integrity(event_log: &EventLog, stale_threshold_ms: i64) -> Ipc
                 });
             }
         }
-    }
+    });
 
     let healthy = stale_calls.is_empty() && errored == 0;
 

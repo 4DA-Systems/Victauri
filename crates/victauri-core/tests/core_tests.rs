@@ -2630,3 +2630,23 @@ fn dom_snapshot_accessible_text_uses_tag_when_no_role() {
     let text = snapshot.to_accessible_text(0);
     assert!(text.contains("- section \"Content\""));
 }
+
+/// R5B-PAGEQ1: page-callable `victauri_get_ipc_log` / `victauri_detect_ghost_commands` cloned
+/// every call in the log (bodies included) on the UI thread. The bounded accessors return the
+/// same data as the full clone for what they cover.
+#[test]
+fn recent_ipc_calls_and_command_names_match_the_full_log() {
+    let log = EventLog::new(1000);
+    for i in 0..50 {
+        log.push(make_ipc_simple(&format!("c{i}"), &format!("cmd{}", i % 3)));
+        log.push(AppEvent::state_change(format!("k{i}"), Utc::now(), None));
+    }
+    let all = log.ipc_calls();
+    let recent = log.recent_ipc_calls(10);
+    assert_eq!(recent.len(), 10);
+    assert_eq!(recent, all[40..].to_vec(), "newest 10, oldest first");
+    assert_eq!(log.recent_ipc_calls(1000), all);
+    assert!(log.recent_ipc_calls(0).is_empty());
+    let names: Vec<String> = log.ipc_command_names().into_iter().collect();
+    assert_eq!(names, vec!["cmd0", "cmd1", "cmd2"]);
+}
