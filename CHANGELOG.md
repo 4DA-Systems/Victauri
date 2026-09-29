@@ -479,6 +479,12 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
   corrected: the animation scrub/sweep helpers (`scrubPrepare`, `scrubSeek`, `scrubRestore`,
   `installSweepRecorder`, `readSweep`) are on the public `window.__VICTAURI__`, not behind the
   per-process key as round 3 said.
+- MIGRATION.md did not list most of the API this release hid: all of `victauri_core::middleware`
+  and `victauri_core::security`, `acquire_lock`/`acquire_read`/`acquire_write`, the plugin's
+  `privacy::{strict,observe,test}_privacy_config` and several `database` / `js_bridge` /
+  `screencast` items. It now lists every removed, hidden and newly `#[non_exhaustive]` item that
+  `cargo semver-checks --release-type minor` reports against 0.8.8 for core, plugin and test.
+  CONTRIBUTING.md no longer presents the hidden `acquire_*` helpers as API.
 
 ## [0.8.8] - 2026-08-12
 
