@@ -464,3 +464,92 @@ fn r5_js4_route_glob_matches_a_literal_question_mark() {
         "{r}"
     );
 }
+
+// ── R5-JS5: capped uncaught-error messages; pristine JSON.parse in addRoute ──
+
+/// `error` / `unhandledrejection` capture stored the whole message (console messages are
+/// capped at 4096 chars), so one huge thrown message filled the console log's budget.
+#[test]
+fn r5_js5_uncaught_error_messages_are_capped_like_console_messages() {
+    let def = def(
+        None,
+        vec![case(
+            "huge uncaught error + rejection",
+            r"
+            window.dispatchEvent(new ErrorEvent('error', { message: 'E'.repeat(100000) }));
+            var ev = new Event('unhandledrejection');
+            ev.reason = new Error('R'.repeat(100000));
+            window.dispatchEvent(ev);
+            var odd = new Event('unhandledrejection');
+            odd.reason = Object.create(null); // String() of this throws
+            window.dispatchEvent(odd);
+            return window.__VICTAURI__.getConsoleLogs().map(function(l) {
+                return { len: l.message.length, head: l.message.slice(0, 24), tail: l.message.slice(-40) };
+            });
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let logs = result(&results, 0);
+    let logs = logs.as_array().unwrap();
+    assert_eq!(logs.len(), 3, "{logs:?}");
+    for l in &logs[..2] {
+        let len = l["len"].as_u64().unwrap();
+        assert!(len < 4200, "uncaught message not capped ({len} chars): {l}");
+        assert!(
+            l["tail"].as_str().unwrap().contains("bytes truncated"),
+            "{l}"
+        );
+    }
+    assert!(
+        logs[0]["head"]
+            .as_str()
+            .unwrap()
+            .starts_with("[uncaught] E")
+    );
+    assert!(
+        logs[1]["head"]
+            .as_str()
+            .unwrap()
+            .starts_with("[unhandled rejection] R")
+    );
+    assert!(
+        logs[2]["head"]
+            .as_str()
+            .unwrap()
+            .starts_with("[unhandled rejection]"),
+        "an unprintable reason is still recorded: {logs:?}"
+    );
+}
+
+/// `addRoute` parsed the agent's rule with the page's `JSON.parse`, so page script could
+/// rewrite every rule the agent added (e.g. turn a block into a no-op).
+#[test]
+fn r5_js5_add_route_parses_with_the_pristine_json_parse() {
+    let def = def(
+        Some(
+            "JSON.parse = function() { return { pattern: 'never-matches', action: 'delay' }; };"
+                .to_string(),
+        ),
+        vec![case(
+            "page JSON.parse replaced",
+            r#"
+            var r = window.__VICTAURI__.addRoute('{"pattern":"/api/x","action":"block"}');
+            return { ok: r.ok, pattern: r.rule && r.rule.pattern, action: r.rule && r.rule.action };
+            "#,
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    assert_eq!(
+        r,
+        serde_json::json!({ "ok": true, "pattern": "/api/x", "action": "block" }),
+        "{r}"
+    );
+}

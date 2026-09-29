@@ -1236,7 +1236,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         // action ('block'|'fulfill'|'delay'), status, status_text, headers,
         // body, content_type, delay_ms, times }. Returns the assigned id.
         addRoute: function(rule) {
-            if (typeof rule === 'string') { try { rule = JSON.parse(rule); } catch (e) { return { ok: false, error: 'invalid rule JSON' }; } }
+            // The captured parse, not the page's: page script could rewrite every rule the agent adds.
+            if (typeof rule === 'string') { try { rule = PRISTINE_PARSE(rule); } catch (e) { return { ok: false, error: 'invalid rule JSON' }; } }
             if (!rule || !rule.pattern) return { ok: false, error: 'route rule requires a pattern' };
             if ((rule.action || 'fulfill') === 'fulfill' && typeof rule.status === 'number'
                 && (rule.status !== Math.floor(rule.status) || rule.status < 200 || rule.status > 599)) {
@@ -2550,6 +2551,17 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
     }
 
+    // Strip control characters and cap at MAX_CONSOLE_MSG, marking what was cut. Shared by
+    // console capture and uncaught-error capture (R5-JS5: the latter stored whole messages).
+    function capConsoleMessage(msg, skippedArgs) {
+        msg = msg.replace(CTRL_RE, '');
+        if (msg.length > MAX_CONSOLE_MSG) {
+            msg = truncText(msg, MAX_CONSOLE_MSG) + '…[+' + (msg.length - MAX_CONSOLE_MSG) + ' bytes truncated'
+                + (skippedArgs ? ', ' + skippedArgs + ' more args' : '') + ']';
+        }
+        return msg;
+    }
+
     function hookConsole(level) {
         console[level] = function() {
             try {
@@ -2560,12 +2572,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (i) msg += ' ';
                     msg += safeArgString(arguments[i]);
                 }
-                msg = msg.replace(CTRL_RE, '');
-                if (msg.length > MAX_CONSOLE_MSG) {
-                    msg = truncText(msg, MAX_CONSOLE_MSG) + '…[+' + (msg.length - MAX_CONSOLE_MSG) + ' bytes truncated'
-                        + (skippedArgs ? ', ' + skippedArgs + ' more args' : '') + ']';
-                }
-                consoleLogs.push({ level: level, message: msg, timestamp: Date.now() });
+                consoleLogs.push({ level: level, message: capConsoleMessage(msg, skippedArgs), timestamp: Date.now() });
                 if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
             } catch (e) {}
             // Always forward to the original method, whatever capture did.
@@ -2582,16 +2589,25 @@ const INIT_SCRIPT_BODY: &str = r#"
     // ── Global Error Capture ────────────────────────────────────────────────
 
     window.addEventListener('error', function(e) {
-        var msg = e.message || 'Unknown error';
-        if (e.filename) msg += ' at ' + e.filename + ':' + e.lineno + ':' + e.colno;
-        consoleLogs.push({ level: 'error', message: ('[uncaught] ' + msg).replace(CTRL_RE, ''), timestamp: Date.now() });
-        if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        try {
+            var msg = safeArgString(e.message || 'Unknown error');
+            if (e.filename) msg += ' at ' + safeArgString(e.filename) + ':' + e.lineno + ':' + e.colno;
+            consoleLogs.push({ level: 'error', message: capConsoleMessage('[uncaught] ' + msg, 0), timestamp: Date.now() });
+            if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        } catch (x) {}
     });
 
     window.addEventListener('unhandledrejection', function(e) {
-        var msg = e.reason ? (e.reason.message || String(e.reason)) : 'Unhandled promise rejection';
-        consoleLogs.push({ level: 'error', message: ('[unhandled rejection] ' + msg).replace(CTRL_RE, ''), timestamp: Date.now() });
-        if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        try {
+            var r = e.reason, msg;
+            if (!r) msg = 'Unhandled promise rejection';
+            else {
+                var m; try { m = r.message; } catch (x) { m = undefined; }
+                msg = safeArgString(m || r);
+            }
+            consoleLogs.push({ level: 'error', message: capConsoleMessage('[unhandled rejection] ' + msg, 0), timestamp: Date.now() });
+            if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+        } catch (x) {}
     });
 
     // ── Interaction Observer (for record mode) ────────────────────────────────

@@ -2722,6 +2722,10 @@ impl VictauriMcpHandler {
             }
             RouteAction::Matches => {
                 let limit = params.limit.unwrap_or(100);
+                // A maximum of 0 entries is none — not "all" (the bridge's falsy limit).
+                if limit == 0 {
+                    return CallToolResult::success(vec![ContentBlock::text("[]")]);
+                }
                 let code = format!("return window.__VICTAURI__?.getRouteMatches({limit})");
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
@@ -3110,6 +3114,22 @@ impl VictauriMcpHandler {
         )
     )]
     async fn logs(&self, Parameters(params): Parameters<LogsParams>) -> CallToolResult {
+        // `limit` is the maximum number of entries to return, so 0 returns none (R5-JS5). The
+        // page is not asked at all: `.slice(-0)` and the bridge's "falsy limit = everything"
+        // used to turn it into EVERY entry, bodies included.
+        if params.limit == Some(0)
+            && matches!(
+                params.action,
+                LogsAction::Console
+                    | LogsAction::Network
+                    | LogsAction::Ipc
+                    | LogsAction::Navigation
+                    | LogsAction::Dialogs
+                    | LogsAction::Events
+            )
+        {
+            return CallToolResult::success(vec![ContentBlock::text("[]")]);
+        }
         match params.action {
             LogsAction::Console => {
                 let since_arg = params.since.map(|ts| format!("{ts}")).unwrap_or_default();
@@ -5670,7 +5690,7 @@ fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
                 return out;
             }}
             var arr = {source_expr} || [];
-            if (arr.length > {limit}) arr = arr.slice(-{limit});
+            if (arr.length > {limit}) arr = arr.slice(arr.length - {limit}); // not slice(-0): all
             return arr.map(trimEntry);
         }})()"
     )
@@ -8772,6 +8792,43 @@ mod command_policy_dispatch_tests {
     }
 
     /// The eval envelope for a page result `value`.
+    /// R5-JS5: `limit: 0` means "return at most zero entries". The log JS used `.slice(-0)`
+    /// (and the bridge treats a falsy limit as "all"), so it returned EVERY entry.
+    #[tokio::test]
+    async fn log_limit_zero_returns_no_entries() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(&ok_envelope(&json!([{"a": 1}, {"a": 2}])));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        for action in [
+            "console",
+            "network",
+            "ipc",
+            "navigation",
+            "dialogs",
+            "events",
+        ] {
+            let r = call(&h, "logs", json!({"action": action, "limit": 0})).await;
+            let text = result_text(&r);
+            assert_ne!(r.is_error, Some(true), "{action}: {text}");
+            let v: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{action}: not JSON ({e}): {text}"));
+            assert_eq!(
+                v,
+                json!([]),
+                "logs {action} limit=0 returned entries: {text}"
+            );
+        }
+        let r = call(&h, "route", json!({"action": "matches", "limit": 0})).await;
+        let text = result_text(&r);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        assert_eq!(
+            v,
+            json!([]),
+            "route matches limit=0 returned entries: {text}"
+        );
+    }
+
     fn ok_envelope(value: &serde_json::Value) -> String {
         json!({"__victauri_ok": value, "__victauri_type": "object"}).to_string()
     }
