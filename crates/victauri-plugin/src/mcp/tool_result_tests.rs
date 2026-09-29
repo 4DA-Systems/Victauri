@@ -280,3 +280,56 @@ async fn wait_for_expression_keeps_polling_through_a_page_exception() {
     );
     assert!(bridge.labels_of("x.ready").len() > 1, "did not poll");
 }
+
+// ── R5B-ASSERT1: `undefined` is a value assertions can test ────────────────────────────────
+
+const UNDEFINED: &str = r#"{"__victauri_ok":null,"__victauri_type":"undefined"}"#;
+
+/// An expression that evaluates to `undefined` (a missing property, an absent global) used to
+/// fail with "not valid JSON", so `exists` / `falsy` could not be asserted against it. It is
+/// now read as `null` — what JSON makes of it, and what JavaScript's `x == null` says.
+#[tokio::test]
+async fn assert_semantic_treats_undefined_as_null() {
+    let state = state();
+    let bridge = ScriptBridge::answering(&state, UNDEFINED);
+    let h = handler(&state, &bridge);
+    for (condition, expected, passes) in [
+        ("exists", json!(null), false),
+        ("falsy", json!(null), true),
+        ("truthy", json!(null), false),
+        ("equals", json!(null), true),
+        ("not_equals", json!(null), false),
+        ("type_is", json!("null"), true),
+    ] {
+        let r = ok_json(
+            &call(
+                &h,
+                "assert_semantic",
+                json!({"expression": "window.nothingHere", "condition": condition,
+                       "expected": expected}),
+            )
+            .await,
+        );
+        assert_eq!(r["passed"], passes, "{condition}: {r}");
+        assert_eq!(r["actual"], json!(null), "{condition}: {r}");
+    }
+}
+
+/// `verify_state` reads an `undefined` frontend value the same way: it is compared (as `null`)
+/// instead of failing the call.
+#[tokio::test]
+async fn verify_state_treats_undefined_as_null() {
+    let state = state();
+    let bridge = ScriptBridge::answering(&state, UNDEFINED);
+    let h = handler(&state, &bridge);
+    let r = ok_json(
+        &call(
+            &h,
+            "verify_state",
+            json!({"frontend_expr": "window.nothingHere", "backend_state": {"a": 1}}),
+        )
+        .await,
+    );
+    assert_eq!(r["passed"], false, "{r}");
+    assert_eq!(r["frontend_state"], json!(null), "{r}");
+}

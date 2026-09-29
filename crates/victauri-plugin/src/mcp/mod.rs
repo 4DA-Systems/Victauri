@@ -737,7 +737,7 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to evaluate frontend expression: {e}")),
         };
 
-        let frontend_state: serde_json::Value = match serde_json::from_str(&frontend_json) {
+        let frontend_state: serde_json::Value = match parse_expression_value(&frontend_json) {
             Ok(v) => v,
             Err(e) => {
                 return tool_error(format!(
@@ -1020,7 +1020,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is.",
+        description = "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is. A result of `undefined` is treated as `null` (JSON has no undefined; like JS `x == null`): `exists` is false, `falsy` is true, `equals null` and `type_is \"null\"` pass.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1044,7 +1044,7 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to evaluate expression: {e}")),
         };
 
-        let actual: serde_json::Value = match serde_json::from_str(&actual_json) {
+        let actual: serde_json::Value = match parse_expression_value(&actual_json) {
             Ok(v) => v,
             Err(e) => return tool_error(format!("expression did not return valid JSON: {e}")),
         };
@@ -5893,6 +5893,17 @@ fn expression_eval_code(expr: &str) -> String {
     }
     let body = expr.trim_end_matches(|c: char| c == ';' || is_js_space(c));
     format!("return (\n{body}\n);")
+}
+
+/// Parse the value of an expression evaluated by [`expression_eval_code`]. `undefined` (which
+/// the engine reports as the bare text `undefined`) is read as `null`: JSON has no `undefined`,
+/// and `null` is what JavaScript's `x == null` groups it with — so `exists` is false and `falsy`
+/// is true for it instead of the call failing as "not valid JSON".
+fn parse_expression_value(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    if raw == "undefined" {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(raw)
 }
 
 /// Statement keywords where a leading `return` would be a syntax error. Matched as whole words
