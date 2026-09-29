@@ -296,3 +296,71 @@ fn r5b_scrubkey1_page_hooks_never_reach_the_key_through_animation_ops() {
         "the hooks were exercised: {r}"
     );
 }
+
+// ── R5B-ROUTEURL1: a rule hits the same request however the app spells it ─────
+
+/// A route pattern matched only the URL *as the app passed it*: `fetch('/api/x')` exposed the
+/// relative string, a `Request` or `URL` object the absolute URL, so an `exact` (or anchored
+/// regex) rule hit one form and silently missed the other. Rules now match the absolute URL,
+/// the same-origin path, and the raw string.
+#[test]
+fn r5b_routeurl1_rules_match_relative_and_absolute_forms() {
+    let def = def(
+        None,
+        vec![web_case(
+            "exact / regex / glob rules against string, URL and Request forms, fetch and XHR",
+            r"
+            var V = window.__VICTAURI__;
+            V.addRoute({ pattern: '/api/rel', match_type: 'exact', action: 'block' });
+            V.addRoute({ pattern: 'http://localhost/api/abs', match_type: 'exact', action: 'block' });
+            V.addRoute({ pattern: '^/api/rx', match_type: 'regex', action: 'block' });
+            V.addRoute({ pattern: 'http://localhost/api/gl*', match_type: 'glob', action: 'block' });
+            async function blocked(input) {
+                try { await fetch(input); return false; }
+                catch (e) { return /blocked by route/.test(e.message); }
+            }
+            var abs = function(p) { return 'http://localhost' + p; };
+            var out = {};
+            var paths = ['/api/rel', '/api/abs', '/api/rx', '/api/glob'];
+            for (var i = 0; i < paths.length; i++) {
+                var p = paths[i];
+                out[p] = [
+                    await blocked(p),
+                    await blocked(abs(p)),
+                    await blocked(new URL(p, location.href)),
+                    await blocked(new Request(abs(p))),
+                ];
+            }
+            // An unrelated path is untouched in every form.
+            out.other = [await blocked('/api/other'), await blocked(new Request(abs('/api/other')))];
+            // XHR, relative and absolute.
+            function xhrBlocked(u) {
+                return new Promise(function(res) {
+                    var x = new XMLHttpRequest();
+                    x.open('GET', u);
+                    var done = function() { res(V.getNetworkLog(null, 1)[0].status === 'blocked'); };
+                    x.addEventListener('error', done);
+                    x.addEventListener('loadend', done);
+                    x.send();
+                });
+            }
+            out.xhr = [await xhrBlocked('/api/abs'), await xhrBlocked(abs('/api/rel'))];
+            return out;
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    for p in ["/api/rel", "/api/abs", "/api/rx", "/api/glob"] {
+        assert_eq!(
+            r[p],
+            serde_json::json!([true, true, true, true]),
+            "{p} must be blocked in every form: {r}"
+        );
+    }
+    assert_eq!(r["other"], serde_json::json!([false, false]), "{r}");
+    assert_eq!(r["xhr"], serde_json::json!([true, true]), "{r}");
+}

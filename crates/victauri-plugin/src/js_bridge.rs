@@ -353,22 +353,53 @@ const INIT_SCRIPT_BODY: &str = r#"
         return ms > MAX_TIMER_DELAY_MS ? MAX_TIMER_DELAY_MS : ms;
     }
 
+    // The forms a request URL is matched in (R5B-ROUTEURL1). `fetch('/api/x')` hands the bridge
+    // the relative string while a `Request` or `URL` object yields the absolute URL, so a rule
+    // matched against only one of them hit one spelling of a request and silently missed the
+    // other. A rule is tested against: the absolute URL (resolved against the document base URL,
+    // as fetch/XHR resolve it), the path + query + fragment when same-origin, and the string as
+    // the app passed it. The URL built-ins are the ones captured at init.
+    function routeUrlForms(url) {
+        var forms = [url];
+        if (!URL_CTOR || !URL_HREF_GET) return forms;
+        try {
+            var base = BASE_URI_GET ? REFLECT_APPLY(BASE_URI_GET, document, []) : window.location.href;
+            var u = new URL_CTOR(url, base);
+            var abs = REFLECT_APPLY(URL_HREF_GET, u, []);
+            if (abs !== url) forms[forms.length] = abs;
+            var loc = new URL_CTOR(window.location.href);
+            var sameOrigin = REFLECT_APPLY(URL_PROTOCOL_GET, u, []) === REFLECT_APPLY(URL_PROTOCOL_GET, loc, [])
+                && REFLECT_APPLY(URL_HOST_GET, u, []) === REFLECT_APPLY(URL_HOST_GET, loc, []);
+            if (sameOrigin) {
+                var rel = REFLECT_APPLY(URL_PATHNAME_GET, u, []) + REFLECT_APPLY(URL_SEARCH_GET, u, [])
+                    + REFLECT_APPLY(URL_HASH_GET, u, []);
+                if (rel !== url) forms[forms.length] = rel;
+            }
+        } catch (e) {}
+        return forms;
+    }
+
+    function routeRuleHits(r, url) {
+        try {
+            if (r.match_type === 'exact') return url === r.pattern;
+            if (r.match_type === 'regex') return new RegExp(r.pattern).test(url);
+            if (r.match_type === 'glob') return globToRegExp(r.pattern).test(url);
+            return url.indexOf(r.pattern) !== -1; // substring (default)
+        } catch (e) { return false; }
+    }
+
     function matchRoute(url, method) {
         if (!routeRules.length) return null;
         if (isVictauriInternalUrl(url)) return null;
         var m = (method || 'GET').toUpperCase();
+        var forms = routeUrlForms(url);
         for (var i = 0; i < routeRules.length; i++) {
             var r = routeRules[i];
             if (r.times && r.triggered >= r.times) continue;
             if (r.method && r.method.toUpperCase() !== m) continue;
-            var hit = false;
-            try {
-                if (r.match_type === 'exact') hit = (url === r.pattern);
-                else if (r.match_type === 'regex') hit = new RegExp(r.pattern).test(url);
-                else if (r.match_type === 'glob') hit = globToRegExp(r.pattern).test(url);
-                else hit = (url.indexOf(r.pattern) !== -1); // substring (default)
-            } catch (e) { hit = false; }
-            if (hit) return r;
+            for (var f = 0; f < forms.length; f++) {
+                if (routeRuleHits(r, forms[f])) return r;
+            }
         }
         return null;
     }
@@ -490,6 +521,21 @@ const INIT_SCRIPT_BODY: &str = r#"
     // argument (it throws for a Symbol, as they do). Not `String(v)`: page script can replace
     // `window.String`, and `String(symbol)` does not throw.
     function toStringExact(v) { return `${v}`; }
+    // The URL constructor and the getters route matching reads (routeUrlForms), and the
+    // document base URL getter fetch/XHR resolve a relative URL against.
+    var URL_CTOR = typeof window.URL === 'function' ? window.URL : null;
+    function protoGetter(proto, name) {
+        try { var d = Object.getOwnPropertyDescriptor(proto, name); return d && d.get ? d.get : null; }
+        catch (e) { return null; }
+    }
+    var URL_PROTO = URL_CTOR ? URL_CTOR.prototype : null;
+    var URL_HREF_GET = URL_PROTO && protoGetter(URL_PROTO, 'href');
+    var URL_PROTOCOL_GET = URL_PROTO && protoGetter(URL_PROTO, 'protocol');
+    var URL_HOST_GET = URL_PROTO && protoGetter(URL_PROTO, 'host');
+    var URL_PATHNAME_GET = URL_PROTO && protoGetter(URL_PROTO, 'pathname');
+    var URL_SEARCH_GET = URL_PROTO && protoGetter(URL_PROTO, 'search');
+    var URL_HASH_GET = URL_PROTO && protoGetter(URL_PROTO, 'hash');
+    var BASE_URI_GET = typeof Node === 'function' ? protoGetter(Node.prototype, 'baseURI') : null;
     var AGENT_KEY = '__VICTAURI_AGENT_KEY__';
 
     // Page script can plant `toJSON` on Object.prototype / Array.prototype, which JSON.stringify
