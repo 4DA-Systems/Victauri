@@ -154,6 +154,8 @@ impl Harness {
 #[derive(Clone, Default)]
 struct Backend {
     tool_calls: Arc<AtomicU64>,
+    /// JSON arrays (batches) that reached the backend.
+    batches: Arc<AtomicU64>,
 }
 
 async fn stateless_mcp(
@@ -162,6 +164,11 @@ async fn stateless_mcp(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    if v.is_array() {
+        // What rmcp 3.1.2 does with a batch (verified live): reject it, never execute it.
+        b.batches.fetch_add(1, Ordering::SeqCst);
+        return axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
+    }
     let id = v.get("id").cloned();
     match v.get("method").and_then(Value::as_str) {
         Some("tools/call") => {
@@ -202,4 +209,58 @@ async fn empty_victauri_app_env_is_treated_as_unset() {
         );
         assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 1);
     }
+}
+
+/// R5-BR1: a JSON-RPC batch (a JSON array) is answered LOCALLY — MCP removed batching in
+/// 2025-06-18 and the real server rejects it — with a JSON-RPC batch response: one -32600 error
+/// per request element, carrying that element's id (notifications get none), so every pending
+/// id the client holds is resolved. It is never forwarded (so never re-sent after a failure),
+/// and an all-notification batch gets no reply at all, per JSON-RPC 2.0 §6.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_batch_is_rejected_locally_with_one_error_per_request() {
+    let backend = Backend::default();
+    let mut h = Harness::start(backend_routes(&backend), true, &[]).await;
+
+    h.send(&json!([
+        {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"eval_js","arguments":{}}},
+        {"jsonrpc":"2.0","method":"notifications/progress","params":{}},
+        {"jsonrpc":"2.0","id":"eleven","method":"ping"},
+        42
+    ]));
+    let reply = h.recv_reply();
+    let errs = reply
+        .as_array()
+        .unwrap_or_else(|| panic!("batch reply must be an array: {reply}"));
+    let ids: Vec<&Value> = errs.iter().map(|e| &e["id"]).collect();
+    assert_eq!(ids, [&json!(10), &json!("eleven"), &Value::Null], "{reply}");
+    for e in errs {
+        assert_eq!(e["jsonrpc"], "2.0");
+        assert_eq!(e["error"]["code"], -32600, "{e}");
+        assert!(
+            e["error"]["message"].as_str().unwrap().contains("batch"),
+            "{e}"
+        );
+    }
+
+    // An empty batch is itself an invalid request: one error object, id null.
+    h.send(&json!([]));
+    let empty = h.recv_reply();
+    assert_eq!(empty["id"], Value::Null, "{empty}");
+    assert_eq!(empty["error"]["code"], -32600, "{empty}");
+
+    // All notifications → no reply. The next reply seen must be the ping's.
+    h.send(&json!([{"jsonrpc":"2.0","method":"notifications/progress","params":{}}]));
+    h.send(&json!({"jsonrpc":"2.0","id":12,"method":"ping"}));
+    let ping = h.recv_reply();
+    assert_eq!(
+        ping["id"], 12,
+        "an all-notification batch must get no reply: {ping}"
+    );
+
+    assert_eq!(
+        backend.batches.load(Ordering::SeqCst),
+        0,
+        "batches are never forwarded"
+    );
+    assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 0);
 }

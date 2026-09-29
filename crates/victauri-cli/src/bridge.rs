@@ -190,6 +190,18 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
             }
         };
 
+        // A JSON-RPC batch is answered here and NEVER forwarded (R5-BR1): see `batch_rejection`.
+        if let Value::Array(items) = &msg {
+            match batch_rejection(items) {
+                Some(reply) => write_value(&stdout, &reply),
+                None => eprintln!(
+                    "victauri-bridge: dropped a JSON-RPC batch of notifications/responses \
+                     (batching is not supported)"
+                ),
+            }
+            continue;
+        }
+
         let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let is_notification = msg.get("id").is_none();
@@ -293,6 +305,53 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// JSON-RPC "Invalid Request" — used for a batch, which MCP does not support.
+const INVALID_REQUEST: i64 = -32600;
+const BATCH_UNSUPPORTED: &str = "batch requests are not supported: MCP removed JSON-RPC \
+     batching in protocol revision 2025-06-18; send each message as its own line";
+
+/// The local reply to a JSON-RPC batch (a JSON array on stdin), or `None` when nothing may be
+/// answered.
+///
+/// MCP removed batching in 2025-06-18 and the embedded server rejects a batch without executing
+/// it, so the bridge never forwards one: forwarding only produced an id-less error the client
+/// could not match (or, after a post-send failure, re-sent the whole batch). Instead it answers
+/// the way JSON-RPC 2.0 §6 prescribes for a batch: an ARRAY holding one `-32600` error per
+/// request element, each carrying that element's `id`, so every id the client is waiting on is
+/// resolved. Notifications and responses inside the batch get no entry (JSON-RPC never answers
+/// either); an element that is not an object gets an error with `id: null`. An empty array is
+/// itself an invalid request → a single error object with `id: null`. A batch of only
+/// notifications/responses → `None` (§6: "the Server MUST NOT return an empty Array").
+fn batch_rejection(items: &[Value]) -> Option<Value> {
+    let error = |id: Value| {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": INVALID_REQUEST, "message": BATCH_UNSUPPORTED }
+        })
+    };
+    if items.is_empty() {
+        return Some(error(Value::Null));
+    }
+    let replies: Vec<Value> = items
+        .iter()
+        .filter_map(|item| {
+            let Some(obj) = item.as_object() else {
+                return Some(error(Value::Null));
+            };
+            let is_notification = obj.contains_key("method") && !obj.contains_key("id");
+            let is_response = !obj.contains_key("method")
+                && (obj.contains_key("result") || obj.contains_key("error"));
+            if is_notification || is_response {
+                None
+            } else {
+                Some(error(obj.get("id").cloned().unwrap_or(Value::Null)))
+            }
+        })
+        .collect();
+    (!replies.is_empty()).then_some(Value::Array(replies))
 }
 
 /// The `initialize` reply the bridge synthesizes itself, so the MCP server is "connected"
@@ -1808,6 +1867,39 @@ mod tests {
         assert!(!dir_is_trusted(&link), "symlinked dir must be rejected");
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// R5-BR1: a batch is rejected locally, one error per request element, per JSON-RPC §6.
+    #[test]
+    fn batch_rejection_answers_each_request_and_nothing_else() {
+        let reply = batch_rejection(&[
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call"}),
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled"}),
+            json!({"jsonrpc":"2.0","id":"srv-1","result":{}}),
+            json!({"jsonrpc":"2.0","id":2}),
+            json!("junk"),
+        ])
+        .unwrap();
+        let ids: Vec<Value> = reply
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["id"].clone())
+            .collect();
+        assert_eq!(ids, [json!(1), json!(2), Value::Null]);
+        assert!(
+            reply
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["error"]["code"] == INVALID_REQUEST)
+        );
+        let empty = batch_rejection(&[]).unwrap();
+        assert!(empty.is_object() && empty["id"].is_null());
+        assert_eq!(
+            batch_rejection(&[json!({"jsonrpc":"2.0","method":"notifications/x"})]),
+            None
+        );
     }
 
     /// R5-BR2: blank selectors are "unset", matching victauri-test and the watchdog.
