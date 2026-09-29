@@ -204,6 +204,16 @@ fn find_window<'a, R: Runtime>(
     }
 }
 
+/// The label of the window a `None` label resolves to (see `find_window`). MAIN THREAD ONLY:
+/// it lists the webview windows, which clones their handles (see [`on_main`]) — for a sync
+/// Tauri command such as the eval callback.
+pub(crate) fn default_window_label<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<String> {
+    let windows = app.webview_windows();
+    find_window(&windows, None)
+        .ok()
+        .map(|window| window.label().to_string())
+}
+
 /// Serializes Victauri's main-thread round trips.
 ///
 /// **Correction (0.9.0): the heap corruption described below was NOT caused by concurrent round

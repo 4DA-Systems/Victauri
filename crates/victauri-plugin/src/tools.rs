@@ -89,12 +89,9 @@ pub async fn reserve_page_eval(
             crate::mcp::MAX_PENDING_EVALS
         ));
     }
-    Ok(crate::PendingSlot::insert(
-        &state.pending_evals,
-        &mut pending,
-        id,
-        tx,
-    ))
+    let slot = crate::PendingSlot::insert(&state.pending_evals, &mut pending, id, tx);
+    slot.bind_window(Some(label));
+    Ok(slot)
 }
 
 #[tauri::command]
@@ -177,8 +174,35 @@ pub fn victauri_eval_callback<R: Runtime>(
         state.page_loads.record_load(webview.label(), nonce);
         return Ok(());
     }
-    deliver_eval_result(Arc::clone(state.inner()), id, result);
+    accept_eval_result(
+        Arc::clone(state.inner()),
+        webview.label(),
+        || crate::bridge::default_window_label(webview.app_handle()),
+        id,
+        result,
+    );
     Ok(())
+}
+
+/// Deliver an eval result from webview `caller` — only if the eval was sent to that window
+/// (see [`crate::eval_result_accepted`]); a result from any other window is dropped. Returns
+/// whether it was accepted.
+fn accept_eval_result(
+    state: Arc<VictauriState>,
+    caller: &str,
+    default_label: impl FnOnce() -> Option<String>,
+    id: String,
+    result: String,
+) -> bool {
+    if !crate::eval_result_accepted(&id, caller, default_label) {
+        tracing::debug!(
+            window = caller,
+            "ignored an eval result from a window the eval was not sent to (or for no pending              eval)"
+        );
+        return false;
+    }
+    deliver_eval_result(state, id, result);
+    true
 }
 
 /// Hand an eval result to the caller waiting on `id` without blocking the calling (main)
@@ -450,6 +474,100 @@ mod tests {
 
         let ghosts = page_ghost_report(&state);
         assert_eq!(ghosts.frontend_only.len(), 20);
+    }
+
+    /// R5B-EVALWIN1: `victauri_eval_callback` delivered a result for any pending eval id to
+    /// whichever window sent it. A result is now accepted only from the window the eval was sent
+    /// to — by label, or for an eval sent to the default window, from the window the default
+    /// resolves to.
+    #[tokio::test]
+    async fn eval_results_are_accepted_only_from_the_target_window() {
+        let state = Arc::new(VictauriState::for_tests());
+        let no_default = || None;
+
+        // A page eval for window "main".
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let slot = reserve_page_eval(&state, "main", tx).await.unwrap();
+        let id = slot.id().to_string();
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "other",
+            no_default,
+            id.clone(),
+            "forged".into()
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "another window's result was delivered"
+        );
+        assert!(accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            no_default,
+            id,
+            "real".into()
+        ));
+        assert_eq!(rx.await.unwrap(), "real");
+        drop(slot);
+
+        // An agent eval sent to the default window.
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let slot = {
+            let mut pending = state.pending_evals.lock().await;
+            crate::PendingSlot::insert(&state.pending_evals, &mut pending, "agent-1".into(), tx)
+        };
+        slot.bind_window(None);
+        let main_is_default = || Some("main".to_string());
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "other",
+            main_is_default,
+            "agent-1".into(),
+            "x".into()
+        ));
+        assert!(rx.try_recv().is_err());
+        // Narrowed to the window it actually resolved to.
+        slot.bind_window(Some("side"));
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            main_is_default,
+            "agent-1".into(),
+            "x".into()
+        ));
+        assert!(accept_eval_result(
+            Arc::clone(&state),
+            "side",
+            main_is_default,
+            "agent-1".into(),
+            "ok".into()
+        ));
+        assert_eq!(rx.await.unwrap(), "ok");
+
+        // An eval that was never bound, and an id with no pending eval, are refused.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let unbound = {
+            let mut pending = state.pending_evals.lock().await;
+            crate::PendingSlot::insert(&state.pending_evals, &mut pending, "agent-2".into(), tx)
+        };
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            main_is_default,
+            "agent-2".into(),
+            "x".into()
+        ));
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            main_is_default,
+            "nope".into(),
+            "x".into()
+        ));
+        drop(unbound);
+        // The binding goes with the slot.
+        drop(slot);
+        assert!(!crate::eval_result_accepted("agent-1", "side", || None));
     }
 
     /// Tauri runs an `async` command on a tokio worker and extracts/drops its arguments and its

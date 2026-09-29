@@ -1378,7 +1378,9 @@ async fn drain_window(
         if pending.len() >= MAX_PENDING_EVALS {
             return None;
         }
-        crate::PendingSlot::insert(&state.pending_evals, &mut pending, id.clone(), tx)
+        let slot = crate::PendingSlot::insert(&state.pending_evals, &mut pending, id.clone(), tx);
+        slot.bind_window(Some(label));
+        slot
     };
 
     // Delivered through the bridge's frozen `_evalSettle`, which serializes with the

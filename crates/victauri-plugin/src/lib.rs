@@ -178,10 +178,59 @@ impl PendingSlot {
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
+
+    /// Record which window this eval's result must come from: `Some(label)` for that window,
+    /// `None` for the default window (resolved when the result arrives). Call before the eval
+    /// is delivered — a result for an unbound eval is refused (see [`eval_result_accepted`]).
+    /// May be called again to narrow `None` to the label the eval actually resolved to.
+    pub(crate) fn bind_window(&self, label: Option<&str>) {
+        let target = label.map_or(EvalTarget::DefaultWindow, |l| {
+            EvalTarget::Window(l.to_string())
+        });
+        eval_targets().insert(self.id.clone(), target);
+    }
+}
+
+/// The window an eval's result must come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EvalTarget {
+    /// This window.
+    Window(String),
+    /// The default window, as resolved when the result arrives.
+    DefaultWindow,
+}
+
+/// Eval id -> the window its result must come from (entries live as long as their
+/// [`PendingSlot`]). Process-wide: eval ids are UUIDs, unique across every state.
+static EVAL_TARGETS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, EvalTarget>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn eval_targets() -> std::sync::MutexGuard<'static, HashMap<String, EvalTarget>> {
+    EVAL_TARGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether an eval result for `id` arriving from webview `caller` may be delivered: only from
+/// the window the eval was sent to (R5B-EVALWIN1). `default_label` resolves the default window
+/// (only called for an eval sent to it). A result for an id with no binding — not a pending eval,
+/// or one that was never bound — is refused.
+pub(crate) fn eval_result_accepted(
+    id: &str,
+    caller: &str,
+    default_label: impl FnOnce() -> Option<String>,
+) -> bool {
+    let target = eval_targets().get(id).cloned();
+    match target {
+        Some(EvalTarget::Window(label)) => label == caller,
+        Some(EvalTarget::DefaultWindow) => default_label().as_deref() == Some(caller),
+        None => false,
+    }
 }
 
 impl Drop for PendingSlot {
     fn drop(&mut self) {
+        eval_targets().remove(&self.id);
         // The map's lock is async and only held for map operations, so it is almost always
         // free; when it is not, finish the removal on the runtime (or block, outside one).
         if let Ok(mut map) = self.map.try_lock() {
