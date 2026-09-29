@@ -244,7 +244,7 @@
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --watch",
     "package": "npx --no-install vsce package",
     "lint": "tsc --noEmit && tsc --noEmit -p test",
-    "test": "esbuild test/codegen.test.ts test/discovery.test.ts --bundle --platform=node --format=cjs --outdir=out-test --alias:vscode=./test/vscode-stub.ts --log-level=warning && node --test out-test/codegen.test.js out-test/discovery.test.js"
+    "test": "esbuild test/codegen.test.ts test/discovery.test.ts test/client.test.ts --bundle --platform=node --format=cjs --outdir=out-test --alias:vscode=./test/vscode-stub.ts --log-level=warning && node --test out-test/codegen.test.js out-test/discovery.test.js out-test/client.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

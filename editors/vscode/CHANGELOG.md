@@ -6,6 +6,15 @@ All notable changes to the Victauri VS Code extension will be documented in this
 
 Version-synced with the Victauri 0.9.0 release. Extension changes:
 
+- **The auth token stops following a port its app no longer owns.** The extension resolved the
+  port and token once and then sent the token to that port every poll, forever — after the
+  app exited, any local process that bound the port received it. Before each token-bearing
+  request the extension now re-reads discovery and requires a live, trusted entry that still
+  maps that port to that token and app; if the app restarted on another port it follows it by
+  identity and checks `/info`'s `app_identifier` before anything else carries the new token,
+  and if nothing vouches for the port the token is not sent. The poller also no longer
+  overlaps itself when a refresh outlasts the poll interval.
+
 - **"Generate Test for Element" can no longer be used for code injection.** The DOM node's
   accessible name (and ref id) — page-controlled text — was interpolated into the generated
   Rust unescaped, so a page could break out of `Locator::text("…")` and add Rust that runs on

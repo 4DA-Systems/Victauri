@@ -172,7 +172,18 @@ export async function scanServers(
 }
 
 export type Resolution =
-  | { ok: true; port: number; token: string | undefined; warning?: string }
+  | {
+      ok: true;
+      port: number;
+      token: string | undefined;
+      warning?: string;
+      /**
+       * The live discovery entry whose token is used, when discovery chose (or matched) it.
+       * The client then keeps re-checking discovery before sending that token (R5-VSC1).
+       * Absent for an explicitly configured port + token, or when no token is sent.
+       */
+      vouchedBy?: DiscoveredServer;
+    }
   | { ok: false; message: string };
 
 function label(s: DiscoveredServer): string {
@@ -197,12 +208,17 @@ export function resolveConnection(
   const servers = scan.live;
   if (explicit.port !== undefined) {
     const onPort = servers.filter((s) => s.port === explicit.port);
-    const token = explicit.token || (onPort.length === 1 ? onPort[0].token : undefined);
-    return { ok: true, port: explicit.port, token };
+    if (explicit.token) return { ok: true, port: explicit.port, token: explicit.token };
+    if (onPort.length === 1 && onPort[0].token) {
+      return { ok: true, port: explicit.port, token: onPort[0].token, vouchedBy: onPort[0] };
+    }
+    return { ok: true, port: explicit.port, token: undefined };
   }
   if (explicit.token) {
     const owners = servers.filter((s) => s.token === explicit.token);
-    if (owners.length === 1) return { ok: true, port: owners[0].port, token: explicit.token };
+    if (owners.length === 1) {
+      return { ok: true, port: owners[0].port, token: explicit.token, vouchedBy: owners[0] };
+    }
     if (owners.length === 0) {
       return {
         ok: false,
@@ -219,7 +235,10 @@ export function resolveConnection(
     };
   }
   if (servers.length === 1) {
-    return { ok: true, port: servers[0].port, token: servers[0].token };
+    const only = servers[0];
+    return only.token
+      ? { ok: true, port: only.port, token: only.token, vouchedBy: only }
+      : { ok: true, port: only.port, token: undefined };
   }
   if (servers.length > 1) {
     return {

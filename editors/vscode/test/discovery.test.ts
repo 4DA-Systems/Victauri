@@ -28,10 +28,19 @@ test("a configured token without a configured port goes only to the app that own
     ok: true,
     port: 7374,
     token: "mine",
+    vouchedBy: live[1],
   });
   const refused = resolveConnection({ token: "mine" }, scan(live.slice(0, 1)), 7373);
   assert.equal(refused.ok, false);
   assert.match(!refused.ok ? refused.message : "", /victauri\.port/);
+  // An explicit port WITHOUT a token uses the discovered token, and stays vouched for by
+  // that entry (R5-VSC1: the client re-checks discovery before re-sending it).
+  assert.deepEqual(resolveConnection({ port: 7374 }, scan(live), 7373), {
+    ok: true,
+    port: 7374,
+    token: "mine",
+    vouchedBy: live[1],
+  });
   // An explicit port + explicit token keeps the old behaviour.
   assert.deepEqual(resolveConnection({ port: 7373, token: "t" }, scan(live), 7373), {
     ok: true,
@@ -52,6 +61,7 @@ test("several running apps are an error naming each, never a silent pick", () =>
     ok: true,
     port: 7373,
     token: "a",
+    vouchedBy: live[0],
   });
   const none = resolveConnection({}, scan([]), 7373);
   assert.deepEqual(none, { ok: true, port: 7373, token: undefined, warning: undefined });

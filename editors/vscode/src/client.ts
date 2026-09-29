@@ -1,5 +1,7 @@
 import * as vscode from "vscode";
 
+import type { DiscoveredServer } from "./discovery";
+
 export interface ToolInfo {
   name: string;
   description?: string;
@@ -71,11 +73,32 @@ export function authProbeVerdict(status: number): AuthProbeVerdict {
   return status >= 200 && status < 300 ? "ok" : "error";
 }
 
+/**
+ * How the client keeps a discovered endpoint honest (R5-VSC1). With `discover`, every request
+ * that carries the token first re-reads discovery and requires a live, trusted entry that still
+ * maps this port to this token (and `identifier`). If the app restarted elsewhere, the client
+ * follows it by `identifier` and verifies `/info`'s `app_identifier` before any other request
+ * carries the new token; if nothing vouches for the port, the token is not sent.
+ */
+export interface ConnectOptions {
+  /** Bundle identifier of the discovered app (from its discovery `metadata.json`). */
+  identifier?: string;
+  /** The live, trusted discovery entries right now (`scanServers().live`). */
+  discover?: () => Promise<DiscoveredServer[]>;
+}
+
 export class VictauriClient {
   private baseUrl = "";
+  private port = 0;
   private token = "";
+  private identifier: string | undefined;
+  private discover: (() => Promise<DiscoveredServer[]>) | undefined;
+  /** Set when an endpoint proved to be a different app: nothing is sent until reconnect. */
+  private refusedReason: string | undefined;
   private state: ConnectionState = "disconnected";
   private pollTimer: ReturnType<typeof setInterval> | undefined;
+  /** A poll is running: the next tick is skipped rather than overlapping it (R5-VSC1). */
+  private refreshing = false;
   private readonly onStateChange = new vscode.EventEmitter<ConnectionState>();
   private readonly onDataUpdate = new vscode.EventEmitter<void>();
 
@@ -96,9 +119,11 @@ export class VictauriClient {
     return this.state;
   }
 
-  async connect(port: number, authToken?: string): Promise<void> {
-    this.baseUrl = `http://127.0.0.1:${port}`;
-    this.token = authToken ?? "";
+  async connect(port: number, authToken?: string, options: ConnectOptions = {}): Promise<void> {
+    this.pointAt(port, authToken ?? "");
+    this.identifier = options.identifier;
+    this.discover = options.discover;
+    this.refusedReason = undefined;
     this.setState("connecting");
 
     try {
@@ -163,6 +188,64 @@ export class VictauriClient {
     if (!resp.ok) {
       throw new Error(`Authenticated probe (/info) failed: HTTP ${resp.status}`);
     }
+    await this.checkIdentity(resp);
+  }
+
+  /**
+   * The `/info` answer must name the app we discovered: a port can change hands, and a
+   * restarted app is re-resolved by identity (R5-VSC1). On a mismatch nothing more is sent to
+   * this endpoint until the user reconnects.
+   */
+  private async checkIdentity(resp: Response): Promise<void> {
+    if (this.identifier === undefined) return;
+    let reported: unknown;
+    try {
+      reported = ((await resp.json()) as { app_identifier?: unknown } | null)?.app_identifier;
+    } catch {
+      reported = undefined;
+    }
+    if (reported !== this.identifier) {
+      this.refusedReason =
+        `port ${this.port} answers as ${typeof reported === "string" ? reported : "an unknown app"}, ` +
+        `not ${this.identifier}; nothing more is sent to it. Reconnect once the app is running.`;
+      throw new Error(`Victauri: ${this.refusedReason}`);
+    }
+  }
+
+  /**
+   * Before the token goes out: confirm through discovery that this port still belongs to the
+   * app we connected to. Discovery (a trusted, own-process entry carrying this exact port and
+   * token) is the only proof available before sending the token: `/info` itself requires it.
+   */
+  private async ensureEndpointTrusted(): Promise<void> {
+    if (this.refusedReason) throw new Error(`Victauri: ${this.refusedReason}`);
+    if (!this.discover || !this.token) return;
+    const live = await this.discover();
+    const sameApp = (s: DiscoveredServer) =>
+      this.identifier === undefined || s.identifier === this.identifier;
+    if (live.some((s) => s.port === this.port && s.token === this.token && sameApp(s))) return;
+
+    // Not vouched for any more. Follow the SAME app (by identity) if it restarted elsewhere.
+    const moved =
+      this.identifier === undefined
+        ? []
+        : live.filter((s) => s.identifier === this.identifier && s.token);
+    if (moved.length !== 1) {
+      throw new Error(
+        `Victauri: port ${this.port} no longer belongs to ` +
+          `${this.identifier ?? "the app this window connected to"} (its discovery entry is ` +
+          "gone), so the auth token was not sent. Reconnect once the app is running."
+      );
+    }
+    this.pointAt(moved[0].port, moved[0].token ?? "");
+    // Verify the new endpoint's identity before any other request carries the token.
+    await this.checkIdentity(await this.rawFetch("/info"));
+  }
+
+  private pointAt(port: number, token: string): void {
+    this.port = port;
+    this.baseUrl = `http://127.0.0.1:${port}`;
+    this.token = token;
   }
 
   async refreshAll(): Promise<void> {
@@ -372,17 +455,39 @@ export class VictauriClient {
       .getConfiguration("victauri")
       .get<number>("pollInterval", 2000);
     this.pollTimer = setInterval(() => {
-      this.refreshAll().catch((e: unknown) => {
-        // Server went down (or the token stopped working, e.g. the app was
-        // restarted and minted a fresh one): disconnect so the UI says so.
-        if (this.state !== "connected") return;
-        this.disconnect();
-        this.onDataUpdate.fire();
-        vscode.window.showWarningMessage(
-          `Victauri: Lost connection to Tauri app — ${e instanceof Error ? e.message : String(e)}`
-        );
-      });
+      // A refresh on a slow app can outlast the interval: skip this tick instead of stacking
+      // a second concurrent refresh on top of it (R5-VSC1).
+      if (this.refreshing) return;
+      this.refreshing = true;
+      this.pollOnce()
+        .catch((e: unknown) => {
+          // Server went down (or the token stopped working, e.g. the app was
+          // restarted and minted a fresh one): disconnect so the UI says so.
+          if (this.state !== "connected") return;
+          this.disconnect();
+          this.onDataUpdate.fire();
+          vscode.window.showWarningMessage(
+            `Victauri: Lost connection to Tauri app — ${e instanceof Error ? e.message : String(e)}`
+          );
+        })
+        .finally(() => {
+          this.refreshing = false;
+        });
     }, interval);
+  }
+
+  /**
+   * One poll. On a CONNECTION error (the app exited or is restarting) retry once: that retry
+   * re-resolves through discovery before sending anything, following the same app to its new
+   * port or refusing to send the token at all.
+   */
+  private async pollOnce(): Promise<void> {
+    try {
+      await this.refreshAll();
+    } catch (e) {
+      if (!isConnectionError(e) || this.state !== "connected") throw e;
+      await this.refreshAll();
+    }
   }
 
   private stopPolling(): void {
@@ -397,7 +502,13 @@ export class VictauriClient {
     this.onStateChange.fire(s);
   }
 
-  private async fetch(
+  /** Every request goes through here; a token-bearing one is vouched for first. */
+  private async fetch(path: string, init?: RequestInit): Promise<Response> {
+    if (path !== "/health") await this.ensureEndpointTrusted();
+    return this.rawFetch(path, init);
+  }
+
+  private async rawFetch(
     path: string,
     init?: RequestInit
   ): Promise<Response> {
@@ -419,4 +530,9 @@ export class VictauriClient {
       clearTimeout(timeout);
     }
   }
+}
+
+/** `fetch` rejects with a `TypeError` when no HTTP response arrived at all. */
+function isConnectionError(e: unknown): boolean {
+  return e instanceof TypeError;
 }

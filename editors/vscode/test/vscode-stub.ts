@@ -36,3 +36,16 @@ export enum TreeItemCollapsibleState {
   Collapsed = 1,
   Expanded = 2,
 }
+
+/** Settings the client reads through `workspace.getConfiguration`; tests may override. */
+export const stubConfig: Record<string, unknown> = {};
+
+export const workspace = {
+  getConfiguration: () => ({
+    get: <T>(key: string, fallback: T): T => (key in stubConfig ? (stubConfig[key] as T) : fallback),
+  }),
+};
+
+export const window = {
+  showWarningMessage: (..._args: unknown[]) => undefined,
+};
