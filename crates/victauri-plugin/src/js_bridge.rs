@@ -91,7 +91,9 @@ fn js_literal(s: &str) -> String {
 }
 
 /// The pre-eval liveness probe: answers `"probe_ok:<page nonce>"` (just `"probe_ok"` without a
-/// bridge). The id follows `id:` with no space, unlike the wrapper's `id: `.
+/// bridge). The id follows `id:` with no space, unlike the wrapper's `id: `. The callback args
+/// have no prototype, so a page's `Object.prototype.toJSON` cannot break their serialization
+/// (R5-JS2).
 #[doc(hidden)]
 #[must_use]
 pub fn eval_probe_script(id: &str) -> String {
@@ -99,7 +101,7 @@ pub fn eval_probe_script(id: &str) -> String {
         "(async()=>{{var v=window.__VICTAURI__;\
          var n=(v&&typeof v._pageNonce==='string')?':'+v._pageNonce:'';\
          await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback',\
-         {{id:{},result:'\"probe_ok'+n+'\"'}});}})();",
+         Object.assign(Object.create(null),{{id:{},result:'\"probe_ok'+n+'\"'}}));}})();",
         js_literal(id)
     )
 }
@@ -561,11 +563,57 @@ const INIT_SCRIPT_BODY: &str = r#"
         evalState.delete(id);
         evalDone.add(id);
     }
+    // `body` is always a JSON string. The args object has NO prototype: Tauri serializes it with
+    // the page's JSON.stringify, which consults `toJSON` up the prototype chain, so a page that
+    // planted a throwing `Object.prototype.toJSON` blocked every outcome (R5-JS2). Only string
+    // primitives are inside, and JSON.stringify never looks up `toJSON` on a primitive.
     function evalCallback(id, body) {
         'use strict';
         try {
-            return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', { id: id, result: body });
+            var args = OBJ_CREATE(null);
+            args.id = id;
+            args.result = body;
+            return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', args);
         } catch (e) { return null; }
+    }
+    // A JSON string literal for `s`, built without serializing any object (see evalCallback).
+    function jsonStringLiteral(s) {
+        'use strict';
+        try { return NATIVE_STRINGIFY(typeof s === 'string' ? s : toStringExact(s)); }
+        catch (e) { return '"(unprintable)"'; }
+    }
+    function errorText(e) {
+        'use strict';
+        try {
+            var m = e && e.message;
+            return typeof m === 'string' ? m : toStringExact(e);
+        } catch (x) { return 'unknown error'; }
+    }
+    // The callback body for an eval outcome. Every envelope is assembled as a string around
+    // pristine-serialized parts, so nothing but the eval's own result value is serialized as an
+    // object — a page that breaks object serialization cannot also break the error report.
+    function evalOutcomeBody(payload) {
+        'use strict';
+        var type = payload && payload.__victauri_type;
+        if (type === 'value') {
+            // The code RAN; a result JSON cannot carry (circular, BigInt, a function, a
+            // throwing toJSON) is reported as exactly that, never as a JavaScript error.
+            var value = payload.__victauri_ok;
+            var json;
+            try { json = PRISTINE_STRINGIFY(value); }
+            catch (e) { return '{"__victauri_unserializable":' + jsonStringLiteral(errorText(e)) + '}'; }
+            if (json === undefined) {
+                return '{"__victauri_unserializable":' + jsonStringLiteral('the result is a ' + typeof value + ', which JSON cannot represent') + '}';
+            }
+            return '{"__victauri_ok":' + json + ',"__victauri_type":"value"}';
+        }
+        if (type === 'null' || type === 'undefined') {
+            return '{"__victauri_ok":null,"__victauri_type":"' + type + '"}';
+        }
+        if (payload && hasOwn(payload, '__victauri_err')) {
+            return '{"__victauri_err":' + jsonStringLiteral(payload.__victauri_err) + '}';
+        }
+        return PRISTINE_STRINGIFY(payload);
     }
 
     // The bridge's logs are handed out as per-entry COPIES. Returning the live internal arrays
@@ -740,7 +788,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             id = '' + id; // not String(id): page script can replace window.String
             if (nonce !== PAGE_NONCE || evalState.has(id) || evalDone.has(id)) return null;
             evalMarkDone(id);
-            return evalCallback(id, PRISTINE_STRINGIFY({ __victauri_not_run: 'the code did not begin executing — this almost always means a syntax/parse error in the submitted code' }));
+            return evalCallback(id, '{"__victauri_not_run":' + jsonStringLiteral('the code did not begin executing — this almost always means a syntax/parse error in the submitted code') + '}');
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
@@ -748,21 +796,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             id = '' + id; // not String(id): page script can replace window.String
             if (evalDone.has(id)) return null;
             evalMarkDone(id);
+            // Marked done first, so an outcome MUST be sent from here on: nothing below may
+            // throw past this point without one (R5-JS2).
             var body;
-            if (payload && payload.__victauri_type === 'value') {
-                // The code RAN; a result JSON cannot carry (circular, BigInt, a function) is
-                // reported as exactly that, never as a JavaScript error.
-                var json;
-                try { json = PRISTINE_STRINGIFY(payload.__victauri_ok); }
-                catch (e) { json = null; body = PRISTINE_STRINGIFY({ __victauri_unserializable: String((e && e.message) || e) }); }
-                if (body === undefined) {
-                    body = json === undefined
-                        ? PRISTINE_STRINGIFY({ __victauri_unserializable: 'the result is a ' + typeof payload.__victauri_ok + ', which JSON cannot represent' })
-                        : '{"__victauri_ok":' + json + ',"__victauri_type":"value"}';
-                }
-            } else {
-                try { body = PRISTINE_STRINGIFY(payload); }
-                catch (e) { body = PRISTINE_STRINGIFY({ __victauri_err: String((e && e.message) || e) }); }
+            try { body = evalOutcomeBody(payload); }
+            catch (e) { body = undefined; }
+            if (typeof body !== 'string') {
+                body = '{"__victauri_err":' + jsonStringLiteral('the eval outcome could not be serialized') + '}';
             }
             return evalCallback(id, body);
         },
@@ -3091,12 +3131,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     // load by its nonce. A page restored from the back/forward cache re-runs no init script, so
     // it re-announces itself: an eval armed in the page it replaced must not wait out its timeout.
     function signalReady() {
-        try {
-            window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {
-                id: '__victauri_bridge_ready__',
-                result: PAGE_NONCE
-            });
-        } catch(e) {}
+        evalCallback('__victauri_bridge_ready__', PAGE_NONCE);
     }
     window.addEventListener('pageshow', function(e) { if (e && e.isTrusted === true && e.persisted) signalReady(); });
     signalReady();

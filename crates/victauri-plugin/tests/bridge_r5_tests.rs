@@ -222,3 +222,124 @@ fn r5_js1_ipc_log_reads_are_not_proportional_to_total_body_bytes() {
         "waitForIpcComplete took {wait:.0} ms with the last call complete (must not copy the log): {r}"
     );
 }
+
+// ── R5-JS2: a page's throwing toJSON cannot make every eval hang ─────────────
+
+/// A Tauri-like `invoke` stub: serializes the args with the page's (global, looked up at call
+/// time) `JSON.stringify`, as Tauri's IPC transport does, and records the delivered result
+/// per id. Plus the real eval scripts as `S.<name>` and `run(script)`.
+fn eval_prelude(scripts: &[(&str, String)]) -> String {
+    let mut js = String::from(
+        r"
+        var delivered = {};
+        window.__TAURI_INTERNALS__ = { invoke: function(cmd, args) {
+            var wire = JSON.stringify(args);
+            var a = JSON.parse(wire);
+            (delivered[a.id] = delivered[a.id] || []).push(a.result);
+            return Promise.resolve(null);
+        } };
+        // A script's own promise rejecting (the wrapper escaping with an error) is recorded,
+        // not left unhandled (which would abort the runner).
+        var escaped = [];
+        function run(s) {
+            try {
+                var p = (0, eval)(s);
+                if (p && typeof p.then === 'function') p.then(null, function(e) { escaped.push('' + (e && e.message)); });
+                return null;
+            } catch (e) { return e.name; }
+        }
+        function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+        var S = {};
+        ",
+    );
+    for (name, script) in scripts {
+        js.push_str(&format!(
+            "S[{}] = {};\n",
+            serde_json::to_string(name).unwrap(),
+            serde_json::to_string(script).unwrap()
+        ));
+    }
+    js
+}
+
+/// Page script with a throwing `Object.prototype.toJSON` (a getter, or a method) broke every
+/// serialization the eval plumbing did: `_evalSettle` marked the eval done, then its error
+/// fallback — itself an object — threw again, so NO outcome was ever sent and every eval (and
+/// the liveness probe) hung until the timeout. An outcome must always be delivered.
+#[test]
+fn r5_js2_throwing_to_json_cannot_suppress_eval_outcomes() {
+    use victauri_plugin::js_bridge::{eval_probe_script, eval_wrapper_script};
+    let prelude = eval_prelude(&[
+        ("probe", eval_probe_script("id-p")),
+        ("obj", eval_wrapper_script("id-obj", "return {a: 1}")),
+        ("str", eval_wrapper_script("id-str", "return 'hello'")),
+        (
+            "thr",
+            eval_wrapper_script("id-thr", "throw new Error('boom')"),
+        ),
+        ("undef", eval_wrapper_script("id-undef", "return undefined")),
+    ]);
+    let body = r"
+        run(S.probe); run(S.obj); run(S.str); run(S.thr); run(S.undef);
+        await sleep(30);
+        delete Object.prototype.toJSON; // so the runner can report the result
+        return { delivered: delivered, escaped: escaped };
+    ";
+    let getter = format!(
+        "{prelude}\nObject.defineProperty(Object.prototype, 'toJSON', {{ configurable: true, \
+         get: function() {{ throw new Error('nope'); }} }});\n{body}"
+    );
+    let method = format!(
+        "{prelude}\nObject.prototype.toJSON = function() {{ throw new Error('nope'); }};\n{body}"
+    );
+    let def = def(
+        None,
+        vec![
+            case("throwing toJSON getter", &getter),
+            case("throwing toJSON method", &method),
+        ],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    for i in 0..2 {
+        let r = result(&results, i);
+        assert_eq!(r["escaped"], serde_json::json!([]), "[{i}] {r}");
+        let v = &r["delivered"];
+        let one = |id: &str| -> serde_json::Value {
+            let arr = v[id]
+                .as_array()
+                .unwrap_or_else(|| panic!("[{i}] no outcome delivered for {id}: {v}"));
+            assert_eq!(arr.len(), 1, "[{i}] {id}: {v}");
+            serde_json::from_str(arr[0].as_str().unwrap())
+                .unwrap_or_else(|e| panic!("[{i}] {id} body is not JSON ({e}): {v}"))
+        };
+        assert!(
+            one("id-p").as_str().unwrap().starts_with("probe_ok"),
+            "[{i}] {v}"
+        );
+        assert_eq!(
+            one("id-str"),
+            serde_json::json!({ "__victauri_ok": "hello", "__victauri_type": "value" }),
+            "[{i}]"
+        );
+        assert_eq!(
+            one("id-undef"),
+            serde_json::json!({ "__victauri_ok": null, "__victauri_type": "undefined" }),
+            "[{i}]"
+        );
+        assert_eq!(
+            one("id-thr"),
+            serde_json::json!({ "__victauri_err": "boom" }),
+            "[{i}]"
+        );
+        let obj = one("id-obj");
+        assert!(
+            obj["__victauri_unserializable"]
+                .as_str()
+                .is_some_and(|m| m.contains("nope")),
+            "[{i}] an object result the page made unserializable is reported as such: {obj}"
+        );
+    }
+}
