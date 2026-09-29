@@ -21,13 +21,25 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tauri::{Emitter, Manager, WebviewWindow};
 use victauri_core::CommandInfo;
 use victauri_plugin::inspectable;
+
+/// The app's one long-lived `AppHandle`, cloned once in `setup` (on the main
+/// thread) and never dropped (statics are not dropped).
+///
+/// Background tasks borrow it (`APP.get()` + `emit(&self, ..)`) instead of
+/// moving an `AppHandle` into `tauri::async_runtime::spawn`. On Linux every
+/// Tauri handle carries tao's main-thread-only `Rc` state behind an
+/// `unsafe impl Send + Sync`; cloning or dropping a handle off the main thread
+/// races that non-atomic refcount and can corrupt the heap. The gauntlet must
+/// not do that itself, or a dead CI host could be the app's fault rather than
+/// Victauri's. See MIGRATION.md (v0.9.0).
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 /// Number of synthetic registry entries. These are registered as schema *data*
 /// (no real handler) to exercise the registry/resolve/ghost/coverage tools at
@@ -102,6 +114,8 @@ fn flood_marker(seq: i64) -> i64 {
     intent = "run a slow command",
     category = "stress"
 )]
+// Async on purpose (timing stress). Tauri itself runs an async command's argument
+// extraction and resolver on a tokio worker — an upstream Tauri path, not app code.
 async fn slow_command(ms: u64) -> String {
     tokio::time::sleep(Duration::from_millis(ms.min(2000))).await;
     format!("slept {ms}ms")
@@ -124,7 +138,7 @@ fn fail_command() -> Result<(), String> {
     category = "pipeline",
     example = "run the pipeline"
 )]
-fn run_pipeline(app: tauri::AppHandle, pipeline: tauri::State<'_, Arc<PipelineState>>) {
+fn run_pipeline(pipeline: tauri::State<'_, Arc<PipelineState>>) {
     let state = Arc::clone(&pipeline);
     if state.running.swap(true, Ordering::SeqCst) {
         return; // already running
@@ -136,7 +150,10 @@ fn run_pipeline(app: tauri::AppHandle, pipeline: tauri::State<'_, Arc<PipelineSt
             state.processed.fetch_add(1, Ordering::SeqCst);
         }
         state.running.store(false, Ordering::SeqCst);
-        let _ = app.emit("pipeline-complete", state.processed.load(Ordering::SeqCst));
+        // Borrow the main-thread-owned handle; the task owns no Tauri handle.
+        if let Some(app) = APP.get() {
+            let _ = app.emit("pipeline-complete", state.processed.load(Ordering::SeqCst));
+        }
     });
 }
 
@@ -214,6 +231,8 @@ fn main() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            // Main thread: take the one handle background tasks may borrow.
+            let _ = APP.set(handle.clone());
 
             // Seed a real SQLite DB in the app data dir (a default query_db search
             // root) so query_db / introspect db_health have a real schema + rows to

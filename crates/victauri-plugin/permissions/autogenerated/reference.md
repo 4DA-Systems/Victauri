@@ -1,17 +1,15 @@
 ## Default Permission
 
-Default permissions for the Victauri plugin — allows all introspection commands.
+Default permissions for the Victauri plugin — the commands Victauri's own injected bridge needs (the eval callback) plus the synchronous, read-only introspection commands. `allow-victauri-eval-js` and `allow-victauri-dom-snapshot` (page-callable eval / snapshot; async commands) are NOT included — grant them explicitly if page code needs them.
 
 #### This default permission set includes the following:
 
-- `allow-victauri-eval-js`
 - `allow-victauri-eval-callback`
 - `allow-victauri-get-window-state`
 - `allow-victauri-list-windows`
 - `allow-victauri-get-ipc-log`
 - `allow-victauri-get-registry`
 - `allow-victauri-get-memory-stats`
-- `allow-victauri-dom-snapshot`
 - `allow-victauri-verify-state`
 - `allow-victauri-detect-ghost-commands`
 - `allow-victauri-check-ipc-integrity`

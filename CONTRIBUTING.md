@@ -34,7 +34,7 @@ All checks (test, clippy, fmt) must pass. CI runs them on Linux, Windows, and ma
 - All value-returning public functions must have `#[must_use]`
 - Prefer `let...else` over match for single-pattern extraction with early return
 - Prefer `map_or` over `map().unwrap_or()`
-- No `unwrap()` on mutexes or RwLocks — use `victauri_core::acquire_lock`, `acquire_read`, or `acquire_write` helpers for poisoning recovery with diagnostic logging
+- No `unwrap()` on mutexes or RwLocks — recover from poisoning instead (`.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`, or the workspace-internal `victauri_core::acquire_lock` / `acquire_read` / `acquire_write`, which also log). Since 0.9.0 those `acquire_*` helpers are `#[doc(hidden)]` plumbing shared by the Victauri crates, not public API: don't document or recommend them for use outside this workspace
 - No `unreachable!()` in match arms that could be reached by malformed input
 - `unsafe_code = "deny"` is enforced workspace-wide — use targeted `#[allow(unsafe_code)]` with `// SAFETY:` comments for FFI
 

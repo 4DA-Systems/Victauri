@@ -119,6 +119,39 @@ Tauri 2 supports only one `invoke_handler` per app ([tauri-apps/tauri#11447](htt
 | macOS | macOS 10.15+ | WKWebView ships with the OS. No additional runtime. |
 | Linux | WebKitGTK 2.36+ (webkit2gtk-4.1) | Ubuntu 22.04+. Tauri 2 won't compile on older versions, so not a Victauri concern. |
 
+### Linux: keep Tauri handles on the main thread
+
+On Linux every Tauri handle (`AppHandle`, `Window`, `Webview`, `WebviewWindow`) carries tao's
+main-thread-only state, including a non-atomic `Rc`, behind an `unsafe impl Send + Sync`. Cloning or
+dropping any handle on another thread races that refcount, and the app can later abort with glibc
+`corrupted double-linked list` / `unaligned fastbin chunk` on whichever thread allocates next. This is
+a Tauri/tao behavior, not something Victauri adds. Victauri itself only clones and drops handles on the
+main thread since 0.9.0, but an app's own code can still hit the race, and when it does the crash can
+look like it came from whatever happened to be running at the time, Victauri included.
+
+The usual culprit is moving an `AppHandle` into `std::thread::spawn` or `tauri::async_runtime::spawn`
+to `emit` from background work: the handle is dropped on that thread when the work ends. Instead, take
+one handle on the main thread and let background work borrow it (`emit` only needs `&self`):
+
+```rust
+use std::sync::OnceLock;
+use tauri::Emitter;
+
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+// in .setup(|app| { ... }) — runs on the main thread
+let _ = APP.set(app.handle().clone());
+
+// in background work: borrow, never clone or own
+if let Some(app) = APP.get() {
+    let _ = app.emit("job-complete", 42);
+}
+```
+
+Victauri's own example apps (`examples/demo-app`, `examples/gauntlet-app`) use this pattern. Async
+`#[tauri::command]`s are a separate, upstream case: Tauri extracts their arguments and drops their
+resolver on a tokio worker, whatever the command body does.
+
 ### Tauri Version Compatibility
 
 Victauri is tested with Tauri 2.0 through 2.11. Key compatibility facts:

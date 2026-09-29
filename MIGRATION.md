@@ -27,12 +27,45 @@ Exhaustive `match`es on the now-`#[non_exhaustive]` enums (`InteractionKind`, `C
 `FaultType`, `JsonShape`, `PrivacyProfile`, `ThresholdPreset`) need a `_ =>` arm, and patterns on
 `AppEvent`'s struct variants need `..`.
 
-**No longer public API:** `victauri_plugin::filmstrip`; the `js_bridge`, `screencast`, `database`
-modules, `mcp::build_app_stateful` and a few helpers are `#[doc(hidden)]` (reachable for tests, not
-covered by semver — `Screencast::start`/`stop` also changed signature).
+**No longer public API.** Removed: `victauri_plugin::filmstrip` (`Frame`, `compose`,
+`default_cols`). Everything else below is now `#[doc(hidden)]`: still reachable (Victauri's own
+crates and tests use it) but not covered by semver, so it can change in any release. The full list,
+from `cargo semver-checks check-release --release-type minor` against 0.8.8:
 
-**Types you can read but not build.** Some newly `#[non_exhaustive]` output types have no public
-constructor because nothing outside Victauri should create them: `DomSnapshot`, `DomElement`,
+- `victauri-core`: the `middleware` module (`require_auth`, `rate_limit`, `origin_guard`,
+  `dns_rebinding_guard`, `security_headers`, `default_rate_limiter`, `AuthState`), the `security`
+  module (`generate_token`, `constant_time_eq`, `is_localhost_host`, `is_allowed_origin`,
+  `RateLimiter`, `DEFAULT_RATE_LIMIT`), and `acquire_lock` / `acquire_read` / `acquire_write`.
+  These were plumbing for the plugin/CLI; an app that used them should copy what it needs
+  (poison recovery is `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`).
+- `victauri-plugin`: `privacy::{strict_privacy_config, observe_privacy_config,
+  test_privacy_config}` (use `VictauriBuilder::privacy_profile(PrivacyProfile::Observe | Test)` or
+  `.strict_privacy_mode()`); `js_bridge::{init_script, BridgeCapacities}`;
+  `database::{discover_databases, classify_databases, select_app_database, is_webview_internal,
+  query, DbCandidate}`; `screencast::{Screencast, TraceFrame}` (`Screencast::start`/`stop` also
+  changed signature); `mcp::build_app_stateful`; and the recording-drain plumbing listed in
+  CHANGELOG round 4.
+
+**Every type that became `#[non_exhaustive]`** (so a struct literal or an exhaustive `match`
+outside its crate no longer compiles):
+
+- `victauri-core` structs: `IpcCall`, `WindowState`, `DomSnapshot`, `DomElement`, `ElementBounds`,
+  `CommandInfo`, `CommandArg`, `ScoredCommand`, `RecordedSession`, `RecordedEvent`,
+  `StateCheckpoint`, `VerificationResult`, `Divergence`, `MemoryDelta`, `RefHandle`,
+  `GhostCommand`, `GhostCommandReport`, `IpcIntegrityReport`, `StaleCall`, `ErrorCall`,
+  `SemanticAssertion`, `AssertionResult`; enums `InteractionKind`, `CodegenStyle`; and the struct
+  variants of `AppEvent` (`StateChange`, `DomMutation`, `DomInteraction`, `WindowEvent`,
+  `Console`).
+- `victauri-plugin` structs: `VictauriState`, `PrivacyConfig`, `CommandTimingStats`,
+  `FaultConfig`, `ContractBaseline`, `ContractDrift`, `TypeChange`, `StartupPhase`,
+  `CapturedTauriEvent`, `TrackedTaskInfo`, `ChildProcessInfo`; enums `FaultType`, `JsonShape`,
+  `PrivacyProfile`.
+- `victauri-test` structs: `PluginInfo`, `MemoryStats`, `SmokeReport`, `SmokeCheckResult`,
+  `CheckResult`, `VerifyReport`, `CoverageReport`, `CommandCalls`, `VisualDiff`, `LocatorMatch`,
+  `Bounds`; enum `ThresholdPreset`.
+
+**Types you can read but not build.** Some of these output types have no public constructor
+because nothing outside Victauri should create them: `DomSnapshot`, `DomElement`,
 `VerificationResult`, `StateCheckpoint`, `SmokeReport`, `CoverageReport` and similar reports. If a
 test needs one (e.g. a `StateCheckpoint` for `RecordedSession::new`), deserialize it from JSON with
 `serde_json::from_value`.
@@ -55,8 +88,9 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   `integrity_check: "not completed…"` instead of failing on large databases.
 - `query_db` rejects table-valued `pragma_*()` functions for non-allowlisted pragmas and the
   `PRAGMA name(value)` write form.
-- Browser-originated (`Origin`-bearing) POSTs to `/mcp` or `/api/tools` must be
-  `Content-Type: application/json` (415 otherwise). Non-browser clients are unaffected.
+- A POST that carries an `Origin` header and gets past the origin check below (a localhost
+  `http`/`https` origin, no `Sec-Fetch-Site` other than `none`) must be
+  `Content-Type: application/json` (415 otherwise). Clients that send no `Origin` are unaffected.
 - Several tools' MCP annotations changed (`recording`, `introspect`, `logs`, `window` are now
   `destructive_hint`; `verify_state`, `wait_for`, `assert_semantic`, `inspect`, `animation` are no
   longer `read_only_hint`). Clients that auto-approve read-only tools will now ask for these.
@@ -83,10 +117,13 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   runs in, so the call fails clearly instead of typing into another app).
 - `victauri-test`: `Locator::check()`/`uncheck()` click the element (and verify it changed), and a
   stale element reference is `ElementNotFound` instead of an empty/false value.
-- The server speaks HTTP/1.1 only and refuses browser-originated requests (any `Origin`, a
-  `Sec-Fetch-Site` other than `none`) with 403, including `tauri://` origins; it no longer sends
-  `Access-Control-Allow-Origin`. HTTP clients (curl, reqwest, the CLI, `victauri-test`) are
-  unaffected.
+- The server speaks HTTP/1.1 only and answers 403 to a request with a `Sec-Fetch-Site` header
+  other than `none` (which every current browser sends on a web page's cross-site or same-site
+  fetch), an `Origin` that is not an `http`/`https` localhost origin (`localhost`, `127.0.0.1`,
+  `[::1]`), an `Origin` it cannot parse, or a `tauri://` origin. A localhost `Origin` alone is
+  allowed through, and then meets the JSON content-type rule above (415). The server no longer
+  sends `Access-Control-Allow-Origin`. HTTP clients that send no `Origin` or `Sec-Fetch-Site`
+  (curl, reqwest, the CLI, `victauri-test`) are unaffected.
 - On Unix the discovery directory moved to `$XDG_RUNTIME_DIR/victauri/<pid>` or
   `<temp>/victauri-<euid>/<pid>`. The 0.9 CLI, test client and watchdog also read the old
   `<temp>/victauri/` root, so they find apps built with 0.8.x; a 0.8.x client does not find a 0.9 app.
@@ -133,12 +170,33 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   page still gets a promise; nothing to change). This keeps Tauri handles on the main thread —
   cloning or dropping one elsewhere corrupted the heap on Linux (see CHANGELOG). If your own app
   clones an `AppHandle` / window / webview on background threads on Linux, the same Tauri race
-  applies to it.
+  applies to it. That includes moving an `AppHandle` into `std::thread::spawn` or
+  `tauri::async_runtime::spawn` to `emit` later, because the handle is then dropped on that
+  thread. Take one handle on the main thread in `setup` (`static APP: OnceLock<AppHandle>`,
+  `APP.set(app.handle().clone())`) and have background work borrow it (`APP.get()`; `emit` only
+  needs `&self`). The demo and gauntlet apps do this, and the docs'
+  [compatibility page](docs/src/compatibility.md) has the snippet.
+- **`victauri:default` no longer grants `victauri_eval_js` / `victauri_dom_snapshot`.** These two
+  page-callable Tauri commands are the only async Victauri commands left (Tauri runs an async
+  command's argument extraction on a tokio worker, the Linux handle race above), and
+  `victauri_eval_js` is a CSP-independent eval that any page script could call. Nothing in Victauri
+  uses them — the MCP/REST tools and the injected bridge only need `victauri_eval_callback`, which
+  stays in the default set — so almost every app needs no change. If your own frontend code calls
+  them, grant them explicitly next to `victauri:default` in that window's capability file:
+
+  ```json
+  "permissions": [
+    "victauri:default",
+    "victauri:allow-victauri-eval-js",
+    "victauri:allow-victauri-dom-snapshot"
+  ]
+  ```
 - New in `victauri-test`: `invoke_command_with_timeout`, `discover_app`, the `terminal` sanitizer
   module and `health_status_means_alive`.
 - The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
   `Junit*` report types stay exhaustive (struct-update syntax keeps working); a field added to one
   of them later will be called out as a breaking change.
+
 ## v0.8.7 → v0.8.8 (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
 
 No consumer code changes are required and no dependency-requirement change is needed

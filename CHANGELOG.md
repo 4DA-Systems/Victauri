@@ -66,7 +66,8 @@ that did not survive testing are listed under "Disproved" below. No Critical or 
   are verified now: focus through shadow roots and frames; actionability, iframe offsets and the
   window's client area.
 - **Any probe error aborted an eval as "page reloaded"** (the round-3 claim that page script cannot
-  forge one was wrong), inviting a double-executing retry. Only a positively different page aborts.
+  forge one was wrong), inviting a double-executing retry. Only a positively different page aborts
+  (a positive answer that same-window script forges still counts — see Round 5).
 - **The `eval_js` auto-return scanner still dropped statements** (the round-3 "never drops a
   statement" claim was wrong): a line break inside `/* */`, a lone CR, a line ending in `1.`, and
   `of`/`yield` used as names. Differential check against node: 10,793 → 0 divergent of 35,459
@@ -208,10 +209,12 @@ Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
   eval ids, and an `Object.prototype.toJSON` rewrote every result and log entry. Eval state is now
   null-prototype tables behind closures, ids are coerced without page-replaceable globals, and the
   bridge's stringify ignores a `toJSON` inherited from `Object.prototype`/`Array.prototype`. Logs
-  hand out deep copies. (Same-window page script remains a documented residual; see SECURITY.md.)
-- **Agent-only bridge controls were callable by the page** (clear logs/routes, dialog auto-answers,
-  animation scrub/sweep state). They are now reachable only with a per-process key the plugin
-  embeds in its own evals.
+  hand out deep copies. (Same-window page script can still read, rewrite or drop its own window's
+  results in transit — see Round 5 and docs/src/security.md.)
+- **Agent-only bridge controls were callable by the page** (clear logs/routes, dialog auto-answers).
+  They are now reachable only with a per-process key the plugin embeds in its own evals. (The
+  animation scrub/sweep helpers are NOT behind the key: they stay on the public
+  `window.__VICTAURI__`; only the old `__VICTAURI_SCRUB__` / `__SWEEP__` globals were removed.)
 - **Compact snapshot lines could still be forged** through `role` and quote-stripped attribute
   values; every field is now encoded and each element yields exactly one well-formed line.
 - **Windows discovery liveness** substring-matched `tasklist` output (PID 12 "matched" 123) and
@@ -250,8 +253,8 @@ Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
   exactly once.
 - **Reload detection**: a reload within 250 ms of injection waited the full timeout, and a
   same-page ready signal delayed >250 ms discarded a real result. Each page load now carries a
-  nonce; only a ready signal from a *different* page aborts an eval, and page script cannot forge
-  one.
+  nonce; only a ready signal from a *different* page aborts an eval. (Script in another page cannot
+  forge one; script in the same page can — see Round 5.)
 - **Dropped calls leaked pending-eval slots** (a REST client that disconnected mid-call); 100 of
   them wedged every eval tool until restart. Slots are now released on drop everywhere.
 - **Recording drain**: an event stamped ahead of Rust's clock was re-recorded on every drain,
@@ -308,9 +311,11 @@ Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
 
 ### Security — pre-audit red team (no Critical/High found)
 
-- **Hostile page content could forge or suppress eval results.** Pending eval ids lived on a
-  page-visible global (`window.__VIC_EVAL__`); the eval bookkeeping now lives in the bridge's
+- **Hostile page content could forge or suppress eval results through a page-visible global.**
+  Pending eval ids lived on `window.__VIC_EVAL__`; the eval bookkeeping now lives in the bridge's
   frozen closure, and serialization uses a `JSON.stringify` captured before any page script ran.
+  (This closed that route only: same-window script can still rewrite or drop results in transit —
+  see Round 5.)
 - **The injected bridge's log getters returned its live internal arrays**, so page script could
   plant a forged "successful" IPC call (which `recording replay` would then invoke), hide its own
   traffic, or freeze the recording drain. They now return copies; drain watermarks are clamped.
@@ -444,6 +449,64 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
   0.9 apps in the per-user Unix root and no longer counts another user's process as live.
 - Surface Audit workflow had false-failed every week since July (crates.io 403s without a
   User-Agent); docs install pins, action refs and tool counts corrected.
+
+### Round 5 — pre-publish audit
+
+- **Breaking (permissions): `victauri:default` no longer grants `allow-victauri-eval-js` or
+  `allow-victauri-dom-snapshot`.** They were in the default set although this entry describes them
+  as "page API, opt-in". They are the only async Victauri commands left — on Linux an async
+  command's argument extraction and resolver clone and drop Tauri handles on a tokio worker (the
+  host heap-corruption class fixed above), so any page script in an app using `victauri:default`
+  could drive that path in a loop — and `victauri_eval_js` is an eval reachable by page script
+  regardless of the app's CSP. Nothing in Victauri calls them (the bridge and every tool use only
+  `victauri_eval_callback`). The individual `allow-`/`deny-` permissions remain, so an app can opt
+  back in; see MIGRATION.md.
+- **The example apps dropped Tauri handles off the main thread**, the race MIGRATION.md tells apps
+  to avoid: the demo's `run_pipeline` moved an `AppHandle` into `std::thread::spawn` (run three times
+  by the integration tests) and the gauntlet's into `tauri::async_runtime::spawn`. A host death in
+  CI could therefore have been the example's fault rather than Victauri's. Both now take one handle
+  on the main thread in `setup` (`static APP: OnceLock<AppHandle>`) and background work only borrows
+  it. The pattern is documented for apps under "Linux: keep Tauri handles on the main thread" in the
+  compatibility docs.
+- **CI never compiled the plugin without SQLite.** The "no default features" clippy step ran over the
+  workspace, where the example apps' default-feature dependency on the plugin kept `sqlite` on
+  through feature unification. CI now also runs clippy and the unit tests for `victauri-plugin`
+  alone with `--no-default-features` (both clean locally). The MSRV job checks with `--locked`.
+  The semver job's comment claimed the 0.8.8 → 0.9.0 check "passes as the intended major bump";
+  for a 0.x major bump cargo-semver-checks runs no lints at all ("0 checks … 254 skip").
+  RELEASING.md now says to also run `--release-type minor` for a major bump to list what actually
+  changed.
+- Docs: the plugin README's tools-reference link 404'd (GitHub Pages paths are case-sensitive:
+  `/Victauri/`); the `sqlite` / `bundled-sqlite` features, including that `bundled-sqlite` also
+  switches the app's own rusqlite to bundled SQLite and how to opt out, are documented in the
+  plugin README and the configuration docs; the demo app's `.mcp.json` no longer passes the no-op
+  `--wait`.
+- Docs: MIGRATION.md contradicted itself on browser-originated requests (one bullet said an
+  `Origin`-bearing POST gets 415 unless JSON, another that "any `Origin`" gets 403), and the
+  security docs repeated the 403 claim. The actual rule, now in both: 403 for a `Sec-Fetch-Site`
+  other than `none`, a non-localhost, unparseable or `tauri://` `Origin`; a localhost `Origin` is
+  allowed through and a POST carrying it must be JSON (415 otherwise).
+- **Claims corrected: same-window page script CAN forge and suppress eval results.** Tauri (2.11.5,
+  `scripts/ipc-protocol.js`) sends every IPC message with the bare global `fetch(...)`, looked up
+  at call time, so script that wraps `window.fetch` after the bridge loads sees every
+  `victauri_eval_callback` body (`{"id": …, "result": …}`) and can rewrite or drop it. A jsdom
+  proof of concept returned an agent's `return document.title` as a page-chosen string, and forged
+  a liveness-probe answer that trips the "page replaced/reloaded" abort. Earlier entries in this
+  release said page script cannot forge or suppress results, that the reload abort cannot be
+  forged, and (in the security docs) that replay "never runs what did not run"; they are corrected
+  in place. The real boundary: page script in the same webview is trusted for the integrity and
+  confidentiality of that webview's eval results and probe answers (it can read, rewrite or drop
+  them, and so can plant IPC calls in a recording of its window); it still cannot read the agent
+  key or call keyed agent operations, and other windows and Rust-side tools are unaffected. Also
+  corrected: the animation scrub/sweep helpers (`scrubPrepare`, `scrubSeek`, `scrubRestore`,
+  `installSweepRecorder`, `readSweep`) are on the public `window.__VICTAURI__`, not behind the
+  per-process key as round 3 said.
+- MIGRATION.md did not list most of the API this release hid: all of `victauri_core::middleware`
+  and `victauri_core::security`, `acquire_lock`/`acquire_read`/`acquire_write`, the plugin's
+  `privacy::{strict,observe,test}_privacy_config` and several `database` / `js_bridge` /
+  `screencast` items. It now lists every removed, hidden and newly `#[non_exhaustive]` item that
+  `cargo semver-checks --release-type minor` reports against 0.8.8 for core, plugin and test.
+  CONTRIBUTING.md no longer presents the hidden `acquire_*` helpers as API.
 
 ## [0.8.8] - 2026-08-12
 
