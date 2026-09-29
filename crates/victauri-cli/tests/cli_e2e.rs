@@ -306,3 +306,21 @@ fn init_prints_a_hostile_identifier_on_one_escaped_line() {
         "{err}"
     );
 }
+
+/// R5B-DOCTOR1: `victauri doctor` printed `[FAIL]` items but always exited 0, so a CI step
+/// running it could never fail. A FAIL exits 1; warnings alone do not.
+#[test]
+fn doctor_exits_nonzero_when_a_check_fails() {
+    let iso = IsolatedTemp::new();
+    // No Cargo.toml here: the very first check FAILs.
+    let empty = iso.0.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = iso
+        .victauri(&["doctor"])
+        .current_dir(&empty)
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(err.contains("[FAIL]"), "{err}");
+    assert_eq!(out.status.code(), Some(1), "a FAIL must exit 1:\n{err}");
+}

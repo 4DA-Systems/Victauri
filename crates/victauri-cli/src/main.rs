@@ -161,7 +161,11 @@ async fn main() -> Result<()> {
             cmd_test(max_load_ms, max_heap_mb, junit.as_deref(), &target).await?;
         }
         Commands::Doctor { target } => {
-            cmd_doctor(&target).await?;
+            // A `[FAIL]` exits 1 so a CI step running `victauri doctor` fails with it
+            // (R5B-DOCTOR1); warnings alone still exit 0.
+            if cmd_doctor(&target).await? > 0 {
+                std::process::exit(1);
+            }
         }
         Commands::Bridge { wait, app } => {
             bridge::run(wait, app).await?;
@@ -728,7 +732,8 @@ async fn cmd_check(junit_path: Option<&Path>, target: &AppTarget) -> Result<()> 
     Ok(())
 }
 
-async fn cmd_doctor(target: &AppTarget) -> Result<()> {
+/// Run every doctor check and print the summary; returns the number of `[FAIL]` items.
+async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     eprintln!("Victauri Doctor — checking your setup...\n");
 
     let mut pass_count = 0u32;
@@ -746,7 +751,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<()> {
         eprintln!("         Run this command from your Tauri project root.\n");
         fail_count += 1;
         print_doctor_summary(pass_count, fail_count, warn_count);
-        return Ok(());
+        return Ok(fail_count);
     };
 
     // Check 2: Tauri dependency
@@ -970,7 +975,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<()> {
 
     eprintln!();
     print_doctor_summary(pass_count, fail_count, warn_count);
-    Ok(())
+    Ok(fail_count)
 }
 
 fn print_doctor_summary(pass: u32, fail: u32, warn: u32) {
