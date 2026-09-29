@@ -333,3 +333,82 @@ async fn verify_state_treats_undefined_as_null() {
     assert_eq!(r["passed"], false, "{r}");
     assert_eq!(r["frontend_state"], json!(null), "{r}");
 }
+
+// ── R5B-WAIT0: `timeout_ms: 0` is a single immediate check ─────────────────────────────────
+
+/// The server-side conditions check exactly once with `timeout_ms: 0` (the page-side ones are
+/// covered by `tests/bridge_r5b_tests.rs`), and the page-side wait is given time to answer.
+#[tokio::test]
+async fn wait_for_with_a_zero_timeout_checks_once() {
+    let state = state();
+    let bridge = ScriptBridge::new(
+        &state,
+        Arc::new(|_, script: &str| {
+            Some(if script.contains("waitFor(") {
+                json!({"__victauri_ok": {"ok": false, "error": "timeout after 0ms"},
+                       "__victauri_type": "value"})
+                .to_string()
+            } else {
+                json!({"__victauri_ok": script.contains("isReady"), "__victauri_type": "value"})
+                    .to_string()
+            })
+        }),
+    );
+    let h = handler(&state, &bridge);
+    let started = Instant::now();
+    let met = ok_json(
+        &call(
+            &h,
+            "wait_for",
+            json!({"condition": "expression", "value": "isReady", "timeout_ms": 0}),
+        )
+        .await,
+    );
+    assert_eq!(met["ok"], true, "{met}");
+    let unmet = ok_json(
+        &call(
+            &h,
+            "wait_for",
+            json!({"condition": "expression", "value": "notYet", "timeout_ms": 0}),
+        )
+        .await,
+    );
+    assert_eq!(unmet["ok"], false, "{unmet}");
+    assert_eq!(
+        bridge.labels_of("notYet").len(),
+        1,
+        "must check exactly once"
+    );
+    let event = ok_json(
+        &call(
+            &h,
+            "wait_for",
+            json!({"condition": "event", "value": "never", "timeout_ms": 0}),
+        )
+        .await,
+    );
+    assert_eq!(event["ok"], false, "{event}");
+    let page = ok_json(
+        &call(
+            &h,
+            "wait_for",
+            json!({"condition": "selector", "value": "#x", "timeout_ms": 0}),
+        )
+        .await,
+    );
+    assert_eq!(page["ok"], false, "{page}");
+    assert!(
+        bridge
+            .evals
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, s)| s.contains("timeout_ms: 0,")),
+        "the page must be told 0, not a default"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+}

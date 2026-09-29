@@ -108,7 +108,8 @@ pub struct WaitForParams {
     /// fine, and one that does not parse fails at once instead of polling to the timeout),
     /// or Tauri event name (for `event`).
     pub value: Option<String>,
-    /// Maximum time to wait in milliseconds. Default: 10000.
+    /// Maximum time to wait in milliseconds. Default: 10000; capped at 120000. `0` checks the
+    /// condition exactly once, immediately, and returns (`ok: false` if it is not met yet).
     pub timeout_ms: Option<u64>,
     /// Polling interval in milliseconds. Default: 200.
     pub poll_ms: Option<u64>,
