@@ -370,7 +370,7 @@ fn r5b_routeurl1_rules_match_relative_and_absolute_forms() {
 /// `send()` attached five fresh listeners to the XHR every time, each closing over THAT send's
 /// log entry, so a reused XHR (open/send again on the same object) piled up listeners and every
 /// later request rewrote the earlier entries' status and duration. A re-`open()` while a
-/// request was in flight left its entry 'pending' forever (wedging network_idle), and a
+/// request was in flight left its entry 'pending' forever (wedging `network_idle`), and a
 /// delayed send then fired into the next request. A blocked XHR never fired `loadend`.
 #[test]
 fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
@@ -539,4 +539,130 @@ fn r5b_dataurl1_logged_urls_are_capped() {
     assert!(r["xhr_tail"].as_str().unwrap().contains("chars]"), "{r}");
     assert_eq!(r["blocked"], 1000, "matching still sees the full URL: {r}");
     assert!(r["matches_url_len"].as_u64().unwrap() <= 2200, "{r}");
+}
+
+// ── R5B-PRISTINE1: captured IPC bodies and page evals use the init-time JSON ──
+
+/// The fetch interceptor parsed captured IPC request/response bodies with the PAGE's
+/// `JSON.parse`, so page script replacing it rewrote what `logs ipc` / replay / the catalog
+/// report for every later call.
+#[test]
+fn r5b_pristine1_ipc_bodies_are_parsed_with_the_captured_json() {
+    let def = def(
+        None,
+        vec![case(
+            "a replaced JSON.parse does not forge captured args / results",
+            r#"
+            var V = window.__VICTAURI__;
+            var realParse = JSON.parse;
+            JSON.parse = function() { return { forged: true }; };
+            try {
+                await fetch('http://ipc.localhost/transfer', {
+                    method: 'POST', body: '{"amount":10}',
+                    headers: { 'x-vtest-body': '{"ok":true}' }
+                });
+                await new Promise(function(r) { setTimeout(r, 30); });
+            } finally { JSON.parse = realParse; }
+            var e = V.getIpcLog(1)[0];
+            return { args: e.args, result: e.result };
+            "#,
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    assert_eq!(r["args"], serde_json::json!({"amount": 10}), "{r}");
+    assert_eq!(r["result"], serde_json::json!({"ok": true}), "{r}");
+}
+
+/// The in-app `victauri_eval_js` command's script serialized the result (and built the
+/// callback args) with the page's `JSON` and plain objects: a page `Object.prototype.toJSON`
+/// that throws made every page-originated eval hang until its timeout, and a replaced
+/// `JSON.stringify` forged its result. It now serializes like the agent eval path (R5-JS2).
+#[test]
+fn r5b_pristine1_page_eval_is_robust_to_page_json_tampering() {
+    use victauri_plugin::js_bridge::page_eval_script;
+    let scripts = [
+        ("obj", page_eval_script("\"p-obj\"", "return {a: 1}")),
+        ("undef", page_eval_script("\"p-undef\"", "return undefined")),
+        (
+            "thr",
+            page_eval_script("\"p-thr\"", "throw new Error('boom')"),
+        ),
+        (
+            "circ",
+            page_eval_script("\"p-circ\"", "var o = {}; o.o = o; return o"),
+        ),
+        ("forge", page_eval_script("\"p-forge\"", "return {b: 2}")),
+        (
+            "tojson",
+            page_eval_script("\"p-tojson\"", "return {c: [3]}"),
+        ),
+    ];
+    // A Tauri-like invoke: serializes the args with the native JSON.stringify (captured before
+    // the test tampers with the global), which still consults a planted `toJSON`.
+    let mut setup = String::from(
+        r"
+        var __JS = JSON.stringify, __JP = JSON.parse;
+        window.__got = {};
+        window.__TAURI_INTERNALS__ = { invoke: function(cmd, args) {
+            var a = __JP(__JS(args));
+            window.__got[a.id] = a.result;
+            return Promise.resolve(null);
+        } };
+        ",
+    );
+    setup.push_str(&scripts_js(&scripts));
+    let def = def(
+        Some(setup),
+        vec![case(
+            "results arrive despite a throwing toJSON / replaced stringify",
+            r#"
+            function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+            Object.defineProperty(Object.prototype, 'toJSON', {
+                configurable: true, value: function() { throw new Error('page toJSON'); }
+            });
+            try {
+                (0, eval)(__S.obj);
+                (0, eval)(__S.undef);
+                (0, eval)(__S.thr);
+                (0, eval)(__S.circ);
+                await sleep(30);
+            } finally { delete Object.prototype.toJSON; }
+            var realStringify = JSON.stringify;
+            JSON.stringify = function() { return '"forged"'; };
+            try { (0, eval)(__S.forge); await sleep(30); }
+            finally { JSON.stringify = realStringify; }
+            // A forging (non-throwing) universal toJSON is ignored, as for agent evals.
+            Object.defineProperty(Object.prototype, 'toJSON', {
+                configurable: true, value: function() { return 'forged'; }
+            });
+            Array.prototype.toJSON = function() { return 'forged'; };
+            try { (0, eval)(__S.tojson); await sleep(30); }
+            finally { delete Object.prototype.toJSON; delete Array.prototype.toJSON; }
+            return window.__got;
+            "#,
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    // A throwing universal toJSON: reported (like an agent eval's "unserializable"), never
+    // left to hang until the timeout as before.
+    for id in ["p-obj", "p-circ"] {
+        assert!(
+            r[id]
+                .as_str()
+                .is_some_and(|s| s.starts_with("{\"__error\":")),
+            "{id}: {r}"
+        );
+    }
+    assert_eq!(r["p-undef"], "null", "{r}");
+    assert_eq!(r["p-thr"], "{\"__error\":\"boom\"}", "{r}");
+    assert_eq!(r["p-forge"], "{\"b\":2}", "{r}");
+    assert_eq!(r["p-tojson"], "{\"c\":[3]}", "{r}");
 }

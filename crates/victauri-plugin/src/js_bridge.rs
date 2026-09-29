@@ -197,6 +197,47 @@ pub fn eval_check_script(id: &str, nonce: Option<&str>) -> String {
     )
 }
 
+/// The script the in-app `victauri_eval_js` command (a page-originated eval) injects: runs
+/// `code` and delivers its result to `victauri_eval_callback` under `id_json` (a JSON string
+/// literal). `pub` only so the jsdom suite can drive the real script.
+#[doc(hidden)]
+#[must_use]
+pub fn page_eval_script(id_json: &str, code: &str) -> String {
+    // The result body is built by the bridge's `_pageEvalBody` (the `JSON.stringify` captured at
+    // init, blind to a `toJSON` planted on the universal prototypes, and never throwing), and the
+    // callback args have no prototype, so Tauri's own serialization of them cannot hit a planted
+    // `toJSON` either (R5B-PRISTINE1, mirroring R5-JS2 for agent evals). Without the bridge it
+    // falls back to the page's JSON, as before. Result format is unchanged: the value's JSON
+    // (`null` for `undefined`), or `{"__error": message}`.
+    format!(
+        r"
+        (async () => {{
+            const __vb = window.__VICTAURI__;
+            const __body = (__vb && __vb._pageEvalBody)
+                ? __vb._pageEvalBody
+                : (v, isErr) => isErr
+                    ? JSON.stringify({{ __error: v && v.message }})
+                    : (JSON.stringify(v) ?? 'null');
+            const __send = (body) => {{
+                const a = Object.create(null);
+                a.id = {id_json};
+                a.result = body;
+                return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', a);
+            }};
+            let __out;
+            try {{
+                const __result = await (async () => {{ {code}
+ }})();
+                __out = __body(__result, false);
+            }} catch (e) {{
+                __out = __body(e, true);
+            }}
+            await __send(__out);
+        }})();
+        "
+    )
+}
+
 /// The body of the init script (after capacity variable declarations).
 /// Uses CAP_* variables for all log limits.
 const INIT_SCRIPT_BODY: &str = r#"
@@ -869,6 +910,21 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (nonce !== PAGE_NONCE || evalState.has(id) || evalDone.has(id)) return null;
             evalMarkDone(id);
             return evalCallback(id, '{"__victauri_not_run":' + jsonStringLiteral('the code did not begin executing — this almost always means a syntax/parse error in the submitted code') + '}');
+        },
+        // The result body of a page-originated eval (`victauri_eval_js`, see page_eval_script):
+        // the value's JSON (`null` when JSON has no representation) or `{"__error": message}`,
+        // serialized with the stringify captured at init. Never throws: a value that cannot be
+        // serialized (circular, BigInt, a throwing own `toJSON`) is reported as an error, not
+        // left to time out (R5B-PRISTINE1).
+        _pageEvalBody: function(value, isError) {
+            'use strict';
+            if (isError) return '{"__error":' + jsonStringLiteral(errorText(value)) + '}';
+            var json;
+            try { json = PRISTINE_STRINGIFY(value); }
+            catch (e) {
+                return '{"__error":' + jsonStringLiteral('the result could not be serialized: ' + errorText(e)) + '}';
+            }
+            return json === undefined ? 'null' : json;
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
@@ -2905,7 +2961,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                                 if (reqBody.length > MAX_IPC_BODY) {
                                     entry.request_args = bodyOmitted(reqBody.length, null);
                                 } else {
-                                    entry.request_args = JSON.parse(reqBody);
+                                    entry.request_args = PRISTINE_PARSE(reqBody);
                                 }
                             }
                         } catch(e) {}
@@ -2943,7 +2999,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                             // The Response constructor throws if a null-body status carries a body.
                             var nullBody = status === 204 || status === 205 || status === 304;
                             var bodyStr = nullBody ? null
-                                : ((typeof route.body === 'string') ? route.body : JSON.stringify(route.body));
+                                : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
                             var hdrs = { 'content-type': route.content_type };
                             for (var k in route.headers) { if (Object.prototype.hasOwnProperty.call(route.headers, k)) hdrs[k] = route.headers[k]; }
                             var resp = new Response(bodyStr, { status: status, statusText: route.status_text, headers: hdrs });
@@ -2954,7 +3010,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                             if (isIpc) {
                                 if (bodyStr === null) entry.response_body = null;
                                 else if (bodyStr.length > MAX_IPC_BODY) entry.response_body = bodyOmitted(bodyStr.length, null);
-                                else { try { entry.response_body = JSON.parse(bodyStr); } catch (e) { entry.response_body = bodyStr; } }
+                                else { try { entry.response_body = PRISTINE_PARSE(bodyStr); } catch (e) { entry.response_body = bodyStr; } }
                                 flushIpcWaiters();
                             }
                             return resp;
@@ -3015,7 +3071,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                                         entry.response_body = bodyOmitted(text.length, null);
                                         return;
                                     }
-                                    try { entry.response_body = JSON.parse(text); } catch(e) { entry.response_body = text; }
+                                    try { entry.response_body = PRISTINE_PARSE(text); } catch(e) { entry.response_body = text; }
                                 }).catch(function() {}).then(function() {
                                     flushIpcWaiters();
                                 });
