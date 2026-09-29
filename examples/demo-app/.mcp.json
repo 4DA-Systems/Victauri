@@ -2,7 +2,7 @@
   "mcpServers": {
     "victauri-demo": {
       "command": "victauri",
-      "args": ["bridge", "--wait", "--app", "com.example.victauri-demo"]
+      "args": ["bridge", "--app", "com.example.victauri-demo"]
     }
   }
 }

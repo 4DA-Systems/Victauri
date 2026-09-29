@@ -159,6 +159,7 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
 - The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
   `Junit*` report types stay exhaustive (struct-update syntax keeps working); a field added to one
   of them later will be called out as a breaking change.
+
 ## v0.8.7 → v0.8.8 (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
 
 No consumer code changes are required and no dependency-requirement change is needed

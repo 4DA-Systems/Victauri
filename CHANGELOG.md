@@ -449,6 +449,11 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
   for a 0.x major bump cargo-semver-checks runs no lints at all ("0 checks … 254 skip").
   RELEASING.md now says to also run `--release-type minor` for a major bump to list what actually
   changed.
+- Docs: the plugin README's tools-reference link 404'd (GitHub Pages paths are case-sensitive:
+  `/Victauri/`); the `sqlite` / `bundled-sqlite` features, including that `bundled-sqlite` also
+  switches the app's own rusqlite to bundled SQLite and how to opt out, are documented in the
+  plugin README and the configuration docs; the demo app's `.mcp.json` no longer passes the no-op
+  `--wait`.
 
 ## [0.8.8] - 2026-08-12
 
