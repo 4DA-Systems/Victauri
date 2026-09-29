@@ -264,11 +264,17 @@ The MCP server only accepts connections from localhost (`127.0.0.1` / `::1`). Th
 - Other machines on the LAN cannot connect
 - Only processes on the same machine can reach the server
 
-Browsers on the same machine are refused outright, before any rate limiting: a request carrying
-an `Origin` header (including an unreadable one or a `tauri://` origin — the app's own webview
-talks to Victauri over Tauri IPC, never HTTP) or any `Sec-Fetch-Site` other than `none` gets 403,
-and no `Access-Control-Allow-Origin` header is ever sent. (Browsers too old to send
-`Sec-Fetch-*` headers, e.g. Safari before 16.4, are still stopped by the Host/Origin checks.)
+Browser requests are refused before any rate limiting. A request gets 403 if it carries a
+`Sec-Fetch-Site` header other than `none` (every current browser sends one on a web page's
+cross-site or same-site fetch), an `Origin` that is not an `http`/`https` localhost origin
+(`localhost`, `127.0.0.1`, `[::1]`), an `Origin` that cannot be parsed, or a `tauri://` origin
+(the app's own webview talks to Victauri over Tauri IPC, never HTTP). A localhost `Origin` on its
+own is allowed through; a POST carrying one must then be `Content-Type: application/json`, or it
+gets 415. No `Access-Control-Allow-Origin` header is ever sent, so a browser can neither read a
+response nor get a preflighted (JSON or `Authorization`-bearing) request approved. That is what
+still stops a page on a localhost origin in a browser too old to send `Sec-Fetch-*` headers
+(e.g. Safari before 16.4): its CORS-simple POSTs are refused as non-JSON, and anything else needs
+a preflight the server never approves.
 
 ## Security Headers
 

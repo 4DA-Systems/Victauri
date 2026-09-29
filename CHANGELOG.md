@@ -454,6 +454,11 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
   switches the app's own rusqlite to bundled SQLite and how to opt out, are documented in the
   plugin README and the configuration docs; the demo app's `.mcp.json` no longer passes the no-op
   `--wait`.
+- Docs: MIGRATION.md contradicted itself on browser-originated requests (one bullet said an
+  `Origin`-bearing POST gets 415 unless JSON, another that "any `Origin`" gets 403), and the
+  security docs repeated the 403 claim. The actual rule, now in both: 403 for a `Sec-Fetch-Site`
+  other than `none`, a non-localhost, unparseable or `tauri://` `Origin`; a localhost `Origin` is
+  allowed through and a POST carrying it must be JSON (415 otherwise).
 
 ## [0.8.8] - 2026-08-12
 

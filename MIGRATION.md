@@ -55,8 +55,9 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   `integrity_check: "not completed…"` instead of failing on large databases.
 - `query_db` rejects table-valued `pragma_*()` functions for non-allowlisted pragmas and the
   `PRAGMA name(value)` write form.
-- Browser-originated (`Origin`-bearing) POSTs to `/mcp` or `/api/tools` must be
-  `Content-Type: application/json` (415 otherwise). Non-browser clients are unaffected.
+- A POST that carries an `Origin` header and gets past the origin check below (a localhost
+  `http`/`https` origin, no `Sec-Fetch-Site` other than `none`) must be
+  `Content-Type: application/json` (415 otherwise). Clients that send no `Origin` are unaffected.
 - Several tools' MCP annotations changed (`recording`, `introspect`, `logs`, `window` are now
   `destructive_hint`; `verify_state`, `wait_for`, `assert_semantic`, `inspect`, `animation` are no
   longer `read_only_hint`). Clients that auto-approve read-only tools will now ask for these.
@@ -83,10 +84,13 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   runs in, so the call fails clearly instead of typing into another app).
 - `victauri-test`: `Locator::check()`/`uncheck()` click the element (and verify it changed), and a
   stale element reference is `ElementNotFound` instead of an empty/false value.
-- The server speaks HTTP/1.1 only and refuses browser-originated requests (any `Origin`, a
-  `Sec-Fetch-Site` other than `none`) with 403, including `tauri://` origins; it no longer sends
-  `Access-Control-Allow-Origin`. HTTP clients (curl, reqwest, the CLI, `victauri-test`) are
-  unaffected.
+- The server speaks HTTP/1.1 only and answers 403 to a request with a `Sec-Fetch-Site` header
+  other than `none` (which every current browser sends on a web page's cross-site or same-site
+  fetch), an `Origin` that is not an `http`/`https` localhost origin (`localhost`, `127.0.0.1`,
+  `[::1]`), an `Origin` it cannot parse, or a `tauri://` origin. A localhost `Origin` alone is
+  allowed through, and then meets the JSON content-type rule above (415). The server no longer
+  sends `Access-Control-Allow-Origin`. HTTP clients that send no `Origin` or `Sec-Fetch-Site`
+  (curl, reqwest, the CLI, `victauri-test`) are unaffected.
 - On Unix the discovery directory moved to `$XDG_RUNTIME_DIR/victauri/<pid>` or
   `<temp>/victauri-<euid>/<pid>`. The 0.9 CLI, test client and watchdog also read the old
   `<temp>/victauri/` root, so they find apps built with 0.8.x; a 0.8.x client does not find a 0.9 app.
