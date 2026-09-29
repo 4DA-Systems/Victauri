@@ -145,7 +145,13 @@ with an empty closure, 3/5 with no IPC at all); the same load with the handle ta
 thread ran 10/10 clean. Now the dispatcher's closure uses a handle owned by the main thread (the
 caller only borrows the `AppHandle` to post it, which does not clone), and the eval callback plus
 every other page-callable command that never waits are synchronous commands, which Tauri runs on the
-main thread. Every bisect, allocator, sanitizer and SQLite experiment run on the way (listed in the
+main thread. Validated in CI (ubuntu-latest) on the fixed code: **0 host deaths in 40 stress runs**
+(the unfixed code lost the host 37/80 the same day), while the Victauri-less repro still died 15/15
+with the off-thread clone and 0/15 without it; the release head then passed all 23 CI jobs, and the
+Linux E2E job now also repeats the heap-sensitive tests against three fresh apps. Live on 4DA
+(Windows, 1.47 GB database): probe battery 121/121, auth-on flood 5/5, reload soaks 35,157 and
+35,625 calls with 1 and 0 errors, dogfood 155/1/3 (the one failure is 4DA's own >30 s command, as
+before the fix). Every bisect, allocator, sanitizer and SQLite experiment run on the way (listed in the
 round-4 report) pointed at timing because a refcount race IS timing: it explains why the 0.8.8 lock
 reduced the crash, why round-4's extra waits made it worse, and why identical code crashed or passed
 depending on the build. **Residual (upstream):** `victauri_eval_js` / `victauri_dom_snapshot` (page

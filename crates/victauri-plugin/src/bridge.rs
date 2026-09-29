@@ -206,6 +206,13 @@ fn find_window<'a, R: Runtime>(
 
 /// Serializes Victauri's main-thread round trips.
 ///
+/// **Correction (0.9.0): the heap corruption described below was NOT caused by concurrent round
+/// trips as such.** Its real cause was the `AppHandle` clone each round trip made on the calling
+/// thread (see [`on_main`]) — cloning or dropping any Tauri handle off the main thread races a
+/// non-atomic `Rc` inside tao on Linux. Serializing only limited how many threads cloned at once,
+/// which is why it reduced the crash without removing it. The lock stays: it bounds how much
+/// Victauri can queue onto the UI thread and is measured-safe. The original 0.8.8 notes follow.
+///
 /// Concurrent `run_on_main_thread` round trips corrupt the process heap on Linux/WebKitGTK —
 /// glibc aborts the app with `malloc(): unaligned tcache chunk detected` or `corrupted
 /// double-linked list`. Measured on Ubuntu 24.04 + `WebKitGTK` 2.52, three concurrent
