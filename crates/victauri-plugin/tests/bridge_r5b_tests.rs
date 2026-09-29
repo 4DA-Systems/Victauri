@@ -449,3 +449,38 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
     assert_eq!(r["blocked_loadend"], true, "{r}");
     assert_eq!(r["blocked_events"], serde_json::json!(["error"]), "{r}");
 }
+
+// ── R5B-FETCH0: fetch() with no arguments rejects like the native one ───────
+
+/// The interceptor converted a missing input to the string "undefined" and fetched it (a
+/// relative request to `./undefined`) instead of letting native fetch reject.
+#[test]
+fn r5b_fetch0_fetch_without_arguments_rejects_natively() {
+    let def = def(
+        None,
+        vec![case(
+            "fetch() rejects with the native TypeError and logs nothing",
+            r"
+            var V = window.__VICTAURI__;
+            var outcome;
+            try { await fetch(); outcome = 'resolved'; }
+            catch (e) { outcome = e.name + ': ' + e.message; }
+            // One argument still works and is logged.
+            await fetch('/r5b/one');
+            return { outcome: outcome, urls: V.getNetworkLog().map(function(e) { return e.url; }) };
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    assert!(
+        r["outcome"]
+            .as_str()
+            .is_some_and(|o| o.starts_with("TypeError: Failed to execute 'fetch'")),
+        "{r}"
+    );
+    assert_eq!(r["urls"], serde_json::json!(["/r5b/one"]), "{r}");
+}

@@ -2841,6 +2841,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         var origFetch = window.fetch;
         if (origFetch) {
             window.fetch = function(input, init) {
+                // Arguments pass through exactly as given (R5B-FETCH0): `fetch()` with no input
+                // must reject natively, not fetch the string "undefined"; `fetch(x)` must not
+                // grow an explicit `undefined` init.
+                var argc = arguments.length;
+                if (argc === 0) return REFLECT_APPLY(origFetch, this, []);
+                function fetchArgs(first) { return argc === 1 ? [first] : [first, init]; }
                 // Log exactly the request fetch will make (R4-JS3). A look-alike object's own
                 // `url`/`method` used to be logged although fetch requests `String(input)`, so a
                 // page could plant fake IPC entries (a "quit_app" call that never happened).
@@ -2865,7 +2871,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (initMethod !== undefined) method = toStringExact(initMethod);
                 } catch (e) {
                     // fetch itself rejects this input: let it, with nothing logged.
-                    return REFLECT_APPLY(origFetch, this, [input, init]);
+                    return REFLECT_APPLY(origFetch, this, fetchArgs(input));
                 }
                 var id = ++networkCounter;
                 var isIpc = isIpcUrl(url);
@@ -2961,7 +2967,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 return doRealFetch();
 
                 function doRealFetch() {
-                    return REFLECT_APPLY(origFetch, self, [fetchInput, init]).then(function(response) {
+                    return REFLECT_APPLY(origFetch, self, fetchArgs(fetchInput)).then(function(response) {
                         entry.status = response.status;
                         entry.status_text = response.statusText;
                         entry.duration_ms = Date.now() - entry.timestamp;
