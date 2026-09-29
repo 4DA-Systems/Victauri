@@ -33,23 +33,57 @@ struct Harness {
     _root: tempfile::TempDir,
 }
 
+/// Knobs for [`Harness::start_with`].
+#[derive(Default)]
+struct Opts<'a> {
+    /// Pass `--app <the discovery entry's identity>`.
+    app_arg: bool,
+    /// Extra environment, applied after the Victauri variables are cleared. A value of
+    /// `"{port}"` is replaced with the mock backend's port.
+    env: &'a [(&'a str, &'a str)],
+    /// Extra bridge arguments.
+    args: &'a [&'a str],
+    /// The identity the backend's `/info` reports; `None` = the discovery entry's own.
+    info_identity: Option<&'a str>,
+}
+
 impl Harness {
     /// Serve `mcp_routes` (plus `/health`) on an ephemeral port, write a discovery entry for it
     /// with a unique identity, and spawn the bridge. `app_arg` = pass `--app <identity>`;
     /// `env` is applied after the Victauri selector variables are cleared.
     async fn start(mcp_routes: Router, app_arg: bool, env: &[(&str, &str)]) -> Self {
-        let router = mcp_routes.route("/health", get(|| async { "ok" }));
+        Self::start_with(
+            mcp_routes,
+            Opts {
+                app_arg,
+                env,
+                ..Opts::default()
+            },
+        )
+        .await
+    }
+
+    async fn start_with(mcp_routes: Router, opts: Opts<'_>) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ident = format!("com.test.bridge-protocol.{unique}");
+        // `/info` reports the app's identity, like the real plugin (the bridge confirms it
+        // before binding an `--app`, R5B-BR6).
+        let info = json!({
+            "app_identifier": opts.info_identity.unwrap_or(ident.as_str()),
+            "app_product_name": "Proto",
+        });
+        let router = mcp_routes
+            .route("/health", get(|| async { "ok" }))
+            .route("/info", get(move || async move { axum::Json(info) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let ident = format!("com.test.bridge-protocol.{unique}");
         let root = tempfile::tempdir().unwrap();
         let pid = std::process::id();
         let dir = root.path().join("victauri").join(pid.to_string());
@@ -77,13 +111,19 @@ impl Harness {
         for var in ["VICTAURI_APP", "VICTAURI_PORT", "VICTAURI_AUTH_TOKEN"] {
             cmd.env_remove(var);
         }
-        for (k, v) in env {
+        for (k, v) in opts.env {
+            let v = if *v == "{port}" {
+                port.to_string()
+            } else {
+                (*v).to_string()
+            };
             cmd.env(k, v);
         }
         cmd.arg("bridge");
-        if app_arg {
+        if opts.app_arg {
             cmd.args(["--app", ident.as_str()]);
         }
+        cmd.args(opts.args);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -465,4 +505,38 @@ async fn a_slow_tool_call_blocks_neither_ping_nor_cancel_nor_parallel_calls() {
         done - sent
     );
     assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 2);
+}
+
+/// R5B-BR6: `--app` binds by discovery metadata + PID liveness. After a crash the app's stale
+/// entry can carry a PID that was reused by another of our processes while a DIFFERENT app
+/// (auth disabled) now holds the port — the bridge then silently drove the wrong app. It now
+/// confirms the identity the server itself reports on `/info` before forwarding anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_whose_info_reports_another_identity_is_never_driven() {
+    let backend = Backend::default();
+    let mut h = Harness::start_with(
+        backend_routes(&backend),
+        Opts {
+            app_arg: true,
+            info_identity: Some("com.someone.else"),
+            ..Opts::default()
+        },
+    )
+    .await;
+    h.send(&json!({"jsonrpc":"2.0","id":40,"method":"tools/call",
+        "params":{"name":"invoke_command","arguments":{"command":"quit_app"}}}));
+    let r = h.recv_reply();
+    assert_eq!(r["id"], 40, "{r}");
+    let msg = r["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("must refuse, got: {r}"));
+    assert!(
+        msg.contains("com.someone.else"),
+        "names what it found: {msg}"
+    );
+    assert_eq!(
+        backend.tool_calls.load(Ordering::SeqCst),
+        0,
+        "nothing may be sent to a server that is not the selected app"
+    );
 }

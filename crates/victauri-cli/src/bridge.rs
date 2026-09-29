@@ -89,14 +89,19 @@ impl ServerInfo {
     /// case-insensitive) — never a substring (R4-CLI2: `--app com.example` bound
     /// `com.example.victauri-demo`, contradicting "never a silent wrong-app binding").
     fn matches_app(&self, app: &str) -> bool {
-        self.identifier
-            .as_deref()
-            .is_some_and(|i| i.eq_ignore_ascii_case(app))
-            || self
-                .product_name
-                .as_deref()
-                .is_some_and(|p| p.eq_ignore_ascii_case(app))
+        identity_matches(
+            self.identifier.as_deref(),
+            self.product_name.as_deref(),
+            app,
+        )
     }
+}
+
+/// An app selector matches a bundle identifier or a product name EXACTLY, ASCII
+/// case-insensitive — the one rule for discovery metadata and for `/info` alike.
+fn identity_matches(identifier: Option<&str>, product_name: Option<&str>, app: &str) -> bool {
+    identifier.is_some_and(|i| i.eq_ignore_ascii_case(app))
+        || product_name.is_some_and(|p| p.eq_ignore_ascii_case(app))
 }
 
 /// The effective app selector: `--app`, else `VICTAURI_APP`, each trimmed, and an empty or
@@ -806,6 +811,7 @@ async fn forward_with_retries(bridge: &Bridge, msg: &Value) -> ForwardResult {
         // #1 rule (never reuse a cached connection); the retry loop's restart patience still
         // applies once a live trusted backend is found, and the next call ~1s later succeeds.
         Selection::None => return ForwardResult::Unreachable(unreachable_message()),
+        Selection::Refused(why) => return ForwardResult::Unreachable(why),
     };
 
     for attempt in 0..MAX_RETRIES {
@@ -1054,9 +1060,12 @@ async fn scan_once(app: Option<&str>) -> Selection {
     // are reused. `/health` returns a static `ok` and carries no token, so it proves *something*
     // is bound but does not authenticate the listener as the real app. A stale `<pid>` dir whose
     // recorded PID has been recycled onto another of our live processes, combined with an attacker
-    // binding the freed port, could still pass liveness+health+identity and receive the token.
+    // binding the freed port, could still pass liveness+health and receive the token.
     // Re-resolving on every forward (audit #1) shrinks this to a per-call coincidence rather than
-    // a cache-lifetime one; fully closing it needs mutual auth on `/health` (a plugin-side change).
+    // a cache-lifetime one. With `--app`, the identity the SERVER reports on `/info` must also
+    // match (R5B-BR6) — which stops a different (e.g. auth-disabled) Victauri app that took the
+    // port from being driven, but not a hostile listener that lies on `/info`; fully closing that
+    // needs mutual auth (a plugin-side change).
     let entries = discover_entries();
     // Nothing discovered (the app is down): nothing to check, so no process enumeration —
     // the availability poller runs this every 1.5 s.
@@ -1075,7 +1084,100 @@ async fn scan_once(app: Option<&str>) -> Selection {
             live.push(s);
         }
     }
-    select(&live, app)
+    match (select(&live, app), app) {
+        (Selection::One(info), Some(app)) => {
+            match confirm_identity(&info, app, verified_backend()).await {
+                Ok(()) => Selection::One(info),
+                Err(why) => Selection::Refused(format!(
+                    "No running Victauri app matches --app '{}': the discovery entry {} {why}.                      The entry is stale (the app exited and its PID was reused) or another app                      now holds its port. Start the app, or run `victauri doctor`.",
+                    victauri_test::terminal::single_line(app),
+                    victauri_test::terminal::single_line(&info.label()),
+                )),
+            }
+        }
+        (selection, _) => selection,
+    }
+}
+
+/// A backend whose `/info` identity was confirmed for an app selector, so a later forward to
+/// the SAME resolved entry (pid, port, token) needs no extra request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct VerifiedBackend {
+    pid: Option<u32>,
+    port: u16,
+    token: Option<String>,
+    app: String,
+}
+
+fn verified_backend() -> &'static Mutex<Option<VerifiedBackend>> {
+    static VERIFIED: Mutex<Option<VerifiedBackend>> = Mutex::new(None);
+    &VERIFIED
+}
+
+/// The identity the server on `port` reports on `/info` — `(app_identifier,
+/// app_product_name)` — or `None` when it does not answer a well-formed `/info` (the token is
+/// sent: `/info` is authenticated).
+async fn fetch_identity(
+    port: u16,
+    token: Option<&str>,
+) -> Option<(Option<String>, Option<String>)> {
+    let mut req = health_client().get(format!("http://127.0.0.1:{port}/info"));
+    if let Some(t) = token {
+        req = req.header("Authorization", format!("Bearer {t}"));
+    }
+    let resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let info: Value = resp.json().await.ok()?;
+    let field = |k: &str| {
+        info.get(k)
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    Some((field("app_identifier"), field("app_product_name")))
+}
+
+/// Confirm that the server `info` resolved to really IS the app `app` selects, from what the
+/// server itself reports on `/info` (R5B-BR6). Discovery metadata + PID liveness alone can
+/// bind a crashed app's stale entry once its PID is reused, and with auth disabled nothing
+/// else would notice that a DIFFERENT app now holds the port. A confirmation is cached for the
+/// exact resolved entry (pid, port, token) — re-checked whenever the resolution changes; an
+/// entry with no pid (a bare `VICTAURI_PORT`) is re-checked every time. Fails closed: a server
+/// that does not report a matching identity is never used.
+async fn confirm_identity(
+    info: &ServerInfo,
+    app: &str,
+    cache: &Mutex<Option<VerifiedBackend>>,
+) -> Result<(), String> {
+    let key = VerifiedBackend {
+        pid: info.pid,
+        port: info.port,
+        token: info.token.clone(),
+        app: app.to_ascii_lowercase(),
+    };
+    if key.pid.is_some() && locked(cache).as_ref() == Some(&key) {
+        return Ok(());
+    }
+    let reported = fetch_identity(info.port, info.token.as_deref()).await;
+    let outcome = match &reported {
+        Some((id, name)) if identity_matches(id.as_deref(), name.as_deref(), app) => Ok(()),
+        Some((id, name)) => Err(format!(
+            "points at a server that reports itself as '{}'",
+            victauri_test::terminal::single_line(
+                id.as_deref()
+                    .or(name.as_deref())
+                    .unwrap_or("<no app identity>")
+            )
+        )),
+        None => Err("points at a server that did not confirm its identity on /info".to_string()),
+    };
+    *locked(cache) = match (&outcome, key.pid) {
+        (Ok(()), Some(_)) => Some(key),
+        _ => None,
+    };
+    outcome
 }
 
 /// A single non-blocking discovery attempt — `Some` iff exactly one matching live backend is
@@ -1114,6 +1216,7 @@ async fn discover_and_select(wait: bool, app: Option<&str>) -> Result<ServerInfo
             Selection::Ambiguous(labels) => {
                 bail!("{}", ambiguous_message(&labels));
             }
+            Selection::Refused(why) => bail!("{why}"),
         }
     }
 
@@ -1134,6 +1237,9 @@ enum Selection {
     One(ServerInfo),
     None,
     Ambiguous(Vec<String>),
+    /// A backend was resolved but must not be used: its identity does not match the app
+    /// selector (R5B-BR6 / R5B-PORTAPP1). The message says why.
+    Refused(String),
 }
 
 /// Pick the server matching `app` exactly, or the sole running server. Several matches —
@@ -1866,6 +1972,93 @@ mod tests {
         live.token = Some("live-token".to_string());
         assert_eq!(token_for_port(&[stale, live.clone()], 7374), None);
         assert_eq!(token_for_port(&[live], 7374).as_deref(), Some("live-token"));
+    }
+
+    /// A mock `/info` reporting `identifier`, counting requests.
+    async fn info_server(identifier: &'static str) -> (u16, Arc<std::sync::atomic::AtomicU32>) {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = Arc::clone(&hits);
+        let app = axum::Router::new().route(
+            "/info",
+            axum::routing::get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    axum::Json(json!({"app_identifier": identifier, "app_product_name": "Name"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, hits)
+    }
+
+    /// R5B-BR6: identity is confirmed from `/info`, cached per resolved (pid, port, token), and
+    /// re-checked when the resolution changes.
+    #[tokio::test]
+    async fn app_identity_is_confirmed_once_per_resolved_entry() {
+        let (port, hits) = info_server("com.real.app").await;
+        let cache = Mutex::new(None);
+        let mut info = srv("com.real.app", "Real", port);
+        info.pid = Some(4242);
+
+        assert!(
+            confirm_identity(&info, "COM.REAL.APP", &cache)
+                .await
+                .is_ok()
+        );
+        assert!(
+            confirm_identity(&info, "com.real.app", &cache)
+                .await
+                .is_ok()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "cached for the same entry");
+        // The product name selects too, like discovery's `--app`.
+        assert!(confirm_identity(&info, "name", &cache).await.is_ok());
+
+        // A new token (the app restarted) is a different entry: re-checked.
+        info.token = Some("fresh".into());
+        assert!(
+            confirm_identity(&info, "com.real.app", &cache)
+                .await
+                .is_ok()
+        );
+        let after_restart = hits.load(Ordering::SeqCst);
+        assert!(after_restart >= 2, "{after_restart}");
+
+        // Another app's selector: refused, naming what the server reported; never cached.
+        let err = confirm_identity(&info, "com.other.app", &cache)
+            .await
+            .unwrap_err();
+        assert!(err.contains("com.real.app"), "{err}");
+        assert_eq!(*cache.lock().unwrap(), None);
+
+        // No pid (a bare VICTAURI_PORT): checked every time.
+        info.pid = None;
+        let before = hits.load(Ordering::SeqCst);
+        assert!(
+            confirm_identity(&info, "com.real.app", &cache)
+                .await
+                .is_ok()
+        );
+        assert!(
+            confirm_identity(&info, "com.real.app", &cache)
+                .await
+                .is_ok()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), before + 2);
+    }
+
+    #[tokio::test]
+    async fn a_server_without_a_usable_info_is_refused() {
+        // Nothing listens on :9 → no identity → fail closed.
+        let mut info = srv("com.real.app", "Real", 9);
+        info.pid = Some(1);
+        let cache = Mutex::new(None);
+        let err = confirm_identity(&info, "com.real.app", &cache)
+            .await
+            .unwrap_err();
+        assert!(err.contains("did not confirm"), "{err}");
     }
 
     #[tokio::test]
