@@ -108,6 +108,75 @@ fn resolve_app_selector(cli: Option<String>, env: Option<String>) -> Option<Stri
     normalize(cli).or_else(|| normalize(env))
 }
 
+/// Most forwarded requests the bridge keeps in flight at once. Past this a request is refused
+/// immediately with an error rather than queued without bound (the plugin caps concurrency
+/// server-side too). Local methods (`ping`, `initialize`, …) are never subject to it.
+const MAX_IN_FLIGHT: usize = 32;
+/// Notifications and client responses waiting to be forwarded, in order. A flood beyond this
+/// is dropped (with a note on stderr) instead of growing memory without bound.
+const ONE_WAY_QUEUE: usize = 1024;
+/// On stdin EOF, how long the bridge lets in-flight requests finish (and queued notifications
+/// drain) before it exits.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// State shared by the stdin loop, the per-request tasks, the one-way forwarder and the
+/// availability poller.
+struct Bridge {
+    http: reqwest::Client,
+    /// `--app` / `VICTAURI_APP`, normalized.
+    app: Option<String>,
+    /// The backend MCP session (a stateful legacy backend only).
+    session_id: Mutex<Option<String>>,
+    /// The client's `initialize` message, cached so we can hand-shake the BACKEND (replay it)
+    /// when we first forward a real request and after a restart. The client is answered
+    /// locally, so it only ever sends `initialize` once.
+    cached_init: Mutex<Option<Value>>,
+    /// Set once a backend handshake returns no `Mcp-Session-Id`: the server is stateless, so
+    /// there is no session to mint or lose and we must not re-`initialize` before every call.
+    stateless: AtomicBool,
+    /// Single-flight guard for the lazy backend handshake: concurrent requests that all find no
+    /// session wait here for ONE handshake instead of racing several (R5B-BR5).
+    handshake: tokio::sync::Mutex<()>,
+    /// Last-known backend availability — SOLELY owned by the poller (see H1 in the audit): the
+    /// request path never writes it, so the down→up edge is detected in exactly one place.
+    backend_up: AtomicBool,
+    /// Set once the client sends `notifications/initialized` (its OWN handshake completion), so
+    /// the poller never emits a server notification before the client has finished initializing
+    /// — not merely before we answered `initialize` (audit #3).
+    client_ready: AtomicBool,
+    /// stdout is shared by every writer; each write locks, emits complete line(s), and flushes,
+    /// so replies and notifications never interleave mid-line.
+    stdout: Mutex<std::io::Stdout>,
+    /// Bounds the forwarded requests in flight ([`MAX_IN_FLIGHT`]).
+    in_flight: Arc<tokio::sync::Semaphore>,
+}
+
+impl Bridge {
+    fn new(http: reqwest::Client, app: Option<String>) -> Self {
+        Self {
+            http,
+            app,
+            session_id: Mutex::new(None),
+            cached_init: Mutex::new(None),
+            stateless: AtomicBool::new(false),
+            handshake: tokio::sync::Mutex::new(()),
+            backend_up: AtomicBool::new(false),
+            client_ready: AtomicBool::new(false),
+            stdout: Mutex::new(std::io::stdout()),
+            in_flight: Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT)),
+        }
+    }
+
+    /// Forget the backend session — only if it is still `used`: a concurrent request may already
+    /// have minted a fresh one, which a stale reply to an OLD session must not wipe.
+    fn clear_session_if(&self, used: Option<&str>) {
+        let mut sid = locked(&self.session_id);
+        if sid.as_deref() == used {
+            *sid = None;
+        }
+    }
+}
+
 /// Run the stdio bridge for MCP clients.
 ///
 /// Unlike a naive proxy, this NEVER blocks the MCP handshake on discovering a backend:
@@ -115,6 +184,12 @@ fn resolve_app_selector(cli: Option<String>, env: Option<String>) -> Option<Stri
 /// and only tool *calls* require a live app. `app` selects which app to bind when several
 /// are running (matches the Tauri bundle identifier or product name; falls back to the
 /// `VICTAURI_APP` env var).
+///
+/// Requests are handled CONCURRENTLY (R5B-BR5): local methods (`initialize`, `ping`, the
+/// client's `notifications/initialized`, batches, invalid messages) are answered inline; every
+/// forwarded request runs as its own task, so a long `tools/call` (up to 330 s) no longer
+/// delays a `ping`, a parallel tool call, or a `notifications/cancelled` for that very call.
+/// Notifications and client responses are forwarded promptly, in order, by one dedicated task.
 ///
 /// # Errors
 ///
@@ -126,40 +201,22 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     // Tool calls discover lazily and fail fast with an actionable message when the app is down.
     let _ = wait;
     let app = resolve_app_selector(app, std::env::var("VICTAURI_APP").ok());
-    let http = build_client()?;
+    let bridge = Arc::new(Bridge::new(build_client()?, app));
 
-    // The live backend, discovered lazily. `None` until an app is found — the bridge starts
-    // and serves the handshake with no backend at all.
-    let connection: Arc<Mutex<Option<ServerInfo>>> = Arc::new(Mutex::new(None));
-    let session_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    // The client's `initialize` message, cached so we can hand-shake the BACKEND (replay it)
-    // when we first forward a real request and after a restart. The client is answered
-    // locally, so it only ever sends `initialize` once.
-    let cached_init: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
-    // Set once a backend handshake returns no `Mcp-Session-Id`: the server is stateless, so
-    // there is no session to mint or lose and we must not re-`initialize` before every call.
-    let stateless: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
-    // Last-known backend availability — SOLELY owned by the poller (see H1 in the audit): the
-    // request path never writes it, so the down→up edge is detected in exactly one place.
-    let backend_up = Arc::new(AtomicBool::new(false));
-    // Set once the client sends `notifications/initialized` (its OWN handshake completion), so
-    // the poller never emits a server notification before the client has finished initializing —
-    // not merely before we answered `initialize` (audit #3). Gating on the client's ack, not on
-    // our local reply, closes the window where `list_changed` could precede the init response.
-    let client_ready = Arc::new(AtomicBool::new(false));
-    // stdout is shared with the background poller (which writes `list_changed`); every write
-    // locks, emits one line, and flushes, so responses and notifications never interleave.
-    let stdout = Arc::new(Mutex::new(std::io::stdout()));
+    spawn_availability_poller(Arc::clone(&bridge));
 
-    spawn_availability_poller(
-        app.clone(),
-        Arc::clone(&connection),
-        Arc::clone(&session_id),
-        Arc::clone(&stateless),
-        Arc::clone(&backend_up),
-        Arc::clone(&client_ready),
-        Arc::clone(&stdout),
-    );
+    // Notifications and client responses: forwarded in arrival order by ONE task, so a
+    // `notifications/cancelled` reaches the backend while the call it cancels is still running,
+    // and never waits behind it.
+    let (one_way_tx, mut one_way_rx) = tokio::sync::mpsc::channel::<Value>(ONE_WAY_QUEUE);
+    let forwarder = {
+        let bridge = Arc::clone(&bridge);
+        tokio::spawn(async move {
+            while let Some(msg) = one_way_rx.recv().await {
+                forward_one_way(&bridge, &msg).await;
+            }
+        })
+    };
 
     // Read stdin on a DEDICATED OS thread feeding an async channel, so the blocking read never
     // parks a tokio worker (which, on a single-vCPU host, would starve the timer and stop the
@@ -177,178 +234,198 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     });
 
     while let Some(line) = line_rx.recv().await {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let msg: Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("victauri-bridge: invalid JSON on stdin: {e}");
-                continue;
-            }
-        };
-
-        // A JSON-RPC batch is answered here and NEVER forwarded (R5-BR1): see `batch_rejection`.
-        if let Value::Array(items) = &msg {
-            match batch_rejection(items) {
-                Some(reply) => write_value(&stdout, &reply),
-                None => eprintln!(
-                    "victauri-bridge: dropped a JSON-RPC batch of notifications/responses \
-                     (batching is not supported)"
-                ),
-            }
-            continue;
-        }
-
-        // No `method`: a client->server RESPONSE, or an Invalid Request (R5-BR3).
-        if msg.get("method").is_none() {
-            if is_client_response(&msg) {
-                // A reply to a server-initiated request (sampling/elicitation/roots), which a
-                // stateful backend may send inside an SSE stream this bridge relays verbatim — so
-                // it must reach the backend. But JSON-RPC never answers a response: whatever the
-                // backend says (202, or an error body) is logged, never written to the client.
-                let outcome = forward_with_retries(
-                    &http,
-                    &connection,
-                    &session_id,
-                    &stateless,
-                    &cached_init,
-                    app.as_deref(),
-                    &msg,
-                )
-                .await;
-                match outcome {
-                    ForwardResult::Accepted => {}
-                    ForwardResult::Payloads(p) if p.is_empty() => {}
-                    ForwardResult::Payloads(p) => eprintln!(
-                        "victauri-bridge: backend answered a client response (not relayed): {}",
-                        p.join(" ")
-                    ),
-                    ForwardResult::Unreachable(e) => {
-                        eprintln!("victauri-bridge: could not deliver a client response: {e}");
-                    }
-                }
-            } else {
-                write_value(
-                    &stdout,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": msg.get("id").cloned().unwrap_or(Value::Null),
-                        "error": {
-                            "code": INVALID_REQUEST,
-                            "message": "invalid request: a JSON-RPC request needs a `method`"
-                        }
-                    }),
-                );
-            }
-            continue;
-        }
-
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        let id = msg.get("id").cloned().unwrap_or(Value::Null);
-        let is_notification = !expects_reply(&msg);
-
-        match method {
-            // ── Answered locally — never block on a backend ──────────────────────
-            "initialize" => {
-                // Cache for the lazy backend handshake, then reply immediately.
-                *locked(&cached_init) = Some(msg.clone());
-                write_value(&stdout, &local_initialize_response(&msg));
-            }
-            // The client's ack of OUR local initialize. It must never reach a backend (we
-            // handshake the backend separately) and needs no response — but it is the point at
-            // which the client is ready to receive server notifications, so mark it here (NOT on
-            // `initialize`) so the poller can't emit `list_changed` before the client is ready.
-            "notifications/initialized" => {
-                client_ready.store(true, Ordering::Release);
-                // If the backend already came up during the init-handshake window, the poller
-                // saw that down→up edge but skipped the emit (the client wasn't ready yet), and
-                // there is no fresh edge to emit on later. Emit once now so the client still
-                // refreshes to the live tool list — idempotent and cheap. (A compliant client's
-                // first `tools/list` after this ack already returns the live list directly; this
-                // just covers a client that relies solely on the notification.)
-                if backend_up.load(Ordering::Acquire) {
-                    write_notification(&stdout, "notifications/tools/list_changed");
-                    write_notification(&stdout, "notifications/resources/list_changed");
-                }
-            }
-            "ping" => {
-                write_value(&stdout, &json!({"jsonrpc": "2.0", "id": id, "result": {}}));
-            }
-            // ── List methods: live when up, graceful placeholder when down ───────
-            "tools/list" => {
-                match forward_when_up(
-                    &http,
-                    &connection,
-                    &session_id,
-                    &stateless,
-                    &cached_init,
-                    app.as_deref(),
-                    &msg,
-                )
-                .await
-                {
-                    Some(payloads) => write_payloads(&stdout, &payloads),
-                    // App down (or a transient fetch miss): serve the full baked fallback so
-                    // the agent still sees every tool. The live list arrives via
-                    // `tools/list_changed` when the app comes up.
-                    None => write_value(&stdout, &fallback_tools_response(&id)),
-                }
-            }
-            "resources/list" | "resources/templates/list" | "prompts/list" => {
-                match forward_when_up(
-                    &http,
-                    &connection,
-                    &session_id,
-                    &stateless,
-                    &cached_init,
-                    app.as_deref(),
-                    &msg,
-                )
-                .await
-                {
-                    Some(payloads) => write_payloads(&stdout, &payloads),
-                    // Empty (but valid) result when down — avoids a startup error for a
-                    // capability we advertise; the real list arrives via `list_changed`.
-                    None => write_value(&stdout, &empty_list_response(method, &id)),
-                }
-            }
-            // ── Everything else (tools/call, resources/read, …) needs a live app ─
-            _ => {
-                match forward_with_retries(
-                    &http,
-                    &connection,
-                    &session_id,
-                    &stateless,
-                    &cached_init,
-                    app.as_deref(),
-                    &msg,
-                )
-                .await
-                {
-                    ForwardResult::Payloads(payloads) => write_payloads(&stdout, &payloads),
-                    ForwardResult::Accepted => {}
-                    ForwardResult::Unreachable(err_msg) => {
-                        // A notification to a down backend is simply dropped (no id to answer).
-                        if !is_notification {
-                            write_value(
-                                &stdout,
-                                &json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "error": { "code": -32000, "message": err_msg }
-                                }),
-                            );
-                        }
-                    }
-                }
-            }
-        }
+        handle_line(&bridge, &one_way_tx, line.trim());
     }
 
+    // stdin closed: let what is already running finish (bounded), then exit.
+    drop(one_way_tx);
+    let _ = tokio::time::timeout(SHUTDOWN_GRACE, async {
+        let _ = forwarder.await;
+        let _ = bridge.in_flight.acquire_many(MAX_IN_FLIGHT as u32).await;
+    })
+    .await;
     Ok(())
+}
+
+/// Handle one stdin line. Never awaits: everything that talks to a backend is handed to a task
+/// (a request) or to the ordered one-way queue (a notification / client response).
+fn handle_line(bridge: &Arc<Bridge>, one_way: &tokio::sync::mpsc::Sender<Value>, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    let msg: Value = match serde_json::from_str(line) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("victauri-bridge: invalid JSON on stdin: {e}");
+            return;
+        }
+    };
+
+    // A JSON-RPC batch is answered here and NEVER forwarded (R5-BR1): see `batch_rejection`.
+    if let Value::Array(items) = &msg {
+        match batch_rejection(items) {
+            Some(reply) => write_value(&bridge.stdout, &reply),
+            None => eprintln!(
+                "victauri-bridge: dropped a JSON-RPC batch of notifications/responses \
+                 (batching is not supported)"
+            ),
+        }
+        return;
+    }
+
+    // No `method`: a client->server RESPONSE, or an Invalid Request (R5-BR3).
+    if msg.get("method").is_none() {
+        if is_client_response(&msg) {
+            // A reply to a server-initiated request (sampling/elicitation/roots), which a
+            // stateful backend may send inside an SSE stream this bridge relays verbatim — so
+            // it must reach the backend. JSON-RPC never answers a response.
+            enqueue_one_way(one_way, msg);
+        } else {
+            write_value(
+                &bridge.stdout,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": msg.get("id").cloned().unwrap_or(Value::Null),
+                    "error": {
+                        "code": INVALID_REQUEST,
+                        "message": "invalid request: a JSON-RPC request needs a `method`"
+                    }
+                }),
+            );
+        }
+        return;
+    }
+
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    match method {
+        // ── Answered locally, inline — never block on a backend ─────────────
+        "initialize" => {
+            // Cache for the lazy backend handshake, then reply immediately.
+            *locked(&bridge.cached_init) = Some(msg.clone());
+            write_value(&bridge.stdout, &local_initialize_response(&msg));
+        }
+        // The client's ack of OUR local initialize. It must never reach a backend (we
+        // handshake the backend separately) and needs no response — but it is the point at
+        // which the client is ready to receive server notifications, so mark it here (NOT on
+        // `initialize`) so the poller can't emit `list_changed` before the client is ready.
+        "notifications/initialized" => {
+            bridge.client_ready.store(true, Ordering::Release);
+            // If the backend already came up during the init-handshake window, the poller
+            // saw that down→up edge but skipped the emit (the client wasn't ready yet), and
+            // there is no fresh edge to emit on later. Emit once now so the client still
+            // refreshes to the live tool list — idempotent and cheap.
+            if bridge.backend_up.load(Ordering::Acquire) {
+                write_notification(&bridge.stdout, "notifications/tools/list_changed");
+                write_notification(&bridge.stdout, "notifications/resources/list_changed");
+            }
+        }
+        "ping" => {
+            write_value(
+                &bridge.stdout,
+                &json!({"jsonrpc": "2.0", "id": id, "result": {}}),
+            );
+        }
+        // Any other notification (incl. `notifications/cancelled`): forwarded, in order,
+        // without waiting for in-flight requests.
+        _ if !expects_reply(&msg) => enqueue_one_way(one_way, msg),
+        // ── A forwarded request: its own task, bounded ──────────────────────
+        _ => match Arc::clone(&bridge.in_flight).try_acquire_owned() {
+            Ok(permit) => {
+                let bridge = Arc::clone(bridge);
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let payloads = handle_request(&bridge, &msg).await;
+                    write_payloads(&bridge.stdout, &payloads);
+                });
+            }
+            Err(_) => write_value(
+                &bridge.stdout,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": {
+                        "code": -32000,
+                        "message": format!(
+                            "victauri bridge: {MAX_IN_FLIGHT} requests are already in flight; \
+                             retry when one completes"
+                        )
+                    }
+                }),
+            ),
+        },
+    }
+}
+
+/// Queue a notification / client response for the ordered one-way forwarder.
+fn enqueue_one_way(one_way: &tokio::sync::mpsc::Sender<Value>, msg: Value) {
+    if let Err(e) = one_way.try_send(msg) {
+        let method = match &e {
+            tokio::sync::mpsc::error::TrySendError::Full(m)
+            | tokio::sync::mpsc::error::TrySendError::Closed(m) => m
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("<response>")
+                .to_string(),
+        };
+        eprintln!("victauri-bridge: dropped {method}: {ONE_WAY_QUEUE} messages already queued");
+    }
+}
+
+/// Forward a notification or a client response. Nothing is ever written to the client: a
+/// notification to a down backend is simply dropped, and JSON-RPC never answers a response.
+async fn forward_one_way(bridge: &Bridge, msg: &Value) {
+    let outcome = forward_with_retries(bridge, msg).await;
+    if !is_client_response(msg) {
+        return;
+    }
+    match outcome {
+        ForwardResult::Accepted => {}
+        ForwardResult::Payloads(p) if p.is_empty() => {}
+        ForwardResult::Payloads(p) => eprintln!(
+            "victauri-bridge: backend answered a client response (not relayed): {}",
+            p.join(" ")
+        ),
+        ForwardResult::Unreachable(e) => {
+            eprintln!("victauri-bridge: could not deliver a client response: {e}");
+        }
+    }
+}
+
+/// The reply line(s) for one forwarded request (a request always gets at least one).
+async fn handle_request(bridge: &Bridge, msg: &Value) -> Vec<String> {
+    let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    match method {
+        // ── List methods: live when up, graceful placeholder when down ───────
+        "tools/list" => match forward_when_up(bridge, msg).await {
+            Some(payloads) => payloads,
+            // App down (or a transient fetch miss): serve the full baked fallback so the agent
+            // still sees every tool. The live list arrives via `tools/list_changed` when the
+            // app comes up.
+            None => vec![fallback_tools_response(&id).to_string()],
+        },
+        "resources/list" | "resources/templates/list" | "prompts/list" => {
+            match forward_when_up(bridge, msg).await {
+                Some(payloads) => payloads,
+                // Empty (but valid) result when down — avoids a startup error for a
+                // capability we advertise; the real list arrives via `list_changed`.
+                None => vec![empty_list_response(method, &id).to_string()],
+            }
+        }
+        // ── Everything else (tools/call, resources/read, …) needs a live app ─
+        _ => match forward_with_retries(bridge, msg).await {
+            ForwardResult::Payloads(payloads) => payloads,
+            // `forward_with_retries` synthesizes an error for a request answered with a bare
+            // 202, so this is unreachable for a request; answer defensively anyway.
+            ForwardResult::Accepted => vec![error_for_request(
+                msg,
+                -32603,
+                "backend accepted the request with no response (HTTP 202)",
+            )],
+            ForwardResult::Unreachable(err_msg) => vec![error_for_request(msg, -32000, &err_msg)],
+        },
+    }
 }
 
 /// Whether `msg` is a JSON-RPC request the client is waiting on a reply to: it has both a
@@ -485,14 +562,14 @@ fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// Write one JSON-RPC value as a line to the shared stdout.
-fn write_value(stdout: &Arc<Mutex<std::io::Stdout>>, v: &Value) {
+fn write_value(stdout: &Mutex<std::io::Stdout>, v: &Value) {
     let mut o = locked(stdout);
     let _ = writeln!(o, "{v}");
     let _ = o.flush();
 }
 
 /// Relay already-serialized JSON-RPC payload lines (from a backend response) verbatim.
-fn write_payloads(stdout: &Arc<Mutex<std::io::Stdout>>, payloads: &[String]) {
+fn write_payloads(stdout: &Mutex<std::io::Stdout>, payloads: &[String]) {
     let mut o = locked(stdout);
     for payload in payloads {
         let _ = writeln!(o, "{payload}");
@@ -501,7 +578,7 @@ fn write_payloads(stdout: &Arc<Mutex<std::io::Stdout>>, payloads: &[String]) {
 }
 
 /// Emit a server→client JSON-RPC notification (no id).
-fn write_notification(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
+fn write_notification(stdout: &Mutex<std::io::Stdout>, method: &str) {
     write_value(stdout, &json!({ "jsonrpc": "2.0", "method": method }));
 }
 
@@ -602,48 +679,34 @@ fn undelivered_response_message(msg: &Value, err: &anyhow::Error, app_still_up: 
 /// Background task that watches for the backend becoming reachable and, on a down→up
 /// transition, tells the client to refresh its tool/resource lists — so the baked fallback
 /// is replaced by the live, version-accurate set with no `/mcp` reconnect.
-#[allow(clippy::too_many_arguments)]
-fn spawn_availability_poller(
-    app: Option<String>,
-    connection: Arc<Mutex<Option<ServerInfo>>>,
-    session_id: Arc<Mutex<Option<String>>>,
-    stateless: Arc<Mutex<bool>>,
-    backend_up: Arc<AtomicBool>,
-    client_ready: Arc<AtomicBool>,
-    stdout: Arc<Mutex<std::io::Stdout>>,
-) {
+fn spawn_availability_poller(bridge: Arc<Bridge>) {
     tokio::spawn(async move {
         loop {
             // Poll fast while DOWN (a freshly-started app is noticed within ~1.5s) and back off
             // while UP (we only need to catch a later restart).
-            let interval = if backend_up.load(Ordering::Acquire) {
+            let interval = if bridge.backend_up.load(Ordering::Acquire) {
                 POLL_INTERVAL_UP_MS
             } else {
                 POLL_INTERVAL_MS
             };
             tokio::time::sleep(Duration::from_millis(interval)).await;
-            let found = discover_one(app.as_deref()).await;
-            let up = found.is_some();
-            if let Some(info) = found {
-                *locked(&connection) = Some(info);
-            } else {
-                // Backend gone — drop the cached connection/session so nothing can reuse a stale
-                // (port, token) pair (defense-in-depth for audit #1; the request path also
-                // re-resolves the trusted entry on every call).
-                *locked(&connection) = None;
-                *locked(&session_id) = None;
-                *locked(&stateless) = false;
+            let up = discover_one(bridge.app.as_deref()).await.is_some();
+            if !up {
+                // Backend gone — drop the session so nothing can reuse it (defense-in-depth for
+                // audit #1; the request path also re-resolves the trusted entry on every call).
+                *locked(&bridge.session_id) = None;
+                bridge.stateless.store(false, Ordering::Release);
             }
-            // The poller is the SOLE owner of `backend_up`: the request path no longer writes it,
-            // so the down→up edge is detected here exactly once and can never be silently consumed
-            // by a tool call that happened to reconnect first.
-            let was = backend_up.swap(up, Ordering::AcqRel);
+            // The poller is the SOLE owner of `backend_up`: the request path never writes it,
+            // so the down→up edge is detected here exactly once and can never be silently
+            // consumed by a tool call that happened to reconnect first.
+            let was = bridge.backend_up.swap(up, Ordering::AcqRel);
             // Only announce a refresh once the CLIENT has finished initializing (sent
             // `notifications/initialized`) — a server notification before that is a lifecycle
             // violation a strict client may reject.
-            if up && !was && client_ready.load(Ordering::Acquire) {
-                write_notification(&stdout, "notifications/tools/list_changed");
-                write_notification(&stdout, "notifications/resources/list_changed");
+            if up && !was && bridge.client_ready.load(Ordering::Acquire) {
+                write_notification(&bridge.stdout, "notifications/tools/list_changed");
+                write_notification(&bridge.stdout, "notifications/resources/list_changed");
             }
         }
     });
@@ -663,44 +726,63 @@ enum ForwardResult {
 /// reachable; `None` when the app is down (the caller then serves a local placeholder). Delegates
 /// to `forward_with_retries`, which re-resolves the trusted backend itself — so a live `tools/list`
 /// pays exactly one discovery pass and a down one fails fast to the fallback.
-#[allow(clippy::too_many_arguments)]
-async fn forward_when_up(
-    http: &reqwest::Client,
-    connection: &Arc<Mutex<Option<ServerInfo>>>,
-    session_id: &Arc<Mutex<Option<String>>>,
-    stateless: &Arc<Mutex<bool>>,
-    cached_init: &Arc<Mutex<Option<Value>>>,
-    app: Option<&str>,
-    msg: &Value,
-) -> Option<Vec<String>> {
-    match forward_with_retries(
-        http,
-        connection,
-        session_id,
-        stateless,
-        cached_init,
-        app,
-        msg,
-    )
-    .await
-    {
+async fn forward_when_up(bridge: &Bridge, msg: &Value) -> Option<Vec<String>> {
+    match forward_with_retries(bridge, msg).await {
         ForwardResult::Payloads(payloads) => Some(payloads),
         _ => None,
     }
 }
 
+/// Establish the backend MCP session if we have none (first forward, or after a restart
+/// invalidated it) — ONE handshake at a time: concurrent requests that all find no session
+/// wait for the first one's instead of racing their own (R5B-BR5). This is what makes
+/// restart-recovery work — replaying a tool call with no session would 422.
+async fn ensure_backend_session(bridge: &Bridge, info: &ServerInfo) {
+    let needed =
+        || !bridge.stateless.load(Ordering::Acquire) && locked(&bridge.session_id).is_none();
+    if !needed() {
+        return;
+    }
+    let _single_flight = bridge.handshake.lock().await;
+    if !needed() {
+        return; // another request completed the handshake while we waited
+    }
+    let init = locked(&bridge.cached_init).clone();
+    let Some(init) = init else {
+        return;
+    };
+    let token = info.token.as_deref();
+    // We don't relay the backend handshake response to the client; it already believes it
+    // is initialized (we answered locally).
+    let Ok(out) = post_message(&bridge.http, info.port, token, None, &init).await else {
+        return;
+    };
+    let backend_sid = out.session_id.clone();
+    if let Some(sid) = out.session_id {
+        *locked(&bridge.session_id) = Some(sid);
+    } else if !out.stale_session {
+        // Handshake succeeded with no session id → stateless backend.
+        bridge.stateless.store(true, Ordering::Release);
+    }
+    // Complete the MCP lifecycle for a STATEFUL backend (harmless for the stateless default):
+    // the client's `notifications/initialized` was answered locally, so replay it to the
+    // backend now — a stateful rmcp session may gate tool calls on having received it.
+    let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
+    let _ = post_message(
+        &bridge.http,
+        info.port,
+        token,
+        backend_sid.as_deref(),
+        &note,
+    )
+    .await;
+}
+
 /// Forward a message to the live backend, establishing/recovering the backend session and
-/// retrying across a restart. Discovers a backend first if we don't have one; returns
-/// `Unreachable` (never blocks indefinitely) when no app is running.
-async fn forward_with_retries(
-    http: &reqwest::Client,
-    connection: &Arc<Mutex<Option<ServerInfo>>>,
-    session_id: &Arc<Mutex<Option<String>>>,
-    stateless: &Arc<Mutex<bool>>,
-    cached_init: &Arc<Mutex<Option<Value>>>,
-    app: Option<&str>,
-    msg: &Value,
-) -> ForwardResult {
+/// retrying across a restart. Discovers a backend first; returns `Unreachable` (never blocks
+/// indefinitely) when no app is running.
+async fn forward_with_retries(bridge: &Bridge, msg: &Value) -> ForwardResult {
+    let app = bridge.app.as_deref();
     // Only a request (method + id) is owed a reply; never synthesize one for a notification or
     // for a client response (R5-BR3).
     let is_notification = !expects_reply(msg);
@@ -711,78 +793,35 @@ async fn forward_with_retries(
     // identity and yields the port and token together. Without this, after the app shut down (its
     // discovery entry gone) an attacker who bound the freed port would receive the cached Bearer
     // token and could relay forged tool results. This is ONE discovery pass (no 1s-sleep retries):
-    // a live app resolves fast; a down app fails fast to the actionable message / fallback.
-    match scan_once(app).await {
-        Selection::One(info) => {
-            *locked(connection) = Some(info);
-        }
+    // a live app resolves fast; a down app fails fast to the actionable message / fallback. The
+    // backend is held in a LOCAL for this forward, so concurrent forwards never see each other's.
+    let mut info = match scan_once(app).await {
+        Selection::One(info) => info,
         Selection::Ambiguous(labels) => {
-            *locked(connection) = None;
             return ForwardResult::Unreachable(ambiguous_message(&labels));
         }
-        Selection::None => {
-            *locked(connection) = None;
-            // Fail-fast by design: a tool call issued in the sub-second window where a restarting
-            // app has removed its old discovery entry but not yet written the new one gets the
-            // actionable "unreachable" message rather than waiting. This is the price of the audit
-            // #1 rule (never reuse a cached connection); the retry loop's restart patience still
-            // applies once a live trusted backend is found, and the next call ~1s later succeeds.
-            return ForwardResult::Unreachable(unreachable_message());
-        }
-    }
-
-    let mut last_err = None;
+        // Fail-fast by design: a tool call issued in the sub-second window where a restarting
+        // app has removed its old discovery entry but not yet written the new one gets the
+        // actionable "unreachable" message rather than waiting. This is the price of the audit
+        // #1 rule (never reuse a cached connection); the retry loop's restart patience still
+        // applies once a live trusted backend is found, and the next call ~1s later succeeds.
+        Selection::None => return ForwardResult::Unreachable(unreachable_message()),
+    };
 
     for attempt in 0..MAX_RETRIES {
-        // Re-establish a fresh backend session BEFORE replaying the real request when we have
-        // none (first forward, or after a restart invalidated it). This is what makes
-        // restart-recovery work — replaying a tool call with no session would 422.
-        if !*locked(stateless) {
-            let need_reinit = locked(session_id).is_none();
-            if need_reinit {
-                let init = locked(cached_init).clone();
-                if let Some(init) = init
-                    && let Some((port, token)) = conn_parts(connection)
-                {
-                    // We don't relay the backend handshake response to the client; it already
-                    // believes it is initialized (we answered locally).
-                    if let Ok(out) = post_message(http, port, token.as_deref(), None, &init).await {
-                        let backend_sid = out.session_id.clone();
-                        if let Some(sid) = out.session_id {
-                            *locked(session_id) = Some(sid);
-                        } else if !out.stale_session {
-                            // Handshake succeeded with no session id → stateless backend.
-                            *locked(stateless) = true;
-                        }
-                        // Complete the MCP lifecycle for a STATEFUL backend (harmless for the
-                        // stateless default): the client's `notifications/initialized` was
-                        // answered locally, so replay it to the backend now — a stateful rmcp
-                        // session may gate tool calls on having received it.
-                        let note = json!({"jsonrpc": "2.0", "method": "notifications/initialized"});
-                        let _ = post_message(
-                            http,
-                            port,
-                            token.as_deref(),
-                            backend_sid.as_deref(),
-                            &note,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
+        ensure_backend_session(bridge, &info).await;
+        let sid = locked(&bridge.session_id).clone();
 
-        let Some((port, token)) = conn_parts(connection) else {
-            return ForwardResult::Unreachable(unreachable_message());
-        };
-        let sid = locked(session_id).clone();
-
-        match post_message(http, port, token.as_deref(), sid.as_deref(), msg).await {
+        match post_message(
+            &bridge.http,
+            info.port,
+            info.token.as_deref(),
+            sid.as_deref(),
+            msg,
+        )
+        .await
+        {
             Ok(out) => {
-                if let Some(new_sid) = out.session_id {
-                    *locked(session_id) = Some(new_sid);
-                }
-
                 if out.stale_session {
                     eprintln!(
                         "victauri-bridge: stale session (HTTP {}), re-establishing (attempt {}/{})",
@@ -790,15 +829,17 @@ async fn forward_with_retries(
                         attempt + 1,
                         MAX_RETRIES
                     );
-                    *locked(session_id) = None;
+                    bridge.clear_session_if(sid.as_deref());
                     if attempt + 1 < MAX_RETRIES {
                         tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
-                        if let Ok(new_conn) = discover_and_select(false, app).await {
-                            *locked(connection) = Some(new_conn);
+                        if let Ok(new_info) = discover_and_select(false, app).await {
+                            info = new_info;
                         }
                     }
-                    last_err = Some(format!("Victauri returned {}", out.status));
                     continue;
+                }
+                if let Some(new_sid) = out.session_id {
+                    *locked(&bridge.session_id) = Some(new_sid);
                 }
 
                 if out.accepted {
@@ -833,7 +874,7 @@ async fn forward_with_retries(
                     attempt + 1,
                     MAX_RETRIES
                 );
-                *locked(session_id) = None;
+                bridge.clear_session_if(sid.as_deref());
                 // A tool call that may already have REACHED the app must not be replayed: it
                 // can have side effects (invoke_command, input, interact…), and the commonest
                 // way to get here is a call that itself quit or restarted the app (`quit_app`)
@@ -854,24 +895,19 @@ async fn forward_with_retries(
                     .await;
                     // Re-discover; the app may have restarted on a new port, or gone away.
                     match discover_and_select(false, app).await {
-                        Ok(new_conn) => {
-                            eprintln!("victauri-bridge: reconnected to {}", new_conn.label());
-                            *locked(connection) = Some(new_conn);
+                        Ok(new_info) => {
+                            eprintln!("victauri-bridge: reconnected to {}", new_info.label());
+                            info = new_info;
                         }
-                        Err(_) => {
-                            *locked(connection) = None;
-                        }
+                        Err(_) => return ForwardResult::Unreachable(unreachable_message()),
                     }
                 }
-                last_err = Some(format!("Victauri server unreachable ({e})"));
-                continue;
             }
         }
     }
 
-    // Retries exhausted — the app is down or perpetually restarting. `last_err` is logged to
+    // Retries exhausted — the app is down or perpetually restarting. Each failure was logged to
     // stderr already; the client gets the actionable remedy.
-    let _ = last_err;
     ForwardResult::Unreachable(unreachable_message())
 }
 
@@ -882,12 +918,6 @@ fn build_client() -> Result<reqwest::Client> {
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
         .map_err(Into::into)
-}
-
-fn conn_parts(connection: &Arc<Mutex<Option<ServerInfo>>>) -> Option<(u16, Option<String>)> {
-    locked(connection)
-        .as_ref()
-        .map(|s| (s.port, s.token.clone()))
 }
 
 /// Outcome of forwarding one JSON-RPC message to the backend.
