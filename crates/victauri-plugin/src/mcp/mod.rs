@@ -19,6 +19,8 @@ mod rest;
 #[cfg(test)]
 mod robustness_tests;
 mod server;
+#[cfg(test)]
+mod tool_result_tests;
 mod verification_params;
 mod webview_params;
 mod window_params;
@@ -261,7 +263,15 @@ impl EvalFailure {
             message: message.into(),
         }
     }
+
+    /// The code did not parse (reported by the bridge's post-wrapper check), so it never ran.
+    fn is_parse_error(&self) -> bool {
+        self.kind == EvalFailureKind::NotSent && self.message.starts_with(PARSE_ERROR_PREFIX)
+    }
 }
+
+/// How [`unwrap_eval_envelope`] reports code that did not parse.
+const PARSE_ERROR_PREFIX: &str = "JavaScript parse error:";
 
 /// How long `app_state` waits for an app-registered probe closure (shortened under test).
 const PROBE_TIMEOUT: std::time::Duration = if cfg!(test) {
@@ -718,7 +728,7 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("eval_js") {
             return tool_disabled("verify_state requires eval_js capability");
         }
-        let code = format!("return ({})", params.frontend_expr);
+        let code = expression_eval_code(&params.frontend_expr);
         let frontend_json = match self
             .eval_with_return(&code, params.webview_label.as_deref())
             .await
@@ -897,7 +907,7 @@ impl VictauriMcpHandler {
         let Some(expr) = params.value.as_deref().filter(|s| !s.is_empty()) else {
             return missing_param("value", "wait_for(expression)");
         };
-        let code = format!("return ({expr});");
+        let code = expression_eval_code(expr);
         let start = std::time::Instant::now();
         let deadline = start + std::time::Duration::from_millis(timeout_ms);
         let poll = std::time::Duration::from_millis(poll_ms);
@@ -910,9 +920,14 @@ impl VictauriMcpHandler {
                 .min(std::time::Duration::from_secs(15))
                 .max(std::time::Duration::from_secs(1));
             match self
-                .eval_with_return_timeout(&code, params.webview_label.as_deref(), per_eval)
+                .eval_outcome(&code, params.webview_label.as_deref(), per_eval)
                 .await
             {
+                // Code that does not parse can never start matching: fail now instead of
+                // polling to the timeout.
+                Err(f) if f.is_parse_error() => {
+                    return tool_error(format!("wait_for(expression): {}", f.message));
+                }
                 Ok(raw) => {
                     let val = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
                     let met = match &params.expected {
@@ -928,7 +943,7 @@ impl VictauriMcpHandler {
                     }
                     last_value = val;
                 }
-                Err(e) => last_error = Some(e),
+                Err(e) => last_error = Some(e.message),
             }
 
             if std::time::Instant::now() >= deadline {
@@ -1020,7 +1035,7 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("eval_js") {
             return tool_disabled("assert_semantic requires eval_js capability");
         }
-        let code = format!("return ({})", params.expression);
+        let code = expression_eval_code(&params.expression);
         let actual_json = match self
             .eval_with_return(&code, params.webview_label.as_deref())
             .await
@@ -5805,7 +5820,7 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, EvalFailure> {
             return Err(EvalFailure::new(
                 EvalFailureKind::NotSent,
                 format!(
-                    "JavaScript parse error: {}",
+                    "{PARSE_ERROR_PREFIX} {}",
                     why.as_str().unwrap_or("the code did not begin executing")
                 ),
             ));
@@ -5859,6 +5874,25 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, EvalFailure> {
         ));
     }
     Ok(raw)
+}
+
+/// The eval code for a caller-supplied EXPRESSION (`verify_state`, `assert_semantic`,
+/// `wait_for` expression): code that returns the expression's value.
+///
+/// These used to be wrapped as `return (<expr>)`, so a trailing `;` or a trailing `// comment`
+/// (which swallowed the closing paren) turned a valid expression into a parse error. A single
+/// expression is now handed to the eval engine as-is: its string/comment-aware `return`
+/// auto-prepend already accepts a trailing `;`, trailing comments and multi-line expressions,
+/// and the wrapper ends the code with a newline. Anything the engine would NOT wrap (an object
+/// literal `{a: 1}.a`, which reads as a block) keeps the parenthesized form, with trailing `;`s
+/// dropped and the expression on lines of its own so a trailing line comment cannot swallow the
+/// closing paren. Multi-statement code stays a syntax error (these tools take an expression).
+fn expression_eval_code(expr: &str) -> String {
+    if should_prepend_return(expr) {
+        return expr.to_string();
+    }
+    let body = expr.trim_end_matches(|c: char| c == ';' || is_js_space(c));
+    format!("return (\n{body}\n);")
 }
 
 /// Statement keywords where a leading `return` would be a syntax error. Matched as whole words
