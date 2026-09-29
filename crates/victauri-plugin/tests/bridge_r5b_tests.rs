@@ -364,3 +364,88 @@ fn r5b_routeurl1_rules_match_relative_and_absolute_forms() {
     assert_eq!(r["other"], serde_json::json!([false, false]), "{r}");
     assert_eq!(r["xhr"], serde_json::json!([true, true]), "{r}");
 }
+
+// ── R5B-XHR1: a reused XHR gets one log entry per request, listeners once ────
+
+/// `send()` attached five fresh listeners to the XHR every time, each closing over THAT send's
+/// log entry, so a reused XHR (open/send again on the same object) piled up listeners and every
+/// later request rewrote the earlier entries' status and duration. A re-`open()` while a
+/// request was in flight left its entry 'pending' forever (wedging network_idle), and a
+/// delayed send then fired into the next request. A blocked XHR never fired `loadend`.
+#[test]
+fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
+    let def = def(
+        None,
+        vec![case(
+            "three requests on one XHR, a re-open mid-flight, a blocked request",
+            r"
+            var V = window.__VICTAURI__;
+            function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+            function loadend(x, ms) {
+                return new Promise(function(r) {
+                    x.addEventListener('loadend', function() { r(true); }, { once: true });
+                    setTimeout(function() { r(false); }, ms || 2000);
+                });
+            }
+            var x = new XMLHttpRequest();
+            x.open('GET', '/r5b/one'); var p = loadend(x); x.send(); await p;
+            var first = V.getNetworkLog('/r5b/', 10)[0];
+            await sleep(80);
+            x.open('GET', '/r5b/two'); p = loadend(x); x.send(); await p;
+            await sleep(80);
+            x.open('GET', '/r5b/three'); p = loadend(x); x.send(); await p;
+            var log = V.getNetworkLog('/r5b/', 10);
+
+            // Re-open while a (route-delayed) request is still pending.
+            V.addRoute({ pattern: '/r5c/slow', action: 'delay', delay_ms: 150 });
+            var y = new XMLHttpRequest();
+            y.open('GET', '/r5c/slow'); y.send();
+            y.open('GET', '/r5c/after'); p = loadend(y); y.send(); await p;
+            await sleep(300);
+            var log2 = V.getNetworkLog('/r5c/', 10);
+
+            // A blocked request ends like a failed one: error, then loadend.
+            V.addRoute({ pattern: '/r5d/blocked', action: 'block' });
+            var z = new XMLHttpRequest();
+            var events = [];
+            z.addEventListener('error', function() { events.push('error'); });
+            z.open('GET', '/r5d/blocked'); p = loadend(z, 500); z.send();
+            var ended = await p;
+
+            return {
+                urls: log.map(function(e) { return e.url; }),
+                ids_distinct: new Set(log.map(function(e) { return e.id; })).size,
+                first_status: first.status, first_duration: first.duration_ms,
+                first_after: { status: log[0].status, duration: log[0].duration_ms },
+                pending: log.filter(function(e) { return e.status === 'pending'; }).length,
+                reopen: log2.map(function(e) { return e.url + '=' + e.status; }),
+                blocked_loadend: ended, blocked_events: events,
+            };
+            ",
+        )],
+    );
+    let Some(results) = run_tests(&def) else {
+        return;
+    };
+    assert_all_pass(&results);
+    let r = result(&results, 0);
+    assert_eq!(
+        r["urls"],
+        serde_json::json!(["/r5b/one", "/r5b/two", "/r5b/three"]),
+        "{r}"
+    );
+    assert_eq!(r["ids_distinct"], 3, "{r}");
+    assert_eq!(r["pending"], 0, "{r}");
+    assert_eq!(
+        r["first_after"]["duration"], r["first_duration"],
+        "a later request on the same XHR rewrote the first entry: {r}"
+    );
+    assert_eq!(r["first_after"]["status"], r["first_status"], "{r}");
+    assert_eq!(
+        r["reopen"],
+        serde_json::json!(["/r5c/slow=aborted", "/r5c/after=error"]),
+        "{r}"
+    );
+    assert_eq!(r["blocked_loadend"], true, "{r}");
+    assert_eq!(r["blocked_events"], serde_json::json!(["error"]), "{r}");
+}

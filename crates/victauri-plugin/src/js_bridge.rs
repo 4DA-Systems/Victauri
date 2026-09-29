@@ -3018,12 +3018,72 @@ const INIT_SCRIPT_BODY: &str = r#"
         // XMLHttpRequest
         var origOpen = XMLHttpRequest.prototype.open;
         var origSend = XMLHttpRequest.prototype.send;
-        // Per-request {method, url} as `open()` really received them, in a closure WeakMap —
-        // not an expando on the XHR, which page script could overwrite to forge the entry
-        // `send()` logs (R4-JS3). The WeakMap methods are captured before page script runs.
+        var ADD_LISTENER = EventTarget.prototype.addEventListener;
+        var DISPATCH_EVENT = EventTarget.prototype.dispatchEvent;
+        // Per-XHR state in a closure WeakMap — not an expando on the XHR, which page script
+        // could overwrite to forge the entry `send()` logs (R4-JS3): the {method, url} `open()`
+        // really received, and the log entry of the request currently in flight. The WeakMap
+        // methods are captured before page script runs.
+        //
+        // The bridge's listeners are attached ONCE per XHR and always update the CURRENT entry
+        // (R5B-XHR1). Attaching them on every send() piled them up on a reused XHR, each closing
+        // over its own send's entry, so every later request rewrote the earlier entries.
         var xhrNet = new WeakMap();
         var XHR_NET_GET = Function.prototype.call.bind(WeakMap.prototype.get);
         var XHR_NET_SET = Function.prototype.call.bind(WeakMap.prototype.set);
+        function xhrState(xhr) {
+            var st = XHR_NET_GET(xhrNet, xhr);
+            if (!st) {
+                st = { net: null, entry: null, hooked: false };
+                XHR_NET_SET(xhrNet, xhr, st);
+            }
+            return st;
+        }
+        function xhrEvent(type) {
+            return typeof ProgressEvent === 'function' ? new ProgressEvent(type) : new Event(type);
+        }
+        function xhrFinish(entry, status) {
+            entry.status = status;
+            entry.duration_ms = Date.now() - entry.timestamp;
+        }
+        function xhrLog(entry) {
+            networkLog.push(entry);
+            if (networkLog.length > CAP_NETWORK) networkLog.shift();
+        }
+        function xhrUnlog(entry) {
+            for (var i = networkLog.length - 1; i >= 0; i--) {
+                if (networkLog[i] === entry) { networkLog.splice(i, 1); return; }
+            }
+        }
+        function xhrHook(xhr, st) {
+            if (st.hooked) return;
+            st.hooked = true;
+            var on = function(type, fn) { REFLECT_APPLY(ADD_LISTENER, xhr, [type, fn]); };
+            on('load', function() {
+                var e = st.entry;
+                if (!e || e.status !== 'pending') return;
+                e.status_text = xhr.statusText;
+                xhrFinish(e, xhr.status);
+            });
+            on('error', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'error');
+            });
+            on('abort', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'aborted');
+            });
+            on('timeout', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'timeout');
+            });
+            // Backstop: whatever ended the request, it must not stay 'pending' forever (that
+            // would wedge wait_for network_idle / ipc_idle).
+            on('loadend', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'error');
+            });
+        }
         XMLHttpRequest.prototype.open = function(method, url) {
             // No early delete: an open() that throws leaves the previous request intact (spec),
             // and a successful one replaces this entry below.
@@ -3037,79 +3097,80 @@ const INIT_SCRIPT_BODY: &str = r#"
             var args = [m, u];
             for (var i = 2; i < arguments.length; i++) args[i] = arguments[i];
             var ret = REFLECT_APPLY(origOpen, this, args);
-            XHR_NET_SET(xhrNet, this, { method: m, url: u });
+            var st = xhrState(this);
+            // open() on a request in flight terminates it without firing any event: close its
+            // entry here, or it would stay 'pending' forever.
+            if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+            st.entry = null;
+            st.net = { method: m, url: u };
             return ret;
         };
         XMLHttpRequest.prototype.send = function() {
-            var net = XHR_NET_GET(xhrNet, this);
-            if (net) {
-                var isVictauriInternal = isVictauriInternalUrl(net.url);
-                if (isVictauriInternal) {
-                    return REFLECT_APPLY(origSend, this, arguments);
-                }
-                var id = ++networkCounter;
-                var entry = {
-                    id: id,
-                    method: net.method.toUpperCase(),
-                    url: net.url,
-                    timestamp: Date.now(),
-                    status: 'pending',
-                    duration_ms: null,
-                };
-                networkLog.push(entry);
-                if (networkLog.length > CAP_NETWORK) networkLog.shift();
-                var self = this;
-                this.addEventListener('load', function() {
-                    entry.status = self.status;
-                    entry.status_text = self.statusText;
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                this.addEventListener('error', function() {
-                    if (entry.blocked) return; // keep 'blocked' for route-blocked requests
-                    entry.status = 'error';
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                this.addEventListener('abort', function() {
-                    entry.status = 'aborted';
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                this.addEventListener('timeout', function() {
-                    entry.status = 'timeout';
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                // Backstop: whatever ended the request, it must not stay 'pending'
-                // forever (that would wedge wait_for network_idle / ipc_idle).
-                this.addEventListener('loadend', function() {
-                    if (entry.status === 'pending') {
-                        entry.status = 'error';
-                        entry.duration_ms = Date.now() - entry.timestamp;
-                    }
-                });
+            var st = XHR_NET_GET(xhrNet, this);
+            var net = st && st.net;
+            if (!net || isVictauriInternalUrl(net.url)) {
+                return REFLECT_APPLY(origSend, this, arguments);
+            }
+            // Each send() is its own request with its own log entry.
+            var entry = {
+                id: ++networkCounter,
+                method: net.method.toUpperCase(),
+                url: net.url,
+                timestamp: Date.now(),
+                status: 'pending',
+                duration_ms: null,
+            };
+            xhrHook(this, st);
+            var self = this;
 
-                // Phase 1 routing for XHR: block + delay are supported here.
-                // `fulfill` (synthetic response) is fetch-only — faking the full
-                // XHR response surface is unreliable; document as a limitation.
-                var xroute = matchRoute(net.url, net.method);
-                if (xroute) {
-                    recordRouteMatch(xroute, net.url, net.method);
-                    if (xroute.action === 'block') {
-                        entry.status = 'blocked';
-                        entry.blocked = true;
-                        entry.duration_ms = Date.now() - entry.timestamp;
-                        var blockedXhr = this;
-                        setTimeout(function() {
-                            try { blockedXhr.dispatchEvent(new Event('error')); } catch (e) {}
-                        }, 0);
-                        return; // do not send
-                    }
-                    if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
-                        var dArgs = arguments, dSelf = this;
-                        setTimeout(function() { REFLECT_APPLY(origSend, dSelf, dArgs); }, xroute.delay_ms);
-                        return;
-                    }
+            // Phase 1 routing for XHR: block + delay are supported here.
+            // `fulfill` (synthetic response) is fetch-only — faking the full
+            // XHR response surface is unreliable; document as a limitation.
+            var xroute = matchRoute(net.url, net.method);
+            if (xroute) {
+                recordRouteMatch(xroute, net.url, net.method);
+                if (xroute.action === 'block') {
+                    st.entry = entry;
+                    entry.blocked = true;
+                    xhrFinish(entry, 'blocked');
+                    xhrLog(entry);
+                    // End it like a network failure — `error`, then `loadend` — unless the app
+                    // has moved this XHR on to another request meanwhile.
+                    SET_TIMEOUT(function() {
+                        if (st.entry !== entry) return;
+                        try {
+                            REFLECT_APPLY(DISPATCH_EVENT, self, [xhrEvent('error')]);
+                            REFLECT_APPLY(DISPATCH_EVENT, self, [xhrEvent('loadend')]);
+                        } catch (e) {}
+                    }, 0);
+                    return; // do not send
+                }
+                if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
+                    st.entry = entry;
+                    xhrLog(entry);
+                    var dArgs = arguments;
+                    SET_TIMEOUT(function() {
+                        // Re-opened meanwhile: this request no longer exists.
+                        if (st.entry !== entry || entry.status !== 'pending') return;
+                        try { REFLECT_APPLY(origSend, self, dArgs); }
+                        catch (e) { entry.error = String(e); xhrFinish(entry, 'error'); }
+                    }, xroute.delay_ms);
+                    return;
                 }
             }
-            return REFLECT_APPLY(origSend, this, arguments);
+            // The entry is current BEFORE the real send(): a synchronous XHR fires its events
+            // inside send(). A send() that throws (not opened, already sent) starts no request:
+            // its entry is dropped and the request still in flight stays current.
+            var previous = st.entry;
+            st.entry = entry;
+            xhrLog(entry);
+            try {
+                return REFLECT_APPLY(origSend, this, arguments);
+            } catch (e) {
+                if (st.entry === entry) st.entry = previous;
+                xhrUnlog(entry);
+                throw e;
+            }
         };
     })();
 
