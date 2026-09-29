@@ -345,4 +345,28 @@ mod tests {
             MAX_PAGE_WINDOW_QUERIES
         );
     }
+
+    /// Tauri runs an `async` command on a tokio worker and extracts/drops its arguments and its
+    /// resolver (which holds a `Webview`) there; on Linux every Tauri handle carries a non-atomic
+    /// `Rc`, and doing that for the eval callback on every eval corrupted the host heap (0.9.0).
+    /// Only the two commands that genuinely wait for the page may be `async`. A new `async`
+    /// command here must first be shown not to touch Tauri handles off the main thread.
+    #[test]
+    fn only_the_commands_that_wait_for_the_page_are_async() {
+        let source = include_str!("tools.rs");
+        let async_commands: Vec<&str> = source
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix("pub async fn victauri_"))
+            .map(|rest| rest.split(['<', '(']).next().unwrap_or(rest))
+            .collect();
+        assert_eq!(
+            async_commands,
+            vec!["eval_js", "dom_snapshot"],
+            "only victauri_eval_js / victauri_dom_snapshot may be async commands"
+        );
+        assert!(
+            source.contains("pub fn victauri_eval_callback<R: Runtime>("),
+            "victauri_eval_callback must stay a synchronous command"
+        );
+    }
 }

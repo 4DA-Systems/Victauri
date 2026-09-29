@@ -204,6 +204,24 @@ Disproved with evidence (don't re-raise): eval-id `.caller` leak, quick_check ov
 dirs left on clean exit, Windows socket inheritance by child processes, missing tauri `rename`.
 PR #73 (backend logs) is deferred to 0.9.1. Report: https://claude.ai/artifact/Wfmx9d2khAuCesB7SFu8ge
 
+**Linux host heap corruption — ROOT CAUSE (don't re-investigate):** on Linux every Tauri handle
+(`AppHandle`, `Webview`, `WebviewWindow`) carries tauri-runtime-wry's `Context`, which holds the
+main-thread context by value, which holds tao's `EventLoopWindowTarget` with
+`windows: Rc<RefCell<HashSet<WindowId>>>` (behind `unsafe impl Send + Sync`, "main thread only").
+**Cloning or dropping ANY Tauri handle off the main thread races that non-atomic `Rc`** → glibc
+`corrupted double-linked list` / `unaligned fastbin chunk`, surfacing on whatever thread allocates
+next. Proven with no Victauri in the process (demo-app build with an in-process driver: bg threads
+that only clone+drop the `AppHandle` abort; with the handle taken on the main thread, 10/10 clean).
+Victauri did it per call: `on_main` cloned the `AppHandle` on the caller, and the eval callback was
+an `async` Tauri command (Tauri extracts async args + drops the resolver's `Webview` on tokio).
+Fixed: `on_main` uses a main-thread-owned handle (`bridge::install_main_app`), and every Victauri
+command that does not wait for the page is SYNC (runs on the main thread); a test pins that only
+`victauri_eval_js`/`victauri_dom_snapshot` are async. The 0.8.8 `MAIN_DISPATCH_LOCK` only reduced
+concurrent off-main clones — it was never the real fix. Lessons: bisecting a refcount race
+converges on noise (identical code split 3/3 vs 0/3 across builds); WSL never reproduced the
+Victauri suite but reproduced the minimal repro instantly; the CI E2E job now repeats the
+heap-sensitive tests against 3 fresh apps on Linux.
+
 ### v0.9.0 — rounds 1-2 + a one-time `#[non_exhaustive]` break (release-prepped, NOT published)
 
 Triggered by an in-the-wild failure: a 4DA session ran `invoke_command quit_app` through the

@@ -125,8 +125,32 @@ rusqlite range forced `bundled` onto the app's rusqlite (now a separate default 
 60 s while the server allows 300 s; the VS Code extension counted a 429 on the authenticated probe
 as success; plus a garbled error message, a stray doc comment, and a lost XHR log entry after a
 throwing `open()`. (A proposed yield spin to shave up to ~15 ms off back-to-back main-thread round
-trips on Windows was reverted: with it the Linux/WebKitGTK E2E host crashed with heap corruption in
-CI 2/2, without it passed — a latency nicety is not worth reopening that race.)
+trips on Windows was dropped while chasing the Linux host crash below; it was not the cause.)
+
+**Linux host crash under concurrent introspection — root cause found and fixed.** Round-4 builds
+lost the Linux/WebKitGTK host in ~25–50% of CI stress runs (the E2E sequence repeated against fresh
+apps; glibc `corrupted double-linked list` / `unaligned fastbin chunk`), against 0 in 104 runs for
+0.8.8 and every pre-round-4 build. The cause is below Victauri but Victauri triggered it: on Linux
+every Tauri handle (`AppHandle`, `Webview`, `WebviewWindow`) carries tauri-runtime-wry's `Context`,
+which holds the main-thread context by value — including tao's event-loop target and its
+`Rc<RefCell<HashSet<WindowId>>>` — behind an `unsafe impl Send + Sync` whose contract is "main
+thread only". Cloning or dropping any handle therefore bumps a non-atomic refcount that the main
+thread bumps constantly. Victauri did that on every tool call: the main-thread dispatcher cloned the
+`AppHandle` on the calling thread, and the eval callback (hit by every eval, drain tick and
+snapshot) was an async command, which Tauri runs — extracting and dropping its `Webview` — on a
+tokio worker. Proven with Victauri absent (a bare Tauri app running the same load in-process):
+background threads that only clone and drop the `AppHandle` while the page makes IPC calls abort the
+process; 12 threads of `run_on_main_thread` round trips with an off-thread clone aborted 5/5 (5/5
+with an empty closure, 3/5 with no IPC at all); the same load with the handle taken on the main
+thread ran 10/10 clean. Now the dispatcher's closure uses a handle owned by the main thread (the
+caller only borrows the `AppHandle` to post it, which does not clone), and the eval callback plus
+every other page-callable command that never waits are synchronous commands, which Tauri runs on the
+main thread. Every bisect, allocator, sanitizer and SQLite experiment run on the way (listed in the
+round-4 report) pointed at timing because a refcount race IS timing: it explains why the 0.8.8 lock
+reduced the crash, why round-4's extra waits made it worse, and why identical code crashed or passed
+depending on the build. **Residual (upstream):** `victauri_eval_js` / `victauri_dom_snapshot` (page
+API, opt-in) must stay async, and an app's own async commands and background `AppHandle` clones go
+through the same Tauri path — reportable to Tauri/tao.
 
 **Disproved in round 4** (tested, not defects): eval ids leaking via `.caller` (V8 blocks the
 second hop); `PRAGMA quick_check` overrunning its deadline on a 1.47 GB database (3.8 s); discovery

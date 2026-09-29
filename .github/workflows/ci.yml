@@ -636,6 +636,46 @@ jobs:
         env:
           VICTAURI_E2E: "1"
 
+      # One run of the suite is a weak detector for a host crash that depends on timing: the
+      # 0.9.0 Linux heap corruption (a Tauri handle cloned/dropped off the main thread) killed the
+      # host in only ~25-50% of runs and hid behind nine green single runs. So on Linux the
+      # heap-sensitive tests run again against three FRESH apps, and any dead host fails the job.
+      - name: Heap-safety repeats against fresh apps (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VICTAURI_E2E: "1"
+        run: |
+          # The suite's app is stopped on purpose here; clear APP_PID so the failure step below
+          # does not report it as a host that died.
+          if [ -n "$APP_PID" ]; then kill "$APP_PID" 2>/dev/null || true; fi
+          echo "APP_PID=" >> "$GITHUB_ENV"
+          sleep 1
+          deaths=0
+          for i in 1 2 3; do
+            xvfb-run -a ./target/debug/demo-app >/tmp/repeat-$i.out 2>/tmp/repeat-$i.err &
+            pid=$!
+            for t in $(seq 1 60); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7373/health || true)
+              case "$code" in 2??|429) break ;; esac
+              sleep 1
+            done
+            cargo test -q -p demo-app --test integration -- --test-threads=1 --exact \
+              concurrent_window_introspection_is_heap_safe \
+              webview_access_main_thread_safe_under_ipc_load \
+              webview_reload_during_introspection_is_safe || true
+            sleep 2
+            if ! pgrep -x demo-app >/dev/null || grep -qE 'malloc|corrupted|double free|unaligned|free\(\)' /tmp/repeat-$i.err /tmp/repeat-$i.out; then
+              deaths=$((deaths + 1))
+              echo "::error::repeat $i: the demo-app host died"
+              tail -n 40 /tmp/repeat-$i.err /tmp/repeat-$i.out
+            fi
+            pkill -x demo-app || true
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+          done
+          echo "host deaths: $deaths/3"
+          test "$deaths" -eq 0
+
       # Only on failure, and only where we captured it. If the host died, its own output names
       # the cause; without this the log shows nothing but "connection refused".
       - name: Show demo app output on failure (Unix)

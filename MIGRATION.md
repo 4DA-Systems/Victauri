@@ -126,6 +126,14 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
 - `introspect command_timings` has an additive `saturated` flag; `ContractStore::record` returns the
   command of a baseline it evicted (`Option<String>`); faults, contract baselines and page-load
   records are capped (256 / 1024 / 256).
+- Victauri's page-callable Tauri commands `victauri_eval_callback`, `victauri_get_window_state`,
+  `victauri_list_windows`, `victauri_get_ipc_log`, `victauri_get_registry`,
+  `victauri_get_memory_stats`, `victauri_verify_state`, `victauri_detect_ghost_commands` and
+  `victauri_check_ipc_integrity` are now synchronous, so Tauri runs them on the main thread (the
+  page still gets a promise; nothing to change). This keeps Tauri handles on the main thread —
+  cloning or dropping one elsewhere corrupted the heap on Linux (see CHANGELOG). If your own app
+  clones an `AppHandle` / window / webview on background threads on Linux, the same Tauri race
+  applies to it.
 - New in `victauri-test`: `invoke_command_with_timeout`, `discover_app`, the `terminal` sanitizer
   module and `health_status_means_alive`.
 - The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
