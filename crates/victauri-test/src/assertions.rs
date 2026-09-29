@@ -127,7 +127,17 @@ impl VerifyReport {
             .failures()
             .iter()
             .enumerate()
-            .map(|(i, f)| format!("  {}. {} — {}", i + 1, f.description, f.detail))
+            // Descriptions and details can carry page text (console errors, DOM text, state
+            // values): render each single-line so it cannot drive the terminal or start a
+            // `::error` workflow command in a CI log (R5-TERM2, as the smoke summary does).
+            .map(|(i, f)| {
+                format!(
+                    "  {}. {} — {}",
+                    i + 1,
+                    crate::terminal::single_line(&f.description),
+                    crate::terminal::single_line(&f.detail)
+                )
+            })
             .collect();
         panic!(
             "verify() failed ({}/{} checks passed):\n{}",
@@ -575,12 +585,13 @@ fn console_log_errors(log: &Value) -> Vec<String> {
         .filter_map(|entry| {
             let level = entry.get("level").and_then(Value::as_str).unwrap_or("");
             if level == "error" {
+                // Page-controlled: neutralize before it lands in a check detail that is printed,
+                // joined with "; " and put into panics (R5-TERM2).
                 let msg = entry
                     .get("message")
                     .and_then(Value::as_str)
-                    .unwrap_or("(no message)")
-                    .to_string();
-                Some(msg)
+                    .unwrap_or("(no message)");
+                Some(crate::terminal::single_line(msg))
             } else {
                 None
             }
@@ -763,6 +774,52 @@ mod tests {
         assert_eq!(errors.len(), 2);
         assert_eq!(errors[0], "something broke");
         assert_eq!(errors[1], "another error");
+    }
+
+    /// R5-TERM2: console.error text is page-controlled. It must not carry control
+    /// characters / ANSI escapes, or a newline that starts a `::error` GitHub workflow
+    /// command, into the check detail — which is printed and put into panics.
+    #[test]
+    fn console_errors_are_neutralized_for_terminals() {
+        let log = json!([
+            {"level": "error", "message": "boom\n::error file=src/main.rs::forged\u{1b}[2J\u{202e}"}
+        ]);
+        let errors = console_log_errors(&log);
+        assert_eq!(errors.len(), 1);
+        let e = &errors[0];
+        assert!(!e.chars().any(char::is_control), "{e:?}");
+        assert!(!e.contains('\u{202e}'), "{e:?}");
+        assert!(
+            e.contains("boom") && e.contains("forged"),
+            "text is kept visibly: {e}"
+        );
+    }
+
+    /// R5-TERM2: `assert_all_passed` panics with check details, which may carry page text
+    /// from any check — render them single-line, like the smoke summary (R4-TERM1).
+    #[test]
+    fn assert_all_passed_panic_message_is_terminal_safe() {
+        let report = VerifyReport {
+            results: vec![CheckResult {
+                description: "desc\u{1b}[31m".into(),
+                passed: false,
+                detail: "page said\n::warning::forged\r\u{7}".into(),
+            }],
+        };
+        let payload = std::panic::catch_unwind(|| report.assert_all_passed()).unwrap_err();
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(msg.starts_with("verify() failed"), "{msg}");
+        assert!(
+            !msg.contains('\u{1b}') && !msg.contains('\r') && !msg.contains('\u{7}'),
+            "{msg:?}"
+        );
+        assert!(
+            !msg.lines().any(|l| l.trim_start().starts_with("::")),
+            "no line may start a workflow command: {msg:?}"
+        );
     }
 
     #[test]
