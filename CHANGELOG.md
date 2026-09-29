@@ -110,7 +110,12 @@ contract and page-load maps are capped; panicked background tasks are reported f
 capture runs on one COM thread with a bounded wait; `Locator::check()` works on ARIA checkboxes;
 `victauri check` lists ghost names; `recording stop` flushes every window first (events captured since the last 1 s drain tick were dropped; a window that cannot answer within 3 s is reported in `final_flush_unreachable`); a request the guards refuse (401/403/415/429) closes its
 connection, so refused requests (a web page's no-cors fetches, a local script) cannot park the
-256 connection slots; GitHub Release notes are the version's CHANGELOG section (not raw commit
+256 request slots, and a connection takes a request slot only once it has sent its first byte —
+a connection that sends nothing (a page's `<link rel=preconnect>` across `*.localhost` names
+never reaches a guard; measured in Edge: ~370 held, agent `/health` probes failing 17/30) waits
+in a separate pool of 1,024 and is closed after 3 s instead of holding a slot for the 30 s header
+deadline (round 5). Residual: a local process can still fill the 256 slots with started-but-stalled
+request heads until the header deadline (slow-loris is bounded, not prevented); GitHub Release notes are the version's CHANGELOG section (not raw commit
 subjects) and the binaries ship with `SHA256SUMS`; tool-reference, MIGRATION, README and security
 docs corrections.
 

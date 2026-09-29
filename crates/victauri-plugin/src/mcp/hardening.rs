@@ -28,12 +28,18 @@ pub struct ServeLimits {
     pub max_connections: usize,
     /// A connection that has not delivered a complete request head within this is closed.
     pub header_read_timeout: Duration,
+    /// Accepted connections that have not yet sent a byte (or wait for a request slot).
+    pub max_pending: usize,
+    /// A connection that sends nothing within this is closed.
+    pub first_byte_timeout: Duration,
 }
 
 impl ServeLimits {
     pub const DEFAULT: Self = Self {
         max_connections: 256,
         header_read_timeout: Duration::from_secs(30),
+        max_pending: 1024,
+        first_byte_timeout: Duration::from_secs(3),
     };
 }
 
@@ -44,7 +50,9 @@ const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 ///
 /// Replaces `axum::serve`, which builds hyper with no timer (so no header-read timeout: a
 /// client trickling header bytes held its connection forever) and accepts connections without
-/// limit (slow-loris clients exhausted file descriptors).
+/// limit (slow-loris clients exhausted file descriptors). A connection holds a request slot only
+/// once it has sent a byte; before that it holds a slot of the larger pending pool, for at most
+/// `first_byte_timeout`.
 pub async fn serve_hardened<F>(
     listener: tokio::net::TcpListener,
     app: axum::Router,
@@ -55,14 +63,20 @@ pub async fn serve_hardened<F>(
 {
     use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 
+    // Two pools. A connection is accepted into `pending` (bounding file descriptors) and only
+    // takes one of the `slots` once it has sent its first byte. A connection that never sends
+    // anything (a browser's speculative `<link rel=preconnect>`, which no request guard ever
+    // sees) is closed at the short first-byte deadline and never holds a request slot; it used to
+    // hold one for the whole header deadline, and a page could park every slot that way.
     let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let pending = Arc::new(Semaphore::new(limits.max_pending));
     let (signal_tx, _) = watch::channel(false);
     let (close_tx, close_rx) = watch::channel(());
     tokio::pin!(shutdown);
 
     loop {
-        let permit = tokio::select! {
-            permit = Arc::clone(&slots).acquire_owned() => match permit {
+        let pending_permit = tokio::select! {
+            permit = Arc::clone(&pending).acquire_owned() => match permit {
                 Ok(permit) => permit,
                 Err(_closed) => break,
             },
@@ -83,8 +97,18 @@ pub async fn serve_hardened<F>(
         let service = hyper_util::service::TowerToHyperService::new(app.clone());
         let mut signal_rx = signal_tx.subscribe();
         let close_rx = close_rx.clone();
+        let slots = Arc::clone(&slots);
         tokio::spawn(async move {
-            let _permit = permit;
+            // Until the first byte, a slot, or shutdown — whichever comes first.
+            let admitted = tokio::select! {
+                permit = admit(&stream, &slots, limits.first_byte_timeout) => permit,
+                _ = signal_rx.changed() => None,
+            };
+            drop(pending_permit);
+            let Some(_permit) = admitted else {
+                drop(close_rx);
+                return;
+            };
             // HTTP/1 only, and no protocol sniffing: the auto builder's HTTP/2-preface
             // detection runs before hyper's header timer starts, so a client that connects and
             // sends nothing sat there untimed.
@@ -121,6 +145,20 @@ pub async fn serve_hardened<F>(
     signal_tx.send_replace(true);
     drop(close_rx);
     close_tx.closed().await;
+}
+
+/// Wait for `stream`'s first byte (at most `first_byte_timeout`), then for a request slot.
+/// `None` closes the connection: it sent nothing in time, hung up, or the pool is closed.
+async fn admit(
+    stream: &tokio::net::TcpStream,
+    slots: &Arc<Semaphore>,
+    first_byte_timeout: Duration,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let mut probe = [0u8; 1];
+    match tokio::time::timeout(first_byte_timeout, stream.peek(&mut probe)).await {
+        Ok(Ok(n)) if n > 0 => Arc::clone(slots).acquire_owned().await.ok(),
+        _ => None,
+    }
 }
 
 /// Read the whole request body under [`BODY_READ_TIMEOUT`] and [`MAX_REQUEST_BODY_BYTES`]
@@ -245,12 +283,22 @@ mod tests {
         out
     }
 
+    /// Limits for tests: generous pending pool and first-byte deadline unless a test is about them.
+    fn limits(max_connections: usize, header_read_timeout: Duration) -> ServeLimits {
+        ServeLimits {
+            max_connections,
+            header_read_timeout,
+            max_pending: 64,
+            first_byte_timeout: Duration::from_secs(10),
+        }
+    }
+
     /// Audit N4: a client trickling its request head was never timed out.
     #[tokio::test]
     async fn a_stalled_request_head_is_closed_at_the_header_deadline() {
         let addr = spawn_server(ServeLimits {
-            max_connections: 8,
-            header_read_timeout: Duration::from_millis(300),
+            first_byte_timeout: Duration::from_millis(300),
+            ..limits(8, Duration::from_millis(300))
         })
         .await;
         let started = Instant::now();
@@ -278,12 +326,10 @@ mod tests {
     /// Audit N4: connections are capped; a waiting client is served once a slot frees up.
     #[tokio::test]
     async fn connections_beyond_the_cap_wait_for_a_free_slot() {
-        let addr = spawn_server(ServeLimits {
-            max_connections: 1,
-            header_read_timeout: Duration::from_millis(400),
-        })
-        .await;
-        let _hog = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let addr = spawn_server(limits(1, Duration::from_millis(400))).await;
+        // A client that has started a request (and stalls in its head) holds the only slot.
+        let mut hog = tokio::net::TcpStream::connect(addr).await.unwrap();
+        hog.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
         let started = Instant::now();
         let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -296,6 +342,113 @@ mod tests {
         assert!(
             started.elapsed() >= Duration::from_millis(250),
             "served before the only slot was released ({:?})",
+            started.elapsed()
+        );
+    }
+
+    /// R5-NET1: connections that never send a byte (a page's `<link rel=preconnect>` across
+    /// `*.localhost` names — no request, so no guard ever runs) each held a request slot for the
+    /// full header deadline, locking the agent out. They must not hold request slots.
+    #[tokio::test]
+    async fn silent_connections_do_not_block_a_real_request() {
+        let addr = spawn_server(limits(2, Duration::from_secs(10))).await;
+        let mut silent = Vec::new();
+        for _ in 0..20 {
+            silent.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            read_to_close(&mut client, Duration::from_secs(5)),
+        )
+        .await
+        .expect("a real request must be served while silent connections are open");
+        assert!(String::from_utf8_lossy(&reply).contains("200 OK"));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        drop(silent);
+    }
+
+    /// R5-NET1: a connection that sends nothing is closed at the (short) first-byte deadline,
+    /// not the 30 s header deadline.
+    #[tokio::test]
+    async fn a_silent_connection_is_closed_at_the_first_byte_deadline() {
+        let addr = spawn_server(ServeLimits {
+            first_byte_timeout: Duration::from_millis(300),
+            ..limits(8, Duration::from_secs(30))
+        })
+        .await;
+        let started = Instant::now();
+        let mut silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let reply = read_to_close(&mut silent, Duration::from_secs(5)).await;
+        assert!(reply.is_empty(), "{}", String::from_utf8_lossy(&reply));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Graceful shutdown does not wait for connections that never sent a byte.
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_silent_connections() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "ok" }));
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve_hardened(
+            listener,
+            app,
+            limits(2, Duration::from_secs(30)),
+            async move {
+                let _ = stop_rx.await;
+            },
+        ));
+        let mut _silent = Vec::new();
+        for _ in 0..5 {
+            _silent.push(tokio::net::TcpStream::connect(addr).await.unwrap());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = stop_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("shutdown must not wait for silent connections")
+            .unwrap();
+    }
+
+    /// R5-NET1: silent connections are still bounded (file descriptors): beyond `max_pending`
+    /// a new connection waits in the backlog until the first-byte deadline reaps one.
+    #[tokio::test]
+    async fn silent_connections_are_bounded_by_the_pending_pool() {
+        let addr = spawn_server(ServeLimits {
+            max_pending: 2,
+            first_byte_timeout: Duration::from_millis(400),
+            ..limits(8, Duration::from_secs(30))
+        })
+        .await;
+        let _silent_a = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _silent_b = tokio::net::TcpStream::connect(addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let started = Instant::now();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let reply = read_to_close(&mut client, Duration::from_secs(5)).await;
+        assert!(String::from_utf8_lossy(&reply).contains("200 OK"));
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "accepted beyond the pending pool ({:?})",
             started.elapsed()
         );
     }
@@ -409,10 +562,7 @@ mod tests {
         tokio::spawn(serve_hardened(
             listener,
             test_app(Arc::new(RateLimiterState::new(100))),
-            ServeLimits {
-                max_connections: 8,
-                header_read_timeout: Duration::from_secs(30),
-            },
+            limits(8, Duration::from_secs(30)),
             std::future::pending::<()>(),
         ));
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
