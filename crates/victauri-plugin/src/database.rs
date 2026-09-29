@@ -176,12 +176,14 @@ const MAX_DB_HEALTH_CELL_BYTES: i32 = 1_048_576;
 /// The database file is treated as untrusted input: the connection is opened read-only with
 /// `trusted_schema=OFF` and `SQLite`'s defensive mode, and virtual tables are listed but never
 /// counted (counting one runs its module's code). That does not keep virtual-table module code
-/// out of the call entirely: `quick_check` connects every virtual table whose module is
-/// registered and (`SQLite` >= 3.44) runs its `xIntegrity` check. Victauri registers no module on
-/// this connection, so that is `SQLite`'s built-ins (FTS3/4/5, R-Tree) plus anything the host
-/// process installed as an auto-extension. Verified on
-/// 3.46: a corrupted FTS5 index reports `malformed inverted index for FTS5 table …`, and a
-/// broken one fails `quick_check` with `vtable constructor failed`.
+/// out of the call by itself: a whole-database `quick_check` connects every virtual table whose
+/// module is registered and (`SQLite` >= 3.44) runs its `xIntegrity` check. Victauri registers no
+/// module on this connection, so that is `SQLite`'s built-ins (FTS3/4/5, R-Tree — checked: on
+/// 3.46 a corrupted FTS5 index reports `malformed inverted index for FTS5 table …`) plus
+/// anything the host process installed as an auto-extension. So when the host registered a
+/// non-built-in module and the file has virtual tables, the check runs per ordinary table
+/// instead (`integrity_check_kind: "quick_check (per table)"`, with the reason in
+/// `integrity_check_note`) and no module code runs.
 #[cfg(feature = "sqlite")]
 pub(crate) fn db_health_report(
     path: &str,
@@ -273,6 +275,15 @@ pub(crate) fn db_health_report(
     #[allow(clippy::cast_precision_loss)]
     let db_size_mb = page_count.saturating_mul(page_size) as f64 / (1024.0 * 1024.0);
 
+    // Needed by phase 2 (the loop below consumes `names`).
+    let ordinary_tables: Vec<String> = names
+        .iter()
+        .filter(|(_, kind)| *kind == TableKind::Ordinary)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let may_hold_virtual_tables =
+        tables_truncated || names.iter().any(|(_, kind)| *kind != TableKind::Ordinary);
+
     // Phase 1: per-table row counts under a shared count budget.
     let counts_started = Instant::now();
     let mut budget_exhausted = false;
@@ -312,18 +323,66 @@ pub(crate) fn db_health_report(
         tables.push(entry);
     }
 
-    // Phase 2: integrity, on its own budget.
-    let integrity = match run_bounded(&conn, check_budget, |c| {
-        c.pragma_query_value(None, "quick_check", |r| r.get::<_, String>(0))
-    }) {
-        Bounded::Done(s) => s,
-        Bounded::TimedOut => format!(
-            "not completed: quick_check exceeded its {} ms budget on a {:.0} MB database \
-             (a full-file scan; the result is unknown, not failed)",
-            check_budget.as_millis(),
-            db_size_mb
-        ),
-        Bounded::Failed(e) => format!("failed: {e}"),
+    // Phase 2: integrity, on its own budget. A whole-database `quick_check` connects every
+    // virtual table whose module is registered and (SQLite >= 3.44) runs the module's integrity
+    // routine. SQLite's own modules are fine; a module the HOST registered process-wide (an
+    // auto-extension) is arbitrary code. With such a module registered and virtual tables in
+    // the file, check the ordinary tables one by one (`PRAGMA quick_check(<table>)`), which
+    // connects no virtual table.
+    let per_table_reason = if may_hold_virtual_tables {
+        match foreign_vtab_modules(&conn) {
+            Ok(modules) if modules.is_empty() => None,
+            Ok(modules) => Some(format!(
+                "the database has virtual tables and the host registered non-built-in \
+                 virtual-table module(s) {}",
+                modules.join(", ")
+            )),
+            Err(e) => Some(format!(
+                "the database has virtual tables and the registered virtual-table modules could \
+                 not be listed ({e})"
+            )),
+        }
+    } else {
+        None
+    };
+    let (integrity, integrity_kind, integrity_note) = match per_table_reason {
+        None => {
+            let integrity = match run_bounded(&conn, check_budget, |c| {
+                c.pragma_query_value(None, "quick_check", |r| r.get::<_, String>(0))
+            }) {
+                Bounded::Done(s) => s,
+                Bounded::TimedOut => format!(
+                    "not completed: quick_check exceeded its {} ms budget on a {:.0} MB database \
+                     (a full-file scan; the result is unknown, not failed)",
+                    check_budget.as_millis(),
+                    db_size_mb
+                ),
+                Bounded::Failed(e) => format!("failed: {e}"),
+            };
+            (integrity, "quick_check", None)
+        }
+        Some(reason) => {
+            let integrity = match run_bounded(&conn, check_budget, |c| {
+                quick_check_tables(c, &ordinary_tables)
+            }) {
+                Bounded::Done(problems) if problems.is_empty() => "ok".to_string(),
+                Bounded::Done(problems) => problems.join("\n"),
+                Bounded::TimedOut => format!(
+                    "not completed: the per-table quick_check exceeded its {} ms budget on a \
+                     {:.0} MB database (the result is unknown, not failed)",
+                    check_budget.as_millis(),
+                    db_size_mb
+                ),
+                Bounded::Failed(e) => format!("failed: {e}"),
+            };
+            let note = format!(
+                "{reason}: checked the {} ordinary table(s) one by one instead of the whole \
+                 database, so no virtual-table module code ran. Virtual tables and \
+                 database-wide structures (the free list) were not checked.",
+                ordinary_tables.len()
+            );
+            (integrity, "quick_check (per table)", Some(note))
+        }
     };
 
     Ok(serde_json::json!({
@@ -335,7 +394,8 @@ pub(crate) fn db_health_report(
         "freelist_count": freelist_count,
         "wal_checkpoint": wal_checkpoint,
         "integrity_check": integrity,
-        "integrity_check_kind": "quick_check",
+        "integrity_check_kind": integrity_kind,
+        "integrity_check_note": integrity_note,
         "tables": tables,
         "tables_truncated": tables_truncated,
         // Every listed table has a row count (false if the budget ran out, a count failed, or a
@@ -343,6 +403,79 @@ pub(crate) fn db_health_report(
         "row_counts_complete": all_counted,
         "row_count_budget_exhausted": budget_exhausted,
     }))
+}
+
+/// Virtual-table modules that are part of `SQLite` itself (compiled-in extensions and the
+/// eponymous introspection tables). Anything else registered on a connection came from the
+/// host process.
+#[cfg(feature = "sqlite")]
+static SQLITE_BUILTIN_VTAB_MODULES: &[&str] = &[
+    "fts3",
+    "fts3tokenize",
+    "fts4",
+    "fts4aux",
+    "fts5",
+    "fts5vocab",
+    "rtree",
+    "rtree_i32",
+    "geopoly",
+    "dbstat",
+    "sqlite_dbpage",
+    "sqlite_dbdata",
+    "sqlite_dbptr",
+    "sqlite_stmt",
+    "json_each",
+    "json_tree",
+    "jsonb_each",
+    "jsonb_tree",
+    "carray",
+    "generate_series",
+    "bytecode",
+    "tables_used",
+    "completion",
+];
+
+/// Most problems reported by a per-table `quick_check`.
+#[cfg(feature = "sqlite")]
+const MAX_INTEGRITY_PROBLEMS: usize = 100;
+
+/// The virtual-table modules registered on `conn` that are not part of `SQLite`.
+#[cfg(feature = "sqlite")]
+fn foreign_vtab_modules(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM pragma_module_list ORDER BY name")?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names
+        .into_iter()
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !lower.starts_with("pragma_") && !SQLITE_BUILTIN_VTAB_MODULES.contains(&lower.as_str())
+        })
+        .collect())
+}
+
+/// `PRAGMA quick_check(<table>)` for each of `tables` (ordinary tables only: checking one
+/// connects no virtual table). Returns the problems found (empty = ok), at most
+/// [`MAX_INTEGRITY_PROBLEMS`].
+#[cfg(feature = "sqlite")]
+fn quick_check_tables(
+    conn: &rusqlite::Connection,
+    tables: &[String],
+) -> rusqlite::Result<Vec<String>> {
+    let mut problems = Vec::new();
+    for table in tables {
+        let sql = format!("PRAGMA quick_check({})", quote_sqlite_identifier(table));
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let line: String = row.get(0)?;
+            if line != "ok" && problems.len() < MAX_INTEGRITY_PROBLEMS {
+                problems.push(line);
+            }
+        }
+    }
+    Ok(problems)
 }
 
 /// How [`db_health_report`] treats a `sqlite_master` table entry.
@@ -1904,6 +2037,153 @@ mod tests {
             };
             assert!(known, "function `{name}` (builtin={builtin}) is not listed");
         }
+    }
+
+    /// Register a virtual-table module named `name` on `conn` (as a host's
+    /// `sqlite3_auto_extension` would) whose constructor only counts how often it ran and fails.
+    #[allow(unsafe_code)]
+    fn register_counting_module(
+        conn: &rusqlite::Connection,
+        name: &str,
+        connects: &'static std::sync::atomic::AtomicUsize,
+    ) {
+        use rusqlite::ffi;
+        use std::os::raw::{c_char, c_int, c_void};
+        unsafe extern "C" fn construct(
+            _db: *mut ffi::sqlite3,
+            aux: *mut c_void,
+            _argc: c_int,
+            _argv: *const *const c_char,
+            _vtab: *mut *mut ffi::sqlite3_vtab,
+            _err: *mut *mut c_char,
+        ) -> c_int {
+            // SAFETY: `aux` is the `&'static AtomicUsize` passed as client data below.
+            let counter = unsafe { &*aux.cast::<std::sync::atomic::AtomicUsize>() };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            ffi::SQLITE_ERROR
+        }
+        // SAFETY: an all-zero `sqlite3_module` is valid (version 0, every method absent).
+        let mut module: ffi::sqlite3_module = unsafe { std::mem::zeroed() };
+        module.xCreate = Some(construct);
+        module.xConnect = Some(construct);
+        let module: &'static ffi::sqlite3_module = Box::leak(Box::new(module));
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: a valid connection handle, a NUL-terminated name, a module that outlives the
+        // connection (leaked) and client data that is `'static`; no destructor.
+        let rc = unsafe {
+            ffi::sqlite3_create_module_v2(
+                conn.handle(),
+                name.as_ptr(),
+                module,
+                std::ptr::from_ref(connects).cast_mut().cast(),
+                None,
+            )
+        };
+        assert_eq!(rc, ffi::SQLITE_OK);
+    }
+
+    /// Plant `CREATE VIRTUAL TABLE <table> USING <module>(x)` in the schema without the module
+    /// being present (`writable_schema`), as a crafted database file can.
+    fn plant_virtual_table(path: &Path, table: &str, module: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch("PRAGMA writable_schema=ON;").unwrap();
+        conn.execute(
+            "INSERT INTO sqlite_master (type, name, tbl_name, rootpage, sql) \
+             VALUES ('table', ?1, ?1, 0, ?2)",
+            [
+                table.to_string(),
+                format!("CREATE VIRTUAL TABLE {table} USING {module}(x)"),
+            ],
+        )
+        .unwrap();
+    }
+
+    /// R5B-QC1: on `SQLite` >= 3.44 a whole-database `quick_check` connects every virtual
+    /// table whose module is registered and runs its integrity routine — module code, including
+    /// a module the HOST registered process-wide. With such a module registered and a virtual
+    /// table using it in the file, `db_health` must check the ordinary tables one by one instead,
+    /// so no module code runs.
+    #[test]
+    fn db_health_never_runs_a_host_registered_module() {
+        static CONNECTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let (_f, path) = create_test_db();
+        plant_virtual_table(&path, "planted", "victauri_marker");
+        let long = Duration::from_secs(10);
+        let r = with_open_hook(
+            |c| register_counting_module(c, "victauri_marker", &CONNECTS),
+            || db_health_report(path.to_str().unwrap(), long, long).unwrap(),
+        );
+        assert_eq!(
+            CONNECTS.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the module's constructor ran: {r}"
+        );
+        assert_eq!(r["integrity_check"], "ok", "{r}");
+        assert_eq!(r["integrity_check_kind"], "quick_check (per table)", "{r}");
+        let note = r["integrity_check_note"].as_str().unwrap_or_default();
+        assert!(note.contains("victauri_marker"), "{r}");
+        let planted = r["tables"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "planted")
+            .expect("the planted table is listed");
+        assert!(planted["row_count"].is_null(), "{planted}");
+    }
+
+    /// Per-table checking still finds corruption in an ordinary table.
+    #[test]
+    fn db_health_per_table_check_still_reports_problems() {
+        static CONNECTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let path = file.path().to_path_buf();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'c');",
+            )
+            .unwrap();
+            // Declare a NOT NULL the stored rows violate (quick_check verifies NOT NULL).
+            conn.execute_batch(
+                "PRAGMA writable_schema=ON;
+                 UPDATE sqlite_master SET sql = 'CREATE TABLE t (id INTEGER PRIMARY KEY,                  v TEXT NOT NULL)' WHERE name = 't';",
+            )
+            .unwrap();
+        }
+        plant_virtual_table(&path, "planted", "victauri_marker2");
+        let long = Duration::from_secs(10);
+        let r = with_open_hook(
+            |c| register_counting_module(c, "victauri_marker2", &CONNECTS),
+            || db_health_report(path.to_str().unwrap(), long, long).unwrap(),
+        );
+        assert_eq!(CONNECTS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(r["integrity_check_kind"], "quick_check (per table)", "{r}");
+        let integrity = r["integrity_check"].as_str().unwrap();
+        assert!(integrity.contains("NULL value in t.v"), "{r}");
+    }
+
+    /// Without a host-registered module the whole database is still checked, `SQLite`'s own
+    /// virtual tables included (an FTS5 table), and a virtual table whose module is not loaded
+    /// is simply not connected.
+    #[test]
+    fn db_health_checks_the_whole_database_when_only_builtin_modules_exist() {
+        let (_f, path) = create_test_db();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        if conn
+            .execute_batch(
+                "CREATE VIRTUAL TABLE docs USING fts5(body); INSERT INTO docs VALUES ('x');",
+            )
+            .is_err()
+        {
+            return; // this SQLite build has no FTS5
+        }
+        drop(conn);
+        plant_virtual_table(&path, "unknown_vtab", "not_a_loaded_module");
+        let long = Duration::from_secs(10);
+        let r = db_health_report(path.to_str().unwrap(), long, long).unwrap();
+        assert_eq!(r["integrity_check"], "ok", "{r}");
+        assert_eq!(r["integrity_check_kind"], "quick_check", "{r}");
     }
 
     #[test]
