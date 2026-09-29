@@ -423,6 +423,18 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
 - Surface Audit workflow had false-failed every week since July (crates.io 403s without a
   User-Agent); docs install pins, action refs and tool counts corrected.
 
+### Round 5 — pre-publish audit
+
+- **Breaking (permissions): `victauri:default` no longer grants `allow-victauri-eval-js` or
+  `allow-victauri-dom-snapshot`.** They were in the default set although this entry describes them
+  as "page API, opt-in". They are the only async Victauri commands left — on Linux an async
+  command's argument extraction and resolver clone and drop Tauri handles on a tokio worker (the
+  host heap-corruption class fixed above), so any page script in an app using `victauri:default`
+  could drive that path in a loop — and `victauri_eval_js` is an eval reachable by page script
+  regardless of the app's CSP. Nothing in Victauri calls them (the bridge and every tool use only
+  `victauri_eval_callback`). The individual `allow-`/`deny-` permissions remain, so an app can opt
+  back in; see MIGRATION.md.
+
 ## [0.8.8] - 2026-08-12
 
 The MCP-infrastructure release: the embedded server jumps two SDK major versions

@@ -134,6 +134,21 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   cloning or dropping one elsewhere corrupted the heap on Linux (see CHANGELOG). If your own app
   clones an `AppHandle` / window / webview on background threads on Linux, the same Tauri race
   applies to it.
+- **`victauri:default` no longer grants `victauri_eval_js` / `victauri_dom_snapshot`.** These two
+  page-callable Tauri commands are the only async Victauri commands left (Tauri runs an async
+  command's argument extraction on a tokio worker, the Linux handle race above), and
+  `victauri_eval_js` is a CSP-independent eval that any page script could call. Nothing in Victauri
+  uses them — the MCP/REST tools and the injected bridge only need `victauri_eval_callback`, which
+  stays in the default set — so almost every app needs no change. If your own frontend code calls
+  them, grant them explicitly next to `victauri:default` in that window's capability file:
+
+  ```json
+  "permissions": [
+    "victauri:default",
+    "victauri:allow-victauri-eval-js",
+    "victauri:allow-victauri-dom-snapshot"
+  ]
+  ```
 - New in `victauri-test`: `invoke_command_with_timeout`, `discover_app`, the `terminal` sanitizer
   module and `health_status_means_alive`.
 - The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
