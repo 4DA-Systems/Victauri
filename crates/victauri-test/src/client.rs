@@ -1651,7 +1651,7 @@ impl VictauriClient {
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to get_ipc_calls_since")]
-    pub async fn ipc_calls_since(&mut self, checkpoint: usize) -> Result<Vec<Value>, TestError> {
+    pub async fn ipc_calls_since(&mut self, checkpoint: u64) -> Result<Vec<Value>, TestError> {
         // Timestamp filter, NOT positional skip: the server's log tools return a
         // capped sliding window of the NEWEST entries (default 100), so
         // `skip(checkpoint_length)` silently yields nothing the moment a busy app
@@ -1663,7 +1663,7 @@ impl VictauriClient {
             .filter(|e| {
                 e.get("timestamp")
                     .and_then(Value::as_u64)
-                    .map_or(checkpoint == 0, |t| t > checkpoint as u64)
+                    .map_or(checkpoint == 0, |t| t > checkpoint)
             })
             .collect())
     }
@@ -1697,10 +1697,7 @@ impl VictauriClient {
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn get_ipc_calls_since(
-        &mut self,
-        checkpoint: usize,
-    ) -> Result<Vec<Value>, TestError> {
+    pub async fn get_ipc_calls_since(&mut self, checkpoint: u64) -> Result<Vec<Value>, TestError> {
         #[allow(deprecated)]
         self.ipc_calls_since(checkpoint).await
     }
@@ -1743,14 +1740,14 @@ impl VictauriClient {
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to create_ipc_checkpoint")]
-    pub async fn ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+    pub async fn ipc_checkpoint(&mut self) -> Result<u64, TestError> {
         self.create_ipc_checkpoint().await
     }
 
     /// Snapshot the newest IPC-log timestamp, for use with `ipc_calls_since`.
     ///
-    /// Returns the maximum entry `timestamp` (epoch milliseconds) currently
-    /// visible in the IPC log, or `0` when the log is empty. Pass this value to
+    /// Returns the maximum entry `timestamp` (epoch milliseconds, a `u64` — epoch ms do not
+    /// fit a 32-bit `usize`) currently visible in the IPC log, or `0` when the log is empty. Pass this value to
     /// [`VictauriClient::ipc_calls_since`] to get only the calls that occurred
     /// after the checkpoint. For non-empty logs this method waits until the
     /// local clock has advanced past the checkpoint millisecond before it
@@ -1763,7 +1760,7 @@ impl VictauriClient {
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn create_ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+    pub async fn create_ipc_checkpoint(&mut self) -> Result<u64, TestError> {
         // The checkpoint is the NEWEST entry timestamp (epoch ms), not the log
         // length: the log tools serve a capped sliding window, so a length
         // snapshot breaks (always-empty `calls_since`) once the app has logged
@@ -1775,7 +1772,7 @@ impl VictauriClient {
             .max()
             .unwrap_or(0);
         wait_past_ipc_checkpoint_ms(checkpoint_ms).await;
-        Ok(checkpoint_ms as usize)
+        Ok(checkpoint_ms)
     }
 
     // ── Typed Response Methods (Phase 4E) ────────────────────────────────────
