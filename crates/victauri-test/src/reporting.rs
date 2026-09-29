@@ -143,6 +143,13 @@ fn format_duration(d: Duration) -> String {
     format!("{:.3}", d.as_secs_f64())
 }
 
+/// Escape `s` for an XML 1.0 ATTRIBUTE value (every value this report writes is an attribute).
+///
+/// Characters outside XML 1.0's `Char` production — the C0 controls other than tab/LF/CR
+/// (e.g. the ESC of an ANSI colour code in a console error), U+FFFE and U+FFFF — cannot appear
+/// in an XML 1.0 document at all, not even as character references; one of them made the whole
+/// report unparseable (R5-XML1). They are replaced with U+FFFD. Tab, LF and CR are written as
+/// character references: literally, attribute-value normalization would turn them into spaces.
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -152,6 +159,10 @@ fn xml_escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
+            '\t' => out.push_str("&#9;"),
+            '\n' => out.push_str("&#10;"),
+            '\r' => out.push_str("&#13;"),
+            c if c < '\u{20}' || c == '\u{FFFE}' || c == '\u{FFFF}' => out.push('\u{FFFD}'),
             other => out.push(other),
         }
     }
@@ -235,6 +246,41 @@ mod tests {
         assert!(xml.contains("&amp;"));
         assert!(xml.contains("&quot;"));
         assert!(xml.contains("&apos;"));
+    }
+
+    /// XML 1.0 `Char` production.
+    fn is_xml_char(c: char) -> bool {
+        matches!(c, '\t' | '\n' | '\r' | '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..)
+    }
+
+    /// R5-XML1: page text (console errors, ANSI-coloured output…) carries C0 control
+    /// characters. XML 1.0 forbids them outright, so one ESC made the whole report unparseable
+    /// by CI (Python's parser rejected it). They are replaced; tab/newline/CR survive as
+    /// character references (a literal newline in an attribute is normalized to a space).
+    #[test]
+    fn control_characters_never_reach_the_xml() {
+        let detail = "\u{1b}[31mTypeError\u{1b}[0m: boom\u{0}\u{7}\u{8}\u{b}\u{c}\u{1f}\u{FFFE}\u{FFFF}\nline2\r\tend";
+        let report = VerifyReport {
+            results: vec![fail_result("check \u{1b}name", detail)],
+        };
+        let xml = JunitReport::from_verify_report(&report, "suite\u{2}", Duration::ZERO).to_xml();
+        for c in xml.chars() {
+            assert!(
+                is_xml_char(c),
+                "U+{:04X} is not an XML 1.0 char: {xml:?}",
+                c as u32
+            );
+        }
+        let failure = xml
+            .lines()
+            .find(|l| l.contains("<failure"))
+            .expect("failure element");
+        assert!(failure.contains("TypeError"), "{failure}");
+        assert!(
+            failure.contains("&#10;line2&#13;&#9;end"),
+            "whitespace kept as character references: {failure}"
+        );
+        assert!(!failure.contains('\u{1b}'));
     }
 
     #[test]
