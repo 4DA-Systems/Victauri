@@ -388,12 +388,13 @@ read it, rewrite it or drop it. That means same-window script can:
 
 What it still cannot do:
 
-- **Read the agent key or call agent-only operations.** Clearing logs and network routes and
-  dialog auto-answers are not on the page-visible `window.__VICTAURI__`; they need a per-process
-  key that only the plugin's own injected scripts carry, and the functions that hold it are strict
-  mode so a page hook cannot reach them through `Function.caller`. (The animation `scrub` / `sample`
-  helpers — `scrubPrepare`, `scrubSeek`, `scrubRestore`, `installSweepRecorder`, `readSweep` — are
-  on the public `window.__VICTAURI__` and are **not** behind the key: page script can call them.)
+- **Read the agent key or call agent-only operations.** Clearing logs and network routes,
+  dialog auto-answers, and the animation `scrub` / `sample` helpers (`scrubPrepare`, `scrubSeek`,
+  `scrubRestore`, `installSweepRecorder`, `readSweep` — so page script cannot replace or erase a
+  sweep recording, or pause and seek animations under the agent) are not on the page-visible
+  `window.__VICTAURI__`; they need a per-process key that only the plugin's own injected scripts
+  carry, and the functions that hold it are strict mode so a page hook cannot reach them through
+  `Function.caller`. (`animation list` reads through the public, read-only `listAnimations`.)
 - **Reach other windows or out-of-process state.** Another window's results, and Rust-side tools
   (`query_db`, `app_state`, the registry, memory stats, window state), do not pass through that
   page, so they are unaffected.

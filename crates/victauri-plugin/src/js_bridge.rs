@@ -60,7 +60,7 @@ pub fn init_script(caps: &BridgeCapacities) -> String {
 }
 
 /// Per-process secret that unlocks the bridge's agent-only operations (clearing logs and route
-/// rules, dialog auto-responses). It is embedded in the init script's closure and in the
+/// rules, dialog auto-responses, animation scrub / sweep recording). It is embedded in the init script's closure and in the
 /// scripts Victauri itself injects, never in anything page script can read, so a page cannot
 /// silently remove the agent's block/mock rules or erase captured evidence.
 #[doc(hidden)]
@@ -78,6 +78,20 @@ pub fn agent_key() -> &'static str {
 #[must_use]
 pub fn agent_ops_js() -> String {
     format!("window.__VICTAURI__?._agent(\"{}\")", agent_key())
+}
+
+/// Eval-wrapper code that calls one agent-only bridge operation, `call` (e.g.
+/// `scrubSeek(0.5)`), awaiting a returned promise; an object with `error` when the bridge is
+/// not loaded. Used by the `animation` tool. `pub` only so the jsdom suite can run the real
+/// snippets.
+#[doc(hidden)]
+#[must_use]
+pub fn agent_op_call_js(call: &str) -> String {
+    format!(
+        "return await (function () {{ var o = {}; \
+         return o ? o.{call} : {{ error: 'the Victauri bridge is not loaded in this page' }}; }})()",
+        agent_ops_js()
+    )
 }
 
 // ── Eval scripts ─────────────────────────────────────────────────────────────
@@ -1268,7 +1282,8 @@ const INIT_SCRIPT_BODY: &str = r#"
             return copyEntries(limit ? routeMatchLog.slice(-limit) : routeMatchLog);
         },
 
-        // Agent-only operations (clear logs / route rules, dialog auto-responses) are NOT on
+        // Agent-only operations (clear logs / route rules, dialog auto-responses, animation
+        // scrub / sweep recorder) are NOT on
         // this page-visible object: page script could otherwise silently remove the agent's
         // block/mock rules, erase captured evidence, or flip dialog auto-answers. They are
         // handed out only for the per-process key Victauri embeds in its own injected scripts.
@@ -1979,7 +1994,59 @@ const INIT_SCRIPT_BODY: &str = r#"
                 };
             });
         },
+    };
 
+    try {
+        Object.freeze(window.__VICTAURI__);
+        Object.defineProperty(window, '__VICTAURI__', {
+            value: window.__VICTAURI__,
+            configurable: false,
+            writable: false,
+        });
+    } catch(e) {}
+
+    // Animation scrub / sweep-recorder state. Closure-held, not `window.__VICTAURI_SCRUB__` /
+    // `window.__VICTAURI_SWEEP__` globals, which page script could overwrite to fake the
+    // measured animation curve and jank statistics.
+    var scrubState = null;
+    var sweepState = null;
+
+    // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
+    // every op — and every callback an op creates — is strict: a page hook on a built-in an op
+    // calls then cannot reach the op through `.caller` (and call it without the key), nor the
+    // injected script beyond it whose source carries the key (R4-JS2).
+    var AGENT_OPS = (function() {
+    'use strict';
+    var AGENT_OPS = OBJ_CREATE(null);
+    AGENT_OPS.clearIpcLog = function() {
+        for (var i = networkLog.length - 1; i >= 0; i--) {
+            if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
+        }
+        return { ok: true };
+    };
+    AGENT_OPS.clearNetworkLog = function() { networkLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearConsoleLogs = function() { consoleLogs.length = 0; return { ok: true }; };
+    AGENT_OPS.clearMutationLog = function() { mutationLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearDialogLog = function() { dialogLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearRoute = function(id) {
+        var before = routeRules.length;
+        routeRules = routeRules.filter(function(r) { return r.id !== id; });
+        return { ok: true, removed: before - routeRules.length };
+    };
+    AGENT_OPS.clearRoutes = function() {
+        var n = routeRules.length;
+        routeRules = [];
+        return { ok: true, removed: n };
+    };
+    AGENT_OPS.setDialogAutoResponse = function(type, action, text) {
+        dialogAutoResponses[type] = { action: action, text: text };
+        return { ok: true };
+    };
+    // Animation scrub + sweep recorder (R5B-SCRUBKEY1). Agent-only: from page script,
+    // `installSweepRecorder` superseded the agent's armed recorder, `readSweep(true)` erased what
+    // it had recorded, and `scrubPrepare` / `scrubSeek` / `scrubRestore` paused, moved and
+    // resumed the page's animations under the agent. `listAnimations` stays public (read-only).
+    ASSIGN(AGENT_OPS, {
         // ── Deterministic animation scrubbing ────────────────────────────────
         // Pause the target's WAAPI animations and hold state across calls so the
         // Rust side can seek to evenly-spaced progress points and capture a
@@ -2177,54 +2244,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
             return res;
         },
-    };
-
-    try {
-        Object.freeze(window.__VICTAURI__);
-        Object.defineProperty(window, '__VICTAURI__', {
-            value: window.__VICTAURI__,
-            configurable: false,
-            writable: false,
-        });
-    } catch(e) {}
-
-    // Animation scrub / sweep-recorder state. Closure-held, not `window.__VICTAURI_SCRUB__` /
-    // `window.__VICTAURI_SWEEP__` globals, which page script could overwrite to fake the
-    // measured animation curve and jank statistics.
-    var scrubState = null;
-    var sweepState = null;
-
-    // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
-    // every op — and every callback an op creates — is strict: a page hook on a built-in an op
-    // calls then cannot reach the op through `.caller` (and call it without the key), nor the
-    // injected script beyond it whose source carries the key (R4-JS2).
-    var AGENT_OPS = (function() {
-    'use strict';
-    var AGENT_OPS = OBJ_CREATE(null);
-    AGENT_OPS.clearIpcLog = function() {
-        for (var i = networkLog.length - 1; i >= 0; i--) {
-            if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
-        }
-        return { ok: true };
-    };
-    AGENT_OPS.clearNetworkLog = function() { networkLog.length = 0; return { ok: true }; };
-    AGENT_OPS.clearConsoleLogs = function() { consoleLogs.length = 0; return { ok: true }; };
-    AGENT_OPS.clearMutationLog = function() { mutationLog.length = 0; return { ok: true }; };
-    AGENT_OPS.clearDialogLog = function() { dialogLog.length = 0; return { ok: true }; };
-    AGENT_OPS.clearRoute = function(id) {
-        var before = routeRules.length;
-        routeRules = routeRules.filter(function(r) { return r.id !== id; });
-        return { ok: true, removed: before - routeRules.length };
-    };
-    AGENT_OPS.clearRoutes = function() {
-        var n = routeRules.length;
-        routeRules = [];
-        return { ok: true, removed: n };
-    };
-    AGENT_OPS.setDialogAutoResponse = function(type, action, text) {
-        dialogAutoResponses[type] = { action: action, text: text };
-        return { ok: true };
-    };
+    });
     return Object.freeze(AGENT_OPS);
     })();
 
