@@ -1934,7 +1934,7 @@ async fn logs_events_happy_path() {
 async fn logs_slow_ipc_happy_path() {
     let state = test_state();
     let base = start_callback_server(state, &["main"], |script| {
-        if script.contains("getIpcLog()") {
+        if script.contains("getIpcLog(") {
             r#"[{"command":"slow_cmd","duration_ms":500},{"command":"fast_cmd","duration_ms":5}]"#
                 .to_string()
         } else {

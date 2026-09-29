@@ -223,6 +223,170 @@ fn r5_js1_ipc_log_reads_are_not_proportional_to_total_body_bytes() {
     );
 }
 
+/// R5-JS1: the IPC-log projections the tools send to the page, run against the REAL bridge in
+/// jsdom. R5-JS1 made them read a body-free view and fetch bodies
+/// only for the entries they report, so their output is pinned end to end here.
+mod r5_js1_ipc_projections {
+    use std::io::Write;
+    use victauri_plugin::mcp::ipc_log_js::{
+        ghost_ipc_outcomes_js, ipc_catalog_projection_js, ipc_integrity_js,
+        ipc_timing_projection_js, slow_ipc_js, trimmed_log_js,
+    };
+
+    const TRAFFIC: &str = r#"
+        function call(cmd, args, headers) {
+            return fetch('http://ipc.localhost/' + cmd, { method: 'POST', body: JSON.stringify(args), headers: headers || {} });
+        }
+        await call('get_a', { x: 1 }, { 'x-vtest-body': '{"n":1,"s":"a"}' });
+        await call('get_a', { x: 2 }, { 'x-vtest-body': '{"n":2,"s":"b"}' });
+        await call('bad_cmd', {}, { 'x-vtest-tauri-response': 'error', 'x-vtest-body': '"command bad_cmd not found"' });
+        await call('delayed', { d: true }, { 'x-vtest-delay-ms': '80', 'x-vtest-body': '{"late":true}' });
+        call('stuck', { p: 1 }, { 'x-vtest-delay-ms': '1500' });
+        await new Promise(function(r) { setTimeout(r, 40); });
+    "#;
+
+    fn run(code: &str) -> Option<serde_json::Value> {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("bridge_tests");
+        if !dir.join("node_modules").join("jsdom").exists() {
+            assert!(
+                std::env::var_os("CI").is_none()
+                    && std::env::var_os("VICTAURI_REQUIRE_JSDOM").is_none(),
+                "jsdom is not installed: `npm ci` in crates/victauri-plugin/tests/bridge_tests/"
+            );
+            eprintln!("SKIP: jsdom not installed");
+            return None;
+        }
+        let def = serde_json::json!({
+            "bridge_script": victauri_plugin::js_bridge::init_script(
+                &victauri_plugin::js_bridge::BridgeCapacities::default()
+            ),
+            "setup_html": "<html><body></body></html>",
+            "tests": [{ "name": "projection", "code": format!("{TRAFFIC}\nreturn (function() {{ {code} }})();") }],
+        });
+        let mut tmp = tempfile::NamedTempFile::new().expect("temp file");
+        tmp.write_all(def.to_string().as_bytes()).expect("write");
+        tmp.flush().expect("flush");
+        let out = std::process::Command::new("node")
+            .arg(dir.join("run_tests.js"))
+            .arg(tmp.path())
+            .output()
+            .expect("run node");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("VICTAURI_RESULTS:"))
+            .unwrap_or_else(|| panic!("no results: {stdout}"));
+        let results: serde_json::Value = serde_json::from_str(line).expect("results json");
+        let r = &results[0];
+        assert_eq!(r["passed"], true, "projection threw: {r}");
+        Some(r["result"].clone())
+    }
+
+    #[test]
+    fn catalog_reports_first_arg_and_first_ok_result_shapes() {
+        let Some(v) = run(&ipc_catalog_projection_js()) else {
+            return;
+        };
+        let by = |c: &str| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["command"] == c)
+                .cloned()
+                .unwrap_or_else(|| panic!("{c} missing: {v}"))
+        };
+        let a = by("get_a");
+        assert_eq!(a["call_count"], 2, "{v}");
+        assert_eq!(a["arg_shape"], serde_json::json!({ "x": "number" }), "{v}");
+        assert_eq!(
+            a["result_shape"],
+            serde_json::json!({ "n": "number", "s": "string" }),
+            "{v}"
+        );
+        let bad = by("bad_cmd");
+        assert_eq!(bad["error_count"], 1, "{v}");
+        assert_eq!(bad["result_shape"], "string", "{v}");
+        let stuck = by("stuck");
+        assert_eq!(stuck["last_status"], "pending", "{v}");
+        assert_eq!(
+            stuck["arg_shape"],
+            serde_json::json!({ "p": "number" }),
+            "{v}"
+        );
+        assert_eq!(stuck["result_shape"], "null", "{v}");
+    }
+
+    #[test]
+    fn ghost_outcomes_and_timings_come_from_the_body_free_view() {
+        let Some(v) = run(&ghost_ipc_outcomes_js(None)) else {
+            return;
+        };
+        let bad = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["command"] == "bad_cmd")
+            .cloned()
+            .unwrap();
+        assert_eq!(bad["ok"], false, "{v}");
+        assert!(
+            bad["err"].as_str().unwrap().contains("not found"),
+            "the error sample must survive without bodies: {v}"
+        );
+        let Some(t) = run(&ipc_timing_projection_js(None)) else {
+            return;
+        };
+        assert_eq!(t.as_array().unwrap().len(), 5, "{t}");
+        assert!(t[3]["duration_ms"].as_f64().unwrap() >= 60.0, "{t}");
+    }
+
+    #[test]
+    fn integrity_lists_stale_and_errored_calls_with_their_bodies() {
+        let Some(v) = run(&ipc_integrity_js(10)) else {
+            return;
+        };
+        assert_eq!(v["healthy"], false, "{v}");
+        assert_eq!(v["total_calls"], 5, "{v}");
+        assert_eq!(v["stale_count"], 1, "{v}");
+        assert_eq!(v["error_count"], 1, "{v}");
+        assert_eq!(v["stale_calls"][0]["command"], "stuck", "{v}");
+        assert_eq!(v["stale_calls"][0]["args"]["p"], 1, "{v}");
+        assert_eq!(
+            v["errored_calls"][0]["result"], "command bad_cmd not found",
+            "{v}"
+        );
+    }
+
+    #[test]
+    fn slow_ipc_returns_the_slowest_calls_with_their_bodies() {
+        let Some(v) = run(&slow_ipc_js(50, 20)) else {
+            return;
+        };
+        assert_eq!(v["count"], 1, "{v}");
+        assert_eq!(v["calls"][0]["command"], "delayed", "{v}");
+        assert_eq!(v["calls"][0]["args"]["d"], true, "{v}");
+        assert_eq!(v["calls"][0]["result"]["late"], true, "{v}");
+    }
+
+    #[test]
+    fn logs_ipc_source_keeps_the_newest_entries() {
+        let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog(2)", 100);
+        let Some(v) = run(&code) else {
+            return;
+        };
+        let cmds: Vec<&str> = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["command"].as_str().unwrap())
+            .collect();
+        assert_eq!(cmds, ["delayed", "stuck"], "{v}");
+        assert_eq!(v[0]["result"]["late"], true, "{v}");
+    }
+}
+
 // ── R5-JS2: a page's throwing toJSON cannot make every eval hang ─────────────
 
 /// A Tauri-like `invoke` stub: serializes the args with the page's (global, looked up at call
