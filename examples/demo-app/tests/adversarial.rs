@@ -244,11 +244,12 @@ adv!(interact_on_stale_ref_fails_cleanly, base, {
         json!({"action":"click","ref_id":"e99999999"}),
     )
     .await;
-    // Either a tool error or an ok:false with a ref-not-found hint — never a hang/panic.
-    let body = serde_json::to_string(&r).unwrap();
+    // A tool error naming the missing ref (with a recovery hint) — never a hang/panic, and
+    // never a SUCCESS result (a refused action used to come back as `{ok:false}`, R5B-ISERR1).
+    let e = error(&r);
     assert!(
-        body.contains("not found") || body.contains("ok\":false") || r.get("error").is_some(),
-        "stale ref not handled cleanly: {body}"
+        (e.contains("not found") || e.contains("detached")) && e.contains("[hint: "),
+        "stale ref not handled cleanly: {e}"
     );
 });
 

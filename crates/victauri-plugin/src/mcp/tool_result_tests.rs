@@ -468,3 +468,137 @@ async fn explain_diff_counts_calls_and_lists_unique_commands() {
     assert_eq!(r["ipc_calls_made"], 7, "{r}");
     assert_eq!(r["unique_commands"], json!(["zeta", "alpha", "mid"]), "{r}");
 }
+
+// ── R5B-ISERR1: a page-reported failure is a tool error ────────────────────────────────────
+
+fn page_value(value: &serde_json::Value) -> String {
+    json!({"__victauri_ok": value, "__victauri_type": "value"}).to_string()
+}
+
+/// `interact` / `input` / `inspect` / `route add` returned the page's `{ok:false, error}` (or
+/// `{error}`) as a SUCCESS result, so a refused click read as done. They now come back as
+/// `isError` with the page's message and recovery hint — like `find_elements` already did.
+#[tokio::test]
+async fn page_reported_failures_are_tool_errors() {
+    let refused = json!({"ok": false, "error": "element is covered by div.modal at (10,20)",
+                         "hint": "RETRY_LATER"});
+    let not_found = json!({"error": "ref not found: e9"});
+    let cases = [
+        (
+            json!({"action": "click", "ref_id": "e9"}),
+            "interact",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "double_click", "ref_id": "e9"}),
+            "interact",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "hover", "ref_id": "e9"}),
+            "interact",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "focus", "ref_id": "e9"}),
+            "interact",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "scroll_into_view", "ref_id": "e9"}),
+            "interact",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "select_option", "ref_id": "e9", "value": "a"}),
+            "interact",
+            json!({"ok": false, "error": "element is not a <select>", "hint": "CHECK_INPUT"}),
+        ),
+        (
+            json!({"action": "fill", "ref_id": "e9", "value": "x"}),
+            "input",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "type_text", "ref_id": "e9", "text": "x"}),
+            "input",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "press_key", "key": "Enter"}),
+            "input",
+            refused.clone(),
+        ),
+        (
+            json!({"action": "get_styles", "ref_id": "e9"}),
+            "inspect",
+            not_found.clone(),
+        ),
+        (
+            json!({"action": "highlight", "ref_id": "e9"}),
+            "inspect",
+            not_found.clone(),
+        ),
+        (
+            json!({"action": "add", "pattern": "/api"}),
+            "route",
+            json!({"ok": false, "error": "fulfill status must be an integer in 200-599"}),
+        ),
+    ];
+    for (args, tool, answer) in cases {
+        let state = state();
+        let bridge = ScriptBridge::answering(&state, &page_value(&answer));
+        let h = handler(&state, &bridge);
+        let r = call(&h, tool, args.clone()).await;
+        let t = text(&r);
+        assert_eq!(r.is_error, Some(true), "{tool} {args}: {t}");
+        let want = answer["error"].as_str().unwrap();
+        assert!(t.starts_with(want), "{tool} {args}: {t}");
+        if let Some(hint) = answer["hint"].as_str() {
+            assert!(
+                t.ends_with(&format!("[hint: {hint}]")),
+                "{tool} {args}: {t}"
+            );
+        }
+    }
+}
+
+/// Success shapes stay successes — including partial per-item errors inside an array and
+/// results that merely CONTAIN an `error` field below the top level.
+#[tokio::test]
+async fn page_successes_stay_successes() {
+    let cases = [
+        (
+            json!({"action": "click", "ref_id": "e1"}),
+            "interact",
+            json!({"ok": true}),
+        ),
+        (
+            json!({"action": "focus", "ref_id": "e1"}),
+            "interact",
+            json!({"ok": true, "tag": "input"}),
+        ),
+        (
+            json!({"action": "get_bounding_boxes", "ref_ids": ["e1", "e2"]}),
+            "inspect",
+            json!([{"ref_id": "e1", "x": 1}, {"ref_id": "e2", "error": "ref not found"}]),
+        ),
+        (
+            json!({"action": "audit_accessibility"}),
+            "inspect",
+            json!({"violations": [{"error": "x"}], "warnings": [], "summary": {}}),
+        ),
+        (
+            json!({"action": "add", "pattern": "/api"}),
+            "route",
+            json!({"ok": true, "id": 3}),
+        ),
+    ];
+    for (args, tool, answer) in cases {
+        let state = state();
+        let bridge = ScriptBridge::answering(&state, &page_value(&answer));
+        let h = handler(&state, &bridge);
+        let r = ok_json(&call(&h, tool, args.clone()).await);
+        assert_eq!(r, answer, "{tool} {args}");
+    }
+}

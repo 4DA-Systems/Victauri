@@ -1650,7 +1650,7 @@ impl VictauriMcpHandler {
     // ── Compound Tools ──────────────────────────────────────────────────────
 
     #[tool(
-        description = "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions.",
+        description = "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions. An action the page refuses (element covered, disabled, hidden, detached, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1724,7 +1724,7 @@ impl VictauriMcpHandler {
                     };
                 }
                 let code = format!("return window.__VICTAURI__?.click({})", js_string(ref_id));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::DoubleClick => {
@@ -1738,7 +1738,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.doubleClick({})",
                     js_string(ref_id)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::Hover => {
@@ -1749,7 +1749,7 @@ impl VictauriMcpHandler {
                     return missing_param("ref_id", "hover");
                 };
                 let code = format!("return window.__VICTAURI__?.hover({})", js_string(ref_id));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::Focus => {
@@ -1763,7 +1763,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.focusElement({})",
                     js_string(ref_id)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::ScrollIntoView => {
@@ -1781,7 +1781,7 @@ impl VictauriMcpHandler {
                 let x = params.x.unwrap_or(0.0);
                 let y = params.y.unwrap_or(0.0);
                 let code = format!("return window.__VICTAURI__?.scrollTo({ref_arg}, {x}, {y})");
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::SelectOption => {
@@ -1807,14 +1807,14 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     values_json
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
         }
     }
 
     #[tool(
-        description = "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls.",
+        description = "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls. An input the page refuses (element not fillable, covered, disabled, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1839,7 +1839,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     js_string(value)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InputAction::TypeText => {
@@ -1880,7 +1880,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     js_string(text)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InputAction::PressKey => {
@@ -1914,7 +1914,7 @@ impl VictauriMcpHandler {
                     };
                 }
                 let code = format!("return window.__VICTAURI__?.pressKey({})", js_string(key));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
         }
@@ -2528,7 +2528,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     props_arg
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::GetBoundingBoxes => {
@@ -2540,7 +2540,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.getBoundingBoxes([{}])",
                     refs.join(",")
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::Highlight => {
@@ -2570,7 +2570,7 @@ impl VictauriMcpHandler {
                     color_arg,
                     label_arg
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::ClearHighlights => {
@@ -2581,21 +2581,21 @@ impl VictauriMcpHandler {
                 {
                     return tool_disabled("inspect.clear_highlights");
                 }
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.clearHighlights()",
                     params.webview_label.as_deref(),
                 )
                 .await
             }
             InspectAction::AuditAccessibility => {
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.auditAccessibility()",
                     params.webview_label.as_deref(),
                 )
                 .await
             }
             InspectAction::GetPerformance => {
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.getPerformanceMetrics()",
                     params.webview_label.as_deref(),
                 )
@@ -2724,7 +2724,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.addRoute({})",
                     js_string(&rule.to_string())
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             RouteAction::List => {
@@ -4892,6 +4892,21 @@ impl VictauriMcpHandler {
         }
     }
 
+    /// Run a page ACTION (`interact`, `input`, `inspect`, `route add`) and report a failure the
+    /// page returns — `{ok: false, error, hint}` or `{error}` — as a tool error carrying the
+    /// page's message and recovery hint. These used to come back as a SUCCESS result, so a
+    /// refused click (covered, disabled, ref not found) read as done unless the caller parsed
+    /// the body (R5B-ISERR1).
+    async fn eval_page_action(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
+        match self.eval_with_return(code, webview_label).await {
+            Ok(result) => match page_action_error(&result) {
+                Some(message) => tool_error(message),
+                None => CallToolResult::success(vec![ContentBlock::text(result)]),
+            },
+            Err(e) => tool_error(e),
+        }
+    }
+
     async fn eval_with_return(
         &self,
         code: &str,
@@ -5910,6 +5925,33 @@ fn parse_expression_value(raw: &str) -> Result<serde_json::Value, serde_json::Er
         return Ok(serde_json::Value::Null);
     }
     serde_json::from_str(raw)
+}
+
+/// The failure a page action reported, as tool-error text: `{ok: false, …}`, or an object with
+/// a top-level `error` string and no `ok: true`. Anything else (arrays with per-item errors, an
+/// audit whose findings contain an `error` field) is a result. The page's recovery hint is kept
+/// in the same `[hint: …]` form every tool error uses; it is page-controlled, so only a plain
+/// `UPPER_SNAKE` word is carried over.
+fn page_action_error(result: &str) -> Option<String> {
+    let value: serde_json::Value = page_json::parse_page_json(result).ok()?;
+    let obj = value.as_object()?;
+    let ok = obj.get("ok").and_then(serde_json::Value::as_bool);
+    let error = obj.get("error").and_then(serde_json::Value::as_str);
+    if ok == Some(true) || (ok.is_none() && error.is_none()) {
+        return None;
+    }
+    let mut message = error.map_or_else(
+        || format!("the page reported failure: {value}"),
+        str::to_string,
+    );
+    if let Some(hint) = obj.get("hint").and_then(serde_json::Value::as_str)
+        && !hint.is_empty()
+        && hint.len() <= 32
+        && hint.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+    {
+        message.push_str(&format!("\n\n[hint: {hint}]"));
+    }
+    Some(message)
 }
 
 /// Statement keywords where a leading `return` would be a syntax error. Matched as whole words

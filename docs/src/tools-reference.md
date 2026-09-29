@@ -412,6 +412,13 @@ Element interactions with Playwright-grade actionability checks. Works on
 elements inside same-origin iframes too (refs from a snapshot/find resolve
 across frame boundaries).
 
+An action the page refuses — element covered, disabled, hidden, detached, not a
+`<select>`, or ref not found — is a **tool error** (MCP `isError: true`; REST
+`{"error": …}`) whose text is the reason followed by `[hint: RETRY_LATER]` (the UI
+may still settle) or `[hint: CHECK_INPUT]` (wrong target). The same applies to
+`input`, `inspect` (e.g. `get_styles` on an unknown ref) and `route add`. (Before
+0.9.0 these came back as a successful `{"ok": false, "error": …}` result.)
+
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `click` | `ref_id` | Click an element |
