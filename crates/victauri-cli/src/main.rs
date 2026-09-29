@@ -205,14 +205,14 @@ async fn main() -> Result<()> {
 
 fn cmd_init(root: &Path) -> Result<()> {
     let root = std::fs::canonicalize(root)
-        .with_context(|| format!("directory not found: {}", root.display()))?;
+        .with_context(|| format!("directory not found: {}", display_path(root)))?;
 
     let (cargo_toml_path, is_tauri) = detect_project(&root)?;
 
     if !is_tauri {
         eprintln!(
             "Warning: no Tauri dependency detected in {}",
-            cargo_toml_path.display()
+            display_path(&cargo_toml_path)
         );
         eprintln!("         Victauri is designed for Tauri apps — tests may not connect.\n");
     }
@@ -262,7 +262,8 @@ fn cmd_init(root: &Path) -> Result<()> {
             eprintln!("      Add this to your mcpServers (the bridge auto-discovers the port —");
             eprintln!("      prefer it over a fixed url so agents never bind the wrong app):\n");
             eprintln!(
-                "        \"victauri\": {{ \"command\": \"victauri\", \"args\": [\"bridge\"] }}\n"
+                "        \"victauri\": {{ \"command\": \"victauri\", \"args\": [\"bridge\"] }}
+"
             );
         }
     } else {
@@ -288,7 +289,7 @@ fn cmd_init(root: &Path) -> Result<()> {
             eprintln!("  [=] capabilities/victauri.json already exists");
         } else {
             std::fs::create_dir_all(&caps_dir)
-                .with_context(|| format!("failed to create {}", caps_dir.display()))?;
+                .with_context(|| format!("failed to create {}", display_path(&caps_dir)))?;
             write_new_file(&cap_path, generate_capability_json())?;
             eprintln!("  [+] Created capabilities/victauri.json");
         }
@@ -322,7 +323,7 @@ fn cmd_init(root: &Path) -> Result<()> {
     let tests_dir = find_src_tauri(&root).map_or_else(|| root.join("tests"), |p| p.join("tests"));
     ensure_inside_project(&root, &tests_dir.join("smoke.rs"))?;
     std::fs::create_dir_all(&tests_dir)
-        .with_context(|| format!("failed to create {}", tests_dir.display()))?;
+        .with_context(|| format!("failed to create {}", display_path(&tests_dir)))?;
 
     let smoke_path = tests_dir.join("smoke.rs");
     if smoke_path.exists() {
@@ -353,7 +354,7 @@ fn cmd_init(root: &Path) -> Result<()> {
         eprintln!("  [=] .github/workflows/victauri.yml already exists");
     } else {
         std::fs::create_dir_all(&workflows_dir)
-            .with_context(|| format!("failed to create {}", workflows_dir.display()))?;
+            .with_context(|| format!("failed to create {}", display_path(&workflows_dir)))?;
         // The Rust crate's directory relative to the repo root (`src-tauri` for the
         // standard create-tauri-app layout, `.` when Cargo.toml is at the root).
         let app_dir = cargo_toml_path
@@ -722,11 +723,11 @@ async fn cmd_check(junit_path: Option<&Path>, target: &AppTarget) -> Result<()> 
         let junit = report.to_junit("victauri-check", duration);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
         }
         victauri_test::reporting::write_junit_report(&junit, path)
-            .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
-        eprintln!("JUnit report written to {}", path.display());
+            .with_context(|| format!("failed to write JUnit report to {}", display_path(path)))?;
+        eprintln!("JUnit report written to {}", display_path(path));
     }
 
     Ok(())
@@ -743,7 +744,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     // Check 1: Project structure
     let cwd = std::env::current_dir()?;
     let (cargo_path, is_tauri) = if let Ok(result) = detect_project(&cwd) {
-        eprintln!("  [PASS] Cargo.toml found: {}", result.0.display());
+        eprintln!("  [PASS] Cargo.toml found: {}", display_path(&result.0));
         pass_count += 1;
         result
     } else {
@@ -762,7 +763,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
         eprintln!("  [FAIL] No Tauri dependency in Cargo.toml");
         eprintln!(
             "         Add `tauri` to [dependencies] in {}",
-            cargo_path.display()
+            display_path(&cargo_path)
         );
         fail_count += 1;
     }
@@ -839,7 +840,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
             eprintln!("         eval_js / dom_snapshot will time out with no error.");
             eprintln!(
                 "         Run `victauri init`, or add {}:",
-                caps.join("victauri.json").display()
+                display_path(&caps.join("victauri.json"))
             );
             eprintln!("{}", indent_block(generate_capability_json()));
             warn_count += 1;
@@ -849,10 +850,10 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
         } else {
             // Labels and file names come from the (possibly untrusted) project: print them
             // with control characters escaped (R4-TERM1).
-            let file = scan.file.as_deref().map_or_else(
-                || "the capability file".to_string(),
-                |p| victauri_test::terminal::single_line(&p.display().to_string()),
-            );
+            let file = scan
+                .file
+                .as_deref()
+                .map_or_else(|| "the capability file".to_string(), display_path);
             match scan.windows.as_deref() {
                 Some(labels) if !labels.is_empty() => {
                     eprintln!(
@@ -877,7 +878,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     // Check 8: Test files
     let tests_dir = find_src_tauri(&cwd).map_or_else(|| cwd.join("tests"), |p| p.join("tests"));
     if tests_dir.join("smoke.rs").exists() || tests_dir.join("integration.rs").exists() {
-        eprintln!("  [PASS] Test files found in {}", tests_dir.display());
+        eprintln!("  [PASS] Test files found in {}", display_path(&tests_dir));
         pass_count += 1;
     } else {
         eprintln!("  [WARN] No Victauri test files found");
@@ -1019,11 +1020,11 @@ async fn cmd_test(
         let junit = verify.to_junit("victauri-smoke", report.duration);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
         }
         victauri_test::reporting::write_junit_report(&junit, path)
-            .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
-        eprintln!("JUnit report written to {}", path.display());
+            .with_context(|| format!("failed to write JUnit report to {}", display_path(path)))?;
+        eprintln!("JUnit report written to {}", display_path(path));
     }
 
     if !report.all_passed() {
@@ -1116,11 +1117,11 @@ async fn cmd_coverage(
         let junit = verify_report.to_junit("victauri-coverage", std::time::Duration::from_secs(0));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
         }
         victauri_test::reporting::write_junit_report(&junit, path)
-            .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
-        eprintln!("JUnit report written to {}", path.display());
+            .with_context(|| format!("failed to write JUnit report to {}", display_path(path)))?;
+        eprintln!("JUnit report written to {}", display_path(path));
     }
 
     if let Some(t) = threshold {
@@ -1210,14 +1211,14 @@ async fn cmd_record(
     let output = output.as_path();
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+            .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
     }
     write_regular_file(output, &code)?;
 
     eprintln!(
         "  Captured {event_count} events ({interaction_count} interactions, {ipc_count} IPC calls)"
     );
-    eprintln!("  Generated test: {}", output.display());
+    eprintln!("  Generated test: {}", display_path(output));
     // `--test` selects the test TARGET (the file stem under tests/), not the function;
     // the function name is the trailing name filter.
     let target = output.file_stem().map_or_else(
@@ -1239,11 +1240,14 @@ async fn cmd_watch(dir: &Path, filter: Option<&str>) -> Result<()> {
     };
 
     if !watch_dir.exists() {
-        bail!("watch directory does not exist: {}", watch_dir.display());
+        bail!(
+            "watch directory does not exist: {}",
+            display_path(&watch_dir)
+        );
     }
 
     eprintln!("\x1b[36mVictauri Watch\x1b[0m");
-    eprintln!("  Directory: {}", watch_dir.display());
+    eprintln!("  Directory: {}", display_path(&watch_dir));
     if let Some(f) = filter {
         eprintln!("  Filter: {f}");
     }
@@ -1269,7 +1273,7 @@ async fn cmd_watch(dir: &Path, filter: Option<&str>) -> Result<()> {
 
     watcher
         .watch(&watch_dir, RecursiveMode::Recursive)
-        .with_context(|| format!("failed to watch {}", watch_dir.display()))?;
+        .with_context(|| format!("failed to watch {}", display_path(&watch_dir)))?;
 
     run_tests_with_output(filter, None);
 
@@ -1344,12 +1348,12 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
             continue;
         }
         let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+            .with_context(|| format!("failed to read {}", display_path(&path)))?;
 
         if content.contains("victauri_plugin") {
             eprintln!(
                 "  [=] {} already references victauri_plugin",
-                path.display()
+                display_path(&path)
             );
             return Ok(true);
         }
@@ -1403,10 +1407,10 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
             // repo's `src/main.rs` could point at a file outside the project).
             refuse_symlink(&path)?;
             std::fs::write(&path, new_content)
-                .with_context(|| format!("failed to write {}", path.display()))?;
+                .with_context(|| format!("failed to write {}", display_path(&path)))?;
             eprintln!(
                 "  [+] Patched {} with .plugin(victauri_plugin::init())",
-                path.display()
+                display_path(&path)
             );
             return Ok(true);
         }
@@ -1455,10 +1459,28 @@ fn refuse_symlink(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
             "refusing to write {}: it is a symbolic link (victauri init never writes through symlinks)",
-            path.display()
+            display_path(path)
         ),
         _ => Ok(()),
     }
+}
+
+/// A path as shown to the user: the Windows verbatim prefix `std::fs::canonicalize` adds
+/// (`\\?\C:\…`, `\\?\UNC\server\share\…`) is dropped, dunce-style (R5B-INIT1), and control
+/// characters are escaped — a cloned repo's directory names are untrusted (R4-TERM1).
+fn display_path(path: &Path) -> String {
+    let shown = path.display().to_string();
+    let plain = if let Some(unc) = shown.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = shown
+        .strip_prefix(r"\\?\")
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+    {
+        rest.to_string()
+    } else {
+        shown
+    };
+    victauri_test::terminal::single_line(&plain)
 }
 
 /// Refuse to write `path` unless it lies inside the (canonical) project `root` with no
@@ -1474,11 +1496,11 @@ fn ensure_inside_project(root: &Path, path: &Path) -> Result<()> {
         anyhow::bail!(
             "refusing to write {}: {why} (victauri init never writes through symlinks or \
              outside the project)",
-            path.display()
+            display_path(path)
         )
     };
     let Ok(relative) = path.strip_prefix(root) else {
-        return refuse(format!("it is outside the project {}", root.display()));
+        return refuse(format!("it is outside the project {}", display_path(root)));
     };
     let components: Vec<_> = relative.components().collect();
     let mut current = root.to_path_buf();
@@ -1489,10 +1511,10 @@ fn ensure_inside_project(root: &Path, path: &Path) -> Result<()> {
         current.push(name);
         match std::fs::symlink_metadata(&current) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                return refuse(format!("{} is a symbolic link", current.display()));
+                return refuse(format!("{} is a symbolic link", display_path(&current)));
             }
             Ok(meta) if i + 1 < components.len() && !meta.is_dir() => {
-                return refuse(format!("{} is not a directory", current.display()));
+                return refuse(format!("{} is not a directory", display_path(&current)));
             }
             Ok(_) => {}
             // Missing: nothing below it exists yet, so nothing below it can be a link.
@@ -1506,11 +1528,11 @@ fn ensure_inside_project(root: &Path, path: &Path) -> Result<()> {
         }
     }
     let canonical = std::fs::canonicalize(&existing)
-        .with_context(|| format!("failed to resolve {}", existing.display()))?;
+        .with_context(|| format!("failed to resolve {}", display_path(&existing)))?;
     if !canonical.starts_with(root) {
         return refuse(format!(
             "it resolves outside the project ({})",
-            canonical.display()
+            display_path(&canonical)
         ));
     }
     Ok(())
@@ -1522,7 +1544,7 @@ fn ensure_inside_project(root: &Path, path: &Path) -> Result<()> {
 /// working directory is the user's explicit choice; only its final component is checked.
 fn checked_record_output(cwd: &Path, output: &Path) -> Result<PathBuf> {
     let cwd = std::fs::canonicalize(cwd)
-        .with_context(|| format!("failed to resolve {}", cwd.display()))?;
+        .with_context(|| format!("failed to resolve {}", display_path(cwd)))?;
     let absolute = if output.is_absolute() {
         output.to_path_buf()
     } else {
@@ -1539,7 +1561,8 @@ fn checked_record_output(cwd: &Path, output: &Path) -> Result<PathBuf> {
 /// Write `contents` to `path`, replacing a regular file but never following a symlink.
 fn write_regular_file(path: &Path, contents: &str) -> Result<()> {
     refuse_symlink(path)?;
-    std::fs::write(path, contents).with_context(|| format!("failed to write {}", path.display()))
+    std::fs::write(path, contents)
+        .with_context(|| format!("failed to write {}", display_path(path)))
 }
 
 /// Create a NEW file with `contents`, never following or clobbering anything already at
@@ -1552,9 +1575,9 @@ fn write_new_file(path: &Path, contents: &str) -> Result<()> {
         .write(true)
         .create_new(true)
         .open(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+        .with_context(|| format!("failed to create {}", display_path(path)))?;
     std::io::Write::write_all(&mut file, contents.as_bytes())
-        .with_context(|| format!("failed to write {}", path.display()))?;
+        .with_context(|| format!("failed to write {}", display_path(path)))?;
     Ok(())
 }
 
@@ -1562,19 +1585,19 @@ fn write_new_file(path: &Path, contents: &str) -> Result<()> {
 fn append_to_regular_file(path: &Path, contents: &str) -> Result<()> {
     refuse_symlink(path)?;
     let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("failed to stat {}", path.display()))?;
+        .with_context(|| format!("failed to stat {}", display_path(path)))?;
     if !meta.is_file() {
         anyhow::bail!(
             "refusing to append to {}: not a regular file",
-            path.display()
+            display_path(path)
         );
     }
     let mut file = std::fs::OpenOptions::new()
         .append(true)
         .open(path)
-        .with_context(|| format!("failed to append to {}", path.display()))?;
+        .with_context(|| format!("failed to append to {}", display_path(path)))?;
     std::io::Write::write_all(&mut file, contents.as_bytes())
-        .with_context(|| format!("failed to write to {}", path.display()))?;
+        .with_context(|| format!("failed to write to {}", display_path(path)))?;
     Ok(())
 }
 
@@ -1927,8 +1950,8 @@ fn detect_project(root: &Path) -> Result<(PathBuf, bool)> {
     } else {
         bail!(
             "No Cargo.toml found in {} or {}/src-tauri/",
-            root.display(),
-            root.display()
+            display_path(root),
+            display_path(root)
         );
     };
 
@@ -2510,6 +2533,17 @@ mod tests {
 
         let patched = try_patch_tauri_builder(&src).unwrap();
         assert!(!patched, "should return false when no tauri::Builder found");
+    }
+
+    #[test]
+    fn display_path_drops_only_the_verbatim_prefix() {
+        let shown = |s: &str| display_path(Path::new(s));
+        assert_eq!(shown(r"\\?\C:\proj\Cargo.toml"), r"C:\proj\Cargo.toml");
+        assert_eq!(shown(r"\\?\UNC\srv\share\proj"), r"\\srv\share\proj");
+        // A verbatim path with no drive-letter form stays as is (it has no plain spelling).
+        assert_eq!(shown(r"\\?\Volume{1234}\proj"), r"\\?\Volume{1234}\proj");
+        assert_eq!(shown("src-tauri/Cargo.toml"), "src-tauri/Cargo.toml");
+        assert_eq!(shown("a\nb"), r"a\nb");
     }
 
     #[test]

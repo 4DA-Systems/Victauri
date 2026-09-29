@@ -324,3 +324,38 @@ fn doctor_exits_nonzero_when_a_check_fails() {
     assert!(err.contains("[FAIL]"), "{err}");
     assert_eq!(out.status.code(), Some(1), "a FAIL must exit 1:\n{err}");
 }
+
+fn write_tauri_project(dir: &std::path::Path, tauri_dep: bool) {
+    std::fs::create_dir_all(dir).unwrap();
+    let deps = if tauri_dep { "tauri = \"2\"\n" } else { "" };
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tauri.conf.json"),
+        json!({"identifier": "com.test.init"}).to_string(),
+    )
+    .unwrap();
+}
+
+/// R5B-INIT1: `init` canonicalizes the project root, which on Windows yields a `\?\C:\…`
+/// verbatim path — and printed it that way.
+#[test]
+fn init_never_prints_verbatim_windows_paths() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    // No tauri dependency → `init` warns and names the Cargo.toml path.
+    write_tauri_project(&project, false);
+    let out = iso
+        .victauri(&["init", "--path", project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("Cargo.toml"), "{err}");
+    assert!(!err.contains(r"\?\"), "verbatim path printed:\n{err}");
+}
