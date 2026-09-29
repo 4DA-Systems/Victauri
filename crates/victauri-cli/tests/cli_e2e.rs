@@ -359,3 +359,23 @@ fn init_never_prints_verbatim_windows_paths() {
     assert!(err.contains("Cargo.toml"), "{err}");
     assert!(!err.contains(r"\?\"), "verbatim path printed:\n{err}");
 }
+
+/// R5B-INIT2: with an existing `.mcp.json` that lacks Victauri, the suggested snippet must pin
+/// the bridge to the app exactly like the generated file does (`--app <identifier>`).
+#[test]
+fn init_suggestion_for_an_existing_mcp_json_pins_the_app() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    write_tauri_project(&project, true);
+    std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    let out = iso
+        .victauri(&["init", "--path", project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains(r#""args": ["bridge", "--app", "com.test.init"]"#),
+        "the suggestion must pin the app:\n{err}"
+    );
+}

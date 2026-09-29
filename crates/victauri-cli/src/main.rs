@@ -261,9 +261,10 @@ fn cmd_init(root: &Path) -> Result<()> {
             eprintln!("  [!] .mcp.json exists but doesn't reference Victauri.");
             eprintln!("      Add this to your mcpServers (the bridge auto-discovers the port —");
             eprintln!("      prefer it over a fixed url so agents never bind the wrong app):\n");
+            // The same `--app <identifier>` pin the generated file carries (R5B-INIT2).
             eprintln!(
-                "        \"victauri\": {{ \"command\": \"victauri\", \"args\": [\"bridge\"] }}
-"
+                "        {}\n",
+                mcp_server_entry_snippet(read_app_identifier(root.as_path()).as_deref())
             );
         }
     } else {
@@ -1450,6 +1451,25 @@ fn generate_mcp_json(app: Option<&str>) -> String {
     out
 }
 
+/// The `"victauri": {…}` entry to paste into an existing `.mcp.json` — the same bridge args
+/// [`generate_mcp_json`] writes, so a hand-merged config is pinned to the app too (R5B-INIT2).
+/// Each value is JSON-encoded (the identifier is untrusted project data) and the line is
+/// printed with control characters escaped.
+fn mcp_server_entry_snippet(app: Option<&str>) -> String {
+    let mut args = vec!["bridge"];
+    if let Some(id) = app {
+        args.extend(["--app", id]);
+    }
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| serde_json::Value::from(*a).to_string())
+        .collect();
+    victauri_test::terminal::single_line(&format!(
+        "\"victauri\": {{ \"command\": \"victauri\", \"args\": [{}] }}",
+        args.join(", ")
+    ))
+}
+
 /// Refuse to operate on `path` if it is a symbolic link.
 ///
 /// `victauri init` writes into a project directory that may come from an untrusted clone; a
@@ -2544,6 +2564,21 @@ mod tests {
         assert_eq!(shown(r"\\?\Volume{1234}\proj"), r"\\?\Volume{1234}\proj");
         assert_eq!(shown("src-tauri/Cargo.toml"), "src-tauri/Cargo.toml");
         assert_eq!(shown("a\nb"), r"a\nb");
+    }
+
+    #[test]
+    fn mcp_server_entry_snippet_pins_the_app_like_the_generated_file() {
+        assert_eq!(
+            mcp_server_entry_snippet(Some("com.x.app")),
+            r#""victauri": { "command": "victauri", "args": ["bridge", "--app", "com.x.app"] }"#
+        );
+        assert_eq!(
+            mcp_server_entry_snippet(None),
+            r#""victauri": { "command": "victauri", "args": ["bridge"] }"#
+        );
+        // Hostile identifier: JSON-escaped, and no raw control characters reach the terminal.
+        let s = mcp_server_entry_snippet(Some("a\"b\n::error"));
+        assert!(!s.contains('\n') && s.contains(r#"a\"b"#), "{s}");
     }
 
     #[test]
