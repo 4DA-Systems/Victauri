@@ -309,6 +309,8 @@ mod tests {
 
     #[test]
     fn rate_limiter_concurrent() {
+        // Started before the limiter: the refill clock can only have run for less than this.
+        let started = std::time::Instant::now();
         let limiter = std::sync::Arc::new(RateLimiter::new(1000));
         let mut handles = vec![];
         for _ in 0..10 {
@@ -328,7 +330,15 @@ mod tests {
             total >= 1000,
             "should dispense at least the initial budget, got {total}"
         );
-        assert!(total <= 1200, "refill overshoot too high, got {total}");
+        // The limiter refills 1,000 tokens/s (1 per elapsed ms), so the most it can hand out is
+        // the initial 1,000 plus 1 per millisecond the threads ran. A fixed ceiling (1,200)
+        // failed on a loaded machine where the loop simply took longer; anything above this
+        // bound is a real refill double-count.
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        assert!(
+            total <= 1000 + elapsed_ms + 1,
+            "refill overshoot: {total} tokens in {elapsed_ms} ms"
+        );
     }
 
     // is_localhost_host

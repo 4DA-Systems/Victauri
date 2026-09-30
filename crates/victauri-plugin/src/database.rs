@@ -15,6 +15,10 @@ use std::time::{Duration, Instant};
 pub(crate) struct InterruptGuard {
     done: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// How many times the watchdog woke up (test builds only): pins that it parks until the
+    /// deadline instead of polling in fixed steps.
+    #[cfg(test)]
+    wakes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 #[cfg(feature = "sqlite")]
@@ -23,6 +27,10 @@ impl InterruptGuard {
         let done = Arc::new(AtomicBool::new(false));
         let interrupt = conn.get_interrupt_handle();
         let done_for_thread = done.clone();
+        #[cfg(test)]
+        let wakes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(test)]
+        let wakes_for_thread = Arc::clone(&wakes);
         // The watchdog PARKS until the deadline and is unparked on drop, so disarming is
         // immediate. (It used to sleep in fixed 25ms steps that the drop then joined — ~25ms
         // per guard however fast the guarded query was, which capped db_health at ~200 tables
@@ -30,6 +38,8 @@ impl InterruptGuard {
         let handle = std::thread::spawn(move || {
             let start = Instant::now();
             loop {
+                #[cfg(test)]
+                wakes_for_thread.fetch_add(1, Ordering::Relaxed);
                 if done_for_thread.load(Ordering::Acquire) {
                     return;
                 }
@@ -46,6 +56,8 @@ impl InterruptGuard {
         Self {
             done,
             handle: Some(handle),
+            #[cfg(test)]
+            wakes,
         }
     }
 }
@@ -2192,27 +2204,46 @@ mod tests {
         // on drop), capping a 5s budget at ~200 tables even on a tiny database.
         let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
         let conn = rusqlite::Connection::open(file.path()).unwrap();
-        let mut ddl = String::new();
+        // One transaction: 400 autocommitted inserts cost a sync each (~75 s on a busy box).
+        let mut ddl = String::from("BEGIN;");
         for i in 0..400 {
             ddl.push_str(&format!(
                 "CREATE TABLE t{i} (x INTEGER); INSERT INTO t{i} VALUES (1);"
             ));
         }
+        ddl.push_str("COMMIT;");
         conn.execute_batch(&ddl).unwrap();
         drop(conn);
-        let started = Instant::now();
+        // Budgets far above need, so a loaded machine cannot fail this: it checks that hundreds
+        // of tables are all listed and counted. The per-count cost that capped this at ~200
+        // tables is pinned deterministically by `interrupt_guard_parks_instead_of_polling`.
         let r = db_health_report(
             file.path().to_str().unwrap(),
-            Duration::from_secs(5),
-            Duration::from_secs(5),
+            Duration::from_secs(60),
+            Duration::from_secs(60),
         )
         .unwrap();
         assert_eq!(r["tables"].as_array().unwrap().len(), 400);
         assert_eq!(r["row_counts_complete"], true, "{r}");
+    }
+
+    /// The watchdog used to sleep in fixed 25 ms steps that every guard's drop then joined —
+    /// ~25 ms per guarded statement however fast it was, which capped `db_health` at ~200 table
+    /// counts per 5 s budget. It must park until the deadline (woken early only by the drop).
+    /// Counted, not timed, so machine load cannot make this flaky.
+    #[test]
+    fn interrupt_guard_parks_instead_of_polling() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let guard = InterruptGuard::arm(&conn, Duration::from_secs(60));
+        let wakes = Arc::clone(&guard.wakes);
+        std::thread::sleep(Duration::from_millis(300));
+        drop(guard);
+        let n = wakes.load(Ordering::Relaxed);
+        // One wake on start + one on the drop's unpark; allow one spurious park return. A 25 ms
+        // stepping watchdog would have woken ~12 times in 300 ms.
         assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "400 trivial counts took {:?}",
-            started.elapsed()
+            n <= 3,
+            "the watchdog woke {n} times in 300 ms: it is polling"
         );
     }
 
@@ -2488,15 +2519,11 @@ mod tests {
             "SELECT name FROM users WHERE name LIKE ?",
             "SELECT name FROM users WHERE name GLOB ?",
         ] {
-            let started = Instant::now();
+            // Refused per row BEFORE matching — the refusal itself is the proof. (A wall-clock
+            // bound here never discriminated: with three short rows the match is instant either
+            // way, and it only flaked on loaded machines.)
             let err = query(&path, sql, &[serde_json::json!(pattern)], None).unwrap_err();
             assert!(err.contains("pattern too complex"), "{sql}: {err}");
-            // Refused per row BEFORE matching (generous bound: loaded CI machines).
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "{:?}",
-                started.elapsed()
-            );
         }
         // An ordinary pattern still works.
         let r = query(
@@ -2514,13 +2541,28 @@ mod tests {
     #[test]
     fn lock_wait_is_short() {
         let (_f, path) = create_test_db();
+        // The query connection's own busy timeout — deterministic, unlike wall time.
+        let pragma = query(&path, "PRAGMA busy_timeout", &[], None).unwrap();
+        let configured = pragma["rows"][0]
+            .as_object()
+            .and_then(|row| row.values().next())
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_else(|| panic!("busy_timeout not reported: {pragma}"));
+        assert_eq!(
+            u128::from(configured),
+            QUERY_BUSY_TIMEOUT.as_millis(),
+            "{pragma}"
+        );
+        assert!(QUERY_BUSY_TIMEOUT <= Duration::from_secs(1));
         let locker = rusqlite::Connection::open(&path).unwrap();
         locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
         let started = Instant::now();
         let err = query(&path, "SELECT * FROM users", &[], None).unwrap_err();
         assert!(err.contains("locked"), "{err}");
+        // Loose wall bound (the pre-fix wait was 5 s + the 5 s CPU deadline); the exact
+        // configured timeout is asserted above.
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(4),
             "lock wait took {:?}",
             started.elapsed()
         );

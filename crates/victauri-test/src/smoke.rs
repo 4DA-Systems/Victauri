@@ -553,6 +553,25 @@ impl VictauriClient {
             }};
         }
 
+        // A check that may be SKIPPED: its expression yields `Ok(Some(reason))` when it chose not
+        // to run (the reason becomes the detail), `Ok(None)` when it passed.
+        macro_rules! skippable_check {
+            ($name:expr, $expr:expr) => {{
+                let start = Instant::now();
+                let outcome: Result<Option<String>, TestError> = $expr;
+                checks.push(SmokeCheckResult {
+                    name: $name.to_string(),
+                    passed: outcome.is_ok(),
+                    skipped: matches!(outcome, Ok(Some(_))),
+                    detail: match outcome {
+                        Ok(reason) => reason.unwrap_or_default(),
+                        Err(e) => e.to_string(),
+                    },
+                    duration: start.elapsed(),
+                });
+            }};
+        }
+
         check!("eval_js works", self.assert_eval_works().await);
         check!("DOM snapshot valid", self.assert_dom_snapshot_valid().await);
         check!(
@@ -576,18 +595,10 @@ impl VictauriClient {
             self.assert_heap_under_mb(config.max_heap_mb).await
         );
         // Skippable: never ends a recording another client has in progress (R5B-SMOKE1).
-        let start = Instant::now();
-        let outcome = self.recording_lifecycle_check().await;
-        checks.push(SmokeCheckResult {
-            name: "recording lifecycle".to_string(),
-            passed: outcome.is_ok(),
-            skipped: matches!(outcome, Ok(Some(_))),
-            detail: match outcome {
-                Ok(reason) => reason.unwrap_or_default(),
-                Err(e) => e.to_string(),
-            },
-            duration: start.elapsed(),
-        });
+        skippable_check!(
+            "recording lifecycle",
+            self.recording_lifecycle_check().await
+        );
         check!(
             "health endpoint hardened",
             self.assert_health_hardened().await

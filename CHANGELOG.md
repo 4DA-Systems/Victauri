@@ -128,8 +128,8 @@ connection, so refused requests (a web page's no-cors fetches, a local script) c
 256 request slots, and a connection takes a request slot only once it has sent its first byte —
 a connection that sends nothing (a page's `<link rel=preconnect>` across `*.localhost` names
 never reaches a guard; measured in Edge: ~370 held, agent `/health` probes failing 17/30) waits
-in a separate pool of 1,024 and is closed after 3 s instead of holding a slot for the 30 s header
-deadline (round 5). Residual: a local process can still fill the 256 slots with started-but-stalled
+in a separate pool of 1,024 and is closed after 3 s instead of holding a slot for the header
+deadline (round 5; that deadline is now 10 s, was 30 s). Residual: a local process can still fill the 256 slots with started-but-stalled
 request heads until the header deadline (slow-loris is bounded, not prevented); GitHub Release notes are the version's CHANGELOG section (not raw commit
 subjects) and the binaries ship with `SHA256SUMS`; tool-reference, MIGRATION, README and security
 docs corrections.
@@ -231,7 +231,7 @@ Tauri lacking `#[tauri::command(rename)]` (supported since tauri-macros 2.6).
   header is sent at all.
 - **Connection exhaustion.** `axum::serve` set no hyper timer: a client trickling request headers
   held a connection forever, and with `auth_disabled` 64 slow bodies held every request slot. The
-  server now runs HTTP/1.1 with a 30 s header deadline, a 30 s / 2 MiB body deadline read after
+  server now runs HTTP/1.1 with a header deadline (10 s since round 5b; 30 s before), a 30 s / 2 MiB body deadline read after
   authentication, and a 256-connection cap; `/mcp` bodies are capped at 2 MiB like every route.
 - **Discovery could be blocked by another local user** on Unix (shared `/tmp/victauri`, which the
   owner check then refused). The root is per-user (`$XDG_RUNTIME_DIR/victauri` or
@@ -548,6 +548,96 @@ The remainder of this entry is the first (full-surface) audit round, merged in #
 - VS Code extension (released separately): it no longer re-sends the Bearer token to a port its app
   no longer owns (discovery is re-checked before every token-bearing request), and refresh polls
   cannot overlap.
+
+### Round 5b — every remaining Low fixed before release
+
+Round 5 closed its Mediums but listed ~35 Low findings from its six lenses. All of them are fixed
+here (still 0.9.0), each with a test that failed first; behavior changes are in MIGRATION.md.
+
+**Tools**
+
+- `verify_state`, `assert_semantic` and `wait_for` (`expression`) accept a trailing `;` or
+  `// comment` and multi-line expressions; a `wait_for` expression that does not parse fails at once
+  instead of polling until its timeout. An expression that evaluates to `undefined` reads as `null`
+  (it failed with "not valid JSON"). `wait_for` `timeout_ms: 0` checks once, immediately (the page
+  treated 0 as its 10 s default and the call failed as "eval timed out").
+- **Refused page actions are tool errors:** `interact`, `input`, `inspect` and `route add` report a
+  page refusal (covered, disabled, hidden, detached, not fillable, unknown ref, invalid rule) as
+  `isError` with the reason and a `[hint: …]`, instead of a successful `{ok:false}` result.
+- `logs slow_ipc` honours `webview_label`; `explain diff` reports the real call count and each
+  command once (a consecutive-only dedup double-listed interleaved commands).
+
+**Plugin core, data access and threading**
+
+- Plugin setup that runs off the main thread (a plugin registered at runtime from a background
+  thread via `AppHandle::plugin`) now records the real main thread and installs its handle there;
+  every webview/window tool used to fail with "main-thread app handle is not installed".
+- Page-callable IPC queries are bounded: `victauri_get_ipc_log` returns the newest 100 calls by
+  default (max 1000), and ghost detection / IPC integrity no longer copy the whole event log on the
+  UI thread (14–17 ms → 0.1–3 ms on a 10,000-call log).
+- `query_db` runs only SQLite built-ins, SQLite's own FTS/R-Tree/Geopoly functions and functions
+  registered as deterministic; other app-registered functions are refused by name, and
+  `load_extension` is never allowed. **Also fixed: R-Tree tables could not be read through
+  `query_db` at all** (the authorizer refused the statements R-Tree prepares when it connects).
+- `db_health` never runs app-registered virtual-table code: when such a module is registered and
+  the file may contain virtual tables, `quick_check` runs per ordinary table
+  (`integrity_check_kind: "quick_check (per table)"`, new `integrity_check_note`).
+- An eval result is accepted only from the window it was sent to.
+- Redaction covers URL credential parameters (`access_token`, `api_key`, `sig`, …), sensitive keys
+  in JSON nested inside strings, JSON embedded in text, and truncated JSON; the remaining limits
+  are listed in the security docs.
+- The request-head deadline (also the idle keep-alive timeout) is 10 s instead of 30 s, and every
+  Victauri HTTP client drops pooled connections after 5 s, so a pooled connection is never reused
+  just as the server closes it.
+- `probe` / `on_ready` docs state which thread they run on and that they must not touch Tauri
+  handles; the main-thread round trip documents its real ~2× timeout worst case.
+
+**Injected bridge**
+
+- `css inject`'s remote-URL check is allowlist-based on a real CSS tokenizer: in a URL position only
+  `data:` or a scheme-less, non-`//` reference passes (`url(https:evil/x)`, `http:/evil`,
+  `image-set("//evil")` and escaped variants used to pass), and a `/*` inside a string can no longer
+  hide a following remote `url()`.
+- The animation scrub/sample helpers moved behind the per-process agent key (page script could
+  erase or replace a sweep recording).
+- Route rules match every spelling of a request (relative, absolute, `URL`, `Request`, XHR);
+  a route glob's behaviour is documented.
+- A reused XHR gets one network-log entry per request (later requests rewrote earlier entries; a
+  re-`open()` mid-flight left a `pending` entry that wedged `network_idle`); `fetch()` with no
+  arguments rejects natively; logged URLs over 2048 characters are stored cut (large `data:` URLs
+  pinned up to 1000× their size); captured IPC bodies and the in-app `victauri_eval_js` /
+  `victauri_dom_snapshot` commands use the init-time JSON functions, so a page `toJSON` or a
+  replaced `JSON.stringify` cannot forge their results or hang them.
+
+**Clients and discovery**
+
+- The CLI bridge handles requests concurrently (a long `tools/call` no longer delays `ping`,
+  parallel calls or `notifications/cancelled`; up to 32 in flight; one backend handshake), still
+  never re-sending a possibly-delivered call.
+- The bridge confirms the app's `/info` identity for `--app` before forwarding, refuses
+  `VICTAURI_PORT` combined with a selector naming a different app (also in `victauri-test`/CLI
+  discovery), and uses victauri-test's hardened liveness check on Unix (never a bare `PATH` lookup).
+- Windows discovery readers (CLI/bridge, `victauri-test`, watchdog, VS Code) trust a discovery
+  folder only if the current user owns it (or `BUILTIN\Administrators` with the user a member): an
+  entry planted on a shared `TEMP` (e.g. MSYS2's `C:\msys64\tmp`) used to be trusted.
+- On Unix, when `/tmp/victauri-<uid>` is unusable (another user created it first — a discovery
+  denial of service), the plugin registers under `$XDG_STATE_HOME/victauri`
+  (`~/.local/state/victauri`) and every reader scans it.
+- `victauri doctor` exits 1 when a check fails; `init` prints plain paths (no `\\?\`) and its
+  suggested `.mcp.json` snippet includes `--app`; the smoke suite never stops a recording it did
+  not start (the check is reported skipped); IPC checkpoints are `u64` (they truncated on 32-bit —
+  see MIGRATION); the 401 hint names the real token locations; `TestError` display neutralizes
+  page-derived text (control characters, `::` workflow commands) while keeping line breaks.
+
+**Tests, CI and docs**
+
+- Eight timing-sensitive tests made deterministic (dispatch-gate, probe, file-read, rate-limiter,
+  lock-wait and db_health tests now synchronize or count instead of racing wall-clock bounds);
+  checked by running each 20–30× under full CPU oversubscription.
+- The `rusqlite-range` CI job fails if the update did not actually reach rusqlite 0.40.x; the
+  getting-started guide says the 1.88 MSRV is Victauri's own and that a fresh tauri 2.12 tree needs
+  Rust 1.90; stale `<temp>/victauri/<pid>/token` paths and a "token is printed to the log" claim
+  (it never is) corrected in the rustdoc.
 
 ## [0.8.8] - 2026-08-12
 

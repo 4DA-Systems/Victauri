@@ -25,7 +25,10 @@
 //! # Configuration
 //!
 //! Authentication is **enabled by default** with an auto-generated Bearer token
-//! written to `<temp>/victauri/<pid>/token` for client auto-discovery. The MCP
+//! written to the per-user discovery directory (`<root>/<pid>/token`; the root is `%TEMP%\victauri` on
+//! Windows, and on Unix `$XDG_RUNTIME_DIR/victauri`, `<temp>/victauri-<uid>` or
+//! `~/.local/state/victauri`) for client
+//! auto-discovery. The MCP
 //! server listens on `127.0.0.1` only and is gated behind `#[cfg(debug_assertions)]`.
 //! Use `.auth_token("...")` for a fixed token, or `.auth_disabled()` to opt out.
 //!
@@ -367,7 +370,9 @@ impl VictauriState {
 /// via environment variables.
 ///
 /// **Authentication is enabled by default** with an auto-generated token written to
-/// the discovery directory (`<temp>/victauri/<pid>/token`). MCP clients that read
+/// the per-user discovery directory (`<root>/<pid>/token`; the root is `%TEMP%\victauri` on
+/// Windows, and on Unix `$XDG_RUNTIME_DIR/victauri`, `<temp>/victauri-<uid>` or
+/// `~/.local/state/victauri`). MCP clients that read
 /// this file get seamless access. Set `VICTAURI_AUTH_TOKEN` for a fixed token, or
 /// call [`auth_disabled()`](VictauriBuilder::auth_disabled) to opt out for local-only
 /// single-user development.
@@ -473,9 +478,11 @@ impl VictauriBuilder {
     ///
     /// **Authentication is already enabled by default** (see [`Self::auth_disabled`]),
     /// so this call is redundant in normal use and is kept for explicitness and
-    /// backward compatibility. The token is printed to the log on startup and written
-    /// to the discovery directory (`<temp>/victauri/<pid>/token`) for client
-    /// auto-discovery.
+    /// backward compatibility. The token is never logged; it is written only to
+    /// the per-user discovery directory (`<root>/<pid>/token`; the root is `%TEMP%\victauri` on
+    /// Windows, and on Unix `$XDG_RUNTIME_DIR/victauri`, `<temp>/victauri-<uid>` or
+    /// `~/.local/state/victauri`)
+    /// for client auto-discovery.
     #[must_use]
     pub fn auth_enabled(mut self) -> Self {
         self.auth_explicitly_enabled = true;
@@ -1229,7 +1236,9 @@ fn emit_security_banner(port: u16) {
 /// Initialize the Victauri plugin with default settings (port 7373 or `VICTAURI_PORT` env var).
 ///
 /// In debug builds: starts the embedded MCP server with **authentication enabled**
-/// (auto-generated token written to `<temp>/victauri/<pid>/token`), injects the JS
+/// (auto-generated token written to the per-user discovery directory (`<root>/<pid>/token`; the root is `%TEMP%\victauri` on
+/// Windows, and on Unix `$XDG_RUNTIME_DIR/victauri`, `<temp>/victauri-<uid>` or
+/// `~/.local/state/victauri`)), injects the JS
 /// bridge, and registers all Tauri command handlers.
 ///
 /// In release builds: returns a no-op plugin. The MCP server, JS bridge, and

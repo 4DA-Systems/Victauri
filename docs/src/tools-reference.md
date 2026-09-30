@@ -788,7 +788,11 @@ Deep backend introspection — command performance profiling, IPC contract testi
 per-table `row_count` (counted under a 5 s budget — tables not reached get
 `row_count: null` and `row_counts_complete: false`; the listing is capped and flagged by
 `tables_truncated`); and `integrity_check` from SQLite `PRAGMA quick_check` under its own
-5 s budget. On a large database `quick_check` may report
+5 s budget. When the file may contain virtual tables and the host app has registered a
+non-built-in virtual-table module, the check runs table by table over ordinary tables only
+(`integrity_check_kind: "quick_check (per table)"`, reason in `integrity_check_note`), so no
+app-registered module code runs; otherwise `integrity_check_note` is `null`. On a large
+database `quick_check` may report
 `"not completed: … exceeded its budget …"` — that means *unknown*, not corrupt. It never
 checkpoints or inspects the `-wal` file (`wal_checkpoint` is reported as "not run
 (read-only diagnostics)" in WAL mode).

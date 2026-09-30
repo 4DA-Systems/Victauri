@@ -315,6 +315,10 @@ impl VictauriClient {
         let host = "127.0.0.1";
         let base_url = format!("http://{host}:{port}");
         let http = reqwest::Client::builder()
+            // Below the plugin's 10 s idle keep-alive (its request-head deadline), so a pooled
+            // connection is never reused just as the server closes it (a request lost that way looks
+            // "possibly delivered" and a tool call is then not retried).
+            .pool_idle_timeout(std::time::Duration::from_secs(5))
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()

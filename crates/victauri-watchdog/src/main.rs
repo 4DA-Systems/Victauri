@@ -652,6 +652,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let client = reqwest::Client::builder()
+        // Below the plugin's 10 s idle keep-alive (its request-head deadline), so a pooled
+        // connection is never reused just as the server closes it (a request lost that way looks
+        // "possibly delivered" and a tool call is then not retried).
+        .pool_idle_timeout(std::time::Duration::from_secs(5))
         .timeout(Duration::from_secs(5))
         .build()?;
 

@@ -5214,7 +5214,7 @@ impl VictauriMcpHandler {
         // never ran.
         //
         // The window check runs in its own task: listing windows is a main-thread round trip
-        // that can take up to its 10s dispatch timeout on a busy UI, and must neither stall this
+        // that can take up to ~2x its 10s dispatch timeout (about 20s) on a busy UI, and must neither stall this
         // wait nor push it past its deadline. A listing that FAILS (a busy or wedged UI) is not
         // evidence of anything — only a successful listing that lacks the window is.
         let watched: Option<String> = (!target.is_empty()).then_some(target);

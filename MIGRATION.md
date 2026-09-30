@@ -125,8 +125,14 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
   sends `Access-Control-Allow-Origin`. HTTP clients that send no `Origin` or `Sec-Fetch-Site`
   (curl, reqwest, the CLI, `victauri-test`) are unaffected.
 - On Unix the discovery directory moved to `$XDG_RUNTIME_DIR/victauri/<pid>` or
-  `<temp>/victauri-<euid>/<pid>`. The 0.9 CLI, test client and watchdog also read the old
-  `<temp>/victauri/` root, so they find apps built with 0.8.x; a 0.8.x client does not find a 0.9 app.
+  `<temp>/victauri-<euid>/<pid>`, and — when `<temp>/victauri-<euid>` is unusable (e.g. another
+  local user created it first) — `$XDG_STATE_HOME/victauri/<pid>` (default
+  `~/.local/state/victauri/<pid>`). The 0.9 CLI, test client, watchdog and VS Code extension scan
+  all of these plus the old `<temp>/victauri/` root, so they find apps built with 0.8.x; a 0.8.x
+  client does not find a 0.9 app.
+- On Windows every discovery reader (CLI/bridge, `victauri-test`, watchdog, VS Code) now trusts a
+  discovery folder only if the current user owns it (or `BUILTIN\Administrators` does and the user
+  is a member) — the same rule the plugin uses when writing it.
 - `query_db` returns at most 256 columns (a wider `SELECT *` errors), suffixes duplicate column
   names (`a`, `a:1`), refuses `LIKE`/`GLOB` patterns over 1000 bytes, and answers "busy" when two
   database calls are already running. "database not found" also covers a path resolving outside
@@ -191,6 +197,50 @@ implementations, so existing impls compile unchanged — `try_get_window_states`
     "victauri:allow-victauri-dom-snapshot"
   ]
   ```
+- **Refused page actions are tool errors.** `interact` (click/double_click/hover/focus/
+  scroll_into_view/select_option), `input` (fill/type_text/press_key), `inspect` (e.g. an unknown
+  ref) and `route add` used to return a *successful* `{"ok": false, "error": "…", "hint": "…"}` when
+  the page refused the action. They now return an error: MCP `isError: true` with text
+  `"<error>\n\n[hint: RETRY_LATER|CHECK_INPUT]"`, REST `{"error": "<same text>"}`. With
+  `victauri-test`, `client.click(..)` / `Locator::click(..)` and friends now return
+  `Err(TestError::ToolError(msg))` instead of `Ok(json)`; if you checked `result["ok"] == false`,
+  match on the error instead. Successful results are unchanged.
+- `wait_for` `timeout_ms: 0` now means "check once, immediately" (it meant the 10 s default), and
+  a `wait_for` expression that does not parse fails at once instead of polling until its timeout.
+  `assert_semantic` / `verify_state` read an expression that evaluates to `undefined` as `null`
+  (`exists` false, `falsy` true) instead of failing; a trailing `;` or `// comment` is accepted.
+- **`victauri-test` IPC checkpoints are `u64`** (they were `usize`, which truncated on 32-bit):
+  `create_ipc_checkpoint(&mut self) -> Result<u64, TestError>`, `get_ipc_calls_since(&mut self,
+  checkpoint: u64)` (and the deprecated `ipc_checkpoint` / `ipc_calls_since`). Code that passes the
+  value straight back needs no change; drop any `as usize` / `: usize`.
+- `SmokeCheckResult` has a new `skipped` field (non-breaking: the type is `#[non_exhaustive]`): the
+  smoke suite no longer stops a recording it did not start — that check is reported as skipped.
+- `css inject` (without `allow_remote`) rejects more remote-URL forms: `https:host/x`, `http:/host`,
+  `\\host`, `/\host`, `blob:` and any other scheme in a URL position, and any string naming a
+  remote host (e.g. `content:"https://…"`); only `data:` and scheme-less relative references pass.
+- The animation `scrub` / `sample` helpers (`scrubPrepare`, `scrubSeek`, `scrubRestore`,
+  `installSweepRecorder`, `readSweep`) are no longer callable from page script on
+  `window.__VICTAURI__`; the `animation` tool is unchanged.
+- Network-log URLs longer than 2048 characters are stored cut with a `…[+N chars]` marker (IPC
+  URLs never); route matching still sees the full URL. Route patterns now match the absolute URL,
+  the same-origin path+query+hash and the raw string, so a rule hits every spelling of a request.
+- Page-callable commands: `victauri_get_ipc_log` without `limit` returns the newest 100 calls (pass
+  `limit`, max 1000, for more); `victauri_check_ipc_integrity` lists at most the newest 100 stale /
+  error calls (its counts still cover the whole log); a page-originated `victauri_eval_js`
+  returning `undefined` resolves to `"null"` (it timed out).
+- `query_db` allows SQLite built-ins, SQLite's own FTS/R-Tree/Geopoly functions and app functions
+  registered as deterministic; any other app-registered function is refused with an error naming
+  it, and `load_extension` is never allowed. Register pure functions with `SQLITE_DETERMINISTIC`.
+- `introspect db_health` has a new `integrity_check_note` field (`null` when the whole database was
+  checked); `integrity_check_kind` can be `"quick_check (per table)"` when the host app registered a
+  non-built-in virtual-table module (so none of its code runs).
+- The server's request-head deadline — also its idle keep-alive timeout — is 10 s (was 30 s). The
+  0.9 clients (CLI bridge, `victauri-test`, watchdog) drop pooled connections after 5 s; an HTTP
+  client of your own that keeps idle connections longer than 10 s should do the same.
+- `victauri bridge --app` checks that the backend's `/info` reports that identity before forwarding
+  (any real plugin ≥ 0.7.4 does), and `VICTAURI_PORT` together with an app selector that names a
+  different app is refused (bridge, CLI and `victauri-test`) instead of driving the app on that port.
+- `victauri doctor` exits 1 when any check fails (warnings still exit 0).
 - New in `victauri-test`: `invoke_command_with_timeout`, `discover_app`, the `terminal` sanitizer
   module and `health_status_means_alive`.
 - The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the

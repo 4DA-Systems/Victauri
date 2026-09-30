@@ -920,6 +920,10 @@ async fn forward_with_retries(bridge: &Bridge, msg: &Value) -> ForwardResult {
 fn build_client() -> Result<reqwest::Client> {
     // The default; `post_message` sets each request's own (see `request_timeout_for`).
     reqwest::Client::builder()
+        // Below the plugin's 10 s idle keep-alive (its request-head deadline), so a pooled
+        // connection is never reused just as the server closes it (a request lost that way looks
+        // "possibly delivered" and a tool call is then not retried).
+        .pool_idle_timeout(std::time::Duration::from_secs(5))
         .timeout(DEFAULT_REQUEST_TIMEOUT)
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1518,6 +1522,10 @@ fn health_client() -> &'static reqwest::Client {
     static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
+            // Below the plugin's 10 s idle keep-alive (its request-head deadline), so a pooled
+            // connection is never reused just as the server closes it (a request lost that way looks
+            // "possibly delivered" and a tool call is then not retried).
+            .pool_idle_timeout(std::time::Duration::from_secs(5))
             .connect_timeout(Duration::from_millis(1200))
             .timeout(Duration::from_secs(3))
             .build()
