@@ -100,25 +100,7 @@ pub async fn victauri_eval_js<R: Runtime>(
     let slot = reserve_page_eval(&state, webview.label(), tx).await?;
     let id = serde_json::to_string(slot.id()).map_err(|e| e.to_string())?;
 
-    let inject = format!(
-        r"
-        (async () => {{
-            try {{
-                const __result = await (async () => {{ {code}
- }})();
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id},
-                    result: JSON.stringify(__result)
-                }});
-            }} catch (e) {{
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id},
-                    result: JSON.stringify({{ __error: e.message }})
-                }});
-            }}
-        }})();
-        "
-    );
+    let inject = crate::js_bridge::page_eval_script(&id, &code);
 
     // Through the bridge, i.e. on the main thread and serialized with every other
     // round trip — not a direct `webview.eval` from this tokio worker thread.
@@ -200,24 +182,8 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
     let slot = reserve_page_eval(&state, webview.label(), tx).await?;
     let id = serde_json::to_string(slot.id()).map_err(|e| e.to_string())?;
 
-    let inject = format!(
-        r"
-        (async () => {{
-            try {{
-                const snapshot = window.__VICTAURI__?.snapshot();
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id},
-                    result: JSON.stringify(snapshot)
-                }});
-            }} catch (e) {{
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id},
-                    result: JSON.stringify({{ __error: e.message }})
-                }});
-            }}
-        }})();
-        "
-    );
+    // Same delivery as a page eval: serialized by the bridge with its init-time JSON.
+    let inject = crate::js_bridge::page_eval_script(&id, "return window.__VICTAURI__?.snapshot()");
 
     // Through the bridge, i.e. on the main thread and serialized with every other
     // round trip — not a direct `webview.eval` from this tokio worker thread.

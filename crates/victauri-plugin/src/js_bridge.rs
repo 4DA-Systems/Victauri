@@ -60,7 +60,7 @@ pub fn init_script(caps: &BridgeCapacities) -> String {
 }
 
 /// Per-process secret that unlocks the bridge's agent-only operations (clearing logs and route
-/// rules, dialog auto-responses). It is embedded in the init script's closure and in the
+/// rules, dialog auto-responses, animation scrub / sweep recording). It is embedded in the init script's closure and in the
 /// scripts Victauri itself injects, never in anything page script can read, so a page cannot
 /// silently remove the agent's block/mock rules or erase captured evidence.
 #[doc(hidden)]
@@ -78,6 +78,20 @@ pub fn agent_key() -> &'static str {
 #[must_use]
 pub fn agent_ops_js() -> String {
     format!("window.__VICTAURI__?._agent(\"{}\")", agent_key())
+}
+
+/// Eval-wrapper code that calls one agent-only bridge operation, `call` (e.g.
+/// `scrubSeek(0.5)`), awaiting a returned promise; an object with `error` when the bridge is
+/// not loaded. Used by the `animation` tool. `pub` only so the jsdom suite can run the real
+/// snippets.
+#[doc(hidden)]
+#[must_use]
+pub fn agent_op_call_js(call: &str) -> String {
+    format!(
+        "return await (function () {{ var o = {}; \
+         return o ? o.{call} : {{ error: 'the Victauri bridge is not loaded in this page' }}; }})()",
+        agent_ops_js()
+    )
 }
 
 // ── Eval scripts ─────────────────────────────────────────────────────────────
@@ -183,6 +197,47 @@ pub fn eval_check_script(id: &str, nonce: Option<&str>) -> String {
     )
 }
 
+/// The script the in-app `victauri_eval_js` command (a page-originated eval) injects: runs
+/// `code` and delivers its result to `victauri_eval_callback` under `id_json` (a JSON string
+/// literal). `pub` only so the jsdom suite can drive the real script.
+#[doc(hidden)]
+#[must_use]
+pub fn page_eval_script(id_json: &str, code: &str) -> String {
+    // The result body is built by the bridge's `_pageEvalBody` (the `JSON.stringify` captured at
+    // init, blind to a `toJSON` planted on the universal prototypes, and never throwing), and the
+    // callback args have no prototype, so Tauri's own serialization of them cannot hit a planted
+    // `toJSON` either (R5B-PRISTINE1, mirroring R5-JS2 for agent evals). Without the bridge it
+    // falls back to the page's JSON, as before. Result format is unchanged: the value's JSON
+    // (`null` for `undefined`), or `{"__error": message}`.
+    format!(
+        r"
+        (async () => {{
+            const __vb = window.__VICTAURI__;
+            const __body = (__vb && __vb._pageEvalBody)
+                ? __vb._pageEvalBody
+                : (v, isErr) => isErr
+                    ? JSON.stringify({{ __error: v && v.message }})
+                    : (JSON.stringify(v) ?? 'null');
+            const __send = (body) => {{
+                const a = Object.create(null);
+                a.id = {id_json};
+                a.result = body;
+                return window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', a);
+            }};
+            let __out;
+            try {{
+                const __result = await (async () => {{ {code}
+ }})();
+                __out = __body(__result, false);
+            }} catch (e) {{
+                __out = __body(e, true);
+            }}
+            await __send(__out);
+        }})();
+        "
+    )
+}
+
 /// The body of the init script (after capacity variable declarations).
 /// Uses CAP_* variables for all log limits.
 const INIT_SCRIPT_BODY: &str = r#"
@@ -275,6 +330,16 @@ const INIT_SCRIPT_BODY: &str = r#"
         return null;
     }
     function isIpcUrl(url) { return ipcCommandPath(url) !== null; }
+    // The URL as stored in the network / route-match logs (R5B-DATAURL1). A log holds up to
+    // CAP_NETWORK entries, so keeping every URL verbatim let an app that fetches large `data:` /
+    // `blob:`-sized URLs pin CAP_NETWORK × their size (1000 × 1 MB = 1 GB). A longer URL is cut
+    // with a length marker; matching and IPC parsing always see the full URL.
+    var MAX_LOGGED_URL = 2048;
+    function loggedUrl(url) {
+        if (typeof url !== 'string' || url.length <= MAX_LOGGED_URL || isIpcUrl(url)) return url;
+        var head = truncText(url, MAX_LOGGED_URL);
+        return head + '…[+' + (url.length - head.length) + ' chars]';
+    }
     // Victauri's own IPC (plugin:victauri|*). Decided from the parsed IPC command path — NOT a
     // substring anywhere in the URL, which let any page request containing
     // "plugin%3Avictauri%7C" in a query string escape route rules and network logging.
@@ -339,22 +404,58 @@ const INIT_SCRIPT_BODY: &str = r#"
         return ms > MAX_TIMER_DELAY_MS ? MAX_TIMER_DELAY_MS : ms;
     }
 
+    // The forms a request URL is matched in (R5B-ROUTEURL1). `fetch('/api/x')` hands the bridge
+    // the relative string while a `Request` or `URL` object yields the absolute URL, so a rule
+    // matched against only one of them hit one spelling of a request and silently missed the
+    // other. A rule is tested against: the absolute URL (resolved against the document base URL,
+    // as fetch/XHR resolve it), the path + query + fragment when same-origin, and the string as
+    // the app passed it. The URL built-ins are the ones captured at init.
+    // Resolution is skipped for schemes that have no relative or same-origin spelling (a large
+    // data: URL is common, and parsing it for nothing is pure cost) and for very long URLs.
+    var ROUTE_RESOLVE_MAX = 8192;
+    var OPAQUE_URL_RE = /^\s*(data|blob|javascript|about):/i;
+    function routeUrlForms(url) {
+        var forms = [url];
+        if (!URL_CTOR || !URL_HREF_GET) return forms;
+        if (url.length > ROUTE_RESOLVE_MAX || OPAQUE_URL_RE.test(url)) return forms;
+        try {
+            var base = BASE_URI_GET ? REFLECT_APPLY(BASE_URI_GET, document, []) : window.location.href;
+            var u = new URL_CTOR(url, base);
+            var abs = REFLECT_APPLY(URL_HREF_GET, u, []);
+            if (abs !== url) forms[forms.length] = abs;
+            var loc = new URL_CTOR(window.location.href);
+            var sameOrigin = REFLECT_APPLY(URL_PROTOCOL_GET, u, []) === REFLECT_APPLY(URL_PROTOCOL_GET, loc, [])
+                && REFLECT_APPLY(URL_HOST_GET, u, []) === REFLECT_APPLY(URL_HOST_GET, loc, []);
+            if (sameOrigin) {
+                var rel = REFLECT_APPLY(URL_PATHNAME_GET, u, []) + REFLECT_APPLY(URL_SEARCH_GET, u, [])
+                    + REFLECT_APPLY(URL_HASH_GET, u, []);
+                if (rel !== url) forms[forms.length] = rel;
+            }
+        } catch (e) {}
+        return forms;
+    }
+
+    function routeRuleHits(r, url) {
+        try {
+            if (r.match_type === 'exact') return url === r.pattern;
+            if (r.match_type === 'regex') return new RegExp(r.pattern).test(url);
+            if (r.match_type === 'glob') return globToRegExp(r.pattern).test(url);
+            return url.indexOf(r.pattern) !== -1; // substring (default)
+        } catch (e) { return false; }
+    }
+
     function matchRoute(url, method) {
         if (!routeRules.length) return null;
         if (isVictauriInternalUrl(url)) return null;
         var m = (method || 'GET').toUpperCase();
+        var forms = routeUrlForms(url);
         for (var i = 0; i < routeRules.length; i++) {
             var r = routeRules[i];
             if (r.times && r.triggered >= r.times) continue;
             if (r.method && r.method.toUpperCase() !== m) continue;
-            var hit = false;
-            try {
-                if (r.match_type === 'exact') hit = (url === r.pattern);
-                else if (r.match_type === 'regex') hit = new RegExp(r.pattern).test(url);
-                else if (r.match_type === 'glob') hit = globToRegExp(r.pattern).test(url);
-                else hit = (url.indexOf(r.pattern) !== -1); // substring (default)
-            } catch (e) { hit = false; }
-            if (hit) return r;
+            for (var f = 0; f < forms.length; f++) {
+                if (routeRuleHits(r, forms[f])) return r;
+            }
         }
         return null;
     }
@@ -362,7 +463,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     function recordRouteMatch(rule, url, method) {
         rule.triggered = (rule.triggered || 0) + 1;
         routeMatchLog.push({
-            rule_id: rule.id, action: rule.action, url: url,
+            rule_id: rule.id, action: rule.action, url: loggedUrl(url),
             method: (method || 'GET').toUpperCase(), timestamp: Date.now(),
             trigger_count: rule.triggered,
         });
@@ -476,6 +577,21 @@ const INIT_SCRIPT_BODY: &str = r#"
     // argument (it throws for a Symbol, as they do). Not `String(v)`: page script can replace
     // `window.String`, and `String(symbol)` does not throw.
     function toStringExact(v) { return `${v}`; }
+    // The URL constructor and the getters route matching reads (routeUrlForms), and the
+    // document base URL getter fetch/XHR resolve a relative URL against.
+    var URL_CTOR = typeof window.URL === 'function' ? window.URL : null;
+    function protoGetter(proto, name) {
+        try { var d = Object.getOwnPropertyDescriptor(proto, name); return d && d.get ? d.get : null; }
+        catch (e) { return null; }
+    }
+    var URL_PROTO = URL_CTOR ? URL_CTOR.prototype : null;
+    var URL_HREF_GET = URL_PROTO && protoGetter(URL_PROTO, 'href');
+    var URL_PROTOCOL_GET = URL_PROTO && protoGetter(URL_PROTO, 'protocol');
+    var URL_HOST_GET = URL_PROTO && protoGetter(URL_PROTO, 'host');
+    var URL_PATHNAME_GET = URL_PROTO && protoGetter(URL_PROTO, 'pathname');
+    var URL_SEARCH_GET = URL_PROTO && protoGetter(URL_PROTO, 'search');
+    var URL_HASH_GET = URL_PROTO && protoGetter(URL_PROTO, 'hash');
+    var BASE_URI_GET = typeof Node === 'function' ? protoGetter(Node.prototype, 'baseURI') : null;
     var AGENT_KEY = '__VICTAURI_AGENT_KEY__';
 
     // Page script can plant `toJSON` on Object.prototype / Array.prototype, which JSON.stringify
@@ -794,6 +910,21 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (nonce !== PAGE_NONCE || evalState.has(id) || evalDone.has(id)) return null;
             evalMarkDone(id);
             return evalCallback(id, '{"__victauri_not_run":' + jsonStringLiteral('the code did not begin executing — this almost always means a syntax/parse error in the submitted code') + '}');
+        },
+        // The result body of a page-originated eval (`victauri_eval_js`, see page_eval_script):
+        // the value's JSON (`null` when JSON has no representation) or `{"__error": message}`,
+        // serialized with the stringify captured at init. Never throws: a value that cannot be
+        // serialized (circular, BigInt, a throwing own `toJSON`) is reported as an error, not
+        // left to time out (R5B-PRISTINE1).
+        _pageEvalBody: function(value, isError) {
+            'use strict';
+            if (isError) return '{"__error":' + jsonStringLiteral(errorText(value)) + '}';
+            var json;
+            try { json = PRISTINE_STRINGIFY(value); }
+            catch (e) {
+                return '{"__error":' + jsonStringLiteral('the result could not be serialized: ' + errorText(e)) + '}';
+            }
+            return json === undefined ? 'null' : json;
         },
         // Deliver an eval's outcome exactly once (a later settle for the same id is ignored).
         _evalSettle: function(id, payload) {
@@ -1268,7 +1399,8 @@ const INIT_SCRIPT_BODY: &str = r#"
             return copyEntries(limit ? routeMatchLog.slice(-limit) : routeMatchLog);
         },
 
-        // Agent-only operations (clear logs / route rules, dialog auto-responses) are NOT on
+        // Agent-only operations (clear logs / route rules, dialog auto-responses, animation
+        // scrub / sweep recorder) are NOT on
         // this page-visible object: page script could otherwise silently remove the agent's
         // block/mock rules, erase captured evidence, or flip dialog auto-answers. They are
         // handed out only for the per-process key Victauri embeds in its own injected scripts.
@@ -1979,7 +2111,59 @@ const INIT_SCRIPT_BODY: &str = r#"
                 };
             });
         },
+    };
 
+    try {
+        Object.freeze(window.__VICTAURI__);
+        Object.defineProperty(window, '__VICTAURI__', {
+            value: window.__VICTAURI__,
+            configurable: false,
+            writable: false,
+        });
+    } catch(e) {}
+
+    // Animation scrub / sweep-recorder state. Closure-held, not `window.__VICTAURI_SCRUB__` /
+    // `window.__VICTAURI_SWEEP__` globals, which page script could overwrite to fake the
+    // measured animation curve and jank statistics.
+    var scrubState = null;
+    var sweepState = null;
+
+    // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
+    // every op — and every callback an op creates — is strict: a page hook on a built-in an op
+    // calls then cannot reach the op through `.caller` (and call it without the key), nor the
+    // injected script beyond it whose source carries the key (R4-JS2).
+    var AGENT_OPS = (function() {
+    'use strict';
+    var AGENT_OPS = OBJ_CREATE(null);
+    AGENT_OPS.clearIpcLog = function() {
+        for (var i = networkLog.length - 1; i >= 0; i--) {
+            if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
+        }
+        return { ok: true };
+    };
+    AGENT_OPS.clearNetworkLog = function() { networkLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearConsoleLogs = function() { consoleLogs.length = 0; return { ok: true }; };
+    AGENT_OPS.clearMutationLog = function() { mutationLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearDialogLog = function() { dialogLog.length = 0; return { ok: true }; };
+    AGENT_OPS.clearRoute = function(id) {
+        var before = routeRules.length;
+        routeRules = routeRules.filter(function(r) { return r.id !== id; });
+        return { ok: true, removed: before - routeRules.length };
+    };
+    AGENT_OPS.clearRoutes = function() {
+        var n = routeRules.length;
+        routeRules = [];
+        return { ok: true, removed: n };
+    };
+    AGENT_OPS.setDialogAutoResponse = function(type, action, text) {
+        dialogAutoResponses[type] = { action: action, text: text };
+        return { ok: true };
+    };
+    // Animation scrub + sweep recorder (R5B-SCRUBKEY1). Agent-only: from page script,
+    // `installSweepRecorder` superseded the agent's armed recorder, `readSweep(true)` erased what
+    // it had recorded, and `scrubPrepare` / `scrubSeek` / `scrubRestore` paused, moved and
+    // resumed the page's animations under the agent. `listAnimations` stays public (read-only).
+    ASSIGN(AGENT_OPS, {
         // ── Deterministic animation scrubbing ────────────────────────────────
         // Pause the target's WAAPI animations and hold state across calls so the
         // Rust side can seek to evenly-spaced progress points and capture a
@@ -2177,54 +2361,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
             return res;
         },
-    };
-
-    try {
-        Object.freeze(window.__VICTAURI__);
-        Object.defineProperty(window, '__VICTAURI__', {
-            value: window.__VICTAURI__,
-            configurable: false,
-            writable: false,
-        });
-    } catch(e) {}
-
-    // Animation scrub / sweep-recorder state. Closure-held, not `window.__VICTAURI_SCRUB__` /
-    // `window.__VICTAURI_SWEEP__` globals, which page script could overwrite to fake the
-    // measured animation curve and jank statistics.
-    var scrubState = null;
-    var sweepState = null;
-
-    // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
-    // every op — and every callback an op creates — is strict: a page hook on a built-in an op
-    // calls then cannot reach the op through `.caller` (and call it without the key), nor the
-    // injected script beyond it whose source carries the key (R4-JS2).
-    var AGENT_OPS = (function() {
-    'use strict';
-    var AGENT_OPS = OBJ_CREATE(null);
-    AGENT_OPS.clearIpcLog = function() {
-        for (var i = networkLog.length - 1; i >= 0; i--) {
-            if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
-        }
-        return { ok: true };
-    };
-    AGENT_OPS.clearNetworkLog = function() { networkLog.length = 0; return { ok: true }; };
-    AGENT_OPS.clearConsoleLogs = function() { consoleLogs.length = 0; return { ok: true }; };
-    AGENT_OPS.clearMutationLog = function() { mutationLog.length = 0; return { ok: true }; };
-    AGENT_OPS.clearDialogLog = function() { dialogLog.length = 0; return { ok: true }; };
-    AGENT_OPS.clearRoute = function(id) {
-        var before = routeRules.length;
-        routeRules = routeRules.filter(function(r) { return r.id !== id; });
-        return { ok: true, removed: before - routeRules.length };
-    };
-    AGENT_OPS.clearRoutes = function() {
-        var n = routeRules.length;
-        routeRules = [];
-        return { ok: true, removed: n };
-    };
-    AGENT_OPS.setDialogAutoResponse = function(type, action, text) {
-        dialogAutoResponses[type] = { action: action, text: text };
-        return { ok: true };
-    };
+    });
     return Object.freeze(AGENT_OPS);
     })();
 
@@ -2775,6 +2912,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         var origFetch = window.fetch;
         if (origFetch) {
             window.fetch = function(input, init) {
+                // Arguments pass through exactly as given (R5B-FETCH0): `fetch()` with no input
+                // must reject natively, not fetch the string "undefined"; `fetch(x)` must not
+                // grow an explicit `undefined` init.
+                var argc = arguments.length;
+                if (argc === 0) return REFLECT_APPLY(origFetch, this, []);
+                function fetchArgs(first) { return argc === 1 ? [first] : [first, init]; }
                 // Log exactly the request fetch will make (R4-JS3). A look-alike object's own
                 // `url`/`method` used to be logged although fetch requests `String(input)`, so a
                 // page could plant fake IPC entries (a "quit_app" call that never happened).
@@ -2799,12 +2942,12 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (initMethod !== undefined) method = toStringExact(initMethod);
                 } catch (e) {
                     // fetch itself rejects this input: let it, with nothing logged.
-                    return REFLECT_APPLY(origFetch, this, [input, init]);
+                    return REFLECT_APPLY(origFetch, this, fetchArgs(input));
                 }
                 var id = ++networkCounter;
                 var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isVictauriInternalUrl(url);
-                var entry = { id: id, method: method.toUpperCase(), url: url, timestamp: Date.now(), status: 'pending', duration_ms: null };
+                var entry = { id: id, method: method.toUpperCase(), url: loggedUrl(url), timestamp: Date.now(), status: 'pending', duration_ms: null };
 
                 if (isIpc && !isVictauriInternal) {
                     var reqBody = init ? init.body : null;
@@ -2818,7 +2961,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                                 if (reqBody.length > MAX_IPC_BODY) {
                                     entry.request_args = bodyOmitted(reqBody.length, null);
                                 } else {
-                                    entry.request_args = JSON.parse(reqBody);
+                                    entry.request_args = PRISTINE_PARSE(reqBody);
                                 }
                             }
                         } catch(e) {}
@@ -2856,7 +2999,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                             // The Response constructor throws if a null-body status carries a body.
                             var nullBody = status === 204 || status === 205 || status === 304;
                             var bodyStr = nullBody ? null
-                                : ((typeof route.body === 'string') ? route.body : JSON.stringify(route.body));
+                                : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
                             var hdrs = { 'content-type': route.content_type };
                             for (var k in route.headers) { if (Object.prototype.hasOwnProperty.call(route.headers, k)) hdrs[k] = route.headers[k]; }
                             var resp = new Response(bodyStr, { status: status, statusText: route.status_text, headers: hdrs });
@@ -2867,7 +3010,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                             if (isIpc) {
                                 if (bodyStr === null) entry.response_body = null;
                                 else if (bodyStr.length > MAX_IPC_BODY) entry.response_body = bodyOmitted(bodyStr.length, null);
-                                else { try { entry.response_body = JSON.parse(bodyStr); } catch (e) { entry.response_body = bodyStr; } }
+                                else { try { entry.response_body = PRISTINE_PARSE(bodyStr); } catch (e) { entry.response_body = bodyStr; } }
                                 flushIpcWaiters();
                             }
                             return resp;
@@ -2895,7 +3038,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 return doRealFetch();
 
                 function doRealFetch() {
-                    return REFLECT_APPLY(origFetch, self, [fetchInput, init]).then(function(response) {
+                    return REFLECT_APPLY(origFetch, self, fetchArgs(fetchInput)).then(function(response) {
                         entry.status = response.status;
                         entry.status_text = response.statusText;
                         entry.duration_ms = Date.now() - entry.timestamp;
@@ -2928,7 +3071,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                                         entry.response_body = bodyOmitted(text.length, null);
                                         return;
                                     }
-                                    try { entry.response_body = JSON.parse(text); } catch(e) { entry.response_body = text; }
+                                    try { entry.response_body = PRISTINE_PARSE(text); } catch(e) { entry.response_body = text; }
                                 }).catch(function() {}).then(function() {
                                     flushIpcWaiters();
                                 });
@@ -2952,12 +3095,72 @@ const INIT_SCRIPT_BODY: &str = r#"
         // XMLHttpRequest
         var origOpen = XMLHttpRequest.prototype.open;
         var origSend = XMLHttpRequest.prototype.send;
-        // Per-request {method, url} as `open()` really received them, in a closure WeakMap —
-        // not an expando on the XHR, which page script could overwrite to forge the entry
-        // `send()` logs (R4-JS3). The WeakMap methods are captured before page script runs.
+        var ADD_LISTENER = EventTarget.prototype.addEventListener;
+        var DISPATCH_EVENT = EventTarget.prototype.dispatchEvent;
+        // Per-XHR state in a closure WeakMap — not an expando on the XHR, which page script
+        // could overwrite to forge the entry `send()` logs (R4-JS3): the {method, url} `open()`
+        // really received, and the log entry of the request currently in flight. The WeakMap
+        // methods are captured before page script runs.
+        //
+        // The bridge's listeners are attached ONCE per XHR and always update the CURRENT entry
+        // (R5B-XHR1). Attaching them on every send() piled them up on a reused XHR, each closing
+        // over its own send's entry, so every later request rewrote the earlier entries.
         var xhrNet = new WeakMap();
         var XHR_NET_GET = Function.prototype.call.bind(WeakMap.prototype.get);
         var XHR_NET_SET = Function.prototype.call.bind(WeakMap.prototype.set);
+        function xhrState(xhr) {
+            var st = XHR_NET_GET(xhrNet, xhr);
+            if (!st) {
+                st = { net: null, entry: null, hooked: false };
+                XHR_NET_SET(xhrNet, xhr, st);
+            }
+            return st;
+        }
+        function xhrEvent(type) {
+            return typeof ProgressEvent === 'function' ? new ProgressEvent(type) : new Event(type);
+        }
+        function xhrFinish(entry, status) {
+            entry.status = status;
+            entry.duration_ms = Date.now() - entry.timestamp;
+        }
+        function xhrLog(entry) {
+            networkLog.push(entry);
+            if (networkLog.length > CAP_NETWORK) networkLog.shift();
+        }
+        function xhrUnlog(entry) {
+            for (var i = networkLog.length - 1; i >= 0; i--) {
+                if (networkLog[i] === entry) { networkLog.splice(i, 1); return; }
+            }
+        }
+        function xhrHook(xhr, st) {
+            if (st.hooked) return;
+            st.hooked = true;
+            var on = function(type, fn) { REFLECT_APPLY(ADD_LISTENER, xhr, [type, fn]); };
+            on('load', function() {
+                var e = st.entry;
+                if (!e || e.status !== 'pending') return;
+                e.status_text = xhr.statusText;
+                xhrFinish(e, xhr.status);
+            });
+            on('error', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'error');
+            });
+            on('abort', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'aborted');
+            });
+            on('timeout', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'timeout');
+            });
+            // Backstop: whatever ended the request, it must not stay 'pending' forever (that
+            // would wedge wait_for network_idle / ipc_idle).
+            on('loadend', function() {
+                var e = st.entry;
+                if (e && e.status === 'pending') xhrFinish(e, 'error');
+            });
+        }
         XMLHttpRequest.prototype.open = function(method, url) {
             // No early delete: an open() that throws leaves the previous request intact (spec),
             // and a successful one replaces this entry below.
@@ -2971,79 +3174,80 @@ const INIT_SCRIPT_BODY: &str = r#"
             var args = [m, u];
             for (var i = 2; i < arguments.length; i++) args[i] = arguments[i];
             var ret = REFLECT_APPLY(origOpen, this, args);
-            XHR_NET_SET(xhrNet, this, { method: m, url: u });
+            var st = xhrState(this);
+            // open() on a request in flight terminates it without firing any event: close its
+            // entry here, or it would stay 'pending' forever.
+            if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+            st.entry = null;
+            st.net = { method: m, url: u };
             return ret;
         };
         XMLHttpRequest.prototype.send = function() {
-            var net = XHR_NET_GET(xhrNet, this);
-            if (net) {
-                var isVictauriInternal = isVictauriInternalUrl(net.url);
-                if (isVictauriInternal) {
-                    return REFLECT_APPLY(origSend, this, arguments);
-                }
-                var id = ++networkCounter;
-                var entry = {
-                    id: id,
-                    method: net.method.toUpperCase(),
-                    url: net.url,
-                    timestamp: Date.now(),
-                    status: 'pending',
-                    duration_ms: null,
-                };
-                networkLog.push(entry);
-                if (networkLog.length > CAP_NETWORK) networkLog.shift();
-                var self = this;
-                this.addEventListener('load', function() {
-                    entry.status = self.status;
-                    entry.status_text = self.statusText;
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                this.addEventListener('error', function() {
-                    if (entry.blocked) return; // keep 'blocked' for route-blocked requests
-                    entry.status = 'error';
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                this.addEventListener('abort', function() {
-                    entry.status = 'aborted';
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                this.addEventListener('timeout', function() {
-                    entry.status = 'timeout';
-                    entry.duration_ms = Date.now() - entry.timestamp;
-                });
-                // Backstop: whatever ended the request, it must not stay 'pending'
-                // forever (that would wedge wait_for network_idle / ipc_idle).
-                this.addEventListener('loadend', function() {
-                    if (entry.status === 'pending') {
-                        entry.status = 'error';
-                        entry.duration_ms = Date.now() - entry.timestamp;
-                    }
-                });
+            var st = XHR_NET_GET(xhrNet, this);
+            var net = st && st.net;
+            if (!net || isVictauriInternalUrl(net.url)) {
+                return REFLECT_APPLY(origSend, this, arguments);
+            }
+            // Each send() is its own request with its own log entry.
+            var entry = {
+                id: ++networkCounter,
+                method: net.method.toUpperCase(),
+                url: loggedUrl(net.url),
+                timestamp: Date.now(),
+                status: 'pending',
+                duration_ms: null,
+            };
+            xhrHook(this, st);
+            var self = this;
 
-                // Phase 1 routing for XHR: block + delay are supported here.
-                // `fulfill` (synthetic response) is fetch-only — faking the full
-                // XHR response surface is unreliable; document as a limitation.
-                var xroute = matchRoute(net.url, net.method);
-                if (xroute) {
-                    recordRouteMatch(xroute, net.url, net.method);
-                    if (xroute.action === 'block') {
-                        entry.status = 'blocked';
-                        entry.blocked = true;
-                        entry.duration_ms = Date.now() - entry.timestamp;
-                        var blockedXhr = this;
-                        setTimeout(function() {
-                            try { blockedXhr.dispatchEvent(new Event('error')); } catch (e) {}
-                        }, 0);
-                        return; // do not send
-                    }
-                    if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
-                        var dArgs = arguments, dSelf = this;
-                        setTimeout(function() { REFLECT_APPLY(origSend, dSelf, dArgs); }, xroute.delay_ms);
-                        return;
-                    }
+            // Phase 1 routing for XHR: block + delay are supported here.
+            // `fulfill` (synthetic response) is fetch-only — faking the full
+            // XHR response surface is unreliable; document as a limitation.
+            var xroute = matchRoute(net.url, net.method);
+            if (xroute) {
+                recordRouteMatch(xroute, net.url, net.method);
+                if (xroute.action === 'block') {
+                    st.entry = entry;
+                    entry.blocked = true;
+                    xhrFinish(entry, 'blocked');
+                    xhrLog(entry);
+                    // End it like a network failure — `error`, then `loadend` — unless the app
+                    // has moved this XHR on to another request meanwhile.
+                    SET_TIMEOUT(function() {
+                        if (st.entry !== entry) return;
+                        try {
+                            REFLECT_APPLY(DISPATCH_EVENT, self, [xhrEvent('error')]);
+                            REFLECT_APPLY(DISPATCH_EVENT, self, [xhrEvent('loadend')]);
+                        } catch (e) {}
+                    }, 0);
+                    return; // do not send
+                }
+                if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
+                    st.entry = entry;
+                    xhrLog(entry);
+                    var dArgs = arguments;
+                    SET_TIMEOUT(function() {
+                        // Re-opened meanwhile: this request no longer exists.
+                        if (st.entry !== entry || entry.status !== 'pending') return;
+                        try { REFLECT_APPLY(origSend, self, dArgs); }
+                        catch (e) { entry.error = String(e); xhrFinish(entry, 'error'); }
+                    }, xroute.delay_ms);
+                    return;
                 }
             }
-            return REFLECT_APPLY(origSend, this, arguments);
+            // The entry is current BEFORE the real send(): a synchronous XHR fires its events
+            // inside send(). A send() that throws (not opened, already sent) starts no request:
+            // its entry is dropped and the request still in flight stays current.
+            var previous = st.entry;
+            st.entry = entry;
+            xhrLog(entry);
+            try {
+                return REFLECT_APPLY(origSend, this, arguments);
+            } catch (e) {
+                if (st.entry === entry) st.entry = previous;
+                xhrUnlog(entry);
+                throw e;
+            }
         };
     })();
 

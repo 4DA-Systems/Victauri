@@ -3016,10 +3016,10 @@ impl VictauriMcpHandler {
                     .as_deref()
                     .map_or_else(|| "null".to_string(), js_string);
                 let code = if params.record.unwrap_or(false) {
-                    format!("return window.__VICTAURI__.installSweepRecorder({sel})")
+                    crate::js_bridge::agent_op_call_js(&format!("installSweepRecorder({sel})"))
                 } else {
                     let clear = params.clear.unwrap_or(false);
-                    format!("return window.__VICTAURI__.readSweep({clear})")
+                    crate::js_bridge::agent_op_call_js(&format!("readSweep({clear})"))
                 };
                 match self.eval_with_return(&code, label).await {
                     Ok(result_str) => {
@@ -3044,7 +3044,7 @@ impl VictauriMcpHandler {
             .map_or_else(|| "null".to_string(), js_string);
 
         // 1. Prepare: pause the target's animations, learn the timeline length.
-        let prep_code = format!("return await window.__VICTAURI__.scrubPrepare({sel})");
+        let prep_code = crate::js_bridge::agent_op_call_js(&format!("scrubPrepare({sel})"));
         let prep_v = match self.eval_with_return(&prep_code, label).await {
             Ok(s) => {
                 serde_json::from_str::<serde_json::Value>(&s).unwrap_or(serde_json::Value::Null)
@@ -3064,7 +3064,7 @@ impl VictauriMcpHandler {
                 .unwrap_or_else(|| crate::filmstrip::default_cols(n))
         };
         let resume = params.restore.unwrap_or(true);
-        let restore_code = format!("return window.__VICTAURI__.scrubRestore({resume})");
+        let restore_code = crate::js_bridge::agent_op_call_js(&format!("scrubRestore({resume})"));
         let mut curve: Vec<serde_json::Value> = Vec::with_capacity(points);
         let mut frames: Vec<crate::filmstrip::Frame> = Vec::new();
         let mut manifest: Vec<serde_json::Value> = Vec::new();
@@ -3075,7 +3075,7 @@ impl VictauriMcpHandler {
         for i in 0..points {
             #[allow(clippy::cast_precision_loss)]
             let progress = i as f64 / (points - 1) as f64;
-            let seek_code = format!("return await window.__VICTAURI__.scrubSeek({progress})");
+            let seek_code = crate::js_bridge::agent_op_call_js(&format!("scrubSeek({progress})"));
             match self.eval_with_return(&seek_code, label).await {
                 Ok(s) => {
                     let v = serde_json::from_str::<serde_json::Value>(&s)

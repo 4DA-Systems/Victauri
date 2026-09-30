@@ -220,6 +220,12 @@ async function run() {
     // can update its network log entries.
     if (!window.fetch) {
       window.fetch = function (input, init) {
+        // Native fetch() requires its first argument.
+        if (arguments.length === 0) {
+          return Promise.reject(
+            new TypeError("Failed to execute 'fetch': 1 argument required, but only 0 present."),
+          );
+        }
         const url =
           typeof input === "string"
             ? input

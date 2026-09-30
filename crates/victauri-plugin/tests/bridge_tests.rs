@@ -5539,7 +5539,8 @@ fn agent_only_controls_are_not_page_callable() {
             r"
             var b = window.__VICTAURI__;
             var names = ['clearIpcLog','clearConsoleLogs','clearMutationLog','clearNetworkLog',
-                'clearDialogLog','setDialogAutoResponse','clearRoute','clearRoutes'];
+                'clearDialogLog','setDialogAutoResponse','clearRoute','clearRoutes',
+                'scrubPrepare','scrubSeek','scrubRestore','installSweepRecorder','readSweep'];
             var exposed = names.filter(function(n) { return n in b; });
             b.addRoute({ pattern: '/blocked', action: 'block' });
             var wrongKey = b._agent('guess');
@@ -5552,9 +5553,9 @@ fn agent_only_controls_are_not_page_callable() {
             ops.setDialogAutoResponse('confirm', 'accept');
             var confirmAfter = window.confirm('sure?');
             // Sweep/scrub state is closure-held: a page-planted global is ignored.
-            b.installSweepRecorder(null);
+            ops.installSweepRecorder(null);
             window.__VICTAURI_SWEEP__ = { sessions: [{ samples: [], timing: {}, keyframes: [] }], stopped: false };
-            var sweep = b.readSweep(false);
+            var sweep = ops.readSweep(false);
             return { exposed: exposed, wrong_key: wrongKey, no_key: noKey, frozen: frozen,
                      rules_before: rulesBefore, removed: cleared.removed,
                      rules_after: b.getRouteRules().length,
