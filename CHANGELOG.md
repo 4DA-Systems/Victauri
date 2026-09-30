@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.9.0] - 2026-09-27
+## [0.9.0] - 2026-09-30
 
 A correctness-and-hardening release built from four audit rounds: a full-surface review (three
 lenses + a live sweep of 4DA), a five-lens pre-audit red team (auth/network boundary, new-code
