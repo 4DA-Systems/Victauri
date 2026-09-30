@@ -540,8 +540,13 @@ async fn app_state_probes_are_bounded_and_panic_isolated() {
     state
         .probes
         .register("fine", Arc::new(|| serde_json::json!({"depth": 3})));
-    let h = handler_with(TestBridge::default(), state);
+    let mut h = handler_with(TestBridge::default(), state);
 
+    // Only the deadline check runs under a short deadline. The panicking and the normal probe
+    // keep the production one: a 1 s deadline for them was shorter than a loaded machine's
+    // scheduling tail (new blocking thread + panic hook + unwind), and they flaked as "did not
+    // finish" — which is not what they test.
+    h.probe_timeout = Duration::from_secs(1);
     let started = Instant::now();
     let r = call(&h, "app_state", serde_json::json!({"probe": "stuck"})).await;
     assert_eq!(r.is_error, Some(true));
@@ -551,6 +556,7 @@ async fn app_state_probes_are_bounded_and_panic_isolated() {
         "{:?}",
         started.elapsed()
     );
+    h.probe_timeout = super::PROBE_TIMEOUT;
 
     let r = call(&h, "app_state", serde_json::json!({"probe": "broken"})).await;
     assert_eq!(r.is_error, Some(true));
@@ -573,7 +579,9 @@ async fn hung_probes_cannot_pile_up_blocking_threads() {
             serde_json::json!({"late": true})
         }),
     );
-    let h = Arc::new(handler_with(TestBridge::default(), state));
+    let mut h = handler_with(TestBridge::default(), state);
+    h.probe_timeout = Duration::from_secs(1);
+    let h = Arc::new(h);
     let calls: Vec<_> = (0..super::MAX_CONCURRENT_PROBES + 2)
         .map(|_| {
             let h = Arc::clone(&h);
@@ -644,7 +652,8 @@ async fn a_blocking_file_read_returns_at_its_deadline() {
         eprintln!("SKIP: mkfifo unavailable");
         return;
     }
-    let h = handler(TestBridge::default());
+    let mut h = handler(TestBridge::default());
+    h.file_read_timeout = Duration::from_secs(1);
     let started = Instant::now();
     let r = tokio::time::timeout(
         Duration::from_secs(20),

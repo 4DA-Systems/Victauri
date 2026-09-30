@@ -1413,17 +1413,12 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         waitFor: function(opts) {
             return new Promise(function(resolve) {
-                var timeout = opts.timeout_ms || 10000;
+                // 0 is a real timeout (a single immediate check), not "use the default".
+                var timeout = typeof opts.timeout_ms === 'number' && opts.timeout_ms >= 0 ? opts.timeout_ms : 10000;
                 var poll = opts.poll_ms || 200;
                 var start = Date.now();
 
                 function check() {
-                    var elapsed = Date.now() - start;
-                    if (elapsed >= timeout) {
-                        resolve({ ok: false, error: 'timeout after ' + timeout + 'ms', elapsed_ms: elapsed });
-                        return;
-                    }
-
                     function getFullText(root) {
                         // ShadowRoot has no innerText — fall back to textContent.
                         var text = (typeof root.innerText === 'string' ? root.innerText : root.textContent) || '';
@@ -1450,10 +1445,15 @@ const INIT_SCRIPT_BODY: &str = r#"
                         met = networkLog.every(function(n) { return n.status !== 'pending'; });
                     }
 
+                    // The condition is checked BEFORE the deadline test, so the last check lands
+                    // at the deadline itself, and never sleeps past it.
+                    var elapsed = Date.now() - start;
                     if (met) {
-                        resolve({ ok: true, elapsed_ms: Date.now() - start });
+                        resolve({ ok: true, elapsed_ms: elapsed });
+                    } else if (elapsed >= timeout) {
+                        resolve({ ok: false, error: 'timeout after ' + timeout + 'ms', elapsed_ms: elapsed });
                     } else {
-                        setTimeout(check, poll);
+                        setTimeout(check, Math.min(poll, timeout - elapsed));
                     }
                 }
                 check();

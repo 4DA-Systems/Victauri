@@ -19,6 +19,8 @@ mod rest;
 #[cfg(test)]
 mod robustness_tests;
 mod server;
+#[cfg(test)]
+mod tool_result_tests;
 mod verification_params;
 mod webview_params;
 mod window_params;
@@ -261,14 +263,24 @@ impl EvalFailure {
             message: message.into(),
         }
     }
+
+    /// The code did not parse (reported by the bridge's post-wrapper check), so it never ran.
+    fn is_parse_error(&self) -> bool {
+        self.kind == EvalFailureKind::NotSent && self.message.starts_with(PARSE_ERROR_PREFIX)
+    }
 }
 
-/// How long `app_state` waits for an app-registered probe closure (shortened under test).
-const PROBE_TIMEOUT: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_secs(10)
-};
+/// How [`unwrap_eval_envelope`] reports code that did not parse.
+const PARSE_ERROR_PREFIX: &str = "JavaScript parse error:";
+
+/// How long `app_state` waits for an app-registered probe closure.
+///
+/// This used to be 1 s under `cfg(test)` for EVERY probe call, so a test of a panicking or a
+/// normal probe raced a deadline shorter than the scheduling tail of a loaded machine (a fresh
+/// blocking-pool thread plus the panic hook and unwind measured ~0.4 s at 2x CPU
+/// oversubscription, more in a full parallel suite) and flaked as "did not finish". Tests that
+/// exercise the deadline itself shorten [`VictauriMcpHandler::probe_timeout`] on their handler.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// App-registered probes allowed to run at once. A probe that hangs keeps its blocking thread
 /// past [`PROBE_TIMEOUT`]; the cap stops repeated calls to it from leaking a thread each.
@@ -278,12 +290,9 @@ pub(crate) const MAX_CONCURRENT_PROBES: usize = 4;
 /// its thread past [`READ_APP_FILE_TIMEOUT`]).
 pub(crate) const MAX_CONCURRENT_FILE_READS: usize = 4;
 
-/// How long `read_app_file` waits for its (bounded, at most 10 MB) read (shortened under test).
-const READ_APP_FILE_TIMEOUT: std::time::Duration = if cfg!(test) {
-    std::time::Duration::from_secs(1)
-} else {
-    std::time::Duration::from_secs(15)
-};
+/// How long `read_app_file` waits for its (bounded, at most 10 MB) read. Tests that exercise
+/// the deadline shorten [`VictauriMcpHandler::file_read_timeout`] (see [`PROBE_TIMEOUT`]).
+const READ_APP_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Distinct command names `CommandTimings` tracks (its private `MAX_TIMED_COMMANDS`, mirrored
 /// here — a test pins the two together). Once that many are tracked, new names are dropped and
@@ -414,6 +423,10 @@ pub struct VictauriMcpHandler {
     probe_slots: Arc<tokio::sync::Semaphore>,
     /// Slots for `read_app_file` reads ([`MAX_CONCURRENT_FILE_READS`]); held by the read's thread.
     file_slots: Arc<tokio::sync::Semaphore>,
+    /// Deadline for one app probe ([`PROBE_TIMEOUT`]; tests of the deadline shorten it).
+    probe_timeout: std::time::Duration,
+    /// Deadline for one `read_app_file` read ([`READ_APP_FILE_TIMEOUT`]; likewise).
+    file_read_timeout: std::time::Duration,
 }
 
 #[tool_router]
@@ -718,7 +731,7 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("eval_js") {
             return tool_disabled("verify_state requires eval_js capability");
         }
-        let code = format!("return ({})", params.frontend_expr);
+        let code = expression_eval_code(&params.frontend_expr);
         let frontend_json = match self
             .eval_with_return(&code, params.webview_label.as_deref())
             .await
@@ -727,7 +740,7 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to evaluate frontend expression: {e}")),
         };
 
-        let frontend_state: serde_json::Value = match serde_json::from_str(&frontend_json) {
+        let frontend_state: serde_json::Value = match parse_expression_value(&frontend_json) {
             Ok(v) => v,
             Err(e) => {
                 return tool_error(format!(
@@ -897,7 +910,7 @@ impl VictauriMcpHandler {
         let Some(expr) = params.value.as_deref().filter(|s| !s.is_empty()) else {
             return missing_param("value", "wait_for(expression)");
         };
-        let code = format!("return ({expr});");
+        let code = expression_eval_code(expr);
         let start = std::time::Instant::now();
         let deadline = start + std::time::Duration::from_millis(timeout_ms);
         let poll = std::time::Duration::from_millis(poll_ms);
@@ -910,9 +923,14 @@ impl VictauriMcpHandler {
                 .min(std::time::Duration::from_secs(15))
                 .max(std::time::Duration::from_secs(1));
             match self
-                .eval_with_return_timeout(&code, params.webview_label.as_deref(), per_eval)
+                .eval_outcome(&code, params.webview_label.as_deref(), per_eval)
                 .await
             {
+                // Code that does not parse can never start matching: fail now instead of
+                // polling to the timeout.
+                Err(f) if f.is_parse_error() => {
+                    return tool_error(format!("wait_for(expression): {}", f.message));
+                }
                 Ok(raw) => {
                     let val = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
                     let met = match &params.expected {
@@ -928,7 +946,7 @@ impl VictauriMcpHandler {
                     }
                     last_value = val;
                 }
-                Err(e) => last_error = Some(e),
+                Err(e) => last_error = Some(e.message),
             }
 
             if std::time::Instant::now() >= deadline {
@@ -1005,7 +1023,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is.",
+        description = "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is. A result of `undefined` is treated as `null` (JSON has no undefined; like JS `x == null`): `exists` is false, `falsy` is true, `equals null` and `type_is \"null\"` pass.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1020,7 +1038,7 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("eval_js") {
             return tool_disabled("assert_semantic requires eval_js capability");
         }
-        let code = format!("return ({})", params.expression);
+        let code = expression_eval_code(&params.expression);
         let actual_json = match self
             .eval_with_return(&code, params.webview_label.as_deref())
             .await
@@ -1029,7 +1047,7 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to evaluate expression: {e}")),
         };
 
-        let actual: serde_json::Value = match serde_json::from_str(&actual_json) {
+        let actual: serde_json::Value = match parse_expression_value(&actual_json) {
             Ok(v) => v,
             Err(e) => return tool_error(format!("expression did not return valid JSON: {e}")),
         };
@@ -1105,7 +1123,7 @@ impl VictauriMcpHandler {
             match bounded::run_blocking_bounded(
                 None,
                 &format!("probe '{name}'"),
-                PROBE_TIMEOUT,
+                self.probe_timeout,
                 move || {
                     let _slot = slot;
                     Ok(probe())
@@ -1635,7 +1653,7 @@ impl VictauriMcpHandler {
     // ── Compound Tools ──────────────────────────────────────────────────────
 
     #[tool(
-        description = "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions.",
+        description = "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions. An action the page refuses (element covered, disabled, hidden, detached, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1709,7 +1727,7 @@ impl VictauriMcpHandler {
                     };
                 }
                 let code = format!("return window.__VICTAURI__?.click({})", js_string(ref_id));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::DoubleClick => {
@@ -1723,7 +1741,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.doubleClick({})",
                     js_string(ref_id)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::Hover => {
@@ -1734,7 +1752,7 @@ impl VictauriMcpHandler {
                     return missing_param("ref_id", "hover");
                 };
                 let code = format!("return window.__VICTAURI__?.hover({})", js_string(ref_id));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::Focus => {
@@ -1748,7 +1766,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.focusElement({})",
                     js_string(ref_id)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::ScrollIntoView => {
@@ -1766,7 +1784,7 @@ impl VictauriMcpHandler {
                 let x = params.x.unwrap_or(0.0);
                 let y = params.y.unwrap_or(0.0);
                 let code = format!("return window.__VICTAURI__?.scrollTo({ref_arg}, {x}, {y})");
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::SelectOption => {
@@ -1792,14 +1810,14 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     values_json
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
         }
     }
 
     #[tool(
-        description = "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls.",
+        description = "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls. An input the page refuses (element not fillable, covered, disabled, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1824,7 +1842,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     js_string(value)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InputAction::TypeText => {
@@ -1865,7 +1883,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     js_string(text)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InputAction::PressKey => {
@@ -1899,7 +1917,7 @@ impl VictauriMcpHandler {
                     };
                 }
                 let code = format!("return window.__VICTAURI__?.pressKey({})", js_string(key));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
         }
@@ -2513,7 +2531,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     props_arg
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::GetBoundingBoxes => {
@@ -2525,7 +2543,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.getBoundingBoxes([{}])",
                     refs.join(",")
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::Highlight => {
@@ -2555,7 +2573,7 @@ impl VictauriMcpHandler {
                     color_arg,
                     label_arg
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::ClearHighlights => {
@@ -2566,21 +2584,21 @@ impl VictauriMcpHandler {
                 {
                     return tool_disabled("inspect.clear_highlights");
                 }
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.clearHighlights()",
                     params.webview_label.as_deref(),
                 )
                 .await
             }
             InspectAction::AuditAccessibility => {
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.auditAccessibility()",
                     params.webview_label.as_deref(),
                 )
                 .await
             }
             InspectAction::GetPerformance => {
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.getPerformanceMetrics()",
                     params.webview_label.as_deref(),
                 )
@@ -2709,7 +2727,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.addRoute({})",
                     js_string(&rule.to_string())
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             RouteAction::List => {
@@ -3301,7 +3319,8 @@ impl VictauriMcpHandler {
                 };
                 let limit = params.limit.unwrap_or(20);
                 let code = slow_ipc_js(threshold, limit);
-                self.eval_bridge(&code, None).await
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
             }
             LogsAction::Clear => {
                 // Clearing the IPC/network logs erases captured evidence — a
@@ -4253,13 +4272,18 @@ impl VictauriMcpHandler {
                     }
                 }
 
-                ipc_commands.dedup();
+                // Every call counts; each command is listed once, in first-call order (a
+                // consecutive-only `dedup` used to undercount the calls and still list a
+                // command once per non-adjacent run).
+                let ipc_calls_made = ipc_commands.len();
+                let mut seen = HashSet::new();
+                ipc_commands.retain(|c| seen.insert(c.clone()));
 
                 let result = serde_json::json!({
                     "since": since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     "time_window_secs": secs,
                     "total_events": events.len(),
-                    "ipc_calls_made": ipc_commands.len(),
+                    "ipc_calls_made": ipc_calls_made,
                     "unique_commands": ipc_commands,
                     "dom_elements_changed": dom_changes,
                     "interactions": interaction_count,
@@ -4283,6 +4307,8 @@ impl VictauriMcpHandler {
             timed_out_labels: Arc::new(Mutex::new(HashSet::new())),
             probe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES)),
             file_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_READS)),
+            probe_timeout: PROBE_TIMEOUT,
+            file_read_timeout: READ_APP_FILE_TIMEOUT,
         }
     }
 
@@ -4512,7 +4538,7 @@ impl VictauriMcpHandler {
                  blocked on a pipe or device keeps running past its timeout). Retry shortly."
             ));
         };
-        bounded::run_blocking_bounded(None, "file read", READ_APP_FILE_TIMEOUT, move || {
+        bounded::run_blocking_bounded(None, "file read", self.file_read_timeout, move || {
             let _slot = slot;
             read_regular_file(&path, max_bytes)
         })
@@ -4867,6 +4893,21 @@ impl VictauriMcpHandler {
     async fn eval_bridge(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
         match self.eval_with_return(code, webview_label).await {
             Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
+            Err(e) => tool_error(e),
+        }
+    }
+
+    /// Run a page ACTION (`interact`, `input`, `inspect`, `route add`) and report a failure the
+    /// page returns — `{ok: false, error, hint}` or `{error}` — as a tool error carrying the
+    /// page's message and recovery hint. These used to come back as a SUCCESS result, so a
+    /// refused click (covered, disabled, ref not found) read as done unless the caller parsed
+    /// the body (R5B-ISERR1).
+    async fn eval_page_action(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
+        match self.eval_with_return(code, webview_label).await {
+            Ok(result) => match page_action_error(&result) {
+                Some(message) => tool_error(message),
+                None => CallToolResult::success(vec![ContentBlock::text(result)]),
+            },
             Err(e) => tool_error(e),
         }
     }
@@ -5805,7 +5846,7 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, EvalFailure> {
             return Err(EvalFailure::new(
                 EvalFailureKind::NotSent,
                 format!(
-                    "JavaScript parse error: {}",
+                    "{PARSE_ERROR_PREFIX} {}",
                     why.as_str().unwrap_or("the code did not begin executing")
                 ),
             ));
@@ -5859,6 +5900,63 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, EvalFailure> {
         ));
     }
     Ok(raw)
+}
+
+/// The eval code for a caller-supplied EXPRESSION (`verify_state`, `assert_semantic`,
+/// `wait_for` expression): code that returns the expression's value.
+///
+/// These used to be wrapped as `return (<expr>)`, so a trailing `;` or a trailing `// comment`
+/// (which swallowed the closing paren) turned a valid expression into a parse error. A single
+/// expression is now handed to the eval engine as-is: its string/comment-aware `return`
+/// auto-prepend already accepts a trailing `;`, trailing comments and multi-line expressions,
+/// and the wrapper ends the code with a newline. Anything the engine would NOT wrap (an object
+/// literal `{a: 1}.a`, which reads as a block) keeps the parenthesized form, with trailing `;`s
+/// dropped and the expression on lines of its own so a trailing line comment cannot swallow the
+/// closing paren. Multi-statement code stays a syntax error (these tools take an expression).
+fn expression_eval_code(expr: &str) -> String {
+    if should_prepend_return(expr) {
+        return expr.to_string();
+    }
+    let body = expr.trim_end_matches(|c: char| c == ';' || is_js_space(c));
+    format!("return (\n{body}\n);")
+}
+
+/// Parse the value of an expression evaluated by [`expression_eval_code`]. `undefined` (which
+/// the engine reports as the bare text `undefined`) is read as `null`: JSON has no `undefined`,
+/// and `null` is what JavaScript's `x == null` groups it with — so `exists` is false and `falsy`
+/// is true for it instead of the call failing as "not valid JSON".
+fn parse_expression_value(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    if raw == "undefined" {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(raw)
+}
+
+/// The failure a page action reported, as tool-error text: `{ok: false, …}`, or an object with
+/// a top-level `error` string and no `ok: true`. Anything else (arrays with per-item errors, an
+/// audit whose findings contain an `error` field) is a result. The page's recovery hint is kept
+/// in the same `[hint: …]` form every tool error uses; it is page-controlled, so only a plain
+/// `UPPER_SNAKE` word is carried over.
+fn page_action_error(result: &str) -> Option<String> {
+    let value: serde_json::Value = page_json::parse_page_json(result).ok()?;
+    let obj = value.as_object()?;
+    let ok = obj.get("ok").and_then(serde_json::Value::as_bool);
+    let error = obj.get("error").and_then(serde_json::Value::as_str);
+    if ok == Some(true) || (ok.is_none() && error.is_none()) {
+        return None;
+    }
+    let mut message = error.map_or_else(
+        || format!("the page reported failure: {value}"),
+        str::to_string,
+    );
+    if let Some(hint) = obj.get("hint").and_then(serde_json::Value::as_str)
+        && !hint.is_empty()
+        && hint.len() <= 32
+        && hint.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+    {
+        message.push_str(&format!("\n\n[hint: {hint}]"));
+    }
+    Some(message)
 }
 
 /// Statement keywords where a leading `return` would be a syntax error. Matched as whole words

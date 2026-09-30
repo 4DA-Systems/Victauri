@@ -12,7 +12,7 @@
     "name": "app_state"
   },
   {
-    "description": "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is.",
+    "description": "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is. A result of `undefined` is treated as `null` (JSON has no undefined; like JS `x == null`): `exists` is false, `falsy` is true, `equals null` and `type_is \"null\"` pass.",
     "name": "assert_semantic"
   },
   {
@@ -64,7 +64,7 @@
     "name": "get_registry"
   },
   {
-    "description": "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls.",
+    "description": "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls. An input the page refuses (element not fillable, covered, disabled, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
     "name": "input"
   },
   {
@@ -72,7 +72,7 @@
     "name": "inspect"
   },
   {
-    "description": "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions.",
+    "description": "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions. An action the page refuses (element covered, disabled, hidden, detached, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
     "name": "interact"
   },
   {
