@@ -1020,7 +1020,7 @@ impl QueryPolicy {
     fn for_connection(conn: &rusqlite::Connection) -> Self {
         let mut functions = Self::listed_functions(conn).unwrap_or_else(|e| {
             tracing::debug!(
-                "query_db: pragma_function_list unavailable ({e}); allowing only SQLite's                  built-in functions"
+                "query_db: pragma_function_list unavailable ({e}); allowing only SQLite's built-in functions"
             );
             SQLITE_BUILTIN_FUNCTIONS
                 .iter()
