@@ -187,6 +187,7 @@ fn classify_severity(
 /// with a `reliability` signal for exactly this reason. `registry_only` is purely
 /// informational (registered handlers never invoked during the observation window).
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GhostCommandReport {
     /// Commands invoked from the frontend but absent from Victauri's introspection
     /// registry. A *candidate* ghost — only a real ghost if the registry is complete.
@@ -201,6 +202,7 @@ pub struct GhostCommandReport {
 
 /// A command that exists on only one side of the frontend/backend boundary.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct GhostCommand {
     /// Command name as invoked or registered.
     pub name: String,
@@ -241,20 +243,13 @@ impl fmt::Display for GhostCommand {
 /// # Examples
 ///
 /// ```
-/// use victauri_core::{GhostCommandReport, GhostCommand, GhostSource};
+/// use victauri_core::{CommandInfo, CommandRegistry, detect_ghost_commands};
 ///
-/// let report = GhostCommandReport {
-///     frontend_only: vec![
-///         GhostCommand {
-///             name: "delete".to_string(),
-///             source: GhostSource::FrontendOnly,
-///             description: None,
-///         },
-///     ],
-///     registry_only: vec![],
-///     total_frontend_commands: 3,
-///     total_registry_commands: 2,
-/// };
+/// let registry = CommandRegistry::new();
+/// registry.register(CommandInfo::new("a"));
+/// registry.register(CommandInfo::new("b"));
+/// let frontend = ["a", "b", "delete"].map(String::from);
+/// let report = detect_ghost_commands(&frontend, &registry);
 /// assert_eq!(
 ///     report.to_string(),
 ///     "1 ghost command(s) (3 frontend, 2 registry)"
@@ -275,30 +270,24 @@ impl fmt::Display for GhostCommandReport {
 ///
 /// ```
 /// use victauri_core::verification::IpcIntegrityReport;
+/// use serde_json::json;
 ///
-/// let healthy = IpcIntegrityReport {
-///     total_calls: 10,
-///     completed: 10,
-///     pending: 0,
-///     errored: 0,
-///     stale_calls: vec![],
-///     error_calls: vec![],
-///     healthy: true,
-/// };
+/// // Reports come from `check_ipc_integrity`; parsed from JSON here to show both states.
+/// let healthy: IpcIntegrityReport = serde_json::from_value(json!({
+///     "total_calls": 10, "completed": 10, "pending": 0, "errored": 0,
+///     "stale_calls": [], "error_calls": [], "healthy": true
+/// }))
+/// .unwrap();
 /// assert_eq!(
 ///     healthy.to_string(),
 ///     "IPC healthy: 10/10 completed"
 /// );
 ///
-/// let unhealthy = IpcIntegrityReport {
-///     total_calls: 10,
-///     completed: 7,
-///     pending: 2,
-///     errored: 1,
-///     stale_calls: vec![],
-///     error_calls: vec![],
-///     healthy: false,
-/// };
+/// let unhealthy: IpcIntegrityReport = serde_json::from_value(json!({
+///     "total_calls": 10, "completed": 7, "pending": 2, "errored": 1,
+///     "stale_calls": [], "error_calls": [], "healthy": false
+/// }))
+/// .unwrap();
 /// assert_eq!(
 ///     unhealthy.to_string(),
 ///     "IPC unhealthy: 0 stale, 1 errored of 10 calls"
@@ -398,6 +387,7 @@ pub fn detect_ghost_commands(
 
 /// Summary of IPC round-trip health: completed, pending, errored, and stale calls.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct IpcIntegrityReport {
     /// Total number of IPC calls analyzed.
     pub total_calls: usize,
@@ -417,6 +407,7 @@ pub struct IpcIntegrityReport {
 
 /// An IPC call that has been pending longer than the staleness threshold.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct StaleCall {
     /// Unique call identifier.
     pub id: String,
@@ -432,6 +423,7 @@ pub struct StaleCall {
 
 /// An IPC call that returned an error result.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ErrorCall {
     /// Unique call identifier.
     pub id: String,
@@ -461,15 +453,17 @@ pub struct ErrorCall {
 #[must_use]
 pub fn check_ipc_integrity(event_log: &EventLog, stale_threshold_ms: i64) -> IpcIntegrityReport {
     let now = Utc::now();
-    let calls = event_log.ipc_calls();
-    let total_calls = calls.len();
+    let mut total_calls = 0usize;
     let mut completed = 0usize;
     let mut pending = 0usize;
     let mut errored = 0usize;
     let mut stale_calls = Vec::new();
     let mut error_calls = Vec::new();
 
-    for call in &calls {
+    // Scanned in place: cloning every call (each carries its whole request/response body) just
+    // to count them cost a full copy of the log per check.
+    event_log.for_each_ipc_call(|call| {
+        total_calls += 1;
         match &call.result {
             IpcResult::Ok(_) => completed += 1,
             IpcResult::Pending => {
@@ -496,7 +490,7 @@ pub fn check_ipc_integrity(event_log: &EventLog, stale_threshold_ms: i64) -> Ipc
                 });
             }
         }
-    }
+    });
 
     let healthy = stale_calls.is_empty() && errored == 0;
 
@@ -579,6 +573,7 @@ impl std::fmt::Display for AssertionCondition {
 
 /// A declarative assertion to evaluate against a runtime value (e.g. "equals", "truthy").
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct SemanticAssertion {
     /// Human-readable label describing what is being asserted.
     pub label: String,
@@ -588,8 +583,34 @@ pub struct SemanticAssertion {
     pub expected: serde_json::Value,
 }
 
+impl SemanticAssertion {
+    /// Creates an assertion with the given label, condition, and expected value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use victauri_core::{AssertionCondition, SemanticAssertion};
+    ///
+    /// let a = SemanticAssertion::new("count", AssertionCondition::Equals, serde_json::json!(3));
+    /// assert_eq!(a.label, "count");
+    /// ```
+    #[must_use]
+    pub fn new(
+        label: impl Into<String>,
+        condition: AssertionCondition,
+        expected: serde_json::Value,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            condition,
+            expected,
+        }
+    }
+}
+
 /// Outcome of evaluating a semantic assertion against an actual value.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct AssertionResult {
     /// Label from the original assertion.
     pub label: String,
@@ -627,11 +648,7 @@ fn values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
 /// use victauri_core::verification::{evaluate_assertion, AssertionCondition, SemanticAssertion};
 /// use serde_json::json;
 ///
-/// let assertion = SemanticAssertion {
-///     label: "check count".to_string(),
-///     condition: AssertionCondition::Equals,
-///     expected: json!(42),
-/// };
+/// let assertion = SemanticAssertion::new("check count", AssertionCondition::Equals, json!(42));
 /// let result = evaluate_assertion(json!(42), &assertion);
 /// assert!(result.passed);
 /// ```

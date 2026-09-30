@@ -1,10 +1,8 @@
 #![allow(dead_code)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-use victauri_core::{CommandRegistry, EventLog, EventRecorder, WindowState};
+use victauri_core::WindowState;
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
 
@@ -54,17 +52,17 @@ fn extract_probe_id(script: &str) -> Option<String> {
 pub fn make_windows(labels: &[&str]) -> Vec<WindowState> {
     labels
         .iter()
-        .map(|label| WindowState {
-            label: label.to_string(),
-            title: format!("{label} title"),
-            url: format!("http://localhost/{label}"),
-            visible: true,
-            focused: labels.first() == Some(label),
-            maximized: false,
-            minimized: false,
-            fullscreen: false,
-            position: (0, 0),
-            size: (800, 600),
+        .map(|label| {
+            WindowState::new(label.to_string())
+                .with_title(format!("{label} title"))
+                .with_url(format!("http://localhost/{label}"))
+                .with_visible(true)
+                .with_focused(labels.first() == Some(label))
+                .with_maximized(false)
+                .with_minimized(false)
+                .with_fullscreen(false)
+                .with_position(0, 0)
+                .with_size(800, 600)
         })
         .collect()
 }
@@ -72,30 +70,7 @@ pub fn make_windows(labels: &[&str]) -> Vec<WindowState> {
 // ── Test State Constructor ─────────────────────────────────────────────────
 
 pub fn test_state() -> Arc<VictauriState> {
-    Arc::new(VictauriState {
-        event_log: EventLog::new(1000),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(0),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(1000),
-        privacy: victauri_plugin::privacy::PrivacyConfig::default(),
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
-    })
+    Arc::new(VictauriState::for_tests())
 }
 
 // ── SimpleMockBridge ───────────────────────────────────────────────────────
@@ -182,17 +157,17 @@ impl WebviewBridge for RejectingMockBridge {
         self.labels
             .iter()
             .filter(|l| label.is_none() || label == Some(l.as_str()))
-            .map(|l| WindowState {
-                label: l.clone(),
-                title: format!("{l} title"),
-                url: format!("http://localhost/{l}"),
-                visible: true,
-                focused: l == "main",
-                maximized: false,
-                minimized: false,
-                fullscreen: false,
-                position: (0, 0),
-                size: (800, 600),
+            .map(|l| {
+                WindowState::new(l.clone())
+                    .with_title(format!("{l} title"))
+                    .with_url(format!("http://localhost/{l}"))
+                    .with_visible(true)
+                    .with_focused(l == "main")
+                    .with_maximized(false)
+                    .with_minimized(false)
+                    .with_fullscreen(false)
+                    .with_position(0, 0)
+                    .with_size(800, 600)
             })
             .collect()
     }

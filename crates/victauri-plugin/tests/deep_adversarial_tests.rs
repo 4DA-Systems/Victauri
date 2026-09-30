@@ -1,11 +1,9 @@
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use serde_json::json;
-use tokio::sync::Mutex;
-use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
 use victauri_plugin::mcp::build_app_stateful;
@@ -34,17 +32,17 @@ impl CallbackMockBridge {
         Self {
             windows: labels
                 .iter()
-                .map(|label| victauri_core::WindowState {
-                    label: label.to_string(),
-                    title: format!("{label} Window"),
-                    url: "http://localhost/".to_string(),
-                    visible: true,
-                    focused: labels.first() == Some(label),
-                    maximized: false,
-                    minimized: false,
-                    fullscreen: false,
-                    position: (100, 100),
-                    size: (800, 600),
+                .map(|label| {
+                    victauri_core::WindowState::new(label.to_string())
+                        .with_title(format!("{label} Window"))
+                        .with_url("http://localhost/".to_string())
+                        .with_visible(true)
+                        .with_focused(labels.first() == Some(label))
+                        .with_maximized(false)
+                        .with_minimized(false)
+                        .with_fullscreen(false)
+                        .with_position(100, 100)
+                        .with_size(800, 600)
                 })
                 .collect(),
             pending_evals,
@@ -131,29 +129,10 @@ impl WebviewBridge for CallbackMockBridge {
 // ═══════════════════════════════════════════════════════════════════════════
 
 fn make_state_with_privacy(privacy: PrivacyConfig) -> Arc<VictauriState> {
-    Arc::new(VictauriState {
-        event_log: EventLog::new(1000),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(0),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(1000),
-        privacy,
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
+    Arc::new({
+        let mut s = VictauriState::for_tests();
+        s.privacy = privacy;
+        s
     })
 }
 
@@ -977,9 +956,10 @@ async fn privacy_command_blocklist_blocks_invoke() {
 async fn privacy_command_allowlist_restricts_invoke() {
     let mut allow = HashSet::new();
     allow.insert("greet".to_string());
-    let config = PrivacyConfig {
-        command_allowlist: Some(allow),
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.command_allowlist = Some(allow);
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| "\"ok\"".to_string()).await;
@@ -1006,10 +986,11 @@ async fn privacy_blocklist_wins_over_allowlist() {
     allow.insert("save_key".to_string());
     let mut block = HashSet::new();
     block.insert("save_key".to_string());
-    let config = PrivacyConfig {
-        command_allowlist: Some(allow),
-        command_blocklist: block,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.command_allowlist = Some(allow);
+        c.command_blocklist = block;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| "\"ok\"".to_string()).await;
@@ -1031,9 +1012,10 @@ async fn privacy_blocklist_wins_over_allowlist() {
 
 #[tokio::test]
 async fn privacy_redaction_scrubs_eval_output() {
-    let config = PrivacyConfig {
-        redaction_enabled: true,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.redaction_enabled = true;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| {
@@ -1248,9 +1230,10 @@ async fn privacy_disable_all_tools() {
     for tool in &all_tools {
         disabled.insert(tool.to_string());
     }
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_server(state, &["main"]).await;
@@ -1261,7 +1244,7 @@ async fn privacy_disable_all_tools() {
             "window" => json!({"action": "list"}),
             "recording" => json!({"action": "start"}),
             "logs" => json!({"action": "console"}),
-            "inspect" => json!({"action": "performance"}),
+            "inspect" => json!({"action": "get_performance"}),
             "css" => json!({"action": "inject", "css": "body{}"}),
             "interact" => json!({"action": "click", "ref_id": "e1"}),
             "input" => json!({"action": "fill", "ref_id": "e1", "value": "x"}),
@@ -1284,9 +1267,10 @@ async fn privacy_disabled_tool_also_disabled_in_rest_listing() {
     let mut disabled = HashSet::new();
     disabled.insert("eval_js".to_string());
     disabled.insert("screenshot".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_server(state, &["main"]).await;
@@ -1319,9 +1303,10 @@ async fn privacy_disabled_tool_also_disabled_in_rest_listing() {
 
 #[tokio::test]
 async fn privacy_redaction_on_rest_api() {
-    let config = PrivacyConfig {
-        redaction_enabled: true,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.redaction_enabled = true;
+        c
     };
     let state = make_state_with_privacy(config);
     let base = start_callback_server(state, &["main"], |_| {
@@ -2941,5 +2926,63 @@ async fn delete_to_health_rejected() {
         resp.status().as_u16() >= 400,
         "DELETE to /health should be rejected, got {}",
         resp.status()
+    );
+}
+
+/// Audit N1, end to end over the real HTTP server: in the Test profile `navigate.go_to` is
+/// FullControl-only, but `{"action": {"go_to": null}}` (a shape serde accepts for the enum)
+/// and a positional REST array body were gated as the bare `navigate` — which Test allows —
+/// and the handler then navigated the webview. Neither may reach the bridge now, via REST or
+/// MCP, while the string form is still refused by the profile.
+#[tokio::test]
+async fn tag_shaped_or_positional_action_cannot_bypass_the_profile() {
+    let navigated = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&navigated);
+    let state = make_state_with_privacy(victauri_plugin::privacy::test_privacy_config());
+    let base = start_callback_server(state, &["main"], move |script| {
+        if script.contains("evil.example") {
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        "null".to_string()
+    })
+    .await;
+    let client = reqwest::Client::new();
+    for body in [
+        r#"{"action":{"go_to":null},"url":"https://evil.example"}"#,
+        r#"["go_to","https://evil.example",null,null,null,null]"#,
+    ] {
+        let resp = rest_call(&client, &base, "navigate", body).await;
+        let status = resp.status();
+        let text = resp.text().await.unwrap();
+        assert_eq!(status, 400, "REST {body} must be refused: {status} {text}");
+    }
+    let (mcp, sid) = mcp_session(&base).await;
+    let body = call_tool(
+        &mcp,
+        &base,
+        &sid,
+        "navigate",
+        json!({"action": {"go_to": null}, "url": "https://evil.example"}),
+    )
+    .await;
+    assert!(
+        body.contains("must be a string"),
+        "MCP tag-shaped action must be refused: {body}"
+    );
+    let body = call_tool(
+        &mcp,
+        &base,
+        &sid,
+        "navigate",
+        json!({"action": "go_to", "url": "https://evil.example"}),
+    )
+    .await;
+    assert!(
+        body.contains("disabled"),
+        "string go_to stays FullControl-only: {body}"
+    );
+    assert!(
+        !navigated.load(std::sync::atomic::Ordering::SeqCst),
+        "the webview was navigated"
     );
 }

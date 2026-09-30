@@ -166,22 +166,22 @@ pub fn is_localhost_host(host: &str) -> bool {
 }
 
 fn valid_port(port: &str) -> bool {
-    !port.is_empty() && port.parse::<u16>().is_ok()
+    // Digits only: `u16::from_str` also accepts a leading `+` (`localhost:+7373`).
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok()
 }
 
 // ── Origin validation (cross-origin guard) ───────────────────────────────
 
-/// Returns `true` if `origin` (from the HTTP `Origin` header) is a
-/// localhost origin, a `tauri://` origin, or absent.
+/// Returns `true` if `origin` (from the HTTP `Origin` header) is an `http`/`https`
+/// localhost origin.
 ///
 /// Uses [`url::Url::parse`] internally so that subdomain-smuggling attacks
 /// like `localhost.evil.com` are caught by comparing the **parsed host**
-/// rather than doing prefix matching.
+/// rather than doing prefix matching. `tauri://` origins are refused: the app's own
+/// webview talks to Victauri over IPC, never HTTP, and the prefix check accepted
+/// `tauri://` with ANY host.
 #[must_use]
 pub fn is_allowed_origin(origin: &str) -> bool {
-    if origin.starts_with("tauri://") {
-        return true;
-    }
     let Ok(parsed) = url::Url::parse(origin) else {
         return false;
     };
@@ -309,6 +309,8 @@ mod tests {
 
     #[test]
     fn rate_limiter_concurrent() {
+        // Started before the limiter: the refill clock can only have run for less than this.
+        let started = std::time::Instant::now();
         let limiter = std::sync::Arc::new(RateLimiter::new(1000));
         let mut handles = vec![];
         for _ in 0..10 {
@@ -328,7 +330,15 @@ mod tests {
             total >= 1000,
             "should dispense at least the initial budget, got {total}"
         );
-        assert!(total <= 1200, "refill overshoot too high, got {total}");
+        // The limiter refills 1,000 tokens/s (1 per elapsed ms), so the most it can hand out is
+        // the initial 1,000 plus 1 per millisecond the threads ran. A fixed ceiling (1,200)
+        // failed on a loaded machine where the loop simply took longer; anything above this
+        // bound is a real refill double-count.
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        assert!(
+            total <= 1000 + elapsed_ms + 1,
+            "refill overshoot: {total} tokens in {elapsed_ms} ms"
+        );
     }
 
     // is_localhost_host
@@ -401,8 +411,22 @@ mod tests {
         assert!(is_allowed_origin("http://127.0.0.1:8080"));
         assert!(is_allowed_origin("http://[::1]"));
         assert!(is_allowed_origin("http://[::1]:7373"));
-        assert!(is_allowed_origin("tauri://localhost"));
-        assert!(is_allowed_origin("tauri://some-app"));
+    }
+
+    #[test]
+    fn origin_refuses_tauri_scheme() {
+        assert!(!is_allowed_origin("tauri://localhost"));
+        assert!(!is_allowed_origin("tauri://some-app"));
+        assert!(!is_allowed_origin("tauri://evil.com"));
+    }
+
+    #[test]
+    fn host_port_must_be_plain_digits() {
+        assert!(is_localhost_host("localhost:7373"));
+        assert!(is_localhost_host("[::1]:7373"));
+        assert!(!is_localhost_host("localhost:+7373"));
+        assert!(!is_localhost_host("127.0.0.1:+80"));
+        assert!(!is_localhost_host("[::1]:+7373"));
     }
 
     #[test]

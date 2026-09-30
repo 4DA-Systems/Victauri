@@ -1,70 +1,121 @@
-name: E2E Tests
+name: E2E Tests (victauri-test client suites)
 
+# On-demand live-app run of the `victauri-test` crate's OWN e2e suites
+# (e2e_demo_app / high_level_api / verify_builder). These are NOT covered by ci.yml:
+# ci.yml's `e2e` job runs `demo-app --test integration` + the smoke action, which
+# exercises the plugin through the demo app's test file, not these client-API suites.
+# Kept manual (workflow_dispatch) because the three suites overlap heavily with the
+# gating ci.yml job; run it before a release that changes victauri-test.
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-Dwarnings"
+  VICTAURI_PORT: "7374"
 
 jobs:
   e2e:
-    name: E2E Integration Tests
+    name: victauri-test E2E (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev xvfb
+        uses: ./.github/actions/linux-deps
+        with:
+          xvfb: "true"
 
+      # The action is pinned by SHA, so the toolchain MUST be given explicitly
+      # (only the @stable/@1.xx refs infer it from the ref name).
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
 
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          save-if: false
 
-      - name: Build demo app
-        run: cargo build -p demo-app
+      - name: Build demo app + test binaries
+        run: |
+          cargo build -p demo-app
+          cargo test -p victauri-test --no-run --test e2e_demo_app --test high_level_api --test verify_builder
+        shell: bash
 
+      # Launch the already-built binary (not `cargo run`, which would recompile inside
+      # the readiness window). stderr is captured so a host crash is diagnosable.
       - name: Start demo app (Linux)
         if: runner.os == 'Linux'
         run: |
-          xvfb-run --auto-servernum cargo run -p demo-app &
-          sleep 10
-        env:
-          VICTAURI_PORT: "7374"
+          xvfb-run -a ./target/debug/demo-app >/tmp/demo-app.out 2>/tmp/demo-app.err &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
 
       - name: Start demo app (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $env:VICTAURI_PORT = "7374"
-          Start-Process -NoNewWindow cargo -ArgumentList "run","-p","demo-app"
-          Start-Sleep -Seconds 10
+          # Run a COPY so a later relink of demo-app.exe is not blocked by the running image.
+          Copy-Item .\target\debug\demo-app.exe .\target\debug\demo-app-run.exe -Force
+          $proc = Start-Process -FilePath .\target\debug\demo-app-run.exe -PassThru
+          "APP_PID=$($proc.Id)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
-      - name: Verify server is running
-        run: curl -s http://127.0.0.1:7374/health
+      - name: Wait for the Victauri server
         shell: bash
+        run: |
+          # Poll /health until it answers 2xx (curl -f fails on HTTP errors), up to 120s.
+          for i in $(seq 1 120); do
+            if curl -sf --max-time 2 "http://127.0.0.1:${VICTAURI_PORT}/health" >/dev/null; then
+              echo "Victauri server healthy after ${i}s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::Victauri server did not become healthy on :${VICTAURI_PORT} within 120s"
+          exit 1
 
       - name: Run E2E tests
         run: cargo test -p victauri-test --test e2e_demo_app -- --test-threads=1
         env:
           VICTAURI_E2E: "1"
-          VICTAURI_PORT: "7374"
 
       - name: Run high-level API tests
         run: cargo test -p victauri-test --test high_level_api -- --test-threads=1
         env:
           VICTAURI_E2E: "1"
-          VICTAURI_PORT: "7374"
 
       - name: Run verify builder tests
         run: cargo test -p victauri-test --test verify_builder -- --test-threads=1
         env:
           VICTAURI_E2E: "1"
-          VICTAURI_PORT: "7374"
+
+      - name: Show demo app output on failure (Linux)
+        if: failure() && runner.os == 'Linux'
+        run: |
+          echo "::group::demo-app stderr"
+          tail -n 200 /tmp/demo-app.err 2>/dev/null || echo "(no stderr captured)"
+          echo "::endgroup::"
+          if [ -n "$APP_PID" ] && ! kill -0 "$APP_PID" 2>/dev/null; then
+            echo "::warning::demo-app (PID $APP_PID) is NOT running — the host process died."
+          fi
+
+      - name: Cleanup (Linux)
+        if: always() && runner.os == 'Linux'
+        run: |
+          if [ -n "$APP_PID" ]; then kill "$APP_PID" 2>/dev/null || true; fi
+
+      - name: Cleanup (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if ($env:APP_PID) { Stop-Process -Id $env:APP_PID -Force -ErrorAction SilentlyContinue }

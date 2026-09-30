@@ -1,14 +1,11 @@
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::Mutex;
 
-use victauri_core::{
-    AppEvent, CommandInfo, CommandRegistry, EventLog, EventRecorder, IpcCall, IpcResult,
-};
+use victauri_core::{AppEvent, CommandInfo, EventLog, EventRecorder, IpcCall, IpcResult};
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
 use victauri_plugin::mcp::{
@@ -40,17 +37,17 @@ impl CallbackMockBridge {
         Self {
             windows: labels
                 .iter()
-                .map(|label| victauri_core::WindowState {
-                    label: label.to_string(),
-                    title: format!("{label} Window"),
-                    url: "http://localhost/".to_string(),
-                    visible: true,
-                    focused: labels.first() == Some(label),
-                    maximized: false,
-                    minimized: false,
-                    fullscreen: false,
-                    position: (100, 100),
-                    size: (800, 600),
+                .map(|label| {
+                    victauri_core::WindowState::new(label.to_string())
+                        .with_title(format!("{label} Window"))
+                        .with_url("http://localhost/".to_string())
+                        .with_visible(true)
+                        .with_focused(labels.first() == Some(label))
+                        .with_maximized(false)
+                        .with_minimized(false)
+                        .with_fullscreen(false)
+                        .with_position(100, 100)
+                        .with_size(800, 600)
                 })
                 .collect(),
             pending_evals,
@@ -270,15 +267,15 @@ fn sample_command(name: &str) -> CommandInfo {
 }
 
 fn sample_ipc_call(command: &str, result: IpcResult) -> IpcCall {
-    IpcCall {
-        id: uuid::Uuid::new_v4().to_string(),
-        command: command.to_string(),
-        timestamp: Utc::now(),
-        duration_ms: Some(5),
+    IpcCall::new(
+        uuid::Uuid::new_v4().to_string(),
+        command.to_string(),
+        Utc::now(),
         result,
-        arg_size_bytes: 42,
-        webview_label: "main".to_string(),
-    }
+        Some(5),
+        42,
+        "main".to_string(),
+    )
 }
 
 // ── Handler construction tests ──────────────────────────────────────────────
@@ -1496,29 +1493,10 @@ async fn mcp_read_unknown_resource_fails() {
 
 #[tokio::test]
 async fn state_port_reflected_in_info() {
-    let state = Arc::new(VictauriState {
-        event_log: EventLog::new(1000),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(9999),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(1000),
-        privacy: PrivacyConfig::default(),
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
+    let state = Arc::new({
+        let mut s = VictauriState::for_tests();
+        s.port = std::sync::atomic::AtomicU16::new(9999);
+        s
     });
 
     let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(&["main"]));
@@ -1570,29 +1548,12 @@ fn builder_default_port() {
 
 #[test]
 fn builder_custom_port_reflected_in_state() {
-    let state = Arc::new(VictauriState {
-        event_log: EventLog::new(500),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(8888),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(500),
-        privacy: PrivacyConfig::default(),
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
+    let state = Arc::new({
+        let mut s = VictauriState::for_tests();
+        s.event_log = EventLog::new(500);
+        s.port = std::sync::atomic::AtomicU16::new(8888);
+        s.recorder = EventRecorder::new(500);
+        s
     });
 
     assert_eq!(state.port.load(std::sync::atomic::Ordering::Relaxed), 8888);
@@ -1675,11 +1636,11 @@ async fn ipc_replay_sequence_returns_only_ipc() {
     state
         .recorder
         .record_event(AppEvent::Ipc(sample_ipc_call("cmd1", IpcResult::Pending)));
-    state.recorder.record_event(AppEvent::WindowEvent {
-        label: "main".to_string(),
-        event: "focus".to_string(),
-        timestamp: Utc::now(),
-    });
+    state.recorder.record_event(AppEvent::window_event(
+        "main".to_string(),
+        "focus".to_string(),
+        Utc::now(),
+    ));
     state
         .recorder
         .record_event(AppEvent::Ipc(sample_ipc_call("cmd2", IpcResult::Pending)));
@@ -1839,29 +1800,10 @@ fn generate_token_produces_valid_uuid() {
 // ── Privacy integration tests ─────────────────────────────────────────────
 
 fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
-    Arc::new(VictauriState {
-        event_log: EventLog::new(1000),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(0),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(1000),
-        privacy: config,
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
+    Arc::new({
+        let mut s = VictauriState::for_tests();
+        s.privacy = config;
+        s
     })
 }
 
@@ -1929,9 +1871,10 @@ async fn privacy_disabled_tools_hidden_from_list() {
     disabled.insert("screenshot".to_string());
     disabled.insert("inject_css".to_string());
 
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
 
     let base = start_privacy_test_server(config, &["main"]).await;
@@ -1980,9 +1923,10 @@ async fn privacy_disabled_tool_call_rejected() {
     let mut disabled = HashSet::new();
     disabled.insert("eval_js".to_string());
 
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
 
     let base = start_privacy_test_server(config, &["main"]).await;
@@ -2057,9 +2001,10 @@ async fn privacy_strict_mode_disables_dangerous_tools() {
 async fn privacy_info_shows_privacy_mode() {
     let mut disabled = HashSet::new();
     disabled.insert("eval_js".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
 
     let base = start_privacy_test_server(config, &["main"]).await;
@@ -4538,17 +4483,9 @@ async fn rest_get_plugin_info_returns_version() {
 #[tokio::test]
 async fn rest_get_registry_returns_json_result() {
     let state = test_state();
-    state.registry.register(CommandInfo {
-        name: "test_cmd".to_string(),
-        plugin: None,
-        description: Some("A test command".to_string()),
-        args: vec![],
-        return_type: None,
-        is_async: false,
-        intent: None,
-        category: None,
-        examples: vec![],
-    });
+    state
+        .registry
+        .register(CommandInfo::new("test_cmd").with_description("A test command"));
     let base = start_test_server(state, &["main"]).await;
     let client = reqwest::Client::new();
 

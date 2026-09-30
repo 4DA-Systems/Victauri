@@ -2,7 +2,57 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
-## Unreleased
+## 0.9.0
+
+Version-synced with the Victauri 0.9.0 release. Extension changes:
+
+- **Discovery also scans the plugin's home-directory fallback root on Unix.** When another
+  local user has pre-created the predictable `/tmp/victauri-<uid>`, the plugin now registers
+  under `$XDG_STATE_HOME/victauri` (default `~/.local/state/victauri`); the extension scans it
+  after `<temp>/victauri-<uid>`, before the legacy root, with the same ownership checks.
+- **A discovery entry planted by another Windows user is no longer trusted.** Discovery
+  trusted every directory under `%TEMP%\victauri` on Windows. When `TEMP` is shared (an app
+  launched from MSYS2 uses `C:\msys64\tmp`), another user could plant
+  `victauri\<live pid>\{port,token}` pointing at a port they control and receive the
+  extension's requests. A discovery directory outside your user profile is now used only if
+  you own it (or `BUILTIN\Administrators` does and you are a member — the plugin's own rule),
+  checked with one batched, cached `Get-Acl` call (10 s timeout; it fails closed). The default
+  `%LOCALAPPDATA%\Temp`, inside your profile, needs no check: Windows gives no other
+  non-admin user access to a profile.
+- **The auth token stops following a port its app no longer owns.** The extension resolved the
+  port and token once and then sent the token to that port every poll, forever — after the
+  app exited, any local process that bound the port received it. Before each token-bearing
+  request the extension now re-reads discovery and requires a live, trusted entry that still
+  maps that port to that token and app; if the app restarted on another port it follows it by
+  identity and checks `/info`'s `app_identifier` before anything else carries the new token,
+  and if nothing vouches for the port the token is not sent. The poller also no longer
+  overlaps itself when a refresh outlasts the poll interval.
+
+- **"Generate Test for Element" can no longer be used for code injection.** The DOM node's
+  accessible name (and ref id) — page-controlled text — was interpolated into the generated
+  Rust unescaped, so a page could break out of `Locator::text("…")` and add Rust that runs on
+  `cargo test`. Every interpolated value is now escaped exactly like the Rust recorder's
+  `escape_rust_str` (backslash, quote, control and bidi characters as `\u{…}`); a test proves
+  `rustc` reads each literal back as the original text. The command CodeLens generator uses
+  the same escaping.
+- **A configured `victauri.authToken` is never sent to whoever holds the default port.** With
+  a token set but `victauri.port` left at its default, the token went to `127.0.0.1:7373` — on
+  a shared machine, a squatter there received it. The token is now sent only to an explicitly
+  configured port, or to the running app whose own discovery token equals it; otherwise
+  connect fails with a message telling you to set `victauri.port`.
+- **Several running apps are named instead of silently skipped.** Auto-discovery with more
+  than one live app used to fall back to the default port with no token; it now lists each
+  app (`identifier (port N, pid P)`) and asks you to set `victauri.port`.
+- **An app whose process can't be verified is reported.** On Windows an `EPERM` from the
+  liveness probe (typically an app running elevated while VS Code is not) now produces a
+  warning explaining why nothing was found, instead of silence. Its token is still never used.
+- **A rate-limited server is not "disconnected".** `/health` and the auth probe treat
+  `429 Too Many Requests` as alive, so a local request flood can't make the extension drop a
+  live connection.
+- Unit tests (`npm test`) cover code generation, discovery/connection resolution and the
+  health check, runnable under plain Node.
+
+Earlier 0.9.0 changes:
 
 - **DOM Explorer now shows the tree.** It read a `body` key that `dom_snapshot` never
   returns (the tool returns `{ tree, stale_refs, format }`), so the view was always empty.
@@ -18,6 +68,12 @@ All notable changes to the Victauri VS Code extension will be documented in this
   authenticated liveness probe first.
 - **Auto-discovery ignores stale discovery dirs** whose app process has exited, and rejects
   malformed port files.
+- **Auto-discovery finds Victauri 0.9 apps on Unix** in their per-user discovery root
+  (`$XDG_RUNTIME_DIR/victauri` or `<temp>/victauri-<uid>`), still reading the legacy
+  `<temp>/victauri` for older apps.
+- **A discovery entry whose PID now belongs to another user's process is not live.** An
+  `EPERM` from the liveness probe counted as alive, so a recycled PID could make a stale
+  entry (and its token) look current.
 - REST tool errors now report the real HTTP status (e.g. 401/500) instead of a JSON parse
   error on non-JSON bodies.
 

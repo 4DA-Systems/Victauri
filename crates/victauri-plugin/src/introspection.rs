@@ -13,6 +13,7 @@ use serde::Serialize;
 
 /// Per-command timing statistics aggregated from IPC invocations.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct CommandTimingStats {
     /// Command name.
     pub command: String,
@@ -117,6 +118,11 @@ impl TimingSamples {
     }
 }
 
+/// Maximum distinct commands tracked. The map is keyed by the caller-supplied command name, so
+/// without a cap an agent (or a loop) invoking ever-new names grows it forever. Once full, new
+/// names are not tracked; commands already tracked keep accumulating.
+const MAX_TIMED_COMMANDS: usize = 1024;
+
 /// Thread-safe store for per-command timing data.
 pub struct CommandTimings {
     inner: RwLock<HashMap<String, TimingSamples>>,
@@ -137,7 +143,11 @@ impl CommandTimings {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.entry(command.to_string()).or_default().record(duration);
+        if let Some(samples) = map.get_mut(command) {
+            samples.record(duration);
+        } else if map.len() < MAX_TIMED_COMMANDS {
+            map.entry(command.to_string()).or_default().record(duration);
+        }
     }
 
     /// Get stats for all commands, sorted by total time descending.
@@ -187,6 +197,7 @@ impl Default for CommandTimings {
 
 /// The type of fault to inject into a command.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub enum FaultType {
     /// Add artificial latency before command execution.
     Delay {
@@ -206,6 +217,7 @@ pub enum FaultType {
 
 /// Configuration for a single fault injection rule.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct FaultConfig {
     /// Target command name.
     pub command: String,
@@ -225,6 +237,19 @@ pub struct FaultConfig {
 pub const FAULT_TTL: Duration = Duration::from_secs(900); // 15 minutes
 
 impl FaultConfig {
+    /// Creates a fault rule for `command`, created now with zero triggers so far.
+    /// `max_triggers == 0` means unlimited (until [`FAULT_TTL`] expires it).
+    #[must_use]
+    pub fn new(command: impl Into<String>, fault_type: FaultType, max_triggers: u64) -> Self {
+        Self {
+            command: command.into(),
+            fault_type,
+            trigger_count: 0,
+            max_triggers,
+            created_at: Instant::now(),
+        }
+    }
+
     /// Whether this fault should still trigger, evaluated at `now`. A fault is
     /// inert once it is older than [`FAULT_TTL`] or has hit `max_triggers`.
     #[must_use]
@@ -242,9 +267,29 @@ impl FaultConfig {
     }
 }
 
+/// Most fault rules held at once (G-10). Rules are keyed by the caller-chosen command name; at
+/// the cap, injecting a rule for a NEW command evicts the oldest-injected rule.
+pub(crate) const MAX_FAULT_RULES: usize = 256;
+
 /// Thread-safe registry of active fault injection rules.
 pub struct FaultRegistry {
-    inner: RwLock<HashMap<String, FaultConfig>>,
+    inner: RwLock<FaultRules>,
+}
+
+#[derive(Default)]
+struct FaultRules {
+    /// Injection order, so eviction at the cap is deterministic (oldest first).
+    next_seq: u64,
+    map: HashMap<String, (u64, FaultConfig)>,
+}
+
+impl FaultRules {
+    /// Drop rules past [`FAULT_TTL`]: they can never trigger again, and were kept (and listed)
+    /// forever before (G-10).
+    fn evict_expired(&mut self, now: Instant) {
+        self.map
+            .retain(|_, (_, c)| now.saturating_duration_since(c.created_at) < FAULT_TTL);
+    }
 }
 
 impl FaultRegistry {
@@ -252,27 +297,42 @@ impl FaultRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(FaultRules::default()),
         }
     }
 
-    /// Register a fault for a command.
+    /// Register a fault for a command (replacing any rule for the same command). Expired rules
+    /// are evicted first; if the registry still holds its maximum (256) rules, the
+    /// oldest-injected rule is evicted to make room.
     pub fn inject(&self, config: FaultConfig) {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(config.command.clone(), config);
+        rules.evict_expired(Instant::now());
+        if !rules.map.contains_key(&config.command) && rules.map.len() >= MAX_FAULT_RULES {
+            let oldest = rules
+                .map
+                .iter()
+                .min_by_key(|(_, (seq, _))| *seq)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                rules.map.remove(&oldest);
+            }
+        }
+        let seq = rules.next_seq;
+        rules.next_seq += 1;
+        rules.map.insert(config.command.clone(), (seq, config));
     }
 
     /// Look up and optionally trigger a fault for a command.
     /// Returns the fault type if one is active and should trigger.
     pub fn check_and_trigger(&self, command: &str) -> Option<FaultType> {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(config) = map.get_mut(command)
+        if let Some((_, config)) = rules.map.get_mut(command)
             && config.should_trigger()
         {
             config.trigger_count += 1;
@@ -281,33 +341,34 @@ impl FaultRegistry {
         None
     }
 
-    /// List all active fault rules.
+    /// List the fault rules that have not expired (expired ones are evicted here too).
     #[must_use]
     pub fn list(&self) -> Vec<FaultConfig> {
-        let map = self
+        let mut rules = self
             .inner
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.values().cloned().collect()
+        rules.evict_expired(Instant::now());
+        rules.map.values().map(|(_, c)| c.clone()).collect()
     }
 
     /// Remove a fault rule for a command.
     pub fn clear(&self, command: &str) -> bool {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.remove(command).is_some()
+        rules.map.remove(command).is_some()
     }
 
     /// Remove all fault rules.
     pub fn clear_all(&self) -> usize {
-        let mut map = self
+        let mut rules = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = map.len();
-        map.clear();
+        let count = rules.map.len();
+        rules.map.clear();
         count
     }
 }
@@ -322,6 +383,7 @@ impl Default for FaultRegistry {
 
 /// Describes the shape of a JSON value for contract comparison.
 #[derive(Debug, Clone, Serialize, PartialEq)]
+#[non_exhaustive]
 pub enum JsonShape {
     /// null
     Null,
@@ -376,6 +438,7 @@ impl JsonShape {
 
 /// A recorded contract baseline for a command's response.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ContractBaseline {
     /// Command name.
     pub command: String,
@@ -389,8 +452,29 @@ pub struct ContractBaseline {
     pub recorded_at: String,
 }
 
+impl ContractBaseline {
+    /// Creates a contract baseline for `command`.
+    #[must_use]
+    pub fn new(
+        command: impl Into<String>,
+        args: serde_json::Value,
+        shape: JsonShape,
+        sample: impl Into<String>,
+        recorded_at: impl Into<String>,
+    ) -> Self {
+        Self {
+            command: command.into(),
+            args,
+            shape,
+            sample: sample.into(),
+            recorded_at: recorded_at.into(),
+        }
+    }
+}
+
 /// Differences found when checking a contract against baseline.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ContractDrift {
     /// Command name.
     pub command: String,
@@ -406,6 +490,7 @@ pub struct ContractDrift {
 
 /// A single field type change between baseline and current.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TypeChange {
     /// Dot-separated field path.
     pub path: String,
@@ -504,9 +589,20 @@ fn diff_shapes_inner(
     }
 }
 
+/// Most contract baselines held at once (G-10). At the cap, recording a baseline for a NEW
+/// command evicts the least recently recorded one (the store never refuses a recording).
+pub(crate) const MAX_CONTRACT_BASELINES: usize = 1024;
+
 /// Thread-safe store for IPC contract baselines.
 pub struct ContractStore {
-    inner: RwLock<HashMap<String, ContractBaseline>>,
+    inner: RwLock<ContractBaselines>,
+}
+
+#[derive(Default)]
+struct ContractBaselines {
+    /// Recording order, so eviction at the cap is deterministic (least recently recorded).
+    next_seq: u64,
+    map: HashMap<String, (u64, ContractBaseline)>,
 }
 
 impl ContractStore {
@@ -514,47 +610,63 @@ impl ContractStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: RwLock::new(ContractBaselines::default()),
         }
     }
 
-    /// Record a baseline for a command.
-    pub fn record(&self, baseline: ContractBaseline) {
-        let mut map = self
+    /// Record a baseline for a command, replacing (and refreshing) any earlier one for it. The
+    /// store holds at most 1024 baselines: at that cap, recording one for a new command evicts
+    /// the least recently recorded baseline, whose command is returned.
+    pub fn record(&self, baseline: ContractBaseline) -> Option<String> {
+        let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.insert(baseline.command.clone(), baseline);
+        let mut evicted = None;
+        if !store.map.contains_key(&baseline.command) && store.map.len() >= MAX_CONTRACT_BASELINES {
+            evicted = store
+                .map
+                .iter()
+                .min_by_key(|(_, (seq, _))| *seq)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = &evicted {
+                store.map.remove(oldest);
+            }
+        }
+        let seq = store.next_seq;
+        store.next_seq += 1;
+        store.map.insert(baseline.command.clone(), (seq, baseline));
+        evicted
     }
 
     /// Get the baseline for a command.
     #[must_use]
     pub fn get(&self, command: &str) -> Option<ContractBaseline> {
-        let map = self
+        let store = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.get(command).cloned()
+        store.map.get(command).map(|(_, b)| b.clone())
     }
 
     /// Get all baselines.
     #[must_use]
     pub fn all(&self) -> Vec<ContractBaseline> {
-        let map = self
+        let store = self
             .inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        map.values().cloned().collect()
+        store.map.values().map(|(_, b)| b.clone()).collect()
     }
 
     /// Clear all baselines.
     pub fn clear(&self) -> usize {
-        let mut map = self
+        let mut store = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = map.len();
-        map.clear();
+        let count = store.map.len();
+        store.map.clear();
         count
     }
 }
@@ -569,6 +681,7 @@ impl Default for ContractStore {
 
 /// A single phase in the startup timeline.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct StartupPhase {
     /// Phase name.
     pub name: String,
@@ -651,6 +764,7 @@ impl Default for StartupTimeline {
 
 /// A Tauri event captured from the application's native event bus.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct CapturedTauriEvent {
     /// Event name (e.g. "notification-added", `tauri://focus`).
     pub name: String,
@@ -658,6 +772,22 @@ pub struct CapturedTauriEvent {
     pub payload: String,
     /// ISO 8601 timestamp.
     pub timestamp: String,
+}
+
+impl CapturedTauriEvent {
+    /// Creates a captured event record (`timestamp` is an ISO 8601 string).
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        payload: impl Into<String>,
+        timestamp: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            payload: payload.into(),
+            timestamp: timestamp.into(),
+        }
+    }
 }
 
 const DEFAULT_EVENT_BUS_CAPACITY: usize = 1000;
@@ -779,13 +909,18 @@ impl AppStateProbes {
     /// registered under that name.
     #[must_use]
     pub fn run(&self, name: &str) -> Option<serde_json::Value> {
-        let probe = self
-            .inner
+        self.get(name).map(|p| p())
+    }
+
+    /// The probe registered under `name`, to run somewhere other than the caller's thread
+    /// (the `app_state` tool runs it on the blocking pool with a timeout).
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<std::sync::Arc<ProbeFn>> {
+        self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(name)
-            .cloned();
-        probe.map(|p| p())
+            .cloned()
     }
 
     /// Number of registered probes.
@@ -808,6 +943,7 @@ impl AppStateProbes {
 
 /// Info about a tracked async task spawned by Victauri.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct TrackedTaskInfo {
     /// Human-readable task name.
     pub name: String,
@@ -856,6 +992,14 @@ impl TaskTracker {
         finished
     }
 
+    /// Register a new task and return a guard that marks it finished when DROPPED — at the end
+    /// of the task body, when the task panics (the drop runs during unwinding), or when its
+    /// future is dropped unfinished. Setting the flag by hand after the body left a panicked
+    /// task reported active forever (G-9).
+    pub(crate) fn track_guarded(&self, name: &str) -> TaskFinishedGuard {
+        TaskFinishedGuard(self.track(name))
+    }
+
     /// List all tracked tasks with their current status.
     #[must_use]
     pub fn list(&self) -> Vec<TrackedTaskInfo> {
@@ -894,10 +1038,22 @@ impl Default for TaskTracker {
     }
 }
 
+/// Marks a tracked task finished when dropped (see [`TaskTracker::track_guarded`]). Move it
+/// into the spawned task and hold it for the task's whole body.
+#[must_use = "the task is marked finished as soon as the guard is dropped"]
+pub(crate) struct TaskFinishedGuard(std::sync::Arc<AtomicBool>);
+
+impl Drop for TaskFinishedGuard {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 // ── Child Process Enumeration ──────────────────────────────────────────
 
 /// Information about a child process of the Tauri application.
 #[derive(Debug, Clone, Serialize)]
+#[non_exhaustive]
 pub struct ChildProcessInfo {
     /// Process ID.
     pub pid: u32,
@@ -1187,9 +1343,322 @@ fn enumerate_children_macos(parent_pid: u32) -> Vec<ChildProcessInfo> {
     children
 }
 
+// ── Page loads ─────────────────────────────────────────────────────────────
+
+/// Each window's latest bridge ready signal — sent whenever its JS bridge (re)initializes, i.e.
+/// on every page load or reload — with the nonce identifying that page load. An eval running in
+/// a page that has since been replaced can never deliver its result, so a ready signal from a
+/// DIFFERENT page lets the caller fail fast ("the page reloaded while the call was in flight")
+/// instead of waiting out the full timeout.
+#[derive(Default)]
+pub(crate) struct PageLoads {
+    last_load: std::sync::Mutex<HashMap<String, PageLoad>>,
+    seq: std::sync::atomic::AtomicU64,
+    changed: tokio::sync::Notify,
+}
+
+/// One recorded ready signal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PageLoad {
+    /// Increases with every ready signal (from any window), so a caller can tell "a new signal
+    /// since I looked" from "the same one".
+    pub seq: u64,
+    /// The page-load nonce the signal carried (`None` from a bridge that sends none).
+    pub nonce: Option<String>,
+}
+
+/// Longest nonce kept from a ready signal (the bridge's is a UUID; the signal is page-callable).
+const MAX_PAGE_NONCE_LEN: usize = 128;
+
+/// Most windows whose latest page load is remembered (G-10: an entry per window label ever seen
+/// was kept forever). At the cap, the window that loaded least recently is forgotten.
+const MAX_PAGE_LOAD_WINDOWS: usize = 256;
+
+impl PageLoads {
+    /// Record that window `label` sent a ready signal for the page identified by `nonce`.
+    pub fn record_load(&self, label: &str, nonce: Option<&str>) {
+        let nonce = nonce.map(|n| n.chars().take(MAX_PAGE_NONCE_LEN).collect());
+        {
+            let mut loads = self
+                .last_load
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Numbered under the lock, so a window's stored seq only ever grows.
+            let seq = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if !loads.contains_key(label) && loads.len() >= MAX_PAGE_LOAD_WINDOWS {
+                let oldest = loads
+                    .iter()
+                    .min_by_key(|(_, load)| load.seq)
+                    .map(|(k, _)| k.clone());
+                if let Some(oldest) = oldest {
+                    loads.remove(&oldest);
+                }
+            }
+            loads.insert(label.to_string(), PageLoad { seq, nonce });
+        }
+        self.changed.notify_waiters();
+    }
+
+    /// Window `label`'s latest ready signal, if any.
+    #[must_use]
+    pub fn latest(&self, label: &str) -> Option<PageLoad> {
+        self.last_load
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(label)
+            .cloned()
+    }
+
+    /// The sequence number of the most recent ready signal from any window (0 if none yet).
+    #[must_use]
+    pub fn current_seq(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolves the next time any window records a page load.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+}
+// ── Recording drain watermarks ─────────────────────────────────────────────
+
+/// Per-window drain positions for pulling the JS bridge's event stream into a recording,
+/// shared by the background drain loop and `recording flush`.
+///
+/// Each kept its own watermark before, so a flush re-recorded what the drain had captured
+/// (and vice versa). A position is the bridge's per-page event SEQUENCE (plus the page
+/// instance it belongs to), not a wall-clock timestamp: a timestamp watermark clamped to the
+/// Rust clock re-read an event stamped ahead of it on every drain, and lost events pushed in
+/// the same millisecond after a read. Positions are reset whenever a recording starts or is
+/// imported — the new epoch is the recorder generation, and a window's first read in it skips
+/// the page's pre-recording history by the `floor_ms` timestamp. A per-window async lock
+/// serializes the two readers for the same window.
+#[derive(Default)]
+pub(crate) struct DrainWatermarks {
+    inner: std::sync::Mutex<WatermarkState>,
+}
+
+#[derive(Default)]
+struct WatermarkState {
+    floor_ms: f64,
+    epoch: u64,
+    per_label: HashMap<String, DrainMark>,
+    locks: HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>,
+}
+
+/// How far a window's event stream has been drained: the bridge's page `instance` and the
+/// last sequence number read from it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrainMark {
+    /// Identifies one page load of the window (the sequence restarts on reload).
+    pub instance: String,
+    /// The last sequence number read from that page.
+    pub seq: u64,
+}
+
+/// Where the next drain of a window starts, captured in one step.
+#[derive(Debug, Clone)]
+pub(crate) struct DrainCursor {
+    /// The recording epoch (recorder generation) this position belongs to.
+    pub epoch: u64,
+    /// Entries completed at or before this time predate the recording (first read only).
+    pub floor_ms: f64,
+    /// The window's position, or `None` if it has not been read in this epoch.
+    pub mark: Option<DrainMark>,
+}
+
+impl DrainWatermarks {
+    fn state(&self) -> std::sync::MutexGuard<'_, WatermarkState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Where to read `label`'s stream from.
+    #[must_use]
+    pub fn cursor(&self, label: &str) -> DrainCursor {
+        let s = self.state();
+        DrainCursor {
+            epoch: s.epoch,
+            floor_ms: s.floor_ms,
+            mark: s.per_label.get(label).cloned(),
+        }
+    }
+
+    /// Record that `label` was read up to `mark`, if `epoch` is still the current one (a read
+    /// that straddled a reset must not plant an old position in the new epoch). Returns
+    /// whether the position was stored.
+    pub fn advance(&self, label: &str, epoch: u64, mark: DrainMark) -> bool {
+        let mut s = self.state();
+        if s.epoch != epoch {
+            return false;
+        }
+        s.per_label.insert(label.to_string(), mark);
+        true
+    }
+
+    /// Start recording epoch `epoch`: every window is read afresh, skipping entries at or
+    /// before `floor_ms`. Monotonic: epochs are recorder generations (strictly increasing), so a
+    /// reset for an epoch at or below the current one is a stale caller — a `start` whose
+    /// handler ran late — and is ignored (R4-RACE1).
+    pub fn reset(&self, floor_ms: f64, epoch: u64) {
+        let mut s = self.state();
+        if epoch <= s.epoch {
+            return;
+        }
+        s.floor_ms = floor_ms;
+        s.epoch = epoch;
+        s.per_label.clear();
+    }
+
+    /// Forget windows that no longer exist (bounds the maps across ephemeral windows).
+    pub fn retain(&self, labels: &[String]) {
+        let mut s = self.state();
+        s.per_label.retain(|l, _| labels.contains(l));
+        s.locks.retain(|l, _| labels.contains(l));
+    }
+
+    /// The lock that serializes readers of `label`'s stream.
+    #[must_use]
+    pub fn lock_for(&self, label: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        std::sync::Arc::clone(self.state().locks.entry(label.to_string()).or_default())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G-10: expired fault rules were never evicted, and nothing bounded the number of rules.
+    #[test]
+    fn fault_registry_evicts_expired_rules_and_is_bounded() {
+        let reg = FaultRegistry::new();
+        let mut expired = FaultConfig::new("old", FaultType::Drop, 0);
+        expired.created_at = Instant::now()
+            .checked_sub(FAULT_TTL + Duration::from_secs(1))
+            .expect("clock far enough from boot");
+        reg.inject(expired);
+        reg.inject(FaultConfig::new("fresh", FaultType::Drop, 0));
+        let listed: Vec<String> = reg.list().into_iter().map(|f| f.command).collect();
+        assert_eq!(
+            listed,
+            vec!["fresh".to_string()],
+            "expired rule still listed"
+        );
+        assert_eq!(
+            reg.inner.read().unwrap().map.len(),
+            1,
+            "expired rule still stored"
+        );
+
+        for i in 0..300 {
+            reg.inject(FaultConfig::new(format!("cmd-{i}"), FaultType::Drop, 0));
+        }
+        let stored = reg.inner.read().unwrap().map.len();
+        assert_eq!(stored, 256, "fault rules must be capped");
+        // The newest rule is kept; the oldest ones were evicted first.
+        assert!(reg.check_and_trigger("cmd-299").is_some());
+        assert!(reg.check_and_trigger("fresh").is_none());
+        // Re-injecting an existing command at the cap replaces it without evicting another.
+        reg.inject(FaultConfig::new("cmd-299", FaultType::Drop, 5));
+        assert_eq!(reg.inner.read().unwrap().map.len(), 256);
+    }
+
+    /// G-10: the contract store had no cap. At the cap the OLDEST baseline is evicted (and
+    /// named), rather than refusing the new one.
+    #[test]
+    fn contract_store_is_bounded_evicting_the_oldest() {
+        let store = ContractStore::new();
+        let baseline =
+            |c: &str| ContractBaseline::new(c, serde_json::Value::Null, JsonShape::Null, "", "t");
+        for i in 0..1030 {
+            store.record(baseline(&format!("cmd-{i}")));
+        }
+        assert_eq!(store.all().len(), 1024);
+        assert!(
+            store.get("cmd-0").is_none(),
+            "the oldest baseline goes first"
+        );
+        assert!(store.get("cmd-5").is_none());
+        assert!(store.get("cmd-6").is_some());
+        assert!(store.get("cmd-1029").is_some());
+        // Re-recording an existing command refreshes it in place: nothing is evicted.
+        store.record(baseline("cmd-6"));
+        assert_eq!(store.all().len(), 1024);
+        assert!(store.get("cmd-7").is_some());
+        // The refreshed baseline is now the newest, so the next eviction takes cmd-7.
+        store.record(baseline("cmd-new"));
+        assert!(store.get("cmd-6").is_some());
+        assert!(store.get("cmd-7").is_none());
+    }
+
+    /// G-10: `PageLoads` kept an entry for every window label ever seen.
+    #[test]
+    fn page_loads_are_bounded_keeping_the_most_recent_windows() {
+        let loads = PageLoads::default();
+        for i in 0..300 {
+            loads.record_load(&format!("win-{i}"), Some("n"));
+        }
+        assert_eq!(loads.last_load.lock().unwrap().len(), 256);
+        assert!(loads.latest("win-299").is_some());
+        assert!(
+            loads.latest("win-0").is_none(),
+            "the least recently loaded window goes first"
+        );
+        // A window that loads again becomes the most recent and survives the next eviction.
+        loads.record_load("win-44", Some("n2"));
+        loads.record_load("win-new", None);
+        assert!(loads.latest("win-44").is_some());
+        assert!(loads.latest("win-45").is_none());
+    }
+
+    /// R4-RACE1: a delayed reset for an OLDER recording generation moved the epoch backwards,
+    /// so the drain for the current recording (which captured the newer epoch) had every
+    /// `advance` refused and the recording silently captured no webview events.
+    #[test]
+    fn drain_watermark_reset_is_monotonic() {
+        let w = DrainWatermarks::default();
+        w.reset(200.0, 2);
+        let mark = DrainMark {
+            instance: "page-a".to_string(),
+            seq: 7,
+        };
+        assert!(w.advance("main", 2, mark.clone()));
+        // The reset for generation 1 (an earlier `start` whose handler was delayed) lands late.
+        w.reset(100.0, 1);
+        let c = w.cursor("main");
+        assert_eq!(
+            c.epoch, 2,
+            "a stale reset must not move the epoch backwards"
+        );
+        assert!((c.floor_ms - 200.0).abs() < f64::EPSILON);
+        assert_eq!(c.mark, Some(mark));
+        // The current recording's drain keeps advancing.
+        assert!(w.advance(
+            "main",
+            2,
+            DrainMark {
+                instance: "page-a".to_string(),
+                seq: 9,
+            }
+        ));
+        // A newer generation still resets.
+        w.reset(300.0, 3);
+        let c = w.cursor("main");
+        assert_eq!((c.epoch, c.mark), (3, None));
+    }
+
+    // C15e: the map is keyed by the caller-chosen command name, so it must be bounded.
+    #[test]
+    fn command_timings_bound_distinct_commands() {
+        let t = CommandTimings::new();
+        for i in 0..(MAX_TIMED_COMMANDS + 100) {
+            t.record(&format!("cmd-{i}"), Duration::from_millis(1));
+        }
+        assert_eq!(t.all_stats().len(), MAX_TIMED_COMMANDS);
+        // Commands already tracked keep accumulating once the cap is reached.
+        t.record("cmd-0", Duration::from_millis(1));
+        assert_eq!(t.stats_for("cmd-0").unwrap().count, 2);
+    }
 
     #[test]
     fn p95_is_nearest_rank_not_max_for_small_samples() {
@@ -1286,6 +1755,32 @@ mod tests {
         });
         assert_eq!(bus.clear(), 1);
         assert!(bus.is_empty());
+    }
+
+    /// G-9: the finished flag was only set when a task body returned normally, so a panicked
+    /// task was reported active forever. The guard sets it on unwind (and on a dropped future).
+    #[test]
+    fn a_panicking_tracked_task_is_reported_finished() {
+        let tracker = std::sync::Arc::new(TaskTracker::new());
+        let guard = tracker.track_guarded("event_drain_loop");
+        let r = std::thread::spawn(move || {
+            let _finished = guard;
+            panic!("task blew up");
+        })
+        .join();
+        assert!(r.is_err());
+        assert_eq!(
+            tracker.active_count(),
+            0,
+            "a panicked task is still reported active"
+        );
+        assert!(tracker.list()[0].is_finished);
+
+        // A task that is still running stays active until its guard goes.
+        let running = tracker.track_guarded("mcp_server");
+        assert_eq!(tracker.active_count(), 1);
+        drop(running);
+        assert_eq!(tracker.active_count(), 0);
     }
 
     #[test]

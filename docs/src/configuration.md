@@ -17,6 +17,27 @@ Victauri is configured via the `VictauriBuilder` API in Rust code and/or environ
 | Navigation log cap | `.navigation_log_capacity(200)` | — | 200 |
 | Event bus capture | `.listen_events(&[...])` | — | Window events only |
 
+## Cargo Features
+
+| Feature | Default | What it does |
+|---------|---------|--------------|
+| `sqlite` | on | `query_db` and `introspect db_health` (via rusqlite). Without it both tools return a clear "not compiled in" error. |
+| `bundled-sqlite` | on | Compiles SQLite into the binary (rusqlite's `bundled` feature). Implies `sqlite`. |
+
+`victauri-plugin` accepts rusqlite `>=0.32, <0.41`, so cargo unifies it with your app's own
+rusqlite (only one `libsqlite3-sys` can be linked per build). The consequence: with the default
+`bundled-sqlite` feature, **your app's rusqlite is switched to the bundled SQLite as well**. That is
+harmless for most apps, but an app that deliberately links a system SQLite or SQLCipher should turn
+the default features off and keep only `sqlite`:
+
+```toml
+[dependencies]
+victauri-plugin = { version = "0.9", default-features = false, features = ["sqlite"] }
+```
+
+With `default-features = false` and no `sqlite` feature, the plugin has no rusqlite dependency
+at all.
+
 ## VictauriBuilder API
 
 ### Basic Setup
@@ -45,7 +66,7 @@ VictauriBuilder::new()
 
 If the preferred port is busy, Victauri tries the next 10 ports (9001-9010). The actual port is:
 - Printed to the log on startup
-- Written to `<temp_dir>/victauri.port`
+- Written to the per-process discovery dir `<root>/<pid>/port` (next to the auth `token` and a `metadata.json` with the app identity) — `<root>` is per-user; see [Security: discovery-directory protection](security.md#discovery-directory-protection)
 - Available via the `/info` endpoint
 - Stored in `VictauriState.port` (AtomicU16)
 

@@ -39,16 +39,5 @@ export class TauriCommandLensProvider implements vscode.CodeLensProvider {
   }
 }
 
-export function generateCommandTest(fnName: string): string {
-  return `e2e_test!(test_${fnName}, |client| async move {
-    let result = client
-        .invoke_command("${fnName}", None)
-        .await
-        .unwrap();
-
-    // Verify the command executed successfully
-    assert!(result.is_object() || result.is_string() || result.is_number(),
-        "${fnName} should return a value, got: {result}");
-});
-`;
-}
+// Generated Rust lives in `rustCodegen.ts` (escaped, and testable without VS Code).
+export { generateCommandTest } from "./rustCodegen";

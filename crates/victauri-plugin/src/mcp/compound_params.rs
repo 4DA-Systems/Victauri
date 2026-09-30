@@ -463,7 +463,8 @@ pub struct RecordingParams {
     pub since_index: Option<usize>,
     /// JSON string of a previously exported `RecordedSession` (for import).
     pub session_json: Option<String>,
-    /// Target webview label (for replay).
+    /// Target webview label: the window to flush, or for replay, replay only the calls
+    /// recorded in this window (each call always runs in the window that recorded it).
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
 }
@@ -597,7 +598,8 @@ impl fmt::Display for RouteAction {
 pub enum RouteMatchType {
     /// URL contains the pattern (default).
     Substring,
-    /// Glob with `*` wildcards.
+    /// Glob: `*` matches any run of characters; every other character (including `?`)
+    /// matches itself.
     Glob,
     /// JavaScript regular expression.
     Regex,
@@ -710,7 +712,7 @@ impl fmt::Display for TraceAction {
 pub struct TraceParams {
     /// Action: start, stop, status, frames.
     pub action: TraceAction,
-    /// Capture interval in milliseconds (for start). Default 500, min 50.
+    /// Capture interval in milliseconds (for start). Default 500, clamped to 50..=60000.
     pub interval_ms: Option<u64>,
     /// Maximum frames to retain in the ring buffer (for start). Default 60, max 600.
     pub max_frames: Option<usize>,
@@ -830,7 +832,8 @@ pub struct LogsParams {
     pub since: Option<f64>,
     /// Filter by URL substring (for network).
     pub filter: Option<String>,
-    /// Maximum number of entries to return (for ipc, network, `slow_ipc`).
+    /// Maximum number of entries to return; 0 returns none. Defaults: 100 for ipc and
+    /// network, 20 for `slow_ipc`, everything captured for the other actions.
     pub limit: Option<usize>,
     /// Threshold in milliseconds for slow IPC calls (for `slow_ipc`).
     pub threshold_ms: Option<u64>,

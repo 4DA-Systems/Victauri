@@ -7,9 +7,22 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{Emitter, Manager, WebviewWindow};
 use victauri_plugin::inspectable;
+
+/// The app's one long-lived `AppHandle`, cloned once in `setup` (on the main
+/// thread) and never dropped (statics are not dropped).
+///
+/// Background work borrows it (`APP.get()` + `emit(&self, ..)`) instead of
+/// moving an `AppHandle` into a spawned thread or task. On Linux every Tauri
+/// handle carries tao's main-thread-only `Rc` state behind an
+/// `unsafe impl Send + Sync`; cloning or dropping a handle off the main thread
+/// races that non-atomic refcount and can corrupt the heap (glibc
+/// `corrupted double-linked list`). A handle moved into `std::thread::spawn` is
+/// dropped on that thread when it exits — exactly that race. See MIGRATION.md
+/// (v0.9.0).
+static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 
 // ── State ──────────────────────────────────────────────────────────────────
 
@@ -379,20 +392,24 @@ fn list_notifications(state: tauri::State<'_, AppState>) -> Vec<Notification> {
     category = "pipeline",
     example = "run the pipeline"
 )]
-fn run_pipeline(app: tauri::AppHandle, pipeline: tauri::State<'_, Arc<PipelineState>>) {
-    // Returns immediately. Real work happens on a spawned task; completion is
+fn run_pipeline(pipeline: tauri::State<'_, Arc<PipelineState>>) {
+    // Returns immediately. Real work happens on a spawned thread; completion is
     // signalled by the `running` flag flipping false AND a `pipeline-complete`
     // event. An agent should await one of those, not guess with a sleep.
+    // The thread owns no Tauri handle: it borrows the main-thread-owned `APP`
+    // (see its doc comment for why).
     let pipeline = Arc::clone(&pipeline);
     pipeline.running.store(true, Ordering::SeqCst);
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(400));
         let processed = pipeline.processed.fetch_add(50, Ordering::SeqCst) + 50;
         pipeline.running.store(false, Ordering::SeqCst);
-        let _ = app.emit(
-            "pipeline-complete",
-            serde_json::json!({ "processed": processed }),
-        );
+        if let Some(app) = APP.get() {
+            let _ = app.emit(
+                "pipeline-complete",
+                serde_json::json!({ "processed": processed }),
+            );
+        }
     });
 }
 
@@ -489,6 +506,15 @@ fn get_app_state(state: tauri::State<'_, AppState>) -> serde_json::Value {
     })
 }
 
+fn seed_db(path: &std::path::Path) -> rusqlite::Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS todos (id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INTEGER NOT NULL);
+         DELETE FROM todos;
+         INSERT INTO todos (id, title, done) VALUES (1, 'Write tests', 0), (2, 'Ship', 0), (3, 'Celebrate', 1);",
+    )
+}
+
 fn main() {
     // Shared pipeline state: one Arc cloned into both the `app_state` probe and
     // Tauri's managed state (the idiomatic VictauriBuilder::probe pattern).
@@ -553,8 +579,19 @@ fn main() {
             pipeline_status,
         ])
         .setup(|app| {
+            // Main thread: take the one handle background work may borrow.
+            let _ = APP.set(app.handle().clone());
             let window = app.get_webview_window("main").unwrap();
             window.set_title("Victauri Demo").unwrap();
+            // A real application database in the app data dir (a default query_db search
+            // root). Without it the only SQLite files there are the webview's own stores,
+            // which query_db rightly refuses to treat as the app's data.
+            if let Ok(dir) = app.path().app_data_dir() {
+                let _ = std::fs::create_dir_all(&dir);
+                if let Err(e) = seed_db(&dir.join("demo.db")) {
+                    eprintln!("demo-app: failed to seed demo.db: {e}");
+                }
+            }
             Ok(())
         })
         .run(tauri::generate_context!())

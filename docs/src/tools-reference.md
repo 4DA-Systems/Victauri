@@ -4,6 +4,8 @@ Victauri exposes 35 MCP tools organized into standalone tools (one action per ca
 
 All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
 
+> **Common parameters.** Every tool that touches a webview accepts `webview_label` (aliases `window`, `window_label`) to pick the window; without it the default window is used (`main`, else the first visible one). Every compound tool takes a required `action` string naming the operation.
+
 ## Backend Tools
 
 These tools access the Rust backend directly — no webview proxy, no JavaScript evaluation.
@@ -32,6 +34,9 @@ Browse files in app backend directories (data, config, log, local_data).
 
 **Returns:** `{root, entries: [{name, path, is_dir, size, modified}]}`
 
+A listing stops (and reports `truncated`) at 10,000 returned entries, 100,000 examined entries, or
+5 s — whichever comes first — so a pattern that matches nothing in a huge tree still returns.
+
 ---
 
 ### read_app_file
@@ -47,6 +52,8 @@ Read a file from one of the app's backend directories.
 | `binary` | boolean | no | Return base64 instead of UTF-8 text |
 
 **Returns:** UTF-8 text, or base64-encoded bytes when `binary` is true. Path-traversal-guarded.
+A read truncated at `max_bytes` in the middle of a multi-byte character drops the partial
+character and stays UTF-8 text.
 
 ---
 
@@ -69,6 +76,15 @@ Execute a read-only SQL query against a SQLite database in the app's data direct
 ```
 
 **Returns:** `{columns, rows, row_count, truncated, max_rows}`
+
+Limits: a 5 MB result budget charged cell by cell (the result is `truncated` rather than built
+past it), at most 256 result columns, 1 MB per value, `LIKE`/`GLOB` patterns up to 1000 bytes, a
+5 s CPU deadline, a 1 s wait for a lock held by the app, and at most two database calls
+(`query_db` / `db_health`) running at once — a third gets a "busy" error. Duplicate result
+column names get `:N` keys (`a`, `a:1`) so no value is lost; `columns` lists exactly the keys
+each row carries. A single string function (`LIKE`, `replace`, `instr`) is one uninterruptible
+SQLite step, so a pathological call can overrun the deadline by seconds on its worker thread;
+the tool call itself returns at the deadline.
 
 Read-only and path-traversal-guarded: writes (`INSERT`/`UPDATE`/…), stacked
 queries, `ATTACH`, and the write form of `PRAGMA` (`PRAGMA x = y`) are rejected.
@@ -105,9 +121,11 @@ or be wrapped in an IIFE; otherwise only the first statement runs. async/await i
 supported.
 
 JavaScript errors (thrown exceptions) return an MCP error with `isError: true`.
-`undefined` returns `"undefined"`, `null` returns `null`. A **syntax error**
-surfaces only as the eval timeout (the webview cannot report parse errors to the
-host). Targeting a hidden or unresponsive window fails fast (~2s); and if a prior
+`undefined` returns `"undefined"`, `null` returns `null`. A **syntax error** is
+reported at once as a JavaScript parse error ("the code did not begin executing") — code
+reported that way never runs later. A result JSON cannot represent (a circular object, a
+BigInt, a function) is reported as "the code ran, but its result could not be serialized",
+never as a JavaScript error. A page reload under the call fails it promptly. Targeting a hidden or unresponsive window fails fast (~2s); and if a prior
 eval timed out, the next call re-probes and fails fast if the webview reloaded or
 the app stopped responding.
 
@@ -121,6 +139,7 @@ Capture a full accessible DOM tree with ref handles for every element.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `webview_label` | string | no | Target webview |
+| `format` | string | no | `compact` (default, accessible text, ~70-80% fewer tokens) or `json` (full tree) |
 
 **Returns:** Tree of elements with `ref`, `role`, `name`, `children`, and bounding box data. Descends into open shadow DOM and **same-origin iframes** (cross-origin frames are marked and skipped).
 
@@ -137,6 +156,16 @@ Search for elements by CSS selector or text content. Returns an MCP error for in
 | `text` | string | no | Text content to search for |
 | `role` | string | no | ARIA role to filter by |
 | `webview_label` | string | no | Target webview |
+| `test_id` | string | no | Exact `data-testid` value |
+| `name` | string | no | Accessible name (aria-label, title, placeholder; case-insensitive substring) |
+| `tag` | string | no | Tag name, e.g. `button` |
+| `placeholder` | string | no | Placeholder text (case-insensitive substring) |
+| `alt` | string | no | Alt text (case-insensitive substring) |
+| `title_attr` | string | no | `title` attribute (case-insensitive substring) |
+| `label` | string | no | Associated `<label>` text (finds inputs by their label) |
+| `exact` | boolean | no | Exact instead of substring text matching |
+| `enabled` | boolean | no | Filter by enabled state |
+| `max_results` | integer | no | Maximum results (default 10) |
 
 **Examples:**
 ```json
@@ -156,6 +185,7 @@ Invoke a Tauri command from the backend.
 |------|------|----------|-------------|
 | `command` | string | yes | Command name |
 | `args` | object | no | Arguments to pass |
+| `timeout_ms` | integer | no | How long to wait for the result (default: the plugin eval timeout, 30 s; max 300000). Raise it for legitimately slow commands. `victauri-test`: `invoke_command_with_timeout` |
 
 **Example:**
 ```json
@@ -191,6 +221,8 @@ Compare frontend and backend state to detect drift.
 |------|------|----------|-------------|
 | `frontend_expr` | string | no | JS expression for frontend state |
 | `backend_state` | object | no | Expected backend state to compare |
+| `backend_command` | string | no | Tauri command whose result is the backend state (instead of `backend_state`) |
+| `backend_args` | object | no | Arguments for `backend_command` |
 
 **Example:**
 ```json
@@ -204,11 +236,14 @@ Compare frontend and backend state to detect drift.
 
 ### detect_ghost_commands
 
-Find commands invoked by the frontend that are not registered in the backend registry.
+Classify every command the frontend invoked by its observed outcome: a command that succeeded at least once provably has a handler (counted in `verified_handlers`); one that only ever failed with "not found" is listed in `confirmed_ghosts`; `plugin:*` built-ins are `excluded_builtins`; `frontend_only` is the weak tier (absent from the `#[inspectable]` registry, which is a subset of the real handler set). Read `reliability` and `note` before treating `frontend_only` as a bug list.
 
-**Parameters:** None required.
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `since_ms` | integer | no | Only consider commands invoked within the last N ms (scopes detection to the current test without clearing the IPC log) |
 
-**Returns:** List of ghost commands with invocation counts.
+**Returns:** `confirmed_ghosts` (each `{name, error}`), `verified_handlers` (a count), `frontend_only`, `excluded_builtins`, `registry_only`, `total_frontend_commands`, `total_registry_commands`, `reliability` (`none`/`low`/`high`) and `note`.
 
 ---
 
@@ -216,7 +251,10 @@ Find commands invoked by the frontend that are not registered in the backend reg
 
 Verify the health of IPC communication.
 
-**Parameters:** None required.
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `stale_threshold_ms` | integer | no | Age after which a pending IPC call counts as stale (default 5000) |
 
 **Returns:** `{healthy, total_calls, pending_count, stale_count, error_count, stale_calls, errored_calls, warning}`
 
@@ -293,6 +331,7 @@ Assert a condition about the application state using JS expressions.
 | `expression` | string | yes | JS expression to evaluate |
 | `condition` | string | yes | One of: `equals`, `not_equals`, `contains`, `greater_than`, `less_than`, `truthy`, `falsy` |
 | `expected` | any | no | Expected value (not needed for truthy/falsy) |
+| `label` | string | no | Human-readable name for the assertion (default empty) |
 
 **Example:**
 ```json
@@ -313,6 +352,7 @@ Resolve a natural language description to registered commands.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `query` | string | yes | Natural language description |
+| `limit` | integer | no | Maximum results (default 5) |
 
 **Example:**
 ```json
@@ -325,7 +365,14 @@ Resolve a natural language description to registered commands.
 
 List all registered commands with their metadata.
 
-**Parameters:** None.
+**Parameters:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query` | string | no | Filter commands by name or description |
+
+Each argument lists its Rust `name`, and — when it differs — the `key` the frontend invokes it
+by: Tauri camelCases argument names by default (`size_kb` → `sizeKb`), so pass `key` (or
+`name` when there is no `key`) in `invoke_command`'s `args`.
 
 ---
 
@@ -365,6 +412,13 @@ Element interactions with Playwright-grade actionability checks. Works on
 elements inside same-origin iframes too (refs from a snapshot/find resolve
 across frame boundaries).
 
+An action the page refuses — element covered, disabled, hidden, detached, not a
+`<select>`, or ref not found — is a **tool error** (MCP `isError: true`; REST
+`{"error": …}`) whose text is the reason followed by `[hint: RETRY_LATER]` (the UI
+may still settle) or `[hint: CHECK_INPUT]` (wrong target). The same applies to
+`input`, `inspect` (e.g. `get_styles` on an unknown ref) and `route add`. (Before
+0.9.0 these came back as a successful `{"ok": false, "error": …}` result.)
+
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `click` | `ref_id` | Click an element |
@@ -373,6 +427,9 @@ across frame boundaries).
 | `focus` | `ref_id` | Focus an element |
 | `scroll_into_view` | `ref_id` | Scroll element into viewport |
 | `select_option` | `ref_id`, `value` or `values` | Select option(s) in a `<select>` |
+| `trusted` | boolean | no | `click`: deliver a real OS mouse click (`isTrusted: true`) at the element's centre. Refused if the point is outside the window's client area. Windows only; the app window must be in the foreground |
+| `x` | number | no | `scroll_into_view` without `ref_id`: horizontal scroll position in px |
+| `y` | number | no | `scroll_into_view` without `ref_id`: vertical scroll position in px |
 
 **Trusted (OS-level) clicks:** add `"trusted": true` to `click` to deliver a
 real OS mouse event (`isTrusted: true`) at the element's center, instead of a
@@ -397,10 +454,11 @@ Text input and keyboard operations.
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `fill` | `ref_id`, `value` | Set input value directly |
-| `type` | `ref_id`, `text` | Type character-by-character |
+| `type_text` | `ref_id`, `text` | Type character-by-character |
 | `press_key` | `key` | Press a keyboard key |
+| `trusted` | boolean | no | `type_text`/`press_key`: deliver real OS keyboard input (`isTrusted: true`). The element is focused first and the call is refused if focus does not land on it. Windows only; the app window must be in the foreground |
 
-**Trusted (OS-level) input:** add `"trusted": true` to `type` or `press_key` to
+**Trusted (OS-level) input:** add `"trusted": true` to `type_text` or `press_key` to
 deliver real OS keystrokes (`isTrusted: true`) into the focused element instead
 of synthetic DOM events. The target element (`ref_id`) is focused first.
 Implemented on Windows (Win32 `SendInput`); macOS/Linux fall back to synthetic
@@ -409,8 +467,8 @@ input with a clear error.
 **Example:**
 ```json
 {"action": "fill", "ref_id": "e5", "value": "hello@example.com"}
-{"action": "type", "ref_id": "e5", "text": "Hello"}
-{"action": "type", "ref_id": "e5", "text": "Hello", "trusted": true}
+{"action": "type_text", "ref_id": "e5", "text": "Hello"}
+{"action": "type_text", "ref_id": "e5", "text": "Hello", "trusted": true}
 {"action": "press_key", "key": "Enter"}
 ```
 
@@ -426,7 +484,7 @@ Window management operations.
 |--------|-----------|-------------|
 | `get_state` | `label` | Get window state (position, size, visibility) |
 | `list` | — | List all window labels |
-| `manage` | `label`, `operation` | minimize/unminimize/maximize/unmaximize/close |
+| `manage` | `label`, `manage_action` | `minimize`, `unminimize`, `maximize`, `unmaximize`, `close`, `focus`, `show`, `hide`, `fullscreen`, `unfullscreen`, `always_on_top`, `not_always_on_top` |
 | `resize` | `label`, `width`, `height` | Resize a window |
 | `move_to` | `label`, `x`, `y` | Move a window |
 | `set_title` | `label`, `title` | Change window title |
@@ -450,10 +508,10 @@ Browser storage operations.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
-| `get` | `key` | Get localStorage value |
-| `set` | `key`, `value` | Set localStorage value |
-| `delete` | `key` | Delete localStorage key |
-| `cookies` | — | Get all cookies |
+| `get` | `key`, `storage_type` | Get a value (`storage_type`: `local` (default) or `session`) |
+| `set` | `key`, `value`, `storage_type` | Set a value |
+| `delete` | `key`, `storage_type` | Delete a key |
+| `get_cookies` | — | Get the page's cookies (non-`httpOnly` only — read via `document.cookie`) |
 
 **Example:**
 ```json
@@ -470,14 +528,16 @@ Navigation and history operations.
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `go_to` | `url` | Navigate to a URL (http/https only) |
-| `back` | — | Go back in history |
-| `history` | — | Get navigation history log |
-| `dialogs` | — | Get dialog log (alerts, confirms, prompts) |
+| `go_back` | — | Go back in history |
+| `get_history` | — | Get navigation history log |
+| `set_dialog_response` | `dialog_type`, `dialog_action`, `text` | Auto-respond to future `alert`/`confirm`/`prompt` dialogs (`accept` / `dismiss`) |
+| `get_dialog_log` | — | Get dialog log (alerts, confirms, prompts) |
 
 **Example:**
 ```json
 {"action": "go_to", "url": "https://example.com"}
-{"action": "history"}
+{"action": "get_history"}
+{"action": "set_dialog_response", "dialog_type": "confirm", "dialog_action": "accept"}
 ```
 
 ---
@@ -488,18 +548,38 @@ Time-travel recording for session capture and replay.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
-| `start` | — | Start recording events |
+| `start` | `session_id` (optional) | Start recording events |
 | `stop` | — | Stop recording and return session |
-| `checkpoint` | `label` (alias: `checkpoint_label`) | Create a named checkpoint |
-| `events` | `since`, `limit` | Get recorded events |
+| `checkpoint` | `checkpoint_id` (optional, auto-generated), `checkpoint_label` (alias: `label`), `state` | Create a checkpoint |
+| `list_checkpoints` | — | List checkpoints |
+| `get_events` | `since_index` | Get recorded events |
+| `events_between` | `from`, `to` (checkpoint ids) | Events between two checkpoints |
+| `get_replay` | — | The recorded IPC call sequence |
 | `export` | — | Export full session data (works after stop) |
-| `import` | `session` | Import a session for replay |
-| `replay` | `webview_label` | Re-execute recorded IPC commands and report pass/fail per command (works after stop) |
+| `import` | `session_json` | Import a session (becomes the active recording; refused while one is in progress) |
+| `replay` | `webview_label` | Re-invoke recorded IPC commands (see below; works after stop) |
+| `flush` | `webview_label` | Pull pending bridge events into the active recording now |
+
+**`replay` semantics.** Recordings do not capture call arguments, so `replay` re-invokes
+only calls that **succeeded with no arguments**. Calls that had arguments, failed, or
+never completed are reported as `skipped` with a reason; commands blocked by the privacy
+allow/blocklist are reported as `blocked`. `passed` means the re-invocation succeeded —
+the response is **not** diffed against the original (only its JSON type is reported).
+Re-invoked commands run for real, so their side effects happen again.
+
+Each call is re-invoked **in the window that recorded it** — a window's Tauri capabilities are
+its own — and is skipped if that window no longer exists (it never falls back to `main`);
+`webview_label` only filters which recorded calls are replayed. Calls that were fulfilled or
+blocked by a network route (`route add`, which page script can also use) are recorded as
+`mocked` and never replayed: they never reached the backend. (Script in the recording window
+can still rewrite what the recording captures from that window — see
+[Security](security.md#what-page-script-can-and-cannot-do-to-the-bridge).)
 
 **Example:**
 ```json
 {"action": "start"}
 {"action": "checkpoint", "label": "after-login"}
+{"action": "get_events", "since_index": 0}
 {"action": "stop"}
 {"action": "replay"}
 ```
@@ -512,18 +592,20 @@ CSS inspection, accessibility, and performance profiling.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
-| `styles` | `ref_id`, `properties` | Get computed CSS styles |
-| `bounds` | `ref_ids` | Get bounding boxes with box model |
-| `highlight` | `ref_id`, `color`, `label` | Draw debug overlay on element |
-| `accessibility` | — | Run WCAG accessibility audit |
-| `performance` | — | Get performance metrics |
+| `get_styles` | `ref_id`, `properties` | Get computed CSS styles |
+| `get_bounding_boxes` | `ref_ids` | Get bounding boxes with box model |
+| `highlight` | `ref_id`, `color`, `highlight_label` | Draw debug overlay on element |
+| `clear_highlights` | — | Remove all debug overlays |
+| `audit_accessibility` | — | Run WCAG accessibility audit |
+| `get_performance` | — | Get performance metrics |
+| `label` | string | no | `highlight`: text shown above the overlay |
 
 **Example:**
 ```json
-{"action": "styles", "ref_id": "e3", "properties": ["color", "font-size"]}
-{"action": "bounds", "ref_ids": ["e1", "e2", "e3"]}
-{"action": "accessibility"}
-{"action": "performance"}
+{"action": "get_styles", "ref_id": "e3", "properties": ["color", "font-size"]}
+{"action": "get_bounding_boxes", "ref_ids": ["e1", "e2", "e3"]}
+{"action": "audit_accessibility"}
+{"action": "get_performance"}
 ```
 
 The accessibility audit checks: missing alt text, unlabeled form inputs, empty buttons/links, heading hierarchy, color contrast (WCAG AA), ARIA role validity, positive tabindex, and missing document language/title.
@@ -540,6 +622,7 @@ CSS injection for debugging and prototyping.
 |--------|-----------|-------------|
 | `inject` | `css` | Inject custom CSS (replaces previous) |
 | `remove` | — | Remove injected CSS |
+| `allow_remote` | boolean | no | Allow `@import` and remote `url(...)` in injected CSS (default false: blocked, because remote references turn `css inject` into an exfiltration channel) |
 
 **Example:**
 ```json
@@ -562,6 +645,9 @@ Access all captured logs from the application.
 | `dialogs` | — | Dialog interactions |
 | `events` | `since` | Event stream |
 | `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
+| `clear` | — | Clear the IPC + network logs (per-test isolation) |
+| `filter` | string | no | `network`: URL substring filter |
+| `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |
 
 **Example:**
 ```json
@@ -578,7 +664,7 @@ Access all captured logs from the application.
 ### route
 
 Network request interception — the Playwright `route()` equivalent, implemented
-purely in the JS bridge (no CDP, works identically across all Tauri webviews).
+purely in the JS bridge (no CDP; the same behaviour on all three Tauri webviews, within the fetch/XHR limits below).
 Matches webview `fetch`/XHR by URL and blocks, mocks, or delays them. Rules are
 page-scoped (cleared on reload).
 
@@ -589,13 +675,14 @@ page-scoped (cleared on reload).
 | `clear` | `id` | Remove a rule by id |
 | `clear_all` | — | Remove all rules |
 | `matches` | `limit` | Log of intercepted requests |
+| `status_text` | string | no | `fulfill`: mock response status text |
 
 **`add` parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `pattern` | string | yes | URL pattern to match |
-| `match_type` | string | no | `substring` (default), `glob`, `regex`, `exact` |
+| `pattern` | string | yes | URL pattern to match. Tested against the request's absolute URL (resolved against the page's base URL), its path + query + fragment when same-origin, and the URL string as the app passed it — so a rule hits the same request whether the app calls `fetch('/api/x')`, `fetch(new URL(…))` or `fetch(new Request(…))`, and likewise for XHR |
+| `match_type` | string | no | `substring` (default), `glob` (`*` matches any run of characters; every other character, including `?`, is literal), `regex`, `exact` |
 | `method` | string | no | Restrict to one HTTP method |
 | `behavior` | string | no | `block` (abort), `fulfill` (mock — default), `delay` |
 | `status` | number | no | Mock response status (fulfill, default 200) |
@@ -615,8 +702,16 @@ page-scoped (cleared on reload).
 
 > **Scope:** fetch supports all behaviors; XHR supports `block`/`delay`
 > (`fulfill` is fetch-only). Top-level navigation, sub-resources (img/css), and
-> WebSocket frames are not intercepted. For Tauri **IPC-layer** faults, use the
-> `fault` tool instead.
+> WebSocket frames are not intercepted.
+>
+> **Tauri IPC is observe-only.** The app's real `invoke` traffic
+> (`http://ipc.localhost/…` on Windows, `ipc://localhost/…` on macOS/Linux) is
+> *logged* (`logs ipc`, and a rule may even show up in `matches`), but a rule
+> does **not** control it — Tauri serves real IPC below the JS `fetch` layer the
+> bridge can reach, so the call still goes through, undelayed. The `fault` tool
+> does not touch the app's real frontend IPC either: it only applies to commands
+> you drive through `invoke_command`. Neither tool can reproduce a failure a user
+> clicking the UI would hit.
 
 ---
 
@@ -633,9 +728,24 @@ ring buffer via the native screenshot path (no CDP). Pairs with `recording`
 | `status` | — | Active flag + buffered frame count |
 | `frames` | `limit` | Return captured frames as base64 PNGs |
 
-`start` defaults: `interval_ms` 500 (min 50), `max_frames` 60 (max 600). Set
+`start` defaults: `interval_ms` 500 (min 50, max 60000), `max_frames` 60 (max 600). Set
 `with_events: true` to also start the event recorder so the trace bundles the
 IPC/DOM/console timeline alongside the screencast.
+
+Limits and lifecycle:
+- A trace **auto-stops after 30 minutes** (an abandoned trace must not capture forever).
+- The frame buffer is a ring (`max_frames`) and is also capped at **256 MB** total;
+  the oldest frames are dropped first.
+- `frames` returns the **newest** frames that fit a **25 MB** response cap (with a
+  note when it had to drop older ones) — pass a smaller `limit` to page.
+- **Hidden windows are skipped**: a frame is only captured while the target window is
+  visible (a native capture of a hidden window would return stale or another window's
+  pixels), so a hidden period shows up as a gap, not a wrong image.
+- `stop` (or the 30-minute auto-stop) also **ends the recording that `with_events`
+  started**; a recording you started separately with `recording start` is left alone.
+  The stopped session stays readable via `recording get_events` / `export`.
+- Frames come from the native screenshot path, so the platform limits of `screenshot`
+  apply (Linux needs X11/XWayland).
 
 **Example:**
 ```json
@@ -666,12 +776,26 @@ Deep backend introspection — command performance profiling, IPC contract testi
 | `contract_clear` | — | Clear all recorded contract baselines |
 | `startup_timing` | — | Victauri plugin initialization phase-by-phase timing breakdown |
 | `capabilities` | — | Tauri v2 capabilities, security config (CSP, freeze_prototype), plugins, and window definitions |
-| `db_health` | `db_path` | Bounded, read-only `SQLite` diagnostics (journal mode, WAL presence, page stats) |
+| `db_health` | `db_path` | Bounded, read-only `SQLite` diagnostics (see below) |
 | `plugin_state` | — | Victauri plugin internal state: event counts, registry, recording, faults, timings, uptime |
 | `processes` | — | Host process + child processes (sidecars, background workers) with PID, name, and memory |
 | `plugin_tasks` | — | Victauri's spawned async tasks (MCP server, event drain) with active/finished counts |
 | `event_bus` | — | All captured Tauri events (automatically intercepted) + app events from EventLog |
 | `event_bus_clear` | — | Clear both event bus and event log |
+
+**`db_health` report.** Opens the database read-only and returns: `journal_mode`,
+`page_count`, `page_size`, `db_size_mb`, `freelist_count`; the table list with
+per-table `row_count` (counted under a 5 s budget — tables not reached get
+`row_count: null` and `row_counts_complete: false`; the listing is capped and flagged by
+`tables_truncated`); and `integrity_check` from SQLite `PRAGMA quick_check` under its own
+5 s budget. When the file may contain virtual tables and the host app has registered a
+non-built-in virtual-table module, the check runs table by table over ordinary tables only
+(`integrity_check_kind: "quick_check (per table)"`, reason in `integrity_check_note`), so no
+app-registered module code runs; otherwise `integrity_check_note` is `null`. On a large
+database `quick_check` may report
+`"not completed: … exceeded its budget …"` — that means *unknown*, not corrupt. It never
+checkpoints or inspects the `-wal` file (`wal_checkpoint` is reported as "not run
+(read-only diagnostics)" in WAL mode).
 
 **Examples:**
 ```json
@@ -704,7 +828,16 @@ Probe a backend command handler under failure for chaos engineering.
 | `clear` | `command` | Remove a specific fault rule |
 | `clear_all` | — | Remove all fault rules |
 
-**Fault types:** `delay` (add latency), `error` (return error), `drop` (empty response), `corrupt` (mangle response).
+**Fault types:**
+- `delay` — sleep `delay_ms` (max 120 000), then run the command normally.
+- `error` — return `[FAULT INJECTED] command '<name>': <error_message>` **without running** the command.
+- `drop` — return `{}` **without running** the command.
+- `corrupt` — run the command for real (side effects happen), then return a fixed marker
+  instead of its result: `{"__corrupted":true,"original_length":<n>,"fault":"corrupt"}`.
+
+Rules **auto-expire 15 minutes** after they are injected (so a forgotten fault cannot
+sabotage a later run — re-inject to refresh) or after `max_triggers` hits
+(0 = unlimited).
 
 **Examples:**
 ```json
@@ -719,7 +852,14 @@ Probe a backend command handler under failure for chaos engineering.
 
 ### explain
 
-Natural-language narration of what happened in the app. Aggregates events from the EventLog over a time window and produces human-readable summaries, causal chains, or diffs.
+Natural-language narration of what happened in the app. Aggregates recent events over a time window and produces human-readable summaries, causal chains, or diffs.
+
+**Event source.** While a recording is active, `explain` reads the recorder-fed event
+log. When nothing is recording, it reads the JS bridge's own event stream **on demand**
+(IPC, DOM mutations, console, network, navigation) for the requested window — without
+storing it, so a later recording never double-counts. Victauri's own internal traffic is
+filtered out. Network requests are counted as **state changes** and navigations as
+**window events** in the tallies.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
@@ -753,6 +893,9 @@ Quantitative, deterministic, cross-platform access to the webview's animation en
 | `list` | `webview_label` | `getAnimations()` introspection: declared timing (duration/delay/easing/iterations), computed progress, keyframes, play state, and the animating target. An animation only appears while running/pending — trigger it first. |
 | `scrub` | `selector`, `points`, `capture`, `webview_label` | Pauses the target's animation and seeks it to N evenly-spaced points (`await animation.ready` + double-rAF freezes each frame), returning the exact geometry curve (rect + transform + opacity per point). With `capture: true`, also returns a single contact-sheet **filmstrip PNG** of the whole arc plus a manifest. **CSS-driven animations only** (JS/rAF animations are not seekable — errors clearly and suggests `sample`). |
 | `sample` | `record`, `selector`, `webview_label` | Real-time `requestAnimationFrame` recorder, decoupled from the blocking eval so event-triggered sweeps are catchable: `record: true` arms a watcher, trigger the animation, then `record: false` reads the measured per-frame curve, jank stats (dropped frames, max frame gap), and declared-vs-measured duration. Works for **any** animation including JS/rAF-driven ones. |
+| `restore` | boolean | no | `scrub`: resume the animation afterwards (default true); false leaves it paused at the last point |
+| `cols` | integer | no | `scrub` with `capture`: filmstrip grid columns (default ≈ √points) |
+| `clear` | boolean | no | `sample` read: clear the recorded sessions after returning them |
 
 **Parameters:**
 | Name | Type | Required | Description |

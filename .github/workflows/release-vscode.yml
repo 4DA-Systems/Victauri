@@ -2,57 +2,69 @@ name: Release VS Code Extension
 
 # Decoupled from the core workspace release. Ships ONLY when you tag it:
 #   git tag vscode-v0.7.1 && git push origin vscode-v0.7.1
-# Or run manually (workflow_dispatch) with dry_run=true to just build + package.
+# Or run manually (workflow_dispatch):
+#   - dry_run=true (default): build + typecheck + package the .vsix and upload it as a
+#     workflow artifact. Works from ANY branch — it never touches the `release`
+#     environment or any secret.
+#   - dry_run=false: also publishes. The publish job runs in the `release` environment,
+#     whose deployment-branch policy only admits tag refs, so a real manual publish MUST be
+#     dispatched ON A TAG ("Use workflow from" → the vscode-v* tag), not on a branch.
 #
-# Required secrets (Settings → Secrets → Actions):
+# Required secrets (environment `release`):
 #   VSCE_PAT  — Azure DevOps PAT, Marketplace → Manage scope (publisher 4da-systems)
 #   OVSX_TOKEN — (optional) open-vsx.org token, for Cursor / VSCodium / agent IDEs
+#
+# Supply-chain shape (audit hardening):
+#   - `build` holds NO secrets and only a read-only token. Dependency install scripts are
+#     disabled (`--ignore-scripts`; esbuild/vsce/vsce-sign/keytar all work without them —
+#     verified: lint, build and `vsce package` succeed), and the checkout does not persist
+#     its token into .git/config.
+#   - `publish` downloads the already-built .vsix and only runs the pinned vsce/ovsx CLIs
+#     (installed with `--ignore-scripts` too). Each publish token is scoped to the single
+#     step that uses it.
 on:
   push:
     tags: ["vscode-v*"]
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build + package only (do not publish)"
+        description: "Build + package only (do not publish). A real publish must be dispatched on a vscode-v* tag."
         type: boolean
         default: true
 
-# Least-privilege: default to read-only at the workflow level. Only the single
-# publish job gets `contents: write`, and only because its final step attaches the
-# .vsix to a GitHub Release (softprops/action-gh-release). Marketplace / Open VSX
-# publishing authenticates via VSCE_PAT / OVSX_TOKEN, not the GitHub token.
 permissions:
   contents: read
 
 jobs:
-  publish:
-    name: Build & publish VS Code extension
+  build:
+    name: Build & package VS Code extension
     runs-on: ubuntu-latest
-    environment: release
+    timeout-minutes: 20
     permissions:
-      contents: write # required: attach .vsix to the GitHub Release
-    env:
-      # Job-level so the Open VSX step's `if:` can read `env.OVSX_TOKEN` — a step-level `env:`
-      # is NOT in scope for that same step's `if:` expression, which silently skipped the publish.
-      OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+      contents: read
     defaults:
       run:
         working-directory: editors/vscode
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
 
-      - name: Install dependencies
-        run: npm ci --no-audit --no-fund
+      - name: Install dependencies (no install scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Typecheck
         run: npm run lint
 
       - name: Build
         run: npm run build
+
+      - name: Unit tests
+        run: npm test
 
       - name: Verify tag matches package.json version
         if: startsWith(github.ref, 'refs/tags/')
@@ -66,24 +78,77 @@ jobs:
           fi
 
       # Publish tooling is installed strictly from package-lock.json above. `--no-install`
-      # prevents npx from fetching mutable registry code during a credentialed release.
+      # prevents npx from fetching mutable registry code.
       - name: Package .vsix
         run: npx --no-install vsce package --no-dependencies -o victauri.vsix
 
+      - name: Upload .vsix
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: victauri-vsix
+          path: editors/vscode/victauri.vsix
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish VS Code extension
+    needs: build
+    # Only when actually publishing: a tag push, or a manual dispatch with dry_run=false.
+    # Dry runs never enter the `release` environment, so they work from any branch.
+    if: startsWith(github.ref, 'refs/tags/vscode-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release
+    permissions:
+      contents: write # required: attach .vsix to the GitHub Release
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - name: Require a vscode-v* tag ref for a real publish
+        working-directory: .
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/vscode-v*) ;;
+            *) echo "::error::A real publish must be dispatched on a vscode-v* tag (got $GITHUB_REF). Re-run with 'Use workflow from' set to the tag, or use dry_run=true."; exit 1 ;;
+          esac
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # Only the pinned publish CLIs are needed here; no install scripts run.
+      - name: Install publish tooling (no install scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download .vsix
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: victauri-vsix
+          path: editors/vscode
+
       - name: Publish to VS Code Marketplace
-        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false'
         run: npx --no-install vsce publish --packagePath victauri.vsix -p "$VSCE_PAT"
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
       - name: Publish to Open VSX (Cursor / VSCodium / agent IDEs)
-        # `env.OVSX_TOKEN` resolves from the job-level `env:` above (a step-level env is not in
-        # scope for its own `if:`), so the step now actually runs when the secret is configured.
-        if: ${{ (startsWith(github.ref, 'refs/tags/') || github.event.inputs.dry_run == 'false') && env.OVSX_TOKEN != '' }}
-        run: npx --no-install ovsx publish victauri.vsix -p "$OVSX_TOKEN"
+        # The token is scoped to this step only; the optional-secret check happens in the
+        # shell (a step-level env is not visible to that step's own `if:`).
+        run: |
+          if [ -z "$OVSX_TOKEN" ]; then
+            echo "OVSX_TOKEN not configured — skipping Open VSX publish."
+            exit 0
+          fi
+          npx --no-install ovsx publish victauri.vsix -p "$OVSX_TOKEN"
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
 
       - name: Attach .vsix to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
           name: ${{ github.ref_name }}

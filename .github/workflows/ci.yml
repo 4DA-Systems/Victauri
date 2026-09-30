@@ -61,6 +61,19 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --no-default-features -- -D warnings
 
+      # The workspace step above does NOT compile the plugin without SQLite: demo-app and
+      # gauntlet-app depend on victauri-plugin with default features, and cargo's feature
+      # unification keeps `sqlite` on for every member. Only a `-p victauri-plugin` build
+      # actually compiles the `not(feature = "sqlite")` paths a consumer with
+      # `default-features = false` gets.
+      - name: Clippy (plugin alone, no SQLite)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo clippy -p victauri-plugin --all-targets --no-default-features -- -D warnings
+
+      - name: Plugin unit tests (no SQLite)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo test -p victauri-plugin --no-default-features --lib
+
       - name: Clippy (release profile — incl. tests)
         if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets --release -- -D warnings
@@ -336,6 +349,43 @@ jobs:
           path: gauntlet.log
           if-no-files-found: ignore
 
+  # The VS Code extension: typecheck, bundle, and its unit tests (code generation escaping,
+  # discovery/connection resolution, health semantics) under plain Node.
+  vscode:
+    name: VS Code extension
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+
+      # rustc lets the codegen test prove each generated literal lexes back to its input.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
+
+      - name: Install dependencies (no install scripts)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Typecheck
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Unit tests
+        run: npm test
+
   docs:
     name: Docs
     runs-on: ubuntu-latest
@@ -377,8 +427,52 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
+      # --locked: check the committed lockfile's versions (the ones CI and a fresh
+      # `cargo install --locked` resolve), and fail if Cargo.lock is out of date instead of
+      # silently re-resolving.
       - name: Check MSRV
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
+
+  # victauri-plugin accepts rusqlite `>=0.32, <0.41` so cargo unifies onto the app's own
+  # rusqlite (`links = "sqlite3"` allows one libsqlite3-sys per build). The lockfile pins the
+  # OLD end; this job proves the NEW end: the security setters changed return type across the
+  # range (`SetupOutcome` in database.rs keeps them fail-closed on every version).
+  rusqlite-range:
+    name: rusqlite range (newest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies
+        uses: ./.github/actions/linux-deps
+
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
+
+      - name: Move rusqlite to the newest version the range allows
+        # Fails if the update did not reach the newest minor the workspace range allows
+        # (`>=0.32, <0.41` in Cargo.toml) — otherwise this job would silently keep testing 0.32.
+        # Widen NEWEST together with the range.
+        env:
+          NEWEST: "0.40."
+        run: |
+          cargo update -p rusqlite
+          resolved=$(grep -A1 '^name = "rusqlite"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
+          echo "rusqlite resolved to ${resolved:-<none>}"
+          case "$resolved" in
+            "$NEWEST"*) ;;
+            *) echo "::error::rusqlite resolved to '$resolved', expected $NEWEST* (the newest the range allows)"; exit 1 ;;
+          esac
+
+      - name: Clippy (plugin, sqlite)
+        run: cargo clippy -p victauri-plugin --all-targets --features sqlite -- -D warnings
+
+      - name: Plugin unit tests (incl. query_db / db_health)
+        run: cargo test -p victauri-plugin --features sqlite --lib
 
   security:
     name: Security Audit
@@ -439,10 +533,15 @@ jobs:
       - name: Generate coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@18283e04ce6e62d37312384ff67231eb8fd56d24 # v4.7.1
+      # No Codecov upload: without a token it failed on every run (tokenless upload
+      # refused) while reporting green, and the action ran an unverified `latest`
+      # CLI. The report is kept as an artifact instead.
+      - name: Keep the coverage report
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          files: lcov.info
+          name: lcov
+          path: lcov.info
+          retention-days: 14
 
   semver:
     name: Semver Checks
@@ -466,27 +565,27 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
       # Prebuilt binary — avoids ~3 min compiling cargo-semver-checks from source.
+      # Pinned: the version this action pin defaults to (0.48) cannot read the rustdoc JSON of
+      # current stable ("unsupported rustdoc format v60"), and failed before checking anything.
       - uses: taiki-e/install-action@25435dc8dd3baed7417e0c96d3fe89013a5b2e09 # v2
         with:
-          tool: cargo-semver-checks
+          tool: cargo-semver-checks@0.50.0
 
-      # INFORMATIONAL — not a required gate (removed from ci-success). cargo-semver-
-      # checks builds rustdoc and is currently broken in CI in two INDEPENDENT ways,
-      # neither of which is an API break:
-      #   - victauri-plugin: rustdoc hits an upstream E0119 ("conflicting
-      #     implementations of From<HourBase>") compiling `time` (pulled by
-      #     tauri → cookie) on every stable toolchain tested (1.93.1, 1.95) and the
-      #     latest time (0.3.48). The baseline build uses fresh crates.io resolution,
-      #     so pinning our lock can't fix it.
-      #   - victauri-core: cargo-semver-checks' fresh baseline resolution fails in CI
-      #     (passes locally only with a warm cache).
-      # A plain `cargo doc --workspace` succeeds, so these are tooling/toolchain
-      # issues, not semver violations. Keep it running for signal; use local
-      # `cargo semver-checks` as the pre-release gate. Re-add to ci-success once the
-      # upstream time/rustdoc bug is fixed.
+      # INFORMATIONAL — not a required gate: a new stable rustdoc JSON format can outrun
+      # the pinned cargo-semver-checks, which is a tooling failure, not an API break. Note
+      # that for a 0.x MAJOR bump (0.8.8 -> 0.9.0) this step checks NOTHING: every lint is
+      # already permitted by a major bump, so it reports "0 checks … 254 skip" and passes.
+      # It only has teeth between patch releases of one 0.x line. RELEASING.md step 3 covers
+      # what to run for a major bump (`--release-type minor`, to list what actually broke).
+      # A failure is surfaced as a warning annotation below, never swallowed silently;
+      # RELEASING.md makes the local run the pre-release gate.
       - name: Check semver (informational)
+        id: semver
         continue-on-error: true
         run: cargo semver-checks check-release --workspace
+      - name: Surface a semver-checks failure
+        if: steps.semver.outcome == 'failure'
+        run: echo "::warning title=Semver Checks::cargo semver-checks failed (API break, or a toolchain/tool mismatch) — read the log above"
 
   e2e:
     name: E2E Integration (${{ matrix.os }})
@@ -566,6 +665,46 @@ jobs:
         env:
           VICTAURI_E2E: "1"
 
+      # One run of the suite is a weak detector for a host crash that depends on timing: the
+      # 0.9.0 Linux heap corruption (a Tauri handle cloned/dropped off the main thread) killed the
+      # host in only ~25-50% of runs and hid behind nine green single runs. So on Linux the
+      # heap-sensitive tests run again against three FRESH apps, and any dead host fails the job.
+      - name: Heap-safety repeats against fresh apps (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VICTAURI_E2E: "1"
+        run: |
+          # The suite's app is stopped on purpose here; clear APP_PID so the failure step below
+          # does not report it as a host that died.
+          if [ -n "$APP_PID" ]; then kill "$APP_PID" 2>/dev/null || true; fi
+          echo "APP_PID=" >> "$GITHUB_ENV"
+          sleep 1
+          deaths=0
+          for i in 1 2 3; do
+            xvfb-run -a ./target/debug/demo-app >/tmp/repeat-$i.out 2>/tmp/repeat-$i.err &
+            pid=$!
+            for t in $(seq 1 60); do
+              code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:7373/health || true)
+              case "$code" in 2??|429) break ;; esac
+              sleep 1
+            done
+            cargo test -q -p demo-app --test integration -- --test-threads=1 --exact \
+              concurrent_window_introspection_is_heap_safe \
+              webview_access_main_thread_safe_under_ipc_load \
+              webview_reload_during_introspection_is_safe || true
+            sleep 2
+            if ! pgrep -x demo-app >/dev/null || grep -qE 'malloc|corrupted|double free|unaligned|free\(\)' /tmp/repeat-$i.err /tmp/repeat-$i.out; then
+              deaths=$((deaths + 1))
+              echo "::error::repeat $i: the demo-app host died"
+              tail -n 40 /tmp/repeat-$i.err /tmp/repeat-$i.out
+            fi
+            pkill -x demo-app || true
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+          done
+          echo "host deaths: $deaths/3"
+          test "$deaths" -eq 0
+
       # Only on failure, and only where we captured it. If the host died, its own output names
       # the cause; without this the log shows nothing but "connection refused".
       - name: Show demo app output on failure (Unix)
@@ -601,7 +740,7 @@ jobs:
   # Listing ~15 matrix legs as required checks is brittle (a renamed job
   # silently stops being required). This job depends on all of them and fails
   # if any FAILED or was CANCELLED — a SKIPPED job (a conditional leg that
-  # legitimately did not apply, e.g. `semver` on push or `e2e` on a PR) passes.
+  # legitimately did not apply, e.g. `semver` on a push to main) passes.
   # Require ONLY "CI Success" in branch protection.
   # ─────────────────────────────────────────────────────────────────────
   ci-success:
@@ -614,7 +753,9 @@ jobs:
         live-app,
         gauntlet,
         docs,
+        vscode,
         msrv,
+        rusqlite-range,
         security,
         deny,
         coverage,

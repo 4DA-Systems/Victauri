@@ -104,9 +104,12 @@ pub struct WaitForParams {
     /// Condition to wait for.
     pub condition: WaitCondition,
     /// Value for the condition: text to find, CSS selector, URL substring,
-    /// JS expression (for `expression`), or Tauri event name (for `event`).
+    /// JS expression (for `expression` — a single expression; a trailing `;` or comment is
+    /// fine, and one that does not parse fails at once instead of polling to the timeout),
+    /// or Tauri event name (for `event`).
     pub value: Option<String>,
-    /// Maximum time to wait in milliseconds. Default: 10000.
+    /// Maximum time to wait in milliseconds. Default: 10000; capped at 120000. `0` checks the
+    /// condition exactly once, immediately, and returns (`ok: false` if it is not met yet).
     pub timeout_ms: Option<u64>,
     /// Polling interval in milliseconds. Default: 200.
     pub poll_ms: Option<u64>,

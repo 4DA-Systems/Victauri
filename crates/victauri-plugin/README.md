@@ -8,7 +8,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.8"
+victauri-plugin = "0.9"
 ```
 
 Wire it into your Tauri app:
@@ -47,9 +47,28 @@ victauri_plugin::VictauriBuilder::new()
     .expect("valid config")
 ```
 
+## Cargo features
+
+| Feature | Default | What it does |
+|---|---|---|
+| `sqlite` | on | `query_db` and `introspect db_health` (via rusqlite). Without it both tools return a clear "not compiled in" error. |
+| `bundled-sqlite` | on | Compiles SQLite into the binary (rusqlite's `bundled`). Implies `sqlite`. |
+
+The plugin accepts rusqlite `>=0.32, <0.41`, so cargo unifies it with your app's own rusqlite —
+which means `bundled-sqlite` **also switches your app's rusqlite to the bundled SQLite**. If your
+app links a system SQLite or SQLCipher, keep yours by turning the default features off and
+enabling only `sqlite`:
+
+```toml
+[dependencies]
+victauri-plugin = { version = "0.9", default-features = false, features = ["sqlite"] }
+```
+
+(With `default-features = false` and no `sqlite`, the plugin has no rusqlite dependency at all.)
+
 ## Tools
 
-35 MCP tools across three layers -- webview, IPC, and Rust backend (full catalog in the [tools reference](https://4da-systems.github.io/victauri/tools-reference.html)):
+35 MCP tools across three layers -- webview, IPC, and Rust backend (full catalog in the [tools reference](https://4da-systems.github.io/Victauri/tools-reference.html)):
 
 ### Backend (direct Rust access, no webview needed)
 

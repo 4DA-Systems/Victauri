@@ -1,5 +1,252 @@
 # Migration Guide
 
+## v0.8.8 → v0.9.0 (public data types are `#[non_exhaustive]` — a one-time break)
+
+**Bump the requirement:** `victauri-plugin = "0.9"`, `victauri-test = "0.9"` (and `victauri-core`
+if you depend on it directly). `^0.8` does not pick up 0.9.
+
+**Most apps need no code change.** Wiring the plugin (`VictauriBuilder`, `init()`,
+`CommandInfo::new`, `register_commands!`, `#[inspectable]`), calling tools, and *reading* any
+result type all work unchanged. You only need to change code that **constructs** one of these types
+with a struct literal outside the crate that defines it — typically a mock `WebviewBridge` in
+tests, or code that builds recordings/reports by hand:
+
+| Was | Now |
+|---|---|
+| `WindowState { label, title, visible, .. }` | `WindowState::new(label).with_title(..).with_visible(..)` |
+| `IpcCall { id, command, .. }` | `IpcCall::new(id, command, timestamp, result, duration_ms, arg_size_bytes, webview_label)` |
+| `RecordedSession { .. }` / `RecordedEvent { .. }` | `RecordedSession::new(..)` / `RecordedEvent::new(..)` |
+| `SemanticAssertion { .. }` | `SemanticAssertion::new(..)` |
+| `CommandInfo { .. }` / `CommandArg { .. }` | `CommandInfo::new(name).with_args(..).with_return_type(..)…`, `CommandArg::new(..)` |
+| `AppEvent::Console { level, message, timestamp }` | `AppEvent::console(level, message, timestamp)` (same for `state_change`, `dom_mutation`, `dom_interaction`, `window_event`) |
+| `PrivacyConfig { disabled_tools, ..Default::default() }` | `let mut p = PrivacyConfig::default(); p.disabled_tools = ..;` |
+| `VictauriState { .. }` (tests) | `VictauriState::for_tests()` then set fields (hidden, test-only) |
+| `CheckResult { .. }` / `VerifyReport { .. }` | `CheckResult::new(..)` / `VerifyReport::new(..)` |
+
+Exhaustive `match`es on the now-`#[non_exhaustive]` enums (`InteractionKind`, `CodegenStyle`,
+`FaultType`, `JsonShape`, `PrivacyProfile`, `ThresholdPreset`) need a `_ =>` arm, and patterns on
+`AppEvent`'s struct variants need `..`.
+
+**No longer public API.** Removed: `victauri_plugin::filmstrip` (`Frame`, `compose`,
+`default_cols`). Everything else below is now `#[doc(hidden)]`: still reachable (Victauri's own
+crates and tests use it) but not covered by semver, so it can change in any release. The full list,
+from `cargo semver-checks check-release --release-type minor` against 0.8.8:
+
+- `victauri-core`: the `middleware` module (`require_auth`, `rate_limit`, `origin_guard`,
+  `dns_rebinding_guard`, `security_headers`, `default_rate_limiter`, `AuthState`), the `security`
+  module (`generate_token`, `constant_time_eq`, `is_localhost_host`, `is_allowed_origin`,
+  `RateLimiter`, `DEFAULT_RATE_LIMIT`), and `acquire_lock` / `acquire_read` / `acquire_write`.
+  These were plumbing for the plugin/CLI; an app that used them should copy what it needs
+  (poison recovery is `.lock().unwrap_or_else(std::sync::PoisonError::into_inner)`).
+- `victauri-plugin`: `privacy::{strict_privacy_config, observe_privacy_config,
+  test_privacy_config}` (use `VictauriBuilder::privacy_profile(PrivacyProfile::Observe | Test)` or
+  `.strict_privacy_mode()`); `js_bridge::{init_script, BridgeCapacities}`;
+  `database::{discover_databases, classify_databases, select_app_database, is_webview_internal,
+  query, DbCandidate}`; `screencast::{Screencast, TraceFrame}` (`Screencast::start`/`stop` also
+  changed signature); `mcp::build_app_stateful`; and the recording-drain plumbing listed in
+  CHANGELOG round 4.
+
+**Every type that became `#[non_exhaustive]`** (so a struct literal or an exhaustive `match`
+outside its crate no longer compiles):
+
+- `victauri-core` structs: `IpcCall`, `WindowState`, `DomSnapshot`, `DomElement`, `ElementBounds`,
+  `CommandInfo`, `CommandArg`, `ScoredCommand`, `RecordedSession`, `RecordedEvent`,
+  `StateCheckpoint`, `VerificationResult`, `Divergence`, `MemoryDelta`, `RefHandle`,
+  `GhostCommand`, `GhostCommandReport`, `IpcIntegrityReport`, `StaleCall`, `ErrorCall`,
+  `SemanticAssertion`, `AssertionResult`; enums `InteractionKind`, `CodegenStyle`; and the struct
+  variants of `AppEvent` (`StateChange`, `DomMutation`, `DomInteraction`, `WindowEvent`,
+  `Console`).
+- `victauri-plugin` structs: `VictauriState`, `PrivacyConfig`, `CommandTimingStats`,
+  `FaultConfig`, `ContractBaseline`, `ContractDrift`, `TypeChange`, `StartupPhase`,
+  `CapturedTauriEvent`, `TrackedTaskInfo`, `ChildProcessInfo`; enums `FaultType`, `JsonShape`,
+  `PrivacyProfile`.
+- `victauri-test` structs: `PluginInfo`, `MemoryStats`, `SmokeReport`, `SmokeCheckResult`,
+  `CheckResult`, `VerifyReport`, `CoverageReport`, `CommandCalls`, `VisualDiff`, `LocatorMatch`,
+  `Bounds`; enum `ThresholdPreset`.
+
+**Types you can read but not build.** Some of these output types have no public constructor
+because nothing outside Victauri should create them: `DomSnapshot`, `DomElement`,
+`VerificationResult`, `StateCheckpoint`, `SmokeReport`, `CoverageReport` and similar reports. If a
+test needs one (e.g. a `StateCheckpoint` for `RecordedSession::new`), deserialize it from JSON with
+`serde_json::from_value`.
+
+**`WebviewBridge` implementors (mock bridges):** three methods were added, all with default
+implementations, so existing impls compile unchanged — `try_get_window_states`,
+`try_list_window_labels` and `eval_webview_resolved`. Future additions will also have defaults.
+
+**Behavior changes to be aware of:**
+
+- `victauri bridge` does not replay a `tools/call` whose connection dropped after it was sent; it
+  returns an error saying the call most likely ran (e.g. a command that quit the app).
+- `eval_js` / `invoke_command` report a closed target window, a shutting-down app, or a page
+  reload under the call promptly instead of timing out. `invoke_command` accepts an optional
+  `timeout_ms` (max 300000) for slow commands.
+- `recording replay` skips calls that had arguments, failed, or never completed (arguments are not
+  recorded); `recording import` is refused while a recording is in progress; `trace stop` only
+  stops the recording its own `with_events` started.
+- `introspect db_health` returns partial results with `row_counts_complete` /
+  `integrity_check: "not completed…"` instead of failing on large databases.
+- `query_db` rejects table-valued `pragma_*()` functions for non-allowlisted pragmas and the
+  `PRAGMA name(value)` write form.
+- A POST that carries an `Origin` header and gets past the origin check below (a localhost
+  `http`/`https` origin, no `Sec-Fetch-Site` other than `none`) must be
+  `Content-Type: application/json` (415 otherwise). Clients that send no `Origin` are unaffected.
+- Several tools' MCP annotations changed (`recording`, `introspect`, `logs`, `window` are now
+  `destructive_hint`; `verify_state`, `wait_for`, `assert_semantic`, `inspect`, `animation` are no
+  longer `read_only_hint`). Clients that auto-approve read-only tools will now ask for these.
+- The compact `dom_snapshot` JSON-encodes page text (quotes/newlines in names appear escaped).
+- `victauri-watchdog` discovers the app's port and pins its identity; with `--app` and no match it
+  reports the app down instead of polling 7373.
+- A compound tool call whose `action` is not a string (e.g. `{"action": {"go_to": null}}`), or a
+  REST body that is not a JSON object, is refused as invalid parameters (REST 400).
+- `eval_js` reports a syntax error at once as a parse error, a reload under the call promptly, and
+  an unserializable result as "the code ran" — never a timeout or a JavaScript error.
+- `recording replay` runs each call in the window that recorded it (never falls back to `main`)
+  and never replays a call a network route fulfilled or blocked (`IpcCall::mocked`).
+- The page-visible `window.__VICTAURI__` no longer carries agent-only operations (`clearRoutes`,
+  `setDialogAutoResponse`, `clear*Log`, …), and `window.__VICTAURI_SCRUB__` / `__SWEEP__` are gone.
+  Nothing in an app should have called them; the tools that use them are unchanged.
+- The compact `dom_snapshot` line format quotes non-trivial `role` and attribute values; recorded
+  selectors are CSS-escaped (`#\:r0\:`).
+- `#[inspectable]` registers each argument's IPC `key` (camelCase by default); a command using
+  `#[tauri::command(rename_all = "snake_case")]` or `rename = "…"` (`rename` needs tauri-macros 2.6+,
+  i.e. Tauri 2.11+) should repeat the option on `#[inspectable(...)]` (or put `#[inspectable]` above
+  `#[tauri::command(...)]`).
+- Trusted (OS-level) input — `interact`/`input` with `trusted: true`, Windows only — now requires the
+  app window to be in the foreground (Windows refuses to move focus away from the terminal an agent
+  runs in, so the call fails clearly instead of typing into another app).
+- `victauri-test`: `Locator::check()`/`uncheck()` click the element (and verify it changed), and a
+  stale element reference is `ElementNotFound` instead of an empty/false value.
+- The server speaks HTTP/1.1 only and answers 403 to a request with a `Sec-Fetch-Site` header
+  other than `none` (which every current browser sends on a web page's cross-site or same-site
+  fetch), an `Origin` that is not an `http`/`https` localhost origin (`localhost`, `127.0.0.1`,
+  `[::1]`), an `Origin` it cannot parse, or a `tauri://` origin. A localhost `Origin` alone is
+  allowed through, and then meets the JSON content-type rule above (415). The server no longer
+  sends `Access-Control-Allow-Origin`. HTTP clients that send no `Origin` or `Sec-Fetch-Site`
+  (curl, reqwest, the CLI, `victauri-test`) are unaffected.
+- On Unix the discovery directory moved to `$XDG_RUNTIME_DIR/victauri/<pid>` or
+  `<temp>/victauri-<euid>/<pid>`, and — when `<temp>/victauri-<euid>` is unusable (e.g. another
+  local user created it first) — `$XDG_STATE_HOME/victauri/<pid>` (default
+  `~/.local/state/victauri/<pid>`). The 0.9 CLI, test client, watchdog and VS Code extension scan
+  all of these plus the old `<temp>/victauri/` root, so they find apps built with 0.8.x; a 0.8.x
+  client does not find a 0.9 app.
+- On Windows every discovery reader (CLI/bridge, `victauri-test`, watchdog, VS Code) now trusts a
+  discovery folder only if the current user owns it (or `BUILTIN\Administrators` does and the user
+  is a member) — the same rule the plugin uses when writing it.
+- `query_db` returns at most 256 columns (a wider `SELECT *` errors), suffixes duplicate column
+  names (`a`, `a:1`), refuses `LIKE`/`GLOB` patterns over 1000 bytes, and answers "busy" when two
+  database calls are already running. "database not found" also covers a path resolving outside
+  the allowed roots.
+- **rusqlite**: `victauri-plugin` now accepts rusqlite `>=0.32, <0.41` instead of exactly 0.32,
+  so an app on a newer rusqlite can add it (cargo unifies onto the app's version). Because it is
+  the SAME rusqlite, the plugin's default `bundled-sqlite` feature also compiles SQLite into the
+  app's rusqlite. An app that links a system SQLite or SQLCipher keeps its own with
+  `victauri-plugin = { version = "0.9", default-features = false, features = ["sqlite"] }`.
+- **Discovery (`victauri-test`, CLI):** when several Victauri apps run and nothing selects one,
+  `VictauriClient::discover()` and the CLI commands return an error naming each app instead of
+  silently connecting to :7373. Select with `VICTAURI_APP=<identifier>` (or
+  `VictauriClient::discover_app(Some(..))`, or `--app` on any CLI command) or `VICTAURI_PORT`.
+  `victauri bridge --app` matches the identifier exactly (it used to fall back to a substring).
+- **`VICTAURI_AUTH_TOKEN` without `VICTAURI_PORT`** is sent only to the running app whose own
+  discovery token matches it; otherwise the client refuses and asks for `VICTAURI_PORT` — set it
+  when the app's discovery directory is not visible to the client (the app runs in WSL or a
+  container, or elevated on Windows).
+- `is_alive()` (and the bridge / watchdog health checks) treat a `429` from `/health` as alive.
+- Trusted input is refused unless focus actually landed on the element (`type_text`,
+  `press_key` — a non-focusable child of a `contenteditable` editor is refused; target the editor
+  itself), or the click point is actionable and inside the window's client area (`click`).
+- `interact click` (synthetic and trusted) now reaches elements inside OPEN shadow roots (web
+  components); it used to refuse every one of them as "covered by <host>".
+- `victauri-test`: a tool call without `timeout_ms` now waits up to the server's 300 s ceiling
+  (+40 s) instead of 60 s — the server still answers as soon as the call finishes; this only
+  stops the client abandoning (and a retry re-running) a call the app is still executing.
+- VS Code: an explicitly set `victauri.port` (even `7373`) now selects that port instead of being
+  ignored in favour of discovery; a `429` on the authenticated `/info` probe is reported (the
+  token was probably not accepted) instead of showing "connected".
+- `route add` refuses `delay_ms` above 120000; `read_app_file` gives up after 15 s and refuses a
+  non-regular file; at most 4 app-state probes, 4 file reads and 4 page-originated window queries
+  run at once (the next one is told "busy").
+- `introspect command_timings` has an additive `saturated` flag; `ContractStore::record` returns the
+  command of a baseline it evicted (`Option<String>`); faults, contract baselines and page-load
+  records are capped (256 / 1024 / 256).
+- Victauri's page-callable Tauri commands `victauri_eval_callback`, `victauri_get_window_state`,
+  `victauri_list_windows`, `victauri_get_ipc_log`, `victauri_get_registry`,
+  `victauri_get_memory_stats`, `victauri_verify_state`, `victauri_detect_ghost_commands` and
+  `victauri_check_ipc_integrity` are now synchronous, so Tauri runs them on the main thread (the
+  page still gets a promise; nothing to change). This keeps Tauri handles on the main thread —
+  cloning or dropping one elsewhere corrupted the heap on Linux (see CHANGELOG). If your own app
+  clones an `AppHandle` / window / webview on background threads on Linux, the same Tauri race
+  applies to it. That includes moving an `AppHandle` into `std::thread::spawn` or
+  `tauri::async_runtime::spawn` to `emit` later, because the handle is then dropped on that
+  thread. Take one handle on the main thread in `setup` (`static APP: OnceLock<AppHandle>`,
+  `APP.set(app.handle().clone())`) and have background work borrow it (`APP.get()`; `emit` only
+  needs `&self`). The demo and gauntlet apps do this, and the docs'
+  [compatibility page](docs/src/compatibility.md) has the snippet.
+- **`victauri:default` no longer grants `victauri_eval_js` / `victauri_dom_snapshot`.** These two
+  page-callable Tauri commands are the only async Victauri commands left (Tauri runs an async
+  command's argument extraction on a tokio worker, the Linux handle race above), and
+  `victauri_eval_js` is a CSP-independent eval that any page script could call. Nothing in Victauri
+  uses them — the MCP/REST tools and the injected bridge only need `victauri_eval_callback`, which
+  stays in the default set — so almost every app needs no change. If your own frontend code calls
+  them, grant them explicitly next to `victauri:default` in that window's capability file:
+
+  ```json
+  "permissions": [
+    "victauri:default",
+    "victauri:allow-victauri-eval-js",
+    "victauri:allow-victauri-dom-snapshot"
+  ]
+  ```
+- **Refused page actions are tool errors.** `interact` (click/double_click/hover/focus/
+  scroll_into_view/select_option), `input` (fill/type_text/press_key), `inspect` (e.g. an unknown
+  ref) and `route add` used to return a *successful* `{"ok": false, "error": "…", "hint": "…"}` when
+  the page refused the action. They now return an error: MCP `isError: true` with text
+  `"<error>\n\n[hint: RETRY_LATER|CHECK_INPUT]"`, REST `{"error": "<same text>"}`. With
+  `victauri-test`, `client.click(..)` / `Locator::click(..)` and friends now return
+  `Err(TestError::ToolError(msg))` instead of `Ok(json)`; if you checked `result["ok"] == false`,
+  match on the error instead. Successful results are unchanged.
+- `wait_for` `timeout_ms: 0` now means "check once, immediately" (it meant the 10 s default), and
+  a `wait_for` expression that does not parse fails at once instead of polling until its timeout.
+  `assert_semantic` / `verify_state` read an expression that evaluates to `undefined` as `null`
+  (`exists` false, `falsy` true) instead of failing; a trailing `;` or `// comment` is accepted.
+- **`victauri-test` IPC checkpoints are `u64`** (they were `usize`, which truncated on 32-bit):
+  `create_ipc_checkpoint(&mut self) -> Result<u64, TestError>`, `get_ipc_calls_since(&mut self,
+  checkpoint: u64)` (and the deprecated `ipc_checkpoint` / `ipc_calls_since`). Code that passes the
+  value straight back needs no change; drop any `as usize` / `: usize`.
+- `SmokeCheckResult` has a new `skipped` field (non-breaking: the type is `#[non_exhaustive]`): the
+  smoke suite no longer stops a recording it did not start — that check is reported as skipped.
+- `css inject` (without `allow_remote`) rejects more remote-URL forms: `https:host/x`, `http:/host`,
+  `\\host`, `/\host`, `blob:` and any other scheme in a URL position, and any string naming a
+  remote host (e.g. `content:"https://…"`); only `data:` and scheme-less relative references pass.
+- The animation `scrub` / `sample` helpers (`scrubPrepare`, `scrubSeek`, `scrubRestore`,
+  `installSweepRecorder`, `readSweep`) are no longer callable from page script on
+  `window.__VICTAURI__`; the `animation` tool is unchanged.
+- Network-log URLs longer than 2048 characters are stored cut with a `…[+N chars]` marker (IPC
+  URLs never); route matching still sees the full URL. Route patterns now match the absolute URL,
+  the same-origin path+query+hash and the raw string, so a rule hits every spelling of a request.
+- Page-callable commands: `victauri_get_ipc_log` without `limit` returns the newest 100 calls (pass
+  `limit`, max 1000, for more); `victauri_check_ipc_integrity` lists at most the newest 100 stale /
+  error calls (its counts still cover the whole log); a page-originated `victauri_eval_js`
+  returning `undefined` resolves to `"null"` (it timed out).
+- `query_db` allows SQLite built-ins, SQLite's own FTS/R-Tree/Geopoly functions and app functions
+  registered as deterministic; any other app-registered function is refused with an error naming
+  it, and `load_extension` is never allowed. Register pure functions with `SQLITE_DETERMINISTIC`.
+- `introspect db_health` has a new `integrity_check_note` field (`null` when the whole database was
+  checked); `integrity_check_kind` can be `"quick_check (per table)"` when the host app registered a
+  non-built-in virtual-table module (so none of its code runs).
+- The server's request-head deadline — also its idle keep-alive timeout — is 10 s (was 30 s). The
+  0.9 clients (CLI bridge, `victauri-test`, watchdog) drop pooled connections after 5 s; an HTTP
+  client of your own that keeps idle connections longer than 10 s should do the same.
+- `victauri bridge --app` checks that the backend's `/info` reports that identity before forwarding
+  (any real plugin ≥ 0.7.4 does), and `VICTAURI_PORT` together with an app selector that names a
+  different app is refused (bridge, CLI and `victauri-test`) instead of driving the app on that port.
+- `victauri doctor` exits 1 when any check fails (warnings still exit 0).
+- New in `victauri-test`: `invoke_command_with_timeout`, `discover_app`, the `terminal` sanitizer
+  module and `health_status_means_alive`.
+- The config structs `CodegenOptions`, `SmokeConfig`, `VisualOptions`, `MaskRegion` and the
+  `Junit*` report types stay exhaustive (struct-update syntax keeps working); a field added to one
+  of them later will be called out as a breaking change.
+
 ## v0.8.7 → v0.8.8 (MCP stack upgraded to rmcp 3.1.2 / MCP `2026-07-28`)
 
 No consumer code changes are required and no dependency-requirement change is needed

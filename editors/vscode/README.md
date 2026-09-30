@@ -84,17 +84,17 @@ Right-click any element in the DOM Explorer:
 
 Victauri runs an HTTP server **inside your Tauri app's process**. This extension talks to its REST API, giving it simultaneous access to the webview DOM, Rust backend state, IPC traffic, and native window state — something external tools like Playwright can't do.
 
-The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op in release builds — zero runtime cost (the server never starts). Add it as a `dev-dependency` if you also want it absent from the release binary.
+The plugin is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op in release builds — zero runtime cost (the server never starts). Add it as a normal dependency (the app binary cannot use `[dev-dependencies]`); to also keep it out of the release binary, make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature.
 
 ## Requirements
 
 - A Tauri 2.x app with [victauri-plugin](https://crates.io/crates/victauri-plugin) enabled
 - The plugin starts an HTTP server on `127.0.0.1:7373` that this extension connects to
-- Port discovery reads `victauri.port` from the temp directory if the default port is taken
+- Port discovery reads the per-process discovery directory (`%TEMP%\victauri\<pid>\` on Windows; `$XDG_RUNTIME_DIR/victauri/<pid>/`, `<temp>/victauri-<uid>/<pid>/` or `~/.local/state/victauri/<pid>/` on Unix, plus the legacy `<temp>/victauri/`) — trusted entries owned by a live process of yours only — if the default port is taken. On Windows a discovery directory outside your user profile (a shared `TEMP`, e.g. MSYS2's `C:\msys64\tmp`) is used only if you own it, checked with PowerShell's `Get-Acl`; where PowerShell cannot run, set `victauri.port` and `victauri.authToken` instead
 
 ## Compatibility
 
-Tested against 5 real-world open-source Tauri apps (867/895 tests passing = 96.9%):
+In a one-time evaluation (May 2026, on an older Victauri release) against 5 real-world open-source Tauri apps, 867/895 checks passed (96.9%). Results of that evaluation (the per-release harness in `scripts/compat` re-verifies Kanri, En Croissant and Lettura on each release):
 
 | App | Framework | Result |
 |---|---|---|

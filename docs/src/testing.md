@@ -8,7 +8,7 @@ Add the test crate to your dev dependencies:
 
 ```toml
 [dev-dependencies]
-victauri-test = "0.8"
+victauri-test = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -438,11 +438,13 @@ use victauri_test::visual::{VisualOptions, ThresholdPreset, MaskRegion};
 
 let opts = VisualOptions {
     snapshot_dir: "tests/snapshots".into(),
-    ..VisualOptions::from_preset(ThresholdPreset::Standard)
-};
+    ..VisualOptions::default()
+}
+.with_preset(ThresholdPreset::Standard);
 
+// Errors with `TestError::VisualRegression` when the diff exceeds the threshold.
 let diff = client.screenshot_visual("dashboard", &opts).await?;
-assert!(diff.is_match, "visual regression: {:.2}% pixels differ", diff.diff_percentage);
+println!("{:.2}% of pixels match", diff.match_percentage);
 ```
 
 On first run, the screenshot is saved as the baseline. Subsequent runs compare and generate a red-overlay diff image when mismatched.
@@ -463,11 +465,10 @@ Exclude dynamic content from comparison:
 ```rust
 let opts = VisualOptions {
     snapshot_dir: "tests/snapshots".into(),
-    masks: vec![
-        MaskRegion::new(0, 0, 200, 50),  // timestamp header
-    ],
-    ..VisualOptions::from_preset(ThresholdPreset::Standard)
-};
+    ..VisualOptions::default()
+}
+.with_preset(ThresholdPreset::Standard)
+.with_mask(MaskRegion::new(0, 0, 200, 50)); // timestamp header
 ```
 
 ### Save Screenshots to Files
@@ -685,7 +686,7 @@ async fn smoke() {
 }
 ```
 
-The 11 checks: health endpoint, eval, DOM snapshot, screenshot, window state, IPC integrity, memory, accessibility (violations), accessibility (warnings), performance, and health endpoint hardening.
+The 11 checks: `eval_js` works, DOM snapshot valid, screenshot captures an image, windows exist, IPC integrity healthy, no uncaught errors, accessibility audit, DOM complete under the load budget (`--max-load-ms`), JS heap under the memory budget (`--max-heap-mb`), recording lifecycle, and health endpoint hardened.
 
 Reports include timing data and can export to JUnit XML for CI integration.
 
@@ -843,7 +844,7 @@ Victauri tests run in CI without special infrastructure. Pick the approach that 
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.8.8
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.9.0
   with:
     max-load-ms: 5000
     max-heap-mb: 256

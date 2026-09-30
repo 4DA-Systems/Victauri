@@ -237,6 +237,10 @@ fn blank_frame_reason(pixels: &[u8]) -> Option<&'static str> {
 #[cfg(windows)]
 const WGC_FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Longest a caller waits for its job on the shared COM worker thread.
+#[cfg(windows)]
+const COM_JOB_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Poll cadence for `TryGetNextFrame` while waiting for the first frame.
 #[cfg(windows)]
 const WGC_FRAME_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -250,13 +254,88 @@ async fn capture_window_wgc_raw(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u3
 }
 
 /// Blocking WGC capture: D3D11 device → `GraphicsCaptureItem` from the HWND →
-/// free-threaded `Direct3D11CaptureFramePool` (we are on a tokio blocking
+/// free-threaded `Direct3D11CaptureFramePool` (the work runs on the COM worker
 /// thread, not a `DispatcherQueue` thread) → one frame → CPU staging texture →
 /// map → BGRA rows (respecting `RowPitch`) → straight RGBA, cropped to the
 /// client area so output dimensions match the GDI path (`PW_CLIENTONLY`).
 #[cfg(windows)]
-#[allow(unsafe_code)]
 fn capture_window_wgc_blocking(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
+    run_on_com_thread(move || capture_window_wgc_on_com_thread(hwnd))?
+}
+
+#[cfg(windows)]
+type ComJob = Box<dyn FnOnce() + Send>;
+
+/// Run `f` on Victauri's dedicated COM worker thread and wait for its result.
+///
+/// `WinRT` activation needs an initialized apartment. Calling `CoInitializeEx(MTA)` on the
+/// caller's thread — one of Tauri's SHARED blocking-pool threads — and never balancing it left
+/// that thread in the MTA for good, so later work there needing an STA failed with
+/// `RPC_E_CHANGED_MODE` (G-11). Balancing it with `CoUninitialize` is not safe either:
+/// windows-rs caches agile activation factories process-wide, and tearing down the last MTA
+/// member lets COM unload the DLLs those cached pointers point into. So all WGC work runs on
+/// one long-lived thread that enters the MTA once and stays in it for the process lifetime
+/// (keeping the MTA, and every cached factory, valid), and no shared thread is ever touched.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn run_on_com_thread<T, F>(f: F) -> anyhow::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    static WORKER: std::sync::OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<ComJob>>> =
+        std::sync::OnceLock::new();
+    let sender = WORKER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<ComJob>();
+        let spawned = std::thread::Builder::new()
+            .name("victauri-com".to_string())
+            .spawn(move || {
+                // SAFETY: enters this dedicated thread into the MTA once; it is deliberately
+                // never uninitialized (see above).
+                let _ = unsafe {
+                    windows::Win32::System::Com::CoInitializeEx(
+                        None,
+                        windows::Win32::System::Com::COINIT_MULTITHREADED,
+                    )
+                };
+                for job in rx {
+                    job();
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!("victauri: cannot start the COM worker thread: {e}");
+        }
+        std::sync::Mutex::new(tx)
+    });
+    let (result_tx, result_rx) = std::sync::mpsc::channel();
+    let job: ComJob = Box::new(move || {
+        // A panic must not kill the shared worker (every later capture would fail).
+        let _ = result_tx.send(std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)));
+    });
+    sender
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .send(job)
+        .map_err(|_| anyhow::anyhow!("the COM worker thread is not running"))?;
+    // Bounded: captures share the one COM thread, so a capture stuck in a synchronous COM call
+    // would otherwise block every later caller for good. The frame wait itself is capped at
+    // `WGC_FIRST_FRAME_TIMEOUT`; this backstop only fires if WGC itself hangs.
+    match result_rx.recv_timeout(COM_JOB_TIMEOUT) {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_panic)) => anyhow::bail!("the capture panicked on the COM worker thread"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => anyhow::bail!(
+            "the capture did not finish within {}s on the COM worker thread",
+            COM_JOB_TIMEOUT.as_secs()
+        ),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            anyhow::bail!("the COM worker thread dropped the capture")
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn capture_window_wgc_on_com_thread(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32)> {
     use windows::Graphics::Capture::{
         Direct3D11CaptureFramePool, GraphicsCaptureItem, GraphicsCaptureSession,
     };
@@ -271,7 +350,6 @@ fn capture_window_wgc_blocking(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32
     };
     use windows::Win32::Graphics::Dxgi::IDXGIDevice;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
-    use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx};
     use windows::Win32::System::WinRT::Direct3D11::{
         CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
     };
@@ -283,13 +361,9 @@ fn capture_window_wgc_blocking(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32, u32
 
     // SAFETY: All Win32/WinRT calls operate on the provided window handle and
     // on COM objects owned by this function. The mapped staging texture is
-    // read only while mapped and unmapped before the objects drop.
+    // read only while mapped and unmapped before the objects drop. This runs on the
+    // dedicated COM worker thread, which is in the MTA (see `run_on_com_thread`).
     unsafe {
-        // WinRT activation (the GraphicsCaptureItem factory) requires an
-        // initialized apartment on this thread. Tokio blocking threads are
-        // reused, so an "already initialized" result is fine — ignore it.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
         if !GraphicsCaptureSession::IsSupported().unwrap_or(false) {
             anyhow::bail!("Windows.Graphics.Capture is not supported on this Windows build");
         }
@@ -897,6 +971,38 @@ fn adler32(data: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G-11: the WGC path called `CoInitializeEx(MTA)` on Tauri's shared blocking-pool threads
+    /// and never balanced it, leaving each such thread in the MTA for good. Any later user of
+    /// that thread that needs an STA then got `RPC_E_CHANGED_MODE`.
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn wgc_capture_leaves_the_calling_thread_com_state_untouched() {
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize,
+        };
+        for _ in 0..2 {
+            let hr = std::thread::spawn(|| {
+                // hwnd 0 fails right after the apartment is entered (GetWindowRect).
+                assert!(capture_window_wgc_blocking(0).is_err());
+                // SAFETY: plain COM apartment calls on this thread; balanced on success.
+                unsafe {
+                    let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                    if hr.is_ok() {
+                        CoUninitialize();
+                    }
+                    hr
+                }
+            })
+            .join()
+            .unwrap();
+            assert!(
+                hr.is_ok(),
+                "the capture left the calling thread in the MTA: STA init returned {hr:?}"
+            );
+        }
+    }
 
     #[test]
     fn png_signature_correct() {

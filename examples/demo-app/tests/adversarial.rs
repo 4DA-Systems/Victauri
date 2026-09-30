@@ -168,8 +168,8 @@ adv!(eval_oversized_output_is_capped, base, {
 // ── B. Resilience: recover cleanly after an eval timeout ────────────────────
 
 adv!(eval_recovers_after_failed_eval, base, {
-    // A syntax error now fails FAST via the parse watchdog (~0.75s) instead of hanging for
-    // the full eval timeout. The NEXT eval must still succeed — proving the bridge recovers
+    // A syntax error now fails FAST via the parse check delivered right after the code,
+    // instead of hanging for the full eval timeout. The NEXT eval must still succeed — proving the bridge recovers
     // cleanly after a failed eval.
     let e = error(&eval(&base, "return 1 +").await);
     assert!(
@@ -203,9 +203,21 @@ adv!(query_db_blocks_all_writes, base, {
     // Stacked queries blocked.
     let e = error(&call(&base, "query_db", json!({"query":"SELECT 1; DROP TABLE x"})).await);
     assert!(e.contains("stacked"), "stacked query not blocked: {e}");
-    // A read still works.
-    let ok = call(&base, "query_db", json!({"query":"SELECT 1 AS x"})).await;
-    assert_eq!(result(&ok)["rows"][0]["x"], json!(1));
+    // A read still works, against the demo's own database (named explicitly: the webview's
+    // internal stores live in the same directory and differ per engine).
+    let ok = call(
+        &base,
+        "query_db",
+        json!({"query":"SELECT count(*) AS n FROM todos", "path": "demo.db"}),
+    )
+    .await;
+    assert_eq!(result(&ok)["rows"][0]["n"], json!(3));
+    // Which database auto-selection picks on this engine (informational).
+    let auto = call(&base, "query_db", json!({"query":"SELECT 1"})).await;
+    eprintln!(
+        "query_db auto-selected: {}",
+        auto["result"]["database"].as_str().unwrap_or("<error>")
+    );
 });
 
 // ── D. Filesystem + selector + command error paths ─────────────────────────
@@ -232,11 +244,12 @@ adv!(interact_on_stale_ref_fails_cleanly, base, {
         json!({"action":"click","ref_id":"e99999999"}),
     )
     .await;
-    // Either a tool error or an ok:false with a ref-not-found hint — never a hang/panic.
-    let body = serde_json::to_string(&r).unwrap();
+    // A tool error naming the missing ref (with a recovery hint) — never a hang/panic, and
+    // never a SUCCESS result (a refused action used to come back as `{ok:false}`, R5B-ISERR1).
+    let e = error(&r);
     assert!(
-        body.contains("not found") || body.contains("ok\":false") || r.get("error").is_some(),
-        "stale ref not handled cleanly: {body}"
+        (e.contains("not found") || e.contains("detached")) && e.contains("[hint: "),
+        "stale ref not handled cleanly: {e}"
     );
 });
 

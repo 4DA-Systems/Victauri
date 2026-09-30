@@ -27,7 +27,7 @@ Note: "zero runtime cost" is not the same as "zero bytes." With `victauri-plugin
 regular dependency the crate (and its transitive deps) still compile into the build; the
 server code is simply unreachable at runtime because `init()` is a no-op. Dead-code
 elimination strips most of it, but if you want Victauri completely absent from the release
-binary, add it as a `dev-dependency` (and gate the `.plugin(...)` call behind `#[cfg(debug_assertions)]` / a debug-only feature).
+binary, make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature. (Not a `dev-dependency`: the app binary cannot see `[dev-dependencies]`, so it would no longer compile.)
 
 ### The one way this gate can fail — and how to stop it
 
@@ -73,12 +73,23 @@ Every request except `/health` must include a valid Bearer token.
 
 ### Discovery-directory protection
 
-The per-process discovery directory (`<temp>/victauri/<pid>/`) holds the auth token, so it
-is locked to the current user:
+The per-process discovery directory holds the auth token, so it is locked to the current user.
+It lives in a **per-user** root: `$XDG_RUNTIME_DIR/victauri/<pid>/` when that directory is private
+to the user, else `<temp>/victauri-<euid>/<pid>/` on Unix — or, when that one is unusable,
+`$XDG_STATE_HOME/victauri/<pid>/` (default `~/.local/state/victauri/<pid>/`) — and
+`%TEMP%\victauri\<pid>\` on Windows (where `%TEMP%` is normally per-user). Clients scan those roots
+in that order, then the legacy shared `<temp>/victauri/` root, owner-checked, so an app built with
+an older plugin is still found.
 
-- **Unix:** the directory is created `0700`, and both it and the shared root are trusted only
+- **Unix:** the directory is created `0700`, and both it and its root are trusted only
   when they are real directories (not symlinks) owned by the current uid and not
-  group/other-writable. A planted or world-writable path is refused, never trusted.
+  group/other-writable. A planted or world-writable path is refused, never trusted. A
+  per-user root means another local user can no longer block discovery by pre-creating the
+  shared root. With no private `XDG_RUNTIME_DIR` the root is the predictable
+  `/tmp/victauri-<uid>`, which another local user could still pre-create (and sticky `/tmp`
+  stops you deleting it); the plugin then registers under the home-directory root instead
+  (created `0700`, its parent owned by you and not writable by others), so that no longer
+  blocks discovery either.
 - **Windows:** before any token is trusted, Victauri verifies the directory is **owned by the
   current user** (an attacker who pre-created it on a shared `TEMP` would be its owner, so the
   directory is refused). It then replaces the directory's DACL with a **protected, owner-only
@@ -87,7 +98,12 @@ is locked to the current user:
   unusual filesystem, Victauri falls back to a best-effort `icacls` lockdown (and logs a
   warning); in that fallback only, a custom-SID ACE pre-planted by another principal on a
   **non-default shared** `TEMP` could persist — the default Windows per-user `TEMP` is not
-  writable by other users, so it is unaffected.
+  writable by other users, so it is unaffected. Clients (the CLI and its bridge,
+  `victauri-test`, the watchdog, the VS Code extension) likewise trust a discovery root or
+  `<pid>` directory only if the current user owns it (or `BUILTIN\Administrators` does and the
+  user is a member), so an entry another user planted on a shared `TEMP` (e.g. MSYS2's
+  `C:\msys64\tmp`) is never read. The VS Code extension checks directories outside the user
+  profile with PowerShell's `Get-Acl`, failing closed if it cannot.
 
 In all cases the token file itself is created exclusively (`O_EXCL` / `create_new`) so a
 pre-planted file or symlink at its path is rejected rather than written through.
@@ -124,16 +140,26 @@ VictauriBuilder::new()
 
 The `/health` endpoint is unauthenticated so that the watchdog and load balancers can check liveness without credentials.
 
-## Rate Limiting
+## Rate Limiting and connection limits
 
 A token-bucket rate limiter prevents abuse, even from authenticated clients:
 
 - **Default rate:** 1000 requests per second
-- **Implementation:** Lock-free `AtomicU64` counter
+- **Two buckets:** requests carrying the valid token draw from their own bucket, so traffic
+  that cannot authenticate (a local flood, a web page hammering `/health`) cannot exhaust
+  the agent's budget
 - **Bucket refill:** Continuous (not windowed)
-- **Response on limit:** HTTP 429 Too Many Requests
+- **Response on limit:** HTTP 429 Too Many Requests (Victauri's own clients treat a `429` from
+  `/health` as "alive", so a flood never makes them report a running app as down)
+- **With `auth_disabled()`** there is no token to tell the agent apart, so every caller shares the
+  public bucket and a local process can rate-limit the agent. Keep auth on (the default) wherever
+  other local software runs.
 
-This protects against runaway agents or scripts that flood the server with requests.
+The server speaks HTTP/1.1 only, closes a connection whose request head has not arrived within
+30 s, reads each request body under a 30 s / 2 MiB deadline (after authentication — an
+unauthenticated body is never buffered), and accepts at most 256 concurrent connections. A request
+the guards refuse (401 / 403 / 415 / 429) also closes its connection, so refused requests cannot
+park connection slots.
 
 ## Privacy Layer
 
@@ -206,6 +232,12 @@ Disabled tools:
 - Are omitted from tool discovery listings
 - Cannot be re-enabled at runtime
 
+A bare tool name disables every action of that tool **and** its MCP resource
+(`logs` → `victauri://ipc-log`, `window` → `victauri://windows`). A single action is disabled as
+`tool.action`, e.g. `inspect.get_styles` (the capability spelling `inspect.styles` works too).
+Disabling `screenshot` also refuses `animation scrub capture=true` and `trace`, which capture the
+window. An entry that matches no tool, action or capability is logged as a warning at startup.
+
 ### Output Redaction
 
 Automatically scrub sensitive data from all tool responses:
@@ -219,7 +251,18 @@ VictauriBuilder::new()
 ```
 
 Built-in patterns (when redaction is enabled):
-- API key values in JSON (`"api_key": "..."` becomes `"api_key": "[REDACTED]"`)
+- Values of sensitive JSON keys (`"api_key": "..."` becomes `"api_key": "[REDACTED]"`; any key
+  containing `token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, … — booleans
+  such as `has_api_key: true` are kept). This applies when the whole output is JSON, to JSON
+  carried **inside** JSON string values (IPC/network request and response bodies are captured as
+  JSON-encoded strings) up to 4 levels deep, and to `"key": value` pairs found in plain text or
+  in a truncated JSON fragment (log fields are cut at 4 KB)
+- Credential parameters in URLs: the value of `access_token`, `refresh_token`, `id_token`,
+  `auth_token`, `token`, `api_key`/`apikey`, `key`, `client_secret`, `secret`, `password`,
+  `pwd`, `auth`, `sig`/`signature` and the AWS/GCS signing parameters after `?`, `&` or `#`
+  (`?access_token=abc&page=2` becomes `?access_token=[REDACTED]&page=2`). Only whole parameter
+  names match, so `?keyboard=` or `&tokens_used=` are left alone — but an innocuous parameter
+  literally named `key` or `auth` is redacted too
 - Bearer tokens in strings
 - Email addresses
 - Common secret key formats
@@ -233,6 +276,20 @@ Redaction is applied as a post-processing step to all tool output, regardless of
 > as a guard against *accidental* disclosure in shared transcripts — not as a control that contains
 > a hostile or prompt-injected client. The real boundary is auth + the privacy profile + not
 > pointing the tools at secrets you don't want an authorized local client to read.
+>
+> Known gaps, beyond deliberate splitting:
+> - **Only output is redacted, not what a tool can test.** Text probes answer yes/no about page
+>   content — `find_elements` text search (allowed even under `Observe`), `wait_for` text /
+>   `text_gone` (`Test`), and `assert_semantic` / `eval_js` (`FullControl`) — so a client can
+>   confirm a redacted value piecewise (does the page contain `sk-a`? `sk-ab`? …) without it ever
+>   appearing in an output.
+> - Key-based redaction recognises keys by name. A secret under an innocuous key
+>   (`{"value": "…"}`), in a non-JSON format (YAML, `key=value` config text outside a URL, HTTP
+>   headers other than `Authorization: Bearer`), or as a JSON object/array value found in plain
+>   text (only string and number values are matched there) passes through unless a value pattern
+>   catches it.
+> - A URL parameter is recognised only by the names listed above, and only after `?`, `&` or
+>   `#` (a secret in a URL *path* segment is not).
 
 ## Origin Guard
 
@@ -241,6 +298,18 @@ The MCP server only accepts connections from localhost (`127.0.0.1` / `::1`). Th
 - No remote network access is possible
 - Other machines on the LAN cannot connect
 - Only processes on the same machine can reach the server
+
+Browser requests are refused before any rate limiting. A request gets 403 if it carries a
+`Sec-Fetch-Site` header other than `none` (every current browser sends one on a web page's
+cross-site or same-site fetch), an `Origin` that is not an `http`/`https` localhost origin
+(`localhost`, `127.0.0.1`, `[::1]`), an `Origin` that cannot be parsed, or a `tauri://` origin
+(the app's own webview talks to Victauri over Tauri IPC, never HTTP). A localhost `Origin` on its
+own is allowed through; a POST carrying one must then be `Content-Type: application/json`, or it
+gets 415. No `Access-Control-Allow-Origin` header is ever sent, so a browser can neither read a
+response nor get a preflighted (JSON or `Authorization`-bearing) request approved. That is what
+still stops a page on a localhost origin in a browser too old to send `Sec-Fetch-*` headers
+(e.g. Safari before 16.4): its CORS-simple POSTs are refused as non-JSON, and anything else needs
+a preflight the server never approves.
 
 ## Security Headers
 
@@ -270,6 +339,12 @@ All HTTP responses include security headers:
 - **Malicious code on the same machine with the auth token** — If an attacker has the token and localhost access, they have the same privileges as the legitimate agent. This is inherent to any localhost-based development tool.
 - **Memory inspection of the process** — A sufficiently privileged attacker on the same machine could read process memory directly. Victauri does not add encryption at rest for in-process data.
 - **Prompt injection via captured content** — Victauri cannot stop a prompt-injection payload embedded in app-sourced data (DOM, logs, DB rows) from influencing the agent it feeds. This is an operational risk you mitigate through agent configuration — see [Untrusted Content & Prompt Injection](#untrusted-content--prompt-injection) below.
+- **Transient memory of a very wide query** — `query_db` caps a result at 5 MB, 256 columns and
+  1 MB per cell, but SQLite materialises a row before it is charged: one `SELECT` of 256 × 1 MB
+  columns raised a debug host's peak working set by about 0.5 GB for that call (measured). At most
+  two database calls run at once. Every tighter bound either refuses legitimate wide or large-cell
+  queries or uses SQLite's process-global heap limit, which would also throttle the app's own
+  database, so the bound stays where it is.
 - **Path-resolution TOCTOU by a same-privilege local attacker** — `read_app_file` and `query_db` validate a path is contained within an allowed root (lexically and by canonical containment), then open the canonical validated path. An attacker who already has *write access inside that root* could, in a microsecond race, swap a validated regular file for a symlink/junction after the canonicalize and before the open. This requires local filesystem write access at the app's own privilege — such an attacker can read those files directly anyway, so Victauri adds no privilege. The blocking file/DB IO runs on a worker thread (so a swapped FIFO can't stall the server), and the canonical-path open closes the trivial (non-racing) version. A fully race-free fix needs OS-level `openat2(RESOLVE_BENEATH)` / `O_NOFOLLOW`, which is out of scope.
 
 ## Recommendations
@@ -326,6 +401,56 @@ embedded third-party widgets, or user-generated content rendered in the DOM.
 - **Enable output redaction** (`.enable_redaction()`) so captured secrets are masked before they
   reach the agent.
 - Treat every tool result as potentially attacker-influenced data, not trusted instructions.
+
+### What page script can and cannot do to the bridge
+
+Script running in the app's own page (an XSS, or content the app renders) shares the page's
+JavaScript realm with the injected bridge, so no in-page mechanism can isolate the two. **Treat
+page script in the same webview as trusted for the integrity and confidentiality of that
+webview's eval results and probe answers.** Concretely: Tauri sends every IPC message, including
+the `victauri_eval_callback` that carries an eval result or a liveness-probe answer back to Rust,
+with the bare global `fetch(...)`, looked up when each call is made. Script that wraps
+`window.fetch` after the bridge loads sees every callback body (`{"id": …, "result": …}`) and can
+read it, rewrite it or drop it. That means same-window script can:
+
+- change or suppress what `eval_js`, `dom_snapshot`, `find_elements`, the log tools and any other
+  webview tool report for **its own window** (a proof of concept returned an agent's
+  `return document.title` as a string of the page's choosing);
+- forge a liveness-probe answer, which makes the agent's in-flight eval abort as "the page was
+  replaced/reloaded";
+- rewrite the events the recording drain reads, so a recording (and therefore `recording replay`)
+  can contain IPC calls that never happened in that window.
+
+What it still cannot do:
+
+- **Read the agent key or call agent-only operations.** Clearing logs and network routes,
+  dialog auto-answers, and the animation `scrub` / `sample` helpers (`scrubPrepare`, `scrubSeek`,
+  `scrubRestore`, `installSweepRecorder`, `readSweep` — so page script cannot replace or erase a
+  sweep recording, or pause and seek animations under the agent) are not on the page-visible
+  `window.__VICTAURI__`; they need a per-process key that only the plugin's own injected scripts
+  carry, and the functions that hold it are strict mode so a page hook cannot reach them through
+  `Function.caller`. (`animation list` reads through the public, read-only `listAnimations`.)
+- **Reach other windows or out-of-process state.** Another window's results, and Rust-side tools
+  (`query_db`, `app_state`, the registry, memory stats, window state), do not pass through that
+  page, so they are unaffected.
+- **Observe pending eval ids or rewrite results through prototype hooks.** Eval bookkeeping lives
+  in closures behind null-prototype tables, ids are coerced without page-replaceable globals, and
+  results are serialized with a `JSON.stringify` captured at injection that ignores a `toJSON`
+  planted on `Object.prototype`/`Array.prototype`. (This closes the prototype-hook routes; the
+  `fetch` route above remains.)
+- **Rewrite captured logs through a returned reference.** Every log read hands out a deep copy.
+
+**Replay.** An IPC call fulfilled or blocked by a network route (which page script can also add)
+is recorded as `mocked` and never replayed, and `recording replay` runs each call in the window
+that recorded it (a window's Tauri capabilities are its own) — or not at all if that window is
+gone. Because same-window script can rewrite what the drain reads (above), this is not a guarantee
+that every replayed call really ran; what replay does guarantee is that a planted call only runs
+with no arguments, in the window whose script planted it, with that window's own capabilities —
+the same commands that script could already invoke directly.
+
+**Reload detection** keys on a per-page nonce, so script in *another* page
+cannot make the agent's eval abort; script in the same page can (by forging the probe answer, as
+above).
 
 ## Disclosure & Capture Notes
 

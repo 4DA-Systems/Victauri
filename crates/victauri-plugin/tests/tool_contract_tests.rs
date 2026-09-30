@@ -1,11 +1,8 @@
 mod common;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
-use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
 use victauri_plugin::mcp::build_app_stateful;
@@ -32,17 +29,17 @@ impl CallbackMockBridge {
         Self {
             windows: labels
                 .iter()
-                .map(|label| victauri_core::WindowState {
-                    label: label.to_string(),
-                    title: format!("{label} Window"),
-                    url: "http://localhost/".to_string(),
-                    visible: true,
-                    focused: labels.first() == Some(label),
-                    maximized: false,
-                    minimized: false,
-                    fullscreen: false,
-                    position: (100, 100),
-                    size: (800, 600),
+                .map(|label| {
+                    victauri_core::WindowState::new(label.to_string())
+                        .with_title(format!("{label} Window"))
+                        .with_url("http://localhost/".to_string())
+                        .with_visible(true)
+                        .with_focused(labels.first() == Some(label))
+                        .with_maximized(false)
+                        .with_minimized(false)
+                        .with_fullscreen(false)
+                        .with_position(100, 100)
+                        .with_size(800, 600)
                 })
                 .collect(),
             pending_evals,
@@ -127,56 +124,14 @@ impl WebviewBridge for CallbackMockBridge {
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 fn test_state() -> Arc<VictauriState> {
-    Arc::new(VictauriState {
-        event_log: EventLog::new(1000),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(0),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(1000),
-        privacy: PrivacyConfig::default(),
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
-    })
+    Arc::new(VictauriState::for_tests())
 }
 
 fn privacy_state(config: PrivacyConfig) -> Arc<VictauriState> {
-    Arc::new(VictauriState {
-        event_log: EventLog::new(1000),
-        registry: CommandRegistry::new(),
-        port: std::sync::atomic::AtomicU16::new(0),
-        pending_evals: Arc::new(Mutex::new(HashMap::new())),
-        recorder: EventRecorder::new(1000),
-        privacy: config,
-        eval_timeout: std::time::Duration::from_secs(30),
-        shutdown_tx: tokio::sync::watch::channel(false).0,
-        started_at: std::time::Instant::now(),
-        tool_invocations: std::sync::atomic::AtomicU64::new(0),
-        allow_file_navigation: false,
-        command_timings: victauri_plugin::introspection::CommandTimings::new(),
-        fault_registry: victauri_plugin::introspection::FaultRegistry::new(),
-        contract_store: victauri_plugin::introspection::ContractStore::new(),
-        startup_timeline: victauri_plugin::introspection::StartupTimeline::new(),
-        event_bus: victauri_plugin::introspection::EventBusMonitor::default(),
-        task_tracker: victauri_plugin::introspection::TaskTracker::new(),
-        bridge_ready: std::sync::atomic::AtomicBool::new(true),
-        bridge_notify: tokio::sync::Notify::new(),
-        db_search_paths: Vec::new(),
-        screencast: std::sync::Arc::new(victauri_plugin::screencast::Screencast::default()),
-        probes: victauri_plugin::introspection::AppStateProbes::default(),
+    Arc::new({
+        let mut s = VictauriState::for_tests();
+        s.privacy = config;
+        s
     })
 }
 
@@ -1979,7 +1934,7 @@ async fn logs_events_happy_path() {
 async fn logs_slow_ipc_happy_path() {
     let state = test_state();
     let base = start_callback_server(state, &["main"], |script| {
-        if script.contains("getIpcLog()") {
+        if script.contains("getIpcLog(") {
             r#"[{"command":"slow_cmd","duration_ms":500},{"command":"fast_cmd","duration_ms":5}]"#
                 .to_string()
         } else {
@@ -2024,9 +1979,10 @@ async fn logs_slow_ipc_missing_threshold() {
 async fn privacy_eval_js_disabled() {
     let mut disabled = HashSet::new();
     disabled.insert("eval_js".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let base = start_privacy_server(config, &["main"]).await;
     let (client, sid) = mcp_session(&base).await;
@@ -2048,9 +2004,10 @@ async fn privacy_eval_js_disabled() {
 async fn privacy_screenshot_disabled() {
     let mut disabled = HashSet::new();
     disabled.insert("screenshot".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let base = start_privacy_server(config, &["main"]).await;
     let (client, sid) = mcp_session(&base).await;
@@ -2065,9 +2022,10 @@ async fn privacy_screenshot_disabled() {
 async fn privacy_navigate_disabled() {
     let mut disabled = HashSet::new();
     disabled.insert("navigate".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let base = start_privacy_server(config, &["main"]).await;
     let (client, sid) = mcp_session(&base).await;
@@ -2089,9 +2047,10 @@ async fn privacy_navigate_disabled() {
 async fn privacy_inject_css_disabled() {
     let mut disabled = HashSet::new();
     disabled.insert("inject_css".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let state = privacy_state(config);
     let base = start_callback_server(state, &["main"], |_| "null".to_string()).await;
@@ -2114,9 +2073,10 @@ async fn privacy_inject_css_disabled() {
 async fn privacy_fill_disabled() {
     let mut disabled = HashSet::new();
     disabled.insert("fill".to_string());
-    let config = PrivacyConfig {
-        disabled_tools: disabled,
-        ..Default::default()
+    let config = {
+        let mut c = PrivacyConfig::default();
+        c.disabled_tools = disabled;
+        c
     };
     let state = privacy_state(config);
     let base = start_callback_server(state, &["main"], |_| "null".to_string()).await;
@@ -2403,11 +2363,11 @@ async fn wait_for_event_matches_recent_event() {
     // A valid, far-future timestamp is unconditionally within the look-back window.
     state
         .event_bus
-        .push(victauri_plugin::introspection::CapturedTauriEvent {
-            name: "analysis-complete".to_string(),
-            payload: r#"{"scored":437}"#.to_string(),
-            timestamp: "2099-01-01T00:00:00Z".to_string(),
-        });
+        .push(victauri_plugin::introspection::CapturedTauriEvent::new(
+            "analysis-complete".to_string(),
+            r#"{"scored":437}"#.to_string(),
+            "2099-01-01T00:00:00Z".to_string(),
+        ));
     let base = start_test_server(state, &["main"]).await;
     let body = rest_call(
         &base,
@@ -2432,11 +2392,11 @@ async fn wait_for_event_outside_lookback_times_out() {
     // An old event predates the default 2s look-back, so it must NOT satisfy the wait.
     state
         .event_bus
-        .push(victauri_plugin::introspection::CapturedTauriEvent {
-            name: "analysis-complete".to_string(),
-            payload: "{}".to_string(),
-            timestamp: "2000-01-01T00:00:00Z".to_string(),
-        });
+        .push(victauri_plugin::introspection::CapturedTauriEvent::new(
+            "analysis-complete".to_string(),
+            "{}".to_string(),
+            "2000-01-01T00:00:00Z".to_string(),
+        ));
     let base = start_test_server(state, &["main"]).await;
     let body = rest_call(
         &base,
@@ -2494,4 +2454,47 @@ async fn app_state_lists_empty_when_no_probes() {
         list.contains("probes"),
         "app_state with no probes should still return a probes list: {list}"
     );
+}
+
+// Red-team M2: a browser page on any localhost origin could fire a cross-origin "simple"
+// (text/plain, no-preflight) POST at an auth-disabled server. Browser-originated bodies must be
+// JSON; non-browser clients (no Origin header) are unaffected.
+#[tokio::test]
+async fn browser_simple_post_is_refused_but_json_and_curl_work() {
+    let base = start_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+    let url = format!("{base}/api/tools/get_plugin_info");
+
+    let simple = client
+        .post(&url)
+        .header("Origin", "http://localhost:3000")
+        .header("Content-Type", "text/plain")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        simple.status(),
+        415,
+        "CORS-simple POST from a page must be refused"
+    );
+
+    let json = client
+        .post(&url)
+        .header("Origin", "http://localhost:3000")
+        .header("Content-Type", "application/json; charset=utf-8")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(json.status(), 200);
+
+    let curl_like = client
+        .post(&url)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(curl_like.status(), 200, "non-browser clients keep working");
 }

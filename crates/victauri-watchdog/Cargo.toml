@@ -29,6 +29,10 @@ anyhow = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde_json = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Process liveness + owner check, and the discovery-directory owner check (`process.rs`).
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile = "3"
 

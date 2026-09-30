@@ -5,7 +5,9 @@ Get Victauri running in your Tauri app in under 5 minutes.
 ## Prerequisites
 
 - A Tauri 2.0+ application
-- Rust toolchain (stable)
+- Rust toolchain (stable). Victauri's own MSRV is 1.88 (checked in CI against the committed
+  lockfile). Your app's dependency tree can raise that: a fresh project resolving tauri 2.12 needs
+  Rust 1.90.
 - An MCP client (Claude Code, VS Code, or any MCP-compatible tool)
 
 ## Step 1: Add the Dependency
@@ -14,10 +16,10 @@ Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.8"
+victauri-plugin = "0.9"
 ```
 
-The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary (inert in release). For a zero compiled-footprint release, make it an optional dependency behind a Cargo feature (`victauri-plugin = { version = "0.8", optional = true }` + `[features] victauri = ["dep:victauri-plugin"]`) and gate the `.plugin(...)` call with `#[cfg(feature = "victauri")]`. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
+The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary (inert in release). For a zero compiled-footprint release, make it an optional dependency behind a Cargo feature (`victauri-plugin = { version = "0.9", optional = true }` + `[features] victauri = ["dep:victauri-plugin"]`) and gate the `.plugin(...)` call with `#[cfg(feature = "victauri")]`. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
 
 ## Step 2: Initialize the Plugin
 
@@ -104,9 +106,11 @@ builder with `.auth_token("…")` (or the `VICTAURI_AUTH_TOKEN` env var).
 With your app running, check the health endpoint:
 
 Auth is on by default, so every endpoint except `/health` needs the Bearer token. The plugin
-writes it (and the bound port) to a per-process discovery directory:
-`<temp>/victauri/<pid>/token` (and `.../port`), where `<temp>` is your OS temp dir (`$TMPDIR`
-or `/tmp` on macOS/Linux, `%TEMP%` on Windows) and `<pid>` is the app's process id.
+writes it (and the bound port) to a per-process, per-user discovery directory
+`<root>/<pid>/token` (and `.../port`), where `<pid>` is the app's process id and `<root>` is
+`%TEMP%\victauri` on Windows; on macOS/Linux it is `$XDG_RUNTIME_DIR/victauri` when that
+directory is private to you, else `<temp>/victauri-<uid>` (`<temp>` = `$TMPDIR` or `/tmp`), or
+`~/.local/state/victauri` (`$XDG_STATE_HOME/victauri`) if that one is unusable.
 
 ```bash
 curl http://127.0.0.1:7373/health
@@ -114,7 +118,7 @@ curl http://127.0.0.1:7373/health
 
 TOKEN=$(cat "${TMPDIR:-/tmp}"/victauri/*/token | head -n1)   # single running app
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.8.8",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.9.0",...}
 ```
 
 Or use the Victauri CLI:
@@ -135,8 +139,8 @@ crate victauri_core`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.8"
-victauri-core = "0.8"
+victauri-plugin = "0.9"
+victauri-core = "0.9"
 ```
 
 ```rust

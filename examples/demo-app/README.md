@@ -2,7 +2,7 @@
 
 Multi-window Tauri 2 app instrumented with Victauri. Demonstrates full-stack testing patterns including CRUD, form validation, navigation, notifications, and cross-boundary state verification.
 
-All 19 commands use `#[inspectable]` and are registered in the Victauri command registry, making them discoverable via MCP.
+All 21 commands use `#[inspectable]` and are registered in the Victauri command registry, making them discoverable via MCP.
 
 ## Commands
 

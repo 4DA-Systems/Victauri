@@ -16,7 +16,9 @@ run() {
 run "cargo fmt --check" cargo fmt --all -- --check
 run "clippy"            cargo clippy --workspace --all-targets --features sqlite -- -D warnings
 run "doc-count lint"    bash scripts/check-doc-counts.sh
-run "workspace tests"   cargo test --workspace --features sqlite
+run "bridge test deps"  npm ci --prefix crates/victauri-plugin/tests/bridge_tests --no-audit --no-fund
+# VICTAURI_REQUIRE_JSDOM turns a missing jsdom into a failure instead of a silent skip.
+run "workspace tests"   env VICTAURI_REQUIRE_JSDOM=1 cargo test --workspace --features sqlite
 
 echo
 if [ "${#failed[@]}" -gt 0 ]; then

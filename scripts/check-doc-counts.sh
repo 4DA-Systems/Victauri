@@ -55,6 +55,32 @@ expect "tools-reference 'exposes N MCP tools'" "$tools" \
   "$(grep -oE 'exposes [0-9]+ MCP tools' docs/src/tools-reference.md | grep -oE '[0-9]+' || true)" \
   docs/src/tools-reference.md
 
+expect "plugin README 'N MCP tools across three layers'" "$tools" \
+  "$(grep -oE '[0-9]+ MCP tools across three layers' crates/victauri-plugin/README.md | grep -oE '^[0-9]+' || true)" \
+  crates/victauri-plugin/README.md
+
+# ── Smoke-suite check count (`victauri test`, `VictauriClient::smoke_test`) ───
+checks=$(count '(skippable_)?check!\(' crates/victauri-test/src/smoke.rs)
+echo "Smoke checks defined in code: $checks"
+expect "README 'all N smoke checks'" "$checks" \
+  "$(grep -oE 'all [0-9]+ smoke checks' README.md | grep -oE '[0-9]+' || true)" \
+  README.md
+expect "CLI README '(N checks)'" "$checks" \
+  "$(grep -oE 'smoke test suite \([0-9]+ checks\)' crates/victauri-cli/README.md | grep -oE '[0-9]+' || true)" \
+  crates/victauri-cli/README.md
+expect "victauri-test README 'Runs N checks'" "$checks" \
+  "$(grep -oE 'Runs [0-9]+ checks' crates/victauri-test/README.md | grep -oE '[0-9]+' || true)" \
+  crates/victauri-test/README.md
+expect "testing guide 'The N checks'" "$checks" \
+  "$(grep -oE 'The [0-9]+ checks' docs/src/testing.md | grep -oE '[0-9]+' || true)" \
+  docs/src/testing.md
+expect "testing-tauri-apps 'CLI — N checks'" "$checks" \
+  "$(grep -oE 'CLI — [0-9]+ checks' docs/src/testing-tauri-apps.md | grep -oE '[0-9]+' || true)" \
+  docs/src/testing-tauri-apps.md
+expect "testing-tauri-apps 'victauri test (N checks'" "$checks" \
+  "$(grep -oE 'victauri test \([0-9]+ checks' docs/src/testing-tauri-apps.md | grep -oE '[0-9]+' || true)" \
+  docs/src/testing-tauri-apps.md
+
 if [ "$status" -ne 0 ]; then
   echo
   echo "Doc-count lint FAILED — update the doc number(s) above to match the code."

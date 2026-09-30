@@ -1,5 +1,7 @@
 //! Watchdog process that monitors and restarts the Victauri MCP server if it becomes unresponsive.
 
+mod process;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -83,33 +85,200 @@ fn parse_args(args: &[String]) -> (Option<u16>, Option<String>) {
 
 // ── Discovery ────────────────────────────────────────────────────────────────
 //
-// The plugin writes `<temp>/victauri/<pid>/port` (+ `metadata.json` with the app
+// The plugin writes `<root>/<pid>/port` (see `discovery_roots`; + `metadata.json` with the app
 // `identifier` / `product_name`) and may land on 7374+ when 7373 is taken, so a
 // fixed port can watch the wrong app or nothing at all. `/health` needs no auth,
 // so only the port is read — never the token.
+
+/// Which discovery entries the watchdog is willing to follow.
+///
+/// The watchdog exists to *report* a crash. If it followed "whatever Victauri app is
+/// running" after the watched one died, a second app would turn a crash into a silent
+/// green. So once an app is resolved, its identity is PINNED and only entries with that
+/// identity are ever followed afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selector {
+    /// Nothing resolved yet and no `--app`: any single live app (the first resolution).
+    Any,
+    /// `--app` / `VICTAURI_APP`: matches the bundle `identifier` or the `product_name`.
+    App(String),
+    /// Pinned after resolution: the app's bundle identifier (or, for an entry written by a
+    /// plugin without an identifier, its product name). Only this identity is followed.
+    Pinned(String),
+    /// Pinned to one process whose discovery entry carried no identity at all: it can never
+    /// be re-identified after a restart, so the watchdog never follows anything else.
+    Pid(u32),
+}
+
+impl Selector {
+    fn matches(&self, pid: u32, meta: &serde_json::Value) -> bool {
+        let field = |k: &str| {
+            meta.get(k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        };
+        // Identity comparison is EXACT but ASCII case-insensitive — identical to the CLI
+        // bridge's `matches_app` and victauri-test's discovery (R5-WD1). A case-only mismatch
+        // must never read as "app down": that fires the recovery command against a healthy app.
+        let same =
+            |value: Option<&str>, want: &str| value.is_some_and(|v| v.eq_ignore_ascii_case(want));
+        match self {
+            Self::Any => true,
+            Self::App(want) => same(field("identifier"), want) || same(field("product_name"), want),
+            Self::Pinned(id) => match field("identifier") {
+                Some(identifier) => identifier.eq_ignore_ascii_case(id),
+                None => same(field("product_name"), id),
+            },
+            Self::Pid(p) => *p == pid,
+        }
+    }
+
+    /// The selector to use from now on, once `app` has been resolved.
+    fn pin(&self, app: &DiscoveredApp) -> Self {
+        match self {
+            Self::Pinned(_) => self.clone(),
+            _ => app
+                .identity
+                .clone()
+                .map_or(Self::Pid(app.pid), Self::Pinned),
+        }
+    }
+}
+
+/// One live discovery entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveredApp {
+    pid: u32,
+    port: u16,
+    /// Bundle identifier, else product name, from `metadata.json` (if any).
+    identity: Option<String>,
+}
 
 /// Outcome of scanning the discovery directory.
 #[derive(Debug, PartialEq, Eq)]
 enum Discovery {
     /// Exactly one live app matched.
-    Found(u16),
+    Found(DiscoveredApp),
     /// No live app matched.
     None,
-    /// Several live apps matched and no `--app` selector disambiguates them.
+    /// Several live apps matched and the selector does not disambiguate them.
     Ambiguous(Vec<(u32, u16)>),
 }
 
-fn discovery_base_dir() -> PathBuf {
-    std::env::temp_dir().join("victauri")
+/// The discovery roots the plugin may have written to, most specific first (mirrors the
+/// plugin's `discovery_root`). On Unix the roots are per-user — `$XDG_RUNTIME_DIR/victauri`
+/// when that directory is private to us, then `<temp>/victauri-<euid>` (a shared
+/// `/tmp/victauri` could be pre-created by another user, blocking discovery), then the home
+/// fallback `$XDG_STATE_HOME/victauri` / `$HOME/.local/state/victauri` (where the plugin
+/// registers when `<temp>/victauri-<euid>` was taken over) — and the legacy `<temp>/victauri`
+/// is still read, subject to the same ownership check, for pre-0.9 plugins. Other platforms
+/// use `<temp>/victauri` (a per-user temp dir; Windows readers verify its ownership).
+fn discovery_roots() -> Vec<PathBuf> {
+    let legacy = std::env::temp_dir().join("victauri");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mut roots = Vec::new();
+        if let Some(euid) = current_euid() {
+            if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .filter(|dir| dir.is_absolute())
+                .filter(|dir| {
+                    std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                        m.file_type().is_dir()
+                            && m.uid() == euid
+                            && m.permissions().mode() & 0o077 == 0
+                    })
+                })
+            {
+                roots.push(runtime.join("victauri"));
+            }
+            roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+            // The plugin's fallback when `<temp>/victauri-<euid>` was taken over by another
+            // user (R5B-LINDISC1) — scanned after it, before the legacy root.
+            roots.extend(home_state_root(
+                std::env::var_os("XDG_STATE_HOME"),
+                std::env::var_os("HOME"),
+            ));
+        }
+        roots.push(legacy);
+        roots
+    }
+    #[cfg(not(unix))]
+    {
+        vec![legacy]
+    }
 }
 
-/// Scan `base` for live Victauri apps (owning pid alive), optionally filtered by
-/// `app` against the discovery `metadata.json` identity.
-fn discover_in(base: &Path, app: Option<&str>, is_alive: impl Fn(u32) -> bool) -> Discovery {
+/// The plugin's per-user fallback discovery root under the home directory:
+/// `$XDG_STATE_HOME/victauri`, else `$HOME/.local/state/victauri` (each only when absolute).
+/// The plugin registers there when `<temp>/victauri-<euid>` is untrusted — e.g. another local
+/// user pre-created it, and sticky `/tmp` stops us deleting it (R5B-LINDISC1).
+#[cfg(unix)]
+fn home_state_root(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let absolute =
+        |p: std::ffi::OsString| Some(std::path::PathBuf::from(p)).filter(|p| p.is_absolute());
+    xdg_state_home
+        .and_then(absolute)
+        .or_else(|| {
+            home.and_then(absolute)
+                .map(|h| h.join(".local").join("state"))
+        })
+        .map(|state| state.join("victauri"))
+}
+
+/// [`discover_in`] over every discovery root; a pid found under several roots counts once.
+fn discover_in_roots(
+    roots: &[PathBuf],
+    selector: &Selector,
+    is_alive: impl Fn(u32) -> bool,
+) -> Discovery {
+    let mut found: Vec<DiscoveredApp> = Vec::new();
+    let mut apps: Vec<(u32, u16)> = Vec::new();
+    for root in roots {
+        match discover_in(root, selector, &is_alive) {
+            Discovery::Found(app) => {
+                if !apps.iter().any(|(pid, _)| *pid == app.pid) {
+                    apps.push((app.pid, app.port));
+                    found.push(app);
+                }
+            }
+            Discovery::Ambiguous(more) => {
+                for app in more {
+                    if !apps.iter().any(|(pid, _)| *pid == app.0) {
+                        apps.push(app);
+                    }
+                }
+            }
+            Discovery::None => {}
+        }
+    }
+    match (apps.len(), found.len()) {
+        (0, _) => Discovery::None,
+        (1, 1) => Discovery::Found(found.remove(0)),
+        _ => {
+            apps.sort_unstable();
+            Discovery::Ambiguous(apps)
+        }
+    }
+}
+
+/// Scan `base` for live Victauri apps (owning pid alive) that match `selector`.
+///
+/// Both the base directory and every entry directory must pass [`dir_is_trusted`]; an
+/// untrusted base yields [`Discovery::None`] (on Unix `/tmp` is world-writable, so a planted
+/// `victauri/` tree must not be able to steer the watchdog).
+fn discover_in(base: &Path, selector: &Selector, is_alive: impl Fn(u32) -> bool) -> Discovery {
+    if !dir_is_trusted(base) {
+        return Discovery::None;
+    }
     let Ok(entries) = std::fs::read_dir(base) else {
         return Discovery::None;
     };
-    let mut found: Vec<(u32, u16)> = Vec::new();
+    let mut found: Vec<DiscoveredApp> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         let Some(pid) = path
@@ -119,7 +288,7 @@ fn discover_in(base: &Path, app: Option<&str>, is_alive: impl Fn(u32) -> bool) -
         else {
             continue;
         };
-        if !dir_is_trusted(&path) || !is_alive(pid) {
+        if !dir_is_trusted(&path) {
             continue;
         }
         let Some(port) = std::fs::read_to_string(path.join("port"))
@@ -129,80 +298,236 @@ fn discover_in(base: &Path, app: Option<&str>, is_alive: impl Fn(u32) -> bool) -
         else {
             continue;
         };
-        if let Some(want) = app {
-            let meta: serde_json::Value = std::fs::read_to_string(path.join("metadata.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default();
-            let matches = ["identifier", "product_name"]
-                .iter()
-                .any(|k| meta.get(k).and_then(|v| v.as_str()) == Some(want));
-            if !matches {
-                continue;
-            }
+        let meta: serde_json::Value = std::fs::read_to_string(path.join("metadata.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if !selector.matches(pid, &meta) {
+            continue;
         }
-        found.push((pid, port));
+        // Liveness last: it spawns a process on Windows, so only pay it for matches.
+        if !is_alive(pid) {
+            continue;
+        }
+        let identity = ["identifier", "product_name"].iter().find_map(|k| {
+            meta.get(*k)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+        found.push(DiscoveredApp {
+            pid,
+            port,
+            identity,
+        });
     }
-    match found.as_slice() {
-        [] => Discovery::None,
-        [(_, port)] => Discovery::Found(*port),
+    match found.len() {
+        0 => Discovery::None,
+        1 => Discovery::Found(found.remove(0)),
         _ => {
-            found.sort_unstable();
-            Discovery::Ambiguous(found)
+            let mut apps: Vec<(u32, u16)> = found.iter().map(|a| (a.pid, a.port)).collect();
+            apps.sort_unstable();
+            Discovery::Ambiguous(apps)
         }
     }
 }
 
-/// On Unix the temp root is world-writable: only trust a real (non-symlink)
-/// directory that is not group/other-writable. Windows temp is per-user.
+/// On Unix the temp root is world-writable: only trust a real (non-symlink) directory
+/// that is OWNED by the current effective user and is not group/other-writable. Permission
+/// bits alone are not enough — another local user can create a `0700` directory of their
+/// own. Mirrors `victauri-test`'s `discovery::dir_is_trusted`.
 #[cfg(unix)]
 fn dir_is_trusted(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::symlink_metadata(path)
-        .is_ok_and(|m| m.file_type().is_dir() && (m.permissions().mode() & 0o022) == 0)
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return false;
+    };
+    if !meta.file_type().is_dir() {
+        return false; // reject symlinks / non-dirs
+    }
+    let Some(euid) = current_euid() else {
+        return false; // can't establish our uid -> don't trust
+    };
+    meta.uid() == euid && (meta.permissions().mode() & 0o022) == 0
 }
 
-#[cfg(not(unix))]
-fn dir_is_trusted(path: &Path) -> bool {
-    path.is_dir()
+/// Determine the current effective uid without `unsafe` code: exclusively create a file
+/// and read back its owner uid (same approach as `victauri-test`). Cached for the process.
+#[cfg(unix)]
+fn current_euid() -> Option<u32> {
+    use std::sync::OnceLock;
+
+    static EUID: OnceLock<Option<u32>> = OnceLock::new();
+    *EUID.get_or_init(|| {
+        for _ in 0..16 {
+            // Unpredictable name (R4-DISC2): a guessable `<pid>_<seq>` name in the shared
+            // temp dir let another user pre-create every probe path and deny us our uid.
+            let probe = std::env::temp_dir().join(format!(
+                ".victauri_watchdog_uidprobe_{}",
+                unpredictable_suffix()
+            ));
+            if let Some(uid) = uid_from_exclusive_probe(&probe) {
+                return Some(uid);
+            }
+        }
+        None
+    })
 }
 
-/// Cross-platform "is this pid a live process?" (same approach as victauri-test).
+/// 128 bits another local user cannot predict, without a new dependency: two `SipHash`
+/// outputs keyed by `RandomState` (seeded from the OS RNG per process), mixed with the time.
+#[cfg(unix)]
+fn unpredictable_suffix() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let word = |salt: u64| {
+        let mut h = RandomState::new().build_hasher();
+        h.write_u128(nanos);
+        h.write_u64(salt);
+        h.write_u32(std::process::id());
+        h.finish()
+    };
+    format!("{:016x}{:016x}", word(1), word(2))
+}
+
+/// Create a UID probe without following a pre-planted symlink in the shared temp dir
+/// (`create_new` = `O_EXCL`, which refuses any existing path including a symlink).
+#[cfg(unix)]
+fn uid_from_exclusive_probe(probe: &Path) -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(probe)
+        .ok()?;
+    let uid = file.metadata().ok().map(|m| m.uid());
+    drop(file);
+    let _ = std::fs::remove_file(probe);
+    uid
+}
+
+/// Windows: a real directory (a symlink or junction is not `is_dir()` under `symlink_metadata`)
+/// OWNED by the current user — the token user, the token's default owner, or
+/// `BUILTIN\Administrators` when this token is a member (the plugin writer's rule). `%TEMP%` is
+/// normally per-user, but a shared one (`C:\msys64\tmp`) let another user plant an entry that
+/// pointed the watchdog at a port they control (R5B-WINDISC1).
 #[cfg(windows)]
-fn is_process_alive(pid: u32) -> bool {
-    // Absolute System32 path (as victauri-cli's bridge does): a writable PATH entry must not
-    // be able to shadow `tasklist`, which this loop spawns repeatedly.
-    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-    std::process::Command::new(format!("{root}\\System32\\tasklist.exe"))
-        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
-        .output()
-        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&pid.to_string()))
+fn dir_is_trusted(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && process::dir_owned_by_current_user(path)
 }
 
-#[cfg(not(windows))]
-fn is_process_alive(pid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+#[cfg(not(any(unix, windows)))]
+fn dir_is_trusted(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
 }
 
-/// Resolve the port to poll from discovery, logging the outcome. Returns `None`
-/// when discovery yields no single app (the caller keeps its current port).
-fn discover_port(app: Option<&str>) -> Option<u16> {
-    match discover_in(&discovery_base_dir(), app, is_process_alive) {
-        Discovery::Found(port) => Some(port),
+/// Whether a discovery entry's owner may be the app to watch: anything not known to be gone.
+/// The watchdog only reads the entry's PORT (never its token), so an owner whose liveness
+/// could not be checked — no `kill` binary on NixOS/Guix/minimal images, an elevated app
+/// whose token is unreadable — is still followed (R4-DISC1); `/health` decides from there.
+fn may_be_alive(pid: u32) -> bool {
+    !is_gone(process::liveness(pid))
+}
+
+/// Whether a watched process has definitely exited (or its PID now belongs to another
+/// account, i.e. was recycled). "Could not tell" is NOT gone: before R4-DISC1 a missing
+/// `/bin/kill` made every PID read dead, and the watchdog fired its recovery command on a
+/// healthy app. (Exact PID, own user; see `process.rs` — the old Windows check
+/// substring-matched `tasklist` output, so a crashed app whose PID was a prefix of a live one
+/// looked alive and was never restarted.)
+fn is_gone(liveness: process::Liveness) -> bool {
+    matches!(
+        liveness,
+        process::Liveness::Dead | process::Liveness::OtherUser
+    )
+}
+
+/// Resolve the app to watch from discovery, logging an ambiguous outcome. Returns `None`
+/// when discovery yields no single matching app.
+fn discover_app(selector: &Selector) -> Option<DiscoveredApp> {
+    match discover_in_roots(&discovery_roots(), selector, may_be_alive) {
+        Discovery::Found(app) => Some(app),
         Discovery::None => None,
         Discovery::Ambiguous(apps) => {
             tracing::warn!(
                 ?apps,
-                "Several Victauri apps are running — set --app <identifier> (or VICTAURI_APP) \
-                 or VICTAURI_PORT to choose one"
+                ?selector,
+                "Several matching Victauri apps are running — set --app <identifier> \
+                 (or VICTAURI_APP) or VICTAURI_PORT to choose one"
             );
             None
         }
     }
+}
+
+/// What the watchdog polls.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Target {
+    port: u16,
+    /// The watched process, when resolved by discovery. A dead pid is a failure even if
+    /// something else now answers on the port (that would be a different app).
+    pid: Option<u32>,
+}
+
+/// Initial target before the first poll.
+///
+/// - explicit port → that port, no discovery (pre-discovery behaviour);
+/// - discovered app → its port + pid, and the selector is pinned to its identity;
+/// - `--app` set but not found → `None`: the app is reported DOWN. Falling back to the
+///   default port would watch whatever unrelated app holds 7373 and hide the outage;
+/// - no `--app`, nothing found → the default port (legacy fallback, identity unknown).
+fn initial_target(
+    config: &Config,
+    selector: &mut Selector,
+    discovered: Option<DiscoveredApp>,
+) -> Option<Target> {
+    if config.port_explicit {
+        return Some(Target {
+            port: config.port,
+            pid: None,
+        });
+    }
+    if let Some(app) = discovered {
+        *selector = selector.pin(&app);
+        return Some(Target {
+            port: app.port,
+            pid: Some(app.pid),
+        });
+    }
+    if config.app.is_some() {
+        None
+    } else {
+        Some(Target {
+            port: DEFAULT_PORT,
+            pid: None,
+        })
+    }
+}
+
+/// While failing, re-resolve through discovery — ONLY among entries matching the (pinned)
+/// selector — and follow the watched app if it restarted on a new pid/port. Returns the
+/// new target when it changed.
+fn follow_target(
+    current: Option<&Target>,
+    selector: &mut Selector,
+    discovered: Option<DiscoveredApp>,
+) -> Option<Target> {
+    let app = discovered?;
+    let next = Target {
+        port: app.port,
+        pid: Some(app.pid),
+    };
+    if current == Some(&next) {
+        return None;
+    }
+    *selector = selector.pin(&app);
+    Some(next)
 }
 
 /// Parse `VICTAURI_INTERVAL` (seconds) and clamp it up to `MIN_INTERVAL_SECS`.
@@ -266,8 +591,11 @@ async fn main() -> anyhow::Result<()> {
         println!("victauri-watchdog {}", env!("CARGO_PKG_VERSION"));
         println!("Crash-recovery sidecar for Victauri MCP server\n");
         println!("USAGE: victauri-watchdog [PORT] [--app <identifier>]\n");
-        println!("Without an explicit port, the port is discovered from");
-        println!("<temp>/victauri/<pid>/port (live apps only), falling back to 7373.\n");
+        println!("Without an explicit port, the port is discovered from the per-user");
+        println!("discovery roots (<root>/<pid>/port, live apps only), falling back to 7373 when");
+        println!("no --app is given. Once an app is found its identity is pinned: the");
+        println!("watchdog follows only that app across restarts and never switches to a");
+        println!("different one. With --app and no matching app, it reports the app DOWN.\n");
         println!("OPTIONS:");
         println!("  --app <id>       Watch the app with this bundle identifier / product name");
         println!("  -h, --help       Print help");
@@ -291,30 +619,43 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = Config::from_env();
-    let mut port = config.port;
-    if !config.port_explicit {
-        if let Some(p) = discover_port(config.app.as_deref()) {
-            tracing::info!(port = p, app = ?config.app, "Discovered Victauri app");
-            port = p;
-        } else {
-            tracing::info!(
-                port,
-                app = ?config.app,
-                "No single live Victauri app discovered yet — polling the default port"
-            );
+    let mut selector = config.app.clone().map_or(Selector::Any, Selector::App);
+    let discovered = if config.port_explicit {
+        None
+    } else {
+        discover_app(&selector)
+    };
+    let mut target = initial_target(&config, &mut selector, discovered);
+    match (&target, config.port_explicit) {
+        (Some(t), false) if t.pid.is_some() => {
+            tracing::info!(port = t.port, pid = ?t.pid, identity = ?selector, "Discovered Victauri app — identity pinned");
         }
+        (Some(t), false) => tracing::info!(
+            port = t.port,
+            "No single live Victauri app discovered yet — polling the default port"
+        ),
+        (None, _) => tracing::warn!(
+            app = ?config.app,
+            "The selected Victauri app is not running (no matching discovery entry) — reporting it DOWN until it appears"
+        ),
+        _ => {}
     }
-    let mut url = format!("http://127.0.0.1:{port}/health");
 
     tracing::info!(
-        port,
+        port = target.as_ref().map(|t| t.port),
         interval_secs = config.interval.as_secs(),
         max_failures = config.max_failures,
-        on_failure = config.on_failure_cmd.as_deref().unwrap_or("(none)"),
+        // Program name only (R4-WD1): the full command line may carry secrets, tokens or
+        // sensitive paths — see the same rule at the recovery site below.
+        on_failure = on_failure_label(config.on_failure_cmd.as_deref()),
         "Victauri watchdog started"
     );
 
     let client = reqwest::Client::builder()
+        // Below the plugin's 10 s idle keep-alive (its request-head deadline), so a pooled
+        // connection is never reused just as the server closes it (a request lost that way looks
+        // "possibly delivered" and a tool call is then not retried).
+        .pool_idle_timeout(std::time::Duration::from_secs(5))
         .timeout(Duration::from_secs(5))
         .build()?;
 
@@ -324,8 +665,8 @@ async fn main() -> anyhow::Result<()> {
     loop {
         tokio::time::sleep(config.interval).await;
 
-        match client.get(&url).send().await {
-            Ok(resp) if resp.status().is_success() => {
+        match poll_health(&client, target.as_ref(), process::liveness).await {
+            Ok(()) => {
                 if consecutive_failures > 0 {
                     tracing::info!(
                         after_failures = consecutive_failures,
@@ -335,40 +676,33 @@ async fn main() -> anyhow::Result<()> {
                     action_fired = false;
                 }
             }
-            Ok(resp) => {
+            Err(reason) => {
                 consecutive_failures += 1;
                 tracing::warn!(
-                    status = %resp.status(),
                     failure_count = consecutive_failures,
-                    "Health check returned non-success status"
-                );
-            }
-            Err(e) => {
-                consecutive_failures += 1;
-                tracing::warn!(
-                    error = %e,
-                    failure_count = consecutive_failures,
-                    "Health check failed"
+                    reason,
+                    "Victauri app down"
                 );
             }
         }
 
-        // The app may have restarted on a different port (7373 taken → 7374+). With
-        // no explicit port, re-resolve via discovery on failure and follow it; the
-        // next successful poll then logs the recovery. Discovery only runs while
+        // The watched app may have restarted (new pid) on a different port (7373 taken →
+        // 7374+). With no explicit port, re-resolve via discovery on failure — restricted to
+        // the PINNED identity, so a different app is never silently adopted — and follow it;
+        // the next successful poll then logs the recovery. Discovery only runs while
         // failing, so a healthy app costs no extra process spawns.
         if consecutive_failures > 0
             && !config.port_explicit
-            && let Some(p) = discover_port(config.app.as_deref())
-            && p != port
+            && let rediscovered = discover_app(&selector)
+            && let Some(next) = follow_target(target.as_ref(), &mut selector, rediscovered)
         {
             tracing::info!(
-                from = port,
-                to = p,
-                "Victauri app moved — following discovered port"
+                from = ?target,
+                to = ?next,
+                identity = ?selector,
+                "Watched Victauri app restarted — following it"
             );
-            port = p;
-            url = format!("http://127.0.0.1:{port}/health");
+            target = Some(next);
         }
 
         if consecutive_failures >= config.max_failures && !action_fired {
@@ -400,6 +734,52 @@ async fn main() -> anyhow::Result<()> {
             action_fired = true;
         }
     }
+}
+
+/// Whether an HTTP status from `GET /health` proves the Victauri server is alive: a `2xx`,
+/// or `429 Too Many Requests`. `/health` is unauthenticated and shares the public
+/// rate-limit bucket, so any local process can flood it into 429s — and a rate-limited reply
+/// is still the server answering. Counting 429 as a failure let that flood make the watchdog
+/// run its recovery command against a healthy app (R4-NET1).
+fn health_status_means_alive(status: u16) -> bool {
+    (200..300).contains(&status) || status == 429
+}
+
+/// One poll: `Ok` when the watched app is up, else why it is not.
+///
+/// A watched pid that has exited is a crash even if some other app now answers on the same
+/// port — never let a different app mask it. A pid whose liveness cannot be determined is
+/// not treated as exited; `/health` decides.
+async fn poll_health(
+    client: &reqwest::Client,
+    target: Option<&Target>,
+    liveness: impl Fn(u32) -> process::Liveness,
+) -> Result<(), String> {
+    let Some(target) = target else {
+        return Err(
+            "the selected Victauri app is not running (no matching discovery entry)".to_string(),
+        );
+    };
+    if target.pid.is_some_and(|pid| is_gone(liveness(pid))) {
+        return Err("the watched app process has exited".to_string());
+    }
+    match client
+        .get(format!("http://127.0.0.1:{}/health", target.port))
+        .send()
+        .await
+    {
+        Ok(resp) if health_status_means_alive(resp.status().as_u16()) => Ok(()),
+        Ok(resp) => Err(format!(
+            "health check returned non-success status {}",
+            resp.status()
+        )),
+        Err(e) => Err(format!("health check failed: {e}")),
+    }
+}
+
+/// What the startup log says about the recovery command: its program name only.
+fn on_failure_label(cmd: Option<&str>) -> &str {
+    cmd.map_or("(none)", recovery_program_name)
 }
 
 /// Extract the program name (first whitespace-delimited token) from a recovery
@@ -492,7 +872,81 @@ mod tests {
         write_entry(tmp.path(), 300, "not-a-port", None);
         std::fs::create_dir_all(tmp.path().join("not-a-pid")).unwrap();
         let alive = |pid: u32| pid != 200;
-        assert_eq!(discover_in(tmp.path(), None, alive), Discovery::Found(7374));
+        assert_eq!(
+            discover_in(tmp.path(), &Selector::Any, alive),
+            Discovery::Found(app(100, 7374, Some("com.a")))
+        );
+    }
+
+    /// Audit N6: entries are read from every root (per-user + legacy); one pid counts once.
+    #[test]
+    fn discovery_merges_all_roots() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        write_entry(a.path(), 100, "7374", Some("com.a"));
+        let roots = [a.path().to_path_buf(), b.path().to_path_buf()];
+        let alive = |_| true;
+        assert_eq!(
+            discover_in_roots(&roots, &Selector::Any, alive),
+            Discovery::Found(app(100, 7374, Some("com.a")))
+        );
+        write_entry(b.path(), 100, "7374", Some("com.a")); // same pid again: still one app
+        assert_eq!(
+            discover_in_roots(&roots, &Selector::Any, alive),
+            Discovery::Found(app(100, 7374, Some("com.a")))
+        );
+        write_entry(b.path(), 200, "7375", Some("com.b"));
+        assert_eq!(
+            discover_in_roots(&roots, &Selector::Any, alive),
+            Discovery::Ambiguous(vec![(100, 7374), (200, 7375)])
+        );
+        assert_eq!(
+            discover_in_roots(&roots, &app_sel("com.b"), alive),
+            Discovery::Found(app(200, 7375, Some("com.b")))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_roots_are_per_user_first() {
+        let roots = discovery_roots();
+        let euid = current_euid().unwrap();
+        assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
+        assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
+        assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+        // R5B-LINDISC1: the home fallback is scanned after the per-user temp root, before
+        // the legacy one.
+        let home = home_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+            .expect("HOME is set in the test environment");
+        let at = |p: &std::path::Path| roots.iter().position(|r| r == p);
+        let tmp_root = std::env::temp_dir().join(format!("victauri-{euid}"));
+        assert!(at(&home) > at(&tmp_root), "{roots:?}");
+        assert!(at(&home) < Some(roots.len() - 1), "{roots:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_state_root_prefers_an_absolute_xdg_state_home() {
+        assert_eq!(
+            home_state_root(Some("/x/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/x/state/victauri"))
+        );
+        assert_eq!(
+            home_state_root(Some("rel".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/home/u/.local/state/victauri"))
+        );
+        assert_eq!(home_state_root(None, Some("rel".into())), None);
+    }
+
+    fn app(pid: u32, port: u16, identity: Option<&str>) -> DiscoveredApp {
+        DiscoveredApp {
+            pid,
+            port,
+            identity: identity.map(str::to_string),
+        }
+    }
+
+    fn app_sel(s: &str) -> Selector {
+        Selector::App(s.to_string())
     }
 
     #[test]
@@ -502,26 +956,272 @@ mod tests {
         write_entry(tmp.path(), 200, "7375", Some("com.b"));
         let alive = |_| true;
         assert_eq!(
-            discover_in(tmp.path(), None, alive),
+            discover_in(tmp.path(), &Selector::Any, alive),
             Discovery::Ambiguous(vec![(100, 7373), (200, 7375)])
         );
         assert_eq!(
-            discover_in(tmp.path(), Some("com.b"), alive),
-            Discovery::Found(7375)
+            discover_in(tmp.path(), &app_sel("com.b"), alive),
+            Discovery::Found(app(200, 7375, Some("com.b")))
         );
         // product_name also matches (both entries share "P" here → ambiguous).
         assert!(matches!(
-            discover_in(tmp.path(), Some("P"), alive),
+            discover_in(tmp.path(), &app_sel("P"), alive),
             Discovery::Ambiguous(_)
         ));
         assert_eq!(
-            discover_in(tmp.path(), Some("com.missing"), alive),
+            discover_in(tmp.path(), &app_sel("com.missing"), alive),
             Discovery::None
         );
         assert_eq!(
-            discover_in(&tmp.path().join("absent"), None, alive),
+            discover_in(&tmp.path().join("absent"), &Selector::Any, alive),
             Discovery::None
         );
+    }
+
+    #[test]
+    fn pinned_identity_never_follows_a_different_app() {
+        // The watched app (com.a, pid 100) died; the only live app is com.b. A pinned
+        // watchdog must NOT adopt it — that would turn a crash into a silent green.
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7373", Some("com.a"));
+        write_entry(tmp.path(), 200, "7374", Some("com.b"));
+        let alive = |pid: u32| pid != 100;
+        let pinned = Selector::Pinned("com.a".to_string());
+        assert_eq!(discover_in(tmp.path(), &pinned, alive), Discovery::None);
+
+        // …but it DOES follow the same app restarted under a new pid/port.
+        write_entry(tmp.path(), 300, "7375", Some("com.a"));
+        assert_eq!(
+            discover_in(tmp.path(), &pinned, alive),
+            Discovery::Found(app(300, 7375, Some("com.a")))
+        );
+    }
+
+    #[test]
+    fn pinned_identity_is_the_identifier_not_the_shared_product_name() {
+        // Resolved by product_name "P" → pinned to the bundle identifier, so a different
+        // app sharing the product name is not followed.
+        let found = app(100, 7373, Some("com.a"));
+        let pinned = app_sel("P").pin(&found);
+        assert_eq!(pinned, Selector::Pinned("com.a".to_string()));
+        let other = serde_json::json!({"identifier": "com.b", "product_name": "P"});
+        assert!(!pinned.matches(200, &other));
+        let same = serde_json::json!({"identifier": "com.a", "product_name": "P"});
+        assert!(pinned.matches(300, &same));
+        // An already-pinned selector stays pinned.
+        assert_eq!(pinned.pin(&app(9, 1, Some("com.z"))), pinned);
+    }
+
+    /// R5-WD1: `--app` must match exactly like the CLI bridge (`matches_app`) and
+    /// victauri-test discovery — ASCII case-insensitive, never a substring. A case-only
+    /// mismatch used to be read as "app down" and fire the recovery command in a loop
+    /// against a healthy app.
+    #[test]
+    fn app_selector_is_ascii_case_insensitive_like_the_bridge() {
+        let meta = serde_json::json!({"identifier": "com.Mock.App", "product_name": "Mock App"});
+        assert!(app_sel("com.mock.app").matches(1, &meta));
+        assert!(app_sel("COM.MOCK.APP").matches(1, &meta));
+        assert!(app_sel("mock app").matches(1, &meta));
+        // Still exact: no substring / prefix matches.
+        assert!(!app_sel("com.mock").matches(1, &meta));
+        assert!(!app_sel("mock").matches(1, &meta));
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7373", Some("com.Mock.App"));
+        assert_eq!(
+            discover_in(tmp.path(), &app_sel("com.mock.app"), |_| true),
+            Discovery::Found(app(100, 7373, Some("com.Mock.App")))
+        );
+
+        // The pinned identity follows the same rule (it is re-matched after a restart).
+        let pinned = Selector::Pinned("com.Mock.App".to_string());
+        let restarted = serde_json::json!({"identifier": "com.mock.app"});
+        assert!(pinned.matches(2, &restarted));
+        let other = serde_json::json!({"identifier": "com.mock.app.other"});
+        assert!(!pinned.matches(3, &other));
+    }
+
+    #[test]
+    fn identityless_entry_pins_to_its_pid() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7373", None);
+        let Discovery::Found(found) = discover_in(tmp.path(), &Selector::Any, |_| true) else {
+            panic!("expected one app");
+        };
+        assert_eq!(found.identity, None);
+        let pinned = Selector::Any.pin(&found);
+        assert_eq!(pinned, Selector::Pid(100));
+        // A restart (new pid, no identity) can't be proven to be the same app → not followed.
+        write_entry(tmp.path(), 200, "7374", None);
+        let alive = |pid: u32| pid != 100;
+        assert_eq!(discover_in(tmp.path(), &pinned, alive), Discovery::None);
+    }
+
+    fn test_config(app: Option<&str>, port_explicit: bool) -> Config {
+        Config {
+            port: if port_explicit { 9000 } else { DEFAULT_PORT },
+            port_explicit,
+            app: app.map(str::to_string),
+            interval: Duration::from_secs(5),
+            max_failures: 3,
+            on_failure_cmd: None,
+        }
+    }
+
+    #[test]
+    fn initial_target_with_unmatched_app_reports_down_not_default_port() {
+        let config = test_config(Some("com.missing"), false);
+        let mut sel = app_sel("com.missing");
+        assert_eq!(initial_target(&config, &mut sel, None), None);
+        assert_eq!(sel, app_sel("com.missing"));
+    }
+
+    #[test]
+    fn initial_target_pins_and_falls_back_correctly() {
+        // Discovered → pinned + pid tracked.
+        let config = test_config(None, false);
+        let mut sel = Selector::Any;
+        let t = initial_target(&config, &mut sel, Some(app(42, 7380, Some("com.a"))));
+        assert_eq!(
+            t,
+            Some(Target {
+                port: 7380,
+                pid: Some(42)
+            })
+        );
+        assert_eq!(sel, Selector::Pinned("com.a".to_string()));
+
+        // No --app, nothing found → legacy default-port fallback.
+        let mut sel = Selector::Any;
+        assert_eq!(
+            initial_target(&config, &mut sel, None),
+            Some(Target {
+                port: DEFAULT_PORT,
+                pid: None
+            })
+        );
+
+        // Explicit port wins, discovery ignored.
+        let config = test_config(Some("com.a"), true);
+        let mut sel = app_sel("com.a");
+        assert_eq!(
+            initial_target(&config, &mut sel, Some(app(1, 1, Some("com.a")))),
+            Some(Target {
+                port: 9000,
+                pid: None
+            })
+        );
+    }
+
+    #[test]
+    fn follow_target_only_reports_real_changes() {
+        let mut sel = Selector::Pinned("com.a".to_string());
+        let cur = Target {
+            port: 7373,
+            pid: Some(1),
+        };
+        assert_eq!(follow_target(Some(&cur), &mut sel, None), None);
+        assert_eq!(
+            follow_target(Some(&cur), &mut sel, Some(app(1, 7373, Some("com.a")))),
+            None
+        );
+        assert_eq!(
+            follow_target(Some(&cur), &mut sel, Some(app(2, 7374, Some("com.a")))),
+            Some(Target {
+                port: 7374,
+                pid: Some(2)
+            })
+        );
+        // From "down" (no target) the app appearing is a change; an App selector gets pinned.
+        let mut sel = app_sel("P");
+        assert!(follow_target(None, &mut sel, Some(app(5, 7373, Some("com.p")))).is_some());
+        assert_eq!(sel, Selector::Pinned("com.p".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn untrusted_entries_and_base_are_ignored() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        // World-writable entry dir → ignored.
+        write_entry(tmp.path(), 100, "7373", Some("com.a"));
+        std::fs::set_permissions(
+            tmp.path().join("100"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        // Symlinked entry dir → ignored.
+        let real = tempfile::tempdir().unwrap();
+        write_entry(real.path(), 200, "7374", Some("com.b"));
+        std::os::unix::fs::symlink(real.path().join("200"), tmp.path().join("200")).unwrap();
+        assert_eq!(
+            discover_in(tmp.path(), &Selector::Any, |_| true),
+            Discovery::None
+        );
+
+        // A group/other-writable BASE dir is untrusted as a whole.
+        let base = tempfile::tempdir().unwrap();
+        write_entry(base.path(), 300, "7375", Some("com.c"));
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert_eq!(
+            discover_in(base.path(), &Selector::Any, |_| true),
+            Discovery::None
+        );
+        std::fs::set_permissions(base.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(matches!(
+            discover_in(base.path(), &Selector::Any, |_| true),
+            Discovery::Found(_)
+        ));
+    }
+
+    /// R5B-WINDISC1: a directory owned by another account (SYSTEM stands in; setting that
+    /// up needs an elevated run) is never followed.
+    #[cfg(windows)]
+    #[test]
+    fn windows_entries_owned_by_another_account_are_ignored() {
+        let give_to_system = |p: &Path| {
+            std::process::Command::new("icacls")
+                .arg(p)
+                .args(["/setowner", "*S-1-5-18", "/q"])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7373", Some("com.a"));
+        if !give_to_system(&tmp.path().join("100")) {
+            eprintln!("skipped: cannot change a directory's owner (not elevated)");
+            return;
+        }
+        assert_eq!(
+            discover_in(tmp.path(), &Selector::Any, |_| true),
+            Discovery::None
+        );
+        let base = tempfile::tempdir().unwrap();
+        write_entry(base.path(), 300, "7375", Some("com.c"));
+        assert!(matches!(
+            discover_in(base.path(), &Selector::Any, |_| true),
+            Discovery::Found(_)
+        ));
+        assert!(give_to_system(base.path()));
+        assert_eq!(
+            discover_in(base.path(), &Selector::Any, |_| true),
+            Discovery::None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trust_requires_ownership_by_current_user() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let euid = current_euid().expect("euid probe");
+        assert_eq!(std::fs::metadata(tmp.path()).unwrap().uid(), euid);
+        assert!(dir_is_trusted(tmp.path()));
+        // A directory owned by another user (root's `/`, when we are not root) is rejected
+        // even though its mode (0755) has no group/other write bit.
+        if euid != 0 {
+            assert!(!dir_is_trusted(Path::new("/")));
+        }
     }
 
     #[test]
@@ -657,6 +1357,107 @@ mod tests {
         assert_eq!(recovery_program_name("echo"), "echo");
         assert_eq!(recovery_program_name("   "), "(empty)");
         assert_eq!(recovery_program_name(""), "(empty)");
+    }
+
+    /// A minimal HTTP server answering every request with `status`, on an ephemeral port.
+    fn fixed_status_server(status: u16) -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut sock in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf);
+                let _ = write!(
+                    sock,
+                    "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        port
+    }
+
+    fn target(port: u16, pid: Option<u32>) -> Target {
+        Target { port, pid }
+    }
+
+    #[test]
+    fn a_rate_limited_health_answer_means_alive() {
+        assert!(health_status_means_alive(200));
+        assert!(health_status_means_alive(429));
+        assert!(!health_status_means_alive(401));
+        assert!(!health_status_means_alive(503));
+    }
+
+    #[tokio::test]
+    async fn a_health_flood_429_is_not_a_failure() {
+        // R4-NET1: an unauthenticated /health flood (→ 429) used to count as a failure and,
+        // after VICTAURI_MAX_FAILURES polls, ran the recovery command against a healthy app.
+        let client = reqwest::Client::new();
+        let own = |_| process::Liveness::Own;
+        let limited = fixed_status_server(429);
+        assert_eq!(
+            poll_health(&client, Some(&target(limited, None)), own).await,
+            Ok(())
+        );
+        let broken = fixed_status_server(503);
+        let err = poll_health(&client, Some(&target(broken, None)), own)
+            .await
+            .unwrap_err();
+        assert!(err.contains("503"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn an_undeterminable_pid_is_not_a_crash() {
+        // R4-DISC1: with no working `kill`, every PID read dead and the watchdog fired
+        // recovery on a healthy app. Unknown/unverified liveness must defer to /health.
+        let client = reqwest::Client::new();
+        let port = fixed_status_server(200);
+        for liveness in [process::Liveness::Unknown, process::Liveness::Unverified] {
+            assert_eq!(
+                poll_health(&client, Some(&target(port, Some(42))), |_| liveness).await,
+                Ok(()),
+                "{liveness:?}"
+            );
+        }
+        // A pid that is definitely gone (or recycled by another user) is still a crash, even
+        // though something answers on the port.
+        for liveness in [process::Liveness::Dead, process::Liveness::OtherUser] {
+            let err = poll_health(&client, Some(&target(port, Some(42))), |_| liveness)
+                .await
+                .unwrap_err();
+            assert!(err.contains("exited"), "{liveness:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn discovery_follows_an_owner_whose_liveness_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_entry(tmp.path(), 100, "7374", Some("com.a"));
+        assert!(may_be_alive(std::process::id()));
+        assert_eq!(
+            discover_in(tmp.path(), &Selector::Any, |_| !is_gone(
+                process::Liveness::Unknown
+            )),
+            Discovery::Found(app(100, 7374, Some("com.a")))
+        );
+    }
+
+    #[test]
+    fn startup_log_names_only_the_recovery_program() {
+        // R4-WD1: the startup INFO line logged the full recovery command line.
+        let label = on_failure_label(Some("restart-app --token=SECRET --path /home/u"));
+        assert_eq!(label, "restart-app");
+        assert!(!label.contains("SECRET"));
+        assert_eq!(on_failure_label(None), "(none)");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uid_probe_names_are_unpredictable() {
+        let (a, b) = (unpredictable_suffix(), unpredictable_suffix());
+        assert_eq!(a.len(), 32);
+        assert_ne!(a, b);
     }
 
     #[tokio::test]

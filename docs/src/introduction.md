@@ -30,21 +30,21 @@ All of this is exposed two ways from the same server: a plain **REST/HTTP API** 
 
 ## Design Principles
 
-1. **Same-process** — The MCP server runs inside the Tauri app process, not as a separate sidecar. This gives sub-millisecond tool response times and direct `AppHandle` access.
+1. **Same-process** — The MCP server runs inside the Tauri app process, not as a separate sidecar. This gives direct `AppHandle` access with no extra process hop: Rust-side tools (registry, memory, `app_state`, `query_db`, window state) answer in well under a millisecond; webview tools (`eval_js`, `dom_snapshot`, `interact`, ...) are a JS round trip through the webview, typically ~10-30 ms.
 
-2. **Zero runtime cost in release** — The server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. (The crate still compiles in as a dependency; add it as a `dev-dependency` if you want it absent from the release binary entirely.)
+2. **Zero runtime cost in release** — The server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. Add it as a normal `[dependencies]` entry — the app binary cannot use `[dev-dependencies]`. The crate still compiles in; to keep it out of release binaries entirely, make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature.
 
 3. **Full-stack** — WebView + IPC + Backend + DB, not just DOM. Cross-boundary verification catches state drift between frontend and backend.
 
 4. **MCP-native** — Speaks the protocol AI agents already understand. No custom SDKs or adapters needed.
 
-5. **Cross-platform** — Works identically on Windows, macOS, and Linux. No CDP dependency.
+5. **Cross-platform** — The same tool surface on Windows, macOS, and Linux, with no CDP dependency. Documented platform limits: trusted (OS-level, `isTrusted: true`) input is Windows-only (other platforms fall back to synthetic events), and window screenshots on Linux need X11/XWayland (pure Wayland returns a clear error).
 
 6. **Plugin, not framework** — One line in `Cargo.toml` to add, one line to remove. Your app architecture stays unchanged.
 
 ## Project Structure
 
-Victauri is a Rust workspace with 7 crates:
+Victauri is a Rust workspace with 6 crates:
 
 ```
 victauri/
@@ -63,6 +63,6 @@ victauri/
 
 ## Current Status
 
-All 7 crates are published to crates.io. In a one-time deep evaluation (May 2026) against 5 real-world open-source Tauri apps (Kanri, En Croissant, Surrealist, Duckling, Lettura), 867 of 895 checks passed (96.9%) with zero Victauri bugs and zero changes required to the apps — the remaining failures were test-script issues or correct actionability enforcement. A reproducible per-release compatibility harness (`scripts/compat`) now re-verifies against these apps automatically; it currently confirms Kanri at 15/15 on the latest release, while the other four have drifted upstream and don't yet build in the harness (re-pin pending). Supports Tauri 2.0+ with rmcp 3.1 (MCP protocol `2026-07-28`, backward compatible down to `2024-11-05`).
+All 6 crates are published to crates.io. In a one-time deep evaluation (May 2026) against 5 real-world open-source Tauri apps (Kanri, En Croissant, Surrealist, Duckling, Lettura), 867 of 895 checks passed (96.9%) with zero Victauri bugs and zero changes required to the apps — the remaining failures were test-script issues or correct actionability enforcement. A reproducible per-release compatibility harness (`scripts/compat`) now re-verifies against these apps automatically; three of those apps (Kanri, En Croissant, Lettura) are pinned in it and pass its 15-check battery; the other two are not in the harness (see `scripts/compat/README.md` for why). Supports Tauri 2.0+ with rmcp 3.1 (MCP protocol `2026-07-28`, backward compatible down to `2024-11-05`).
 
 Victauri is open source (Apache-2.0) and built by [4DA Systems](https://4da.ai), which uses it to test its own Tauri app. **Adopters and contributors are very welcome** — see [Contributing](https://github.com/4DA-Systems/victauri/blob/main/CONTRIBUTING.md), and if you ship a Tauri app we'd love to hear how it goes.

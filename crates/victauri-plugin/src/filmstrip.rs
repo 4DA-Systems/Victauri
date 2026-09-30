@@ -31,41 +31,96 @@ impl Frame {
     }
 }
 
+/// Largest composed sheet [`compose`] builds, in bytes of RGBA (512 MiB).
+pub const MAX_SHEET_BYTES: usize = 512 * 1024 * 1024;
+
+/// Width, height and RGBA byte size of a sheet of `n` cells of `cell_w` x `cell_h`, `cols`
+/// wide (clamped to `1..=n`), with `gap` pixels around every cell. `None` on overflow (of
+/// `usize`, or of `u32` for a side).
+#[must_use]
+pub fn sheet_size(
+    cell_w: u32,
+    cell_h: u32,
+    n: usize,
+    cols: usize,
+    gap: u32,
+) -> Option<(u32, u32, usize)> {
+    if n == 0 {
+        return None;
+    }
+    let cols = cols.max(1).min(n);
+    let rows = n.div_ceil(cols);
+    let gap = gap as usize;
+    // out_w = cols*cell_w + (cols+1)*gap ; out_h analogous. All checked.
+    let out_w = cols
+        .checked_mul(cell_w as usize)?
+        .checked_add(cols.checked_add(1)?.checked_mul(gap)?)?;
+    let out_h = rows
+        .checked_mul(cell_h as usize)?
+        .checked_add(rows.checked_add(1)?.checked_mul(gap)?)?;
+    let total = out_w.checked_mul(out_h)?.checked_mul(4)?;
+    Some((
+        u32::try_from(out_w).ok()?,
+        u32::try_from(out_h).ok()?,
+        total,
+    ))
+}
+
+/// Refuse a sheet larger than [`MAX_SHEET_BYTES`] (or one that overflows), with a reason.
+///
+/// # Errors
+///
+/// A human-readable reason when the sheet cannot be built.
+pub fn check_sheet(
+    cell_w: u32,
+    cell_h: u32,
+    n: usize,
+    cols: usize,
+    gap: u32,
+) -> Result<(u32, u32, usize), String> {
+    match sheet_size(cell_w, cell_h, n, cols, gap) {
+        Some((w, h, total)) if total <= MAX_SHEET_BYTES => Ok((w, h, total)),
+        Some((w, h, total)) => Err(format!(
+            "a filmstrip of {n} frames of {cell_w}x{cell_h} would be a {w}x{h} sheet              ({} MiB), over the {} MiB limit",
+            total / (1024 * 1024),
+            MAX_SHEET_BYTES / (1024 * 1024)
+        )),
+        None => Err(format!(
+            "a filmstrip of {n} frames of {cell_w}x{cell_h} is too large to build"
+        )),
+    }
+}
+
 /// Compose `frames` into a grid `cols` wide (rows derived), separated and
 /// bordered by `gap` pixels of `bg`. Cells are sized to the largest frame;
 /// smaller frames are placed top-left within their cell. Returns
-/// `(rgba, width, height)` for the composed sheet, or `None` if `frames` is
-/// empty or the resulting buffer would overflow `usize`.
-#[must_use]
+/// `(rgba, width, height)` for the composed sheet.
+///
+/// # Errors
+///
+/// `frames` is empty, or the sheet would exceed [`MAX_SHEET_BYTES`] / overflow.
 pub fn compose(
     frames: &[Frame],
     cols: usize,
     gap: u32,
     bg: [u8; 4],
-) -> Option<(Vec<u8>, u32, u32)> {
-    if frames.is_empty() {
-        return None;
-    }
+) -> Result<(Vec<u8>, u32, u32), String> {
     let n = frames.len();
+    let cell_w = frames
+        .iter()
+        .map(|f| f.w)
+        .max()
+        .ok_or("no frames to compose")?;
+    let cell_h = frames
+        .iter()
+        .map(|f| f.h)
+        .max()
+        .ok_or("no frames to compose")?;
+    let (sheet_w, sheet_h, total) = check_sheet(cell_w, cell_h, n, cols, gap)?;
     let cols = cols.max(1).min(n);
-    let rows = n.div_ceil(cols);
     let gap = gap as usize;
-
-    let cell_w = frames.iter().map(|f| f.w as usize).max()?;
-    let cell_h = frames.iter().map(|f| f.h as usize).max()?;
-
-    // out_w = cols*cell_w + (cols+1)*gap ; out_h analogous. All checked.
-    let out_w = cols
-        .checked_mul(cell_w)?
-        .checked_add(cols.checked_add(1)?.checked_mul(gap)?)?;
-    let out_h = rows
-        .checked_mul(cell_h)?
-        .checked_add(rows.checked_add(1)?.checked_mul(gap)?)?;
-    let total = out_w.checked_mul(out_h)?.checked_mul(4)?;
-    // Guard against absurd allocations (e.g. > ~512 MB sheet).
-    if total > 512 * 1024 * 1024 {
-        return None;
-    }
+    let (cell_w, cell_h) = (cell_w as usize, cell_h as usize);
+    let out_w = sheet_w as usize;
 
     // Fill background.
     let mut out = vec![0u8; total];
@@ -95,7 +150,7 @@ pub fn compose(
         }
     }
 
-    Some((out, out_w as u32, out_h as u32))
+    Ok((out, sheet_w, sheet_h))
 }
 
 /// Default column count for `n` frames: roughly square, capped so wide strips
@@ -134,8 +189,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_returns_none() {
-        assert!(compose(&[], 4, 2, [0, 0, 0, 0]).is_none());
+    fn empty_is_refused() {
+        assert!(compose(&[], 4, 2, [0, 0, 0, 0]).is_err());
     }
 
     #[test]
@@ -176,6 +231,22 @@ mod tests {
         // Frame sits at (gap,gap) = (1,1): offset = (w + 1)*4.
         let off = (w as usize + 1) * 4;
         assert_eq!(&rgba[off..off + 4], &[255, 255, 255, 255]);
+    }
+
+    /// R5-ANIM1: an oversized sheet is refused with a reason (it used to be a bare `None`,
+    /// which the scrub handler dropped while still reporting `captured: true`).
+    #[test]
+    fn oversized_sheet_is_refused_with_a_reason() {
+        // 120 frames of 4K: ~3.8 GB of RGBA.
+        let err = check_sheet(3840, 2160, 120, 8, 4).unwrap_err();
+        assert!(err.contains("over the 512 MiB limit"), "{err}");
+        assert!(check_sheet(3840, 2160, 4, 2, 4).is_ok());
+        assert!(check_sheet(u32::MAX, u32::MAX, 120, 8, 4).is_err());
+        // compose refuses by the same rule. Cells take the largest width and height, so two
+        // thin frames make two 20000x20000 cells (3.2 GB) from 160 KB of pixels.
+        let frames = [solid(1, 20_000, [0; 4]), solid(20_000, 1, [0; 4])];
+        let err = compose(&frames, 2, 0, [0, 0, 0, 0]).unwrap_err();
+        assert!(err.contains("over the 512 MiB limit"), "{err}");
     }
 
     #[test]

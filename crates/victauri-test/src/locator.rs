@@ -35,6 +35,7 @@ use crate::error::TestError;
 
 /// Bounding rectangle of a DOM element in CSS pixels.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub struct Bounds {
     /// X offset from the viewport left edge.
     pub x: f64,
@@ -48,6 +49,7 @@ pub struct Bounds {
 
 /// A single element resolved from a [`Locator`] query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LocatorMatch {
     /// Ref handle ID used to target this element in subsequent actions.
     pub ref_id: String,
@@ -422,42 +424,39 @@ impl Locator {
         client.select_option(&el.ref_id, values).await
     }
 
-    /// Check a checkbox or radio button (sets `checked = true`).
+    /// Check a checkbox or radio button.
+    ///
+    /// Toggles it with a real `click()` when it is not already checked, so the page
+    /// sees the `click`/`input`/`change` sequence a user produces. (Assigning
+    /// `el.checked` is invisible to React-controlled inputs: React's value tracker
+    /// sees no change and swallows the synthetic `change` event.)
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::ElementNotFound`] if no element matches.
+    /// Returns [`TestError::ElementNotFound`] if no element matches or it went
+    /// stale, and [`TestError::Assertion`] if it did not end up checked (disabled,
+    /// or a handler prevented the change).
     pub async fn check(&self, client: &mut VictauriClient) -> Result<Value, TestError> {
-        let el = self.resolve_one(client).await?;
-        let code = format!(
-            "(function() {{ var el = window.__VICTAURI__?.getRef({}); \
-             if (!el) return null; \
-             if (!el.checked) {{ el.checked = true; \
-             el.dispatchEvent(new Event('change', {{bubbles:true}})); \
-             el.dispatchEvent(new Event('input', {{bubbles:true}})); }} \
-             return true; }})()",
-            serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string()),
-        );
-        client.eval_js(&code).await
+        self.set_checked(client, true).await
     }
 
-    /// Uncheck a checkbox (sets `checked = false`).
+    /// Uncheck a checkbox (toggled the same way as [`check`](Self::check)).
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::ElementNotFound`] if no element matches.
+    /// Returns [`TestError::ElementNotFound`] if no element matches or it went
+    /// stale, and [`TestError::Assertion`] for a checked radio button (a user cannot
+    /// uncheck one either) or if it did not end up unchecked.
     pub async fn uncheck(&self, client: &mut VictauriClient) -> Result<Value, TestError> {
-        let el = self.resolve_one(client).await?;
-        let code = format!(
-            "(function() {{ var el = window.__VICTAURI__?.getRef({}); \
-             if (!el) return null; \
-             if (el.checked) {{ el.checked = false; \
-             el.dispatchEvent(new Event('change', {{bubbles:true}})); \
-             el.dispatchEvent(new Event('input', {{bubbles:true}})); }} \
-             return true; }})()",
-            serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string()),
-        );
-        client.eval_js(&code).await
+        self.set_checked(client, false).await
+    }
+
+    async fn set_checked(
+        &self,
+        client: &mut VictauriClient,
+        want: bool,
+    ) -> Result<Value, TestError> {
+        self.eval_on_element(client, &set_checked_js(want)).await
     }
 
     // ── Query methods ───────────────────────────────────────────────────
@@ -524,7 +523,8 @@ impl Locator {
     ///
     /// Returns [`TestError::ElementNotFound`] if no element matches.
     pub async fn is_checked(&self, client: &mut VictauriClient) -> Result<bool, TestError> {
-        let val = self.eval_on_element(client, "return !!el.checked;").await?;
+        let body = format!("{CHECKED_STATE_JS} return isOn();");
+        let val = self.eval_on_element(client, &body).await?;
         Ok(val.as_bool().unwrap_or(false))
     }
 
@@ -573,8 +573,9 @@ impl Locator {
         client: &mut VictauriClient,
         attr_name: &str,
     ) -> Result<Option<String>, TestError> {
-        let escaped = attr_name.replace('\\', "\\\\").replace('"', "\\\"");
-        let js_body = format!("return el.getAttribute(\"{escaped}\");");
+        // A JSON string is a valid JS string literal for any input (newlines, U+2028…).
+        let name = serde_json::to_string(attr_name).unwrap_or_else(|_| "\"\"".to_string());
+        let js_body = format!("return el.getAttribute({name});");
         let val = self.eval_on_element(client, &js_body).await?;
         if val.is_null() {
             Ok(None)
@@ -604,13 +605,8 @@ impl Locator {
         let elements = self.resolve_all(client).await?;
         let mut texts = Vec::with_capacity(elements.len());
         for el in &elements {
-            let code = format!(
-                "(function() {{ var el = window.__VICTAURI__?.getRef({}); \
-                 if (!el) return \"\"; \
-                 return el.textContent || \"\"; }})()",
-                serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string()),
-            );
-            let val = client.eval_js(&code).await?;
+            let code = element_script(&el.ref_id, "return el.textContent || \"\";");
+            let val = element_result(client.eval_js(&code).await?, self)?;
             texts.push(value_to_string(&val));
         }
         Ok(texts)
@@ -823,13 +819,42 @@ impl Locator {
         js_body: &str,
     ) -> Result<Value, TestError> {
         let el = self.resolve_one(client).await?;
-        let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
-        let code = format!(
-            "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-             if (!el) return null; {js_body} }})()"
-        );
-        client.eval_js(&code).await
+        let code = element_script(&el.ref_id, js_body);
+        element_result(client.eval_js(&code).await?, self)
     }
+}
+
+/// Marker an [`element_script`] returns when its ref no longer resolves.
+const MISSING_KEY: &str = "__victauri_missing_ref";
+/// Marker an [`element_script`] returns, with a message, when its action failed.
+const ERROR_KEY: &str = "__victauri_error";
+
+/// Wraps `js_body` (which sees the element as `el`) in a script that reports a ref
+/// that no longer resolves — instead of returning `null`, which callers would read
+/// as an empty text, an absent attribute or an unchecked box.
+fn element_script(ref_id: &str, js_body: &str) -> String {
+    let ref_str = serde_json::to_string(ref_id).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
+         if (!el) return {{ {MISSING_KEY}: true }}; {js_body} }})()"
+    )
+}
+
+/// Turns an [`element_script`] result's markers into errors.
+fn element_result(val: Value, locator: &Locator) -> Result<Value, TestError> {
+    if val.get(MISSING_KEY).and_then(Value::as_bool) == Some(true) {
+        return Err(TestError::ElementNotFound(format!(
+            "{locator} (the element went stale before it could be read)"
+        )));
+    }
+    if let Some(msg) = val.get(ERROR_KEY).and_then(Value::as_str) {
+        // The message comes from the page: never let it drive a terminal or a CI log (R5-TERM2).
+        return Err(TestError::Assertion(format!(
+            "{locator}: {}",
+            crate::terminal::single_line(msg)
+        )));
+    }
+    Ok(val)
 }
 
 impl fmt::Display for Locator {
@@ -1496,10 +1521,48 @@ async fn check_checked(locator: &Locator, client: &mut VictauriClient) -> Result
     let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
     let code = format!(
         "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-         if (!el) return false; return !!el.checked; }})()"
+         if (!el) return false; {CHECKED_STATE_JS} return isOn(); }})()"
     );
     let val = client.eval_js(&code).await?;
     Ok(val.as_bool().unwrap_or(false))
+}
+
+/// JS (sees the element as `el`) defining `isOn()`: the checked state of a native
+/// checkbox/radio (`el.checked`), else of an ARIA checkbox/radio/switch/menuitemcheckbox
+/// (`aria-checked`, as Radix/Mantine/Headless UI render them on a `<button>`), else of an
+/// ARIA toggle button (`aria-pressed`). `"mixed"` counts as not checked.
+const CHECKED_STATE_JS: &str = "var isOn = function() { \
+     if (el.type === 'checkbox' || el.type === 'radio') return !!el.checked; \
+     var aria = el.getAttribute && el.getAttribute('aria-checked'); \
+     if (aria !== null && aria !== undefined) return aria === 'true'; \
+     var pressed = el.getAttribute && el.getAttribute('aria-pressed'); \
+     if (pressed !== null && pressed !== undefined) return pressed === 'true'; \
+     return !!el.checked; };";
+
+/// The body of [`Locator::check`] / [`Locator::uncheck`] (B-L9).
+///
+/// Clicks only when the state differs, like a user. A native input updates synchronously; an
+/// ARIA checkbox's `aria-checked` is re-rendered by its framework, possibly after the click
+/// returns (React schedules it), so the result is awaited — briefly polled — rather than read
+/// once. Reading `el.checked` alone (the old code) saw `undefined` on an ARIA checkbox: `check()`
+/// clicked, then reported failure, and a retry toggled it back; `uncheck()` did nothing.
+fn set_checked_js(want: bool) -> String {
+    let state = if want { "checked" } else { "unchecked" };
+    format!(
+        "{CHECKED_STATE_JS} var want = {want}; \
+         var radio = el.type === 'radio' || \
+           (el.getAttribute && el.getAttribute('role') === 'radio'); \
+         if (!want && radio && isOn()) return {{ {ERROR_KEY}: \
+           'a checked radio button cannot be unchecked; check another option' }}; \
+         if (isOn() !== want) el.click(); \
+         if (isOn() === want) return true; \
+         return new Promise(function(resolve) {{ var tries = 0; \
+           (function poll() {{ \
+             if (isOn() === want) return resolve(true); \
+             if (++tries > 25) return resolve({{ {ERROR_KEY}: \
+               'the element did not become {state} (disabled, or a handler prevented it)' }}); \
+             setTimeout(poll, 20); }})(); }});"
+    )
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -1855,6 +1918,22 @@ mod tests {
         assert_eq!(picked.ref_id, "e2");
     }
 
+    /// R5-TERM2: an element script's error message is page-controlled text.
+    #[test]
+    fn element_error_text_is_terminal_safe() {
+        let val = json!({ ERROR_KEY: "nope\n::error::forged\u{1b}[2J" });
+        let err = element_result(val, &Locator::css("p")).unwrap_err();
+        let TestError::Assertion(msg) = &err else {
+            panic!("expected an assertion error, got {err:?}");
+        };
+        assert!(!msg.chars().any(char::is_control), "{msg:?}");
+        assert!(msg.contains("nope") && msg.contains("forged"), "{msg}");
+        assert!(
+            !err.to_string().lines().any(|l| l.starts_with("::")),
+            "{err}"
+        );
+    }
+
     #[test]
     fn pick_one_empty_returns_error() {
         let loc = Locator::css("p");
@@ -1971,5 +2050,121 @@ mod tests {
             value: None,
             bounds: None,
         }
+    }
+
+    // ── B-L9: check()/uncheck() on ARIA checkboxes, executed in Node ──
+
+    /// Run `set_checked_js(want)` against fake elements in Node and return one JSON line per
+    /// scenario: `{name, result, on}` (`on` = the element's state afterwards). `None` (test
+    /// skipped) when `node` is not installed.
+    fn run_set_checked_scenarios() -> Option<Vec<serde_json::Value>> {
+        let check = set_checked_js(true);
+        let uncheck = set_checked_js(false);
+        let program = format!(
+            r"
+function aria(role, attr, initial, delayMs, disabled) {{
+  var attrs = {{ role: role }}; attrs[attr] = String(initial);
+  return {{
+    type: undefined,
+    getAttribute: function(k) {{ return Object.prototype.hasOwnProperty.call(attrs, k) ? attrs[k] : null; }},
+    click: function() {{
+      if (disabled) return;
+      var flip = function() {{ attrs[attr] = String(attrs[attr] !== 'true'); }};
+      if (delayMs) setTimeout(flip, delayMs); else flip();
+    }},
+    on: function() {{ return attrs[attr] === 'true'; }}
+  }};
+}}
+function native(type, initial) {{
+  var el = {{ type: type, checked: initial, getAttribute: function() {{ return null; }},
+             click: function() {{ el.checked = type === 'radio' ? true : !el.checked; }},
+             on: function() {{ return el.checked; }} }};
+  return el;
+}}
+var ERR = '{ERROR_KEY}';
+async function run(name, el, want) {{
+  var result = await (want ? (function() {{ {check} }})() : (function() {{ {uncheck} }})());
+  if (result && typeof result === 'object' && ERR in result) result = 'error: ' + result[ERR];
+  console.log(JSON.stringify({{ name: name, result: result, on: el.on() }}));
+}}
+(async function() {{
+  var el;
+  el = aria('checkbox', 'aria-checked', false); await run('aria check', el, true);
+  el = aria('checkbox', 'aria-checked', true); await run('aria uncheck', el, false);
+  el = aria('checkbox', 'aria-checked', true); await run('aria check when already on', el, true);
+  el = aria('checkbox', 'aria-checked', false, 40); await run('aria async check', el, true);
+  el = aria('switch', 'aria-checked', true, 40); await run('aria async uncheck', el, false);
+  el = aria('button', 'aria-pressed', false); await run('pressed toggle', el, true);
+  el = aria('radio', 'aria-checked', true); await run('aria radio uncheck', el, false);
+  el = aria('checkbox', 'aria-checked', false, 0, true); await run('aria disabled', el, true);
+  el = native('checkbox', false); await run('native check', el, true);
+  el = native('checkbox', true); await run('native uncheck', el, false);
+}})();
+"
+        );
+        let out = match std::process::Command::new("node")
+            .args(["-e", &program])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("skipping: node is not available ({e})");
+                return None;
+            }
+        };
+        assert!(
+            out.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("scenario JSON"))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn check_and_uncheck_work_on_aria_checkboxes() {
+        let Some(results) = run_set_checked_scenarios() else {
+            return;
+        };
+        let by_name = |name: &str| {
+            results
+                .iter()
+                .find(|r| r["name"] == name)
+                .unwrap_or_else(|| panic!("no scenario {name}: {results:?}"))
+                .clone()
+        };
+        for (name, on) in [
+            ("aria check", true),
+            ("aria uncheck", false),
+            ("aria check when already on", true),
+            ("aria async check", true),
+            ("aria async uncheck", false),
+            ("pressed toggle", true),
+            ("native check", true),
+            ("native uncheck", false),
+        ] {
+            let r = by_name(name);
+            assert_eq!(r["result"], serde_json::json!(true), "{name}: {r}");
+            assert_eq!(r["on"], serde_json::json!(on), "{name}: {r}");
+        }
+        let radio = by_name("aria radio uncheck");
+        assert!(
+            radio["result"]
+                .as_str()
+                .is_some_and(|s| s.contains("radio")),
+            "{radio}"
+        );
+        assert_eq!(radio["on"], serde_json::json!(true));
+        let disabled = by_name("aria disabled");
+        assert!(
+            disabled["result"]
+                .as_str()
+                .is_some_and(|s| s.contains("did not become checked")),
+            "{disabled}"
+        );
     }
 }

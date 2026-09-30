@@ -4,14 +4,23 @@
 // structs are already factored into sub-modules (webview_params, window_params,
 // etc.) to keep this file focused on dispatch logic.
 
-mod authz;
+pub(crate) mod authz;
 mod backend_params;
+mod bounded;
 mod compound_params;
+#[cfg(test)]
+mod drain_tests;
+mod hardening;
 mod helpers;
 mod introspection_params;
 mod other_params;
+pub(crate) mod page_json;
 mod rest;
+#[cfg(test)]
+mod robustness_tests;
 mod server;
+#[cfg(test)]
+mod tool_result_tests;
 mod verification_params;
 mod webview_params;
 mod window_params;
@@ -24,9 +33,9 @@ use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock,
-    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ReadResourceRequestParams,
-    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
-    ServerInfo, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
+    InitializeResult, ListResourcesResult, ListToolsResult, PaginatedRequestParams,
+    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    ResourceContents, ServerCapabilities, SubscribeRequestParams, Tool, UnsubscribeRequestParams,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_router};
@@ -39,7 +48,7 @@ use helpers::{
     RecoveryHint, build_ghost_report, ghost_ipc_outcomes_js, ghost_ipc_projection_js,
     ipc_catalog_projection_js, ipc_timing_projection_js, ipc_timing_stats, js_string, json_result,
     json_truthy, merge_command_catalog, missing_param, sanitize_css_color, sanitize_injected_css,
-    tool_disabled, tool_error, tool_error_with_hint, validate_url,
+    tool_disabled, tool_error, tool_error_with_hint, truncate_at_char_boundary, validate_url,
 };
 
 // MCP tool *parameter* types are an internal protocol surface: they are deserialized
@@ -50,6 +59,22 @@ use helpers::{
 // VictauriMcpHandler) is the public MCP surface consumers actually use.
 pub(crate) use backend_params::*;
 pub(crate) use compound_params::*;
+/// Page-side probes run before trusted (OS-level) input. Internal: public only so the
+/// crate's own integration tests can run them in a JS engine. Not part of the supported API.
+#[doc(hidden)]
+pub use helpers::{trusted_click_probe_js, trusted_focus_probe_js};
+
+/// The IPC-log JS the tools send to the page. Internal plumbing, `pub` only so the jsdom suite
+/// (`tests/bridge_r5_tests.rs`) can run it against the real bridge — from a test binary of its
+/// own, since a seconds-long `node` child spawned from the library tests can inherit (and hold
+/// open) another test's server socket on Windows.
+#[doc(hidden)]
+pub mod ipc_log_js {
+    pub use super::helpers::{
+        ghost_ipc_outcomes_js, ipc_catalog_projection_js, ipc_timing_projection_js,
+    };
+    pub use super::{ipc_integrity_js, slow_ipc_js, trimmed_log_js};
+}
 pub(crate) use introspection_params::*;
 pub(crate) use other_params::{
     AppStateParams, DiagnosticsParams, FindElementsParams, ResolveCommandParams,
@@ -77,12 +102,6 @@ const MAX_EVAL_CODE_LEN: usize = 1_000_000;
 /// Results exceeding this are truncated to prevent memory exhaustion.
 const MAX_EVAL_RESULT_LEN: usize = 5_000_000;
 
-/// How long the eval parse-watchdog waits for the user-code script to begin executing
-/// before reporting a likely syntax error. A parse error means the script never runs (so
-/// it never marks itself "started"); this caps that failure at ~0.75s instead of the full
-/// eval timeout, while still leaving valid-but-slow code to run to the real timeout.
-const PARSE_WATCHDOG_MS: u64 = 750;
-
 /// Default number of entries returned by IPC/network log tools when no explicit
 /// `limit` is given. Prevents busy apps (large logs) from exceeding the eval cap.
 const DEFAULT_LOG_LIMIT: usize = 100;
@@ -97,6 +116,88 @@ const MAX_LOG_FIELD_BYTES: usize = 4096;
 /// unbounded result Vec and blow the eval/output cap (audit B7). When hit, the
 /// listing stops and the response is marked `truncated: true`.
 const MAX_DIR_ENTRIES: usize = 10_000;
+/// Cap on directory entries `list_app_dir` EXAMINES (returned or not): with a `pattern` that
+/// matches nothing, [`MAX_DIR_ENTRIES`] never trips and the walk used to cover the whole tree.
+const MAX_DIR_VISITED: usize = 100_000;
+/// Wall-clock budget for one `list_app_dir` walk (slow or network filesystems).
+const MAX_DIR_WALK_TIME: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One bounded `list_app_dir` walk: stops (and reports `truncated`) at [`MAX_DIR_ENTRIES`]
+/// returned, [`MAX_DIR_VISITED`] examined, or [`MAX_DIR_WALK_TIME`].
+struct DirWalk {
+    /// The listing root, canonicalized ONCE (it used to be re-canonicalized per entry).
+    canon_base: std::path::PathBuf,
+    pattern: Option<String>,
+    max_depth: u32,
+    deadline: std::time::Instant,
+    max_visited: usize,
+    visited: usize,
+    truncated: bool,
+    entries: Vec<serde_json::Value>,
+}
+
+impl DirWalk {
+    fn out_of_budget(&mut self) -> bool {
+        if self.entries.len() >= MAX_DIR_ENTRIES
+            || self.visited >= self.max_visited
+            || std::time::Instant::now() >= self.deadline
+        {
+            self.truncated = true;
+        }
+        self.truncated
+    }
+
+    fn visit(&mut self, dir: &std::path::Path, base: &std::path::Path, depth: u32) {
+        let Ok(read_dir) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in read_dir.flatten() {
+            if self.out_of_budget() {
+                return;
+            }
+            self.visited += 1;
+            let path = entry.path();
+            if path.is_symlink() {
+                continue;
+            }
+            // `is_symlink` does not cover every redirecting filesystem object
+            // (notably Windows directory junctions/reparse points). Canonical
+            // containment is the actual boundary before metadata or recursion.
+            if !std::fs::canonicalize(&path).is_ok_and(|c| c.starts_with(&self.canon_base)) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = path.is_dir();
+            if let Some(pat) = self.pattern.as_deref()
+                && !is_dir
+                && !VictauriMcpHandler::matches_glob(&name, pat)
+            {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let meta = std::fs::metadata(&path).ok();
+
+            self.entries.push(serde_json::json!({
+                "name": name,
+                "path": relative,
+                "is_dir": is_dir,
+                "size": meta.as_ref().map(std::fs::Metadata::len),
+                "modified": meta.as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+                        .unwrap_or_default().as_secs()),
+            }));
+
+            if is_dir && depth < self.max_depth {
+                self.visit(&path, base, depth + 1);
+            }
+        }
+    }
+}
 
 /// `db_health` performs integrity checks and table counts against app-owned
 /// databases. Each size-dependent phase is bounded separately (see
@@ -108,8 +209,104 @@ const DB_HEALTH_COUNT_BUDGET: std::time::Duration = std::time::Duration::from_se
 #[cfg(feature = "sqlite")]
 const DB_HEALTH_CHECK_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// A timeout for an error message: whole seconds, or milliseconds when under a second (so a
+/// short per-call timeout never reads as "timed out after 0s").
+fn format_timeout(timeout: std::time::Duration) -> String {
+    if timeout < std::time::Duration::from_secs(1) {
+        format!("{}ms", timeout.as_millis())
+    } else {
+        format!("{}s", timeout.as_secs())
+    }
+}
+
+/// Error text for a window query the UI thread did not answer: a wedged/busy UI must never
+/// read as "no windows" or "window not found".
+fn ui_busy(error: &str) -> String {
+    format!("UI thread busy (dispatch timed out) - window state is unavailable, not empty: {error}")
+}
+
+/// The error result for a tool handler that panicked (see `bounded::CatchUnwind`).
+fn tool_panicked(tool: &str, panic: &str) -> CallToolResult {
+    tool_error(format!(
+        "internal error: the '{tool}' handler panicked ({panic}); the server is still running"
+    ))
+}
+
+/// Upper bound for `invoke_command`'s per-call `timeout_ms` (matches the eval-timeout ceiling).
+const MAX_INVOKE_TIMEOUT_MS: u64 = 300_000;
+
+/// How an eval call failed — typed, so a caller never infers from error text whether the code
+/// ran (e.g. whether the call is a command timing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvalFailureKind {
+    /// The code never ran: the call was refused or never delivered (saturated pending map, dead
+    /// bridge, failed injection, app exiting), or it did not parse.
+    NotSent,
+    /// Cut off in flight (timeout, app exit, window closed, page reload): it may or may not
+    /// have run.
+    Aborted,
+    /// The code ran in the page and threw, or ran but its result could not be returned.
+    Page,
+}
+
+/// A failed eval: what happened to the code, and the message for the agent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EvalFailure {
+    kind: EvalFailureKind,
+    message: String,
+}
+
+impl EvalFailure {
+    fn new(kind: EvalFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// The code did not parse (reported by the bridge's post-wrapper check), so it never ran.
+    fn is_parse_error(&self) -> bool {
+        self.kind == EvalFailureKind::NotSent && self.message.starts_with(PARSE_ERROR_PREFIX)
+    }
+}
+
+/// How [`unwrap_eval_envelope`] reports code that did not parse.
+const PARSE_ERROR_PREFIX: &str = "JavaScript parse error:";
+
+/// How long `app_state` waits for an app-registered probe closure.
+///
+/// This used to be 1 s under `cfg(test)` for EVERY probe call, so a test of a panicking or a
+/// normal probe raced a deadline shorter than the scheduling tail of a loaded machine (a fresh
+/// blocking-pool thread plus the panic hook and unwind measured ~0.4 s at 2x CPU
+/// oversubscription, more in a full parallel suite) and flaked as "did not finish". Tests that
+/// exercise the deadline itself shorten [`VictauriMcpHandler::probe_timeout`] on their handler.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// App-registered probes allowed to run at once. A probe that hangs keeps its blocking thread
+/// past [`PROBE_TIMEOUT`]; the cap stops repeated calls to it from leaking a thread each.
+pub(crate) const MAX_CONCURRENT_PROBES: usize = 4;
+
+/// `read_app_file` reads allowed to run at once (a read blocked on a FIFO or slow device keeps
+/// its thread past [`READ_APP_FILE_TIMEOUT`]).
+pub(crate) const MAX_CONCURRENT_FILE_READS: usize = 4;
+
+/// How long `read_app_file` waits for its (bounded, at most 10 MB) read. Tests that exercise
+/// the deadline shorten [`VictauriMcpHandler::file_read_timeout`] (see [`PROBE_TIMEOUT`]).
+const READ_APP_FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Distinct command names `CommandTimings` tracks (its private `MAX_TIMED_COMMANDS`, mirrored
+/// here — a test pins the two together). Once that many are tracked, new names are dropped and
+/// `introspect command_timings` reports `saturated: true`.
+pub(crate) const COMMAND_TIMINGS_CAP: usize = 1024;
+
 /// Upper bound for an injected `fault` delay (matches the `wait_for` ceiling).
 const MAX_FAULT_DELAY_MS: u64 = 120_000;
+
+/// Pixels between (and around) the cells of an `animation scrub` filmstrip.
+const FILMSTRIP_GAP: u32 = 4;
+
+/// Total time `recording stop` spends on its final flush of every window.
+const FINAL_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
 /// How often a slow eval re-checks that its target window still exists (first check after
 /// one interval, so fast evals never pay for it).
 const EVAL_WINDOW_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
@@ -129,20 +326,29 @@ const RESOURCE_URI_STATE: &str = "victauri://state";
 /// only honors TTLs re-syncs within minutes of an app rebuild on the same port.
 const LIST_RESULT_TTL_MS: u64 = 300_000;
 
-/// Map an MCP resource URI to the privacy capability that gates its
-/// tool-equivalent read. Resources are served outside the tool dispatcher, so
-/// this lets `read_resource`/`subscribe` apply the same privacy matrix (audit
-/// B1). Returns `None` for an unknown URI (handled as not-found downstream).
-fn resource_required_capability(uri: &str) -> Option<&'static str> {
+/// Map an MCP resource URI to the tool call it mirrors: `(bare tool, capability)`.
+/// Resources are served outside the tool dispatcher, so `read_resource`/`subscribe` apply
+/// the same gate as a call of that tool action (audit B1) — including a disable of the
+/// whole tool by its bare name (R4-NET3). Returns `None` for an unknown URI (handled as
+/// not-found downstream).
+fn resource_required_capability(uri: &str) -> Option<(&'static str, &'static str)> {
     match uri {
         // Reading the IPC log via a resource == the `logs ipc` tool action.
-        RESOURCE_URI_IPC_LOG => Some("logs.ipc"),
+        RESOURCE_URI_IPC_LOG => Some(("logs", "logs.ipc")),
         // Window states == the `window list` action.
-        RESOURCE_URI_WINDOWS => Some("window.list"),
+        RESOURCE_URI_WINDOWS => Some(("window", "window.list")),
         // The state summary == reading plugin info.
-        RESOURCE_URI_STATE => Some("get_plugin_info"),
+        RESOURCE_URI_STATE => Some(("get_plugin_info", "get_plugin_info")),
         _ => None,
     }
+}
+
+/// Whether the privacy configuration permits reading (or subscribing to) resource `uri`:
+/// exactly when it permits the tool call the resource mirrors. An unknown URI is not gated
+/// here (it is reported as not found).
+fn resource_allowed(privacy: &crate::privacy::PrivacyConfig, uri: &str) -> bool {
+    resource_required_capability(uri)
+        .is_none_or(|(tool, capability)| privacy.is_call_allowed(tool, capability))
 }
 
 const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -213,6 +419,14 @@ pub struct VictauriMcpHandler {
     /// Window keys whose previous eval timed out. Retained only to annotate the
     /// error on the *next* eval (the bridge is probed before every eval anyway).
     timed_out_labels: Arc<Mutex<HashSet<String>>>,
+    /// Slots for running app probes ([`MAX_CONCURRENT_PROBES`]); held by the probe's thread.
+    probe_slots: Arc<tokio::sync::Semaphore>,
+    /// Slots for `read_app_file` reads ([`MAX_CONCURRENT_FILE_READS`]); held by the read's thread.
+    file_slots: Arc<tokio::sync::Semaphore>,
+    /// Deadline for one app probe ([`PROBE_TIMEOUT`]; tests of the deadline shorten it).
+    probe_timeout: std::time::Duration,
+    /// Deadline for one `read_app_file` read ([`READ_APP_FILE_TIMEOUT`]; likewise).
+    file_read_timeout: std::time::Duration,
 }
 
 #[tool_router]
@@ -341,7 +555,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Subject to privacy command filtering.",
+        description = "Invoke a registered Tauri command via IPC, just like the frontend would. Goes through the real IPC pipeline so calls are logged and verifiable. Returns the command's result. Waits up to the eval timeout (30s) — pass `timeout_ms` (max 300000) for a legitimately slow command. Subject to privacy command filtering.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -430,11 +644,23 @@ impl VictauriMcpHandler {
             "return window.__TAURI_INTERNALS__.invoke({}, {args_str})",
             js_string(&params.command)
         );
+        let timeout = params.timeout_ms.map_or(self.state.eval_timeout, |ms| {
+            std::time::Duration::from_millis(ms.clamp(1, MAX_INVOKE_TIMEOUT_MS))
+        });
         let result = self
-            .eval_with_return(&code, params.webview_label.as_deref())
+            .eval_outcome(&code, params.webview_label.as_deref(), timeout)
             .await;
         let elapsed = start.elapsed();
-        self.state.command_timings.record(&params.command, elapsed);
+        // Only calls that reached the command are timings: one never sent (saturated, dead
+        // bridge, failed injection) measures nothing, and one cut off (timeout, app exit, closed
+        // window, reload) measures how long we waited — both skewed p95.
+        let ran = result
+            .as_ref()
+            .map_or_else(|f| f.kind == EvalFailureKind::Page, |_| true);
+        if ran {
+            self.state.command_timings.record(&params.command, elapsed);
+        }
+        let result = result.map_err(|f| f.message);
 
         match result {
             Ok(result) => {
@@ -448,6 +674,10 @@ impl VictauriMcpHandler {
                 }
                 CallToolResult::success(vec![ContentBlock::text(result)])
             }
+            Err(e) if e.starts_with("eval timed out") => tool_error(format!(
+                "invoke_command failed: {e} If the command is legitimately slow, pass \
+                 `timeout_ms` (up to {MAX_INVOKE_TIMEOUT_MS})."
+            )),
             Err(e) => tool_error(format!("invoke_command failed: {e}")),
         }
     }
@@ -488,9 +718,9 @@ impl VictauriMcpHandler {
     #[tool(
         description = "Compare frontend state (evaluated via JS expression) against backend state to detect divergences. Returns a VerificationResult with any mismatches.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -501,7 +731,7 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("eval_js") {
             return tool_disabled("verify_state requires eval_js capability");
         }
-        let code = format!("return ({})", params.frontend_expr);
+        let code = expression_eval_code(&params.frontend_expr);
         let frontend_json = match self
             .eval_with_return(&code, params.webview_label.as_deref())
             .await
@@ -510,7 +740,7 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to evaluate frontend expression: {e}")),
         };
 
-        let frontend_state: serde_json::Value = match serde_json::from_str(&frontend_json) {
+        let frontend_state: serde_json::Value = match parse_expression_value(&frontend_json) {
             Ok(v) => v,
             Err(e) => {
                 return tool_error(format!(
@@ -611,36 +841,7 @@ impl VictauriMcpHandler {
         Parameters(params): Parameters<IpcIntegrityParams>,
     ) -> CallToolResult {
         let threshold = params.stale_threshold_ms.unwrap_or(5000);
-        let code = format!(
-            r"return (function() {{
-                var log = window.__VICTAURI__?.getIpcLog() || [];
-                var now = Date.now();
-                var threshold = {threshold};
-                var pending = log.filter(function(c) {{ return c.status === 'pending'; }});
-                var stale = pending.filter(function(c) {{ return (now - c.timestamp) > threshold; }});
-                var errored = log.filter(function(c) {{ return c.status === 'error'; }});
-                var net = window.__VICTAURI__?.getNetworkLog() || [];
-                var warning = null;
-                if (log.length === 0 && net.length > 5) {{
-                    warning = 'Zero IPC calls captured but ' + net.length + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
-                }}
-                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
-                // A command that completed with an Err is a HEALTHY round-trip (it returned)
-                // — every real app exercises error paths, so counting those as 'unhealthy'
-                // would cry wolf. The error_count/errored_calls surface them for visibility,
-                // but only stale calls flip `healthy`.
-                return {{
-                    healthy: stale.length === 0,
-                    total_calls: log.length,
-                    pending_count: pending.length,
-                    stale_count: stale.length,
-                    error_count: errored.length,
-                    stale_calls: stale.slice(0, 20),
-                    errored_calls: errored.slice(0, 20),
-                    warning: warning
-                }};
-            }})()"
-        );
+        let code = ipc_integrity_js(threshold);
         self.eval_bridge(&code, params.webview_label.as_deref())
             .await
     }
@@ -648,15 +849,17 @@ impl VictauriMcpHandler {
     #[tool(
         description = "Wait for a condition to be met. Polls at regular intervals until satisfied or timeout. Conditions: text (text appears), text_gone (text disappears), selector (CSS selector matches), selector_gone, url (URL contains value), ipc_idle (no pending IPC calls), network_idle (no pending network requests), expression (poll a JS expression in `value` until truthy or until it equals `expected` — may `await`, e.g. await a fire-and-forget command's status), event (block until the Tauri event named in `value` fires, with `since_ms` look-back). Use expression/event to await async backend work to true completion instead of guessing with a fixed sleep.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
     async fn wait_for(&self, Parameters(params): Parameters<WaitForParams>) -> CallToolResult {
         let timeout_ms = params.timeout_ms.unwrap_or(10_000).min(120_000);
-        let poll = params.poll_ms.unwrap_or(200).max(20);
+        // Clamp BEFORE the value reaches JS: a poll longer than the wait is meaningless, and
+        // one past 2^31 ms overflows `setTimeout` (which then fires immediately, in a loop).
+        let poll = params.poll_ms.unwrap_or(200).clamp(20, timeout_ms.max(20));
 
         // The `expression` and `event` conditions are awaited server-side (they
         // poll the eval engine and the captured event bus respectively), so a
@@ -707,7 +910,7 @@ impl VictauriMcpHandler {
         let Some(expr) = params.value.as_deref().filter(|s| !s.is_empty()) else {
             return missing_param("value", "wait_for(expression)");
         };
-        let code = format!("return ({expr});");
+        let code = expression_eval_code(expr);
         let start = std::time::Instant::now();
         let deadline = start + std::time::Duration::from_millis(timeout_ms);
         let poll = std::time::Duration::from_millis(poll_ms);
@@ -720,9 +923,14 @@ impl VictauriMcpHandler {
                 .min(std::time::Duration::from_secs(15))
                 .max(std::time::Duration::from_secs(1));
             match self
-                .eval_with_return_timeout(&code, params.webview_label.as_deref(), per_eval)
+                .eval_outcome(&code, params.webview_label.as_deref(), per_eval)
                 .await
             {
+                // Code that does not parse can never start matching: fail now instead of
+                // polling to the timeout.
+                Err(f) if f.is_parse_error() => {
+                    return tool_error(format!("wait_for(expression): {}", f.message));
+                }
                 Ok(raw) => {
                     let val = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
                     let met = match &params.expected {
@@ -738,7 +946,7 @@ impl VictauriMcpHandler {
                     }
                     last_value = val;
                 }
-                Err(e) => last_error = Some(e),
+                Err(e) => last_error = Some(e.message),
             }
 
             if std::time::Instant::now() >= deadline {
@@ -774,8 +982,7 @@ impl VictauriMcpHandler {
         };
         let since_ms = params.since_ms.unwrap_or(2000);
         let start = std::time::Instant::now();
-        let baseline = chrono::Utc::now()
-            - chrono::TimeDelta::try_milliseconds(since_ms as i64).unwrap_or_default();
+        let baseline = bounded::ms_ago(chrono::Utc::now(), since_ms);
         let deadline = start + std::time::Duration::from_millis(timeout_ms);
         let poll = std::time::Duration::from_millis(poll_ms);
 
@@ -807,16 +1014,20 @@ impl VictauriMcpHandler {
                     "elapsed_ms": start.elapsed().as_millis() as u64,
                 }));
             }
-            tokio::time::sleep(poll).await;
+            // Never sleep past the deadline (a full poll used to overshoot a short timeout).
+            tokio::time::sleep(
+                poll.min(deadline.saturating_duration_since(std::time::Instant::now())),
+            )
+            .await;
         }
     }
 
     #[tool(
-        description = "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is.",
+        description = "Run a semantic assertion: evaluate a JS expression and check the result against an expected condition. Conditions: equals, not_equals, contains, greater_than, less_than, truthy, falsy, exists, type_is. A result of `undefined` is treated as `null` (JSON has no undefined; like JS `x == null`): `exists` is false, `falsy` is true, `equals null` and `type_is \"null\"` pass.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -827,7 +1038,7 @@ impl VictauriMcpHandler {
         if !self.state.privacy.is_tool_enabled("eval_js") {
             return tool_disabled("assert_semantic requires eval_js capability");
         }
-        let code = format!("return ({})", params.expression);
+        let code = expression_eval_code(&params.expression);
         let actual_json = match self
             .eval_with_return(&code, params.webview_label.as_deref())
             .await
@@ -836,16 +1047,13 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to evaluate expression: {e}")),
         };
 
-        let actual: serde_json::Value = match serde_json::from_str(&actual_json) {
+        let actual: serde_json::Value = match parse_expression_value(&actual_json) {
             Ok(v) => v,
             Err(e) => return tool_error(format!("expression did not return valid JSON: {e}")),
         };
 
-        let assertion = victauri_core::SemanticAssertion {
-            label: params.label,
-            condition: params.condition,
-            expected: params.expected,
-        };
+        let assertion =
+            victauri_core::SemanticAssertion::new(params.label, params.condition, params.expected);
 
         let result = victauri_core::evaluate_assertion(actual, &assertion);
         json_result(&result)
@@ -900,8 +1108,32 @@ impl VictauriMcpHandler {
         let Some(name) = params.probe else {
             return json_result(&serde_json::json!({ "probes": self.state.probes.names() }));
         };
-        if let Some(value) = self.state.probes.run(&name) {
-            json_result(&value)
+        if let Some(probe) = self.state.probes.get(&name) {
+            // A probe is app code: run it off the async executor, bounded, and with a panic
+            // boundary (it used to run inline on a tokio worker with neither). Its slot is
+            // held by the probe's thread, so a hung probe that outlives the deadline still
+            // counts against the cap and repeated calls cannot pile up leaked threads.
+            let Ok(slot) = Arc::clone(&self.probe_slots).try_acquire_owned() else {
+                return tool_error(format!(
+                    "probe '{name}' not run: app probes are busy ({MAX_CONCURRENT_PROBES} \
+                     still running — a probe that hangs keeps running past its timeout). \
+                     Retry shortly."
+                ));
+            };
+            match bounded::run_blocking_bounded(
+                None,
+                &format!("probe '{name}'"),
+                self.probe_timeout,
+                move || {
+                    let _slot = slot;
+                    Ok(probe())
+                },
+            )
+            .await
+            {
+                Ok(value) => json_result(&value),
+                Err(e) => tool_error(e),
+            }
         } else {
             let available = self.state.probes.names();
             tool_error_with_hint(
@@ -1128,58 +1360,63 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(e),
         };
 
-        let target = if let Some(ref sub) = params.path {
-            // Lexical traversal guard BEFORE the existence check: `safe_within`
-            // canonicalizes (which errors on non-existent paths), so a `..` or
-            // absolute sub-path must be rejected as traversal up front rather
-            // than falling through to a misleading "does not exist" result.
-            if let Err(e) = Self::lexical_safe(std::path::Path::new(sub)) {
-                return tool_error(e);
-            }
-            let resolved = base.join(sub);
-            // A missing directory is a normal, non-error result.
-            if !resolved.exists() {
-                return json_result(&serde_json::json!({
-                    "base": base.to_string_lossy(),
-                    "path": sub,
-                    "exists": false,
-                    "entries": [],
-                    "count": 0,
-                }));
-            }
-            if let Err(e) = Self::safe_within(&base, &resolved) {
-                return tool_error(e);
-            }
-            resolved
-        } else {
-            base.clone()
-        };
+        // Lexical traversal guard BEFORE any filesystem access: a `..` or absolute sub-path
+        // is rejected as traversal up front.
+        if let Some(sub) = params.path.as_deref()
+            && let Err(e) = Self::lexical_safe(std::path::Path::new(sub))
+        {
+            return tool_error(e);
+        }
+        // Every filesystem call below is synchronous and unbounded in the directory's size, so
+        // the whole walk runs on the blocking pool (it used to run on an async worker).
+        let walk = tokio::task::spawn_blocking(move || Self::list_app_dir_blocking(&base, &params));
+        match walk.await {
+            Ok(Ok(listing)) => json_result(&listing),
+            Ok(Err(e)) => tool_error(e),
+            Err(e) => tool_error(format!("directory listing task failed: {e}")),
+        }
+    }
 
-        // A missing base directory is a normal, non-error result.
-        if !target.exists() {
-            return json_result(&serde_json::json!({
+    fn list_app_dir_blocking(
+        base: &std::path::Path,
+        params: &ListAppDirParams,
+    ) -> Result<serde_json::Value, String> {
+        let sub = params.path.clone().unwrap_or_default();
+        let target = base.join(&sub);
+        // A missing directory is a normal, non-error result — unless the path escapes the
+        // base through a symlink, which is refused whether or not its target exists (so the
+        // listing is no oracle for paths outside the base).
+        if !Self::contained_or_missing(base, &target)? {
+            return Ok(serde_json::json!({
                 "base": base.to_string_lossy(),
-                "path": params.path.unwrap_or_default(),
+                "path": sub,
                 "exists": false,
                 "entries": [],
                 "count": 0,
             }));
         }
+        let canon_base = std::fs::canonicalize(base)
+            .map_err(|e| format!("cannot resolve base directory: {e}"))?;
 
-        let max_depth = params.max_depth.unwrap_or(1).min(5);
-        let pattern = params.pattern.as_deref();
-        let mut entries = Vec::new();
+        let mut walk = DirWalk {
+            canon_base,
+            pattern: params.pattern.clone(),
+            max_depth: params.max_depth.unwrap_or(1).min(5),
+            deadline: std::time::Instant::now() + MAX_DIR_WALK_TIME,
+            max_visited: MAX_DIR_VISITED,
+            visited: 0,
+            truncated: false,
+            entries: Vec::new(),
+        };
+        walk.visit(&target, base, 0);
 
-        Self::list_dir_recursive(&target, &base, 0, max_depth, pattern, &mut entries);
-        let truncated = entries.len() >= MAX_DIR_ENTRIES;
-
-        json_result(&serde_json::json!({
+        Ok(serde_json::json!({
             "base": base.to_string_lossy(),
-            "path": params.path.unwrap_or_default(),
+            "path": sub,
             "exists": true,
-            "entries": entries,
-            "count": entries.len(),
-            "truncated": truncated,
+            "count": walk.entries.len(),
+            "entries": walk.entries,
+            "truncated": walk.truncated,
         }))
     }
 
@@ -1210,8 +1447,11 @@ impl VictauriMcpHandler {
             return tool_error(e);
         }
         let target = base.join(&params.path);
-        if !target.exists() {
-            return tool_error(format!("file not found: {}", params.path));
+        // Refused as traversal whether or not a symlinked-out target exists (no oracle).
+        match Self::contained_or_missing(&base, &target) {
+            Ok(true) => {}
+            Ok(false) => return tool_error(format!("file not found: {}", params.path)),
+            Err(e) => return tool_error(e),
         }
         if let Err(e) = Self::safe_within(&base, &target) {
             return tool_error(e);
@@ -1231,34 +1471,11 @@ impl VictauriMcpHandler {
             Ok(c) => c,
             Err(e) => return tool_error(format!("cannot resolve path: {e}")),
         };
-        #[allow(clippy::cast_possible_truncation)]
-        let read = tokio::task::spawn_blocking(
-            move || -> Result<(Vec<u8>, usize, Option<u64>), String> {
-                use std::io::Read;
-                let metadata = std::fs::metadata(&canonical).ok();
-                let size = metadata.as_ref().map(|m| m.len() as usize);
-                let modified = metadata.as_ref().and_then(|m| m.modified().ok()).map(|t| {
-                    t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs()
-                });
-                // Bounded read (audit B7): pull at most max_bytes+1 instead of slurping the
-                // whole file. The +1 detects truncation; the reported size comes from metadata.
-                let f = std::fs::File::open(&canonical).map_err(|e| e.to_string())?;
-                let mut buf = Vec::new();
-                f.take(max_bytes as u64 + 1)
-                    .read_to_end(&mut buf)
-                    .map_err(|e| e.to_string())?;
-                let reported = size.unwrap_or(buf.len());
-                Ok((buf, reported, modified))
-            },
-        )
-        .await;
-        let (mut bytes, original_size, modified) = match read {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => return tool_error(format!("failed to read file: {e}")),
-            Err(e) => return tool_error(format!("file read task failed: {e}")),
-        };
+        let (mut bytes, original_size, modified) =
+            match self.read_regular_file_bounded(canonical, max_bytes).await {
+                Ok(v) => v,
+                Err(e) => return tool_error(format!("failed to read file: {e}")),
+            };
         let truncated = bytes.len() > max_bytes;
         if truncated {
             bytes.truncate(max_bytes);
@@ -1280,6 +1497,15 @@ impl VictauriMcpHandler {
                 "content": b64,
             }))
         } else {
+            // Truncation can split a multi-byte character; that is not a non-UTF-8 file.
+            // `error_len() == None` means the bytes end mid-character, so drop the partial
+            // character instead of returning the whole read as base64.
+            if truncated
+                && let Err(e) = std::str::from_utf8(&bytes)
+                && e.error_len().is_none()
+            {
+                bytes.truncate(e.valid_up_to());
+            }
             match String::from_utf8(bytes) {
                 Ok(text) => json_result(&serde_json::json!({
                     "file": file_info,
@@ -1332,27 +1558,18 @@ impl VictauriMcpHandler {
     /// Real `query_db` implementation — compiled only with the `sqlite` feature.
     #[cfg(feature = "sqlite")]
     async fn query_db_impl(&self, params: QueryDbParams) -> CallToolResult {
+        // A refused query is refused for what it is, before any database is looked up: the
+        // error used to depend on whether the app HAS a database ("no application database"
+        // for a DELETE on an app without one), and it touched the filesystem for nothing.
+        if let Err(e) = crate::database::validate_query(&params.query) {
+            return tool_error(e);
+        }
         let data_dir = match self.bridge.app_data_dir() {
             Ok(d) => d,
             Err(e) => return tool_error(format!("cannot access app data directory: {e}")),
         };
 
-        let app_dirs: Vec<std::path::PathBuf> = [
-            self.bridge.app_data_dir(),
-            self.bridge.app_config_dir(),
-            self.bridge.app_local_data_dir(),
-            self.bridge.app_log_dir(),
-        ]
-        .into_iter()
-        .filter_map(Result::ok)
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-        // Explicitly-configured roots (VictauriBuilder::db_search_paths) take
-        // precedence over OS app directories for auto-discovery, so a configured
-        // application DB wins over incidental ones (e.g. WebView internals).
-        let mut search_dirs: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
-        search_dirs.extend(app_dirs);
+        let search_dirs = self.db_roots();
 
         let db_path = if let Some(ref requested_path) = params.path {
             match Self::resolve_existing_db_path(&search_dirs, requested_path) {
@@ -1386,26 +1603,57 @@ impl VictauriMcpHandler {
         let query = params.query;
         let max_rows = params.max_rows;
 
-        match tokio::task::spawn_blocking(move || {
-            crate::database::query(&db_path, &query, &bind_params, max_rows)
-        })
+        match bounded::run_blocking_bounded(
+            Some(&bounded::DB_SLOTS),
+            "database query",
+            crate::database::QUERY_TIMEOUT + bounded::BLOCKING_DEADLINE_SLACK,
+            move || crate::database::query(&db_path, &query, &bind_params, max_rows),
+        )
         .await
         {
-            Ok(Ok(mut result)) => {
+            Ok(mut result) => {
                 if let Some(obj) = result.as_object_mut() {
                     obj.insert("database".to_string(), serde_json::json!(db_display));
                 }
                 json_result(&result)
             }
-            Ok(Err(e)) => tool_error(e),
-            Err(e) => tool_error(format!("database query task failed: {e}")),
+            Err(e) => tool_error(e),
         }
+    }
+
+    /// Roots a `query_db` / `db_health` database `path` resolves against, in precedence
+    /// order: configured `db_search_paths` (so a configured app DB beats incidental ones such
+    /// as `WebView` internals), then the app's data, config, local-data and log directories.
+    /// De-duplicated keeping the FIRST occurrence: a relative path present under two roots
+    /// always resolves to the same file (a `HashSet` made that nondeterministic), and both
+    /// tools search the same places (`db_health` used to skip the log directory).
+    #[cfg(feature = "sqlite")]
+    fn db_roots(&self) -> Vec<std::path::PathBuf> {
+        let mut roots: Vec<std::path::PathBuf> = Vec::new();
+        let app_dirs = [
+            self.bridge.app_data_dir(),
+            self.bridge.app_config_dir(),
+            self.bridge.app_local_data_dir(),
+            self.bridge.app_log_dir(),
+        ];
+        let candidates = self
+            .state
+            .db_search_paths
+            .iter()
+            .cloned()
+            .chain(app_dirs.into_iter().filter_map(Result::ok));
+        for dir in candidates {
+            if !roots.contains(&dir) {
+                roots.push(dir);
+            }
+        }
+        roots
     }
 
     // ── Compound Tools ──────────────────────────────────────────────────────
 
     #[tool(
-        description = "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions.",
+        description = "DOM element interactions. Actions: click, double_click, hover, focus, scroll_into_view, select_option. Requires ref_id from a dom_snapshot for most actions. An action the page refuses (element covered, disabled, hidden, detached, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1426,15 +1674,10 @@ impl VictauriMcpHandler {
                     return missing_param("ref_id", "click");
                 };
                 if params.trusted.unwrap_or(false) {
-                    // Resolve the element's viewport-center coords, run the
-                    // actionability check, then deliver a real OS click.
-                    let probe = format!(
-                        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
-                         if(!__e) return null; __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
-                         var __b=__e.getBoundingClientRect(); \
-                         return {{x:__b.left+__b.width/2, y:__b.top+__b.height/2}}",
-                        js_string(ref_id)
-                    );
+                    // Resolve the click point in the top window's viewport (frame offsets
+                    // added), refusing a disabled/hidden/covered/off-screen element — a real
+                    // OS click lands on whatever is on screen there — then deliver it.
+                    let probe = trusted_click_probe_js(ref_id);
                     let raw = match self
                         .eval_with_return(&probe, params.webview_label.as_deref())
                         .await
@@ -1442,12 +1685,15 @@ impl VictauriMcpHandler {
                         Ok(r) => r,
                         Err(e) => return tool_error(e),
                     };
-                    let Ok(point) = serde_json::from_str::<serde_json::Value>(&raw) else {
+                    let point = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_default();
+                    if let Some(why) = point.get("error").and_then(serde_json::Value::as_str) {
                         return tool_error_with_hint(
-                            format!("ref not found: {ref_id}"),
+                            format!(
+                                "trusted click on {ref_id} refused: {why} — no OS click was sent"
+                            ),
                             RecoveryHint::CheckInput,
                         );
-                    };
+                    }
                     let (Some(x), Some(y)) = (
                         point.get("x").and_then(serde_json::Value::as_f64),
                         point.get("y").and_then(serde_json::Value::as_f64),
@@ -1457,6 +1703,15 @@ impl VictauriMcpHandler {
                             RecoveryHint::CheckInput,
                         );
                     };
+                    if !(x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0) {
+                        return tool_error_with_hint(
+                            format!(
+                                "trusted click on {ref_id} refused: the page reported an \
+                                 unusable click point ({x}, {y}) — no OS click was sent"
+                            ),
+                            RecoveryHint::CheckInput,
+                        );
+                    }
                     let bridge = self.bridge.clone();
                     let label = params.webview_label.clone();
                     let native = tokio::task::spawn_blocking(move || {
@@ -1472,7 +1727,7 @@ impl VictauriMcpHandler {
                     };
                 }
                 let code = format!("return window.__VICTAURI__?.click({})", js_string(ref_id));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::DoubleClick => {
@@ -1486,7 +1741,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.doubleClick({})",
                     js_string(ref_id)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::Hover => {
@@ -1497,7 +1752,7 @@ impl VictauriMcpHandler {
                     return missing_param("ref_id", "hover");
                 };
                 let code = format!("return window.__VICTAURI__?.hover({})", js_string(ref_id));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::Focus => {
@@ -1511,7 +1766,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.focusElement({})",
                     js_string(ref_id)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::ScrollIntoView => {
@@ -1529,7 +1784,7 @@ impl VictauriMcpHandler {
                 let x = params.x.unwrap_or(0.0);
                 let y = params.y.unwrap_or(0.0);
                 let code = format!("return window.__VICTAURI__?.scrollTo({ref_arg}, {x}, {y})");
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InteractAction::SelectOption => {
@@ -1555,14 +1810,14 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     values_json
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
         }
     }
 
     #[tool(
-        description = "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls.",
+        description = "Text and keyboard input. Actions: fill (set input value), type_text (character-by-character typing), press_key (trigger a keyboard key). Subject to privacy controls. An input the page refuses (element not fillable, covered, disabled, or ref not found) returns an error with the reason and a [hint: RETRY_LATER|CHECK_INPUT].",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1587,7 +1842,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     js_string(value)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InputAction::TypeText => {
@@ -1601,21 +1856,14 @@ impl VictauriMcpHandler {
                     return missing_param("text", "type_text");
                 };
                 if params.trusted.unwrap_or(false) {
-                    // Focus the element via JS, then deliver real OS keystrokes
+                    // Focus the element via JS — and confirm focus landed on it, since the OS
+                    // keystrokes go to whatever holds focus — then deliver real OS keystrokes
                     // (isTrusted: true) for handlers that reject synthetic events.
-                    let focus = format!(
-                        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); if(__e){{__e.focus();}} return !!__e",
-                        js_string(ref_id)
-                    );
-                    let focused = self
-                        .eval_with_return(&focus, params.webview_label.as_deref())
+                    if let Err(refused) = self
+                        .focus_for_trusted_input(ref_id, params.webview_label.as_deref())
                         .await
-                        .unwrap_or_default();
-                    if focused != "true" {
-                        return tool_error_with_hint(
-                            format!("ref not found or not focusable: {ref_id}"),
-                            RecoveryHint::CheckInput,
-                        );
+                    {
+                        return refused;
                     }
                     let bridge = self.bridge.clone();
                     let label = params.webview_label.clone();
@@ -1635,7 +1883,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     js_string(text)
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InputAction::PressKey => {
@@ -1646,15 +1894,14 @@ impl VictauriMcpHandler {
                     return missing_param("key", "press_key");
                 };
                 if params.trusted.unwrap_or(false) {
-                    // Optionally focus a target element, then send a real OS key.
-                    if let Some(ref_id) = &params.ref_id {
-                        let focus = format!(
-                            "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); if(__e){{__e.focus();}} return !!__e",
-                            js_string(ref_id)
-                        );
-                        let _ = self
-                            .eval_with_return(&focus, params.webview_label.as_deref())
-                            .await;
+                    // Optionally focus a target element, then send a real OS key. A failed focus
+                    // must stop here: the key would otherwise go to whatever holds focus.
+                    if let Some(ref_id) = &params.ref_id
+                        && let Err(refused) = self
+                            .focus_for_trusted_input(ref_id, params.webview_label.as_deref())
+                            .await
+                    {
+                        return refused;
                     }
                     let bridge = self.bridge.clone();
                     let label = params.webview_label.clone();
@@ -1670,7 +1917,7 @@ impl VictauriMcpHandler {
                     };
                 }
                 let code = format!("return window.__VICTAURI__?.pressKey({})", js_string(key));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
         }
@@ -1680,15 +1927,18 @@ impl VictauriMcpHandler {
         description = "Window management. Actions: get_state (window positions/sizes/visibility), list (all window labels), manage (minimize/maximize/close/focus/show/hide/fullscreen/always_on_top), resize, move_to, set_title, introspectability (probe every window and report which Victauri can actually see — a visible window that comes back introspectable:false is almost always missing the \"victauri:default\" capability; run this FIRST when eval_js/dom_snapshot/animation return nothing for a multi-window app).",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
-            idempotent_hint = true,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
     async fn window(&self, Parameters(params): Parameters<WindowParams>) -> CallToolResult {
         match params.action {
             WindowAction::GetState => {
-                let states = self.bridge.get_window_states(params.label.as_deref());
+                let states = match self.bridge.try_get_window_states(params.label.as_deref()) {
+                    Ok(states) => states,
+                    Err(e) => return tool_error(ui_busy(&e)),
+                };
                 // A specific label that matches no window is an error, not an
                 // empty array (which reads as "success, no state").
                 if states.is_empty()
@@ -1700,10 +1950,10 @@ impl VictauriMcpHandler {
                 }
                 json_result(&states)
             }
-            WindowAction::List => {
-                let labels = self.bridge.list_window_labels();
-                json_result(&labels)
-            }
+            WindowAction::List => match self.bridge.try_list_window_labels() {
+                Ok(labels) => json_result(&labels),
+                Err(e) => tool_error(ui_busy(&e)),
+            },
             WindowAction::Introspectability => self.window_introspectability().await,
             WindowAction::Manage => {
                 if !self.state.privacy.is_tool_enabled("window.manage") {
@@ -1922,7 +2172,8 @@ impl VictauriMcpHandler {
                     .as_ref()
                     .map_or_else(|| "undefined".to_string(), |t| js_string(t));
                 let code = format!(
-                    "return window.__VICTAURI__?.setDialogAutoResponse({}, {}, {text_arg})",
+                    "return {}?.setDialogAutoResponse({}, {}, {text_arg})",
+                    crate::js_bridge::agent_ops_js(),
                     js_string(dialog_type.as_str()),
                     js_string(dialog_action.as_str())
                 );
@@ -1940,10 +2191,10 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments — their side effects happen again; calls that had arguments, failed, or never completed are skipped because recordings do not capture arguments), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
+        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, or were answered by a route rule are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = false
         )
@@ -1958,8 +2209,10 @@ impl VictauriMcpHandler {
                 let session_id = params
                     .session_id
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-                match self.state.recorder.start(session_id.clone()) {
-                    Ok(()) => {
+                let floor_ms = now_ms();
+                match self.state.recorder.start_session(session_id.clone()) {
+                    Ok(generation) => {
+                        self.state.drain_watermarks.reset(floor_ms, generation);
                         let result = serde_json::json!({
                             "started": true,
                             "session_id": session_id,
@@ -1969,10 +2222,35 @@ impl VictauriMcpHandler {
                     Err(e) => tool_error(e.to_string()),
                 }
             }
-            RecordingAction::Stop => match self.state.recorder.stop() {
-                Some(session) => json_result(&session),
-                None => tool_error("no recording is active"),
-            },
+            RecordingAction::Stop => {
+                // Final flush first: the background drain reads each window about once a second, so
+                // anything the page captured since its last tick would otherwise be lost — and under
+                // a busy UI no drain may have run at all. Best-effort and bounded; a window that
+                // cannot answer in time is REPORTED, never silently dropped.
+                let unreachable = if self.state.recorder.is_recording() {
+                    self.final_recording_flush().await
+                } else {
+                    Vec::new()
+                };
+                match self.state.recorder.stop() {
+                    Some(session) => {
+                        if unreachable.is_empty() {
+                            json_result(&session)
+                        } else {
+                            let mut value =
+                                serde_json::to_value(&session).unwrap_or(serde_json::Value::Null);
+                            if let Some(obj) = value.as_object_mut() {
+                                obj.insert(
+                                    "final_flush_unreachable".to_string(),
+                                    serde_json::json!(unreachable),
+                                );
+                            }
+                            json_result(&value)
+                        }
+                    }
+                    None => tool_error("no recording is active"),
+                }
+            }
             RecordingAction::Checkpoint => {
                 // checkpoint_id is optional — auto-generate a short id when the
                 // caller just wants a positional marker. The id is echoed back in
@@ -2046,14 +2324,6 @@ impl VictauriMcpHandler {
                         Err(e) => return tool_error(format!("invalid session JSON: {e}")),
                     };
 
-                // Import REPLACES the active recording. Doing that silently threw away an
-                // in-progress recording, so require it to be stopped (and saved) first.
-                if self.state.recorder.is_recording() {
-                    return tool_error(
-                        "a recording is in progress — import would discard it. Stop it first \
-                         (recording action=stop, or export it), then import.",
-                    );
-                }
                 let result = serde_json::json!({
                     "imported": true,
                     "session_id": session.id,
@@ -2064,48 +2334,61 @@ impl VictauriMcpHandler {
                     "note": "the imported session is now the ACTIVE recording: live events are \
                              appended to it until you call recording action=stop",
                 });
-                self.state.recorder.import(session);
+                // Import REPLACES the active recording. Doing that silently threw away an
+                // in-progress recording, so require it to be stopped (and saved) first — checked
+                // and replaced in one step, so a recording started concurrently is never lost.
+                let floor_ms = now_ms();
+                match self.state.recorder.import_if_idle(session) {
+                    Ok(generation) => self.state.drain_watermarks.reset(floor_ms, generation),
+                    Err(_) => {
+                        return tool_error(
+                            "a recording is in progress — import would discard it. Stop it first \
+                             (recording action=stop, or export it), then import.",
+                        );
+                    }
+                }
                 CallToolResult::success(vec![ContentBlock::text(result.to_string())])
             }
             RecordingAction::Flush => {
                 if !self.state.recorder.is_recording() {
                     return tool_error("no active recording — start a recording first");
                 }
-                // Only events NEWER than what the recording already holds (exclusive):
-                // `getEventStream(0)` re-ingested everything since page load, and reading from
-                // the recording start re-recorded whatever the background drain had already
-                // captured. Drained events carry their JS timestamp, so this watermark lines up.
-                let since_ms = self
-                    .state
-                    .recorder
-                    .latest_event_timestamp()
-                    .map_or(0, |t| t.timestamp_millis());
-                let code = format!("return window.__VICTAURI__?.getEventStream({since_ms}, true)");
-                let label = params.webview_label.as_deref().unwrap_or("main");
-                match self
-                    .eval_with_return(&code, params.webview_label.as_deref())
+                // Same routine (and the same shared per-window watermark + lock) as the
+                // background drain, so a flush never re-records what the drain already captured
+                // and vice versa. With no label, every live window is flushed.
+                let labels: Vec<String> = match params.webview_label.as_deref() {
+                    Some(l) => vec![l.to_string()],
+                    None => match self.bridge.try_list_window_labels() {
+                        Ok(labels) => labels,
+                        Err(e) => return tool_error(ui_busy(&e)),
+                    },
+                };
+                let mut captured = 0usize;
+                let mut failed = Vec::new();
+                for label in &labels {
+                    match crate::mcp::server::drain_window_into_recording(
+                        &self.state,
+                        &self.bridge,
+                        label,
+                    )
                     .await
-                {
-                    Ok(result_str) => {
-                        let events: Vec<serde_json::Value> =
-                            serde_json::from_str(&result_str).unwrap_or_default();
-                        let mut count = 0u64;
-                        for ev in &events {
-                            if let Some(app_event) =
-                                crate::mcp::server::parse_bridge_event_from(ev, label)
-                            {
-                                self.state.event_log.push(app_event.clone());
-                                self.state.recorder.record_event(app_event);
-                                count += 1;
-                            }
-                        }
-                        json_result(&serde_json::json!({
-                            "flushed": true,
-                            "events_captured": count,
-                        }))
+                    {
+                        Some(n) => captured += n,
+                        None => failed.push(label.clone()),
                     }
-                    Err(e) => tool_error(format!("flush failed: {e}")),
                 }
+                if !labels.is_empty() && failed.len() == labels.len() {
+                    return tool_error(format!(
+                        "flush failed: no window answered ({})",
+                        failed.join(", ")
+                    ));
+                }
+                json_result(&serde_json::json!({
+                    "flushed": true,
+                    "events_captured": captured,
+                    "windows": labels,
+                    "unreachable_windows": failed,
+                }))
             }
             RecordingAction::Replay => {
                 let calls = self.state.recorder.ipc_replay_sequence();
@@ -2118,13 +2401,30 @@ impl VictauriMcpHandler {
                     // command with none. Re-running a call that took arguments is guaranteed
                     // wrong (it fails, or worse, runs with defaults), and re-running a call
                     // that failed or never completed reproduces nothing — skip both, loudly.
+                    // A call a route rule answered in the page never reached the backend:
+                    // replaying it would turn a fake (possibly page-forged) success into a real
+                    // invocation.
                     let skip_reason = match &call.result {
-                        victauri_core::IpcResult::Ok(_) if call.arg_size_bytes > 0 => {
-                            Some("the original call had arguments, which recordings do not capture")
+                        _ if call.mocked => Some(
+                            "the original call was answered by a route rule in the page, not the backend".to_string(),
+                        ),
+                        victauri_core::IpcResult::Ok(_) if call.arg_size_bytes > 0 => Some(
+                            "the original call had arguments, which recordings do not capture".to_string(),
+                        ),
+                        victauri_core::IpcResult::Ok(_) => params
+                            .webview_label
+                            .as_deref()
+                            .filter(|only| *only != call.webview_label)
+                            .map(|only| {
+                                format!(
+                                    "recorded in window '{}'; replay was limited to '{only}'",
+                                    call.webview_label
+                                )
+                            }),
+                        victauri_core::IpcResult::Err(_) => {
+                            Some("the original call failed".to_string())
                         }
-                        victauri_core::IpcResult::Ok(_) => None,
-                        victauri_core::IpcResult::Err(_) => Some("the original call failed"),
-                        _ => Some("the original call never completed"),
+                        _ => Some("the original call never completed".to_string()),
                     };
                     if let Some(reason) = skip_reason {
                         replay_results.push(serde_json::json!({
@@ -2151,8 +2451,12 @@ impl VictauriMcpHandler {
                         "return window.__TAURI_INTERNALS__.invoke({})",
                         js_string(&call.command)
                     );
+                    // Replay each call in the window that made it — never a default window: a
+                    // command recorded in a low-privilege window must not run with main's
+                    // capabilities. A window that no longer exists fails the call (an explicit
+                    // label never falls back to another window).
                     let outcome = match self
-                        .eval_with_return(&code, params.webview_label.as_deref())
+                        .eval_with_return(&code, Some(call.webview_label.as_str()))
                         .await
                     {
                         Ok(result_str) => {
@@ -2161,6 +2465,7 @@ impl VictauriMcpHandler {
                             let shape = crate::introspection::JsonShape::from_value(&value);
                             serde_json::json!({
                                 "command": call.command,
+                                "webview_label": call.webview_label,
                                 "status": "ok",
                                 "response_type": shape.type_name(),
                             })
@@ -2189,8 +2494,9 @@ impl VictauriMcpHandler {
                     "failed": replayed - passed,
                     "skipped": skipped,
                     "note": "commands are re-invoked WITHOUT arguments (recordings do not capture \
-                             them) and their side effects happen again; calls that had arguments, \
-                             failed, or never completed are skipped",
+                             them), each in the window that recorded it, and their side effects \
+                             happen again; calls that had arguments, failed, never completed, or \
+                             were answered by a route rule are skipped",
                     "results": replay_results,
                 });
                 json_result(&result)
@@ -2201,7 +2507,7 @@ impl VictauriMcpHandler {
     #[tool(
         description = "CSS and visual inspection. Actions: get_styles (computed CSS for element), get_bounding_boxes (layout rects), highlight (debug overlay), clear_highlights, audit_accessibility (a11y audit), get_performance (timing/heap/DOM metrics).",
         annotations(
-            read_only_hint = true,
+            read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = false
@@ -2225,7 +2531,7 @@ impl VictauriMcpHandler {
                     js_string(ref_id),
                     props_arg
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::GetBoundingBoxes => {
@@ -2237,7 +2543,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.getBoundingBoxes([{}])",
                     refs.join(",")
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::Highlight => {
@@ -2267,7 +2573,7 @@ impl VictauriMcpHandler {
                     color_arg,
                     label_arg
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             InspectAction::ClearHighlights => {
@@ -2278,21 +2584,21 @@ impl VictauriMcpHandler {
                 {
                     return tool_disabled("inspect.clear_highlights");
                 }
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.clearHighlights()",
                     params.webview_label.as_deref(),
                 )
                 .await
             }
             InspectAction::AuditAccessibility => {
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.auditAccessibility()",
                     params.webview_label.as_deref(),
                 )
                 .await
             }
             InspectAction::GetPerformance => {
-                self.eval_bridge(
+                self.eval_page_action(
                     "return window.__VICTAURI__?.getPerformanceMetrics()",
                     params.webview_label.as_deref(),
                 )
@@ -2404,6 +2710,14 @@ impl VictauriMcpHandler {
                     rule["content_type"] = serde_json::json!(ct);
                 }
                 if let Some(d) = params.delay_ms {
+                    // A delayed request is held this long in the page; cap it like a `fault`
+                    // delay rather than accept any u64.
+                    if d > MAX_FAULT_DELAY_MS {
+                        return tool_error_with_hint(
+                            format!("delay_ms {d} exceeds the maximum of {MAX_FAULT_DELAY_MS} ms"),
+                            RecoveryHint::CheckInput,
+                        );
+                    }
                     rule["delay_ms"] = serde_json::json!(d);
                 }
                 if let Some(t) = params.times {
@@ -2413,7 +2727,7 @@ impl VictauriMcpHandler {
                     "return window.__VICTAURI__?.addRoute({})",
                     js_string(&rule.to_string())
                 );
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
             RouteAction::List => {
@@ -2427,19 +2741,24 @@ impl VictauriMcpHandler {
                 let Some(id) = params.id else {
                     return missing_param("id", "clear");
                 };
-                let code = format!("return window.__VICTAURI__?.clearRoute({id})");
+                let code = format!(
+                    "return {}?.clearRoute({id})",
+                    crate::js_bridge::agent_ops_js()
+                );
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
             RouteAction::ClearAll => {
-                self.eval_bridge(
-                    "return window.__VICTAURI__?.clearRoutes()",
-                    params.webview_label.as_deref(),
-                )
-                .await
+                let code = format!("return {}?.clearRoutes()", crate::js_bridge::agent_ops_js());
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
             }
             RouteAction::Matches => {
                 let limit = params.limit.unwrap_or(100);
+                // A maximum of 0 entries is none — not "all" (the bridge's falsy limit).
+                if limit == 0 {
+                    return CallToolResult::success(vec![ContentBlock::text("[]")]);
+                }
                 let code = format!("return window.__VICTAURI__?.getRouteMatches({limit})");
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
@@ -2452,10 +2771,14 @@ impl VictauriMcpHandler {
             into a ring buffer, forming a visual timeline that pairs with `recording` (events) and \
             `logs` (network/console). Actions:\n\
             - `start`: begin capturing (`interval_ms` default 500, `max_frames` default 60). Set \
-              `with_events=true` to also start the event recorder.\n\
-            - `stop`: stop and return a summary (frame count, duration, timestamps).\n\
+              `with_events=true` to also start the event recorder. Hidden windows are skipped \
+              (no frame), the buffer is capped at 256 MB, and an abandoned trace auto-stops \
+              after 30 minutes.\n\
+            - `stop`: stop and return a summary (frame count, duration, timestamps); also stops \
+              the recording that `with_events` started (never one started separately).\n\
             - `status`: active flag + buffered frame count.\n\
-            - `frames`: return captured frames as base64 PNGs (`limit` caps how many).",
+            - `frames`: return captured frames as base64 PNGs, newest first up to a 25 MB \
+              response (`limit` caps how many).",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2474,39 +2797,57 @@ impl VictauriMcpHandler {
                 let interval = params.interval_ms.unwrap_or(500);
                 let max_frames = params.max_frames.unwrap_or(60);
                 let label = params.webview_label.clone();
-                let generation = self
-                    .state
-                    .screencast
-                    .start(interval, max_frames, label.clone());
+                // A trace started over a running one supersedes it: end the recording the
+                // previous trace started (if it is still the active one), or it would be left
+                // running with no owner (and the per-second drain loop with it).
+                let (generation, superseded) =
+                    self.state
+                        .screencast
+                        .start(interval, max_frames, label.clone());
+                if let Some(prev) = superseded {
+                    let _ = self.state.recorder.stop_if_generation(prev);
+                }
 
                 let mut events_started = false;
                 if params.with_events.unwrap_or(false) {
                     let session_id = uuid::Uuid::new_v4().to_string();
-                    if self.state.recorder.start(session_id).is_ok() {
-                        events_started = true;
+                    let floor_ms = now_ms();
+                    if let Ok(recording) = self.state.recorder.start_session(session_id) {
+                        self.state.drain_watermarks.reset(floor_ms, recording);
+                        // Only a recording THIS trace started is stopped with it — by recorder
+                        // generation, so a recording started later (even under the same session
+                        // id) is never stopped by us. If this trace was already stopped or
+                        // superseded meanwhile, nothing would ever stop the recording: do it now.
+                        if self
+                            .state
+                            .screencast
+                            .set_owned_recording(generation, recording)
+                        {
+                            events_started = true;
+                        } else {
+                            let _ = self.state.recorder.stop_if_generation(recording);
+                        }
                     }
                 }
-                // Only a recording THIS trace started is stopped with it; a recording the
-                // agent started separately is left alone.
-                self.state.screencast.set_owns_recording(events_started);
 
                 // Background capture task: snapshot the window each interval until the
                 // screencast is stopped, superseded by a newer start, or hits the max duration.
+                // The guard ends the trace (and its recording) however the task exits — the
+                // max-duration break, or a panic.
                 let handler = self.clone();
                 let screencast = self.state.screencast.clone();
+                let guard = crate::screencast::CaptureTaskGuard {
+                    screencast: Arc::clone(&screencast),
+                    recorder: self.state.recorder.clone(),
+                    generation,
+                };
                 tokio::spawn(async move {
+                    let _guard = guard;
                     let t0 = std::time::Instant::now();
-                    while screencast.is_active() && screencast.generation() == generation {
-                        if t0.elapsed() >= MAX_TRACE_DURATION {
-                            // An abandoned trace must not capture (and burn CPU) forever.
-                            if screencast.generation() == generation {
-                                screencast.stop();
-                                if screencast.take_owns_recording() {
-                                    let _ = handler.state.recorder.stop();
-                                }
-                            }
-                            break;
-                        }
+                    // An abandoned trace must not capture (and burn CPU) forever: past the max
+                    // duration the loop ends and the guard stops it (only if no newer trace has
+                    // started in the meantime).
+                    while screencast.is_current(generation) && t0.elapsed() < MAX_TRACE_DURATION {
                         // Same visible-target rule as `screenshot`: a hidden window yields
                         // stale or another window's pixels, so skip the frame instead.
                         if let Ok(target) = handler.resolve_visible_capture_target(label.as_deref())
@@ -2531,25 +2872,25 @@ impl VictauriMcpHandler {
 
                 json_result(&serde_json::json!({
                     "started": true,
-                    "interval_ms": interval.max(50),
+                    "interval_ms": self.state.screencast.interval_ms(),
                     "max_frames": max_frames.clamp(1, 600),
                     "with_events": events_started,
                 }))
             }
             TraceAction::Stop => {
-                let frame_count = self.state.screencast.stop();
+                let (frame_count, owned) = self.state.screencast.stop();
                 let timestamps = self.state.screencast.frame_timestamps();
                 let duration_ms = timestamps.last().copied().unwrap_or(0);
                 // Stop the recording `with_events` started, so the recorder (and the
                 // per-second drain loop it enables) does not outlive the trace. The session
                 // stays readable via recording get_events/export (last stopped session).
-                let event_count = if self.state.screencast.take_owns_recording() {
-                    self.state
+                let event_count = match owned {
+                    Some(owned) => self
+                        .state
                         .recorder
-                        .stop()
-                        .map_or(0, |session| session.events.len())
-                } else {
-                    self.state.recorder.event_count()
+                        .stop_if_generation(owned)
+                        .map_or(0, |session| session.events.len()),
+                    None => self.state.recorder.event_count(),
                 };
                 json_result(&serde_json::json!({
                     "stopped": true,
@@ -2620,9 +2961,9 @@ impl VictauriMcpHandler {
             NOTE: an animation only appears while it is running or pending — trigger it (e.g. show the \
             notification) just before calling `list`/`scrub`, or arm `sample` before triggering.",
         annotations(
-            read_only_hint = true,
+            read_only_hint = false,
             destructive_hint = false,
-            idempotent_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -2652,7 +2993,22 @@ impl VictauriMcpHandler {
                     Err(e) => tool_error(format!("animation list failed: {e}")),
                 }
             }
-            AnimationAction::Scrub => self.animation_scrub(params).await,
+            AnimationAction::Scrub => {
+                // `capture=true` takes native window screenshots (a filmstrip), so it needs the
+                // `screenshot` tool as well — like `trace` — or an operator who disabled
+                // screenshots would still get pixels through here. Refused before anything runs.
+                if params.capture.unwrap_or(false)
+                    && !self.state.privacy.is_tool_enabled("screenshot")
+                {
+                    return tool_error_with_hint(
+                        "animation scrub with capture=true takes native window screenshots, but \
+                         tool 'screenshot' is disabled by privacy configuration — call scrub \
+                         without `capture` to get the geometry curve only",
+                        RecoveryHint::ReportToUser,
+                    );
+                }
+                self.animation_scrub(params).await
+            }
             AnimationAction::Sample => {
                 let label = params.webview_label.as_deref();
                 let sel = params
@@ -2660,10 +3016,10 @@ impl VictauriMcpHandler {
                     .as_deref()
                     .map_or_else(|| "null".to_string(), js_string);
                 let code = if params.record.unwrap_or(false) {
-                    format!("return window.__VICTAURI__.installSweepRecorder({sel})")
+                    crate::js_bridge::agent_op_call_js(&format!("installSweepRecorder({sel})"))
                 } else {
                     let clear = params.clear.unwrap_or(false);
-                    format!("return window.__VICTAURI__.readSweep({clear})")
+                    crate::js_bridge::agent_op_call_js(&format!("readSweep({clear})"))
                 };
                 match self.eval_with_return(&code, label).await {
                     Ok(result_str) => {
@@ -2688,7 +3044,7 @@ impl VictauriMcpHandler {
             .map_or_else(|| "null".to_string(), js_string);
 
         // 1. Prepare: pause the target's animations, learn the timeline length.
-        let prep_code = format!("return await window.__VICTAURI__.scrubPrepare({sel})");
+        let prep_code = crate::js_bridge::agent_op_call_js(&format!("scrubPrepare({sel})"));
         let prep_v = match self.eval_with_return(&prep_code, label).await {
             Ok(s) => {
                 serde_json::from_str::<serde_json::Value>(&s).unwrap_or(serde_json::Value::Null)
@@ -2702,31 +3058,73 @@ impl VictauriMcpHandler {
 
         let points = params.points.unwrap_or(20).clamp(2, 120);
         let capture = params.capture.unwrap_or(false);
+        let cols_for = |n: usize| {
+            params
+                .cols
+                .unwrap_or_else(|| crate::filmstrip::default_cols(n))
+        };
+        let resume = params.restore.unwrap_or(true);
+        let restore_code = crate::js_bridge::agent_op_call_js(&format!("scrubRestore({resume})"));
         let mut curve: Vec<serde_json::Value> = Vec::with_capacity(points);
         let mut frames: Vec<crate::filmstrip::Frame> = Vec::new();
         let mut manifest: Vec<serde_json::Value> = Vec::new();
+        // The first reason a frame could not be captured (reported, never swallowed).
+        let mut capture_error: Option<String> = None;
 
         // 2. Seek to each evenly-spaced point; capture the frozen frame if asked.
         for i in 0..points {
             #[allow(clippy::cast_precision_loss)]
             let progress = i as f64 / (points - 1) as f64;
-            let seek_code = format!("return await window.__VICTAURI__.scrubSeek({progress})");
+            let seek_code = crate::js_bridge::agent_op_call_js(&format!("scrubSeek({progress})"));
             match self.eval_with_return(&seek_code, label).await {
                 Ok(s) => {
                     let v = serde_json::from_str::<serde_json::Value>(&s)
                         .unwrap_or(serde_json::Value::Null);
-                    if capture
-                        && let Ok(handle) = self.bridge.get_native_handle(label)
-                        && let Ok((rgba, w, h)) =
-                            crate::screenshot::capture_window_raw(handle).await
-                        && let Some(frame) = crate::filmstrip::Frame::new(rgba, w, h)
-                    {
-                        manifest.push(serde_json::json!({
-                            "cell": frames.len(),
-                            "progress": progress,
-                            "t": v.get("t").cloned().unwrap_or(serde_json::Value::Null),
-                        }));
-                        frames.push(frame);
+                    if capture {
+                        match self.capture_scrub_frame(label).await {
+                            Ok(frame) => {
+                                // Before holding more frames: would the finished sheet be
+                                // composable at all? (Raw RGBA frames accumulate until then.)
+                                if frames.is_empty()
+                                    && let Err(e) = crate::filmstrip::check_sheet(
+                                        frame.w,
+                                        frame.h,
+                                        points,
+                                        cols_for(points),
+                                        FILMSTRIP_GAP,
+                                    )
+                                {
+                                    let _ = self.eval_with_return(&restore_code, label).await;
+                                    let fitting = (2..points).rev().find(|&n| {
+                                        crate::filmstrip::check_sheet(
+                                            frame.w,
+                                            frame.h,
+                                            n,
+                                            cols_for(n),
+                                            FILMSTRIP_GAP,
+                                        )
+                                        .is_ok()
+                                    });
+                                    let advice = fitting.map_or_else(
+                                        || "call scrub without `capture` for the geometry curve                                             (or shrink the window)"
+                                            .to_string(),
+                                        |n| format!("use `points` <= {n} (or more `cols`)"),
+                                    );
+                                    return tool_error(format!(
+                                        "animation scrub capture refused before capturing: {e};                                          {advice}"
+                                    ));
+                                }
+                                manifest.push(serde_json::json!({
+                                    "cell": frames.len(),
+                                    "progress": progress,
+                                    "t": v.get("t").cloned().unwrap_or(serde_json::Value::Null),
+                                }));
+                                frames.push(frame);
+                            }
+                            Err(e) => {
+                                capture_error.get_or_insert(e);
+                            }
+                        }
                     }
                     curve.push(v);
                 }
@@ -2735,8 +3133,6 @@ impl VictauriMcpHandler {
         }
 
         // 3. Restore (resume) or leave paused.
-        let resume = params.restore.unwrap_or(true);
-        let restore_code = format!("return window.__VICTAURI__.scrubRestore({resume})");
         let _ = self.eval_with_return(&restore_code, label).await;
 
         let mut meta = serde_json::json!({
@@ -2745,52 +3141,89 @@ impl VictauriMcpHandler {
             "duration_ms": prep_v.get("duration").cloned().unwrap_or(serde_json::Value::Null),
             "anim_count": prep_v.get("anim_count").cloned().unwrap_or(serde_json::Value::Null),
             "target": prep_v.get("target").cloned().unwrap_or(serde_json::Value::Null),
-            "captured": capture,
+            // True only when a filmstrip is returned with this result.
+            "captured": false,
             "curve": curve,
         });
+        if let Some(e) = &capture_error {
+            meta["capture_error"] = serde_json::json!(e);
+        }
 
         // 4. Compose the filmstrip if we captured frames.
         if capture && !frames.is_empty() {
-            let cols = params
-                .cols
-                .unwrap_or_else(|| crate::filmstrip::default_cols(frames.len()));
-            if let Some((rgba, w, h)) =
-                crate::filmstrip::compose(&frames, cols, 4, [20, 20, 20, 255])
-            {
-                match crate::screenshot::encode_png(w, h, &rgba) {
-                    Ok(png) => {
-                        use base64::Engine;
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
-                        meta["filmstrip"] = serde_json::json!({
-                            "cols": cols,
-                            "frame_count": frames.len(),
-                            "width": w,
-                            "height": h,
-                            "manifest": manifest,
-                        });
-                        return CallToolResult::success(vec![
-                            ContentBlock::image(b64, "image/png"),
-                            ContentBlock::text(meta.to_string()),
-                        ]);
-                    }
-                    Err(e) => return tool_error(format!("filmstrip encode failed: {e}")),
+            let cols = cols_for(frames.len());
+            let (rgba, w, h) =
+                match crate::filmstrip::compose(&frames, cols, FILMSTRIP_GAP, [20, 20, 20, 255]) {
+                    Ok(sheet) => sheet,
+                    Err(e) => return tool_error(format!("filmstrip compose failed: {e}")),
+                };
+            drop(frames);
+            match crate::screenshot::encode_png(w, h, &rgba) {
+                Ok(png) => {
+                    use base64::Engine;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+                    meta["captured"] = serde_json::json!(true);
+                    meta["filmstrip"] = serde_json::json!({
+                        "cols": cols,
+                        "frame_count": manifest.len(),
+                        "width": w,
+                        "height": h,
+                        "manifest": manifest,
+                    });
+                    return CallToolResult::success(vec![
+                        ContentBlock::image(b64, "image/png"),
+                        ContentBlock::text(meta.to_string()),
+                    ]);
                 }
+                Err(e) => return tool_error(format!("filmstrip encode failed: {e}")),
             }
         }
 
         json_result(&meta)
     }
 
+    /// One native capture of the (frozen) scrub target window, as a filmstrip frame.
+    async fn capture_scrub_frame(
+        &self,
+        label: Option<&str>,
+    ) -> Result<crate::filmstrip::Frame, String> {
+        let handle = self
+            .bridge
+            .get_native_handle(label)
+            .map_err(|e| format!("no native window handle: {e}"))?;
+        let (rgba, w, h) = crate::screenshot::capture_window_raw(handle)
+            .await
+            .map_err(|e| format!("window capture failed: {e}"))?;
+        crate::filmstrip::Frame::new(rgba, w, h)
+            .ok_or_else(|| format!("window capture returned a malformed {w}x{h} frame"))
+    }
+
     #[tool(
-        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls).",
+        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation).",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
+            read_only_hint = false,
+            destructive_hint = true,
             idempotent_hint = true,
             open_world_hint = false
         )
     )]
     async fn logs(&self, Parameters(params): Parameters<LogsParams>) -> CallToolResult {
+        // `limit` is the maximum number of entries to return, so 0 returns none (R5-JS5). The
+        // page is not asked at all: `.slice(-0)` and the bridge's "falsy limit = everything"
+        // used to turn it into EVERY entry, bodies included.
+        if params.limit == Some(0)
+            && matches!(
+                params.action,
+                LogsAction::Console
+                    | LogsAction::Network
+                    | LogsAction::Ipc
+                    | LogsAction::Navigation
+                    | LogsAction::Dialogs
+                    | LogsAction::Events
+            )
+        {
+            return CallToolResult::success(vec![ContentBlock::text("[]")]);
+        }
         match params.action {
             LogsAction::Console => {
                 let since_arg = params.since.map(|ts| format!("{ts}")).unwrap_or_default();
@@ -2822,7 +3255,8 @@ impl VictauriMcpHandler {
                 let wait = params.wait_for_capture.unwrap_or(false);
                 let limit = params.limit.unwrap_or(DEFAULT_LOG_LIMIT);
                 if wait {
-                    let inner = trimmed_log_js("window.__VICTAURI__.getIpcLog()", limit);
+                    let inner =
+                        trimmed_log_js(&format!("window.__VICTAURI__.getIpcLog({limit})"), limit);
                     let code = format!(
                         r"return (async function() {{
                             await window.__VICTAURI__.waitForIpcComplete(500);
@@ -2838,7 +3272,8 @@ impl VictauriMcpHandler {
                         Err(e) => tool_error(e),
                     }
                 } else {
-                    let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", limit);
+                    let code =
+                        trimmed_log_js(&format!("window.__VICTAURI__?.getIpcLog({limit})"), limit);
                     self.eval_bridge(&code, params.webview_label.as_deref())
                         .await
                 }
@@ -2883,23 +3318,9 @@ impl VictauriMcpHandler {
                     return missing_param("threshold_ms", "slow_ipc");
                 };
                 let limit = params.limit.unwrap_or(20);
-                let mb = MAX_LOG_FIELD_BYTES;
-                let code = format!(
-                    r"return (function() {{
-                        var MB = {mb};
-                        function trimField(v) {{
-                            if (typeof v === 'string') return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
-                            if (v && typeof v === 'object') {{ var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }} if (s.length > MB) return '[truncated ' + s.length + ' bytes]'; }}
-                            return v;
-                        }}
-                        function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
-                        var log = window.__VICTAURI__?.getIpcLog() || [];
-                        var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold}; }});
-                        slow.sort(function(a, b) {{ return (b.duration_ms || 0) - (a.duration_ms || 0); }});
-                        return {{ threshold_ms: {threshold}, count: Math.min(slow.length, {limit}), calls: slow.slice(0, {limit}).map(trimEntry) }};
-                    }})()",
-                );
-                self.eval_bridge(&code, None).await
+                let code = slow_ipc_js(threshold, limit);
+                self.eval_bridge(&code, params.webview_label.as_deref())
+                    .await
             }
             LogsAction::Clear => {
                 // Clearing the IPC/network logs erases captured evidence — a
@@ -2908,8 +3329,11 @@ impl VictauriMcpHandler {
                 if !self.state.privacy.is_tool_enabled("logs.clear") {
                     return tool_disabled("logs.clear");
                 }
-                let code = "return (function(){ var b = window.__VICTAURI__; if (!b) return { ok:false, error:'bridge unavailable' }; if (b.clearIpcLog) b.clearIpcLog(); if (b.clearNetworkLog) b.clearNetworkLog(); return { ok:true, cleared:['ipc','network'] }; })()";
-                self.eval_bridge(code, params.webview_label.as_deref())
+                let code = format!(
+                    "return (function(){{ var b = {}; if (!b) return {{ ok:false, error:'bridge unavailable' }}; b.clearIpcLog(); b.clearNetworkLog(); return {{ ok:true, cleared:['ipc','network'] }}; }})()",
+                    crate::js_bridge::agent_ops_js()
+                );
+                self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
         }
@@ -2932,16 +3356,19 @@ impl VictauriMcpHandler {
             - `contract_clear`: Clear all recorded contract baselines.\n\
             - `startup_timing`: Victauri plugin initialization phase-by-phase timing breakdown.\n\
             - `capabilities`: Enumerate Tauri v2 capabilities, security config (CSP, freeze_prototype), configured plugins, and window definitions.\n\
-            - `db_health`: Read-only SQLite database diagnostics (journal mode, WAL presence, page stats).\n\
+            - `db_health`: Read-only SQLite diagnostics: journal mode, page stats, freelist, \
+              per-table row counts, and SQLite `quick_check` — each phase budgeted; a phase that \
+              runs out is reported (`row_counts_complete`, `integrity_check: \"not completed…\"`) \
+              instead of failing.\n\
             - `plugin_state`: Snapshot of the Victauri plugin's internal state (event log, registry, faults, recording, timings, etc.).\n\
             - `processes`: Enumerate the host process and all child processes (sidecars, background workers) with PID, name, and memory usage.\n\
             - `plugin_tasks`: List Victauri's own spawned async tasks (MCP server, event drain) with status.\n\
             - `event_bus`: List captured Tauri events + app events (auto-intercepted via listen_any — no app opt-in needed). Returns the newest events per category (default 100) so the full buffers (up to ~11k events / megabytes) never overflow the result; `count` is the true total and `truncated` flags a capped slice. Scope via the `args` object: `{\"action\":\"event_bus\",\"args\":{\"limit\":500,\"since_ms\":5000}}`.\n\
             - `event_bus_clear`: Clear the event bus capture buffer.",
         annotations(
-            read_only_hint = true,
-            destructive_hint = false,
-            idempotent_hint = true,
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
             open_world_hint = false
         )
     )]
@@ -2969,7 +3396,7 @@ impl VictauriMcpHandler {
                     .eval_with_return(&code, params.webview_label.as_deref())
                     .await
                 {
-                    Ok(json_str) => serde_json::from_str::<Vec<serde_json::Value>>(&json_str)
+                    Ok(json_str) => page_json::parse_page_json::<Vec<serde_json::Value>>(&json_str)
                         .map(|entries| ipc_timing_stats(&entries))
                         .unwrap_or_default(),
                     Err(_) => Vec::new(),
@@ -2985,6 +3412,9 @@ impl VictauriMcpHandler {
                 let result = serde_json::json!({
                     "commands": stats,
                     "total_commands_profiled": driven_count,
+                    // The store stops tracking NEW command names at its cap; say so rather
+                    // than let a missing command look like one that never ran.
+                    "saturated": driven_count >= COMMAND_TIMINGS_CAP,
                     "ipc_traffic": ipc_traffic,
                     "ipc_commands_observed": ipc_traffic.len(),
                     "slow_threshold_ms": params.slow_threshold_ms,
@@ -3015,13 +3445,15 @@ impl VictauriMcpHandler {
                         .eval_with_return(&code, params.webview_label.as_deref())
                         .await
                     {
-                        Ok(json_str) => match serde_json::from_str::<Vec<String>>(&json_str) {
-                            Ok(names) => {
-                                let count = names.len();
-                                (names.into_iter().collect(), count)
+                        Ok(json_str) => {
+                            match page_json::parse_page_json::<Vec<String>>(&json_str) {
+                                Ok(names) => {
+                                    let count = names.len();
+                                    (names.into_iter().collect(), count)
+                                }
+                                Err(_) => (std::collections::HashSet::new(), 0),
                             }
-                            Err(_) => (std::collections::HashSet::new(), 0),
-                        },
+                        }
                         Err(_) => (std::collections::HashSet::new(), 0),
                     };
 
@@ -3080,7 +3512,7 @@ impl VictauriMcpHandler {
                     .eval_with_return(&code, params.webview_label.as_deref())
                     .await
                 {
-                    Ok(json_str) => serde_json::from_str(&json_str).unwrap_or_default(),
+                    Ok(json_str) => page_json::parse_page_json(&json_str).unwrap_or_default(),
                     Err(e) => return tool_error(format!("failed to read IPC log: {e}")),
                 };
 
@@ -3139,7 +3571,10 @@ impl VictauriMcpHandler {
                             .unwrap_or(serde_json::Value::String(result_str.clone()));
                         let shape = crate::introspection::JsonShape::from_value(&value);
                         let sample = if result_str.len() > 4096 {
-                            format!("{}...(truncated)", &result_str[..4096])
+                            format!(
+                                "{}...(truncated)",
+                                truncate_at_char_boundary(&result_str, 4096)
+                            )
                         } else {
                             result_str
                         };
@@ -3255,7 +3690,12 @@ impl VictauriMcpHandler {
             }
             IntrospectAction::Capabilities => {
                 let config = self.bridge.tauri_config();
-                let live_windows = self.bridge.list_window_labels();
+                // A busy UI is reported as such, never as "no live windows".
+                let (live_windows, live_windows_error) = match self.bridge.try_list_window_labels()
+                {
+                    Ok(labels) => (Some(labels), None),
+                    Err(e) => (None, Some(ui_busy(&e))),
+                };
 
                 let result = serde_json::json!({
                     "app": {
@@ -3266,6 +3706,7 @@ impl VictauriMcpHandler {
                     "security": config.get("security"),
                     "configured_windows": config.get("windows"),
                     "live_windows": live_windows,
+                    "live_windows_error": live_windows_error,
                     "configured_plugins": config.get("plugins"),
                     "victauri": {
                         "registered_commands": self.state.registry.list().len(),
@@ -3378,10 +3819,7 @@ impl VictauriMcpHandler {
                 let since_ms = opts
                     .and_then(|a| a.get("since_ms"))
                     .and_then(serde_json::Value::as_u64);
-                let cutoff = since_ms.map(|ms| {
-                    chrono::Utc::now()
-                        - chrono::TimeDelta::milliseconds(i64::try_from(ms).unwrap_or(i64::MAX))
-                });
+                let cutoff = since_ms.map(|ms| bounded::ms_ago(chrono::Utc::now(), ms));
 
                 let all_tauri = self.state.event_bus.events();
                 let tauri_total = all_tauri.len();
@@ -3459,7 +3897,11 @@ impl VictauriMcpHandler {
             which runs below the layer Victauri can reach. Use this to test a handler's error path when \
             YOU drive it; it does not reproduce a failure a user clicking the UI would see.\n\n\
             Actions:\n\
-            - `inject`: Add a fault rule (requires `command`, `fault_type`). Optional: `delay_ms`, `error_message`, `max_triggers`.\n\
+            - `inject`: Add a fault rule (requires `command`, `fault_type`). Optional: `delay_ms` \
+              (max 120000), `error_message`, `max_triggers`. `delay` sleeps then runs the command; \
+              `error` returns the error without running it; `drop` returns `{}` without running \
+              it; `corrupt` runs it and replaces the response with a fixed \
+              `{\"__corrupted\":true,…}` marker. Rules expire after 15 minutes.\n\
             - `list`: List all active fault injection rules.\n\
             - `clear`: Remove a specific fault rule (requires `command`).\n\
             - `clear_all`: Remove all fault rules.",
@@ -3560,7 +4002,9 @@ impl VictauriMcpHandler {
             + window events across the Rust backend and webview simultaneously.\n\n\
             Actions:\n\
             - `summary`: High-level activity summary for the last N seconds (default 30). \
-              Counts IPC calls, DOM mutations, console entries, network requests, errors.\n\
+              Counts IPC calls, DOM mutations, console entries, state changes (incl. network \
+              requests), errors. With no recording active it reads the window's live event \
+              stream (`webview_label`, default main).\n\
             - `last_action`: Correlate the most recent burst of events into a causal timeline \
               (e.g. 'IPC call → DOM update → console.log').\n\
             - `diff`: What changed in the last N seconds — event counts, errors, new IPC commands.",
@@ -3579,8 +4023,7 @@ impl VictauriMcpHandler {
         match params.action {
             ExplainAction::Summary => {
                 let secs = params.seconds.unwrap_or(30);
-                let since = chrono::Utc::now()
-                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let since = bounded::secs_ago(chrono::Utc::now(), secs);
                 let events = self
                     .explain_events(since, params.webview_label.as_deref())
                     .await;
@@ -3673,8 +4116,7 @@ impl VictauriMcpHandler {
             }
             ExplainAction::LastAction => {
                 let secs = params.seconds.unwrap_or(5);
-                let since = chrono::Utc::now()
-                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let since = bounded::secs_ago(chrono::Utc::now(), secs);
                 let events = self
                     .explain_events(since, params.webview_label.as_deref())
                     .await;
@@ -3699,6 +4141,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             mutation_count,
                             webview_label,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -3725,6 +4168,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             key,
                             caused_by,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -3739,6 +4183,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             level,
                             message,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -3750,6 +4195,7 @@ impl VictauriMcpHandler {
                             timestamp,
                             label,
                             event,
+                            ..
                         } => serde_json::json!({
                             "time": timestamp.to_rfc3339_opts(
                                 chrono::SecondsFormat::Millis, true
@@ -3788,8 +4234,7 @@ impl VictauriMcpHandler {
             }
             ExplainAction::Diff => {
                 let secs = params.seconds.unwrap_or(10);
-                let since = chrono::Utc::now()
-                    - chrono::TimeDelta::try_seconds(secs as i64).unwrap_or_default();
+                let since = bounded::secs_ago(chrono::Utc::now(), secs);
                 let events = self
                     .explain_events(since, params.webview_label.as_deref())
                     .await;
@@ -3827,13 +4272,18 @@ impl VictauriMcpHandler {
                     }
                 }
 
-                ipc_commands.dedup();
+                // Every call counts; each command is listed once, in first-call order (a
+                // consecutive-only `dedup` used to undercount the calls and still list a
+                // command once per non-adjacent run).
+                let ipc_calls_made = ipc_commands.len();
+                let mut seen = HashSet::new();
+                ipc_commands.retain(|c| seen.insert(c.clone()));
 
                 let result = serde_json::json!({
                     "since": since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
                     "time_window_secs": secs,
                     "total_events": events.len(),
-                    "ipc_calls_made": ipc_commands.len(),
+                    "ipc_calls_made": ipc_calls_made,
                     "unique_commands": ipc_commands,
                     "dom_elements_changed": dom_changes,
                     "interactions": interaction_count,
@@ -3855,6 +4305,10 @@ impl VictauriMcpHandler {
             subscriptions: Arc::new(Mutex::new(HashSet::new())),
             bridge_checked: Arc::new(AtomicBool::new(false)),
             timed_out_labels: Arc::new(Mutex::new(HashSet::new())),
+            probe_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_PROBES)),
+            file_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_READS)),
+            probe_timeout: PROBE_TIMEOUT,
+            file_read_timeout: READ_APP_FILE_TIMEOUT,
         }
     }
 
@@ -3870,7 +4324,12 @@ impl VictauriMcpHandler {
         // Centralized authorization: resolve the canonical `tool.action` capability
         // and gate on it BEFORE dispatch, so every compound action is checked
         // uniformly (not just the ones whose handler remembers to). See `authz`.
-        let capability = authz::canonical_capability(name, &args);
+        // A disabled tool reports "disabled" whatever its arguments look like.
+        if self.state.privacy.disabled_tools.contains(name) {
+            return Ok(tool_disabled(name));
+        }
+        let capability =
+            authz::resolve_capability(name, &args).map_err(rest::ToolCallError::InvalidParams)?;
         if !self.state.privacy.is_call_allowed(name, &capability) {
             return Ok(tool_disabled(&capability));
         }
@@ -3878,6 +4337,36 @@ impl VictauriMcpHandler {
         let start = std::time::Instant::now();
         tracing::debug!(tool = %name, "REST tool invocation started");
 
+        // A panicking handler becomes an error RESULT; without this boundary it unwound into
+        // hyper's connection task and the client saw a reset connection.
+        let result = match bounded::CatchUnwind::new(self.dispatch_tool(name, args)).await {
+            Ok(dispatched) => dispatched?,
+            Err(panic) => {
+                tracing::error!(tool = %name, "tool handler panicked: {panic}");
+                tool_panicked(name, &panic)
+            }
+        };
+
+        let elapsed = start.elapsed();
+        tracing::debug!(
+            tool = %name,
+            elapsed_ms = elapsed.as_millis() as u64,
+            "REST tool invocation completed"
+        );
+
+        if self.state.privacy.redaction_enabled {
+            Ok(Self::redact_result(result, &self.state.privacy))
+        } else {
+            Ok(result)
+        }
+    }
+
+    /// Route one already-authorized REST call to its tool handler.
+    async fn dispatch_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<CallToolResult, rest::ToolCallError> {
         let result = match name {
             "eval_js" => {
                 let p: EvalJsParams = Self::parse_args(args)?;
@@ -4012,19 +4501,7 @@ impl VictauriMcpHandler {
             }
             _ => return Err(rest::ToolCallError::UnknownTool(name.to_string())),
         };
-
-        let elapsed = start.elapsed();
-        tracing::debug!(
-            tool = %name,
-            elapsed_ms = elapsed.as_millis() as u64,
-            "REST tool invocation completed"
-        );
-
-        if self.state.privacy.redaction_enabled {
-            Ok(Self::redact_result(result, &self.state.privacy))
-        } else {
-            Ok(result)
-        }
+        Ok(result)
     }
 
     fn parse_args<T: serde::de::DeserializeOwned>(
@@ -4043,6 +4520,29 @@ impl VictauriMcpHandler {
             }
         }
         result
+    }
+
+    /// Read at most `max_bytes` (+1, to detect truncation) of the regular file at `path` on
+    /// the blocking pool, within [`READ_APP_FILE_TIMEOUT`] and one of the
+    /// [`MAX_CONCURRENT_FILE_READS`] slots. A read that blocks (a FIFO or device swapped in
+    /// after the handler's checks) returns at the deadline; its thread keeps the slot until
+    /// it finishes, so such reads cannot pile up.
+    async fn read_regular_file_bounded(
+        &self,
+        path: std::path::PathBuf,
+        max_bytes: usize,
+    ) -> Result<(Vec<u8>, usize, Option<u64>), String> {
+        let Ok(slot) = Arc::clone(&self.file_slots).try_acquire_owned() else {
+            return Err(format!(
+                "file reads are busy ({MAX_CONCURRENT_FILE_READS} still running — a read \
+                 blocked on a pipe or device keeps running past its timeout). Retry shortly."
+            ));
+        };
+        bounded::run_blocking_bounded(None, "file read", self.file_read_timeout, move || {
+            let _slot = slot;
+            read_regular_file(&path, max_bytes)
+        })
+        .await
     }
 
     fn resolve_app_dir(&self, dir: Option<AppDir>) -> Result<std::path::PathBuf, String> {
@@ -4099,13 +4599,43 @@ impl VictauriMcpHandler {
         requested: &str,
     ) -> Result<std::path::PathBuf, String> {
         let candidate = std::path::Path::new(requested);
+        // One answer for "missing" and "resolves outside every root" (a symlink inside a root
+        // pointing elsewhere): distinct answers told the caller whether an arbitrary path
+        // exists on disk.
+        let not_found = || {
+            format!(
+                "database not found (or it resolves outside the allowed directories): {requested}"
+            )
+        };
         if candidate.is_absolute() {
-            if !candidate.exists() {
-                return Err(format!("database not found: {requested}"));
+            // `root/link/../y` normalizes lexically to `root/y`, but the OS resolves `..` AFTER
+            // following `link` — so the existence check probed a path outside every root.
+            if candidate
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err("path traversal not allowed: '..' is rejected".to_string());
             }
-            if roots
-                .iter()
-                .any(|root| Self::safe_within(root, candidate).is_ok())
+            // Decide containment LEXICALLY first, before touching the requested path: checking
+            // existence first answered "does X exist?" for any path on disk ("not found" vs
+            // "not within an allowed directory"). The canonical check below still catches
+            // symlink escapes for paths that are lexically inside a root.
+            let normalized = lexically_normalize(candidate);
+            let lexically_inside = roots.iter().any(|root| {
+                normalized.starts_with(lexically_normalize(root))
+                    || std::fs::canonicalize(root)
+                        .is_ok_and(|canon_root| normalized.starts_with(canon_root))
+            });
+            if !lexically_inside {
+                return Err(format!(
+                    "absolute path '{requested}' is not within an allowed directory; \
+                     register its parent via VictauriBuilder::db_search_paths"
+                ));
+            }
+            if candidate.exists()
+                && roots
+                    .iter()
+                    .any(|root| Self::safe_within(root, candidate).is_ok())
             {
                 // Open the CANONICAL validated path, not the caller's literal absolute path,
                 // so the DB is opened at exactly the containment-approved location — symmetric
@@ -4116,17 +4646,14 @@ impl VictauriMcpHandler {
                     .map_err(|e| format!("cannot resolve database path: {e}"))?;
                 return Ok(canonical);
             }
-            return Err(format!(
-                "absolute path '{requested}' is not within an allowed directory; \
-                 register its parent via VictauriBuilder::db_search_paths"
-            ));
+            return Err(not_found());
         }
 
         Self::lexical_safe(candidate)?;
         for root in roots {
             let resolved = root.join(candidate);
-            if resolved.exists() {
-                Self::safe_within(root, &resolved)?;
+            // A match that escapes its root is treated exactly like a miss (see `not_found`).
+            if resolved.exists() && Self::safe_within(root, &resolved).is_ok() {
                 // Open the CANONICAL validated path, not the lexical join, so the DB is opened
                 // at exactly the path containment approved (closes the trivial validate-lexical
                 // vs open-lexical TOCTOU; a same-privilege local symlink swap between
@@ -4142,9 +4669,7 @@ impl VictauriMcpHandler {
             .map(|root| root.display().to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        Err(format!(
-            "database not found: {requested} (searched: {roots})"
-        ))
+        Err(format!("{} (searched: {roots})", not_found()))
     }
 
     /// Events for `explain` since `since`. While a recording is active the background drain
@@ -4169,7 +4694,7 @@ impl VictauriMcpHandler {
         };
         let label = webview_label.unwrap_or("main");
         let mut events: Vec<victauri_core::AppEvent> =
-            serde_json::from_str::<Vec<serde_json::Value>>(&raw)
+            page_json::parse_page_json::<Vec<serde_json::Value>>(&raw)
                 .unwrap_or_default()
                 .iter()
                 .filter_map(|ev| crate::mcp::server::parse_bridge_event_from(ev, label))
@@ -4177,18 +4702,6 @@ impl VictauriMcpHandler {
                 .collect();
         events.sort_by_key(victauri_core::AppEvent::timestamp);
         events
-    }
-
-    /// The window an unlabeled eval lands on, mirroring the bridge's default selection
-    /// (`main` → first visible → any). Used only to detect the window disappearing mid-call.
-    fn default_window_label(&self) -> Option<String> {
-        let states = self.bridge.get_window_states(None);
-        states
-            .iter()
-            .find(|s| s.label == "main")
-            .or_else(|| states.iter().find(|s| s.visible))
-            .or_else(|| states.first())
-            .map(|s| s.label.clone())
     }
 
     /// Resolve the EXACT window a native capture (`screenshot`, `trace`) should target, and
@@ -4206,7 +4719,10 @@ impl VictauriMcpHandler {
     /// hidden in the gap is still TOCTOU; the worst case is a wrong image, not a security
     /// boundary.
     fn resolve_visible_capture_target(&self, label: Option<&str>) -> Result<String, String> {
-        let states = self.bridge.get_window_states(None);
+        let states = self
+            .bridge
+            .try_get_window_states(None)
+            .map_err(|e| ui_busy(&e))?;
         if let Some(label) = label {
             // An explicit label that the enumerator reports hidden is rejected; visible or
             // unknown labels fall through (an unknown one lets get_native_handle produce the
@@ -4236,66 +4752,34 @@ impl VictauriMcpHandler {
             })
     }
 
-    fn list_dir_recursive(
-        dir: &std::path::Path,
+    /// Whether `target` exists, after refusing it if it resolves outside `base`.
+    ///
+    /// For a missing target, containment is decided on its deepest EXISTING ancestor, so a
+    /// path routed through a symlink out of `base` is refused whether or not its final
+    /// component exists ("missing" vs "outside" would otherwise reveal whether an arbitrary
+    /// outside path exists).
+    fn contained_or_missing(
         base: &std::path::Path,
-        depth: u32,
-        max_depth: u32,
-        pattern: Option<&str>,
-        entries: &mut Vec<serde_json::Value>,
-    ) {
-        if entries.len() >= MAX_DIR_ENTRIES {
-            return;
-        }
-        let Ok(read_dir) = std::fs::read_dir(dir) else {
-            return;
+        target: &std::path::Path,
+    ) -> Result<bool, String> {
+        // A missing base holds nothing (and no symlink that could lead out of it).
+        let Ok(canon_base) = std::fs::canonicalize(base) else {
+            return Ok(false);
         };
-        for entry in read_dir.flatten() {
-            if entries.len() >= MAX_DIR_ENTRIES {
-                return;
-            }
-            let path = entry.path();
-            if path.is_symlink() {
-                continue;
-            }
-            // `is_symlink` does not cover every redirecting filesystem object
-            // (notably Windows directory junctions/reparse points). Canonical
-            // containment is the actual boundary before metadata or recursion.
-            if Self::safe_within(base, &path).is_err() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let relative = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .into_owned();
-
-            if let Some(pat) = pattern
-                && !Self::matches_glob(&name, pat)
-                && !path.is_dir()
-            {
-                continue;
-            }
-
-            let is_dir = path.is_dir();
-            let meta = std::fs::metadata(&path).ok();
-
-            entries.push(serde_json::json!({
-                "name": name,
-                "path": relative,
-                "is_dir": is_dir,
-                "size": meta.as_ref().map(std::fs::Metadata::len),
-                "modified": meta.as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .map(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default().as_secs()),
-            }));
-
-            if is_dir && depth < max_depth {
-                Self::list_dir_recursive(&path, base, depth + 1, max_depth, pattern, entries);
+        let exists = target.exists();
+        let probe = if exists {
+            Some(target)
+        } else {
+            target.ancestors().skip(1).find(|a| a.exists())
+        };
+        if let Some(probe) = probe {
+            let canonical = std::fs::canonicalize(probe)
+                .map_err(|e| format!("cannot resolve target path: {e}"))?;
+            if !canonical.starts_with(&canon_base) {
+                return Err("path traversal not allowed".to_string());
             }
         }
+        Ok(exists)
     }
 
     fn matches_glob(name: &str, pattern: &str) -> bool {
@@ -4317,8 +4801,14 @@ impl VictauriMcpHandler {
     /// the bridge's callback IPC, so eval/dom/animation tools see nothing. This
     /// turns that silent dead-end into an actionable, up-front diagnosis.
     async fn window_introspectability(&self) -> CallToolResult {
-        let labels = self.bridge.list_window_labels();
-        let states = self.bridge.get_window_states(None);
+        let labels = match self.bridge.try_list_window_labels() {
+            Ok(labels) => labels,
+            Err(e) => return tool_error(ui_busy(&e)),
+        };
+        let states = match self.bridge.try_get_window_states(None) {
+            Ok(states) => states,
+            Err(e) => return tool_error(ui_busy(&e)),
+        };
         let mut report = Vec::with_capacity(labels.len());
         let mut blind = 0usize;
         for label in &labels {
@@ -4365,9 +4855,59 @@ impl VictauriMcpHandler {
         }))
     }
 
+    /// Focus `ref_id` before trusted (OS-level) keystrokes and confirm focus LANDED on it —
+    /// the keys go to whatever holds focus, so an element that exists but did not take focus
+    /// (not focusable, inert, or a focus handler moved focus on) must stop the input.
+    async fn focus_for_trusted_input(
+        &self,
+        ref_id: &str,
+        webview_label: Option<&str>,
+    ) -> Result<(), CallToolResult> {
+        let raw = self
+            .eval_with_return(&trusted_focus_probe_js(ref_id), webview_label)
+            .await
+            .map_err(|e| {
+                tool_error(format!(
+                    "could not focus {ref_id} before sending OS input: {e} — no keys were sent"
+                ))
+            })?;
+        let answer = serde_json::from_str::<serde_json::Value>(&raw).unwrap_or_default();
+        if answer.get("focused") == Some(&serde_json::Value::Bool(true)) {
+            return Ok(());
+        }
+        let why = if answer.get("found") == Some(&serde_json::Value::Bool(true)) {
+            "focus did not land on it (not focusable, inert, or a focus handler moved focus \
+             elsewhere)"
+        } else {
+            "ref not found"
+        };
+        Err(tool_error_with_hint(
+            format!(
+                "ref not found or not focusable: {ref_id}: {why} — no keys were sent (they \
+                 would have gone to whatever holds focus)"
+            ),
+            RecoveryHint::CheckInput,
+        ))
+    }
+
     async fn eval_bridge(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
         match self.eval_with_return(code, webview_label).await {
             Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
+            Err(e) => tool_error(e),
+        }
+    }
+
+    /// Run a page ACTION (`interact`, `input`, `inspect`, `route add`) and report a failure the
+    /// page returns — `{ok: false, error, hint}` or `{error}` — as a tool error carrying the
+    /// page's message and recovery hint. These used to come back as a SUCCESS result, so a
+    /// refused click (covered, disabled, ref not found) read as done unless the caller parsed
+    /// the body (R5B-ISERR1).
+    async fn eval_page_action(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
+        match self.eval_with_return(code, webview_label).await {
+            Ok(result) => match page_action_error(&result) {
+                Some(message) => tool_error(message),
+                None => CallToolResult::success(vec![ContentBlock::text(result)]),
+            },
             Err(e) => tool_error(e),
         }
     }
@@ -4386,38 +4926,41 @@ impl VictauriMcpHandler {
     /// a TRUE hard ceiling — a separate check-then-insert races (concurrent callers all pass
     /// a stale check, then each inserts, blowing past the cap). On a saturated map it also
     /// fails fast (before any eval is injected) with the real "too many concurrent" cause
-    /// rather than letting a probe burn its full timeout.
+    /// rather than letting a probe burn its full timeout. The slot is released when the
+    /// returned guard drops — on every exit, including the caller's future being dropped.
     async fn reserve_pending(
         &self,
         id: &str,
         tx: tokio::sync::oneshot::Sender<String>,
-    ) -> Result<(), String> {
+    ) -> Result<crate::PendingSlot, String> {
         let mut pending = self.state.pending_evals.lock().await;
         if pending.len() >= MAX_PENDING_EVALS {
             return Err(format!(
                 "too many concurrent eval requests (limit: {MAX_PENDING_EVALS})"
             ));
         }
-        pending.insert(id.to_string(), tx);
-        Ok(())
+        Ok(crate::PendingSlot::insert(
+            &self.state.pending_evals,
+            &mut pending,
+            id.to_string(),
+            tx,
+        ))
     }
 
-    async fn probe_bridge(&self, webview_label: Option<&str>) -> Result<(), String> {
+    /// Liveness probe. On success, returns the nonce of the page that answered (`None` for a
+    /// page without the Victauri bridge).
+    async fn probe_bridge(&self, webview_label: Option<&str>) -> Result<Option<String>, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.reserve_pending(&id, tx).await?;
-        let id_js = js_string(&id);
-        let probe = format!(
-            r#"(async()=>{{await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback',{{id:{id_js},result:'"probe_ok"'}});}})();"#
-        );
+        let slot = self.reserve_pending(&id, tx).await?;
+        slot.bind_window(webview_label);
+        let probe = crate::js_bridge::eval_probe_script(&id);
         if let Err(e) = self.bridge.eval_webview(webview_label, &probe) {
-            self.state.pending_evals.lock().await.remove(&id);
             return Err(format!("eval injection failed: {e}"));
         }
-        if let Ok(Ok(_)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
-            Ok(())
+        if let Ok(Ok(raw)) = tokio::time::timeout(std::time::Duration::from_secs(2), rx).await {
+            Ok(crate::js_bridge::probe_answer_nonce(&raw))
         } else {
-            self.state.pending_evals.lock().await.remove(&id);
             let label = webview_label.unwrap_or("default");
             Err(format!(
                 "bridge not responding on window '{label}' — the window may be hidden, \
@@ -4428,12 +4971,102 @@ impl VictauriMcpHandler {
         }
     }
 
+    /// Whether window `label` has shown a page other than the one an eval was armed in since
+    /// ready-signal `seen` — and if so, the error to report. A ready signal carrying the armed
+    /// nonce is the eval's own page announcing itself late (under load that can take seconds);
+    /// any other is confirmed by asking the page for its CURRENT nonce, because page script can
+    /// send a ready signal itself and must not be able to abort the agent's calls with it.
+    ///
+    /// Only POSITIVE evidence aborts: the page answering the probe with a nonce other than the
+    /// armed one (its bridge's nonce is frozen, so it cannot change without a new page — and a
+    /// page answering with no nonce where one was armed has lost the bridge that armed the
+    /// eval). A probe that fails (a busy UI thread, a full slot map) proves nothing, so the
+    /// eval keeps waiting — its own timeout still bounds it — and the signal is re-checked on
+    /// the next watch tick. Aborting on a failed probe let page script (a forged signal while
+    /// the UI is busy) cut an agent's call short and invited a retry that ran code twice.
+    /// With no armed nonce (a page without the Victauri bridge) only a page that now HAS a
+    /// nonce is evidence of a change.
+    async fn page_replaced(
+        &self,
+        label: Option<&str>,
+        seen: &mut u64,
+        armed: Option<&str>,
+    ) -> Option<String> {
+        let label = label?;
+        let load = self.state.page_loads.latest(label)?;
+        if load.seq <= *seen {
+            return None;
+        }
+        let previously_seen = *seen;
+        *seen = load.seq;
+        if armed.is_some() && load.nonce.as_deref() == armed {
+            return None;
+        }
+        match self.probe_bridge(Some(label)).await {
+            Ok(current) if current.as_deref() != armed => Some(format!(
+                "window '{label}' loaded a new page (a reload or navigation) while the call was \
+                 in flight, so no result will arrive. The code may or may not have run before \
+                 the reload — check the app's state before re-running it."
+            )),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!(
+                    window = label,
+                    "ready signal not confirmed ({e}); the eval keeps waiting"
+                );
+                // Unconfirmed: look at this signal again on the next watch tick.
+                *seen = previously_seen;
+                None
+            }
+        }
+    }
+
+    /// Drain every window into the active recording one last time before `recording stop`,
+    /// within [`FINAL_FLUSH_BUDGET`] in total. Returns the windows that could not be read in time
+    /// (their not-yet-drained events are missing from the stopped session).
+    async fn final_recording_flush(&self) -> Vec<String> {
+        let Ok(labels) = self.bridge.try_list_window_labels() else {
+            return vec!["(window list unavailable: UI thread busy)".to_string()];
+        };
+        let mut pending = labels.clone();
+        let flushed = tokio::time::timeout(FINAL_FLUSH_BUDGET, async {
+            for label in &labels {
+                if crate::mcp::server::drain_window_into_recording(&self.state, &self.bridge, label)
+                    .await
+                    .is_some()
+                {
+                    pending.retain(|l| l != label);
+                }
+            }
+        })
+        .await;
+        if flushed.is_err() {
+            tracing::debug!("recording stop: final flush ran out of time");
+        }
+        pending
+    }
+
     async fn eval_with_return_timeout(
         &self,
         code: &str,
         webview_label: Option<&str>,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
+        self.eval_outcome(code, webview_label, timeout)
+            .await
+            .map_err(|f| f.message)
+    }
+
+    /// Run `code` in the webview and wait for its outcome; a failure says whether the code ran.
+    #[allow(clippy::too_many_lines)]
+    async fn eval_outcome(
+        &self,
+        code: &str,
+        webview_label: Option<&str>,
+        timeout: std::time::Duration,
+    ) -> Result<String, EvalFailure> {
+        use EvalFailureKind::{Aborted, NotSent, Page};
+
         // The hard concurrency ceiling is enforced atomically at every reservation
         // (`reserve_pending`, used by both the probe and the real eval below) — NOT with a
         // separate early check, which races: concurrent callers would all pass a stale
@@ -4460,10 +5093,25 @@ impl VictauriMcpHandler {
             }
         }
 
+        // Subscribe before anything is sent AND check the current value: `subscribe()` marks it
+        // seen, so a call started after the app's exit signal would otherwise wait out its whole
+        // timeout for a change that has already happened.
+        let mut shutdown = self.state.shutdown_tx.subscribe();
+        if *shutdown.borrow() {
+            return Err(EvalFailure::new(
+                NotSent,
+                "the app is shutting down, so the call was not sent",
+            ));
+        }
+
         // Reserved sentinel key for the default (unlabeled) window — cannot
         // collide with a real label.
         let label_key =
             webview_label.map_or_else(|| "\u{1}__default__".to_string(), str::to_string);
+
+        // Ready signals from here on may come from a page that replaced the one this eval runs
+        // in; an earlier one cannot (the probe below then answers from the new page).
+        let mut loads_seen = self.state.page_loads.current_seq();
 
         // Liveness probe before EVERY eval — on the DEFAULT window as well as
         // labeled ones. The probe is a tiny round-trip that returns in ~ms on a
@@ -4475,23 +5123,34 @@ impl VictauriMcpHandler {
         // probed at all. Probing every call (not once-cached) is what guarantees
         // *zero* 30s hangs even across repeated reloads; the healthy-path cost is a
         // single sub-millisecond localhost round-trip, negligible against the value
-        // of never stalling an agent into a CDP fallback. (A saturated pending-eval
-        // map is already rejected above, before this probe.)
+        // of never stalling an agent into a CDP fallback. It also reports the nonce of the
+        // page the eval is armed in, which is what tells a reload from a late ready signal.
         let prev_timed_out = self.timed_out_labels.lock().await.remove(&label_key);
-        if let Err(e) = self.probe_bridge(webview_label).await {
-            return Err(if prev_timed_out {
-                format!(
-                    "{e} (a previous eval on this window also timed out — the webview \
-                     likely reloaded or the app stopped responding)"
-                )
-            } else {
-                e
-            });
-        }
+        let armed_nonce = match self.probe_bridge(webview_label).await {
+            Ok(nonce) => nonce,
+            Err(e) => {
+                return Err(EvalFailure::new(
+                    NotSent,
+                    if prev_timed_out {
+                        format!(
+                            "{e} (a previous eval on this window also timed out — the webview \
+                             likely reloaded or the app stopped responding)"
+                        )
+                    } else {
+                        e
+                    },
+                ));
+            }
+        };
 
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.reserve_pending(&id, tx).await?;
+        let slot = self
+            .reserve_pending(&id, tx)
+            .await
+            .map_err(|e| EvalFailure::new(NotSent, e))?;
+        // Only the target window may answer (a `None` label is narrowed once it has resolved).
+        slot.bind_window(webview_label);
 
         // Auto-prepend `return` so bare expressions produce a value — but ONLY
         // for single expressions. Multi-statement blocks (or code containing an
@@ -4508,171 +5167,177 @@ impl VictauriMcpHandler {
             code.trim().to_string()
         };
 
-        let id_js = js_string(&id);
-
         // Fail fast on a SYNTAX error instead of hanging for the full timeout (audit /
         // red-team "malformed eval consumes the full 30s"). The user code is inlined into
-        // the script below; if it has a parse error the WHOLE script fails to parse and the
-        // try/catch never runs, so the callback never fires. We cannot wrap the code in
-        // `new Function`/`AsyncFunction` to surface the SyntaxError, because dynamic code
-        // generation is gated by the same `unsafe-eval` CSP that blocks `eval()` — which is
-        // exactly why the bridge uses an inline async-IIFE in the first place. Instead an
-        // independent watchdog (which always parses) reports a parse error quickly: the
-        // user-code script sets a `started` flag at its very top, so a script that fails to
-        // parse never sets it. A valid-but-slow eval (e.g. a `wait_for` poll) sets `started`
-        // immediately and is left to run to the real timeout — the watchdog only fires when
-        // the code never began executing.
-        let watchdog = format!(
-            r"
-            (function () {{
-                window.__VIC_EVAL__ = window.__VIC_EVAL__ || {{}};
-                var s = (window.__VIC_EVAL__[{id_js}] =
-                    window.__VIC_EVAL__[{id_js}] || {{ started: false, done: false }});
-                setTimeout(function () {{
-                    if (s.started || s.done) return;
-                    s.done = true;
-                    try {{
-                        window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                            id: {id_js},
-                            result: JSON.stringify({{ __victauri_err: 'code did not begin executing within {PARSE_WATCHDOG_MS}ms — this almost always means a syntax/parse error in the submitted code (or the page main thread was blocked)' }})
-                        }});
-                    }} catch (e) {{}}
-                    delete window.__VIC_EVAL__[{id_js}];
-                }}, {PARSE_WATCHDOG_MS});
-            }})();
-            "
-        );
+        // the wrapper; if it has a parse error the WHOLE script fails to parse, so its callback
+        // never fires. We cannot wrap the code in `new Function`/`AsyncFunction` to surface the
+        // SyntaxError, because dynamic code generation is gated by the same `unsafe-eval` CSP
+        // that blocks `eval()` — which is exactly why the bridge uses an inline async-IIFE in
+        // the first place. Instead a check script (which always parses) is delivered right
+        // AFTER the wrapper, to the same window: webview evals run in order, and a wrapper that
+        // parsed has already marked itself begun, so "not begun" means it did not parse. There
+        // is no timer to race: the check used to be a 750ms watchdog armed BEFORE the code, and
+        // a busy main thread delaying the code past it reported a parse error for code that
+        // then ran (an `invoke_command` retried on that ran twice).
+        // The settle logic lives in the bridge's closure-private state (see `_evalBegin` /
+        // `_evalCheck` / `_evalSettle` in js_bridge.rs): the page can neither enumerate pending
+        // eval ids nor suppress results, each outcome is delivered at most once, and
+        // serialization uses a `JSON.stringify` captured before any page script ran.
+        let inject = crate::js_bridge::eval_wrapper_script(&id, &code);
+        let target = self
+            .bridge
+            .eval_webview_resolved(webview_label, &inject)
+            .map_err(|e| EvalFailure::new(NotSent, format!("eval injection failed: {e}")))?;
+        let deliver_to = if target.is_empty() {
+            webview_label
+        } else {
+            slot.bind_window(Some(target.as_str()));
+            Some(target.as_str())
+        };
+        let check = crate::js_bridge::eval_check_script(&id, armed_nonce.as_deref());
+        // The check only runs when the page reported a nonce (see `eval_check_script`) and the
+        // script reached it; only then can a timeout rule out a parse error.
+        let parse_check_armed = match self.bridge.eval_webview(deliver_to, &check) {
+            Ok(()) => armed_nonce.is_some(),
+            Err(e) => {
+                // Only the fast parse-error report is lost; the code itself was delivered.
+                tracing::debug!("eval parse check not delivered: {e}");
+                false
+            }
+        };
 
-        let inject = format!(
-            r"
-            (async () => {{
-                var __s = (window.__VIC_EVAL__ && window.__VIC_EVAL__[{id_js}]) || null;
-                if (__s) __s.started = true;
-                try {{
-                    const __result = await (async () => {{ {code} }})();
-                    if (__s) {{ if (__s.done) return; __s.done = true; delete window.__VIC_EVAL__[{id_js}]; }}
-                    const __type = __result === undefined ? 'undefined'
-                        : __result === null ? 'null' : 'value';
-                    const __val = __type === 'undefined' ? null
-                        : __type === 'null' ? null : __result;
-                    await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                        id: {id_js},
-                        result: JSON.stringify({{ __victauri_ok: __val, __victauri_type: __type }})
-                    }});
-                }} catch (e) {{
-                    if (__s) {{ if (__s.done) return; __s.done = true; delete window.__VIC_EVAL__[{id_js}]; }}
-                    await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                        id: {id_js},
-                        result: JSON.stringify({{ __victauri_err: (function (x) {{
-                            // A Tauri command's `Err(serde struct)` rejects with a plain object:
-                            // `String(obj)` would collapse it to '[object Object]'.
-                            if (x && typeof x.message === 'string') return x.message;
-                            if (typeof x === 'string') return x;
-                            try {{ var s = JSON.stringify(x); if (s !== undefined) return s; }} catch (_) {{}}
-                            try {{ return String(x); }} catch (_) {{ return Object.prototype.toString.call(x); }}
-                        }})(e) }})
-                    }});
-                }}
-            }})();
-            "
-        );
-
-        // Inject the watchdog first so it is armed before the user code runs. Order is not
-        // critical (the user-code script no-ops the watchdog state if it ran first), but
-        // arming first minimises the window.
-        if let Err(e) = self.bridge.eval_webview(webview_label, &watchdog) {
-            self.state.pending_evals.lock().await.remove(&id);
-            return Err(format!("eval injection failed: {e}"));
-        }
-        if let Err(e) = self.bridge.eval_webview(webview_label, &inject) {
-            self.state.pending_evals.lock().await.remove(&id);
-            return Err(format!("eval injection failed: {e}"));
-        }
-
-        // While waiting, watch for the two ways a call ends with NO callback ever coming: the
-        // target window was destroyed, or the app began shutting down. Both are the EXPECTED
-        // outcome of code that closes its own window or quits the app (e.g. invoking a
-        // `quit_app` command) — reporting them after the full timeout as "an unresolved
-        // promise, an infinite loop…" misled agents into thinking the call never ran.
-        // Resolved lazily on the first liveness tick, so a fast eval never pays for it.
-        let mut watched: Option<Option<String>> = None;
-        let mut shutdown = self.state.shutdown_tx.subscribe();
+        // While waiting, watch for the ways a call ends with NO callback ever coming: the
+        // target window was destroyed, it loaded a new page, or the app began shutting down.
+        // All are the EXPECTED outcome of code that closes its own window, navigates or quits
+        // the app (e.g. invoking a `quit_app` command) — reporting them after the full timeout
+        // as "an unresolved promise, an infinite loop…" misled agents into thinking the call
+        // never ran.
+        //
+        // The window check runs in its own task: listing windows is a main-thread round trip
+        // that can take up to ~2x its 10s dispatch timeout (about 20s) on a busy UI, and must neither stall this
+        // wait nor push it past its deadline. A listing that FAILS (a busy or wedged UI) is not
+        // evidence of anything — only a successful listing that lacks the window is.
+        let watched: Option<String> = (!target.is_empty()).then_some(target);
         let deadline = tokio::time::Instant::now() + timeout;
         let mut liveness = tokio::time::interval_at(
             tokio::time::Instant::now() + EVAL_WINDOW_WATCH_INTERVAL,
             EVAL_WINDOW_WATCH_INTERVAL,
         );
+        let mut check: Option<tokio::task::JoinHandle<Result<Vec<String>, String>>> = None;
+        let armed = armed_nonce.as_deref();
         let mut rx = rx;
-        let outcome = loop {
-            tokio::select! {
-                r = &mut rx => break Ok(r),
-                () = tokio::time::sleep_until(deadline) => break Err(None),
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break Err(Some(
-                            "the app began shutting down while the call was in flight, so no \
-                             result will arrive. If the code/command quits or restarts the app, \
-                             this is the expected outcome and it most likely ran — do not \
-                             re-run it blindly."
-                                .to_string(),
-                        ));
+        // A reload that completed while the code was being delivered is already recorded.
+        let outcome = if let Some(msg) = self
+            .page_replaced(watched.as_deref(), &mut loads_seen, armed)
+            .await
+        {
+            Err(Some(msg))
+        } else {
+            loop {
+                tokio::select! {
+                    r = &mut rx => break Ok(r),
+                    () = self.state.page_loads.changed() => {
+                        if let Some(msg) =
+                            self.page_replaced(watched.as_deref(), &mut loads_seen, armed).await
+                        {
+                            break Err(Some(msg));
+                        }
                     }
-                }
-                _ = liveness.tick() => {
-                    let watched = watched.get_or_insert_with(|| {
-                        webview_label
-                            .map(str::to_string)
-                            .or_else(|| self.default_window_label())
-                    });
-                    if let Some(label) = watched.as_deref()
-                        && !self.bridge.list_window_labels().iter().any(|l| l == label)
+                    () = tokio::time::sleep_until(deadline) => break Err(None),
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break Err(Some(
+                                "the app began shutting down while the call was in flight, so \
+                                 no result will arrive. If the code/command quits or restarts the \
+                                 app, this is the expected outcome and it most likely ran — do \
+                                 not re-run it blindly."
+                                    .to_string(),
+                            ));
+                        }
+                    }
+                    _ = liveness.tick(), if watched.is_some() && check.is_none() => {
+                        // Backstop for a ready signal that arrived between select rounds.
+                        if let Some(msg) =
+                            self.page_replaced(watched.as_deref(), &mut loads_seen, armed).await
+                        {
+                            break Err(Some(msg));
+                        }
+                        let bridge = Arc::clone(&self.bridge);
+                        check = Some(tokio::spawn(async move { bridge.try_list_window_labels() }));
+                    }
+                    listed = async { check.as_mut().expect("guarded by precondition").await },
+                        if check.is_some() =>
                     {
-                        break Err(Some(format!(
-                            "window '{label}' was closed while the call was in flight, so no \
-                             result will arrive. If the code/command closes this window (or \
-                             quits the app), this is the expected outcome and it most likely \
-                             ran — do not re-run it blindly."
-                        )));
+                        check = None;
+                        if let (Ok(Ok(labels)), Some(label)) = (listed, watched.as_deref())
+                            && !labels.iter().any(|l| l == label)
+                        {
+                            break Err(Some(format!(
+                                "window '{label}' was closed while the call was in flight, so no \
+                                 result will arrive. If the code/command closes this window (or \
+                                 quits the app), this is the expected outcome and it most likely \
+                                 ran — do not re-run it blindly."
+                            )));
+                        }
                     }
                 }
             }
         };
-
+        if let Some(pending_check) = check {
+            pending_check.abort();
+        }
         let early = match outcome {
             Ok(r) => Ok(r),
-            Err(Some(msg)) => {
-                self.state.pending_evals.lock().await.remove(&id);
-                return Err(msg);
-            }
+            // The result may have landed while the page change was being confirmed.
+            Err(Some(msg)) => match rx.try_recv() {
+                Ok(raw) => Ok(Ok(raw)),
+                Err(_) => return Err(EvalFailure::new(Aborted, msg)),
+            },
             Err(None) => Err(()),
         };
         match early {
             Ok(Ok(raw)) => {
                 self.check_bridge_version_once();
                 if raw.len() > MAX_EVAL_RESULT_LEN {
-                    return Err(format!(
-                        "eval result too large ({} bytes, limit {MAX_EVAL_RESULT_LEN})",
-                        raw.len()
+                    return Err(EvalFailure::new(
+                        Page,
+                        format!(
+                            "eval result too large ({} bytes, limit {MAX_EVAL_RESULT_LEN})",
+                            raw.len()
+                        ),
                     ));
                 }
                 unwrap_eval_envelope(raw)
             }
-            Ok(Err(_)) => Err("eval callback channel closed".to_string()),
-            Err(_) => {
-                self.state.pending_evals.lock().await.remove(&id);
+            Ok(Err(_)) => Err(EvalFailure::new(Aborted, "eval callback channel closed")),
+            Err(()) => {
                 // Mark this window so the NEXT eval does a fast liveness probe —
                 // if the bridge is gone (reloaded/crashed) the next call fails in
                 // ~2s instead of blocking the full timeout again.
                 self.timed_out_labels.lock().await.insert(label_key.clone());
-                Err(format!(
-                    "eval timed out after {}s — the code began executing but never resolved. \
-                     (A syntax/parse error would have failed fast via the parse watchdog, so \
-                     this is NOT a parse error.) Common causes: an unresolved promise, an \
-                     infinite loop, an `await` on something that never settles, or the webview \
-                     reloaded / the app stopped responding mid-eval. If the app may have \
-                     navigated or crashed, retry (the next call fails fast if the bridge is \
-                     gone).",
-                    timeout.as_secs()
+                let (began, parse_note) = if parse_check_armed {
+                    (
+                        "the code began executing but never resolved",
+                        "(A syntax/parse error is reported immediately, so this is NOT a parse \
+                         error.) Common causes",
+                    )
+                } else {
+                    (
+                        "no result arrived",
+                        "(The fast syntax-error check could not run for this call, so a parse \
+                         error could not be ruled out — check the code's syntax.) Other causes",
+                    )
+                };
+                Err(EvalFailure::new(
+                    Aborted,
+                    format!(
+                        "eval timed out after {} — {began}. {parse_note}: an unresolved \
+                         promise, an infinite loop, an `await` on something that never settles, \
+                         or the webview reloaded / the app stopped responding mid-eval. If the \
+                         app may have navigated or crashed, retry (the next call fails fast if \
+                         the bridge is gone).",
+                        format_timeout(timeout)
+                    ),
                 ))
             }
         }
@@ -4680,18 +5345,7 @@ impl VictauriMcpHandler {
 
     #[cfg(feature = "sqlite")]
     async fn run_db_health(&self, db_path: Option<&str>) -> Result<serde_json::Value, String> {
-        // Roots: configured db_search_paths first, then app directories.
-        let mut roots: Vec<std::path::PathBuf> = self.state.db_search_paths.clone();
-        for d in [
-            self.bridge.app_data_dir(),
-            self.bridge.app_local_data_dir(),
-            self.bridge.app_config_dir(),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            roots.push(d);
-        }
+        let roots = self.db_roots();
 
         let path = if let Some(p) = db_path {
             Self::resolve_existing_db_path(&roots, p)?
@@ -4711,15 +5365,22 @@ impl VictauriMcpHandler {
             .ok_or_else(|| "invalid path encoding".to_string())?
             .to_string();
 
-        tokio::task::spawn_blocking(move || {
-            crate::database::db_health_report(
-                &path_str,
-                DB_HEALTH_COUNT_BUDGET,
-                DB_HEALTH_CHECK_BUDGET,
-            )
-        })
+        bounded::run_blocking_bounded(
+            Some(&bounded::DB_SLOTS),
+            "db health check",
+            crate::database::DB_HEALTH_META_BUDGET
+                + DB_HEALTH_COUNT_BUDGET
+                + DB_HEALTH_CHECK_BUDGET
+                + bounded::BLOCKING_DEADLINE_SLACK,
+            move || {
+                crate::database::db_health_report(
+                    &path_str,
+                    DB_HEALTH_COUNT_BUDGET,
+                    DB_HEALTH_CHECK_BUDGET,
+                )
+            },
+        )
         .await
-        .map_err(|e| format!("db health task failed: {e}"))?
     }
 
     fn check_bridge_version_once(&self) {
@@ -4788,13 +5449,13 @@ app_state (app-defined backend state probes), \
 get_memory_stats, get_plugin_info, get_diagnostics.";
 
 impl ServerHandler for VictauriMcpHandler {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> InitializeResult {
         // NOTE: we advertise `resources` (read) but NOT `resources.subscribe`. A real
         // server-initiated `notifications/resources/updated` push was never implemented
         // (subscribe/unsubscribe only record intent in memory; nothing emits updates), and
         // the default stateless transport has no SSE channel to push over anyway. Advertising
         // a subscribe capability we cannot honour misleads clients — read resources on demand.
-        ServerInfo::new(
+        InitializeResult::new(
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
@@ -4832,7 +5493,12 @@ impl ServerHandler for VictauriMcpHandler {
         // Centralized authorization: gate on the canonical `tool.action` capability
         // resolved from the call arguments, matching the REST path in `execute_tool`.
         let args_value = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
-        let capability = authz::canonical_capability(&tool_name, &args_value);
+        // A disabled tool reports "disabled" whatever its arguments look like.
+        if self.state.privacy.disabled_tools.contains(&tool_name) {
+            return Ok(tool_disabled(&tool_name).into());
+        }
+        let capability = authz::resolve_capability(&tool_name, &args_value)
+            .map_err(|msg| ErrorData::invalid_params(msg, None))?;
         if !self.state.privacy.is_call_allowed(&tool_name, &capability) {
             tracing::debug!(tool = %tool_name, capability = %capability, "tool call blocked by privacy config");
             return Ok(tool_disabled(&capability).into());
@@ -4843,7 +5509,14 @@ impl ServerHandler for VictauriMcpHandler {
         let start = std::time::Instant::now();
         tracing::debug!(tool = %tool_name, "tool invocation started");
         let ctx = ToolCallContext::new(self, request, context);
-        let response = Self::tool_router().call(ctx).await;
+        // Same panic boundary as the REST path: without it a panicking handler left the MCP
+        // request unanswered until the client's own timeout.
+        let response = bounded::CatchUnwind::new(Self::tool_router().call(ctx))
+            .await
+            .unwrap_or_else(|panic| {
+                tracing::error!(tool = %tool_name, "tool handler panicked: {panic}");
+                Ok(tool_panicked(&tool_name, &panic).into())
+            });
         let elapsed = start.elapsed();
         tracing::debug!(
             tool = %tool_name,
@@ -4921,9 +5594,7 @@ impl ServerHandler for VictauriMcpHandler {
         // Resources bypass the tool dispatcher, so they must apply the same privacy
         // gate themselves (audit B1): a strict profile that blocks log/window reads
         // as tools must not be able to read the same data via a resource.
-        if let Some(cap) = resource_required_capability(uri.as_str())
-            && !self.state.privacy.is_tool_enabled(cap)
-        {
+        if !resource_allowed(&self.state.privacy, uri.as_str()) {
             return Err(ErrorData::invalid_request(
                 format!("resource {uri} is not permitted by the current privacy configuration"),
                 None,
@@ -4937,7 +5608,10 @@ impl ServerHandler for VictauriMcpHandler {
                 // itself default-window-drained) — serving a subset that looks complete.
                 // trimmed_log_js bounds entries + truncates oversized fields so the
                 // resource stays correct under load. (Matches the `logs ipc` tool.)
-                let code = trimmed_log_js("window.__VICTAURI__?.getIpcLog()", DEFAULT_LOG_LIMIT);
+                let code = trimmed_log_js(
+                    &format!("window.__VICTAURI__?.getIpcLog({DEFAULT_LOG_LIMIT})"),
+                    DEFAULT_LOG_LIMIT,
+                );
                 if let Ok(json) = self.eval_with_return(&code, None).await {
                     json
                 } else {
@@ -4947,7 +5621,10 @@ impl ServerHandler for VictauriMcpHandler {
                 }
             }
             RESOURCE_URI_WINDOWS => {
-                let states = self.bridge.get_window_states(None);
+                let states = self
+                    .bridge
+                    .try_get_window_states(None)
+                    .map_err(|e| ErrorData::internal_error(ui_busy(&e), None))?;
                 serde_json::to_string_pretty(&states)
                     .map_err(|e| ErrorData::internal_error(e.to_string(), None))?
             }
@@ -4992,9 +5669,7 @@ impl ServerHandler for VictauriMcpHandler {
         let uri = &request.uri;
         // Same privacy gate as read_resource (audit B1) — don't let a blocked
         // resource be subscribed to for push updates.
-        if let Some(cap) = resource_required_capability(uri.as_str())
-            && !self.state.privacy.is_tool_enabled(cap)
-        {
+        if !resource_allowed(&self.state.privacy, uri.as_str()) {
             return Err(ErrorData::invalid_request(
                 format!("resource {uri} is not permitted by the current privacy configuration"),
                 None,
@@ -5025,27 +5700,116 @@ impl ServerHandler for VictauriMcpHandler {
     }
 }
 
-/// Build a JS expression that takes an array of log entries (`source_expr`),
-/// keeps at most `limit` of the most recent, and truncates any per-entry field
-/// larger than [`MAX_LOG_FIELD_BYTES`]. This keeps IPC/network log results under
-/// the eval size cap on busy apps where individual entries carry large bodies.
-///
-/// The returned code is a complete `return (...)` statement.
-fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
+/// JS `function trimField(v)` (with its `MB` bound): a string over [`MAX_LOG_FIELD_BYTES`]
+/// UTF-16 units is cut with a marker, an object whose JSON is larger becomes a size marker.
+/// The cut never falls between the halves of a surrogate pair — a lone surrogate serializes
+/// to JSON that `serde_json` rejects, which failed the whole log read.
+fn trim_field_js() -> String {
     let mb = MAX_LOG_FIELD_BYTES;
     format!(
-        r"return (function() {{
-            var MB = {mb};
+        r"var MB = {mb};
             function trimField(v) {{
                 if (typeof v === 'string') {{
-                    return v.length > MB ? (v.slice(0, MB) + '…[+' + (v.length - MB) + ' bytes truncated]') : v;
+                    if (v.length <= MB) return v;
+                    var end = MB, c = v.charCodeAt(end - 1);
+                    if (c >= 0xD800 && c <= 0xDBFF) end--;
+                    return v.slice(0, end) + '…[+' + (v.length - end) + ' bytes truncated]';
                 }}
                 if (v && typeof v === 'object') {{
                     var s; try {{ s = JSON.stringify(v); }} catch (e) {{ s = ''; }}
                     if (s.length > MB) {{ return '[truncated ' + s.length + ' bytes]'; }}
                 }}
                 return v;
-            }}
+            }}"
+    )
+}
+
+/// JS for `check_ipc_integrity`. Classifies the calls from the body-free IPC view and fetches
+/// full entries (args + result) only for the <= 20 stale and <= 20 errored calls it lists:
+/// deep-copying every retained body just to count statuses froze the UI thread (R5-JS1).
+#[doc(hidden)]
+#[must_use]
+pub fn ipc_integrity_js(threshold_ms: i64) -> String {
+    format!(
+        r"return (function() {{
+                var V = window.__VICTAURI__;
+                var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
+                var now = Date.now();
+                var threshold = {threshold_ms};
+                var pending = log.filter(function(c) {{ return c.status === 'pending'; }});
+                var stale = pending.filter(function(c) {{ return (now - c.timestamp) > threshold; }});
+                var errored = log.filter(function(c) {{ return c.status === 'error'; }});
+                var netCount = (V?.getNetworkLog(null, 0, {{ bodies: false }}) || []).length;
+                var warning = null;
+                if (log.length === 0 && netCount > 5) {{
+                    warning = 'Zero IPC calls captured but ' + netCount + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
+                }}
+                function withBodies(list) {{
+                    list = list.slice(0, 20);
+                    if (!list.length) return list;
+                    var got = V.getIpcLog(0, {{ ids: list.map(function(c) {{ return c.id; }}) }}) || [];
+                    var byId = {{}};
+                    for (var i = 0; i < got.length; i++) byId[got[i].id] = got[i];
+                    return list.map(function(c) {{ return byId[c.id] || c; }});
+                }}
+                // INTEGRITY = round-trip soundness: no stuck/stale (never-returned) calls.
+                // A command that completed with an Err is a HEALTHY round-trip (it returned)
+                // — every real app exercises error paths, so counting those as 'unhealthy'
+                // would cry wolf. The error_count/errored_calls surface them for visibility,
+                // but only stale calls flip `healthy`.
+                return {{
+                    healthy: stale.length === 0,
+                    total_calls: log.length,
+                    pending_count: pending.length,
+                    stale_count: stale.length,
+                    error_count: errored.length,
+                    stale_calls: withBodies(stale),
+                    errored_calls: withBodies(errored),
+                    warning: warning
+                }};
+            }})()"
+    )
+}
+
+/// JS for `logs slow_ipc`: ranks the calls from the body-free IPC view, then fetches full
+/// (field-trimmed) entries only for the `limit` slowest it returns (R5-JS1).
+#[doc(hidden)]
+#[must_use]
+pub fn slow_ipc_js(threshold_ms: u64, limit: usize) -> String {
+    let trim_field = trim_field_js();
+    format!(
+        r"return (function() {{
+                {trim_field}
+                function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
+                var V = window.__VICTAURI__;
+                var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
+                var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold_ms}; }});
+                slow.sort(function(a, b) {{ return (b.duration_ms || 0) - (a.duration_ms || 0); }});
+                var top = slow.slice(0, {limit});
+                if (top.length) {{
+                    var got = V.getIpcLog(0, {{ ids: top.map(function(c) {{ return c.id; }}) }}) || [];
+                    var byId = {{}};
+                    for (var i = 0; i < got.length; i++) byId[got[i].id] = got[i];
+                    top = top.map(function(c) {{ return byId[c.id] || c; }});
+                }}
+                return {{ threshold_ms: {threshold_ms}, count: top.length, calls: top.map(trimEntry) }};
+            }})()",
+    )
+}
+
+/// Build a JS expression that takes an array of log entries (`source_expr`),
+/// keeps at most `limit` of the most recent, and truncates any per-entry field
+/// larger than [`MAX_LOG_FIELD_BYTES`]. This keeps IPC/network log results under
+/// the eval size cap on busy apps where individual entries carry large bodies.
+///
+/// The returned code is a complete `return (...)` statement.
+#[doc(hidden)]
+#[must_use]
+pub fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
+    let trim_field = trim_field_js();
+    format!(
+        r"return (function() {{
+            {trim_field}
             function trimEntry(e) {{
                 if (e == null || typeof e !== 'object') return e;
                 var out = Array.isArray(e) ? [] : {{}};
@@ -5053,10 +5817,19 @@ fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
                 return out;
             }}
             var arr = {source_expr} || [];
-            if (arr.length > {limit}) arr = arr.slice(-{limit});
+            if (arr.length > {limit}) arr = arr.slice(arr.length - {limit}); // not slice(-0): all
             return arr.map(trimEntry);
         }})()"
     )
+}
+
+/// Wall-clock epoch milliseconds: the floor a new recording epoch's drain reads from. Taken
+/// BEFORE the recording starts, so nothing logged after the start falls below it. (An imported
+/// session's old start time used to pull in the page's whole history.)
+fn now_ms() -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let ms = chrono::Utc::now().timestamp_millis() as f64;
+    ms
 }
 
 /// Unwrap the `{"__victauri_ok": <val>, "__victauri_type": <t>}` (or
@@ -5069,12 +5842,35 @@ fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
 /// fails because the value is too deeply nested, the envelope is stripped by
 /// string slicing (no recursion) so the actual value is still returned rather
 /// than leaking the raw envelope string.
-fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
-    if let Ok(envelope) = serde_json::from_str::<serde_json::Value>(&raw) {
+fn unwrap_eval_envelope(raw: String) -> Result<String, EvalFailure> {
+    // Page JSON: sanitize lone surrogates first, or one truncated emoji in a result sends it
+    // down the raw-string fallback below (and every consumer's own parse of it fails too).
+    if let Ok(envelope) = page_json::parse_page_json::<serde_json::Value>(&raw) {
+        if let Some(why) = envelope.get("__victauri_not_run") {
+            return Err(EvalFailure::new(
+                EvalFailureKind::NotSent,
+                format!(
+                    "{PARSE_ERROR_PREFIX} {}",
+                    why.as_str().unwrap_or("the code did not begin executing")
+                ),
+            ));
+        }
         if let Some(err) = envelope.get("__victauri_err") {
-            return Err(format!(
-                "JavaScript error: {}",
-                err.as_str().unwrap_or("unknown error")
+            return Err(EvalFailure::new(
+                EvalFailureKind::Page,
+                format!(
+                    "JavaScript error: {}",
+                    err.as_str().unwrap_or("unknown error")
+                ),
+            ));
+        }
+        if let Some(why) = envelope.get("__victauri_unserializable") {
+            return Err(EvalFailure::new(
+                EvalFailureKind::Page,
+                format!(
+                    "the code ran, but its result could not be serialized to JSON ({}). Return a JSON-serializable value instead — e.g. String() a BigInt, or pick the fields you need from a circular object.",
+                    why.as_str().unwrap_or("unknown reason")
+                ),
             ));
         }
         if envelope.get("__victauri_ok").is_some() {
@@ -5102,41 +5898,150 @@ fn unwrap_eval_envelope(raw: String) -> Result<String, String> {
     }
     if let Some(after) = raw.strip_prefix(r#"{"__victauri_err":"#) {
         let msg = after.trim_end_matches('}').trim_matches('"');
-        return Err(format!("JavaScript error: {msg}"));
+        return Err(EvalFailure::new(
+            EvalFailureKind::Page,
+            format!("JavaScript error: {msg}"),
+        ));
     }
     Ok(raw)
 }
 
-/// Statement keywords where a leading `return` would be a syntax error.
-const STMT_STARTS: &[&str] = &[
-    "return ",
-    "return;",
-    "return\n",
-    "return\t",
-    "if ",
-    "if(",
-    "for ",
-    "for(",
-    "while ",
-    "while(",
-    "switch ",
-    "switch(",
-    "try ",
-    "try{",
-    "const ",
-    "let ",
-    "var ",
-    "function ",
-    "function(",
-    "function*",
-    "class ",
-    "throw ",
-    "do ",
-    "do{",
-    "{",
-    "async function",
-    "debugger",
+/// The eval code for a caller-supplied EXPRESSION (`verify_state`, `assert_semantic`,
+/// `wait_for` expression): code that returns the expression's value.
+///
+/// These used to be wrapped as `return (<expr>)`, so a trailing `;` or a trailing `// comment`
+/// (which swallowed the closing paren) turned a valid expression into a parse error. A single
+/// expression is now handed to the eval engine as-is: its string/comment-aware `return`
+/// auto-prepend already accepts a trailing `;`, trailing comments and multi-line expressions,
+/// and the wrapper ends the code with a newline. Anything the engine would NOT wrap (an object
+/// literal `{a: 1}.a`, which reads as a block) keeps the parenthesized form, with trailing `;`s
+/// dropped and the expression on lines of its own so a trailing line comment cannot swallow the
+/// closing paren. Multi-statement code stays a syntax error (these tools take an expression).
+fn expression_eval_code(expr: &str) -> String {
+    if should_prepend_return(expr) {
+        return expr.to_string();
+    }
+    let body = expr.trim_end_matches(|c: char| c == ';' || is_js_space(c));
+    format!("return (\n{body}\n);")
+}
+
+/// Parse the value of an expression evaluated by [`expression_eval_code`]. `undefined` (which
+/// the engine reports as the bare text `undefined`) is read as `null`: JSON has no `undefined`,
+/// and `null` is what JavaScript's `x == null` groups it with — so `exists` is false and `falsy`
+/// is true for it instead of the call failing as "not valid JSON".
+fn parse_expression_value(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    if raw == "undefined" {
+        return Ok(serde_json::Value::Null);
+    }
+    serde_json::from_str(raw)
+}
+
+/// The failure a page action reported, as tool-error text: `{ok: false, …}`, or an object with
+/// a top-level `error` string and no `ok: true`. Anything else (arrays with per-item errors, an
+/// audit whose findings contain an `error` field) is a result. The page's recovery hint is kept
+/// in the same `[hint: …]` form every tool error uses; it is page-controlled, so only a plain
+/// `UPPER_SNAKE` word is carried over.
+fn page_action_error(result: &str) -> Option<String> {
+    let value: serde_json::Value = page_json::parse_page_json(result).ok()?;
+    let obj = value.as_object()?;
+    let ok = obj.get("ok").and_then(serde_json::Value::as_bool);
+    let error = obj.get("error").and_then(serde_json::Value::as_str);
+    if ok == Some(true) || (ok.is_none() && error.is_none()) {
+        return None;
+    }
+    let mut message = error.map_or_else(
+        || format!("the page reported failure: {value}"),
+        str::to_string,
+    );
+    if let Some(hint) = obj.get("hint").and_then(serde_json::Value::as_str)
+        && !hint.is_empty()
+        && hint.len() <= 32
+        && hint.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+    {
+        message.push_str(&format!("\n\n[hint: {hint}]"));
+    }
+    Some(message)
+}
+
+/// Statement keywords where a leading `return` would be a syntax error. Matched as whole words
+/// (followed by any non-identifier byte — `if\t(`, `const\n`, `function*` — or the end).
+const STMT_KEYWORDS: &[&str] = &[
+    "return", "if", "for", "while", "switch", "try", "const", "let", "var", "function", "class",
+    "throw", "do", "debugger", "with",
 ];
+
+/// `code` starts with the whole word `word` (not merely a longer identifier sharing its prefix).
+fn starts_with_word(code: &str, word: &str) -> bool {
+    code.starts_with(word)
+        && code[word.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_js_ident_char(c))
+}
+
+/// Does `code` begin with a statement (not an expression) — a statement keyword, a block, an
+/// `async function` declaration, or a label (`outer: for …`)? Prepending `return` to any of
+/// these is a syntax error or changes its meaning.
+fn starts_with_statement(code: &str) -> bool {
+    if code.starts_with('{') || STMT_KEYWORDS.iter().any(|k| starts_with_word(code, k)) {
+        return true;
+    }
+    if starts_with_word(code, "async") && starts_with_word(code[5..].trim_start(), "function") {
+        return true;
+    }
+    // A label: an identifier followed (after optional whitespace) by a single `:`.
+    let ident_len: usize = code
+        .chars()
+        .take_while(|&c| is_js_ident_char(c))
+        .map(char::len_utf8)
+        .sum();
+    ident_len > 0
+        && !code.as_bytes()[0].is_ascii_digit()
+        && code[ident_len..].trim_start().starts_with(':')
+}
+
+/// Blocking: open `path`, refuse it unless the OPENED file is a regular file (the handler's
+/// earlier checks ran on the path, which can be swapped for a FIFO or device before the open),
+/// then read at most `max_bytes + 1` bytes (audit B7: never the whole file; the `+1` detects
+/// truncation). Returns the bytes, the file's size and its modification time (Unix seconds).
+pub(crate) fn read_regular_file(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, usize, Option<u64>), String> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let metadata = f.metadata().map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("not a regular file".to_string());
+    }
+    let modified = metadata.modified().ok().map(|t| {
+        t.duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    });
+    let mut buf = Vec::new();
+    f.take(max_bytes as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| e.to_string())?;
+    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    Ok((buf, size, modified))
+}
+
+/// Resolve `.` and `..` components without touching the filesystem.
+#[cfg(feature = "sqlite")]
+fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
 
 /// A line ending in one of these continues onto the next line (no ASI).
 const ASI_CONTINUES_AFTER: &[u8] = b"+-*/%&|^!=<>?:,.([{~";
@@ -5144,18 +6049,60 @@ const ASI_CONTINUES_AFTER: &[u8] = b"+-*/%&|^!=<>?:,.([{~";
 /// `[` and a template literal, which JavaScript itself treats as a continuation.
 const ASI_CONTINUES_BEFORE: &[u8] = b".?)]}+-*/%&|^=<>,:([`";
 
-/// Strip leading whitespace and `//` / `/* */` comments.
+/// Length of the JavaScript line terminator at byte `i` — LF, CR, CRLF (2), or U+2028 /
+/// U+2029 (3) — or 0 when there is none there.
+fn line_terminator_len(bytes: &[u8], i: usize) -> usize {
+    match bytes.get(i) {
+        Some(b'\n') => 1,
+        Some(b'\r') => 1 + usize::from(bytes.get(i + 1) == Some(&b'\n')),
+        Some(0xE2)
+            if bytes.get(i + 1) == Some(&0x80) && matches!(bytes.get(i + 2), Some(0xA8 | 0xA9)) =>
+        {
+            3
+        }
+        _ => 0,
+    }
+}
+
+/// Index of the first line terminator at or after byte `from`, if any.
+fn find_line_terminator(bytes: &[u8], from: usize) -> Option<usize> {
+    (from..bytes.len()).find(|&i| line_terminator_len(bytes, i) > 0)
+}
+
+/// `code` after the rest of its current line (and that line's terminator); `""` if none.
+fn after_line(code: &str) -> &str {
+    let bytes = code.as_bytes();
+    find_line_terminator(bytes, 0).map_or("", |n| &code[n + line_terminator_len(bytes, n)..])
+}
+
+/// Strip leading whitespace and comments: `//`, `/* */`, and the HTML-like `<!--` / `-->`
+/// line comments (the code starts a line). Every JavaScript line terminator ends a line
+/// comment — CR and U+2028/U+2029 as well as LF.
 fn strip_leading_js_comments(mut code: &str) -> &str {
     loop {
         code = code.trim_start();
-        if let Some(rest) = code.strip_prefix("//") {
-            code = rest.find('\n').map_or("", |n| &rest[n + 1..]);
+        if let Some(rest) = code
+            .strip_prefix("//")
+            .or_else(|| code.strip_prefix("<!--"))
+            .or_else(|| code.strip_prefix("-->"))
+        {
+            code = after_line(rest);
         } else if let Some(rest) = code.strip_prefix("/*") {
             code = rest.find("*/").map_or("", |n| &rest[n + 2..]);
         } else {
             return code;
         }
     }
+}
+
+/// What opened a bracket, for [`should_prepend_return`]: a `/` right after the `)` of an
+/// `if`/`while`/`for`/`with` head starts a regex (the statement body), not a division, and `of`
+/// is a keyword only directly inside a `for (…)` head.
+#[derive(PartialEq, Clone, Copy)]
+enum Bracket {
+    Plain,
+    ControlHead,
+    ForHead,
 }
 
 /// String/template/comment scan state for [`should_prepend_return`].
@@ -5181,11 +6128,7 @@ fn should_prepend_return(code: &str) -> bool {
     use ScanState::{Code, DoubleQuote, SingleQuote, Template};
 
     let code = strip_leading_js_comments(code.trim());
-    if code.is_empty() {
-        return false;
-    }
-
-    if STMT_STARTS.iter().any(|k| code.starts_with(k)) {
+    if code.is_empty() || starts_with_statement(code) {
         return false;
     }
 
@@ -5193,85 +6136,178 @@ fn should_prepend_return(code: &str) -> bool {
     let mut i = 0;
     let mut depth: i32 = 0;
     let mut state = ScanState::Code;
+    // Depths at which a template literal's `${` substitution opened: the matching `}` resumes
+    // the template (else a backtick inside `${'`'}` was read as the template's end).
+    let mut template_depths: Vec<i32> = Vec::new();
+    // Only whitespace since the last line terminator (an HTML-like `-->` comment position).
+    let mut at_line_start = true;
+    // Every open bracket (and `${`) and what opened it; the index of the last `)` that closed
+    // an `if`/`while`/`for`/`with` head.
+    let mut brackets: Vec<Bracket> = Vec::new();
+    let mut control_head_closed_at: Option<usize> = None;
 
-    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
-    // Is there a top-level `return` token starting at byte `i` (word-bounded)?
+    // Is there a top-level `return` token starting at byte `i` (word-bounded, and not a
+    // property name such as `obj.return`)?
     let is_return_token = |i: usize| -> bool {
-        let prev_ok = i == 0 || !is_ident(bytes[i - 1]);
+        let prev_ok = code[..i]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_js_ident_char(c));
         prev_ok
             && code[i..].starts_with("return")
-            && bytes.get(i + 6).copied().is_none_or(|b| !is_ident(b))
+            && code[i + 6..]
+                .chars()
+                .next()
+                .is_none_or(|c| !is_js_ident_char(c))
+            && !preceded_by_dot(code, i)
     };
 
-    // Last significant (non-whitespace, non-comment) byte seen in code — for the ASI check.
+    // The last two significant (non-whitespace, non-comment) bytes seen in code, and where the
+    // last one is — for the ASI and regex-vs-division decisions.
     let mut last_sig: Option<u8> = None;
+    let mut prev_sig: Option<u8> = None;
+    let mut last_sig_idx = 0usize;
 
     while i < bytes.len() {
         let c = bytes[i];
-        if state == Code && !c.is_ascii_whitespace() && c != b'/' {
-            last_sig = Some(c);
+        // LF, CR, CRLF and U+2028 / U+2029 are all JavaScript line terminators.
+        let terminator = line_terminator_len(bytes, i);
+        if state == Code && terminator > 0 {
+            let next_start = i + terminator;
+            if depth <= 0 && asi_ends_statement(code, next_start, last_sig, prev_sig, last_sig_idx)
+            {
+                return false;
+            }
+            at_line_start = true;
+            i = next_start;
+            continue;
         }
         match state {
-            Code => match c {
-                // A top-level newline ends the statement (ASI) unless the expression visibly
-                // continues across it. `foo()\nbar()` with `return` prepended would return
-                // `foo()` and silently never run `bar()`.
-                b'\n' if depth <= 0 => {
-                    let rest = strip_leading_js_comments(&code[i + 1..]);
-                    if let Some(&next) = rest.as_bytes().first()
-                        && !last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p))
-                        && !ASI_CONTINUES_BEFORE.contains(&next)
+            Code => {
+                // HTML-like comments (Script goal): `<!--` anywhere, and `-->` at the start of
+                // a line, comment out the rest of the line — up to ANY line terminator.
+                let line_comment = bytes[i..].starts_with(b"<!--")
+                    || (at_line_start && bytes[i..].starts_with(b"-->"))
+                    || bytes[i..].starts_with(b"//");
+                if line_comment {
+                    i = find_line_terminator(bytes, i).unwrap_or(bytes.len());
+                    continue;
+                }
+                // A non-ASCII character: JavaScript whitespace (NBSP, BOM, …) is skipped like
+                // any whitespace; anything else is read as part of an identifier (`énew` is a
+                // name, not the keyword `new`). Line terminators were handled above.
+                if c >= 0x80 {
+                    let ch = code.get(i..).and_then(|rest| rest.chars().next());
+                    let len = ch.map_or(1, char::len_utf8);
+                    if !ch.is_some_and(is_js_space) {
+                        at_line_start = false;
+                        prev_sig = last_sig;
+                        last_sig = Some(c);
+                        last_sig_idx = i + len - 1;
+                    }
+                    i += len;
+                    continue;
+                }
+                if !c.is_ascii_whitespace() {
+                    at_line_start = false;
+                }
+                let in_for_head = brackets.last() == Some(&Bracket::ForHead);
+                match c {
+                    b'\'' => state = SingleQuote,
+                    b'"' => state = DoubleQuote,
+                    b'`' => state = Template,
+                    b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                        let body_start = i + 2;
+                        let end = code[body_start..]
+                            .find("*/")
+                            .map_or(bytes.len(), |n| body_start + n);
+                        i = (end + 2).min(bytes.len());
+                        // A block comment spanning a line break IS a line break for ASI:
+                        // `a = 1 /*\n*/ b = 2` is two statements.
+                        if find_line_terminator(&bytes[..end], body_start).is_some() {
+                            if depth <= 0
+                                && asi_ends_statement(code, i, last_sig, prev_sig, last_sig_idx)
+                            {
+                                return false;
+                            }
+                            at_line_start = true;
+                        }
+                        continue;
+                    }
+                    // After `}` a `/` is division if the brace closed an object literal, and a
+                    // regex if it closed a block — undecidable here, so run the code as-is.
+                    b'/' if last_sig == Some(b'}') => return false,
+                    b'/' if (last_sig == Some(b')')
+                        && control_head_closed_at == Some(last_sig_idx))
+                        || slash_starts_regex(
+                            code,
+                            last_sig,
+                            prev_sig,
+                            last_sig_idx,
+                            in_for_head,
+                        ) =>
                     {
+                        // A regex literal: skip it whole (a quote or newline-like character
+                        // inside it must not be read as code), then its flags.
+                        i = skip_regex_literal(bytes, i);
+                        prev_sig = last_sig;
+                        last_sig = Some(b')'); // an operand, like a closed group
+                        last_sig_idx = i.saturating_sub(1);
+                        continue;
+                    }
+                    b'(' | b'[' | b'{' => {
+                        depth += 1;
+                        let head = if c == b'(' {
+                            control_head_kind(code, last_sig, last_sig_idx)
+                        } else {
+                            Bracket::Plain
+                        };
+                        brackets.push(head);
+                    }
+                    b')' | b']' | b'}' => {
+                        depth -= 1;
+                        if brackets.pop().is_some_and(|b| b != Bracket::Plain) && c == b')' {
+                            control_head_closed_at = Some(i);
+                        }
+                        if c == b'}' && template_depths.last() == Some(&depth) {
+                            template_depths.pop();
+                            state = Template;
+                        }
+                    }
+                    // A top-level `;` with more CODE after it (not just a comment) is a
+                    // multi-statement block.
+                    b';' if depth <= 0 && !strip_leading_js_comments(&code[i + 1..]).is_empty() => {
                         return false;
                     }
+                    // An explicit top-level `return` token means the code already returns.
+                    b'r' if depth <= 0 && is_return_token(i) => return false,
+                    _ => {}
                 }
-                b'/' if !(i + 1 < bytes.len() && matches!(bytes[i + 1], b'/' | b'*')) => {
-                    last_sig = Some(b'/');
-                }
-                b'\'' => state = SingleQuote,
-                b'"' => state = DoubleQuote,
-                b'`' => state = Template,
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'/' => {
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
-                    continue;
-                }
-                b'/' if i + 1 < bytes.len() && bytes[i + 1] == b'*' => {
-                    i += 2;
-                    while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                        i += 1;
-                    }
-                    i += 2;
-                    continue;
-                }
-                b'(' | b'[' | b'{' => depth += 1,
-                b')' | b']' | b'}' => depth -= 1,
-                // A top-level `;` with more code after it == multi-statement.
-                b';' if depth <= 0 && !code[i + 1..].trim().is_empty() => return false,
-                // An explicit top-level `return` token means the code already returns.
-                b'r' if depth <= 0 && is_return_token(i) => return false,
-                _ => {}
-            },
-            SingleQuote => {
-                if c == b'\\' {
-                    i += 1;
-                } else if c == b'\'' {
-                    state = Code;
+                if !c.is_ascii_whitespace() {
+                    prev_sig = last_sig;
+                    last_sig = Some(c);
+                    last_sig_idx = i;
                 }
             }
-            DoubleQuote => {
+            SingleQuote | DoubleQuote | Template => {
+                let close = match state {
+                    SingleQuote => b'\'',
+                    DoubleQuote => b'"',
+                    _ => b'`',
+                };
                 if c == b'\\' {
                     i += 1;
-                } else if c == b'"' {
+                } else if state == Template && c == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                    template_depths.push(depth);
+                    brackets.push(Bracket::Plain);
+                    depth += 1;
                     state = Code;
-                }
-            }
-            Template => {
-                if c == b'\\' {
                     i += 1;
-                } else if c == b'`' {
+                } else if c == close {
                     state = Code;
+                    prev_sig = last_sig;
+                    last_sig = Some(c);
+                    last_sig_idx = i;
                 }
             }
         }
@@ -5279,6 +6315,215 @@ fn should_prepend_return(code: &str) -> bool {
     }
 
     true
+}
+
+/// An identifier byte: ASCII letter/digit/`_`/`$`, or any byte of a non-ASCII character (the
+/// scanner steps over non-ASCII whitespace itself, so what remains is part of a name).
+fn is_js_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+/// JavaScript whitespace outside ASCII: the Unicode space separators (NBSP, U+2000…), and BOM.
+fn is_js_space(c: char) -> bool {
+    c.is_whitespace() || c == '\u{feff}'
+}
+
+/// A character that can be part of an identifier (approximately: non-ASCII letters are not
+/// told apart from other non-ASCII symbols, which are syntax errors anyway).
+fn is_js_ident_char(c: char) -> bool {
+    if c.is_ascii() {
+        c.is_ascii_alphanumeric() || c == '_' || c == '$'
+    } else {
+        !is_js_space(c) && !matches!(c, '\u{2028}' | '\u{2029}')
+    }
+}
+
+/// Start of the identifier that ends just before byte `end` (a char boundary); `end` if none.
+fn ident_start_before(code: &str, end: usize) -> usize {
+    let Some(head) = code.get(..end) else {
+        return end;
+    };
+    let mut start = end;
+    for (idx, c) in head.char_indices().rev() {
+        if !is_js_ident_char(c) {
+            break;
+        }
+        start = idx;
+    }
+    start
+}
+
+/// What a `(` opens, given the last significant token before it: an `if`/`while`/`with` head,
+/// a `for` (or `for await`) head, or anything else.
+fn control_head_kind(code: &str, last_sig: Option<u8>, last_sig_idx: usize) -> Bracket {
+    if !last_sig.is_some_and(is_js_ident) {
+        return Bracket::Plain;
+    }
+    match js_keyword_ending_at(code, last_sig_idx) {
+        "if" | "while" | "with" => Bracket::ControlHead,
+        "for" => Bracket::ForHead,
+        "await" => {
+            // `for await (`: the word before `await`.
+            let before = code[..=last_sig_idx]
+                .strip_suffix("await")
+                .unwrap_or("")
+                .trim_end();
+            match before.len().checked_sub(1) {
+                Some(end) if js_keyword_ending_at(code, end) == "for" => Bracket::ForHead,
+                _ => Bracket::Plain,
+            }
+        }
+        _ => Bracket::Plain,
+    }
+}
+
+/// Is the token starting at byte `start` a property name (`obj.of`, `a?.return`)? Such a
+/// word is never a keyword.
+fn preceded_by_dot(code: &str, start: usize) -> bool {
+    code[..start].trim_end().ends_with('.')
+}
+
+/// The KEYWORD candidate that ends at byte `end` (inclusive): the identifier there, or `""`
+/// when `code[end]` is not an identifier byte or the word is a property name after `.`.
+fn js_keyword_ending_at(code: &str, end: usize) -> &str {
+    let bytes = code.as_bytes();
+    if !bytes.get(end).copied().is_some_and(is_js_ident) || !code.is_char_boundary(end + 1) {
+        return "";
+    }
+    let start = ident_start_before(code, end + 1);
+    if start > end || preceded_by_dot(code, start) {
+        return "";
+    }
+    &code[start..=end]
+}
+
+/// Keywords after which an expression (not a statement end) must follow.
+///
+/// NOT listed: `yield`, which is a plain identifier inside the async-arrow wrapper eval code
+/// runs in (it is a keyword only in generators and strict code), and `of`, which is a keyword
+/// only inside a `for (… of …)` head — see [`is_expr_keyword`].
+const EXPR_KEYWORDS: &[&str] = &[
+    "instanceof",
+    "in",
+    "typeof",
+    "void",
+    "delete",
+    "new",
+    "await",
+    "return",
+    "case",
+    "do",
+    "else",
+    "throw",
+];
+
+/// Whether `word` is a keyword after which an operand must follow. `of` is one only directly
+/// inside a `for (…)` head (`in_for_head`); anywhere else it is an identifier (`f(of / 2)`, or
+/// `of` then a new line then `foo()`, which is two statements).
+fn is_expr_keyword(word: &str, in_for_head: bool) -> bool {
+    (word == "of" && in_for_head) || EXPR_KEYWORDS.contains(&word)
+}
+
+/// Is the `.` at byte `dot` the end of a numeric literal (`1.`) — a complete operand — rather
+/// than a member access? Only a plain decimal integer (digits and `_`, not itself after a `.`)
+/// qualifies: `a1.`, `x.`, `0x1.`, `1e3.`, `1n.` and `1.5.` are member accesses. A misread
+/// only matters in one direction: reading a member access as a complete number merely skips
+/// the `return` prepend, which is always safe.
+fn dot_completes_number(code: &str, dot: usize) -> bool {
+    let bytes = code.as_bytes();
+    let start = ident_start_before(code, dot);
+    let word = &bytes[start..dot];
+    word.first().is_some_and(u8::is_ascii_digit)
+        && word.iter().all(|b| b.is_ascii_digit() || *b == b'_')
+        && !(start > 0 && bytes[start - 1] == b'.')
+}
+
+/// A line (or operand) ending in POSTFIX `++`/`--`.
+fn ends_in_postfix(last_sig: Option<u8>, prev_sig: Option<u8>) -> bool {
+    matches!(
+        (prev_sig, last_sig),
+        (Some(b'+'), Some(b'+')) | (Some(b'-'), Some(b'-'))
+    )
+}
+
+/// Does a line break just before `next_start` end the statement (JavaScript ASI)? Only
+/// consulted at bracket depth 0.
+fn asi_ends_statement(
+    code: &str,
+    next_start: usize,
+    last_sig: Option<u8>,
+    prev_sig: Option<u8>,
+    last_sig_idx: usize,
+) -> bool {
+    let rest = strip_leading_js_comments(&code[next_start.min(code.len())..]);
+    let Some(&next) = rest.as_bytes().first() else {
+        return false; // nothing follows
+    };
+    // Restricted production: `a\n++b` is `a; ++b`.
+    if rest.starts_with("++") || rest.starts_with("--") {
+        return true;
+    }
+    // After POSTFIX `++`/`--` nothing but a binary operator can continue the expression, and
+    // `i++\n[…]` / `i++\n(…)` are ASI'd into two statements — treat any following line as a
+    // new statement (not prepending is always safe; prepending would drop that line).
+    if ends_in_postfix(last_sig, prev_sig) {
+        return true;
+    }
+    // A line ending in `1.` ends in a complete number, not a member access: `1.` then a new
+    // line then `f()` is two statements.
+    let number_dot = last_sig == Some(b'.') && dot_completes_number(code, last_sig_idx);
+    let continues_after = (!number_dot
+        && last_sig.is_some_and(|p| ASI_CONTINUES_AFTER.contains(&p)))
+        || is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), false);
+    !(continues_after || ASI_CONTINUES_BEFORE.contains(&next))
+}
+
+/// Whether a `/` (not starting a comment) begins a regex literal rather than division:
+/// true where an operand is expected — at the start, after an operator or opening
+/// punctuation, or after a keyword such as `return`/`typeof`. After a postfix `++`/`--`
+/// (a complete operand) it is division. (After the `)` of a control-statement head it is a
+/// regex too; the caller decides that case.)
+fn slash_starts_regex(
+    code: &str,
+    last_sig: Option<u8>,
+    prev_sig: Option<u8>,
+    last_sig_idx: usize,
+    in_for_head: bool,
+) -> bool {
+    if ends_in_postfix(last_sig, prev_sig) {
+        return false;
+    }
+    match last_sig {
+        None => true,
+        Some(b) if b"(,=:[!&|?{};+-*%<>~^".contains(&b) => true,
+        Some(b) if is_js_ident(b) => {
+            is_expr_keyword(js_keyword_ending_at(code, last_sig_idx), in_for_head)
+        }
+        Some(_) => false,
+    }
+}
+
+/// Skip a regex literal starting at the `/` at `start`; returns the index after its flags.
+fn skip_regex_literal(bytes: &[u8], start: usize) -> usize {
+    let mut i = start + 1;
+    let mut in_class = false;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => in_class = true,
+            b']' => in_class = false,
+            b'/' if !in_class => break,
+            // Unterminated at a line terminator (any of them): let it be scanned normally.
+            _ if line_terminator_len(bytes, i) > 0 => return i,
+            _ => {}
+        }
+        i += 1;
+    }
+    i += 1;
+    while i < bytes.len() && is_js_ident(bytes[i]) {
+        i += 1;
+    }
+    i
 }
 
 #[cfg(test)]
@@ -5347,6 +6592,20 @@ mod prop_tests {
             prop_assert!(!should_prepend_return(&code), "explicit return prepended: {code:?}");
         }
 
+        /// A line after a postfix `++`/`--`, or after a keyword-named PROPERTY (`obj.of`,
+        /// `obj.in`), starts a new statement: prepending would silently drop it (audit V-6).
+        #[test]
+        fn statement_after_postfix_or_keyword_property_never_prepended(
+            a in ident(), b in bare_expr(), op in prop_oneof![Just("++"), Just("--")],
+            open in prop_oneof![Just("["), Just("(")], prop in prop_oneof![Just("of"), Just("in")]
+        ) {
+            let close = if open == "[" { "]" } else { ")" };
+            let postfix = format!("{a}{op}\n{open}{b}{close}");
+            prop_assert!(!should_prepend_return(&postfix), "would drop a line: {postfix:?}");
+            let keyword_prop = format!("{a}.{prop}\n{b}");
+            prop_assert!(!should_prepend_return(&keyword_prop), "would drop a line: {keyword_prop:?}");
+        }
+
         /// `;` or the word `return` INSIDE a string literal must not trigger a
         /// false multi-statement split — a bare string is one expression.
         #[test]
@@ -5404,8 +6663,19 @@ mod tests {
         std::fs::File::create(&outside).unwrap();
         symlink(&outside, root.join("linked.db")).unwrap();
 
-        let err = VictauriMcpHandler::resolve_existing_db_path(&[root], "linked.db").unwrap_err();
-        assert!(err.contains("path traversal"), "unexpected error: {err}");
+        let err =
+            VictauriMcpHandler::resolve_existing_db_path(std::slice::from_ref(&root), "linked.db")
+                .unwrap_err();
+        // Audit F6: an escape answers exactly like a miss (no existence oracle).
+        let miss = VictauriMcpHandler::resolve_existing_db_path(&[root], "absent.db").unwrap_err();
+        assert!(
+            err.contains("database not found"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            err.replace("linked.db", "X"),
+            miss.replace("absent.db", "X")
+        );
     }
 
     #[cfg(feature = "sqlite")]
@@ -5469,6 +6739,416 @@ mod tests {
         assert!(should_prepend_return("[1, 2].map(x =>\n  x * 2)"));
         assert!(should_prepend_return("`line1\nline2`"));
         assert!(should_prepend_return("document.title\n"));
+    }
+
+    /// The live tool list (name + description), in router order — the source of truth for the
+    /// CLI bridge's baked `tools_fallback.json` (what an agent sees while the app is down).
+    fn live_tool_manifest() -> serde_json::Value {
+        let mut tools = VictauriMcpHandler::tool_router().list_all();
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        serde_json::Value::Array(
+            tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.name.as_ref(),
+                        "description": t.description.as_deref().unwrap_or_default(),
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn fallback_manifest_path() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../victauri-cli/src/tools_fallback.json")
+    }
+
+    #[test]
+    fn cli_fallback_tool_manifest_matches_the_live_tools() {
+        // Names AND descriptions: a stale description shown while the app is down misleads an
+        // agent just as much as a missing tool. Regenerate with:
+        //   VICTAURI_WRITE_FALLBACK=1 cargo test -p victauri-plugin --lib cli_fallback
+        let path = fallback_manifest_path();
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            return; // packaged crate: the CLI source is not alongside
+        };
+        let live = live_tool_manifest();
+        if std::env::var_os("VICTAURI_WRITE_FALLBACK").is_some() {
+            let pretty = serde_json::to_string_pretty(&live).unwrap() + "\n";
+            std::fs::write(&path, pretty).unwrap();
+            return;
+        }
+        let mut baked: Vec<serde_json::Value> = serde_json::from_str(&raw).unwrap();
+        baked.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        assert_eq!(
+            serde_json::Value::Array(baked),
+            live,
+            "crates/victauri-cli/src/tools_fallback.json is stale — regenerate it with \
+             VICTAURI_WRITE_FALLBACK=1 cargo test -p victauri-plugin --lib cli_fallback"
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn db_path_outside_roots_gives_no_existence_oracle() {
+        let root = tempfile::tempdir().unwrap();
+        let roots = vec![root.path().to_path_buf()];
+        let outside_existing = std::env::current_exe().unwrap();
+        let outside_missing = outside_existing.with_file_name("definitely-not-here-7f3a.db");
+        let e1 = VictauriMcpHandler::resolve_existing_db_path(
+            &roots,
+            outside_existing.to_str().unwrap(),
+        )
+        .unwrap_err();
+        let e2 =
+            VictauriMcpHandler::resolve_existing_db_path(&roots, outside_missing.to_str().unwrap())
+                .unwrap_err();
+        assert!(e1.contains("not within an allowed directory"), "{e1}");
+        assert!(e2.contains("not within an allowed directory"), "{e2}");
+        assert!(!e1.contains("not found") && !e2.contains("not found"));
+        // `..` is refused outright in an absolute path (audit F6: the OS resolves it after
+        // following any symlink, so lexical normalization cannot vouch for it).
+        let climb = root.path().join("..").join("x.db");
+        let e3 = VictauriMcpHandler::resolve_existing_db_path(&roots, climb.to_str().unwrap())
+            .unwrap_err();
+        assert!(e3.contains("'..' is rejected"), "{e3}");
+    }
+
+    #[test]
+    fn prepend_return_handles_the_red_team_asi_cases() {
+        // Two statements that must NOT be wrapped (the second line would silently never run).
+        for code in [
+            "window.x++\nwindow.x",
+            "window.x--\nwindow.x",
+            "a\n++b",
+            "/re/.test(s)\nfoo()",
+            "s.replace(/\"/g, '')\nfoo()",
+            "foo()\u{2028}bar()",
+            "foo()\u{2029}bar()",
+        ] {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+        // Valid single expressions spanning lines, which must still be wrapped.
+        for code in [
+            "a instanceof\nB",
+            "typeof\nx",
+            "await\nfoo()",
+            "new\nFoo()",
+            "a /\nb",
+            "s.split(/,/)\n.length",
+            "document.title; // trailing note",
+            "document.title // trailing note",
+            "obj.return",
+            "obj.of\n.length",
+            "i++ / 2",
+            "`a${'`'}b`",
+        ] {
+            assert!(should_prepend_return(code), "must wrap: {code:?}");
+        }
+        // Round 2 (0.9 audit V-6): each of these used to be wrapped and silently lost a
+        // statement, or was wrapped into a syntax error.
+        for code in ASI_ROUND2_STATEMENT_CASES {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+    }
+
+    /// Run a Node script and return its stdout, or `None` (test skipped) without `node`.
+    fn run_node(script: &str) -> Option<String> {
+        let out = std::process::Command::new("node")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .ok()?;
+        Some(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    #[test]
+    fn log_field_truncation_never_splits_a_surrogate_pair() {
+        // An emoji straddling the MAX_LOG_FIELD_BYTES cut used to leave a lone high surrogate,
+        // which serde_json rejects — failing the whole `logs` read (audit V-4).
+        let source = format!(
+            "[{{ body: 'a'.repeat({}) + '\\u{{1F600}}tail' }}]",
+            MAX_LOG_FIELD_BYTES - 1
+        );
+        let code = trimmed_log_js(&source, 10);
+        let script = format!(
+            "const r = (function() {{ {code} }})(); \
+             console.log('OUT:' + r[0].body.isWellFormed() + ':' + r[0].body.indexOf('bytes truncated'));"
+        );
+        let Some(out) = run_node(&script) else {
+            eprintln!("SKIP: node not installed");
+            return;
+        };
+        let line = out
+            .lines()
+            .find_map(|l| l.strip_prefix("OUT:"))
+            .unwrap_or_else(|| panic!("no output: {out}"));
+        let (well_formed, marker_at) = line.split_once(':').unwrap();
+        assert_eq!(
+            well_formed, "true",
+            "truncated field is not well-formed UTF-16"
+        );
+        assert_ne!(marker_at, "-1", "field was not truncated");
+    }
+
+    /// Multi-statement snippets from the 0.9 red-team round (audit V-6): each must run every
+    /// statement. `f()` pushes `'f'` onto the log.
+    const ASI_ROUND2_STATEMENT_CASES: &[&str] = &[
+        "i++ / 2; f()",
+        "x = {} / 1; f()",
+        "i++\n[f()]",
+        "i++\n(f)()",
+        "i--\n[f()]",
+        "i--\n(f)()",
+        "obj.of\nf()",
+        "obj.in\nf()",
+        "if\t(true) f()",
+        "if\n(true) f()",
+        "const\ny = 5; f()",
+        "outer: for (const a of [1]) { f() }",
+        "outer:\nfor (const a of [1]) { f() }",
+        "`a${'`'}b`; f()",
+        "`${'`'}`\nf()",
+        "f() <!-- don't\nf()",
+        "f()\n--> it's a comment\nf()",
+        "a = /[/]/\nf()",
+        "typeof x / 2; f()",
+    ];
+
+    /// Multi-statement snippets from the 0.9 round-4 audit (R4-EVAL2): each was wrapped with
+    /// `return` and silently lost everything after its first statement.
+    const ASI_ROUND4_STATEMENT_CASES: &[&str] = &[
+        // (a) a block comment spanning a line break is a line break
+        "x = 1 /*\n*/ f()",
+        "x = 1 /*\r*/ f()",
+        "x = 1 /*\u{2028}*/ f()",
+        "x = 1 /* a\n b */ f()",
+        // (b) a lone CR (and CRLF) is a line terminator everywhere
+        "x = 1\rf()",
+        "x = 1\r\nf()",
+        "x = 1 // note\rf()",
+        "x = 1 // note\u{2028}f()",
+        "f() <!-- c\rf()",
+        "f()\r--> c\rf()",
+        "x = /a/g\rf()",
+        // (c) a number ending in `.` is a complete operand
+        "x = 1.\nf()",
+        "x = 1_0.\rf()",
+        "x = 10.\n\nf()",
+        // (d) `yield` is an identifier in the eval wrapper; `of` is one at depth 0
+        "x = typeof yield\nf()",
+        "x = typeof of\nf()",
+    ];
+
+    /// Multi-statement snippets from the 0.9 round-5 audit (R5-EVAL1): each was wrapped with
+    /// `return` and lost its second statement. (1) a regex right after the `)` of an
+    /// `if`/`while`/`for`/`with` head was read as division, so a quote or bracket inside it
+    /// broke the scan; (2) `of` was a keyword anywhere inside brackets; (3) a non-ASCII
+    /// identifier ending in a keyword (`énew`) was read as that keyword.
+    const ASI_ROUND5_STATEMENT_CASES: &[&str] = &[
+        "(function(){ if (a) /'/.test('q') })(); f()",
+        "(function(){ if (a) /\\(/.test('q') })(); f()",
+        "(function(){ if (a) /\"/.test('q') })(); f()",
+        "(function(){ if (a) /`/.test('q') })(); f()",
+        "(function(){ if (a) /[(]/.test('q') })(); f()",
+        "(function(){ if (a) /\\[/.test('q') })(); f()",
+        "(function(){ if (a) /\\{/.test('q') })(); f()",
+        "(function(){ if ((a)) /'/.test('q') })(); f()",
+        "(function(){ while (a) /'/.test('q') })(); f()",
+        "(function(){ for (;a;) /'/.test('q') })(); f()",
+        "(function(){ with (obj) /'/.test('q') })(); f()",
+        "(async function(){ for await (const q of []) /'/.test('q') })(); f()",
+        "(() => { if (a) /'/.test('q') })(); f()",
+        "Math.abs(of / 2); f()",
+        "Math.abs(of / 2); f() / 1",
+        "[of / 2]; f()",
+        "énew / 2; f() / 1",
+        "x = énew / 2; f()",
+        "x = \u{e9}typeof / 2; f()",
+    ];
+
+    #[test]
+    fn prepend_return_round5_shapes() {
+        for code in ASI_ROUND5_STATEMENT_CASES {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+        for code in [
+            "(x) / 2 / 1",
+            "f(x) / 2",
+            "f(of / 2)",
+            "[1, 2].map(of => of / 2)",
+            "énew / 2",
+            "if_ (a) / 2",
+            "obj.if (a) / 2",
+            "(a) / 2; ",
+        ] {
+            assert!(should_prepend_return(code), "must wrap: {code:?}");
+        }
+    }
+
+    /// Table for R4-EVAL2: `(code, wrap?)` — every shape the fix touches, both ways.
+    #[test]
+    fn prepend_return_round4_shapes() {
+        for code in ASI_ROUND4_STATEMENT_CASES {
+            assert!(!should_prepend_return(code), "must not wrap: {code:?}");
+        }
+        for code in [
+            "x /* no line break */ + 1",
+            "x /*\n*/ + 1",
+            "x +\r1",
+            "x\r.toString()",
+            "a instanceof\r\nB",
+            "1.5\n.toFixed(1)",
+            "obj.of.\nlength",
+            "0x10.\ntoString()",
+            "1e3.\ntoFixed(0)",
+            "(1).\ntoFixed(0)",
+            "document.title // trailing note\r",
+            "-->x\ndocument.title",
+            "<!-- x\rdocument.title",
+            "// lead\u{2028}document.title",
+            "[1].map(y => { for (const z of\n[2]) {} })",
+        ] {
+            assert!(should_prepend_return(code), "must wrap: {code:?}");
+        }
+    }
+
+    #[test]
+    fn line_terminators_and_number_dots_are_recognized() {
+        for (s, at, len) in [
+            ("a\nb", 1, 1),
+            ("a\rb", 1, 1),
+            ("a\r\nb", 1, 2),
+            ("a\u{2028}b", 1, 3),
+            ("a\u{2029}b", 1, 3),
+            ("a b", 1, 0),
+            ("a\u{2027}b", 1, 0),
+        ] {
+            assert_eq!(line_terminator_len(s.as_bytes(), at), len, "{s:?}");
+        }
+        for (code, complete) in [
+            ("1.", true),
+            ("x = 10.", true),
+            ("1_000.", true),
+            ("a1.", false),
+            ("x.", false),
+            ("0x1.", false),
+            ("1e3.", false),
+            ("1n.", false),
+            ("1.5.", false),
+            ("(1).", false),
+            ("1 .", false),
+        ] {
+            assert_eq!(
+                dot_completes_number(code, code.len() - 1),
+                complete,
+                "{code:?}"
+            );
+        }
+    }
+
+    /// Run each `(code, expected_return, expected_log)` through the REAL eval wrapper shape
+    /// (the code inlined in an async arrow, prepended with `return` exactly when
+    /// [`should_prepend_return`] says so) in Node, and check every statement ran and the
+    /// right value came back. Skips when `node` is not installed.
+    #[test]
+    fn prepend_return_decisions_run_every_statement_in_node() {
+        let mut cases: Vec<(&str, &str, Vec<&str>)> = ASI_ROUND2_STATEMENT_CASES
+            .iter()
+            .chain(ASI_ROUND4_STATEMENT_CASES)
+            .chain(ASI_ROUND5_STATEMENT_CASES)
+            .map(|c| {
+                let n = c.matches("f()").count() + c.matches("(f)()").count();
+                (*c, "undefined", vec!["f"; n])
+            })
+            .collect();
+        cases.extend([
+            ("obj.return", "\"RET\"", vec![]),
+            ("obj.of", "\"OF\"", vec![]),
+            ("obj.in\n.length", "2", vec![]),
+            ("i++ / 2", "0.5", vec![]),
+            ("`a${'`'}b`", "\"a`b\"", vec![]),
+            ("f() <!-- trailing html comment", "1", vec!["f"]),
+            ("f()\n+ 1", "2", vec!["f"]),
+            ("document", "\"doc\"", vec![]),
+            ("x +\r1", "1", vec![]),
+            ("x /*\n*/ + 1", "1", vec![]),
+            ("obj.of.\nlength", "2", vec![]),
+            ("0x10.\ntoString()", "\"16\"", vec![]),
+            ("-->x\ndocument", "\"doc\"", vec![]),
+        ]);
+        let bodies: Vec<String> = cases
+            .iter()
+            .map(|(code, _, _)| {
+                let body = strip_leading_js_comments(code.trim());
+                if should_prepend_return(body) {
+                    format!("return {body}")
+                } else {
+                    code.trim().to_string()
+                }
+            })
+            .collect();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(
+            &mut file,
+            serde_json::to_string(&bodies).unwrap().as_bytes(),
+        )
+        .unwrap();
+        let runner = r"
+            const vm = require('vm');
+            const bodies = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+            (async () => {
+              const out = [];
+              for (const body of bodies) {
+                const log = [];
+                globalThis.__log = log;
+                const src = '(async () => { const log = globalThis.__log; const f = () => log.push(\'f\');'
+                  + ' let i = 1, x = 0, a, of = 4, énew = 2, étypeof = 3; const document = \'doc\';'
+                  + ' const obj = { of: \'OF\', in: \'IN\', return: \'RET\' };\n' + body + '\n })()';
+                let ret, err = null;
+                try { ret = await vm.runInThisContext(src); } catch (e) { err = e.name + ': ' + e.message; }
+                out.push({ ret: ret === undefined ? 'undefined' : JSON.stringify(ret), log, err });
+              }
+              console.log('ASI_RESULTS:' + JSON.stringify(out));
+            })();
+        ";
+        let Ok(output) = std::process::Command::new("node")
+            .arg("-e")
+            .arg(runner)
+            .arg(file.path())
+            .output()
+        else {
+            eprintln!("SKIP: node not installed");
+            return;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let line = stdout
+            .lines()
+            .find_map(|l| l.strip_prefix("ASI_RESULTS:"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "no results: {stdout}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            });
+        let results: Vec<serde_json::Value> = serde_json::from_str(line).unwrap();
+        let mut failures = Vec::new();
+        for (((code, want_ret, want_log), body), got) in cases.iter().zip(&bodies).zip(&results) {
+            let got_log: Vec<&str> = got["log"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            if !got["err"].is_null() || got["ret"] != *want_ret || got_log != *want_log {
+                failures.push(format!(
+                    "{code:?} (ran as {body:?}): got ret={} log={got_log:?} err={}; want ret={want_ret} log={want_log:?}",
+                    got["ret"], got["err"]
+                ));
+            }
+        }
+        assert!(failures.is_empty(), "\n{}", failures.join("\n"));
     }
 
     #[test]
@@ -5563,7 +7243,7 @@ mod tests {
     #[test]
     fn envelope_unwrap_error() {
         let r = unwrap_eval_envelope(r#"{"__victauri_err":"boom"}"#.into());
-        assert!(r.unwrap_err().contains("boom"));
+        assert!(r.unwrap_err().message.contains("boom"));
     }
 
     #[test]
@@ -5891,6 +7571,8 @@ mod authz_dispatch_tests {
             db_search_paths: Vec::new(),
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
+            drain_watermarks: crate::introspection::DrainWatermarks::default(),
+            page_loads: crate::introspection::PageLoads::default(),
         })
     }
 
@@ -5911,6 +7593,123 @@ mod authz_dispatch_tests {
         match h.execute_tool(tool, args).await {
             Ok(r) => r,
             Err(_) => panic!("dispatch returned a transport error (arg parse failure)"),
+        }
+    }
+
+    /// The action strings a params type's `action` enum accepts, from its JSON schema.
+    fn schema_actions<T: schemars::JsonSchema>() -> Vec<String> {
+        fn collect(v: &serde_json::Value, out: &mut Vec<String>) {
+            if let Some(values) = v.get("enum").and_then(serde_json::Value::as_array) {
+                out.extend(values.iter().filter_map(|x| x.as_str().map(String::from)));
+            }
+            if let Some(c) = v.get("const").and_then(serde_json::Value::as_str) {
+                out.push(c.to_string());
+            }
+            for key in ["oneOf", "anyOf"] {
+                for sub in v
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    collect(sub, out);
+                }
+            }
+        }
+        let schema = serde_json::to_value(schemars::schema_for!(T)).unwrap();
+        let mut action = schema["properties"]["action"].clone();
+        if let Some(target) = action.get("$ref").and_then(serde_json::Value::as_str) {
+            let name = target.rsplit('/').next().unwrap();
+            action = schema["$defs"][name].clone();
+        }
+        let mut out = Vec::new();
+        collect(&action, &mut out);
+        out
+    }
+
+    /// `resolve_capability` gates an unknown STRING action as the bare tool name,
+    /// trusting the typed parse to reject it. That holds only if every action the parse
+    /// ACCEPTS is mapped to its own capability — pinned here from the enums themselves,
+    /// so a new variant cannot silently fall back to the bare-name gate.
+    #[test]
+    fn every_action_variant_has_a_capability() {
+        let tools: &[(&str, Vec<String>)] = &[
+            ("interact", schema_actions::<InteractParams>()),
+            ("input", schema_actions::<InputParams>()),
+            ("window", schema_actions::<WindowParams>()),
+            ("storage", schema_actions::<StorageParams>()),
+            ("navigate", schema_actions::<NavigateParams>()),
+            ("recording", schema_actions::<RecordingParams>()),
+            ("inspect", schema_actions::<InspectParams>()),
+            ("css", schema_actions::<CssParams>()),
+            ("route", schema_actions::<RouteParams>()),
+            ("trace", schema_actions::<TraceParams>()),
+            ("animation", schema_actions::<AnimationParams>()),
+            ("logs", schema_actions::<LogsParams>()),
+            ("introspect", schema_actions::<IntrospectParams>()),
+            ("fault", schema_actions::<FaultParams>()),
+            ("explain", schema_actions::<ExplainParams>()),
+        ];
+        for (tool, actions) in tools {
+            assert!(
+                !actions.is_empty(),
+                "{tool}: no actions read from its schema"
+            );
+            for action in actions {
+                assert!(
+                    authz::action_capability(tool, action).is_some(),
+                    "{tool}.{action} is accepted by the parser but has no capability"
+                );
+            }
+        }
+    }
+
+    /// The names `disable_tools` validates against are the live tool surface: every
+    /// registered tool is either a compound tool or in `STANDALONE_TOOLS`, and nothing else.
+    #[test]
+    fn disable_tools_name_list_matches_the_live_tools() {
+        let mut live: Vec<String> = VictauriMcpHandler::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .filter(|n| !authz::is_compound_tool(n))
+            .collect();
+        let mut listed: Vec<String> = authz::STANDALONE_TOOLS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        live.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(live, listed);
+        for t in VictauriMcpHandler::tool_router().list_all() {
+            assert!(authz::is_known_name(&t.name), "{}", t.name);
+        }
+    }
+
+    /// Audit N1: `{"action": {"go_to": null}}` (a tag-shaped enum serde accepts) and a
+    /// positional array body used to be gated as the bare tool name, which the Test
+    /// profile allows for `navigate` — the handler then parsed and ran `go_to`. Both
+    /// shapes must now be refused as invalid params before any handler runs, in every
+    /// profile (`FullControl` with the action disabled is the other half of the bypass).
+    #[tokio::test]
+    async fn non_string_action_cannot_slip_past_the_gate() {
+        let mut full_minus_go_to = PrivacyConfig::default();
+        full_minus_go_to
+            .disabled_tools
+            .insert("navigate.go_to".to_string());
+        for privacy in [crate::privacy::test_privacy_config(), full_minus_go_to] {
+            let h = handler(privacy);
+            for args in [
+                serde_json::json!({"action": {"go_to": null}, "url": "https://evil.example"}),
+                serde_json::json!(["go_to", "https://evil.example", null, null, null, null]),
+                serde_json::json!({"action": 0, "url": "https://evil.example"}),
+            ] {
+                match h.execute_tool("navigate", args.clone()).await {
+                    Err(rest::ToolCallError::InvalidParams(_)) => {}
+                    Ok(r) => panic!("{args} reached dispatch: {:?}", r.content),
+                    Err(rest::ToolCallError::UnknownTool(t)) => panic!("{args}: unknown tool {t}"),
+                }
+            }
         }
     }
 
@@ -6115,6 +7914,71 @@ mod authz_dispatch_tests {
         );
     }
 
+    /// R4-NET2: `animation scrub` with `capture=true` takes native window screenshots, so an
+    /// operator who disabled `screenshot` must not get pixels through it (`trace` already
+    /// required both). Without capture, scrub is a plain page read and stays allowed.
+    #[tokio::test]
+    async fn animation_scrub_capture_requires_the_screenshot_tool() {
+        let cfg = PrivacyConfig {
+            disabled_tools: HashSet::from(["screenshot".to_string()]),
+            ..Default::default()
+        };
+        let h = handler(cfg);
+        let r = call(
+            &h,
+            "animation",
+            serde_json::json!({"action": "scrub", "selector": "#toast", "capture": true}),
+        )
+        .await;
+        assert!(
+            is_privacy_blocked(&r),
+            "scrub capture must be refused while `screenshot` is disabled, got: {:?}",
+            r.content
+        );
+        assert!(
+            r.content
+                .iter()
+                .any(|c| matches!(c, ContentBlock::Text(t) if t.text.contains("screenshot"))),
+            "the refusal must name the screenshot tool: {:?}",
+            r.content
+        );
+        let r = call(
+            &h,
+            "animation",
+            serde_json::json!({"action": "scrub", "selector": "#toast"}),
+        )
+        .await;
+        assert!(!is_privacy_blocked(&r), "scrub without capture is allowed");
+    }
+
+    /// R4-NET4: the action spelling of an `inspect` capability disables it at dispatch.
+    #[tokio::test]
+    async fn disabling_an_inspect_action_by_its_action_name_is_honored() {
+        let cfg = PrivacyConfig {
+            disabled_tools: HashSet::from(["inspect.get_styles".to_string()]),
+            ..Default::default()
+        };
+        let h = handler(cfg);
+        let r = call(
+            &h,
+            "inspect",
+            serde_json::json!({"action": "get_styles", "ref_id": "e1"}),
+        )
+        .await;
+        assert!(
+            is_privacy_blocked(&r),
+            "inspect.get_styles must be blocked, got: {:?}",
+            r.content
+        );
+        let r = call(
+            &h,
+            "inspect",
+            serde_json::json!({"action": "get_bounding_boxes", "ref_ids": ["e1"]}),
+        )
+        .await;
+        assert!(!is_privacy_blocked(&r), "a sibling action stays allowed");
+    }
+
     // Command-policy enforcement on invoke paths (A1/A2) and resource gating (B1)
     // are covered with side-effect detection (a bridge that records actual invokes)
     // in the `command_policy_dispatch_tests` module below — that proves the blocked
@@ -6177,11 +8041,25 @@ mod command_policy_dispatch_tests {
     struct RecordingBridge {
         scripts: Arc<StdMutex<Vec<String>>>,
         pending_evals: Option<crate::PendingCallbacks>,
+        /// The nonce of the page currently loaded (reported by the liveness probe).
+        page_nonce: Arc<StdMutex<Option<String>>>,
+        /// When set, the eval wrapper script is answered with this callback body.
+        eval_answer: Arc<StdMutex<Option<String>>>,
+        /// Every trusted (OS-level) input delivered, e.g. `click 50,26` / `type hi` / `key Enter`.
+        natives: Arc<StdMutex<Vec<String>>>,
+        /// While set, the liveness probe is never answered (a busy or wedged UI thread).
+        probe_silent: Arc<AtomicBool>,
     }
 
     /// Extract the 36-char eval id from a probe script of the form `…id:"<uuid>"…`.
     fn extract_probe_id(script: &str) -> Option<String> {
         let start = script.find("id:\"")? + 4;
+        script.get(start..start + 36).map(str::to_string)
+    }
+
+    /// Extract the eval id from the eval wrapper script (`const __vic = { id: "<uuid>", …`).
+    fn extract_wrapper_id(script: &str) -> Option<String> {
+        let start = script.find("__vic = { id: \"")? + 15;
         script.get(start..start + 36).map(str::to_string)
     }
 
@@ -6191,9 +8069,46 @@ mod command_policy_dispatch_tests {
         /// injected.
         fn answering(pending_evals: crate::PendingCallbacks) -> Self {
             Self {
-                scripts: Arc::default(),
                 pending_evals: Some(pending_evals),
+                ..Self::default()
             }
+        }
+
+        /// Like [`answering`](Self::answering), in a page whose nonce is `nonce`.
+        fn in_page(pending_evals: crate::PendingCallbacks, nonce: &str) -> Self {
+            let b = Self::answering(pending_evals);
+            b.load_page(nonce);
+            b
+        }
+
+        /// The window now shows a page with this nonce (what the liveness probe reports).
+        fn load_page(&self, nonce: &str) {
+            *self
+                .page_nonce
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(nonce.to_string());
+        }
+
+        fn answer_evals_with(&self, body: &str) {
+            *self
+                .eval_answer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body.to_string());
+        }
+
+        fn natives(&self) -> Vec<String> {
+            self.natives
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+        }
+
+        fn record_native(&self, what: String) -> Result<(), String> {
+            self.natives
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(what);
+            Ok(())
         }
 
         /// True iff any recorded eval script invoked `command` via the Tauri IPC bridge.
@@ -6218,21 +8133,51 @@ mod command_policy_dispatch_tests {
             // real eval is still left unanswered, so it times out fast at the 100ms
             // test `eval_timeout` — we only care WHICH scripts reached the bridge,
             // never the eval's return value.
-            if let Some(pending) = &self.pending_evals
-                && script.contains("probe_ok")
-                && let Some(id) = extract_probe_id(script)
-            {
+            let answer = if script.contains("probe_ok") {
+                if self.probe_silent.load(Ordering::SeqCst) {
+                    return Ok(());
+                }
+                extract_probe_id(script).map(|id| {
+                    let nonce = self
+                        .page_nonce
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .clone();
+                    let body = nonce.map_or_else(
+                        || "\"probe_ok\"".to_string(),
+                        |n| format!("\"probe_ok:{n}\""),
+                    );
+                    (id, body)
+                })
+            } else {
+                let body = self
+                    .eval_answer
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                extract_wrapper_id(script).zip(body)
+            };
+            if let (Some(pending), Some((id, body))) = (&self.pending_evals, answer) {
                 let pending = pending.clone();
                 std::thread::spawn(move || {
                     let mut map = pending.blocking_lock();
                     if let Some(tx) = map.remove(&id) {
-                        let _ = tx.send("\"probe_ok\"".to_string());
+                        let _ = tx.send(body);
                     }
                 });
             }
             // Return Ok so `eval_with_return` injects BOTH its watchdog and the
             // user-code script (it bails on the first Err).
             Ok(())
+        }
+        fn native_click(&self, _l: Option<&str>, x: f64, y: f64) -> Result<(), String> {
+            self.record_native(format!("click {x},{y}"))
+        }
+        fn native_type_text(&self, _l: Option<&str>, text: &str) -> Result<(), String> {
+            self.record_native(format!("type {text}"))
+        }
+        fn native_key(&self, _l: Option<&str>, key: &str) -> Result<(), String> {
+            self.record_native(format!("key {key}"))
         }
         fn get_window_states(&self, _l: Option<&str>) -> Vec<WindowState> {
             Vec::new()
@@ -6281,6 +8226,8 @@ mod command_policy_dispatch_tests {
             db_search_paths: Vec::new(),
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
+            drain_watermarks: crate::introspection::DrainWatermarks::default(),
+            page_loads: crate::introspection::PageLoads::default(),
         })
     }
 
@@ -6295,15 +8242,15 @@ mod command_policy_dispatch_tests {
     }
 
     fn ipc_event(command: &str) -> AppEvent {
-        AppEvent::Ipc(IpcCall {
-            id: format!("c-{command}"),
-            command: command.to_string(),
-            timestamp: chrono::Utc::now(),
-            duration_ms: Some(1),
-            result: IpcResult::Ok(json!(true)),
-            arg_size_bytes: 0,
-            webview_label: "main".to_string(),
-        })
+        AppEvent::Ipc(IpcCall::new(
+            format!("c-{command}"),
+            command.to_string(),
+            chrono::Utc::now(),
+            IpcResult::Ok(json!(true)),
+            Some(1),
+            0,
+            "main".to_string(),
+        ))
     }
 
     fn result_text(r: &CallToolResult) -> String {
@@ -6412,16 +8359,16 @@ mod command_policy_dispatch_tests {
         let state = state_with(blocking(&["wipe_database"]));
         let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
 
-        let session = RecordedSession {
-            id: "poisoned".to_string(),
-            started_at: chrono::Utc::now(),
-            events: vec![RecordedEvent {
-                index: 0,
-                timestamp: chrono::Utc::now(),
-                event: ipc_event("wipe_database"),
-            }],
-            checkpoints: Vec::new(),
-        };
+        let session = RecordedSession::new(
+            "poisoned".to_string(),
+            chrono::Utc::now(),
+            vec![RecordedEvent::new(
+                0,
+                chrono::Utc::now(),
+                ipc_event("wipe_database"),
+            )],
+            Vec::new(),
+        );
         let session_json = serde_json::to_string(&session).unwrap();
 
         let imp = call(
@@ -6523,6 +8470,240 @@ mod command_policy_dispatch_tests {
         );
     }
 
+    /// A bridge whose UI thread never answers a window listing (a busy/wedged UI), but which
+    /// otherwise behaves like `RecordingBridge`.
+    struct WedgedListingBridge(RecordingBridge);
+
+    impl WebviewBridge for WedgedListingBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            self.0.eval_webview(label, script)
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn try_list_window_labels(&self) -> Result<Vec<String>, String> {
+            Err("list_window_labels did not complete on the main thread: timed out".to_string())
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
+    }
+
+    #[tokio::test]
+    async fn page_originated_evals_cannot_starve_agent_evals() {
+        // Red-team: page JS can call victauri_eval_js; with one shared pool it could park
+        // never-resolving evals in all 100 slots and fail every agent eval.
+        let state = state_with(PrivacyConfig::default());
+        let mut held = Vec::new();
+        for i in 0..crate::tools::MAX_PAGE_PENDING_EVALS {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            // Spread over windows so the page-wide budget, not a window's, is what fills up.
+            let label = format!("w{}", i % 5);
+            let slot = crate::tools::reserve_page_eval(&state, &label, tx)
+                .await
+                .unwrap();
+            held.push((slot, rx));
+        }
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let over = crate::tools::reserve_page_eval(&state, "w9", tx).await;
+        assert!(over.err().unwrap().contains("page-originated"));
+        // The agent path still has room.
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let (tx, _rx2) = tokio::sync::oneshot::channel();
+        assert!(h.reserve_pending("agent-1", tx).await.is_ok());
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn one_window_cannot_starve_another_windows_page_evals() {
+        let state = state_with(PrivacyConfig::default());
+        let mut held = Vec::new();
+        let mut refused = None;
+        // Window "a" (whose label is a prefix of "a:b") fills its own budget and no more.
+        for _ in 0..=crate::tools::MAX_PAGE_PENDING_EVALS_PER_WINDOW {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            match crate::tools::reserve_page_eval(&state, "a", tx).await {
+                Ok(slot) => held.push((slot, rx)),
+                Err(e) => refused = Some(e),
+            }
+        }
+        assert_eq!(held.len(), crate::tools::MAX_PAGE_PENDING_EVALS_PER_WINDOW);
+        assert!(refused.unwrap().contains("window 'a'"));
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let other = crate::tools::reserve_page_eval(&state, "a:b", tx).await;
+        assert!(
+            other.is_ok(),
+            "window 'a:b' was starved by window 'a': {:?}",
+            other.as_ref().err()
+        );
+        // Dropping the slots releases them.
+        drop(held);
+        drop(other);
+        assert!(state.pending_evals.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_busy_ui_is_not_mistaken_for_a_closed_window() {
+        // Red-team finding: a main-thread listing that times out returned `[]`, which the
+        // eval watch read as "window closed … it most likely ran — do not re-run it". A
+        // listing that FAILS is not evidence; the eval must run to its own timeout instead.
+        let Ok(mut s) = Arc::try_unwrap(state_with(PrivacyConfig::default())) else {
+            unreachable!("fresh Arc has one owner")
+        };
+        s.eval_timeout = std::time::Duration::from_millis(2500);
+        let state = Arc::new(s);
+        let bridge = WedgedListingBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(
+            !text.contains("was closed"),
+            "false 'window closed': {text}"
+        );
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    /// `RecordingBridge`, but reporting a live `main` window (so only page loads are in play).
+    struct MainWindowBridge(RecordingBridge);
+
+    impl WebviewBridge for MainWindowBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            self.0.eval_webview(label, script)
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            vec!["main".to_string()]
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
+    }
+
+    fn eval_state_with_timeout(ms: u64) -> Arc<VictauriState> {
+        let Ok(mut s) = Arc::try_unwrap(state_with(PrivacyConfig::default())) else {
+            unreachable!("fresh Arc has one owner")
+        };
+        s.eval_timeout = std::time::Duration::from_millis(ms);
+        Arc::new(s)
+    }
+
+    #[tokio::test]
+    async fn eval_fails_fast_when_its_page_reloads() {
+        let state = eval_state_with_timeout(20_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
+        let reloader = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            inner.load_page("page-2"); // the page reloaded
+            ready_signal(&reloader, "main", "page-2");
+        });
+        let started = std::time::Instant::now();
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(text.contains("loaded a new page"), "{text}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "must not wait out the 20s timeout (took {:?})",
+            started.elapsed()
+        );
+        assert!(
+            state.pending_evals.lock().await.is_empty(),
+            "pending entry removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_ready_signal_from_the_same_page_is_not_a_reload() {
+        // The bridge's ready signal is fire-and-forget at init and can land just after our
+        // probe; it carries the nonce of the page the eval runs in and is not a reload.
+        let state = eval_state_with_timeout(1_500);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner)));
+        let late = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            ready_signal(&late, "main", "page-1");
+        });
+        let r = call(
+            &h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(!text.contains("loaded a new page"), "false reload: {text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn invoke_command_honors_timeout_ms_and_skips_aborted_timings() {
+        let state = eval_state_with_timeout(20_000);
+        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let started = std::time::Instant::now();
+        let r = call(
+            &h,
+            "invoke_command",
+            json!({"command": "slow_thing", "webview_label": "main", "timeout_ms": 400}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "timeout_ms ignored"
+        );
+        assert!(text.contains("timed out after 400ms"), "{text}");
+        assert!(
+            text.contains("timeout_ms"),
+            "the error must point at timeout_ms: {text}"
+        );
+        assert!(
+            state.command_timings.stats_for("slow_thing").is_none(),
+            "a timed-out call is not a command duration"
+        );
+    }
+
     #[tokio::test]
     async fn eval_reports_app_shutdown_instead_of_timing_out() {
         let state = slow_eval_state();
@@ -6548,17 +8729,629 @@ mod command_policy_dispatch_tests {
         );
     }
 
+    /// The bridge's ready signal for window `label`, from a page whose nonce is `nonce`.
+    fn ready_signal(state: &VictauriState, label: &str, nonce: &str) {
+        state.page_loads.record_load(label, Some(nonce));
+    }
+
+    async fn hanging_eval(h: &VictauriMcpHandler) -> (String, std::time::Duration) {
+        let started = std::time::Instant::now();
+        let r = call(
+            h,
+            "eval_js",
+            json!({"code": "await new Promise(() => {})", "webview_label": "main"}),
+        )
+        .await;
+        (result_text(&r), started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn a_reload_right_after_injection_is_detected() {
+        // A reload that completes within a few ms of the injection (eval_js("location.reload()"),
+        // navigate, a fast HMR) was hidden by a 250ms grace and waited out the full timeout.
+        let state = eval_state_with_timeout(20_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
+        let reloader = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            inner.load_page("page-2");
+            ready_signal(&reloader, "main", "page-2");
+        });
+        let (text, took) = hanging_eval(&h).await;
+        assert!(text.contains("loaded a new page"), "{text}");
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn a_same_page_ready_signal_arriving_late_is_not_a_reload() {
+        // Under load the page's own ready signal can land seconds after the probe; it carries the
+        // nonce the eval was armed in, so the eval keeps waiting for its real result.
+        let state = eval_state_with_timeout(3_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner)));
+        let late = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+            ready_signal(&late, "main", "page-1");
+        });
+        let (text, _) = hanging_eval(&h).await;
+        assert!(!text.contains("loaded a new page"), "false reload: {text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_forged_ready_signal_does_not_abort_an_eval() {
+        // Page script can call victauri_eval_callback('__victauri_bridge_ready__') itself. The
+        // page did not change (the probe still reports the armed nonce), so it is not a reload.
+        let state = eval_state_with_timeout(2_500);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner)));
+        let forger = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+            ready_signal(&forger, "main", "forged");
+        });
+        let (text, _) = hanging_eval(&h).await;
+        assert!(!text.contains("loaded a new page"), "forged reload: {text}");
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    /// R4-EVAL1: a ready signal whose confirming probe FAILS (a busy UI thread, a full slot
+    /// map) is no evidence of a new page. The eval used to abort as "loaded a new page" — which
+    /// page script can provoke with a forged signal while the UI is busy, and which invites a
+    /// retry that runs side-effecting code twice. It must keep waiting (its own timeout bounds
+    /// it).
+    #[tokio::test]
+    async fn an_unconfirmed_ready_signal_does_not_abort_an_eval() {
+        let state = eval_state_with_timeout(4_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
+        let signal = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            inner.probe_silent.store(true, Ordering::SeqCst); // the UI stops answering
+            ready_signal(&signal, "main", "forged");
+        });
+        let (text, _) = hanging_eval(&h).await;
+        assert!(
+            !text.contains("loaded a new page"),
+            "aborted on no evidence: {text}"
+        );
+        assert!(text.contains("timed out"), "{text}");
+    }
+
+    /// B-L5: the timeout message rules out a parse error only when the fast parse check was
+    /// actually armed (the page reported a nonce) and delivered; otherwise it cannot know.
+    #[tokio::test]
+    async fn a_timeout_claims_no_parse_error_only_when_the_parse_check_ran() {
+        let state = eval_state_with_timeout(300);
+        // No nonce from the probe: the parse check is disabled.
+        let h = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(RecordingBridge::answering(state.pending_evals.clone())),
+        );
+        let (text, _) = hanging_eval(&h).await;
+        assert!(text.contains("timed out"), "{text}");
+        assert!(!text.contains("NOT a parse"), "unfounded claim: {text}");
+        assert!(text.contains("could not be ruled out"), "{text}");
+        // Armed and delivered: the claim holds.
+        let h = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(RecordingBridge::in_page(state.pending_evals.clone(), "p1")),
+        );
+        let (text, _) = hanging_eval(&h).await;
+        assert!(text.contains("NOT a parse error"), "{text}");
+        // Armed but the check could not be delivered.
+        let h = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(CheckNotDeliveredBridge(RecordingBridge::in_page(
+                state.pending_evals.clone(),
+                "p1",
+            ))),
+        );
+        let (text, _) = hanging_eval(&h).await;
+        assert!(!text.contains("NOT a parse"), "unfounded claim: {text}");
+    }
+
+    /// Delivers everything but the eval's parse-check script.
+    struct CheckNotDeliveredBridge(RecordingBridge);
+
+    impl WebviewBridge for CheckNotDeliveredBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            if script.contains("_evalCheck") {
+                return Err("window busy".to_string());
+            }
+            self.0.eval_webview(label, script)
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            vec!["main".to_string()]
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
+    }
+
+    /// A page that answers WITHOUT the armed nonce (the bridge that armed the eval is gone)
+    /// is positive evidence of a new page.
+    #[tokio::test]
+    async fn a_page_without_the_armed_nonce_is_a_reload() {
+        let state = eval_state_with_timeout(20_000);
+        let inner = RecordingBridge::in_page(state.pending_evals.clone(), "page-1");
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(inner.clone())));
+        let reloader = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            *inner
+                .page_nonce
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            ready_signal(&reloader, "main", "whatever");
+        });
+        let (text, took) = hanging_eval(&h).await;
+        assert!(text.contains("loaded a new page"), "{text}");
+        assert!(took < std::time::Duration::from_secs(5), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn an_eval_started_after_app_exit_fails_fast() {
+        // `subscribe()` marks the current value seen: an eval started after the exit signal
+        // waited its whole timeout for a change that had already happened.
+        let state = slow_eval_state();
+        state.shutdown_tx.send_replace(true);
+        let bridge = MainWindowBridge(RecordingBridge::answering(state.pending_evals.clone()));
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let (text, took) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), hanging_eval(&h))
+                .await
+                .expect("an eval after app exit must not wait out its 20s timeout");
+        assert!(text.contains("shutting down"), "{text}");
+        assert!(took < std::time::Duration::from_secs(3), "took {took:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_eval_call_releases_its_pending_slot() {
+        // REST runs the tool inside the axum future: a client that disconnects or times out
+        // drops it mid-wait. The pending entry used to leak; 100 of them wedged every eval.
+        let state = eval_state_with_timeout(20_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        for _ in 0..3 {
+            let dropped = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                h.execute_tool("eval_js", json!({"code": "await new Promise(() => {})"})),
+            )
+            .await;
+            assert!(
+                dropped.is_err(),
+                "the call must still be in flight when dropped"
+            );
+        }
+        // The recording drain reserves slots too (its page never answers here). It only reads
+        // while a recording is active and its drain epoch is set, as `recording start` does.
+        let generation = state
+            .recorder
+            .start_session("slot-release".to_string())
+            .unwrap();
+        state.drain_watermarks.reset(0.0, generation);
+        let bridge: Arc<dyn WebviewBridge> = Arc::new(RecordingBridge::default());
+        let dropped = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            drain_window_into_recording(&state, &bridge, "main"),
+        )
+        .await;
+        assert!(
+            dropped.is_err(),
+            "the drain must still be in flight when dropped"
+        );
+        // Removal on drop may be deferred to a task when the map is momentarily locked.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            state.pending_evals.lock().await.is_empty(),
+            "a dropped call leaked its pending-eval slot"
+        );
+    }
+
+    /// Answers the liveness probe, but every other script fails to inject.
+    struct InjectFailsBridge(RecordingBridge);
+
+    impl WebviewBridge for InjectFailsBridge {
+        fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+            self.0.eval_webview(label, script)?;
+            if script.contains("probe_ok") {
+                Ok(())
+            } else {
+                Err("window not found: main".to_string())
+            }
+        }
+        fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+            self.0.get_window_states(label)
+        }
+        fn list_window_labels(&self) -> Vec<String> {
+            vec!["main".to_string()]
+        }
+        fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+            self.0.get_native_handle(label)
+        }
+        fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+            self.0.manage_window(label, action)
+        }
+        fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+            self.0.resize_window(label, w, h)
+        }
+        fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+            self.0.move_window(label, x, y)
+        }
+        fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+            self.0.set_window_title(label, title)
+        }
+    }
+
+    #[tokio::test]
+    async fn invoke_command_records_no_timing_for_calls_that_never_ran() {
+        // Only a call that reached the command is a command duration: a saturated pending map
+        // (~0ms), a dead bridge (~2s probe) or a failed injection measure nothing about it.
+        let state = eval_state_with_timeout(1_000);
+        let fillers: Vec<_> = (0..MAX_PENDING_EVALS)
+            .map(|_| tokio::sync::oneshot::channel::<String>())
+            .collect();
+        {
+            let mut p = state.pending_evals.lock().await;
+            for (i, (tx, _)) in fillers.into_iter().enumerate() {
+                p.insert(format!("filler-{i}"), tx);
+            }
+        }
+        let answering = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(answering.clone()));
+        let r = call(&h, "invoke_command", json!({"command": "saturated"})).await;
+        assert!(
+            result_text(&r).contains("too many concurrent"),
+            "{}",
+            result_text(&r)
+        );
+        state.pending_evals.lock().await.clear();
+
+        let dead = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
+        let r = call(&dead, "invoke_command", json!({"command": "dead_bridge"})).await;
+        assert!(
+            result_text(&r).contains("bridge not responding"),
+            "{}",
+            result_text(&r)
+        );
+
+        let failing = VictauriMcpHandler::new(
+            state.clone(),
+            Arc::new(InjectFailsBridge(RecordingBridge::answering(
+                state.pending_evals.clone(),
+            ))),
+        );
+        let r = call(
+            &failing,
+            "invoke_command",
+            json!({"command": "not_injected"}),
+        )
+        .await;
+        assert!(
+            result_text(&r).contains("injection failed"),
+            "{}",
+            result_text(&r)
+        );
+
+        for cmd in ["saturated", "dead_bridge", "not_injected"] {
+            assert!(
+                state.command_timings.stats_for(cmd).is_none(),
+                "'{cmd}' never ran but was recorded as a command timing"
+            );
+        }
+
+        // Code that did not parse never ran either.
+        answering.answer_evals_with(r#"{"__victauri_not_run":"did not begin executing"}"#);
+        let r = call(&h, "invoke_command", json!({"command": "never_parsed"})).await;
+        assert!(
+            result_text(&r).contains("parse error"),
+            "{}",
+            result_text(&r)
+        );
+        assert!(state.command_timings.stats_for("never_parsed").is_none());
+
+        // Positive control: a call that ran (and threw) IS a timing.
+        answering.answer_evals_with(r#"{"__victauri_err":"boom"}"#);
+        let r = call(&h, "invoke_command", json!({"command": "ran_and_threw"})).await;
+        assert!(result_text(&r).contains("boom"), "{}", result_text(&r));
+        assert!(state.command_timings.stats_for("ran_and_threw").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_trusted_key_press_stops_when_its_element_cannot_be_focused() {
+        // The focus result used to be ignored and the OS key sent regardless — into whatever
+        // element (or app) held focus.
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(r#"{"__victauri_ok":false,"__victauri_type":"value"}"#);
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(
+            &h,
+            "input",
+            json!({"action": "press_key", "key": "Enter", "ref_id": "e9", "trusted": true}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("not focusable"), "key sent anyway: {text}");
+    }
+
+    /// G-12: `route add` forwarded any `delay_ms` (a u64) to the page, where a delayed request
+    /// is held that long. It is capped like a `fault` delay, refused before reaching the page.
+    #[tokio::test]
+    async fn route_delay_is_capped() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(&ok_envelope(&json!({"ok": true, "id": 1})));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+        let added = |b: &RecordingBridge| {
+            b.scripts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .filter(|s| s.contains("addRoute("))
+                .count()
+        };
+        let r = call(
+            &h,
+            "route",
+            json!({"action": "add", "pattern": "/api", "behavior": "delay",
+                   "delay_ms": MAX_FAULT_DELAY_MS + 1}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("delay_ms"), "{text}");
+        assert_eq!(added(&bridge), 0, "the rule must not reach the page");
+        // At the cap it is accepted.
+        let r = call(
+            &h,
+            "route",
+            json!({"action": "add", "pattern": "/api", "behavior": "delay",
+                   "delay_ms": MAX_FAULT_DELAY_MS}),
+        )
+        .await;
+        assert_ne!(r.is_error, Some(true), "{}", result_text(&r));
+        assert_eq!(added(&bridge), 1);
+    }
+
+    /// R5-ANIM1: `animation scrub capture=true` reported `"captured": true` with no filmstrip
+    /// when no frame could be captured (here: no native window handle), hiding the failure.
+    #[tokio::test]
+    async fn animation_scrub_never_claims_a_capture_it_did_not_make() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(&ok_envelope(
+            &json!({"prepared": true, "duration": 100, "anim_count": 1, "t": 0}),
+        ));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(
+            &h,
+            "animation",
+            json!({"action": "scrub", "selector": "#toast", "points": 2, "capture": true}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_ne!(
+            r.is_error,
+            Some(true),
+            "the geometry curve is still returned: {text}"
+        );
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["captured"], false, "{v}");
+        assert!(v.get("filmstrip").is_none(), "{v}");
+        assert!(
+            v["capture_error"]
+                .as_str()
+                .is_some_and(|e| e.contains("no handle")),
+            "the capture failure must be surfaced: {v}"
+        );
+        assert_eq!(v["curve"].as_array().map(Vec::len), Some(2), "{v}");
+    }
+
+    /// The eval envelope for a page result `value`.
+    /// R5-JS5: `limit: 0` means "return at most zero entries". The log JS used `.slice(-0)`
+    /// (and the bridge treats a falsy limit as "all"), so it returned EVERY entry.
+    #[tokio::test]
+    async fn log_limit_zero_returns_no_entries() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(&ok_envelope(&json!([{"a": 1}, {"a": 2}])));
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        for action in [
+            "console",
+            "network",
+            "ipc",
+            "navigation",
+            "dialogs",
+            "events",
+        ] {
+            let r = call(&h, "logs", json!({"action": action, "limit": 0})).await;
+            let text = result_text(&r);
+            assert_ne!(r.is_error, Some(true), "{action}: {text}");
+            let v: serde_json::Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("{action}: not JSON ({e}): {text}"));
+            assert_eq!(
+                v,
+                json!([]),
+                "logs {action} limit=0 returned entries: {text}"
+            );
+        }
+        let r = call(&h, "route", json!({"action": "matches", "limit": 0})).await;
+        let text = result_text(&r);
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+        assert_eq!(
+            v,
+            json!([]),
+            "route matches limit=0 returned entries: {text}"
+        );
+    }
+
+    fn ok_envelope(value: &serde_json::Value) -> String {
+        json!({"__victauri_ok": value, "__victauri_type": "object"}).to_string()
+    }
+
+    /// R4-IN1: trusted typing / key presses go out only when the page confirms focus landed
+    /// on the element; an element that exists but did not take focus stops the input.
+    #[tokio::test]
+    async fn trusted_keys_are_sent_only_when_focus_landed_on_the_element() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+        let type_args =
+            json!({"action": "type_text", "ref_id": "e3", "text": "hi", "trusted": true});
+        let key_args =
+            json!({"action": "press_key", "key": "Enter", "ref_id": "e3", "trusted": true});
+
+        bridge.answer_evals_with(&ok_envelope(&json!({"found": true, "focused": false})));
+        for args in [&type_args, &key_args] {
+            let r = call(&h, "input", args.clone()).await;
+            let text = result_text(&r);
+            assert_eq!(r.is_error, Some(true), "{args}: {text}");
+            assert!(text.contains("focus did not land"), "{args}: {text}");
+        }
+        bridge.answer_evals_with(&ok_envelope(&json!({"found": false, "focused": false})));
+        let r = call(&h, "input", type_args.clone()).await;
+        assert!(
+            result_text(&r).contains("ref not found"),
+            "{}",
+            result_text(&r)
+        );
+        assert!(
+            bridge.natives().is_empty(),
+            "keys sent: {:?}",
+            bridge.natives()
+        );
+
+        // Positive control: confirmed focus → the OS input goes out.
+        bridge.answer_evals_with(&ok_envelope(&json!({"found": true, "focused": true})));
+        for args in [&type_args, &key_args] {
+            let r = call(&h, "input", args.clone()).await;
+            assert_ne!(r.is_error, Some(true), "{args}: {}", result_text(&r));
+        }
+        assert_eq!(bridge.natives(), vec!["type hi", "key Enter"]);
+    }
+
+    /// R4-IN2: a trusted click is sent only at a point the page vouched for, and never at an
+    /// unusable one.
+    #[tokio::test]
+    async fn trusted_click_is_refused_unless_the_page_reports_a_clickable_point() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge.clone()));
+        let args = json!({"action": "click", "ref_id": "e5", "trusted": true});
+        for (answer, expect) in [
+            (
+                json!({"error": "element is covered at its center point by <div>"}),
+                "covered",
+            ),
+            (json!({"x": -4.0, "y": 10.0}), "unusable click point"),
+            (json!(null), "ref not found"),
+        ] {
+            bridge.answer_evals_with(&ok_envelope(&answer));
+            let r = call(&h, "interact", args.clone()).await;
+            let text = result_text(&r);
+            assert_eq!(r.is_error, Some(true), "{answer}: {text}");
+            assert!(text.contains(expect), "{answer}: {text}");
+        }
+        assert!(
+            bridge.natives().is_empty(),
+            "clicked: {:?}",
+            bridge.natives()
+        );
+        bridge.answer_evals_with(&ok_envelope(&json!({"x": 150.0, "y": 226.0})));
+        let r = call(&h, "interact", args).await;
+        assert_ne!(r.is_error, Some(true), "{}", result_text(&r));
+        assert_eq!(bridge.natives(), vec!["click 150,226"]);
+    }
+
+    #[tokio::test]
+    async fn an_unserializable_result_is_reported_as_code_that_ran() {
+        // A circular object / BigInt result used to read "JavaScript error: …" although the code
+        // ran — an agent then re-ran side-effecting code to "fix" it.
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        bridge.answer_evals_with(
+            r#"{"__victauri_unserializable":"Do not know how to serialize a BigInt"}"#,
+        );
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(&h, "eval_js", json!({"code": "return 1n"})).await;
+        let text = result_text(&r);
+        assert_eq!(r.is_error, Some(true), "{text}");
+        assert!(text.contains("the code ran"), "{text}");
+        assert!(text.contains("BigInt"), "{text}");
+        assert!(!text.contains("JavaScript error"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn trace_stop_never_stops_a_recording_it_did_not_start() {
+        let state = state_with(PrivacyConfig::default());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
+        let _ = call(&h, "trace", json!({"action": "start", "with_events": true})).await;
+        let traced = state
+            .recorder
+            .active_session_id()
+            .expect("trace started a recording");
+        // The agent ends the trace's recording and starts its own.
+        let _ = state.recorder.stop();
+        state.recorder.start("mine".to_string()).unwrap();
+        let _ = call(&h, "trace", json!({"action": "stop"})).await;
+        assert_eq!(
+            state.recorder.active_session_id().as_deref(),
+            Some("mine"),
+            "trace stop must not end a recording it did not start (it started {traced})"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarting_a_trace_does_not_orphan_its_recording() {
+        let state = state_with(PrivacyConfig::default());
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
+        let _ = call(&h, "trace", json!({"action": "start", "with_events": true})).await;
+        let first = state.recorder.active_session_id().unwrap();
+        let _ = call(&h, "trace", json!({"action": "start", "with_events": true})).await;
+        let second = state.recorder.active_session_id().unwrap();
+        assert_ne!(
+            first, second,
+            "the first trace's recording was superseded, not orphaned"
+        );
+        let _ = call(&h, "trace", json!({"action": "stop"})).await;
+        assert!(
+            !state.recorder.is_recording(),
+            "stop ends the second trace's recording"
+        );
+    }
+
     #[tokio::test]
     async fn import_refuses_to_discard_an_active_recording() {
         let state = state_with(PrivacyConfig::default());
         state.recorder.start("live".to_string()).unwrap();
         let h = VictauriMcpHandler::new(state.clone(), Arc::new(RecordingBridge::default()));
-        let session = RecordedSession {
-            id: "other".to_string(),
-            started_at: chrono::Utc::now(),
-            events: Vec::new(),
-            checkpoints: Vec::new(),
-        };
+        let session = RecordedSession::new(
+            "other".to_string(),
+            chrono::Utc::now(),
+            Vec::new(),
+            Vec::new(),
+        );
         let r = call(
             &h,
             "recording",
@@ -6619,6 +9412,41 @@ mod command_policy_dispatch_tests {
         );
     }
 
+    /// R4-PANIC1: the stored sample was cut with `&s[..4096]`, which panics when byte 4096
+    /// falls inside a multi-byte character — any non-ASCII response over 4 KiB.
+    #[tokio::test]
+    async fn contract_record_samples_a_large_non_ascii_response_without_panicking() {
+        let state = eval_state_with_timeout(2_000);
+        let bridge = RecordingBridge::answering(state.pending_evals.clone());
+        // The result text is `"ééé…"`: the opening quote puts every `é` on an odd byte
+        // offset, so byte 4096 is the second byte of a character.
+        let payload = "é".repeat(3000);
+        bridge.answer_evals_with(
+            &json!({"__victauri_ok": payload, "__victauri_type": "string"}).to_string(),
+        );
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(bridge));
+        let r = call(
+            &h,
+            "introspect",
+            json!({"action": "contract_record", "command": "get_notes"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert_ne!(r.is_error, Some(true), "{text}");
+        let baseline = state
+            .contract_store
+            .all()
+            .into_iter()
+            .find(|b| b.command == "get_notes")
+            .expect("baseline recorded");
+        assert!(
+            baseline.sample.ends_with("...(truncated)"),
+            "{}",
+            baseline.sample
+        );
+        assert!(baseline.sample.len() <= 4096 + "...(truncated)".len());
+    }
+
     // ── pending-eval concurrency ceiling (audit: TOCTOU race) ────────────────
     #[tokio::test]
     async fn reserve_pending_is_a_hard_ceiling_under_concurrency() {
@@ -6644,19 +9472,19 @@ mod command_policy_dispatch_tests {
             let h = h.clone();
             tasks.push(tokio::spawn(async move {
                 let (tx, _rx) = tokio::sync::oneshot::channel();
-                // keep rx alive until the reservation has been decided
-                let ok = h.reserve_pending(&format!("c-{i}"), tx).await.is_ok();
-                (ok, _rx)
+                // keep rx and the slot alive until the reservation has been decided
+                let slot = h.reserve_pending(&format!("c-{i}"), tx).await.ok();
+                (slot, _rx)
             }));
         }
         let mut granted = 0;
         let mut keep = Vec::new();
         for t in tasks {
-            let (ok, rx) = t.await.unwrap();
-            if ok {
+            let (slot, rx) = t.await.unwrap();
+            if slot.is_some() {
                 granted += 1;
             }
-            keep.push(rx); // hold receivers so reserved entries are not dropped/removed
+            keep.push((slot, rx)); // hold slots so reserved entries are not released
         }
         let len = state.pending_evals.lock().await.len();
         assert!(
@@ -6714,9 +9542,14 @@ mod command_policy_dispatch_tests {
             RESOURCE_URI_WINDOWS,
             RESOURCE_URI_STATE,
         ] {
-            let cap = resource_required_capability(uri).expect("resource maps to a capability");
+            let (_, cap) =
+                resource_required_capability(uri).expect("resource maps to a capability");
             assert!(
                 !cfg.is_tool_enabled(cap),
+                "disabling capability {cap} must gate resource {uri} (audit B1)"
+            );
+            assert!(
+                !resource_allowed(&cfg, uri),
                 "disabling capability {cap} must gate resource {uri} (audit B1)"
             );
         }
@@ -6727,8 +9560,67 @@ mod command_policy_dispatch_tests {
             RESOURCE_URI_WINDOWS,
             RESOURCE_URI_STATE,
         ] {
-            assert!(full.is_tool_enabled(resource_required_capability(uri).unwrap()));
+            assert!(full.is_tool_enabled(resource_required_capability(uri).unwrap().1));
+            assert!(resource_allowed(&full, uri));
         }
+    }
+
+    /// One JSON-RPC request to `/mcp` (legacy protocol, so the legacy subscribe method is
+    /// routed); returns the response body text.
+    async fn mcp_body(privacy: PrivacyConfig, method: &str, params: serde_json::Value) -> String {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+        let app = build_app(state_with(privacy), Arc::new(RecordingBridge::default()));
+        let body = json!({"jsonrpc": "2.0", "id": 1, "method": method, "params": params});
+        let req = axum::http::Request::post("/mcp")
+            .header("host", "127.0.0.1:7373")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-06-18")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap();
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(20), app.oneshot(req))
+            .await
+            .expect("an MCP request must be answered")
+            .unwrap();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// R4-NET3: a resource mirrors a tool action, and disabling the TOOL by its bare name
+    /// (`disable_tools(["logs"])`) blocks every one of its actions — so it must block the
+    /// resource too. The gate checked only the capability (`logs.ipc`), so the bare-name
+    /// disable was ignored for resources (read and the legacy subscribe).
+    #[tokio::test]
+    async fn a_bare_tool_disable_also_blocks_its_resources() {
+        for (disabled, uri) in [
+            ("logs", RESOURCE_URI_IPC_LOG),
+            ("window", RESOURCE_URI_WINDOWS),
+            ("get_plugin_info", RESOURCE_URI_STATE),
+        ] {
+            let cfg = || PrivacyConfig {
+                disabled_tools: HashSet::from([disabled.to_string()]),
+                ..Default::default()
+            };
+            for method in ["resources/read", "resources/subscribe"] {
+                let body = mcp_body(cfg(), method, json!({"uri": uri})).await;
+                assert!(
+                    body.contains("not permitted by the current privacy configuration"),
+                    "disable_tools([{disabled:?}]) must block {method} {uri}: {body}"
+                );
+            }
+        }
+        // Positive control: nothing disabled, the resource reads.
+        let body = mcp_body(
+            PrivacyConfig::default(),
+            "resources/read",
+            json!({"uri": RESOURCE_URI_WINDOWS}),
+        )
+        .await;
+        assert!(
+            body.contains("\"contents\"") && !body.contains("not permitted"),
+            "{body}"
+        );
     }
 
     // ── empty/whitespace auth token collapses to NO auth (audit B2) ───────────
@@ -6815,18 +9707,16 @@ mod screenshot_visibility_tests {
     use victauri_core::{CommandRegistry, EventLog, EventRecorder, WindowState};
 
     fn window(label: &str, visible: bool) -> WindowState {
-        WindowState {
-            label: label.to_string(),
-            title: label.to_string(),
-            url: "http://localhost/".to_string(),
-            visible,
-            focused: false,
-            maximized: false,
-            minimized: false,
-            fullscreen: false,
-            position: (0, 0),
-            size: (800, 600),
-        }
+        WindowState::new(label.to_string())
+            .with_title(label.to_string())
+            .with_url("http://localhost/".to_string())
+            .with_visible(visible)
+            .with_focused(false)
+            .with_maximized(false)
+            .with_minimized(false)
+            .with_fullscreen(false)
+            .with_position(0, 0)
+            .with_size(800, 600)
     }
 
     /// A bridge with a configurable window set that RECORDS the label `get_native_handle`
@@ -6920,6 +9810,8 @@ mod screenshot_visibility_tests {
             db_search_paths: Vec::new(),
             screencast: Arc::new(crate::screencast::Screencast::default()),
             probes: crate::introspection::AppStateProbes::default(),
+            drain_watermarks: crate::introspection::DrainWatermarks::default(),
+            page_loads: crate::introspection::PageLoads::default(),
         });
         VictauriMcpHandler::new(state, bridge)
     }

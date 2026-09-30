@@ -32,21 +32,43 @@ async fn wait_past_ipc_checkpoint_ms(checkpoint_ms: u64) {
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Headroom added on top of a tool's own `timeout_ms` so the HTTP request never
-/// times out before the server-side wait it is waiting on has finished.
-const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(10);
+/// times out before the server-side wait it is waiting on has finished. Before that wait
+/// starts the server may wait for the webview bridge (up to 5 s), probe it (up to 2 s) and
+/// make main-thread round trips — the same allowance `victauri bridge` uses.
+const TOOL_TIMEOUT_HEADROOM: Duration = Duration::from_secs(40);
+
+/// The server's ceiling for any per-call `timeout_ms` (`invoke_command`).
+const MAX_TOOL_TIMEOUT_MS: u64 = 300_000;
 
 /// Per-request HTTP timeout for a tool call. Tools that block server-side for a
 /// caller-chosen `timeout_ms` (e.g. `wait_for`, which accepts up to 120 000 ms)
 /// need the HTTP timeout to outlast that wait; otherwise the client gives up at
 /// the fixed 60 s default while the server is still legitimately waiting.
+///
+/// A tool call WITHOUT `timeout_ms` is bounded server-side by the app's configured eval timeout,
+/// which can be up to 300 s; the client must not give up first, or a retry would run a
+/// side-effecting call twice (round-4 review — the same class `victauri bridge` fixed). The
+/// server still answers as soon as the call finishes, so this never slows a normal call.
 fn request_timeout_for(arguments: &Value) -> Duration {
-    arguments
+    let ms = arguments
         .get("timeout_ms")
         .and_then(Value::as_u64)
-        .map_or(DEFAULT_REQUEST_TIMEOUT, |ms| {
-            DEFAULT_REQUEST_TIMEOUT
-                .max(Duration::from_millis(ms).saturating_add(TOOL_TIMEOUT_HEADROOM))
-        })
+        .unwrap_or(MAX_TOOL_TIMEOUT_MS);
+    DEFAULT_REQUEST_TIMEOUT.max(
+        Duration::from_millis(ms.min(MAX_TOOL_TIMEOUT_MS)).saturating_add(TOOL_TIMEOUT_HEADROOM),
+    )
+}
+
+/// Whether an HTTP status from `GET /health` proves the Victauri server is alive.
+///
+/// A `2xx` does, and so does `429 Too Many Requests`: `/health` shares the public rate-limit
+/// bucket, so anyone on the machine can flood it, and a rate-limited reply is still the
+/// server answering. Treating 429 as "down" let an unauthenticated flood make every client
+/// report a live app as unreachable (round-4 audit R4-NET1).
+#[doc(hidden)]
+#[must_use]
+pub fn health_status_means_alive(status: u16) -> bool {
+    (200..300).contains(&status) || status == 429
 }
 
 /// Truncate `text` to at most `max_chars` characters without splitting a UTF-8
@@ -106,6 +128,7 @@ fn find_sse_response(text: &str, expected_id: u64) -> Option<Value> {
 /// println!("v{} — {} tools, up {:.0}s", info.version, info.tools.total, info.uptime_secs);
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct PluginInfo {
     /// Plugin version string (e.g. `"0.2.0"`).
     pub version: String,
@@ -124,6 +147,7 @@ pub struct PluginInfo {
 
 /// Tool information nested inside [`PluginInfo`].
 #[derive(Debug, Clone, Default, Deserialize)]
+#[non_exhaustive]
 pub struct PluginToolInfo {
     /// Total number of tools registered.
     #[serde(default)]
@@ -143,6 +167,7 @@ pub struct PluginToolInfo {
 /// assert!(mb < 512.0, "memory usage too high: {mb:.1} MB");
 /// ```
 #[derive(Debug, Clone, Deserialize)]
+#[non_exhaustive]
 pub struct MemoryStats {
     /// Current working set size in bytes.
     pub working_set_bytes: u64,
@@ -257,6 +282,11 @@ pub struct VictauriClient {
     /// re-handshake instead of replaying stale credentials. `false` for explicit
     /// [`Self::connect_with_token`] clients, whose endpoint is the caller's choice.
     discovered: bool,
+    /// Tauri app identifier of the server this client connected to, recorded at
+    /// [`Self::discover`] time (from `/info`, else discovery metadata). Rediscovery
+    /// only accepts a server with this same identity, so a restarted client can never
+    /// silently bind to a different app that took over the port.
+    app_identifier: Option<String>,
 }
 
 impl VictauriClient {
@@ -285,6 +315,10 @@ impl VictauriClient {
         let host = "127.0.0.1";
         let base_url = format!("http://{host}:{port}");
         let http = reqwest::Client::builder()
+            // Below the plugin's 10 s idle keep-alive (its request-head deadline), so a pooled
+            // connection is never reused just as the server closes it (a request lost that way looks
+            // "possibly delivered" and a tool call is then not retried).
+            .pool_idle_timeout(std::time::Duration::from_secs(5))
             .timeout(DEFAULT_REQUEST_TIMEOUT)
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
@@ -305,6 +339,7 @@ impl VictauriClient {
             next_id: 10,
             auth_token: token.map(String::from),
             discovered: false,
+            app_identifier: None,
         })
     }
 
@@ -412,7 +447,7 @@ impl VictauriClient {
     /// restarted, the client reconnected, or the `notifications/initialized` was missed.
     async fn reinitialize(&mut self) -> Result<(), TestError> {
         if self.discovered {
-            self.rediscover();
+            self.rediscover()?;
         }
         let token = self.auth_token.clone();
         let session_id = Self::perform_handshake(
@@ -424,42 +459,175 @@ impl VictauriClient {
         )
         .await?;
         self.session_id = session_id;
+        if self.discovered {
+            self.verify_identity().await?;
+        }
         Ok(())
     }
 
-    /// Re-resolve the endpoint (port + auth token) from discovery, exactly as
-    /// [`Self::discover`] did. Only meaningful for discovered clients: after an app
-    /// restart the plugin has a fresh token and possibly a different port.
-    fn rediscover(&mut self) {
-        let (port, token) = crate::discovery::resolve_connection();
+    /// Re-resolve the endpoint (port + auth token) from discovery for the SAME app
+    /// [`Self::discover`] connected to. Only meaningful for discovered clients: after
+    /// an app restart the plugin has a fresh token and possibly a different port.
+    ///
+    /// Errors (leaving the endpoint unchanged) when no live server with the recorded
+    /// app identity is found — it never falls back to the default port.
+    fn rediscover(&mut self) -> Result<(), TestError> {
+        let Some((port, token)) =
+            crate::discovery::resolve_rediscovery(self.app_identifier.as_deref())
+        else {
+            return Err(TestError::Connection {
+                host: self.host.clone(),
+                port: self.port,
+                reason: self.app_identifier.as_ref().map_or_else(
+                    || {
+                        "rediscovery found no unambiguous live Victauri server — the app may \
+                         still be restarting"
+                            .to_string()
+                    },
+                    |id| {
+                        format!(
+                            "rediscovery found no live Victauri server for app '{id}' — the \
+                             app may still be restarting (other running apps are ignored)"
+                        )
+                    },
+                ),
+            });
+        };
         if port != self.port {
             self.port = port;
             self.base_url = format!("http://{}:{port}", self.host);
         }
         self.auth_token = token;
+        Ok(())
+    }
+
+    /// Read the host app's identifier from the server's `/info` endpoint.
+    async fn fetch_app_identifier(&self) -> Option<String> {
+        self.fetch_app_identity().await?.0
+    }
+
+    /// The host app's `(app_identifier, app_product_name)` from the server's `/info`
+    /// endpoint; `None` when it does not answer one.
+    async fn fetch_app_identity(&self) -> Option<(Option<String>, Option<String>)> {
+        let mut req = self.http.get(format!("{}/info", self.base_url));
+        if let Some(ref t) = self.auth_token {
+            req = req.header("Authorization", format!("Bearer {t}"));
+        }
+        let info: Value = req.send().await.ok()?.json().await.ok()?;
+        let field = |k: &str| {
+            info.get(k)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Some((field("app_identifier"), field("app_product_name")))
+    }
+
+    /// After a rediscovery re-handshake, confirm the server is still the app this
+    /// client was pinned to (defense in depth for explicit `VICTAURI_PORT` configs,
+    /// where discovery metadata is not consulted).
+    async fn verify_identity(&self) -> Result<(), TestError> {
+        let Some(expected) = self.app_identifier.as_deref() else {
+            return Ok(());
+        };
+        match self.fetch_app_identifier().await {
+            Some(actual) if actual != expected => Err(TestError::Connection {
+                host: self.host.clone(),
+                port: self.port,
+                reason: format!(
+                    "rediscovered server on port {} is app '{actual}', not '{expected}' — \
+                     refusing to switch apps",
+                    self.port
+                ),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The Tauri app identifier this client is pinned to, when known (recorded by
+    /// [`Self::discover`]; `None` for [`Self::connect_with_token`] clients).
+    #[must_use]
+    pub fn app_identifier(&self) -> Option<&str> {
+        self.app_identifier.as_deref()
     }
 
     /// Auto-discover a running Victauri server via temp files.
     ///
     /// Discovery priority:
-    /// 1. `VICTAURI_PORT` / `VICTAURI_AUTH_TOKEN` env vars (explicit override)
-    /// 2. Per-process discovery directory: `<temp>/victauri/<pid>/port`
-    /// 3. Default: port 7373, no auth
+    /// 1. `VICTAURI_PORT` (+ optional `VICTAURI_AUTH_TOKEN`) — the explicit endpoint
+    /// 2. Per-process discovery directories (`<root>/<pid>/{port,token,metadata.json}`),
+    ///    narrowed by `VICTAURI_APP` (exact bundle identifier or product name) when set
+    /// 3. Default: port 7373, no auth — only when no Victauri app is discovered at all
+    ///
+    /// A `VICTAURI_AUTH_TOKEN` without `VICTAURI_PORT` is only sent to the running app whose
+    /// own discovery token equals it — never to whatever holds the default port.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Connection`] if the server is unreachable or
-    /// returns a non-success status. Returns [`TestError::Request`] on
-    /// HTTP transport failures.
+    /// Returns [`TestError::Other`] when discovery cannot pick one app (several are running
+    /// and nothing selects one, the selected app is not running, or an explicit token
+    /// matches no running app) — the message names the running apps and how to select one.
+    /// Returns [`TestError::Connection`] if the server is unreachable or returns a
+    /// non-success status. Returns [`TestError::Request`] on HTTP transport failures.
     pub async fn discover() -> Result<Self, TestError> {
-        // Classify the discovery directory BEFORE `discover_port` runs — that path
-        // deletes stale (unreachable) discovery dirs as a side effect, so the
-        // diagnosis must be captured first to explain a subsequent failure.
+        Self::discover_app(None).await
+    }
+
+    /// [`Self::discover`], selecting the app by its exact Tauri bundle identifier (or
+    /// product name) when several Victauri apps are running. `None` falls back to the
+    /// `VICTAURI_APP` env var, then to "the single running app".
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::discover`].
+    pub async fn discover_app(app: Option<&str>) -> Result<Self, TestError> {
+        // Classify the discovery directory BEFORE resolving — resolution deletes the
+        // entries of dead apps as a side effect, so the diagnosis must be captured first
+        // to explain a subsequent failure.
         let diagnosis = crate::discovery::diagnose_discovery();
-        let (port, token) = crate::discovery::resolve_connection();
+        let (port, token) =
+            crate::discovery::try_resolve_connection(app).map_err(TestError::Other)?;
         match Self::connect_with_token(port, token.as_deref()).await {
             Ok(mut client) => {
                 client.discovered = true;
+                // Pin the app identity so a later rediscovery can only re-attach to
+                // this same app. `/info` is authoritative (it is the server we just
+                // reached); discovery metadata is the fallback for older plugins.
+                let (identifier, product_name) =
+                    client.fetch_app_identity().await.unwrap_or_default();
+                client.app_identifier =
+                    identifier.or_else(|| crate::discovery::identifier_for_port(port));
+                // An app selector must match the app actually reached — essential when
+                // `VICTAURI_PORT` names the endpoint (R5B-PORTAPP1), and a cheap re-check
+                // otherwise. An app whose identity is unknown (a pre-0.7.4 plugin) passes.
+                let selector = app
+                    .map(str::to_string)
+                    .or_else(crate::discovery::configured_app);
+                if let Some(selector) = selector
+                    && (client.app_identifier.is_some() || product_name.is_some())
+                    && !crate::discovery::identity_matches(
+                        client.app_identifier.as_deref(),
+                        product_name.as_deref(),
+                        &selector,
+                    )
+                {
+                    let found = client
+                        .app_identifier
+                        .clone()
+                        .or(product_name)
+                        .unwrap_or_default();
+                    let message = if crate::discovery::configured_port().is_some() {
+                        crate::discovery::port_app_mismatch(port, &found, &selector)
+                    } else {
+                        format!(
+                            "the server on port {port} is app '{}', not the selected '{}' — \
+                             refusing to drive a different app",
+                            crate::terminal::single_line(&found),
+                            crate::terminal::single_line(&selector)
+                        )
+                    };
+                    return Err(TestError::Other(message));
+                }
                 Ok(client)
             }
             Err(TestError::Connection { host, port, reason }) => {
@@ -475,14 +643,17 @@ impl VictauriClient {
 
     /// Check whether the server is still reachable.
     ///
-    /// Sends a GET to `/health` and returns `true` if the response is 200 OK.
+    /// Sends a GET to `/health` and returns `true` if the server answered with a success
+    /// status — or with `429 Too Many Requests`: a rate-limited answer still proves the
+    /// server is alive (an unauthenticated `/health` flood must not make a live app look
+    /// dead, R4-NET1).
     #[must_use]
     pub async fn is_alive(&self) -> bool {
         self.http
             .get(format!("{}/health", self.base_url))
             .send()
             .await
-            .is_ok_and(|r| r.status().is_success())
+            .is_ok_and(|r| health_status_means_alive(r.status().as_u16()))
     }
 
     /// Re-establish an MCP session after the app restarts.
@@ -504,20 +675,29 @@ impl VictauriClient {
     pub async fn reconnect(&self, max_wait: std::time::Duration) -> Result<Self, TestError> {
         let start = std::time::Instant::now();
         loop {
-            let (port, token) = if self.discovered {
-                crate::discovery::resolve_connection()
+            // A discovered client only re-attaches to its own app (same identifier);
+            // no match yet means "not back yet" — never a default-port guess.
+            let endpoint = if self.discovered {
+                crate::discovery::resolve_rediscovery(self.app_identifier.as_deref())
             } else {
-                (self.port, self.auth_token.clone())
+                Some((self.port, self.auth_token.clone()))
             };
-            let alive = self
-                .http
-                .get(format!("http://{}:{port}/health", self.host))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success());
-            if alive {
+            let alive = match &endpoint {
+                Some((port, _)) => self
+                    .http
+                    .get(format!("http://{}:{port}/health", self.host))
+                    .send()
+                    .await
+                    .is_ok_and(|r| health_status_means_alive(r.status().as_u16())),
+                None => false,
+            };
+            if alive && let Some((port, token)) = endpoint {
                 let mut client = Self::connect_with_token(port, token.as_deref()).await?;
                 client.discovered = self.discovered;
+                client.app_identifier.clone_from(&self.app_identifier);
+                if client.discovered {
+                    client.verify_identity().await?;
+                }
                 return Ok(client);
             }
             if start.elapsed() > max_wait {
@@ -561,6 +741,7 @@ impl VictauriClient {
         let mut resp = None;
         let mut reinitialized = false;
         let mut reauthed = false;
+        let mut reconnected = false;
         for attempt in 0..4 {
             let mut req = self
                 .http
@@ -578,7 +759,18 @@ impl VictauriClient {
             if let Some(ref t) = self.auth_token {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
-            let r = req.send().await?;
+            let r = match req.send().await {
+                Ok(r) => r,
+                // Connection refused/reset on a discovered client: the app most likely
+                // restarted (possibly on another port). Rediscover the SAME app once and
+                // retry; explicit-endpoint clients surface the error as-is.
+                Err(e) if e.is_connect() && self.discovered && !reconnected && attempt < 3 => {
+                    reconnected = true;
+                    self.reinitialize().await?;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let status = r.status();
 
             if status == 429 && attempt < 3 {
@@ -713,10 +905,13 @@ impl VictauriClient {
                 return Ok(parsed);
             }
             let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
-                " — auth token missing or wrong (auth is on by default; the token is in \
-                 <temp>/victauri/<pid>/token, or set VICTAURI_AUTH_TOKEN)"
+                format!(
+                    " — auth token missing or wrong (auth is on by default; the app writes it to \
+                     {}; or set VICTAURI_AUTH_TOKEN)",
+                    crate::discovery::TOKEN_LOCATIONS
+                )
             } else {
-                ""
+                String::new()
             };
             return Err(TestError::Connection {
                 host: host.to_string(),
@@ -942,6 +1137,9 @@ impl VictauriClient {
 
     /// Invoke a Tauri command by name with optional arguments.
     ///
+    /// Uses the server's default command timeout; for a slow command use
+    /// [`Self::invoke_command_with_timeout`].
+    ///
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
@@ -950,11 +1148,28 @@ impl VictauriClient {
         command: &str,
         args: Option<Value>,
     ) -> Result<Value, TestError> {
-        let mut params = json!({"command": command});
-        if let Some(a) = args {
-            params["args"] = a;
-        }
-        self.call_tool("invoke_command", params).await
+        self.call_tool("invoke_command", invoke_command_params(command, args, None))
+            .await
+    }
+
+    /// [`Self::invoke_command`] with an explicit server-side timeout (`timeout_ms`, capped
+    /// by the server at 300 000 ms) — the option the server's own timeout error tells you to
+    /// set for a slow command. The HTTP request timeout is extended to outlast it.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from [`VictauriClient::call_tool`].
+    pub async fn invoke_command_with_timeout(
+        &mut self,
+        command: &str,
+        args: Option<Value>,
+        timeout_ms: u64,
+    ) -> Result<Value, TestError> {
+        self.call_tool(
+            "invoke_command",
+            invoke_command_params(command, args, Some(timeout_ms)),
+        )
+        .await
     }
 
     /// Get the IPC call log.
@@ -1484,7 +1699,7 @@ impl VictauriClient {
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to get_ipc_calls_since")]
-    pub async fn ipc_calls_since(&mut self, checkpoint: usize) -> Result<Vec<Value>, TestError> {
+    pub async fn ipc_calls_since(&mut self, checkpoint: u64) -> Result<Vec<Value>, TestError> {
         // Timestamp filter, NOT positional skip: the server's log tools return a
         // capped sliding window of the NEWEST entries (default 100), so
         // `skip(checkpoint_length)` silently yields nothing the moment a busy app
@@ -1496,7 +1711,7 @@ impl VictauriClient {
             .filter(|e| {
                 e.get("timestamp")
                     .and_then(Value::as_u64)
-                    .map_or(checkpoint == 0, |t| t > checkpoint as u64)
+                    .map_or(checkpoint == 0, |t| t > checkpoint)
             })
             .collect())
     }
@@ -1530,10 +1745,7 @@ impl VictauriClient {
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn get_ipc_calls_since(
-        &mut self,
-        checkpoint: usize,
-    ) -> Result<Vec<Value>, TestError> {
+    pub async fn get_ipc_calls_since(&mut self, checkpoint: u64) -> Result<Vec<Value>, TestError> {
         #[allow(deprecated)]
         self.ipc_calls_since(checkpoint).await
     }
@@ -1576,14 +1788,14 @@ impl VictauriClient {
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to create_ipc_checkpoint")]
-    pub async fn ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+    pub async fn ipc_checkpoint(&mut self) -> Result<u64, TestError> {
         self.create_ipc_checkpoint().await
     }
 
     /// Snapshot the newest IPC-log timestamp, for use with `ipc_calls_since`.
     ///
-    /// Returns the maximum entry `timestamp` (epoch milliseconds) currently
-    /// visible in the IPC log, or `0` when the log is empty. Pass this value to
+    /// Returns the maximum entry `timestamp` (epoch milliseconds, a `u64` — epoch ms do not
+    /// fit a 32-bit `usize`) currently visible in the IPC log, or `0` when the log is empty. Pass this value to
     /// [`VictauriClient::ipc_calls_since`] to get only the calls that occurred
     /// after the checkpoint. For non-empty logs this method waits until the
     /// local clock has advanced past the checkpoint millisecond before it
@@ -1596,7 +1808,7 @@ impl VictauriClient {
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn create_ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+    pub async fn create_ipc_checkpoint(&mut self) -> Result<u64, TestError> {
         // The checkpoint is the NEWEST entry timestamp (epoch ms), not the log
         // length: the log tools serve a capped sliding window, so a length
         // snapshot breaks (always-empty `calls_since`) once the app has logged
@@ -1608,7 +1820,7 @@ impl VictauriClient {
             .max()
             .unwrap_or(0);
         wait_past_ipc_checkpoint_ms(checkpoint_ms).await;
-        Ok(checkpoint_ms as usize)
+        Ok(checkpoint_ms)
     }
 
     // ── Typed Response Methods (Phase 4E) ────────────────────────────────────
@@ -1932,6 +2144,17 @@ impl VictauriClient {
         self.scroll_to(&ref_id).await
     }
 
+    /// Scroll the first element whose accessible text contains the given string into view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::ElementNotFound`] if no matching element is found.
+    /// Returns other errors from [`VictauriClient::call_tool`].
+    pub async fn scroll_to_by_text(&mut self, text: &str) -> Result<Value, TestError> {
+        let ref_id = self.find_ref_by_text(text).await?;
+        self.scroll_to(&ref_id).await
+    }
+
     /// Get the text content of an element identified by HTML `id`.
     ///
     /// # Errors
@@ -2084,6 +2307,18 @@ impl VictauriClient {
         let base64_data = extract_screenshot_base64(&result)?;
         save_screenshot_to_file(&base64_data, path.as_ref())
     }
+}
+
+/// `invoke_command` tool arguments.
+fn invoke_command_params(command: &str, args: Option<Value>, timeout_ms: Option<u64>) -> Value {
+    let mut params = json!({"command": command});
+    if let Some(a) = args {
+        params["args"] = a;
+    }
+    if let Some(ms) = timeout_ms {
+        params["timeout_ms"] = json!(ms);
+    }
+    params
 }
 
 fn save_screenshot_to_file(
@@ -2364,6 +2599,36 @@ pub fn assert_state_matches(verification: &Value) {
 mod transport_tests {
     use super::*;
 
+    /// R5B-HINT1: the 401 hint named `<temp>/victauri/<pid>/token`, which 0.9 no longer writes
+    /// on Unix (per-user roots) — pointing a user at an empty directory.
+    #[tokio::test]
+    async fn unauthorized_hint_names_the_real_discovery_locations() {
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(401)
+                .body("unauthorized")
+                .unwrap(),
+        );
+        let Err(TestError::Connection { reason, .. }) =
+            VictauriClient::parse_response(resp, "127.0.0.1", 7373, 1).await
+        else {
+            panic!("a 401 must be a connection error");
+        };
+        assert!(
+            !reason.contains("<temp>/victauri/<pid>/token"),
+            "stale location: {reason}"
+        );
+        #[cfg(unix)]
+        assert!(
+            reason.contains("$XDG_RUNTIME_DIR/victauri/<pid>/token")
+                && reason.contains("victauri-<uid>/<pid>/token"),
+            "{reason}"
+        );
+        #[cfg(windows)]
+        assert!(reason.contains(r"%TEMP%\victauri\<pid>\token"), "{reason}");
+        assert!(reason.contains("VICTAURI_AUTH_TOKEN"), "{reason}");
+    }
+
     #[test]
     fn truncate_chars_never_splits_a_code_point() {
         // "a" + 2-byte chars: byte 200 falls mid-"é", where `&odd[..200]` panics.
@@ -2376,15 +2641,92 @@ mod transport_tests {
 
     #[test]
     fn request_timeout_outlasts_tool_wait() {
-        assert_eq!(request_timeout_for(&json!({})), DEFAULT_REQUEST_TIMEOUT);
+        // No `timeout_ms`: the server bounds the call by the app's eval timeout (up to 300 s),
+        // so the client must outlast that ceiling, not give up at 60 s and invite a retry.
+        assert_eq!(request_timeout_for(&json!({})), Duration::from_secs(340));
         assert_eq!(
             request_timeout_for(&json!({"timeout_ms": 5_000})),
             DEFAULT_REQUEST_TIMEOUT
         );
         assert_eq!(
             request_timeout_for(&json!({"timeout_ms": 120_000})),
-            Duration::from_secs(130)
+            Duration::from_secs(160)
         );
+        // Clamped the way the server clamps it.
+        assert_eq!(
+            request_timeout_for(&json!({"timeout_ms": u64::MAX})),
+            Duration::from_secs(340)
+        );
+    }
+
+    #[test]
+    fn invoke_command_with_timeout_sends_timeout_ms_and_outlasts_it() {
+        // R4-TC1: the server tells a slow command's caller to set `timeout_ms`, but the
+        // client had no way to send it.
+        let params = invoke_command_params("slow", Some(json!({"n": 1})), Some(200_000));
+        assert_eq!(params["command"], "slow");
+        assert_eq!(params["args"]["n"], 1);
+        assert_eq!(params["timeout_ms"], 200_000);
+        assert!(request_timeout_for(&params) > Duration::from_millis(200_000));
+        // The plain form is unchanged.
+        assert_eq!(
+            invoke_command_params("fast", None, None),
+            json!({"command": "fast"})
+        );
+    }
+
+    /// A minimal HTTP server answering every request with `status` and an empty body, which
+    /// records the JSON bodies it received.
+    async fn fixed_status_server(
+        status: u16,
+    ) -> (u16, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let record = std::sync::Arc::clone(&seen);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let record = std::sync::Arc::clone(&record);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 16 * 1024];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&buf[..n]).into_owned());
+                    let reply = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (port, seen)
+    }
+
+    #[test]
+    fn a_rate_limited_health_answer_means_alive() {
+        // R4-NET1.
+        assert!(health_status_means_alive(200));
+        assert!(health_status_means_alive(204));
+        assert!(health_status_means_alive(429));
+        assert!(!health_status_means_alive(401));
+        assert!(!health_status_means_alive(404));
+        assert!(!health_status_means_alive(500));
+        assert!(!health_status_means_alive(503));
+    }
+
+    #[tokio::test]
+    async fn is_alive_treats_a_rate_limited_server_as_alive() {
+        // R4-NET1: an unauthenticated /health flood (→ 429) must not make a live app look dead.
+        let (port, _) = fixed_status_server(429).await;
+        assert!(client_at(port, false, None).is_alive().await);
+        let (port, _) = fixed_status_server(503).await;
+        assert!(!client_at(port, false, None).is_alive().await);
     }
 
     #[test]
@@ -2396,6 +2738,93 @@ mod transport_tests {
         let msg = find_sse_response(body, 42).expect("response for id 42");
         assert_eq!(msg["result"]["ok"], json!(true));
         assert!(find_sse_response(body, 99).is_none());
+    }
+
+    /// A port that refuses connections for as long as the returned socket lives: BOUND but
+    /// never listening. (Binding then releasing — the old approach — let another process on a
+    /// busy CI runner grab the port, turning "connection refused" into a non-HTTP reply.)
+    fn closed_port() -> (u16, tokio::net::TcpSocket) {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        (port, socket)
+    }
+
+    fn client_at(port: u16, discovered: bool, app_identifier: Option<&str>) -> VictauriClient {
+        VictauriClient {
+            http: reqwest::Client::new(),
+            base_url: format!("http://127.0.0.1:{port}"),
+            host: "127.0.0.1".to_string(),
+            port,
+            session_id: None,
+            next_id: 10,
+            auth_token: None,
+            discovered,
+            app_identifier: app_identifier.map(str::to_string),
+        }
+    }
+
+    fn explicit_discovery_env() -> bool {
+        std::env::var_os("VICTAURI_PORT").is_some()
+            || std::env::var_os("VICTAURI_AUTH_TOKEN").is_some()
+    }
+
+    #[tokio::test]
+    async fn connection_refused_on_discovered_client_rediscovers_same_app_only() {
+        if explicit_discovery_env() {
+            return; // explicit endpoint config bypasses discovery by design
+        }
+        let (port, _held) = closed_port();
+        // An identity no live app can have: rediscovery must find nothing and say so,
+        // instead of binding to whatever app holds the default port.
+        let id = format!("com.victauri.test.absent-{}", std::process::id());
+        let mut client = client_at(port, true, Some(&id));
+        let err = client
+            .call_tool("get_plugin_info", json!({}))
+            .await
+            .expect_err("nothing is listening");
+        match err {
+            TestError::Connection { reason, .. } => {
+                assert!(
+                    reason.contains(&id),
+                    "a connection error on a discovered client must trigger an identity-pinned \
+                     rediscovery: {reason}"
+                );
+            }
+            other => panic!("expected a rediscovery Connection error, got {other:?}"),
+        }
+        assert_eq!(client.port(), port, "no default-port (7373) fallback");
+        assert_eq!(client.app_identifier(), Some(id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn connection_refused_on_explicit_client_is_not_rediscovered() {
+        let (port, _held) = closed_port();
+        let mut client = client_at(port, false, None);
+        let err = client
+            .call_tool("get_plugin_info", json!({}))
+            .await
+            .expect_err("nothing is listening");
+        assert!(
+            matches!(err, TestError::Request(ref e) if e.is_connect()),
+            "an explicit-endpoint client surfaces the transport error as-is: {err:?}"
+        );
+        assert_eq!(client.port(), port);
+    }
+
+    #[test]
+    fn rediscover_without_a_match_leaves_the_endpoint_untouched() {
+        if explicit_discovery_env() {
+            return;
+        }
+        let (port, _held) = closed_port();
+        let id = format!("com.victauri.test.absent2-{}", std::process::id());
+        let mut client = client_at(port, true, Some(&id));
+        client.auth_token = Some("keep".to_string());
+        assert!(client.rediscover().is_err());
+        assert_eq!(client.port, port);
+        assert_eq!(client.base_url, format!("http://127.0.0.1:{port}"));
+        assert_eq!(client.auth_token.as_deref(), Some("keep"));
     }
 
     #[test]

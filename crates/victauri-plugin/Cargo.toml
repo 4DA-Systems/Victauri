@@ -40,11 +40,20 @@ regex = "1"
 url = { workspace = true }
 flate2 = "1"
 tower = { version = "0.5", features = ["limit"] }
+# Serve loop with a header-read timer and a connection cap (axum::serve sets neither).
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1"] }
 rusqlite = { workspace = true, optional = true }
 
 [features]
-default = ["sqlite"]
+default = ["sqlite", "bundled-sqlite"]
+# `query_db` / `introspect db_health`.
 sqlite = ["dep:rusqlite"]
+# Compile SQLite into the binary (rusqlite `bundled`). Because cargo unifies the plugin's
+# rusqlite with the app's, this also switches the APP's rusqlite to bundled SQLite. An app that
+# links a system SQLite or SQLCipher keeps its own with
+# `default-features = false, features = ["sqlite"]`.
+bundled-sqlite = ["sqlite", "rusqlite?/bundled"]
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }

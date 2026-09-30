@@ -77,9 +77,19 @@ impl std::fmt::Display for TestError {
                     -32603 => "\n  Hint: internal error — check the Tauri app's stderr for details",
                     _ => "",
                 };
-                write!(f, "MCP error {code}: {message}{hint}")
+                // The message can carry page-derived text (R5B-TERM3).
+                write!(
+                    f,
+                    "MCP error {code}: {}{hint}",
+                    crate::terminal::untrusted_multi_line(message)
+                )
             }
-            Self::ToolError(msg) => write!(f, "tool call failed: {msg}"),
+            // A tool error is often a page's own exception text (R5B-TERM3).
+            Self::ToolError(msg) => write!(
+                f,
+                "tool call failed: {}",
+                crate::terminal::untrusted_multi_line(msg)
+            ),
             Self::Assertion(msg) => write!(f, "assertion failed: {msg}"),
             Self::Timeout(msg) => {
                 write!(
@@ -119,6 +129,42 @@ impl std::error::Error for TestError {
         match self {
             Self::Request(e) => Some(e),
             _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R5B-TERM3: a tool error / JSON-RPC error message can carry page-derived text (a JS
+    /// exception message). Printed raw, it could drive the terminal (ESC sequences) or forge a
+    /// GitHub Actions annotation on a line of its own (`::error …`). Legitimate line breaks stay.
+    #[test]
+    fn untrusted_error_text_is_neutralized_but_keeps_line_breaks() {
+        let hostile = "boom at line 1\n::error file=src/main.rs::forged\n  ::warning::x\n\
+                       ##[error]legacy\u{1b}[2J\u{9b}31m\u{202e}rtl";
+        for rendered in [
+            TestError::ToolError(hostile.to_string()).to_string(),
+            TestError::Mcp {
+                code: -32000,
+                message: hostile.to_string(),
+            }
+            .to_string(),
+        ] {
+            assert!(rendered.contains("boom at line 1\n"), "{rendered}");
+            for line in rendered.lines() {
+                let t = line.trim_start();
+                assert!(
+                    !t.starts_with("::") && !t.starts_with("##["),
+                    "a line became a workflow command: {line:?}\n{rendered}"
+                );
+            }
+            assert!(
+                !rendered.chars().any(|c| c.is_control() && c != '\n')
+                    && !rendered.contains('\u{202e}'),
+                "raw control/bidi characters: {rendered:?}"
+            );
         }
     }
 }

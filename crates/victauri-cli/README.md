@@ -43,7 +43,15 @@ Connect to a running Tauri app and report health — IPC integrity, ghost comman
 ```bash
 victauri check
 victauri check --junit report.xml   # JUnit XML output for CI
+victauri check --app com.example.app  # pick one of several running apps
 ```
+
+**Several Victauri apps running?** `check`, `test`, `invoke`, `coverage`, `doctor` and `record`
+refuse to guess: they list each running app as `identifier (port N, pid P)` and ask you to
+select one with `--app <bundle-identifier>` (exact identifier or product name — never a
+prefix) or the `VICTAURI_APP` env var, or to pin the port with `VICTAURI_PORT`. A
+`VICTAURI_AUTH_TOKEN` without `VICTAURI_PORT` is only sent to the running app whose own
+discovery token matches it.
 
 ### `victauri test`
 
@@ -94,7 +102,7 @@ victauri watch --filter greet            # Only run matching tests
 
 Full API docs: [docs.rs/victauri-cli](https://docs.rs/victauri-cli)
 
-MCP Registry name: `mcp-name: io.github.4da-systems/victauri`
+MCP Registry name: `mcp-name: io.github.4DA-Systems/victauri`
 
 ## License
 

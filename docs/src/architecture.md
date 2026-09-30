@@ -37,7 +37,7 @@ The JS bridge is injected into every webview via `js_init_script()` (persistent 
 
 ### IPC Layer
 
-Tauri 2.0 sends all IPC via `fetch()` to `http://ipc.localhost/<command>`. Victauri intercepts this at the network level:
+Tauri 2.0 sends IPC via `fetch()` to `http://ipc.localhost/<command>` on Windows (WebView2) and to the custom `ipc://localhost/<command>` scheme on macOS (WKWebView) and Linux (WebKitGTK). Victauri's fetch interceptor matches both and derives the IPC log from them (observe-only — it logs real IPC traffic but cannot block, delay, or fault it):
 
 - **Command registry** — Discover all available commands with metadata
 - **IPC log** — Full history of command invocations with timing
@@ -62,13 +62,13 @@ External approach:          Victauri approach:
 Agent ──HTTP──► Proxy       Agent ──HTTP──► Tauri App
                  │                          (contains MCP server)
                 CDP                         Direct AppHandle access
-                 │                          Sub-ms response times
+                 │                          No extra process hop
                Browser                      No state drift
 ```
 
 Benefits:
 - **No state drift** — The MCP server reads the same memory as the application
-- **Sub-millisecond responses** — No IPC hop to an external process
+- **No external hop** — No IPC hop to an external process. Rust-side tools (registry, memory, `app_state`, `query_db`, window state) answer in well under a millisecond; webview tools (`eval_js`, `dom_snapshot`, `interact`, ...) are a JS round trip through the webview, typically ~10-30 ms
 - **Full access** — Can read Rust state, invoke commands, access the database directly
 - **Single dependency** — No separate process to manage or keep alive
 
@@ -139,7 +139,7 @@ Three read-on-demand resources expose live state (the `subscribe` capability is 
 
 ## Port Fallback
 
-If port 7373 is already in use (e.g., another Tauri app running Victauri), the server tries ports 7374 through 7383. The actual bound port is written to a temp file (`<temp>/victauri.port`) for client discovery and cleaned up on shutdown.
+If port 7373 is already in use (e.g., another Tauri app running Victauri), the server tries ports 7374 through 7383. The actual bound port is written to the per-process discovery directory (`<root>/<pid>/port`, alongside the auth `token` and `metadata.json`; `<root>` is per-user — see [Security](security.md#discovery-directory-protection)) for client discovery and cleaned up on shutdown.
 
 ## Release Safety
 

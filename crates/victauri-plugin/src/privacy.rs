@@ -13,6 +13,7 @@ use crate::redaction::Redactor;
 /// | `Test` | Yes | Yes | Storage writes | No |
 /// | `FullControl` | Yes | Yes | Yes | Yes |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum PrivacyProfile {
     /// Read-only observation. Snapshots, logs, registry, accessibility, performance,
     /// window state — but no clicks, no input, no eval, no screenshots, no mutations.
@@ -42,7 +43,11 @@ impl std::fmt::Display for PrivacyProfile {
 /// overrides: command allowlists/blocklists, per-tool disabling, and output redaction.
 ///
 /// **Precedence:** explicit `disabled_tools` overrides → profile matrix → allowlist/blocklist.
+///
+/// `#[non_exhaustive]`: start from [`PrivacyConfig::default()`] (or one of the
+/// profile presets) and assign the `pub` fields you need.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct PrivacyConfig {
     /// The active privacy profile tier.
     pub profile: PrivacyProfile,
@@ -86,10 +91,19 @@ impl PrivacyConfig {
     /// is permitted by the current profile AND not in the explicit disabled set.
     #[must_use]
     pub fn is_tool_enabled(&self, tool_or_action: &str) -> bool {
-        if self.disabled_tools.contains(tool_or_action) {
+        if self.is_disabled(tool_or_action) {
             return false;
         }
         is_allowed_by_profile(self.profile, tool_or_action)
+    }
+
+    /// Whether `name` is in `disabled_tools` under either of its spellings: a few
+    /// capability ids differ from their `tool.action` name (`inspect.styles` is the
+    /// `inspect` tool's `get_styles` action), and an operator may write either.
+    fn is_disabled(&self, name: &str) -> bool {
+        self.disabled_tools.contains(name)
+            || crate::mcp::authz::capability_alias(name)
+                .is_some_and(|alias| self.disabled_tools.contains(alias))
     }
 
     /// Authoritative dispatch gate for a tool call.
@@ -150,7 +164,9 @@ impl PrivacyConfig {
 /// Naming convention: standalone tools use bare names (`"eval_js"`), compound tool
 /// actions use dot-qualified names (`"window.manage"`, `"input.fill"`).
 ///
-/// Everything not explicitly listed defaults to allowed (open-world for new tools).
+/// `FullControl` allows everything. `Test` and `Observe` are **deny-by-default**:
+/// only the tools/actions explicitly listed for that profile are allowed, so a new
+/// tool stays blocked under them until it is added here.
 #[must_use]
 fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool {
     match profile {
@@ -289,6 +305,7 @@ fn is_allowed_by_profile(profile: PrivacyProfile, tool_or_action: &str) -> bool 
 
 /// Create a [`PrivacyConfig`] for the `Observe` profile with redaction enabled.
 #[must_use]
+#[doc(hidden)]
 pub fn observe_privacy_config() -> PrivacyConfig {
     PrivacyConfig {
         profile: PrivacyProfile::Observe,
@@ -303,6 +320,7 @@ pub fn observe_privacy_config() -> PrivacyConfig {
 
 /// Create a [`PrivacyConfig`] for the `Test` profile with redaction enabled.
 #[must_use]
+#[doc(hidden)]
 pub fn test_privacy_config() -> PrivacyConfig {
     PrivacyConfig {
         profile: PrivacyProfile::Test,
@@ -320,6 +338,7 @@ pub fn test_privacy_config() -> PrivacyConfig {
 /// This is an alias for [`observe_privacy_config()`] — strict mode maps to the
 /// `Observe` profile.
 #[must_use]
+#[doc(hidden)]
 pub fn strict_privacy_config() -> PrivacyConfig {
     observe_privacy_config()
 }
@@ -699,6 +718,42 @@ mod tests {
         assert!(!config.is_tool_enabled("dom_snapshot"));
         // Profile blocks eval_js
         assert!(!config.is_tool_enabled("eval_js"));
+    }
+
+    /// R4-NET4: four `inspect` capabilities are named differently from their actions
+    /// (`get_styles` → `inspect.styles`), so `disable_tools(["inspect.get_styles"])` — the
+    /// spelling an operator reads off the tool's action list — was silently a no-op. Both
+    /// spellings must disable the action.
+    #[test]
+    fn inspect_action_spelling_and_capability_id_both_disable() {
+        for (action_spelling, capability) in [
+            ("inspect.get_styles", "inspect.styles"),
+            ("inspect.get_bounding_boxes", "inspect.bounds"),
+            ("inspect.audit_accessibility", "inspect.audit_a11y"),
+            ("inspect.get_performance", "inspect.performance"),
+        ] {
+            for disabled in [action_spelling, capability] {
+                let config = PrivacyConfig {
+                    disabled_tools: HashSet::from([disabled.to_string()]),
+                    ..Default::default()
+                };
+                assert!(
+                    !config.is_call_allowed("inspect", capability),
+                    "disabling {disabled:?} must block {capability}"
+                );
+                assert!(
+                    !config.is_tool_enabled(action_spelling),
+                    "disabling {disabled:?} must block {action_spelling}"
+                );
+            }
+        }
+        // Siblings stay enabled.
+        let config = PrivacyConfig {
+            disabled_tools: HashSet::from(["inspect.get_styles".to_string()]),
+            ..Default::default()
+        };
+        assert!(config.is_call_allowed("inspect", "inspect.bounds"));
+        assert!(config.is_call_allowed("inspect", "inspect.highlight"));
     }
 
     // ── invoke_command special handling ─────────────────────────────────────

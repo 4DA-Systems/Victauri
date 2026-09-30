@@ -9,7 +9,7 @@ fails loudly if any published version falls behind the repo.
 
 | Secret | Used by | Scope |
 |---|---|---|
-| `CARGO_REGISTRY_TOKEN` | core release → crates.io | crates.io API token |
+| `CARGO_REGISTRY_TOKEN` | core release → crates.io | crates.io API token. Store it as a secret of the **`release` environment** (Settings → Environments → release), not as a repository secret: only an environment secret is behind that environment's required reviewers — a repository secret is readable by any workflow run on any branch. (Or drop the token entirely for crates.io Trusted Publishing.) |
 | `VSCE_PAT` | VS Code release → Marketplace | Azure DevOps PAT, *Marketplace → Manage* (publisher `4da-systems`) |
 | `OVSX_TOKEN` *(optional)* | VS Code release → Open VSX | open-vsx.org token (Cursor / VSCodium / agent IDEs) |
 
@@ -25,12 +25,26 @@ the release's own test step runs **only on ubuntu** and publish wasn't gated on 
 Two layers now prevent that:
 
 1. **Local preflight** — run `./scripts/preflight.ps1` (Windows) or `./scripts/preflight.sh`
-   before pushing. It runs fmt + clippy + the full workspace tests + the Chrome bridge tests,
-   so fast failures are caught locally in seconds instead of a 16-minute CI round trip. It
+   before pushing. It runs fmt + clippy + the doc-count lint + `npm ci` for the jsdom JS-bridge
+   tests + the full workspace tests (with `VICTAURI_REQUIRE_JSDOM=1`, so the bridge tests fail
+   rather than silently skip), so fast failures are caught locally in seconds instead of a
+   16-minute CI round trip. It
    **cannot** catch macOS/Linux-only bugs (you're on one OS) or the real-app E2E — that's CI.
 2. **`require-ci-green` (the hard gate)** — `release.yml` will **not** publish unless the
-   **full CI** (all platforms + real-app E2E) concluded **success** for the exact release
-   commit. A tag on a non-CI-green commit is refused, loudly, before the publish step.
+   tagged commit is **on `main`** and the **full CI push run on `main`** (all platforms +
+   real-app E2E) concluded **success** for that exact commit. (A pull-request run tested the
+   merge of the commit into `main`, not the commit itself, so it does not count.) A tag on a
+   non-CI-green commit is refused, loudly, before the publish step.
+3. **Semver report (local)** — `cargo semver-checks check-release --workspace` before bumping.
+   CI runs the same check but only as information; read its output rather than its colour.
+   **For a 0.x major bump (e.g. 0.8.x → 0.9.0) that command checks nothing**: a major bump
+   already permits every lint, so it prints "0 checks … N skip" and passes. Also run
+   `cargo semver-checks check-release --workspace --release-type minor` (or per crate with
+   `-p`) and read the failures: they are the list of what actually changed, and every item in it
+   must be covered by MIGRATION.md.
+4. **Publish runs verified-then-tokenless** — `release.yml` first runs
+   `cargo publish --workspace --dry-run` with no token present, then uploads each crate with
+   `--no-verify` in a step that alone holds the token, so no build script ever runs next to it.
 
 **Recommended flow:** `preflight` → push to `main` → **wait for CI green on all platforms** →
 bump + tag. (Pushing commit + tag together still works — the gate waits for CI to finish, up
@@ -45,6 +59,12 @@ git tag v0.8.0 && git push origin main --tags
 ```
 `release.yml`: test gate → cross-platform binaries (cli/watchdog) →
 publish the crates to crates.io in dependency order → GitHub Release.
+
+Then list the release in the **MCP Registry** (`server.json`, name
+`io.github.4DA-Systems/victauri` — the namespace is the GitHub login and is matched
+case-sensitively): `mcp-publisher login github && mcp-publisher publish`. The registry reads the
+`mcp-name:` line from the README of the *published* `victauri-cli` version, so it must be right
+before the crate is uploaded.
 
 ## VS Code extension — `vscode-v*` (decoupled)
 

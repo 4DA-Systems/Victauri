@@ -11,6 +11,7 @@ use crate::recording::RecordedSession;
 
 /// Controls whether generated code uses direct client methods or the Locator API.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+#[non_exhaustive]
 pub enum CodegenStyle {
     /// Generate `client.click_by_id("btn")` style calls.
     #[default]
@@ -184,10 +185,22 @@ pub fn generate_test(session: &RecordedSession, options: &CodegenOptions) -> Str
     out
 }
 
-/// Flattens newlines/carriage returns so a value interpolated into a `//` line
-/// comment cannot break out of the comment (defense-in-depth, audit #16).
+/// Makes a recorded value safe to interpolate into a `//` line comment: a newline
+/// could break out of the comment (audit #16), and a control or bidi character
+/// (`U+202E`, …) makes rustc reject the whole file — its
+/// `text_direction_codepoint_in_comment` lint is deny-by-default — so those are
+/// written as `\u{…}` escapes instead.
 fn sanitize_comment(s: &str) -> String {
-    s.replace(['\n', '\r'], " ")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\n' | '\r' => out.push(' '),
+            // Quotes and backslashes are harmless in a comment; keep them readable.
+            '"' | '\'' | '\\' => out.push(ch),
+            _ => out.extend(ch.escape_debug()),
+        }
+    }
+    out
 }
 
 /// Converts arbitrary input into a safe Rust identifier for generated test names.
@@ -226,16 +239,18 @@ const RUST_KEYWORDS: &[&str] = &[
 ];
 
 /// Escapes a string for embedding in a Rust string literal.
+///
+/// Beyond quotes, backslashes and newlines, every control, invisible or bidi
+/// character becomes a `\u{…}` escape: a raw `U+202E` in a literal makes rustc
+/// reject the file (`text_direction_codepoint_in_literal` is deny-by-default), and
+/// recorded page text is attacker-controlled.
 fn escape_rust_str(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
-            '\\' => escaped.push_str("\\\\"),
-            '"' => escaped.push_str("\\\""),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            other => escaped.push(other),
+            // `escape_debug` would write `\'`: legal inside "…" but needless noise.
+            '\'' => escaped.push(ch),
+            _ => escaped.extend(ch.escape_debug()),
         }
     }
     escaped
@@ -291,44 +306,139 @@ fn emit_locator_interaction(
     }
 }
 
-/// Converts a raw CSS selector into a Locator factory expression.
+/// Converts a recorded selector into a Locator factory expression.
 fn selector_to_locator(selector: &str) -> String {
-    // :has-text("...") → Locator::text("...")
-    if let Some(start) = selector.find(":has-text(\"") {
-        let text_start = start + ":has-text(\"".len();
-        if let Some(end) = selector[text_start..].find("\")") {
-            let text = escape_rust_str(&selector[text_start..text_start + end]);
-            return format!("Locator::text(\"{text}\")");
+    let (factory, arg) = match parse_recorded_selector(selector) {
+        RecordedSelector::TestId(id) => ("test_id", id),
+        RecordedSelector::Role(role) => ("role", role),
+        RecordedSelector::Text(text) => ("text", text),
+        // `#id` stays CSS: it is valid CSS as recorded (the bridge CSS-escapes it).
+        RecordedSelector::Id(_) | RecordedSelector::Css => ("css", selector.to_string()),
+    };
+    format!("Locator::{factory}(\"{}\")", escape_rust_str(&arg))
+}
+
+/// The shapes the bridge's `bestSelector` records (`js_bridge.rs`), parsed from the
+/// start of the selector — never by searching for a marker, which a quoted value can
+/// itself contain (`[data-testid="a:has-text(\"x\")"]`).
+#[derive(Debug, PartialEq, Eq)]
+enum RecordedSelector {
+    /// `[data-testid="…"]`
+    TestId(String),
+    /// `#id` — the id, CSS escapes decoded.
+    Id(String),
+    /// `[role="…"]`
+    Role(String),
+    /// `[role="…"]:has-text("…")` or `tag:has-text("…")` — the text.
+    Text(String),
+    /// Anything else: plain CSS, passed through unchanged.
+    Css,
+}
+
+fn parse_recorded_selector(selector: &str) -> RecordedSelector {
+    if let Some(rest) = selector.strip_prefix("[data-testid=")
+        && let Some((id, rest)) = css_string(rest)
+        && rest == "]"
+    {
+        return RecordedSelector::TestId(id);
+    }
+    if let Some(rest) = selector.strip_prefix('#')
+        && let Some(id) = css_ident(rest)
+    {
+        return RecordedSelector::Id(id);
+    }
+    if let Some(rest) = selector.strip_prefix("[role=")
+        && let Some((role, rest)) = css_string(rest)
+        && let Some(rest) = rest.strip_prefix(']')
+    {
+        if rest.is_empty() {
+            return RecordedSelector::Role(role);
+        }
+        if let Some(text) = has_text_suffix(rest) {
+            return RecordedSelector::Text(text);
+        }
+        return RecordedSelector::Css;
+    }
+    let tag_len = selector
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+        .unwrap_or(selector.len());
+    if tag_len > 0
+        && let Some(text) = has_text_suffix(&selector[tag_len..])
+    {
+        return RecordedSelector::Text(text);
+    }
+    RecordedSelector::Css
+}
+
+/// `:has-text("…")` spanning the whole of `s` → the decoded text.
+fn has_text_suffix(s: &str) -> Option<String> {
+    let (text, rest) = css_string(s.strip_prefix(":has-text(")?)?;
+    (rest == ")").then_some(text)
+}
+
+/// Decodes a CSS double-quoted string at the start of `s`; returns it and the rest.
+fn css_string(s: &str) -> Option<(String, &str)> {
+    let body = s.strip_prefix('"')?;
+    let mut out = String::new();
+    let mut chars = body.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => return Some((out, &body[i + 1..])),
+            '\\' => match css_escape(&mut chars) {
+                Some(Some(decoded)) => out.push(decoded),
+                Some(None) => {} // escaped newline: a line continuation
+                None => return None,
+            },
+            _ => out.push(c),
         }
     }
+    None
+}
 
-    // #id → Locator::css("#id")
-    if selector.starts_with('#') && !selector[1..].contains(' ') {
-        let escaped = escape_rust_str(selector);
-        return format!("Locator::css(\"{escaped}\")");
-    }
-
-    // [data-testid="..."] → Locator::test_id("...")
-    if let Some(start) = selector.find("[data-testid=\"") {
-        let id_start = start + "[data-testid=\"".len();
-        if let Some(end) = selector[id_start..].find("\"]") {
-            let id = escape_rust_str(&selector[id_start..id_start + end]);
-            return format!("Locator::test_id(\"{id}\")");
+/// Decodes a CSS identifier spanning all of `s` (as `CSS.escape` writes one).
+fn css_ident(s: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = s.char_indices();
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '\\' => out.push(css_escape(&mut chars)??),
+            c if c.is_alphanumeric() || c == '-' || c == '_' || !c.is_ascii() => out.push(c),
+            _ => return None,
         }
     }
+    (!out.is_empty()).then_some(out)
+}
 
-    // [role="..."] → Locator::role("...")
-    if let Some(start) = selector.find("[role=\"") {
-        let role_start = start + "[role=\"".len();
-        if let Some(end) = selector[role_start..].find("\"]") {
-            let role = escape_rust_str(&selector[role_start..role_start + end]);
-            return format!("Locator::role(\"{role}\")");
+/// Decodes one CSS escape after its backslash: `Some(Some(c))` for a character,
+/// `Some(None)` for an escaped newline, `None` for a backslash at the end.
+fn css_escape(chars: &mut std::str::CharIndices<'_>) -> Option<Option<char>> {
+    let (_, first) = chars.next()?;
+    if first == '\n' {
+        return Some(None);
+    }
+    let Some(mut code) = first.to_digit(16) else {
+        return Some(Some(first));
+    };
+    // Up to six hex digits, then one optional whitespace terminator.
+    for _ in 1..6 {
+        let mut peek = chars.clone();
+        match peek.next() {
+            Some((_, d)) if d.is_ascii_hexdigit() => {
+                code = code * 16 + d.to_digit(16).unwrap_or(0);
+                *chars = peek;
+            }
+            _ => break,
         }
     }
-
-    // Fallback: Locator::css("...")
-    let escaped = escape_rust_str(selector);
-    format!("Locator::css(\"{escaped}\")")
+    let mut peek = chars.clone();
+    if matches!(peek.next(), Some((_, ' ' | '\t' | '\n'))) {
+        *chars = peek;
+    }
+    Some(Some(
+        char::from_u32(code)
+            .filter(|&c| c != '\0')
+            .unwrap_or(char::REPLACEMENT_CHARACTER),
+    ))
 }
 
 /// Resolved selector form for emitting idiomatic `VictauriClient` calls.
@@ -337,32 +447,23 @@ fn selector_to_locator(selector: &str) -> String {
 /// to the high-level convenience methods on `VictauriClient` (`click_by_id`,
 /// `click_by_text`, etc.) so generated tests read naturally.
 enum ResolvedSelector {
-    /// Selector started with `#` — strip the hash and use `*_by_id`.
+    /// A `#id` selector — the decoded id, for `*_by_id`.
     ById(String),
-    /// Selector contained `:has-text("...")` — extract the text and use `*_by_text`.
+    /// A `:has-text("...")` selector — the decoded text, for `*_by_text`.
     ByText(String),
     /// Everything else — pass the raw selector through.
     Raw(String),
 }
 
-/// Classifies a raw CSS selector into the most idiomatic `VictauriClient` form.
+/// Classifies a recorded selector into the most idiomatic `VictauriClient` form.
 fn resolve_selector(selector: &str) -> ResolvedSelector {
-    // Pattern 2: contains `:has-text("...")` — extract the quoted text.
-    if let Some(start) = selector.find(":has-text(\"") {
-        let text_start = start + ":has-text(\"".len();
-        if let Some(end) = selector[text_start..].find("\")") {
-            let text = &selector[text_start..text_start + end];
-            return ResolvedSelector::ByText(text.to_string());
+    match parse_recorded_selector(selector) {
+        RecordedSelector::Id(id) => ResolvedSelector::ById(id),
+        RecordedSelector::Text(text) => ResolvedSelector::ByText(text),
+        RecordedSelector::TestId(_) | RecordedSelector::Role(_) | RecordedSelector::Css => {
+            ResolvedSelector::Raw(selector.to_string())
         }
     }
-
-    // Pattern 1: starts with `#` (simple ID selector, no combinators).
-    if selector.starts_with('#') && !selector[1..].contains(' ') {
-        let id = &selector[1..];
-        return ResolvedSelector::ById(id.to_string());
-    }
-
-    ResolvedSelector::Raw(selector.to_string())
 }
 
 /// Emits a single DOM interaction as a `VictauriClient` method call.
@@ -472,28 +573,18 @@ fn emit_resolved_select(out: &mut String, resolved: &ResolvedSelector, val: &str
 
 /// Emits a resolved `scroll_to` call.
 ///
-/// For `Raw` selectors, emits `scroll_to_by_selector`. For `ById`, emits
-/// `scroll_to_by_id`. For `ByText`, falls back to `scroll_to_by_selector`
-/// with the original selector text (scroll has no text variant).
+/// Emits `scroll_to_by_id` / `scroll_to_by_text` / `scroll_to_by_selector`.
+/// (Text is never passed as a CSS selector: it is not one.)
 fn emit_resolved_scroll(out: &mut String, resolved: &ResolvedSelector) {
-    match resolved {
-        ResolvedSelector::ById(id) => {
-            let escaped = escape_rust_str(id);
-            out.push_str(&format!(
-                "    client.scroll_to_by_id(\"{escaped}\").await.unwrap();\n"
-            ));
-        }
-        ResolvedSelector::ByText(_) | ResolvedSelector::Raw(_) => {
-            let sel = match resolved {
-                ResolvedSelector::ByText(t) => escape_rust_str(t),
-                ResolvedSelector::Raw(s) => escape_rust_str(s),
-                _ => unreachable!(),
-            };
-            out.push_str(&format!(
-                "    client.scroll_to_by_selector(\"{sel}\").await.unwrap();\n"
-            ));
-        }
-    }
+    let (method, arg) = match resolved {
+        ResolvedSelector::ById(id) => ("scroll_to_by_id", id),
+        ResolvedSelector::ByText(text) => ("scroll_to_by_text", text),
+        ResolvedSelector::Raw(sel) => ("scroll_to_by_selector", sel),
+    };
+    let escaped = escape_rust_str(arg);
+    out.push_str(&format!(
+        "    client.{method}(\"{escaped}\").await.unwrap();\n"
+    ));
 }
 
 #[cfg(test)]
@@ -591,6 +682,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!(true)),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let code = generate_test_default(&session);
@@ -611,6 +703,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!({})),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let code = generate_test_default(&session);
@@ -631,6 +724,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!(true)),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let opts = CodegenOptions {
@@ -1032,6 +1126,7 @@ mod tests {
                     result: IpcResult::Ok(serde_json::json!({"saved": true})),
                     arg_size_bytes: 42,
                     webview_label: "main".to_string(),
+                    mocked: false,
                 }),
             },
             // 4: StateChange caused by save_draft
@@ -1224,6 +1319,7 @@ mod tests {
                 result: IpcResult::Ok(serde_json::json!(true)),
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
+                mocked: false,
             }),
         }]);
         let opts = CodegenOptions {

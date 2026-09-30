@@ -6,12 +6,16 @@ Since Victauri's MCP server runs inside the Tauri app process, a crash kills the
 
 ## What It Does
 
-- Discovers the app's port from `<temp>/victauri/<pid>/port` (live processes only; the plugin
+- Discovers the app's port from the per-user discovery directory `<root>/<pid>/port` (the
+  roots every Victauri client scans; live processes of yours only; the plugin
   may bind 7374+ when 7373 is taken), optionally selecting an app by identity with
   `--app <identifier>` / `VICTAURI_APP`, and follows the app if it restarts on a new port.
   An explicit `VICTAURI_PORT` (or positional `PORT`) skips discovery entirely.
-- Polls `GET /health` on the Victauri MCP server at a configurable interval
-- Logs warnings on first failure, errors after consecutive misses
+- Polls `GET /health` on the Victauri MCP server at a configurable interval (a `2xx` — or a
+  `429`: a rate-limited `/health` still proves the server is up, so a local request flood
+  cannot trigger recovery)
+- Logs warnings on first failure, errors after consecutive misses (the recovery command is
+  logged by program name only — its arguments may carry secrets)
 - Executes a configurable recovery command after threshold failures
 - Resets failure count automatically when the server recovers
 

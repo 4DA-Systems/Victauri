@@ -100,7 +100,8 @@ e2e_test!(eval_js_returns_number, {
         .eval_js("document.querySelectorAll('.card').length")
         .await
         .unwrap();
-    assert_eq!(result.as_u64().unwrap(), 4);
+    // The demo's frontend renders seven cards (unchanged since 2026-06-02).
+    assert_eq!(result.as_u64().unwrap(), 7);
 });
 
 e2e_test!(eval_js_returns_object, {
@@ -380,13 +381,15 @@ e2e_test!(invoke_get_app_state, {
 
 e2e_test!(invoke_nonexistent_command, {
     let mut client = VictauriClient::discover().await.unwrap();
-    let result = client
+    // Tauri rejects an unknown command, and the client surfaces it as an error.
+    let err = client
         .invoke_command("this_does_not_exist_xyz", None)
         .await
-        .unwrap();
-    // Tauri returns null/empty for nonexistent commands
-    let text = serde_json::to_string(&result).unwrap();
-    assert!(text == "null" || text == "{}" || text.contains("error") || text.contains("unknown"));
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("not found"),
+        "unexpected error for an unknown command: {err}"
+    );
 });
 
 // ── Window Management ───────────────────────────────────────────────────────
@@ -433,7 +436,11 @@ e2e_test!(registry_returns_array, {
     let mut client = VictauriClient::discover().await.unwrap();
     let result = client.get_registry().await.unwrap();
     let arr = result.as_array().unwrap();
-    assert_eq!(arr.len(), 12, "demo app registers 12 commands");
+    assert_eq!(
+        arr.len(),
+        21,
+        "demo app registers 21 #[inspectable] commands"
+    );
 });
 
 e2e_test!(registry_search_returns_array, {

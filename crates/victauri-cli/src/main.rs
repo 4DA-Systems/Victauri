@@ -33,6 +33,8 @@ enum Commands {
         /// Write `JUnit` XML report to this path
         #[arg(long)]
         junit: Option<PathBuf>,
+        #[command(flatten)]
+        target: AppTarget,
     },
     /// Run the built-in smoke test suite against a running Tauri app
     Test {
@@ -45,6 +47,8 @@ enum Commands {
         /// Write `JUnit` XML report to this path
         #[arg(long)]
         junit: Option<PathBuf>,
+        #[command(flatten)]
+        target: AppTarget,
     },
     /// Record user interactions and generate a test file
     Record {
@@ -60,9 +64,14 @@ enum Commands {
         /// Emit `assert_ipc_called` assertions for each IPC command
         #[arg(long)]
         assert_ipc: bool,
+        #[command(flatten)]
+        target: AppTarget,
     },
     /// Diagnose your Victauri setup — check every step from plugin wiring to tool operation
-    Doctor,
+    Doctor {
+        #[command(flatten)]
+        target: AppTarget,
+    },
     /// Watch test files and re-run on changes
     Watch {
         /// Directory to watch (default: tests/)
@@ -82,6 +91,8 @@ enum Commands {
         /// Print raw JSON output (no formatting)
         #[arg(long)]
         raw: bool,
+        #[command(flatten)]
+        target: AppTarget,
     },
     /// Run as a stdio-to-HTTP MCP bridge for Claude Code and other MCP hosts
     Bridge {
@@ -107,7 +118,26 @@ enum Commands {
         /// Allow empty registry (zero commands) without failing
         #[arg(long)]
         allow_empty_registry: bool,
+        #[command(flatten)]
+        target: AppTarget,
     },
+}
+
+/// Which running app a command talks to when several Victauri apps are up.
+#[derive(clap::Args, Debug, Clone, Default)]
+struct AppTarget {
+    /// Select the app by its exact Tauri bundle identifier (or product name) when several
+    /// Victauri apps are running (env: `VICTAURI_APP`). Without it the single running app is
+    /// used, and several running apps are an error that lists them.
+    #[arg(long, value_name = "IDENTIFIER")]
+    app: Option<String>,
+}
+
+/// Connect to the running app `target` selects (see [`AppTarget`]).
+async fn connect(target: &AppTarget) -> Result<victauri_test::VictauriClient> {
+    victauri_test::VictauriClient::discover_app(target.app.as_deref())
+        .await
+        .map_err(|e| anyhow::anyhow!("{}", connect_failure_message(&e.to_string())))
 }
 
 #[tokio::main]
@@ -119,18 +149,23 @@ async fn main() -> Result<()> {
             let root = path.unwrap_or_else(|| PathBuf::from("."));
             cmd_init(&root)?;
         }
-        Commands::Check { junit } => {
-            cmd_check(junit.as_deref()).await?;
+        Commands::Check { junit, target } => {
+            cmd_check(junit.as_deref(), &target).await?;
         }
         Commands::Test {
             max_load_ms,
             max_heap_mb,
             junit,
+            target,
         } => {
-            cmd_test(max_load_ms, max_heap_mb, junit.as_deref()).await?;
+            cmd_test(max_load_ms, max_heap_mb, junit.as_deref(), &target).await?;
         }
-        Commands::Doctor => {
-            cmd_doctor().await?;
+        Commands::Doctor { target } => {
+            // A `[FAIL]` exits 1 so a CI step running `victauri doctor` fails with it
+            // (R5B-DOCTOR1); warnings alone still exit 0.
+            if cmd_doctor(&target).await? > 0 {
+                std::process::exit(1);
+            }
         }
         Commands::Bridge { wait, app } => {
             bridge::run(wait, app).await?;
@@ -140,21 +175,28 @@ async fn main() -> Result<()> {
             test_name,
             locator,
             assert_ipc,
+            target,
         } => {
-            cmd_record(&output, &test_name, locator, assert_ipc).await?;
+            cmd_record(&output, &test_name, locator, assert_ipc, &target).await?;
         }
         Commands::Watch { dir, filter } => {
             cmd_watch(&dir, filter.as_deref()).await?;
         }
-        Commands::Invoke { command, args, raw } => {
-            cmd_invoke(&command, args.as_deref(), raw).await?;
+        Commands::Invoke {
+            command,
+            args,
+            raw,
+            target,
+        } => {
+            cmd_invoke(&command, args.as_deref(), raw, &target).await?;
         }
         Commands::Coverage {
             threshold,
             junit,
             allow_empty_registry,
+            target,
         } => {
-            cmd_coverage(threshold, junit.as_deref(), allow_empty_registry).await?;
+            cmd_coverage(threshold, junit.as_deref(), allow_empty_registry, &target).await?;
         }
     }
 
@@ -163,19 +205,24 @@ async fn main() -> Result<()> {
 
 fn cmd_init(root: &Path) -> Result<()> {
     let root = std::fs::canonicalize(root)
-        .with_context(|| format!("directory not found: {}", root.display()))?;
+        .with_context(|| format!("directory not found: {}", display_path(root)))?;
 
     let (cargo_toml_path, is_tauri) = detect_project(&root)?;
 
     if !is_tauri {
         eprintln!(
             "Warning: no Tauri dependency detected in {}",
-            cargo_toml_path.display()
+            display_path(&cargo_toml_path)
         );
         eprintln!("         Victauri is designed for Tauri apps — tests may not connect.\n");
     }
 
     eprintln!("Initializing Victauri...\n");
+
+    // Every path `init` writes must stay inside the project with no symlinked component
+    // (R4-FS1): a cloned repo whose `src-tauri`, `src`, `capabilities`, `tests` or `.github`
+    // is a symlink would otherwise redirect these writes into another project.
+    ensure_inside_project(&root, &cargo_toml_path)?;
 
     // Step 1: Add dependencies to Cargo.toml
     let added = add_dependencies(&cargo_toml_path)?;
@@ -194,6 +241,7 @@ fn cmd_init(root: &Path) -> Result<()> {
         .unwrap_or_default();
     let mut patched = false;
     if src_dir.exists() {
+        ensure_inside_project(&root, &src_dir.join("main.rs"))?;
         patched = try_patch_tauri_builder(&src_dir)?;
     }
     if !patched {
@@ -204,6 +252,7 @@ fn cmd_init(root: &Path) -> Result<()> {
 
     // Step 3: Create .mcp.json for AI agent connection
     let mcp_json_path = root.join(".mcp.json");
+    ensure_inside_project(&root, &mcp_json_path)?;
     if mcp_json_path.exists() {
         let content = std::fs::read_to_string(&mcp_json_path).unwrap_or_default();
         if content.contains("victauri") {
@@ -212,16 +261,22 @@ fn cmd_init(root: &Path) -> Result<()> {
             eprintln!("  [!] .mcp.json exists but doesn't reference Victauri.");
             eprintln!("      Add this to your mcpServers (the bridge auto-discovers the port —");
             eprintln!("      prefer it over a fixed url so agents never bind the wrong app):\n");
+            // The same `--app <identifier>` pin the generated file carries (R5B-INIT2).
             eprintln!(
-                "        \"victauri\": {{ \"command\": \"victauri\", \"args\": [\"bridge\"] }}\n"
+                "        {}\n",
+                mcp_server_entry_snippet(read_app_identifier(root.as_path()).as_deref())
             );
         }
     } else {
         let app_id = read_app_identifier(root.as_path());
-        std::fs::write(&mcp_json_path, generate_mcp_json(app_id.as_deref()))
-            .with_context(|| format!("failed to write {}", mcp_json_path.display()))?;
+        write_new_file(&mcp_json_path, &generate_mcp_json(app_id.as_deref()))?;
         match app_id {
-            Some(id) => eprintln!("  [+] Created .mcp.json (bridge pinned to app '{id}')"),
+            // The identifier comes from the (possibly untrusted) project's tauri.conf.json:
+            // never print its control characters raw (R4-TERM1).
+            Some(id) => eprintln!(
+                "  [+] Created .mcp.json (bridge pinned to app '{}')",
+                victauri_test::terminal::single_line(&id)
+            ),
             None => eprintln!("  [+] Created .mcp.json (AI agent configuration)"),
         }
     }
@@ -230,13 +285,13 @@ fn cmd_init(root: &Path) -> Result<()> {
     let capabilities_dir = find_capabilities_dir(&cargo_toml_path);
     if let Some(caps_dir) = capabilities_dir {
         let cap_path = caps_dir.join("victauri.json");
+        ensure_inside_project(&root, &cap_path)?;
         if cap_path.exists() {
             eprintln!("  [=] capabilities/victauri.json already exists");
         } else {
             std::fs::create_dir_all(&caps_dir)
-                .with_context(|| format!("failed to create {}", caps_dir.display()))?;
-            std::fs::write(&cap_path, generate_capability_json())
-                .with_context(|| format!("failed to write {}", cap_path.display()))?;
+                .with_context(|| format!("failed to create {}", display_path(&caps_dir)))?;
+            write_new_file(&cap_path, generate_capability_json())?;
             eprintln!("  [+] Created capabilities/victauri.json");
         }
         // Verify the effective grant covers every window — a capability scoped to
@@ -267,15 +322,15 @@ fn cmd_init(root: &Path) -> Result<()> {
     }
 
     let tests_dir = find_src_tauri(&root).map_or_else(|| root.join("tests"), |p| p.join("tests"));
+    ensure_inside_project(&root, &tests_dir.join("smoke.rs"))?;
     std::fs::create_dir_all(&tests_dir)
-        .with_context(|| format!("failed to create {}", tests_dir.display()))?;
+        .with_context(|| format!("failed to create {}", display_path(&tests_dir)))?;
 
     let smoke_path = tests_dir.join("smoke.rs");
     if smoke_path.exists() {
         eprintln!("  [=] tests/smoke.rs already exists");
     } else {
-        std::fs::write(&smoke_path, generate_smoke_test())
-            .with_context(|| format!("failed to write {}", smoke_path.display()))?;
+        write_new_file(&smoke_path, generate_smoke_test())?;
         eprintln!("  [+] Created tests/smoke.rs (smoke tests)");
     }
 
@@ -288,19 +343,19 @@ fn cmd_init(root: &Path) -> Result<()> {
         } else {
             generate_integration_test_with_commands(&discovered_commands)
         };
-        std::fs::write(&integration_path, &integration_content)
-            .with_context(|| format!("failed to write {}", integration_path.display()))?;
+        write_new_file(&integration_path, &integration_content)?;
         eprintln!("  [+] Created tests/integration.rs (integration test template)");
     }
 
     // Step 6: Generate CI workflow
     let workflows_dir = root.join(".github").join("workflows");
     let ci_path = workflows_dir.join("victauri.yml");
+    ensure_inside_project(&root, &ci_path)?;
     if ci_path.exists() {
         eprintln!("  [=] .github/workflows/victauri.yml already exists");
     } else {
         std::fs::create_dir_all(&workflows_dir)
-            .with_context(|| format!("failed to create {}", workflows_dir.display()))?;
+            .with_context(|| format!("failed to create {}", display_path(&workflows_dir)))?;
         // The Rust crate's directory relative to the repo root (`src-tauri` for the
         // standard create-tauri-app layout, `.` when Cargo.toml is at the root).
         let app_dir = cargo_toml_path
@@ -309,13 +364,13 @@ fn cmd_init(root: &Path) -> Result<()> {
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| ".".to_string());
-        std::fs::write(&ci_path, generate_ci_workflow(&app_dir))
-            .with_context(|| format!("failed to write {}", ci_path.display()))?;
+        write_new_file(&ci_path, &generate_ci_workflow(&app_dir))?;
         eprintln!("  [+] Created .github/workflows/victauri.yml (CI pipeline)");
     }
 
     // Step 7: Add Victauri section to CLAUDE.md for AI agent guidance
     let claude_md_path = root.join("CLAUDE.md");
+    ensure_inside_project(&root, &claude_md_path)?;
     if claude_md_path.exists() {
         let content = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
         // Detect a prior insertion by our sentinel marker, not a loose substring —
@@ -324,20 +379,14 @@ fn cmd_init(root: &Path) -> Result<()> {
         if content.contains("VICTAURI:BEGIN") {
             eprintln!("  [=] CLAUDE.md already has the Victauri block (VICTAURI markers present)");
         } else {
-            let mut file = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&claude_md_path)
-                .with_context(|| format!("failed to append to {}", claude_md_path.display()))?;
-            std::io::Write::write_all(&mut file, generate_claude_md_section().as_bytes())
-                .with_context(|| format!("failed to write to {}", claude_md_path.display()))?;
+            append_to_regular_file(&claude_md_path, generate_claude_md_section())?;
             eprintln!(
                 "  [+] Appended a Victauri block to CLAUDE.md (between <!-- VICTAURI:BEGIN --> and"
             );
             eprintln!("      <!-- VICTAURI:END --> markers — delete that block to opt out)");
         }
     } else {
-        std::fs::write(&claude_md_path, generate_claude_md_section())
-            .with_context(|| format!("failed to write {}", claude_md_path.display()))?;
+        write_new_file(&claude_md_path, generate_claude_md_section())?;
         eprintln!("  [+] Created CLAUDE.md with Victauri agent instructions");
     }
 
@@ -413,6 +462,13 @@ fn warn_on_version_skew(plugin_version: &str) -> bool {
 /// 401 (auth on by default) and a version-skew handshake failure both surfaced as the generic "is
 /// your app running?" while the app WAS running — so the operator chased the wrong fix.
 fn connect_failure_message(detail: &str) -> String {
+    // Discovery could not pick ONE app (several running, the selected one absent, or an
+    // explicit token matching no app): the message already names the running apps and how
+    // to select one. The generic "stale CLI / is your app running?" advice is wrong here
+    // (R4-CLI1: with two apps running, `check` used to print a 401 and blame a stale CLI).
+    if is_discovery_selection_error(detail) {
+        return format!("Could not choose a Victauri app to connect to:\n{detail}");
+    }
     let lower = detail.to_lowercase();
     let hint = if lower.contains("401") || lower.contains("unauthorized") {
         "Auth is ON by default. `discover()` auto-reads the per-pid discovery token, so a 401 usually \
@@ -435,6 +491,107 @@ fn connect_failure_message(detail: &str) -> String {
     format!("Could not connect to Victauri server: {detail}\n\n{hint}")
 }
 
+/// Names from a ghost-report list whose items are `{ "name": … }` objects (the plugin's
+/// shape: `frontend_only` holds `GhostCommand`s, `confirmed_ghosts` holds `{name, error}`),
+/// or bare strings (older plugins). Deduplicated in order; page-controlled, so sanitized.
+fn ghost_names(list: Option<&serde_json::Value>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for item in list
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let name = item
+            .as_str()
+            .or_else(|| item.get("name").and_then(serde_json::Value::as_str))
+            .or_else(|| item.get("command").and_then(serde_json::Value::as_str));
+        if let Some(name) = name.map(victauri_test::terminal::single_line)
+            && !names.contains(&name)
+        {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The `Ghost commands` section of `victauri check`.
+///
+/// `confirmed_ghosts` (invoked, never succeeded, errored "not found") are real missing
+/// handlers regardless of the registry; `frontend_only` are candidates whose weight depends
+/// on `reliability`. Both are listed BY NAME — the old code read the items as strings (they
+/// are objects), so it printed counts but never a single name, and ignored confirmed ghosts.
+fn ghost_report_lines(ghosts: &serde_json::Value) -> Vec<String> {
+    const SHOWN: usize = 5;
+    let list = |names: &[String], out: &mut Vec<String>| {
+        for name in names.iter().take(SHOWN) {
+            out.push(format!("    - {name}"));
+        }
+        if names.len() > SHOWN {
+            out.push(format!("    ... and {} more", names.len() - SHOWN));
+        }
+    };
+    let confirmed = ghost_names(ghosts.get("confirmed_ghosts"));
+    let candidates = ghost_names(
+        ghosts
+            .get("frontend_only")
+            .or_else(|| ghosts.get("ghost_commands")),
+    );
+    // Honesty signal: `frontend_only` is only a real bug list when the introspection
+    // registry mirrors the app's full command set. Report candidates as candidates.
+    let reliability = ghosts
+        .get("reliability")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let mut out = Vec::new();
+    if confirmed.is_empty() && candidates.is_empty() {
+        out.push("  Ghost commands: none".to_string());
+        return out;
+    }
+    if !confirmed.is_empty() {
+        out.push(format!(
+            "  Ghost commands: {} confirmed (invoked, errored \"not found\" — no backend handler)",
+            confirmed.len()
+        ));
+        list(&confirmed, &mut out);
+    }
+    if !candidates.is_empty() {
+        if reliability == "none" || reliability == "low" {
+            out.push(format!(
+                "  Ghost command candidates: {} (reliability: {} — likely uninstrumented real \
+                 commands, not bugs; verify against the app's generate_handler! list)",
+                candidates.len(),
+                victauri_test::terminal::single_line(reliability)
+            ));
+        } else {
+            out.push(format!(
+                "  Ghost command candidates: {} (absent from a complete registry)",
+                candidates.len()
+            ));
+        }
+        list(&candidates, &mut out);
+    }
+    out
+}
+
+/// Capability window labels for display: from the project's JSON, so each is rendered with
+/// control characters escaped — a label like `"main\n::error::x"` must not start a new line.
+fn capability_labels(labels: &[String]) -> String {
+    labels
+        .iter()
+        .map(|l| victauri_test::terminal::single_line(l))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether `detail` is `victauri-test` discovery refusing to guess an app (see
+/// `VictauriClient::discover_app`), rather than a connection failure.
+fn is_discovery_selection_error(detail: &str) -> bool {
+    detail.contains("Multiple Victauri apps are running")
+        || detail.contains("No running Victauri app matches")
+        || detail.contains("VICTAURI_AUTH_TOKEN is set, but no running Victauri app")
+}
+
 /// Extract the tool count from a `get_plugin_info` response for the `victauri check` summary.
 ///
 /// The server reports it nested under `tools.total` (the shape since 0.7.x); older/odd shapes
@@ -449,15 +606,10 @@ fn parse_tool_count(info: &serde_json::Value) -> String {
         .map_or_else(|| "?".to_string(), |n| n.to_string())
 }
 
-async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
+async fn cmd_check(junit_path: Option<&Path>, target: &AppTarget) -> Result<()> {
     eprintln!("Connecting to running Victauri server...\n");
 
-    let mut client = match victauri_test::VictauriClient::discover().await {
-        Ok(c) => c,
-        Err(e) => {
-            bail!("{}", connect_failure_message(&e.to_string()));
-        }
-    };
+    let mut client = connect(target).await?;
 
     let info = client
         .get_plugin_info()
@@ -475,6 +627,11 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
         .map_or("?".to_string(), |s| format!("{s}s"));
 
     eprintln!("  Victauri v{version}");
+    eprintln!(
+        "  Endpoint: {} (app: {})",
+        client.base_url(),
+        victauri_test::terminal::single_line(client.app_identifier().unwrap_or("unknown"))
+    );
     eprintln!("  Tools:  {tool_count}");
     eprintln!("  Uptime: {uptime}");
 
@@ -532,41 +689,8 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
         .detect_ghost_commands()
         .await
         .context("ghost command detection failed")?;
-    let ghost_list = ghosts
-        .get("frontend_only")
-        .and_then(|g| g.as_array())
-        .or_else(|| ghosts.get("ghost_commands").and_then(|g| g.as_array()));
-    // Honesty signal: `frontend_only` is only a real bug list when the introspection
-    // registry mirrors the app's full command set. Report candidates as candidates.
-    let reliability = ghosts
-        .get("reliability")
-        .and_then(|r| r.as_str())
-        .unwrap_or("unknown");
-    if let Some(list) = ghost_list {
-        if list.is_empty() {
-            eprintln!("  Ghost commands: none");
-        } else {
-            if reliability == "none" || reliability == "low" {
-                eprintln!(
-                    "  Ghost commands: {} candidate(s) (reliability: {reliability} — likely \
-                     uninstrumented real commands, not bugs; verify against the app's \
-                     generate_handler! list)",
-                    list.len()
-                );
-            } else {
-                eprintln!("  Ghost commands: {} detected", list.len());
-            }
-            for g in list.iter().take(5) {
-                if let Some(name) = g.as_str() {
-                    eprintln!("    - {name}");
-                } else if let Some(name) = g.get("command").and_then(|c| c.as_str()) {
-                    eprintln!("    - {name}");
-                }
-            }
-            if list.len() > 5 {
-                eprintln!("    ... and {} more", list.len() - 5);
-            }
-        }
+    for line in ghost_report_lines(&ghosts) {
+        eprintln!("{line}");
     }
 
     let mem = client
@@ -600,17 +724,18 @@ async fn cmd_check(junit_path: Option<&Path>) -> Result<()> {
         let junit = report.to_junit("victauri-check", duration);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
         }
         victauri_test::reporting::write_junit_report(&junit, path)
-            .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
-        eprintln!("JUnit report written to {}", path.display());
+            .with_context(|| format!("failed to write JUnit report to {}", display_path(path)))?;
+        eprintln!("JUnit report written to {}", display_path(path));
     }
 
     Ok(())
 }
 
-async fn cmd_doctor() -> Result<()> {
+/// Run every doctor check and print the summary; returns the number of `[FAIL]` items.
+async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     eprintln!("Victauri Doctor — checking your setup...\n");
 
     let mut pass_count = 0u32;
@@ -620,7 +745,7 @@ async fn cmd_doctor() -> Result<()> {
     // Check 1: Project structure
     let cwd = std::env::current_dir()?;
     let (cargo_path, is_tauri) = if let Ok(result) = detect_project(&cwd) {
-        eprintln!("  [PASS] Cargo.toml found: {}", result.0.display());
+        eprintln!("  [PASS] Cargo.toml found: {}", display_path(&result.0));
         pass_count += 1;
         result
     } else {
@@ -628,7 +753,7 @@ async fn cmd_doctor() -> Result<()> {
         eprintln!("         Run this command from your Tauri project root.\n");
         fail_count += 1;
         print_doctor_summary(pass_count, fail_count, warn_count);
-        return Ok(());
+        return Ok(fail_count);
     };
 
     // Check 2: Tauri dependency
@@ -639,7 +764,7 @@ async fn cmd_doctor() -> Result<()> {
         eprintln!("  [FAIL] No Tauri dependency in Cargo.toml");
         eprintln!(
             "         Add `tauri` to [dependencies] in {}",
-            cargo_path.display()
+            display_path(&cargo_path)
         );
         fail_count += 1;
     }
@@ -716,7 +841,7 @@ async fn cmd_doctor() -> Result<()> {
             eprintln!("         eval_js / dom_snapshot will time out with no error.");
             eprintln!(
                 "         Run `victauri init`, or add {}:",
-                caps.join("victauri.json").display()
+                display_path(&caps.join("victauri.json"))
             );
             eprintln!("{}", indent_block(generate_capability_json()));
             warn_count += 1;
@@ -724,15 +849,17 @@ async fn cmd_doctor() -> Result<()> {
             eprintln!("  [PASS] 'victauri:default' granted to all windows");
             pass_count += 1;
         } else {
-            let file = scan.file.as_deref().map_or_else(
-                || "the capability file".to_string(),
-                |p| p.display().to_string(),
-            );
+            // Labels and file names come from the (possibly untrusted) project: print them
+            // with control characters escaped (R4-TERM1).
+            let file = scan
+                .file
+                .as_deref()
+                .map_or_else(|| "the capability file".to_string(), display_path);
             match scan.windows.as_deref() {
                 Some(labels) if !labels.is_empty() => {
                     eprintln!(
                         "  [WARN] 'victauri:default' only covers window(s): {}",
-                        labels.join(", ")
+                        capability_labels(labels)
                     );
                     eprintln!("         Other windows will be invisible to Victauri (eval_js /");
                     eprintln!(
@@ -752,7 +879,7 @@ async fn cmd_doctor() -> Result<()> {
     // Check 8: Test files
     let tests_dir = find_src_tauri(&cwd).map_or_else(|| cwd.join("tests"), |p| p.join("tests"));
     if tests_dir.join("smoke.rs").exists() || tests_dir.join("integration.rs").exists() {
-        eprintln!("  [PASS] Test files found in {}", tests_dir.display());
+        eprintln!("  [PASS] Test files found in {}", display_path(&tests_dir));
         pass_count += 1;
     } else {
         eprintln!("  [WARN] No Victauri test files found");
@@ -763,7 +890,7 @@ async fn cmd_doctor() -> Result<()> {
     // Check 9: Server connectivity
     eprintln!();
     eprintln!("  Checking server connectivity...");
-    match victauri_test::VictauriClient::discover().await {
+    match victauri_test::VictauriClient::discover_app(target.app.as_deref()).await {
         Ok(mut client) => {
             eprintln!("  [PASS] Connected to Victauri server");
             pass_count += 1;
@@ -792,7 +919,9 @@ async fn cmd_doctor() -> Result<()> {
                     pass_count += 1;
 
                     if let Ok(ver) = client.eval_js("window.__VICTAURI__.version").await {
-                        let ver_str = ver.as_str().unwrap_or("unknown");
+                        // Read from the page: escape control characters (R4-TERM1).
+                        let ver_str =
+                            victauri_test::terminal::single_line(ver.as_str().unwrap_or("unknown"));
                         eprintln!("         Bridge version: {ver_str}");
                     }
                 } else {
@@ -848,7 +977,7 @@ async fn cmd_doctor() -> Result<()> {
 
     eprintln!();
     print_doctor_summary(pass_count, fail_count, warn_count);
-    Ok(())
+    Ok(fail_count)
 }
 
 fn print_doctor_summary(pass: u32, fail: u32, warn: u32) {
@@ -863,15 +992,15 @@ fn print_doctor_summary(pass: u32, fail: u32, warn: u32) {
     }
 }
 
-async fn cmd_test(max_load_ms: u64, max_heap_mb: f64, junit_path: Option<&Path>) -> Result<()> {
+async fn cmd_test(
+    max_load_ms: u64,
+    max_heap_mb: f64,
+    junit_path: Option<&Path>,
+    target: &AppTarget,
+) -> Result<()> {
     eprintln!("Connecting to running Victauri server...\n");
 
-    let mut client = match victauri_test::VictauriClient::discover().await {
-        Ok(c) => c,
-        Err(e) => {
-            bail!("{}", connect_failure_message(&e.to_string()));
-        }
-    };
+    let mut client = connect(target).await?;
 
     eprintln!("Running built-in smoke test suite (11 checks)...\n");
 
@@ -892,11 +1021,11 @@ async fn cmd_test(max_load_ms: u64, max_heap_mb: f64, junit_path: Option<&Path>)
         let junit = verify.to_junit("victauri-smoke", report.duration);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
         }
         victauri_test::reporting::write_junit_report(&junit, path)
-            .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
-        eprintln!("JUnit report written to {}", path.display());
+            .with_context(|| format!("failed to write JUnit report to {}", display_path(path)))?;
+        eprintln!("JUnit report written to {}", display_path(path));
     }
 
     if !report.all_passed() {
@@ -909,17 +1038,17 @@ async fn cmd_test(max_load_ms: u64, max_heap_mb: f64, junit_path: Option<&Path>)
     Ok(())
 }
 
-async fn cmd_invoke(command: &str, args_json: Option<&str>, raw: bool) -> Result<()> {
+async fn cmd_invoke(
+    command: &str,
+    args_json: Option<&str>,
+    raw: bool,
+    target: &AppTarget,
+) -> Result<()> {
     if !raw {
         eprintln!("Connecting to running Victauri server...\n");
     }
 
-    let mut client = match victauri_test::VictauriClient::discover().await {
-        Ok(c) => c,
-        Err(e) => {
-            bail!("{}", connect_failure_message(&e.to_string()));
-        }
-    };
+    let mut client = connect(target).await?;
 
     let args: Option<serde_json::Value> = match args_json {
         Some(s) => Some(serde_json::from_str(s).context("invalid JSON in --args")?),
@@ -949,15 +1078,11 @@ async fn cmd_coverage(
     threshold: Option<f64>,
     junit_path: Option<&Path>,
     allow_empty_registry: bool,
+    target: &AppTarget,
 ) -> Result<()> {
     eprintln!("Connecting to running Victauri server...\n");
 
-    let mut client = match victauri_test::VictauriClient::discover().await {
-        Ok(c) => c,
-        Err(e) => {
-            bail!("{}", connect_failure_message(&e.to_string()));
-        }
-    };
+    let mut client = connect(target).await?;
 
     let report = victauri_test::coverage::coverage_report(&mut client)
         .await
@@ -977,28 +1102,27 @@ async fn cmd_coverage(
     eprintln!("{summary}");
 
     if let Some(path) = junit_path {
-        let verify_report = victauri_test::VerifyReport {
-            results: vec![victauri_test::CheckResult {
-                description: format!(
+        let verify_report =
+            victauri_test::VerifyReport::new(vec![victauri_test::CheckResult::new(
+                format!(
                     "IPC coverage {:.1}% ({}/{})",
                     report.coverage_percentage, report.tested_commands, report.total_commands
                 ),
-                passed: threshold.is_none_or(|t| report.meets_threshold(t)),
-                detail: if report.untested.is_empty() {
+                threshold.is_none_or(|t| report.meets_threshold(t)),
+                if report.untested.is_empty() {
                     String::new()
                 } else {
                     format!("untested: {}", report.untested.join(", "))
                 },
-            }],
-        };
+            )]);
         let junit = verify_report.to_junit("victauri-coverage", std::time::Duration::from_secs(0));
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create directory {}", parent.display()))?;
+                .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
         }
         victauri_test::reporting::write_junit_report(&junit, path)
-            .with_context(|| format!("failed to write JUnit report to {}", path.display()))?;
-        eprintln!("JUnit report written to {}", path.display());
+            .with_context(|| format!("failed to write JUnit report to {}", display_path(path)))?;
+        eprintln!("JUnit report written to {}", display_path(path));
     }
 
     if let Some(t) = threshold {
@@ -1018,15 +1142,16 @@ async fn cmd_coverage(
     Ok(())
 }
 
-async fn cmd_record(output: &Path, test_name: &str, locator: bool, assert_ipc: bool) -> Result<()> {
+async fn cmd_record(
+    output: &Path,
+    test_name: &str,
+    locator: bool,
+    assert_ipc: bool,
+    target: &AppTarget,
+) -> Result<()> {
     eprintln!("Connecting to running Tauri app...\n");
 
-    let mut client = match victauri_test::VictauriClient::discover().await {
-        Ok(c) => c,
-        Err(e) => {
-            bail!("{}", connect_failure_message(&e.to_string()));
-        }
-    };
+    let mut client = connect(target).await?;
 
     let session_id = format!("record-{}", uuid::Uuid::new_v4());
     client
@@ -1083,17 +1208,18 @@ async fn cmd_record(output: &Path, test_name: &str, locator: bool, assert_ipc: b
     };
     let code = victauri_core::generate_test(&session, &options);
 
+    let output = checked_record_output(&std::env::current_dir()?, output)?;
+    let output = output.as_path();
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+            .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
     }
-    std::fs::write(output, &code)
-        .with_context(|| format!("failed to write {}", output.display()))?;
+    write_regular_file(output, &code)?;
 
     eprintln!(
         "  Captured {event_count} events ({interaction_count} interactions, {ipc_count} IPC calls)"
     );
-    eprintln!("  Generated test: {}", output.display());
+    eprintln!("  Generated test: {}", display_path(output));
     // `--test` selects the test TARGET (the file stem under tests/), not the function;
     // the function name is the trailing name filter.
     let target = output.file_stem().map_or_else(
@@ -1115,11 +1241,14 @@ async fn cmd_watch(dir: &Path, filter: Option<&str>) -> Result<()> {
     };
 
     if !watch_dir.exists() {
-        bail!("watch directory does not exist: {}", watch_dir.display());
+        bail!(
+            "watch directory does not exist: {}",
+            display_path(&watch_dir)
+        );
     }
 
     eprintln!("\x1b[36mVictauri Watch\x1b[0m");
-    eprintln!("  Directory: {}", watch_dir.display());
+    eprintln!("  Directory: {}", display_path(&watch_dir));
     if let Some(f) = filter {
         eprintln!("  Filter: {f}");
     }
@@ -1145,7 +1274,7 @@ async fn cmd_watch(dir: &Path, filter: Option<&str>) -> Result<()> {
 
     watcher
         .watch(&watch_dir, RecursiveMode::Recursive)
-        .with_context(|| format!("failed to watch {}", watch_dir.display()))?;
+        .with_context(|| format!("failed to watch {}", display_path(&watch_dir)))?;
 
     run_tests_with_output(filter, None);
 
@@ -1220,12 +1349,12 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
             continue;
         }
         let content = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+            .with_context(|| format!("failed to read {}", display_path(&path)))?;
 
         if content.contains("victauri_plugin") {
             eprintln!(
                 "  [=] {} already references victauri_plugin",
-                path.display()
+                display_path(&path)
             );
             return Ok(true);
         }
@@ -1260,19 +1389,29 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
             new_lines.push(&plugin_line);
             new_lines.extend_from_slice(&lines[idx..]);
 
-            let new_content = new_lines.join("\n");
+            // Keep the file's line endings: `lines()` drops them, and re-joining with "\n"
+            // turned a CRLF source file into a whole-file LF diff.
+            let eol = if content.contains("\r\n") {
+                "\r\n"
+            } else {
+                "\n"
+            };
+            let new_content = new_lines.join(eol);
             // Preserve trailing newline if original had one
             let new_content = if content.ends_with('\n') {
-                format!("{new_content}\n")
+                format!("{new_content}{eol}")
             } else {
                 new_content
             };
 
+            // Same rule as every file `init` creates: never write through a symlink (a cloned
+            // repo's `src/main.rs` could point at a file outside the project).
+            refuse_symlink(&path)?;
             std::fs::write(&path, new_content)
-                .with_context(|| format!("failed to write {}", path.display()))?;
+                .with_context(|| format!("failed to write {}", display_path(&path)))?;
             eprintln!(
                 "  [+] Patched {} with .plugin(victauri_plugin::init())",
-                path.display()
+                display_path(&path)
             );
             return Ok(true);
         }
@@ -1287,22 +1426,199 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
 ///
 /// No `--wait`: the bridge answers the MCP handshake locally and connects to the app lazily,
 /// so it never blocks startup whether or not the app is running yet (`--wait` is now a no-op).
+///
+/// Built with `serde_json` (never string interpolation): the identifier comes from the
+/// project's `tauri.conf.json`, and a value containing quotes, backslashes or control
+/// characters must be escaped, not spliced into the document.
 fn generate_mcp_json(app: Option<&str>) -> String {
-    let args = match app {
-        Some(id) => format!("[\"bridge\", \"--app\", \"{id}\"]"),
-        None => "[\"bridge\"]".to_string(),
+    let args: Vec<&str> = match app {
+        Some(id) => vec!["bridge", "--app", id],
+        None => vec!["bridge"],
     };
-    format!(
-        r#"{{
-  "mcpServers": {{
-    "victauri": {{
-      "command": "victauri",
-      "args": {args}
-    }}
-  }}
-}}
-"#
-    )
+    let doc = serde_json::json!({
+        "mcpServers": {
+            "victauri": {
+                "command": "victauri",
+                "args": args,
+            }
+        }
+    });
+    // Serializing a `Value` built from strings cannot fail; fall back defensively anyway.
+    let mut out = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| {
+        r#"{"mcpServers":{"victauri":{"command":"victauri","args":["bridge"]}}}"#.to_string()
+    });
+    out.push('\n');
+    out
+}
+
+/// The `"victauri": {…}` entry to paste into an existing `.mcp.json` — the same bridge args
+/// [`generate_mcp_json`] writes, so a hand-merged config is pinned to the app too (R5B-INIT2).
+/// Each value is JSON-encoded (the identifier is untrusted project data) and the line is
+/// printed with control characters escaped.
+fn mcp_server_entry_snippet(app: Option<&str>) -> String {
+    let mut args = vec!["bridge"];
+    if let Some(id) = app {
+        args.extend(["--app", id]);
+    }
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| serde_json::Value::from(*a).to_string())
+        .collect();
+    victauri_test::terminal::single_line(&format!(
+        "\"victauri\": {{ \"command\": \"victauri\", \"args\": [{}] }}",
+        args.join(", ")
+    ))
+}
+
+/// Refuse to operate on `path` if it is a symbolic link.
+///
+/// `victauri init` writes into a project directory that may come from an untrusted clone; a
+/// planted symlink (e.g. `CLAUDE.md -> ~/.bashrc`) would otherwise make `fs::write` /
+/// append follow it and modify a file outside the project. A missing path is fine.
+fn refuse_symlink(path: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
+            "refusing to write {}: it is a symbolic link (victauri init never writes through symlinks)",
+            display_path(path)
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// A path as shown to the user: the Windows verbatim prefix `std::fs::canonicalize` adds
+/// (`\\?\C:\…`, `\\?\UNC\server\share\…`) is dropped, dunce-style (R5B-INIT1), and control
+/// characters are escaped — a cloned repo's directory names are untrusted (R4-TERM1).
+fn display_path(path: &Path) -> String {
+    let shown = path.display().to_string();
+    let plain = if let Some(unc) = shown.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = shown
+        .strip_prefix(r"\\?\")
+        .filter(|rest| rest.as_bytes().get(1) == Some(&b':'))
+    {
+        rest.to_string()
+    } else {
+        shown
+    };
+    victauri_test::terminal::single_line(&plain)
+}
+
+/// Refuse to write `path` unless it lies inside the (canonical) project `root` with no
+/// symlinked component between them (R4-FS1).
+///
+/// `refuse_symlink` alone checked only the LAST component, so a symlinked `src-tauri`,
+/// `src`, `capabilities`, `tests` or `.github` in a cloned repo redirected `init`'s writes
+/// into another project. Components that do not exist yet are fine — `init` creates them as
+/// real directories. As defense in depth the deepest existing ancestor must also canonicalize
+/// inside `root`.
+fn ensure_inside_project(root: &Path, path: &Path) -> Result<()> {
+    let refuse = |why: String| -> Result<()> {
+        anyhow::bail!(
+            "refusing to write {}: {why} (victauri init never writes through symlinks or \
+             outside the project)",
+            display_path(path)
+        )
+    };
+    let Ok(relative) = path.strip_prefix(root) else {
+        return refuse(format!("it is outside the project {}", display_path(root)));
+    };
+    let components: Vec<_> = relative.components().collect();
+    let mut current = root.to_path_buf();
+    for (i, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(name) = component else {
+            return refuse("its path is not a plain relative path".to_string());
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return refuse(format!("{} is a symbolic link", display_path(&current)));
+            }
+            Ok(meta) if i + 1 < components.len() && !meta.is_dir() => {
+                return refuse(format!("{} is not a directory", display_path(&current)));
+            }
+            Ok(_) => {}
+            // Missing: nothing below it exists yet, so nothing below it can be a link.
+            Err(_) => break,
+        }
+    }
+    let mut existing = path.to_path_buf();
+    while std::fs::symlink_metadata(&existing).is_err() {
+        if !existing.pop() {
+            break;
+        }
+    }
+    let canonical = std::fs::canonicalize(&existing)
+        .with_context(|| format!("failed to resolve {}", display_path(&existing)))?;
+    if !canonical.starts_with(root) {
+        return refuse(format!(
+            "it resolves outside the project ({})",
+            display_path(&canonical)
+        ));
+    }
+    Ok(())
+}
+
+/// Where `victauri record` writes: an output inside the working directory must not pass
+/// through a symlinked directory (a cloned repo's `tests -> ../other-project/tests`), and
+/// the output file itself must never be a symlink (R4-FS1). An absolute path outside the
+/// working directory is the user's explicit choice; only its final component is checked.
+fn checked_record_output(cwd: &Path, output: &Path) -> Result<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd)
+        .with_context(|| format!("failed to resolve {}", display_path(cwd)))?;
+    let absolute = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        cwd.join(output)
+    };
+    if absolute.starts_with(&cwd) {
+        ensure_inside_project(&cwd, &absolute)?;
+    } else {
+        refuse_symlink(&absolute)?;
+    }
+    Ok(absolute)
+}
+
+/// Write `contents` to `path`, replacing a regular file but never following a symlink.
+fn write_regular_file(path: &Path, contents: &str) -> Result<()> {
+    refuse_symlink(path)?;
+    std::fs::write(path, contents)
+        .with_context(|| format!("failed to write {}", display_path(path)))
+}
+
+/// Create a NEW file with `contents`, never following or clobbering anything already at
+/// `path`. `create_new` is atomic (`O_EXCL` / `CREATE_NEW`): it fails if *anything* exists there,
+/// including a dangling symlink, so a link planted between the existence check and the write
+/// cannot redirect it.
+fn write_new_file(path: &Path, contents: &str) -> Result<()> {
+    refuse_symlink(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", display_path(path)))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())
+        .with_context(|| format!("failed to write {}", display_path(path)))?;
+    Ok(())
+}
+
+/// Append `contents` to an existing regular file, refusing if `path` is a symlink.
+fn append_to_regular_file(path: &Path, contents: &str) -> Result<()> {
+    refuse_symlink(path)?;
+    let meta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat {}", display_path(path)))?;
+    if !meta.is_file() {
+        anyhow::bail!(
+            "refusing to append to {}: not a regular file",
+            display_path(path)
+        );
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to append to {}", display_path(path)))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes())
+        .with_context(|| format!("failed to write to {}", display_path(path)))?;
+    Ok(())
 }
 
 /// Read the Tauri bundle identifier from the project's `tauri.conf.json` so the generated
@@ -1330,8 +1646,8 @@ that gives full-stack access to the webview DOM, IPC layer, Rust backend, and na
 windows. Available when the app is running in debug mode.
 
 **Use Victauri MCP tools for all app inspection and testing tasks.** Victauri runs inside
-the app process with sub-ms response times and direct AppHandle access — it sees
-everything, not just the webview.
+the app process with direct AppHandle access (Rust-side tools answer in well under a
+millisecond; webview tools are a JS round trip) — it sees everything, not just the webview.
 
 Key Victauri tools (the read-only backend/DB introspection below has no CDP/Playwright
 equivalent — and on macOS/Linux CDP can't attach to a Tauri webview at all):
@@ -1374,7 +1690,12 @@ then fails with `422`/`404`. The bridge avoids that by design.
   automatically — just retry (the transport is stateless by default, so there is usually no
   session to lose). If the MCP path is genuinely wedged, the **sessionless
   REST API is the fallback, NOT CDP**: `POST http://127.0.0.1:<port>/api/tools/<tool>` with
-  the Bearer token from `<temp>/victauri/<pid>/token` (same capabilities, no session).
+  the app's Bearer token (same capabilities, no session). Run `victauri check` (add
+  `--app <bundle-identifier>` if several apps run) to see the endpoint; the token is the
+  `token` file in the app's `<pid>` directory under the **per-user** discovery root —
+  `$XDG_RUNTIME_DIR/victauri/` (else `/tmp/victauri-<uid>/`) on Linux/macOS,
+  `%TEMP%\victauri\` on Windows. Never take a token from a shared, world-writable directory
+  such as a bare `/tmp/victauri/`: another local user can plant entries there.
 
 ### Awaiting async backend work (don't guess with sleeps)
 
@@ -1635,7 +1956,7 @@ async fn full_stack_health_check() {
 //         ..VisualOptions::from_preset(ThresholdPreset::Standard)
 //     };
 //     let diff = client.screenshot_visual("main-view", &opts).await.unwrap();
-//     assert!(diff.is_match, "visual regression: {:.2}% differ", diff.diff_percentage);
+//     assert!(diff.is_match(opts.threshold_percent), "visual regression: {:.2}% match", diff.match_percentage);
 // }
 "#
 }
@@ -1649,8 +1970,8 @@ fn detect_project(root: &Path) -> Result<(PathBuf, bool)> {
     } else {
         bail!(
             "No Cargo.toml found in {} or {}/src-tauri/",
-            root.display(),
-            root.display()
+            display_path(root),
+            display_path(root)
         );
     };
 
@@ -1711,6 +2032,7 @@ fn add_dependencies(cargo_toml_path: &Path) -> Result<bool> {
     }
 
     if changed {
+        refuse_symlink(cargo_toml_path)?;
         std::fs::write(cargo_toml_path, doc.to_string())?;
     }
     Ok(changed)
@@ -1821,8 +2143,17 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
     while let Some(dir) = dirs.pop() {
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.filter_map(Result::ok) {
+                // `DirEntry::file_type` does not follow symlinks: a symlinked directory or
+                // file is skipped, so a link can neither loop the scan forever nor walk it
+                // out of the project (e.g. `src/escape -> /`) (R4-FS1).
+                let Ok(file_type) = entry.file_type() else {
+                    continue;
+                };
                 let path = entry.path();
-                if path.is_dir() {
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
                     dirs.push(path);
                 } else if path.extension().is_some_and(|ext| ext == "rs") {
                     rs_files.push(path);
@@ -1963,11 +2294,17 @@ on:
   pull_request:
     branches: [main]
 
+# Least privilege: this workflow only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   e2e:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Install system dependencies
         run: |
@@ -2006,6 +2343,10 @@ jobs:
           xvfb-run -a "$TARGET_DIR/debug/$BIN" &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
 
+      # Pinned to the release TAG that matches your victauri-cli. Tags are mutable: for
+      # supply-chain hardening, replace `@v__VICTAURI_VERSION__` with the full 40-character
+      # commit SHA that tag points to (keep the tag as a trailing comment), e.g.
+      #   git ls-remote https://github.com/4DA-Systems/victauri refs/tags/v__VICTAURI_VERSION__
       - name: Victauri smoke tests
         uses: 4DA-Systems/victauri/.github/actions/victauri-test@v__VICTAURI_VERSION__
         with:
@@ -2143,6 +2484,27 @@ mod tests {
     }
 
     #[test]
+    fn patch_tauri_builder_keeps_crlf_line_endings() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "fn main() {\r\n    tauri::Builder::default()\r\n        .run(tauri::generate_context!())\r\n        .unwrap();\r\n}\r\n",
+        )
+        .unwrap();
+        assert!(try_patch_tauri_builder(&src).unwrap());
+        let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        assert!(content.contains("victauri_plugin::init()"));
+        assert_eq!(
+            content.matches('\n').count(),
+            content.matches("\r\n").count(),
+            "every line ending stays CRLF: {content:?}"
+        );
+        assert!(content.ends_with("}\r\n"));
+    }
+
+    #[test]
     fn patch_tauri_builder_skips_if_already_present() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -2194,6 +2556,32 @@ mod tests {
     }
 
     #[test]
+    fn display_path_drops_only_the_verbatim_prefix() {
+        let shown = |s: &str| display_path(Path::new(s));
+        assert_eq!(shown(r"\\?\C:\proj\Cargo.toml"), r"C:\proj\Cargo.toml");
+        assert_eq!(shown(r"\\?\UNC\srv\share\proj"), r"\\srv\share\proj");
+        // A verbatim path with no drive-letter form stays as is (it has no plain spelling).
+        assert_eq!(shown(r"\\?\Volume{1234}\proj"), r"\\?\Volume{1234}\proj");
+        assert_eq!(shown("src-tauri/Cargo.toml"), "src-tauri/Cargo.toml");
+        assert_eq!(shown("a\nb"), r"a\nb");
+    }
+
+    #[test]
+    fn mcp_server_entry_snippet_pins_the_app_like_the_generated_file() {
+        assert_eq!(
+            mcp_server_entry_snippet(Some("com.x.app")),
+            r#""victauri": { "command": "victauri", "args": ["bridge", "--app", "com.x.app"] }"#
+        );
+        assert_eq!(
+            mcp_server_entry_snippet(None),
+            r#""victauri": { "command": "victauri", "args": ["bridge"] }"#
+        );
+        // Hostile identifier: JSON-escaped, and no raw control characters reach the terminal.
+        let s = mcp_server_entry_snippet(Some("a\"b\n::error"));
+        assert!(!s.contains('\n') && s.contains(r#"a\"b"#), "{s}");
+    }
+
+    #[test]
     fn mcp_json_has_correct_structure() {
         let content = generate_mcp_json(None);
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -2214,6 +2602,108 @@ mod tests {
         let args = parsed["mcpServers"]["victauri"]["args"].as_array().unwrap();
         assert!(args.iter().any(|a| a.as_str() == Some("--app")));
         assert!(args.iter().any(|a| a.as_str() == Some("com.4da.app")));
+    }
+
+    #[test]
+    fn mcp_json_escapes_hostile_identifier() {
+        // A tauri.conf.json identifier is attacker-controllable in a cloned repo. It must be
+        // escaped as ONE JSON string, never able to inject extra args or keys.
+        let hostile = "x\", \"--evil\"], \"command\": \"sh\\\n";
+        let content = generate_mcp_json(Some(hostile));
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let server = &parsed["mcpServers"]["victauri"];
+        assert_eq!(server["command"].as_str(), Some("victauri"));
+        let args = server["args"].as_array().unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[2].as_str(), Some(hostile));
+        assert_eq!(server.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn write_new_file_creates_and_never_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.txt");
+        write_new_file(&path, "hello").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+        // A second write must fail rather than overwrite.
+        assert!(write_new_file(&path, "other").is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
+    }
+
+    #[test]
+    fn append_refuses_non_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(append_to_regular_file(dir.path(), "x").is_err());
+        let f = dir.path().join("CLAUDE.md");
+        std::fs::write(&f, "a").unwrap();
+        append_to_regular_file(&f, "b").unwrap();
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "ab");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_patches_never_follow_a_symlinked_source_or_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.rs");
+        let original = "fn main() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n";
+        std::fs::write(&outside, original).unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::os::unix::fs::symlink(&outside, src.join("main.rs")).unwrap();
+        assert!(try_patch_tauri_builder(&src).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
+
+        let manifest = dir.path().join("outside.toml");
+        std::fs::write(&manifest, "[package]\nname = \"x\"\n\n[dependencies]\n").unwrap();
+        let link = dir.path().join("Cargo.toml");
+        std::os::unix::fs::symlink(&manifest, &link).unwrap();
+        assert!(add_dependencies(&link).is_err());
+        assert!(
+            !std::fs::read_to_string(&manifest)
+                .unwrap()
+                .contains("victauri")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_writes_refuse_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "original").unwrap();
+
+        // Symlink to an existing file: append must refuse and leave the target untouched.
+        let claude_md = dir.path().join("CLAUDE.md");
+        std::os::unix::fs::symlink(&outside, &claude_md).unwrap();
+        assert!(append_to_regular_file(&claude_md, "INJECTED").is_err());
+        assert!(write_new_file(&claude_md, "INJECTED").is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
+
+        // Dangling symlink: `exists()` is false, so init would try to create it — the
+        // create must refuse instead of following the link to create the target.
+        let target = dir.path().join("created-through-link.txt");
+        let mcp = dir.path().join(".mcp.json");
+        std::os::unix::fs::symlink(&target, &mcp).unwrap();
+        assert!(!mcp.exists());
+        assert!(write_new_file(&mcp, "{}").is_err());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cmd_init_refuses_symlinked_claude_md() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntauri = \"2\"\n",
+        )
+        .unwrap();
+        let outside = dir.path().join("outside.md");
+        std::fs::write(&outside, "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("CLAUDE.md")).unwrap();
+        let err = cmd_init(dir.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
     }
 
     #[test]
@@ -2344,6 +2834,11 @@ mod tests {
         assert!(content.contains("working-directory: src-tauri"));
         assert!(content.contains("\"src-tauri -> target\""));
         assert!(!content.contains("__APP_DIR__"));
+        // Least-privilege token + no persisted checkout credentials.
+        assert!(content.contains("permissions:\n  contents: read"));
+        assert!(content.contains("persist-credentials: false"));
+        // The tag-pinned action ref carries SHA-pinning guidance.
+        assert!(content.contains("full 40-character"));
     }
 
     #[test]
@@ -2467,5 +2962,225 @@ mod tests {
             Some("get_count".to_string())
         );
         assert_eq!(extract_fn_name("let x = 1;"), None);
+    }
+
+    // ── round-4 regression tests ──
+
+    /// Create a directory symlink, or report why the platform refused (Windows needs
+    /// Developer Mode or an elevated shell) so the caller can skip instead of failing.
+    fn try_symlink_dir(target: &Path, link: &Path) -> bool {
+        #[cfg(unix)]
+        let made = std::os::unix::fs::symlink(target, link);
+        #[cfg(windows)]
+        let made = std::os::windows::fs::symlink_dir(target, link);
+        match made {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!(
+                    "skipping: cannot create a directory symlink here ({e}); on Windows this \
+                     needs Developer Mode or an elevated shell"
+                );
+                false
+            }
+        }
+    }
+
+    fn tauri_project(dir: &Path) {
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\ntauri = \"2\"\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn init_never_writes_through_a_symlinked_directory() {
+        // R4-FS1: only the LAST path component was checked, so a symlinked `.github` (or
+        // `tests`, `capabilities`, `src`, `src-tauri`) redirected writes into another project.
+        for linked in [".github", "tests"] {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("project");
+            let outside = dir.path().join("other-project");
+            std::fs::create_dir_all(&project).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            tauri_project(&project);
+            if !try_symlink_dir(&outside, &project.join(linked)) {
+                return;
+            }
+            let err = cmd_init(&project).expect_err("init must refuse");
+            assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+            assert_eq!(
+                std::fs::read_dir(&outside).unwrap().count(),
+                0,
+                "nothing may be written through the {linked} link"
+            );
+        }
+    }
+
+    #[test]
+    fn init_never_edits_a_manifest_behind_a_symlinked_src_tauri() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let outside = dir.path().join("other-project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        tauri_project(&outside);
+        let before = std::fs::read_to_string(outside.join("Cargo.toml")).unwrap();
+        if !try_symlink_dir(&outside, &project.join("src-tauri")) {
+            return;
+        }
+        assert!(cmd_init(&project).is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("Cargo.toml")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn ensure_inside_project_accepts_plain_and_not_yet_created_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        ensure_inside_project(&root, &root.join("src").join("main.rs")).unwrap();
+        ensure_inside_project(&root, &root.join(".github/workflows/victauri.yml")).unwrap();
+        assert!(ensure_inside_project(&root, &root.join("../escape.txt")).is_err());
+        assert!(ensure_inside_project(&root, Path::new("/elsewhere/x")).is_err());
+    }
+
+    #[test]
+    fn command_scan_skips_symlinked_directories() {
+        // R4-FS1: the scan followed directory symlinks — a loop never ended, and a link to
+        // `/` (or another project) was walked.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(src.join("a.rs"), "#[tauri::command]\nfn inside() {}\n").unwrap();
+        std::fs::write(
+            outside.join("b.rs"),
+            "#[tauri::command]\nfn outside_the_project() {}\n",
+        )
+        .unwrap();
+        if !try_symlink_dir(&outside, &src.join("escape"))
+            || !try_symlink_dir(&src, &src.join("loop"))
+        {
+            return;
+        }
+        let commands = scan_tauri_commands(&src);
+        assert_eq!(commands, vec!["inside".to_string()]);
+    }
+
+    #[test]
+    fn record_output_refuses_symlinked_directories_and_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        let outside = dir.path().join("other");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let ok = checked_record_output(&cwd, Path::new("tests/recorded_flow.rs")).unwrap();
+        assert!(ok.ends_with("recorded_flow.rs"));
+        if !try_symlink_dir(&outside, &cwd.join("tests")) {
+            return;
+        }
+        let err = checked_record_output(&cwd, Path::new("tests/recorded_flow.rs")).unwrap_err();
+        assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
+        // A symlinked output FILE is refused too.
+        std::fs::create_dir_all(cwd.join("gen")).unwrap();
+        let target = outside.join("victim.rs");
+        std::fs::write(&target, "keep").unwrap();
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target, cwd.join("gen/flow.rs")).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target, cwd.join("gen/flow.rs")).is_ok();
+        if linked {
+            let out = checked_record_output(&cwd, Path::new("gen/flow.rs"));
+            assert!(out.is_err() || write_regular_file(&out.unwrap(), "x").is_err());
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+        }
+    }
+
+    #[test]
+    fn claude_md_points_agents_at_the_per_user_discovery_root() {
+        // R4-DOC1: the generated block told agents the token lives at
+        // `<temp>/victauri/<pid>/token` — on Unix 0.9 writes to a per-user root, and the
+        // legacy shared root can be attacker-planted.
+        let content = generate_claude_md_section();
+        assert!(
+            !content.contains("<temp>/victauri/<pid>/token"),
+            "{content}"
+        );
+        assert!(content.contains("XDG_RUNTIME_DIR"));
+        assert!(content.contains("victauri-<uid>"));
+        assert!(content.contains("victauri check"));
+    }
+
+    #[test]
+    fn ghost_report_lists_confirmed_and_candidate_names() {
+        // Info fix: items are objects `{name, …}`; the old code read them as strings, never
+        // printed a name, and ignored `confirmed_ghosts` entirely.
+        let report = serde_json::json!({
+            "confirmed_ghosts": [
+                {"name": "get_widgetz", "error": "command get_widgetz not found"},
+                {"name": "get_widgetz", "error": "command get_widgetz not found"}
+            ],
+            "frontend_only": [
+                {"name": "set_langauge", "source": "FrontendOnly", "description": null},
+                {"name": "evil\n::error::forged", "source": "FrontendOnly", "description": null}
+            ],
+            "reliability": "low"
+        });
+        let lines = ghost_report_lines(&report).join("\n");
+        assert!(lines.contains("1 confirmed"), "{lines}");
+        assert!(lines.contains("    - get_widgetz"), "{lines}");
+        assert!(lines.contains("    - set_langauge"), "{lines}");
+        assert!(lines.contains("reliability: low"), "{lines}");
+        assert!(
+            !lines.lines().any(|l| l.trim_start().starts_with("::")),
+            "page-controlled names are single-line: {lines}"
+        );
+        assert_eq!(
+            ghost_report_lines(&serde_json::json!({"frontend_only": [], "confirmed_ghosts": []})),
+            vec!["  Ghost commands: none".to_string()]
+        );
+        // Older plugins' bare-string lists still work.
+        let legacy = ghost_report_lines(&serde_json::json!({"frontend_only": ["old_cmd"]}));
+        assert!(legacy.join("\n").contains("old_cmd"));
+    }
+
+    #[test]
+    fn discovery_selection_errors_get_no_misleading_connection_advice() {
+        // R4-CLI1: two running apps printed "stale CLI / is your app running?".
+        let msg = connect_failure_message(
+            "Multiple Victauri apps are running:\n  com.a (port 7373, pid 1)\n  com.b (port \
+             7374, pid 2)\nSelect one with `--app <bundle-identifier>` (victauri CLI) or the \
+             VICTAURI_APP env var, or pin the port with VICTAURI_PORT.",
+        );
+        assert!(msg.contains("com.b (port 7374"), "{msg}");
+        assert!(!msg.contains("Is your Tauri app running"), "{msg}");
+        assert!(!msg.contains("cargo install victauri-cli"), "{msg}");
+    }
+
+    #[test]
+    fn capability_labels_are_printed_single_line() {
+        // R4-TERM1: `doctor` printed raw capability window labels.
+        let shown = capability_labels(&["main".to_string(), "x\n::error::forged".to_string()]);
+        assert_eq!(shown, "main, x\\n::error::forged");
+    }
+
+    #[test]
+    fn every_connecting_command_accepts_app() {
+        use clap::Parser;
+        for args in [
+            &["victauri", "check", "--app", "com.a"][..],
+            &["victauri", "test", "--app", "com.a"],
+            &["victauri", "doctor", "--app", "com.a"],
+            &["victauri", "invoke", "cmd", "--app", "com.a"],
+            &["victauri", "coverage", "--app", "com.a"],
+            &["victauri", "record", "--app", "com.a"],
+            &["victauri", "bridge", "--app", "com.a"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
     }
 }

@@ -18,6 +18,10 @@
 
 const fs = require("fs");
 const { JSDOM } = require("jsdom");
+const { fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
+const { implForWrapper } = require("jsdom/lib/jsdom/living/generated/utils.js");
+const MouseEventIface = require("jsdom/lib/jsdom/living/generated/MouseEvent.js");
+const { fireAPageTransitionEvent } = require("jsdom/lib/jsdom/living/helpers/page-transition-event.js");
 
 const testDefPath = process.argv[2];
 if (!testDefPath) {
@@ -216,6 +220,12 @@ async function run() {
     // can update its network log entries.
     if (!window.fetch) {
       window.fetch = function (input, init) {
+        // Native fetch() requires its first argument.
+        if (arguments.length === 0) {
+          return Promise.reject(
+            new TypeError("Failed to execute 'fetch': 1 argument required, but only 0 present."),
+          );
+        }
         const url =
           typeof input === "string"
             ? input
@@ -254,6 +264,14 @@ async function run() {
               return makeResponse();
             },
           };
+        }
+        // Optional `x-vtest-delay-ms` keeps the call in flight (pending) for a while, to test
+        // how the bridge reports a slow command across event-stream reads.
+        var delayMs = Number(reqHeaders["x-vtest-delay-ms"] || 0);
+        if (delayMs > 0) {
+          return new Promise(function (res) {
+            setTimeout(function () { res(makeResponse()); }, delayMs);
+          });
         }
         return Promise.resolve(makeResponse());
       };
@@ -294,6 +312,29 @@ async function run() {
     // Stub window.scrollTo
     if (!window.scrollTo) {
       window.scrollTo = function () {};
+    }
+
+    // Dispatch a TRUSTED (isTrusted === true) click, as a real user click would be — page
+    // script cannot forge one, so the bridge's record-mode observer ignores synthetic events.
+    window.__vtestTrustedClick = function (el) {
+      fireAnEvent("click", implForWrapper(el), MouseEventIface, {
+        bubbles: true,
+        cancelable: true,
+      });
+    };
+
+    // Dispatch a TRUSTED pagehide / pageshow on the window, as the browser does on a real
+    // unload or back/forward-cache restore (page script can only dispatch untrusted ones).
+    window.__vtestTrustedPageTransition = function (type, persisted) {
+      fireAPageTransitionEvent(type, window, !!persisted);
+    };
+
+    // Opt-in: expose Node's fetch-API classes (jsdom has none) BEFORE the bridge loads, so a
+    // test can exercise the bridge's handling of genuine `Request` objects.
+    if (test.node_web_api || testDef.node_web_api) {
+      window.Request = Request;
+      window.Response = Response;
+      window.Headers = Headers;
     }
 
     // Inject the bridge script

@@ -5,7 +5,7 @@ use axum::extract::DefaultBodyLimit;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tauri::Runtime;
-use tower::limit::ConcurrencyLimitLayer;
+use tower::limit::GlobalConcurrencyLimitLayer;
 
 use crate::VictauriState;
 use crate::bridge::WebviewBridge;
@@ -165,7 +165,10 @@ fn build_app_full_inner(
         StreamableHttpServerConfig::default()
             .with_legacy_session_mode(false)
             .with_json_response(true)
-    };
+    }
+    // rmcp reads the `/mcp` body itself (default cap 4 MiB), so axum's `DefaultBodyLimit`
+    // below never applied to it; match the 2 MiB every other route has.
+    .with_max_request_body_bytes(super::hardening::MAX_REQUEST_BODY_BYTES);
     let mcp_service = StreamableHttpService::new(
         move || Ok(handler.clone()),
         Arc::new(LocalSessionManager::default()),
@@ -219,6 +222,12 @@ fn build_app_full_inner(
             }),
         );
 
+    // Bodies are read under a deadline INSIDE the auth check (an unauthenticated client is
+    // refused before any body is buffered) and inside the concurrency cap below, so a client
+    // trickling its body can hold a request slot for at most `BODY_READ_TIMEOUT`.
+    router = router.layer(axum::middleware::from_fn(
+        super::hardening::read_body_with_deadline,
+    ));
     if auth_token.is_some() {
         router = router.layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -229,9 +238,13 @@ fn build_app_full_inner(
     // The concurrency cap and body limit wrap only the API routes registered so far — NOT
     // `/health`. A liveness probe must never queue behind 64 slow tool calls (long `wait_for`s,
     // injected fault delays): the watchdog would then report a live app as dead.
+    // `GlobalConcurrencyLimitLayer`: ONE shared semaphore. A plain `ConcurrencyLimitLayer` is
+    // instantiated per route by axum, which gave `/mcp` and `/api/tools/*` 64 slots EACH.
     router = router
-        .layer(DefaultBodyLimit::max(2 * 1024 * 1024))
-        .layer(ConcurrencyLimitLayer::new(64));
+        .layer(DefaultBodyLimit::max(
+            super::hardening::MAX_REQUEST_BODY_BYTES,
+        ))
+        .layer(GlobalConcurrencyLimitLayer::new(64));
 
     // `/health` is registered AFTER the auth layer (so liveness probes stay unauthenticated)
     // but BEFORE the rate limiter below, so it is still throttled. Axum applies a `.layer` only
@@ -242,16 +255,61 @@ fn build_app_full_inner(
         axum::routing::get(|| async { axum::Json(serde_json::json!({"status": "ok"})) }),
     );
 
+    // Requests presenting the valid token draw from their own bucket: traffic that cannot
+    // authenticate must not be able to exhaust the agent's budget. (The browser guards below
+    // run first, so a refused browser request spends no token at all.)
     let limiter = rate_limiter.unwrap_or_else(crate::auth::default_rate_limiter);
+    let authenticated = Arc::new(crate::auth::RateLimiterState::new(limiter.max_tokens()));
     router = router.layer(axum::middleware::from_fn_with_state(
-        limiter,
-        crate::auth::rate_limit,
+        Arc::new(super::hardening::SplitRateLimit {
+            token: auth_token,
+            public: limiter,
+            authenticated,
+        }),
+        super::hardening::split_rate_limit,
     ));
 
     router
+        .layer(axum::middleware::from_fn(require_json_from_browsers))
         .layer(axum::middleware::from_fn(crate::auth::security_headers))
         .layer(axum::middleware::from_fn(crate::auth::origin_guard))
         .layer(axum::middleware::from_fn(crate::auth::dns_rebinding_guard))
+        // Outermost: every refusal above (and the rate limiter's 429) also closes its connection.
+        .layer(axum::middleware::from_fn(
+            super::hardening::close_on_rejection,
+        ))
+}
+
+/// Refuse a browser-originated request body that is not JSON (415).
+///
+/// A browser can send a cross-origin POST with a "simple" content type (`text/plain`,
+/// form-encoded, multipart) and NO CORS preflight, so a page on any localhost origin could
+/// fire tool calls blind at an `auth_disabled()` server (with auth on, the `Authorization`
+/// header already forces a preflight that fails). Every legitimate caller sends JSON, and
+/// non-browser clients (curl, scripts, the CLI) send no `Origin` header, so they are unaffected.
+async fn require_json_from_browsers(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{Method, StatusCode, header};
+    use axum::response::IntoResponse;
+    let has_body_method = !matches!(*req.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    if has_body_method && req.headers().contains_key(header::ORIGIN) {
+        let is_json = req
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|ct| ct.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/json"));
+        if !is_json {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "browser-originated requests must send Content-Type: application/json",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 #[doc(hidden)]
@@ -292,16 +350,47 @@ pub async fn start_server_with_options<R: Runtime>(
     state: Arc<VictauriState>,
     port: u16,
     auth_token: Option<String>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
+    start_server_reporting_port(app_handle, state, port, auth_token, shutdown_rx, None).await
+}
+
+/// [`start_server_with_options`], additionally reporting the port ACTUALLY bound (or the
+/// bind failure) on `bound` — the preferred port may be taken, possibly by another process.
+///
+/// # Errors
+///
+/// As [`start_server_with_options`].
+#[doc(hidden)]
+pub async fn start_server_reporting_port<R: Runtime>(
+    app_handle: tauri::AppHandle<R>,
+    state: Arc<VictauriState>,
+    port: u16,
+    auth_token: Option<String>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+    bound: Option<tokio::sync::oneshot::Sender<Result<u16, String>>>,
 ) -> anyhow::Result<()> {
     let bridge: Arc<dyn WebviewBridge> = Arc::new(app_handle);
+    // The bridge IS a Tauri `AppHandle`, and the server's tasks end on tokio workers; dropping
+    // the last reference there would drop a Tauri handle off the main thread — the Linux `Rc`
+    // race documented on `bridge::on_main`. It lives for the process anyway, so keep one
+    // reference forever instead of letting shutdown free it on the wrong thread.
+    std::mem::forget(Arc::clone(&bridge));
     // Normalize once so the discovery-file token and the request gate agree (B2):
     // an empty token must not be written to the discovery file as if auth were on.
     let auth_token = normalize_auth_token(auth_token);
     let token_for_file = auth_token.clone();
     let app = build_app_with_options(state.clone(), bridge.clone(), auth_token);
 
-    let (listener, actual_port) = try_bind(port).await?;
+    let (listener, actual_port) = match try_bind(port).await {
+        Ok(bound_listener) => bound_listener,
+        Err(e) => {
+            if let Some(bound) = bound {
+                let _ = bound.send(Err(e.to_string()));
+            }
+            return Err(e);
+        }
+    };
 
     if actual_port != port {
         tracing::warn!("Victauri: port {port} in use, fell back to {actual_port}");
@@ -311,42 +400,48 @@ pub async fn start_server_with_options<R: Runtime>(
     let cfg = bridge.tauri_config();
     let app_identifier = cfg.get("identifier").and_then(|v| v.as_str());
     let app_product_name = cfg.get("product_name").and_then(|v| v.as_str());
-    write_port_file(actual_port, app_identifier, app_product_name);
     // Always write a session token to the discovery directory so clients can
     // authenticate automatically.  When auth is explicitly configured the
     // configured token is used; otherwise a fresh UUID is generated.  The auth
     // middleware is only enabled when `auth_token` is `Some`, so this file is
     // purely informational when auth is off — sending the token header is a
     // harmless no-op.
+    // The token is written BEFORE the port: clients discover a server by its port file and
+    // then read the token, so the reverse order left a window in which they got 401.
     let discovery_token = token_for_file
         .as_deref()
         .map_or_else(crate::auth::generate_token, String::from);
     write_token_file(&discovery_token);
+    write_port_file(actual_port, app_identifier, app_product_name);
+    if let Some(bound) = bound {
+        let _ = bound.send(Ok(actual_port));
+    }
 
     tracing::info!("Victauri MCP server listening on 127.0.0.1:{actual_port}");
 
     let drain_state = state.clone();
     let drain_bridge = bridge;
     let drain_shutdown = state.shutdown_tx.subscribe();
-    let drain_finished = state.task_tracker.track("event_drain_loop");
+    let drain_finished = state.task_tracker.track_guarded("event_drain_loop");
     tokio::spawn(async move {
+        let _finished = drain_finished;
         event_drain_loop(drain_state, drain_bridge, drain_shutdown).await;
-        drain_finished.store(true, std::sync::atomic::Ordering::Relaxed);
     });
 
     let mut shutdown_rx2 = shutdown_rx.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.wait_for(|&v| v).await;
-        remove_port_file();
-        tracing::info!("Victauri MCP server shutting down gracefully");
-    });
+    let server = super::hardening::serve_hardened(
+        listener,
+        app,
+        super::hardening::ServeLimits::DEFAULT,
+        async move {
+            let _ = shutdown_rx.wait_for(|&v| v).await;
+            remove_port_file();
+            tracing::info!("Victauri MCP server shutting down gracefully");
+        },
+    );
 
     tokio::select! {
-        result = server => {
-            if let Err(e) = result {
-                tracing::error!("Victauri MCP server error: {e}");
-            }
-        }
+        () = server => {}
         _ = async {
             let _ = shutdown_rx2.wait_for(|&v| v).await;
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -380,23 +475,152 @@ async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u1
 }
 
 fn discovery_dir() -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join("victauri")
-        .join(std::process::id().to_string())
+    discovery_root().join(std::process::id().to_string())
+}
+
+/// The directory holding every `<pid>/` discovery entry of this user — decided ONCE per
+/// process, so the entry is written and later removed in the same place.
+///
+/// On Unix it is per-user: `$XDG_RUNTIME_DIR/victauri` when that directory is private to us,
+/// else `<temp>/victauri-<euid>`. The old shared `/tmp/victauri` let any other local user
+/// pre-create it, after which the ownership check refused it and discovery was blocked for
+/// good. `<temp>/victauri-<euid>` is predictable too, and sticky `/tmp` stops us deleting
+/// another user's pre-created copy, so when that root is untrusted (or cannot be created) the
+/// entry goes to a per-user root under the home directory instead —
+/// `$XDG_STATE_HOME/victauri`, else `$HOME/.local/state/victauri` — owner-only (0700) and
+/// verified like the others (R5B-LINDISC1). Windows and other platforms keep `<temp>/victauri`
+/// (their temp dir is per-user; Windows readers verify ownership). Every reader (`victauri`
+/// CLI, `victauri-test`, `victauri-watchdog`, the VS Code extension) scans the same roots, in
+/// order: runtime dir, `<temp>/victauri-<euid>`, the home state root, then the legacy
+/// `<temp>/victauri`.
+fn discovery_root() -> std::path::PathBuf {
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            let euid = current_euid();
+            select_discovery_root(
+                &discovery_root_from(std::env::var_os("XDG_RUNTIME_DIR"), euid),
+                euid.and_then(|_| {
+                    home_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+                }),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            std::env::temp_dir().join("victauri")
+        }
+    })
+    .clone()
+}
+
+/// `primary` when it is (or can be made) a private directory of ours; else the home state
+/// `fallback` when THAT can be; else `primary` anyway — whose ownership check then refuses it,
+/// so discovery fails closed exactly as before.
+#[cfg(unix)]
+fn select_discovery_root(
+    primary: &std::path::Path,
+    fallback: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if ensure_unix_private_dir(primary) {
+        return primary.to_path_buf();
+    }
+    if let Some(fallback) = fallback
+        && ensure_home_state_root(&fallback)
+    {
+        tracing::warn!(
+            "discovery root {} is not usable (another user may have created it); \
+             registering under {} instead",
+            primary.display(),
+            fallback.display()
+        );
+        return fallback;
+    }
+    primary.to_path_buf()
+}
+
+/// The per-user discovery root under the home directory: `$XDG_STATE_HOME/victauri`, else
+/// `$HOME/.local/state/victauri` (each only when absolute).
+#[cfg(unix)]
+fn home_state_root(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let absolute =
+        |p: std::ffi::OsString| Some(std::path::PathBuf::from(p)).filter(|p| p.is_absolute());
+    xdg_state_home
+        .and_then(absolute)
+        .or_else(|| {
+            home.and_then(absolute)
+                .map(|h| h.join(".local").join("state"))
+        })
+        .map(|state| state.join("victauri"))
+}
+
+/// Create (0700) or accept the home state `root`: its parent must be a directory owned by us
+/// that no OTHER user can write (so nobody else can swap `victauri` out from under us), and
+/// `root` itself a private directory of ours — the same check every other root gets.
+#[cfg(unix)]
+fn ensure_home_state_root(root: &std::path::Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    let (Some(parent), Some(euid)) = (root.parent(), current_euid()) else {
+        return false;
+    };
+    // Missing `~/.local/state` components are created owner-only.
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .is_err()
+    {
+        return false;
+    }
+    let parent_ok = std::fs::metadata(parent)
+        .is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o002 == 0);
+    parent_ok && ensure_unix_private_dir(root)
+}
+
+#[cfg(unix)]
+fn discovery_root_from(
+    xdg_runtime_dir: Option<std::ffi::OsString>,
+    euid: Option<u32>,
+) -> std::path::PathBuf {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Some(euid) = euid else {
+        // Unknown uid: the legacy path, which the ownership checks then refuse (fail closed).
+        return std::env::temp_dir().join("victauri");
+    };
+    let private_runtime_dir = xdg_runtime_dir
+        .map(std::path::PathBuf::from)
+        .filter(|dir| dir.is_absolute())
+        .filter(|dir| {
+            std::fs::symlink_metadata(dir).is_ok_and(|m| {
+                m.file_type().is_dir() && m.uid() == euid && m.permissions().mode() & 0o077 == 0
+            })
+        });
+    private_runtime_dir.map_or_else(
+        || std::env::temp_dir().join(format!("victauri-{euid}")),
+        |dir| dir.join("victauri"),
+    )
 }
 
 #[cfg(unix)]
 fn current_euid() -> Option<u32> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    use std::sync::atomic::{AtomicU64, Ordering};
+    current_euid_in(&std::env::temp_dir())
+}
 
-    static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+#[cfg(unix)]
+fn current_euid_in(dir: &std::path::Path) -> Option<u32> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    // An UNPREDICTABLE name (R4-DISC2): `<pid>_<sequence>` in the shared temp dir let another
+    // local user pre-plant every name we would try, making this fail — which disables
+    // discovery (the callers fail closed on an unknown uid).
     for _ in 0..16 {
-        let sequence = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
-        let probe = std::env::temp_dir().join(format!(
-            ".victauri_plugin_uidprobe_{}_{}",
-            std::process::id(),
-            sequence
+        let probe = dir.join(format!(
+            ".victauri_plugin_uidprobe_{}",
+            uuid::Uuid::new_v4().simple()
         ));
         let file = std::fs::OpenOptions::new()
             .write(true)
@@ -573,13 +797,97 @@ fn token_sid(class: windows::Win32::Security::TOKEN_INFORMATION_CLASS) -> Option
 /// process creates are owned by that group, not the user. Accepting either is what makes
 /// the ownership check correct under elevation (where it would otherwise reject every
 /// directory we create and break discovery entirely).
+///
+/// Also `BUILTIN\Administrators` when this account is a member of it (enabled or deny-only):
+/// an app started from an elevated PowerShell/cmd creates the discovery root owned by that
+/// group, while a later app of the SAME user started from Git Bash (whose runtime sets the
+/// default owner to the user) or unelevated has only the user as owner — it refused the root
+/// and silently never registered for discovery until the directory was deleted by hand
+/// (round 4, reproduced on this machine). `%TEMP%` is per-user, and every member of that group
+/// can already read everything in it, so accepting the group concedes nothing.
 #[cfg(windows)]
 fn acceptable_owner_sids() -> Vec<OwnedSid> {
     use windows::Win32::Security::{TokenOwner, TokenUser};
-    [TokenUser, TokenOwner]
+    let mut sids: Vec<OwnedSid> = [TokenUser, TokenOwner]
         .into_iter()
         .filter_map(token_sid)
-        .collect()
+        .collect();
+    sids.extend(builtin_administrators_sid_if_member());
+    sids
+}
+
+/// The `BUILTIN\Administrators` SID when the current token lists it among its groups, with
+/// any attributes (an unelevated admin holds it deny-only; it is still this account's group).
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn builtin_administrators_sid_if_member() -> Option<OwnedSid> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        CreateWellKnownSid, EqualSid, GetTokenInformation, PSID, SECURITY_MAX_SID_SIZE,
+        TOKEN_GROUPS, TOKEN_QUERY, TokenGroups, WinBuiltinAdministratorsSid,
+    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    struct TokenGuard(HANDLE);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` came from `OpenProcessToken` and is closed exactly once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    let mut admins = vec![0_u8; SECURITY_MAX_SID_SIZE as usize];
+    let mut admins_len = SECURITY_MAX_SID_SIZE;
+    // SAFETY: `admins` is writable for `admins_len` bytes, the documented maximum SID size.
+    unsafe {
+        CreateWellKnownSid(
+            WinBuiltinAdministratorsSid,
+            None,
+            Some(PSID(admins.as_mut_ptr().cast::<core::ffi::c_void>())),
+            &raw mut admins_len,
+        )
+        .ok()?;
+    }
+    admins.truncate(admins_len as usize);
+    let admins = OwnedSid(admins);
+
+    let mut token = HANDLE::default();
+    // SAFETY: pseudo-handle for the current process; `token` is a writable out-param, closed by
+    // `TokenGuard` on success.
+    unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw mut token).ok()? };
+    let _guard = TokenGuard(token);
+    let mut len = 0_u32;
+    // SAFETY: size probe (null buffer); fails with ERROR_INSUFFICIENT_BUFFER, setting `len`.
+    unsafe {
+        let _ = GetTokenInformation(token, TokenGroups, None, 0, &raw mut len);
+    }
+    if (len as usize) < std::mem::size_of::<TOKEN_GROUPS>() {
+        return None;
+    }
+    // u64-backed so the TOKEN_GROUPS header (u32 count + pointer-aligned array) is aligned.
+    let mut buf = vec![0_u64; (len as usize).div_ceil(8)];
+    // SAFETY: `buf` is writable for at least `len` bytes; on success it holds a TOKEN_GROUPS.
+    unsafe {
+        GetTokenInformation(
+            token,
+            TokenGroups,
+            Some(buf.as_mut_ptr().cast::<core::ffi::c_void>()),
+            len,
+            &raw mut len,
+        )
+        .ok()?;
+    }
+    // SAFETY: `buf` holds a TOKEN_GROUPS whose `Groups` array has `GroupCount` entries, all
+    // within the buffer the call filled.
+    let member = unsafe {
+        let groups = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
+        std::slice::from_raw_parts(groups.Groups.as_ptr(), groups.GroupCount as usize)
+            .iter()
+            .any(|g| EqualSid(g.Sid, admins.as_psid()).is_ok())
+    };
+    member.then_some(admins)
 }
 
 /// True iff `path` exists and its owner SID is one this process would create objects as
@@ -938,7 +1246,7 @@ pub fn parse_bridge_event(ev: &serde_json::Value) -> Option<victauri_core::AppEv
 /// [`parse_bridge_event`] for an event drained from the webview `label`. Uses the event's own
 /// JS timestamp (epoch ms) when present — not the drain time, which lags by up to the drain
 /// interval and collapses a burst of events onto one instant.
-pub fn parse_bridge_event_from(
+pub(super) fn parse_bridge_event_from(
     ev: &serde_json::Value,
     label: &str,
 ) -> Option<victauri_core::AppEvent> {
@@ -955,73 +1263,70 @@ pub fn parse_bridge_event_from(
         .unwrap_or_else(Utc::now);
 
     let app_event = match event_type {
-        "console" => AppEvent::Console {
-            level: ev
-                .get("level")
+        "console" => AppEvent::console(
+            ev.get("level")
                 .and_then(|l| l.as_str())
                 .unwrap_or("log")
                 .to_string(),
-            message: ev
-                .get("message")
+            ev.get("message")
                 .and_then(|m| m.as_str())
                 .unwrap_or("")
                 .to_string(),
-            timestamp: now,
-        },
-        "dom_mutation" => AppEvent::DomMutation {
-            webview_label: label.to_string(),
-            timestamp: now,
-            mutation_count: ev
-                .get("count")
+            now,
+        ),
+        "dom_mutation" => AppEvent::dom_mutation(
+            label.to_string(),
+            now,
+            ev.get("count")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32,
-        },
+        ),
         "ipc" => {
             let cmd = ev
                 .get("command")
                 .and_then(|c| c.as_str())
                 .unwrap_or("unknown");
-            AppEvent::Ipc(victauri_core::IpcCall {
-                id: uuid::Uuid::new_v4().to_string(),
-                command: cmd.to_string(),
-                timestamp: now,
-                result: match ev.get("status").and_then(|s| s.as_str()) {
-                    Some("ok") => victauri_core::IpcResult::Ok(serde_json::Value::Null),
-                    Some("error") => victauri_core::IpcResult::Err("error".to_string()),
-                    _ => victauri_core::IpcResult::Pending,
-                },
-                duration_ms: ev
-                    .get("duration_ms")
-                    .and_then(serde_json::Value::as_f64)
-                    .map(|d| d as u64),
-                arg_size_bytes: ev
-                    .get("arg_size_bytes")
-                    .and_then(serde_json::Value::as_u64)
-                    .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
-                webview_label: label.to_string(),
-            })
+            AppEvent::Ipc(
+                victauri_core::IpcCall::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    cmd.to_string(),
+                    now,
+                    match ev.get("status").and_then(|s| s.as_str()) {
+                        Some("ok") => victauri_core::IpcResult::Ok(serde_json::Value::Null),
+                        Some("error") => victauri_core::IpcResult::Err("error".to_string()),
+                        _ => victauri_core::IpcResult::Pending,
+                    },
+                    ev.get("duration_ms")
+                        .and_then(serde_json::Value::as_f64)
+                        .map(|d| d as u64),
+                    ev.get("arg_size_bytes")
+                        .and_then(serde_json::Value::as_u64)
+                        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
+                    label.to_string(),
+                )
+                .with_mocked(ev.get("mocked").and_then(serde_json::Value::as_bool) == Some(true)),
+            )
         }
-        "network" => AppEvent::StateChange {
-            key: format!(
+        "network" => AppEvent::state_change(
+            format!(
                 "network.{}",
                 ev.get("method").and_then(|m| m.as_str()).unwrap_or("GET")
             ),
-            timestamp: now,
-            caused_by: ev
-                .get("url")
+            now,
+            ev.get("url")
                 .and_then(|u| u.as_str())
                 .map(std::string::ToString::to_string),
-        },
-        "navigation" => AppEvent::WindowEvent {
-            label: label.to_string(),
-            event: format!(
+        ),
+        "navigation" => AppEvent::window_event(
+            label.to_string(),
+            format!(
                 "navigation.{}",
                 ev.get("nav_type")
                     .and_then(|n| n.as_str())
                     .unwrap_or("unknown")
             ),
-            timestamp: now,
-        },
+            now,
+        ),
         "dom_interaction" => {
             let action_str = ev.get("action").and_then(|a| a.as_str()).unwrap_or("click");
             let action = match action_str {
@@ -1034,20 +1339,18 @@ pub fn parse_bridge_event_from(
                 "scroll" => victauri_core::InteractionKind::Scroll,
                 _ => victauri_core::InteractionKind::Click,
             };
-            AppEvent::DomInteraction {
+            AppEvent::dom_interaction(
                 action,
-                selector: ev
-                    .get("selector")
+                ev.get("selector")
                     .and_then(|s| s.as_str())
                     .unwrap_or("body")
                     .to_string(),
-                value: ev
-                    .get("value")
+                ev.get("value")
                     .and_then(|v| v.as_str())
                     .map(std::string::ToString::to_string),
-                timestamp: now,
-                webview_label: label.to_string(),
-            }
+                now,
+                label.to_string(),
+            )
         }
         _ => return None,
     };
@@ -1060,13 +1363,8 @@ async fn event_drain_loop(
     bridge: Arc<dyn WebviewBridge>,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    // Per-window high-water marks. A single shared timestamp made every window
-    // after the first miss any events older than the previous window's latest —
-    // so the Rust event_log, the recorder (time-travel), and `explain` were blind
-    // to every non-default window (e.g. 4DA's notification/briefing windows).
-    // Track a watermark per label and drain every live window.
-    let mut watermarks: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
-
+    // Per-window high-water marks live in `state.drain_watermarks` (shared with
+    // `recording flush`), one per label, so every live window is drained.
     loop {
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
@@ -1074,7 +1372,7 @@ async fn event_drain_loop(
         }
 
         // Only drain while a time-travel recording is active. Draining evals
-        // `getEventStream` in EVERY window every second, and each eval injects JS that
+        // `drainEvents` in EVERY window every second, and each eval injects JS that
         // calls back via `victauri_eval_callback` — an IPC request. That constant
         // background IPC churn (for a 3-window app: ~3 callbacks/sec, forever) AMPLIFIES a
         // Tauri-runtime `Rc<Webview>` use-after-free that fires when an IPC request hits
@@ -1093,120 +1391,156 @@ async fn event_drain_loop(
         }
         // Drop watermarks for windows that have closed so the map can't grow
         // unbounded across many ephemeral windows.
-        watermarks.retain(|label, _| labels.contains(label));
+        state.drain_watermarks.retain(&labels);
 
         // Drain all windows concurrently. A blind window (e.g. one missing the
         // `victauri:default` capability) hangs until the 5s eval timeout; draining
         // sequentially would let it stall every other window's drain. Concurrency
         // keeps a healthy window's events flowing regardless of a blind sibling.
-        // Never read earlier than the recording's start: an initial watermark of 0 pulled the
-        // page's whole pre-recording history (e.g. app-startup IPC) into the new recording,
-        // and a watermark left from an earlier recording is older than this one's start.
-        #[allow(clippy::cast_precision_loss)]
-        let floor = state
-            .recorder
-            .started_at()
-            .map_or(0.0, |t| t.timestamp_millis() as f64);
         let mut set = tokio::task::JoinSet::new();
         for label in &labels {
-            let since = watermarks.get(label).copied().unwrap_or(0.0).max(floor);
             let state = Arc::clone(&state);
             let bridge = Arc::clone(&bridge);
             let label = label.clone();
-            set.spawn(async move {
-                let newest = drain_window(&state, &bridge, &label, since).await;
-                (label, newest)
-            });
+            set.spawn(async move { drain_window_into_recording(&state, &bridge, &label).await });
         }
-        while let Some(res) = set.join_next().await {
-            if let Ok((label, Some(newest))) = res {
-                watermarks.insert(label, newest);
-            }
-        }
+        while set.join_next().await.is_some() {}
     }
 }
 
-/// Drain one window's event stream into the event log / recorder. Returns the
-/// newest event timestamp seen (to advance the window's watermark), or `None` if
-/// nothing was drained (pending-eval saturation, eval-injection failure, callback
-/// timeout, or an unparseable result). Returning `None` leaves the watermark
-/// unchanged, so a transient failure simply re-fetches the same window next tick.
+/// Drain one window's new events (everything after its shared drain position) into the event
+/// log and recorder, then advance the position. Serialized per window, so the background drain
+/// and `recording flush` never ingest the same window's events twice. Returns how many events
+/// were recorded, or `None` if the window could not be drained this time (the position is left
+/// unchanged, so a transient failure just re-reads the same range next time).
+pub(super) async fn drain_window_into_recording(
+    state: &Arc<VictauriState>,
+    bridge: &Arc<dyn WebviewBridge>,
+    label: &str,
+) -> Option<usize> {
+    let lock = state.drain_watermarks.lock_for(label);
+    let _serialized = lock.lock().await;
+    // Pin the recording this read is for BEFORE the (slow) read: a drain in flight across
+    // `recording stop` + `start` used to append the old recording's events to the new one.
+    let Some(generation) = state.recorder.generation() else {
+        return Some(0);
+    };
+    let cursor = state.drain_watermarks.cursor(label);
+    if cursor.epoch != generation {
+        // The recording has started but its drain epoch is not reset yet (start and reset are
+        // two steps); reading now would use the previous recording's positions. The next tick
+        // reads it.
+        return Some(0);
+    }
+    let (mark, recorded) = drain_window(state, bridge, label, &cursor, generation).await?;
+    state.drain_watermarks.advance(label, cursor.epoch, mark);
+    Some(recorded)
+}
+
+/// Read one window's event stream after `cursor` into the event log / recorder (only while
+/// recording `generation` is still the active one). Returns the new drain position and how many
+/// events were recorded, or `None` if nothing was drained (pending-eval saturation,
+/// eval-injection failure, callback timeout, or an unparseable reply).
 async fn drain_window(
     state: &Arc<VictauriState>,
     bridge: &Arc<dyn WebviewBridge>,
     label: &str,
-    since: f64,
-) -> Option<f64> {
-    // `true` = exclusive: `since` is our own watermark (the newest timestamp already
-    // ingested), so an inclusive read re-ingested the newest event on every tick.
-    let code = format!("return window.__VICTAURI__?.getEventStream({since}, true)");
+    cursor: &crate::introspection::DrainCursor,
+    generation: u64,
+) -> Option<(crate::introspection::DrainMark, usize)> {
+    // Only a window's first read in a recording skips pre-recording history by timestamp;
+    // later reads are purely by sequence (a page clock that is off never drops or repeats).
+    let (after_seq, instance_js, floor_ms) = match &cursor.mark {
+        Some(m) => (m.seq, super::helpers::js_string(&m.instance), 0.0),
+        None => (0, "null".to_string(), cursor.floor_ms),
+    };
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = tokio::sync::oneshot::channel();
 
-    {
+    // Released however this ends — including the drain future being dropped mid-wait.
+    let _slot = {
         let mut pending = state.pending_evals.lock().await;
         if pending.len() >= MAX_PENDING_EVALS {
             return None;
         }
-        pending.insert(id.clone(), tx);
-    }
+        let slot = crate::PendingSlot::insert(&state.pending_evals, &mut pending, id.clone(), tx);
+        slot.bind_window(Some(label));
+        slot
+    };
 
+    // Delivered through the bridge's frozen `_evalSettle`, which serializes with the
+    // `JSON.stringify` captured at bridge init — not the page's own, which page script can
+    // replace to forge or break every drained event.
     let id_js = super::helpers::js_string(&id);
     let inject = format!(
         r"
-        (async () => {{
-            try {{
-                const __result = await (async () => {{ {code} }})();
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id_js},
-                    result: JSON.stringify(__result)
-                }});
-            }} catch (e) {{
-                await window.__TAURI_INTERNALS__.invoke('plugin:victauri|victauri_eval_callback', {{
-                    id: {id_js},
-                    result: JSON.stringify({{ __error: e.message }})
-                }});
-            }}
+        (function() {{
+            var v = window.__VICTAURI__;
+            if (!v) return;
+            var r;
+            try {{ r = v.drainEvents({after_seq}, {instance_js}, {floor_ms}); }}
+            catch (e) {{ r = {{ __error: String(e && e.message) }}; }}
+            v._evalSettle({id_js}, r);
         }})();
         "
     );
 
     if bridge.eval_webview(Some(label), &inject).is_err() {
-        state.pending_evals.lock().await.remove(&id);
         return None;
     }
 
     let Ok(Ok(result)) = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await else {
-        state.pending_evals.lock().await.remove(&id);
         return None;
     };
 
-    let events: Vec<serde_json::Value> = serde_json::from_str(&result).ok()?;
-
-    let mut newest = since;
-    for ev in &events {
-        let ts = ev
-            .get("timestamp")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
-        if ts > newest {
-            newest = ts;
-        }
-
-        if let Some(app_event) = parse_bridge_event_from(ev, label) {
-            state.event_log.push(app_event.clone());
-            if state.recorder.is_recording() {
-                state.recorder.record_event(app_event);
-            }
+    // Page JSON: a lone surrogate (a truncated emoji, or a hostile `console.log('\ud800')`)
+    // must not make the whole reply unparseable — that stalled the window's recording.
+    let reply: serde_json::Value = super::page_json::parse_page_json(&result).ok()?;
+    let mark = crate::introspection::DrainMark {
+        instance: reply.get("instance")?.as_str()?.to_string(),
+        seq: reply.get("seq")?.as_u64()?,
+    };
+    let mut recorded = 0usize;
+    // The position comes from the bridge's counter, not from the entries: an entry that fails
+    // to parse is skipped without holding the window's recording back.
+    for ev in reply.get("events")?.as_array()? {
+        if let Some(app_event) = parse_bridge_event_from(ev, label)
+            && state
+                .recorder
+                .record_event_if(generation, app_event.clone())
+        {
+            state.event_log.push(app_event);
+            recorded += 1;
         }
     }
-    Some(newest)
+    Some((mark, recorded))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use victauri_core::{AppEvent, InteractionKind, IpcResult};
+
+    /// R4-DISC2: the uid-probe file name (`.victauri_plugin_uidprobe_<pid>_<seq>`) was
+    /// predictable, so another user sharing `/tmp` could pre-plant it and make `current_euid`
+    /// fail — which disables discovery entirely (fail closed).
+    #[cfg(unix)]
+    #[test]
+    fn uid_probe_survives_pre_planted_probe_names() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        for seq in 0..4096 {
+            std::fs::create_dir(dir.path().join(format!(
+                ".victauri_plugin_uidprobe_{}_{seq}",
+                std::process::id()
+            )))
+            .unwrap();
+        }
+        let expected = std::fs::metadata(dir.path()).unwrap().uid();
+        assert_eq!(current_euid_in(dir.path()), Some(expected));
+        // The probe cleans up after itself: only the planted entries remain.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 4096);
+    }
 
     // Round-4 audit blocker #4: a pre-planted explicit ACE for an arbitrary principal
     // (the auditor used BUILTIN\Guests) must NOT survive the discovery-dir hardening.
@@ -1349,6 +1683,104 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Audit N6: the discovery root was the shared `/tmp/victauri`; another local user who
+    /// created it first blocked discovery for everyone else. It is per-user now.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_root_is_per_user() {
+        use std::os::unix::fs::PermissionsExt;
+        let euid = current_euid().expect("euid");
+        let shared = std::env::temp_dir().join("victauri");
+        let fallback = std::env::temp_dir().join(format!("victauri-{euid}"));
+        assert_ne!(discovery_root(), shared);
+        assert_eq!(discovery_root_from(None, Some(euid)), fallback);
+
+        // A private XDG runtime dir is preferred …
+        let runtime = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid)),
+            runtime.path().join("victauri")
+        );
+        // … but not one others can reach, one we do not own, or a relative path.
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid)),
+            fallback
+        );
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            discovery_root_from(Some(runtime.path().into()), Some(euid.wrapping_add(1))),
+            std::env::temp_dir().join(format!("victauri-{}", euid.wrapping_add(1)))
+        );
+        assert_eq!(
+            discovery_root_from(Some("relative/run".into()), Some(euid)),
+            fallback
+        );
+    }
+
+    /// R5B-LINDISC1: another local user can pre-create the predictable `/tmp/victauri-<euid>`
+    /// (and sticky `/tmp` stops us deleting it); the app then never registered. An untrusted
+    /// primary root now falls back to the per-user home state root. (A root owned by another
+    /// account needs a second account to set up — see the WSL run; a symlink or a non-directory
+    /// at the primary path is refused by the same check.)
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_primary_root_falls_back_to_the_home_state_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fallback = home_state_root(None, Some(home.clone().into()));
+        let expected = home.join(".local").join("state").join("victauri");
+        assert_eq!(fallback.as_deref(), Some(expected.as_path()));
+
+        // Taken over: a symlink planted at the primary path.
+        let elsewhere = base.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let hijacked = base.path().join("victauri-hijacked");
+        std::os::unix::fs::symlink(&elsewhere, &hijacked).unwrap();
+        assert_eq!(select_discovery_root(&hijacked, fallback.clone()), expected);
+        assert!(unix_private_dir_is_trusted(&expected));
+        let mode = std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // Blocked by a plain file.
+        let blocked = base.path().join("victauri-blocked");
+        std::fs::write(&blocked, "x").unwrap();
+        assert_eq!(select_discovery_root(&blocked, fallback.clone()), expected);
+
+        // A usable primary is kept.
+        let fine = base.path().join("victauri-fine");
+        assert_eq!(select_discovery_root(&fine, fallback), fine);
+
+        // No usable fallback: the primary is returned and its check then refuses it.
+        assert_eq!(select_discovery_root(&hijacked, None), hijacked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_state_root_prefers_an_absolute_xdg_state_home_and_guards_its_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            home_state_root(Some("/x/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/x/state/victauri"))
+        );
+        assert_eq!(
+            home_state_root(Some("rel/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/home/u/.local/state/victauri"))
+        );
+        assert_eq!(home_state_root(None, Some("rel".into())), None);
+        assert_eq!(home_state_root(None, None), None);
+
+        // A parent other users can write is refused (they could swap the root out).
+        let base = tempfile::tempdir().unwrap();
+        let open = base.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!ensure_home_state_root(&open.join("victauri")));
     }
 
     #[cfg(unix)]

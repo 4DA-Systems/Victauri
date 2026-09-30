@@ -20,7 +20,7 @@ Typed HTTP client for the Victauri MCP server with high-level convenience method
 
 ```toml
 [dev-dependencies]
-victauri-test = "0.8"
+victauri-test = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -111,8 +111,9 @@ let opts = VisualOptions {
     ..Default::default()
 };
 
+// Errors with `TestError::VisualRegression` when the screenshot differs beyond the threshold.
 let diff = client.screenshot_visual("dashboard", &opts).await?;
-assert!(diff.is_match);
+assert!(diff.is_match(opts.threshold_percent));
 ```
 
 ## IPC Coverage
@@ -131,7 +132,7 @@ let report = client.smoke_test().await?;
 report.assert_all_passed();
 ```
 
-Runs 11 checks: health, DOM snapshot, eval, IPC integrity, registry, window state, screenshot, memory, console errors, performance, ghost commands.
+Runs 11 checks: `eval_js` works, DOM snapshot valid, screenshot captures an image, windows exist, IPC integrity healthy, no uncaught errors, accessibility audit, DOM complete under the load budget, JS heap under the memory budget, recording lifecycle, and health endpoint hardened.
 
 ## Documentation
 

@@ -40,6 +40,13 @@ struct Mock {
     /// Counts `notifications/initialized` the bridge forwards to the BACKEND after its
     /// handshake — proves the MCP lifecycle is completed for a stateful backend (audit M2).
     initialized_count: Arc<AtomicU64>,
+    /// The app identity `/info` reports (the bridge confirms it before binding `--app`).
+    identity: Arc<std::sync::Mutex<String>>,
+}
+
+/// `/info`, reporting the mock's app identity like the real plugin.
+async fn info(State(s): State<Mock>) -> Json<Value> {
+    Json(json!({"app_identifier": s.identity.lock().unwrap().clone()}))
 }
 
 struct ChildGuard {
@@ -50,6 +57,31 @@ impl Drop for ChildGuard {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+/// A private temp root for one test. The bridge under test resolves its discovery dir from
+/// it, so the fake entry is invisible to every real `victauri bridge` on the machine — the
+/// entries used to go into the real `<temp>/victauri`, where a developer's own editor session
+/// discovered the mock server mid-test and offered its tools to the agent.
+struct IsolatedTemp(tempfile::TempDir);
+
+impl IsolatedTemp {
+    fn new() -> Self {
+        Self(tempfile::tempdir().expect("create isolated temp dir"))
+    }
+
+    fn discovery_dir(&self, pid: u32) -> PathBuf {
+        self.0.path().join("victauri").join(pid.to_string())
+    }
+
+    /// The real bridge binary, with every temp-dir source pointed at this root.
+    fn bridge(&self) -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_victauri"));
+        for var in ["TMP", "TEMP", "TMPDIR", "XDG_RUNTIME_DIR"] {
+            cmd.env(var, self.0.path());
+        }
+        cmd
     }
 }
 
@@ -122,12 +154,14 @@ async fn bridge_selects_by_identity_forwards_and_survives_restart() {
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
         initialized_count: Arc::new(AtomicU64::new(0)),
+        identity: Arc::default(),
     };
 
     // Start the mock backend on an ephemeral port.
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/mcp", post(mcp))
+        .route("/info", get(info))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -142,8 +176,10 @@ async fn bridge_selects_by_identity_forwards_and_survives_restart() {
         .unwrap()
         .as_nanos();
     let ident = format!("com.test.e2e-bridge.{unique}");
+    *mock.identity.lock().unwrap() = ident.clone();
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join("victauri").join(pid.to_string());
+    let iso = IsolatedTemp::new();
+    let dir = iso.discovery_dir(pid);
     std::fs::create_dir_all(&dir).unwrap();
     let _dir_guard = DirGuard(dir.clone());
     std::fs::write(dir.join("port"), port.to_string()).unwrap();
@@ -156,7 +192,8 @@ async fn bridge_selects_by_identity_forwards_and_survives_restart() {
 
     // Spawn the real bridge binary, pinned to our app by identity.
     let mut child = ChildGuard {
-        child: Command::new(env!("CARGO_BIN_EXE_victauri"))
+        child: iso
+            .bridge()
             .args(["bridge", "--wait", "--app", ident.as_str()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -285,14 +322,16 @@ async fn bridge_cold_start_serves_handshake_then_goes_live_when_app_appears() {
         .as_nanos();
     let ident = format!("com.test.coldstart.{unique}");
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join("victauri").join(pid.to_string());
+    let iso = IsolatedTemp::new();
+    let dir = iso.discovery_dir(pid);
     // Ensure we truly start "app down" — no leftover discovery entry for this pid.
     let _ = std::fs::remove_dir_all(&dir);
     let _dir_guard = DirGuard(dir.clone());
 
     // Spawn the bridge with NO backend present, pinned to our (currently-absent) app.
     let mut child = ChildGuard {
-        child: Command::new(env!("CARGO_BIN_EXE_victauri"))
+        child: iso
+            .bridge()
             .args(["bridge", "--app", ident.as_str()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -416,10 +455,13 @@ async fn bridge_cold_start_serves_handshake_then_goes_live_when_app_appears() {
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
         initialized_count: Arc::new(AtomicU64::new(0)),
+        identity: Arc::default(),
     };
+    *mock.identity.lock().unwrap() = ident.clone();
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/mcp", post(mcp))
+        .route("/info", get(info))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -501,10 +543,12 @@ async fn bridge_reresolves_and_wont_reuse_a_stale_cached_backend() {
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
         initialized_count: Arc::new(AtomicU64::new(0)),
+        identity: Arc::default(),
     };
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/mcp", post(mcp))
+        .route("/info", get(info))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -517,8 +561,10 @@ async fn bridge_reresolves_and_wont_reuse_a_stale_cached_backend() {
         .unwrap()
         .as_nanos();
     let ident = format!("com.test.reresolve.{unique}");
+    *mock.identity.lock().unwrap() = ident.clone();
     let pid = std::process::id();
-    let dir = std::env::temp_dir().join("victauri").join(pid.to_string());
+    let iso = IsolatedTemp::new();
+    let dir = iso.discovery_dir(pid);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let _dir_guard = DirGuard(dir.clone());
@@ -537,7 +583,8 @@ async fn bridge_reresolves_and_wont_reuse_a_stale_cached_backend() {
     .unwrap();
 
     let mut child = ChildGuard {
-        child: Command::new(env!("CARGO_BIN_EXE_victauri"))
+        child: iso
+            .bridge()
             .args(["bridge", "--app", ident.as_str()])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
