@@ -6,7 +6,8 @@ Since Victauri's MCP server runs inside the Tauri app process, a crash kills the
 
 ## What It Does
 
-- Discovers the app's port from `<temp>/victauri/<pid>/port` (live processes only; the plugin
+- Discovers the app's port from the per-user discovery directory `<root>/<pid>/port` (the
+  roots every Victauri client scans; live processes of yours only; the plugin
   may bind 7374+ when 7373 is taken), optionally selecting an app by identity with
   `--app <identifier>` / `VICTAURI_APP`, and follows the app if it restarts on a new port.
   An explicit `VICTAURI_PORT` (or positional `PORT`) skips discovery entirely.

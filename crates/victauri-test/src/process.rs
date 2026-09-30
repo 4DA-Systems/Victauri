@@ -1,6 +1,6 @@
 //! Process liveness for discovery: is `pid` a live process owned by the current user?
 //!
-//! Discovery trusts a `<temp>/victauri/<pid>/` entry only while its PID is alive, so this
+//! Discovery trusts a `<root>/<pid>/` entry only while its PID is alive, so this
 //! check decides where a Bearer token is sent. It must be exact (PID 12 is not PID 123),
 //! scoped to our own user (another user's process that inherited a stale PID must not make
 //! an entry look live), and cheap — the CLI bridge polls it every 1.5 s. The previous

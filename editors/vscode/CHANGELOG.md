@@ -6,6 +6,10 @@ All notable changes to the Victauri VS Code extension will be documented in this
 
 Version-synced with the Victauri 0.9.0 release. Extension changes:
 
+- **Discovery also scans the plugin's home-directory fallback root on Unix.** When another
+  local user has pre-created the predictable `/tmp/victauri-<uid>`, the plugin now registers
+  under `$XDG_STATE_HOME/victauri` (default `~/.local/state/victauri`); the extension scans it
+  after `<temp>/victauri-<uid>`, before the legacy root, with the same ownership checks.
 - **A discovery entry planted by another Windows user is no longer trusted.** Discovery
   trusted every directory under `%TEMP%\victauri` on Windows. When `TEMP` is shared (an app
   launched from MSYS2 uses `C:\msys64\tmp`), another user could plant

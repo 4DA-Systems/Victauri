@@ -9,6 +9,8 @@ import * as path from "node:path";
 import { authProbeVerdict, healthStatusMeansAlive } from "../src/client";
 import {
   DiscoveredServer,
+  discoveryRoots,
+  homeStateRoot,
   pidLiveness,
   resolveConnection,
   scanServers,
@@ -161,4 +163,30 @@ test("windows: a discovery directory owned by another account is not trusted", a
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+// R5B-LINDISC1: the plugin falls back to a per-user root under the home directory when the
+// predictable `<temp>/victauri-<uid>` was taken over by another user; the extension must scan it.
+test("homeStateRoot: $XDG_STATE_HOME/victauri, else ~/.local/state/victauri", () => {
+  assert.equal(homeStateRoot({ XDG_STATE_HOME: "/x/state", HOME: "/home/u" }), "/x/state/victauri");
+  assert.equal(
+    homeStateRoot({ XDG_STATE_HOME: "rel", HOME: "/home/u" }),
+    "/home/u/.local/state/victauri"
+  );
+  assert.equal(homeStateRoot({ HOME: "/home/u" }), "/home/u/.local/state/victauri");
+  assert.equal(homeStateRoot({ HOME: "rel" }), undefined);
+  assert.equal(homeStateRoot({}), undefined);
+});
+
+test("unix: the home fallback root is scanned after <temp>/victauri-<uid>, before the legacy root", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("unix only");
+    return;
+  }
+  const roots = await discoveryRoots();
+  const home = homeStateRoot();
+  assert.ok(home, "HOME is set");
+  const at = roots.indexOf(home!);
+  assert.ok(at > 0 && at < roots.length - 1, JSON.stringify(roots));
+  assert.ok(roots[at - 1].endsWith(`victauri-${process.geteuid!()}`), JSON.stringify(roots));
 });

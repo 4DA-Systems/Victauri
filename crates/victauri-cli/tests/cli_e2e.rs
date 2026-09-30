@@ -422,3 +422,47 @@ async fn victauri_port_with_a_different_app_selector_is_refused() {
     assert!(out.status.success(), "{}", stderr(&out));
     assert!(stdout(&out).contains("com.test.portapp"));
 }
+
+/// R5B-LINDISC1: when another user has pre-created `<temp>/victauri-<uid>` (sticky /tmp stops
+/// us removing it) the app registers under `$HOME/.local/state/victauri` instead — and every
+/// reader must look there. (0777 stands in for "another user's"; the WSL run used a real
+/// foreign-owned directory.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readers_find_an_app_registered_under_the_home_state_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let iso = IsolatedTemp::new();
+    let port = start_mock("com.test.homeroot").await;
+    // The predictable per-user temp root exists but is untrusted.
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(iso.0.path()).unwrap());
+    let squatted = iso.0.path().join(format!("victauri-{uid}"));
+    std::fs::create_dir(&squatted).unwrap();
+    std::fs::set_permissions(&squatted, std::fs::Permissions::from_mode(0o777)).unwrap();
+    // The app's entry, where the plugin falls back to.
+    let home = iso.0.path().join("home");
+    let root = home.join(".local").join("state").join("victauri");
+    let dir = root.join(std::process::id().to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    for d in [&home, &root, &dir] {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(dir.join("port"), port.to_string()).unwrap();
+    std::fs::write(dir.join("token"), "tok").unwrap();
+    std::fs::write(
+        dir.join("metadata.json"),
+        json!({"identifier": "com.test.homeroot"}).to_string(),
+    )
+    .unwrap();
+
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw"]);
+    cmd.env("HOME", &home)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME");
+    let out = run(cmd).await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("com.test.homeroot"),
+        "{}",
+        stdout(&out)
+    );
+}

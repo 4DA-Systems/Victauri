@@ -22,11 +22,26 @@ function tempDir(): string {
   return process.env.TMPDIR || "/tmp";
 }
 
-// Where discovery directories live, most specific first. On Unix the root is per-user —
-// `$XDG_RUNTIME_DIR/victauri` when that directory is private to us, else
-// `<temp>/victauri-<euid>` — so another local user cannot pre-create the shared root and
-// block discovery; the legacy shared `<temp>/victauri` (0.8.x apps) is read last. Windows
-// `%TEMP%` is already per-user.
+// The plugin's per-user fallback discovery root under the home directory (Unix):
+// `$XDG_STATE_HOME/victauri`, else `$HOME/.local/state/victauri` (each only when absolute). The
+// plugin registers there when `<temp>/victauri-<euid>` is untrusted — another local user can
+// pre-create that predictable path, and sticky `/tmp` stops us deleting it (R5B-LINDISC1).
+export function homeStateRoot(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const state = env.XDG_STATE_HOME;
+  if (state && path.posix.isAbsolute(state)) return path.posix.join(state, "victauri");
+  const home = env.HOME;
+  if (home && path.posix.isAbsolute(home)) {
+    return path.posix.join(home, ".local", "state", "victauri");
+  }
+  return undefined;
+}
+
+// Where discovery directories live, most specific first — the order every Victauri reader
+// scans. On Unix the roots are per-user: `$XDG_RUNTIME_DIR/victauri` when that directory is
+// private to us, then `<temp>/victauri-<euid>` (so another local user cannot pre-create a
+// shared root and block discovery), then the home fallback above; the legacy shared
+// `<temp>/victauri` (0.8.x apps) is read last. Windows `%TEMP%` is normally per-user (and
+// ownership is verified, see below).
 export async function discoveryRoots(): Promise<string[]> {
   const tmp = tempDir();
   const legacy = path.join(tmp, "victauri");
@@ -46,6 +61,8 @@ export async function discoveryRoots(): Promise<string[]> {
       }
     }
     roots.push(path.join(tmp, `victauri-${euid}`));
+    const home = homeStateRoot();
+    if (home) roots.push(home);
   }
   roots.push(legacy);
   return roots;

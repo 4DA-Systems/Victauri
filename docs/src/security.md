@@ -75,16 +75,21 @@ Every request except `/health` must include a valid Bearer token.
 
 The per-process discovery directory holds the auth token, so it is locked to the current user.
 It lives in a **per-user** root: `$XDG_RUNTIME_DIR/victauri/<pid>/` when that directory is private
-to the user, else `<temp>/victauri-<euid>/<pid>/` on Unix, and `%TEMP%\victauri\<pid>\` on Windows
-(where `%TEMP%` is already per-user). Clients also read the legacy shared `<temp>/victauri/` root,
-owner-checked, so an app built with an older plugin is still found.
+to the user, else `<temp>/victauri-<euid>/<pid>/` on Unix — or, when that one is unusable,
+`$XDG_STATE_HOME/victauri/<pid>/` (default `~/.local/state/victauri/<pid>/`) — and
+`%TEMP%\victauri\<pid>\` on Windows (where `%TEMP%` is normally per-user). Clients scan those roots
+in that order, then the legacy shared `<temp>/victauri/` root, owner-checked, so an app built with
+an older plugin is still found.
 
 - **Unix:** the directory is created `0700`, and both it and its root are trusted only
   when they are real directories (not symlinks) owned by the current uid and not
   group/other-writable. A planted or world-writable path is refused, never trusted. A
   per-user root means another local user can no longer block discovery by pre-creating the
-  shared root; with no `XDG_RUNTIME_DIR`, they could still pre-create `/tmp/victauri-<uid>`
-  (discovery then fails closed rather than trusting it).
+  shared root. With no private `XDG_RUNTIME_DIR` the root is the predictable
+  `/tmp/victauri-<uid>`, which another local user could still pre-create (and sticky `/tmp`
+  stops you deleting it); the plugin then registers under the home-directory root instead
+  (created `0700`, its parent owned by you and not writable by others), so that no longer
+  blocks discovery either.
 - **Windows:** before any token is trusted, Victauri verifies the directory is **owned by the
   current user** (an attacker who pre-created it on a shared `TEMP` would be its owner, so the
   directory is refused). It then replaces the directory's DACL with a **protected, owner-only
@@ -93,7 +98,12 @@ owner-checked, so an app built with an older plugin is still found.
   unusual filesystem, Victauri falls back to a best-effort `icacls` lockdown (and logs a
   warning); in that fallback only, a custom-SID ACE pre-planted by another principal on a
   **non-default shared** `TEMP` could persist — the default Windows per-user `TEMP` is not
-  writable by other users, so it is unaffected.
+  writable by other users, so it is unaffected. Clients (the CLI and its bridge,
+  `victauri-test`, the watchdog, the VS Code extension) likewise trust a discovery root or
+  `<pid>` directory only if the current user owns it (or `BUILTIN\Administrators` does and the
+  user is a member), so an entry another user planted on a shared `TEMP` (e.g. MSYS2's
+  `C:\msys64\tmp`) is never read. The VS Code extension checks directories outside the user
+  profile with PowerShell's `Get-Acl`, failing closed if it cannot.
 
 In all cases the token file itself is created exclusively (`O_EXCL` / `create_new`) so a
 pre-planted file or symlink at its path is rejected rather than written through.

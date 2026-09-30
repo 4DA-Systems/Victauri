@@ -1,6 +1,7 @@
 //! Per-process server discovery for CI parallelism.
 //!
-//! Victauri servers write discovery files to `<temp>/victauri/<pid>/` with
+//! Victauri servers write discovery files to a per-user `<root>/<pid>/` (see
+//! `discovery_roots`) with
 //! port, token, and metadata. This module scans those directories and returns
 //! the live server(s). A directory is deleted only when its owning process is
 //! definitely dead — never merely because its port did not answer a probe (a
@@ -10,11 +11,13 @@
 use std::path::PathBuf;
 
 /// The discovery roots the plugin may have written to, most specific first (mirrors the
-/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
-/// that directory is private to us, else `<temp>/victauri-<euid>` (a shared `/tmp/victauri`
-/// could be pre-created by another user, blocking discovery) — and the legacy
-/// `<temp>/victauri` is still read, subject to the same ownership check, for pre-0.9 plugins.
-/// Other platforms use `<temp>/victauri` (a per-user temp dir).
+/// plugin's `discovery_root`). On Unix the roots are per-user — `$XDG_RUNTIME_DIR/victauri`
+/// when that directory is private to us, then `<temp>/victauri-<euid>` (a shared
+/// `/tmp/victauri` could be pre-created by another user, blocking discovery), then the home
+/// fallback `$XDG_STATE_HOME/victauri` / `$HOME/.local/state/victauri` (where the plugin
+/// registers when `<temp>/victauri-<euid>` was taken over) — and the legacy `<temp>/victauri`
+/// is still read, subject to the same ownership check, for pre-0.9 plugins. Other platforms
+/// use `<temp>/victauri` (a per-user temp dir; Windows readers verify its ownership).
 #[cfg(not(test))]
 fn discovery_roots() -> Vec<PathBuf> {
     real_discovery_roots()
@@ -37,7 +40,8 @@ fn discovery_roots() -> Vec<PathBuf> {
 /// [`discovery_roots`] scans, in the same order.
 #[cfg(unix)]
 pub const TOKEN_LOCATIONS: &str = "$XDG_RUNTIME_DIR/victauri/<pid>/token (when that \
-     directory is private to you), else <temp>/victauri-<uid>/<pid>/token";
+     directory is private to you), else <temp>/victauri-<uid>/<pid>/token, or \
+     ~/.local/state/victauri/<pid>/token when that one was not usable";
 /// Where a running app's auth token lives, for error messages.
 #[cfg(not(unix))]
 pub const TOKEN_LOCATIONS: &str = r"%TEMP%\victauri\<pid>\token";
@@ -64,6 +68,12 @@ fn real_discovery_roots() -> Vec<PathBuf> {
                 roots.push(runtime.join("victauri"));
             }
             roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+            // The plugin's fallback when `<temp>/victauri-<euid>` was taken over by another
+            // user (R5B-LINDISC1) — scanned after it, before the legacy root.
+            roots.extend(home_state_root(
+                std::env::var_os("XDG_STATE_HOME"),
+                std::env::var_os("HOME"),
+            ));
         }
         roots.push(legacy);
         roots
@@ -72,6 +82,26 @@ fn real_discovery_roots() -> Vec<PathBuf> {
     {
         vec![legacy]
     }
+}
+
+/// The plugin's per-user fallback discovery root under the home directory:
+/// `$XDG_STATE_HOME/victauri`, else `$HOME/.local/state/victauri` (each only when absolute).
+/// The plugin registers there when `<temp>/victauri-<euid>` is untrusted — e.g. another local
+/// user pre-created it, and sticky `/tmp` stops us deleting it (R5B-LINDISC1).
+#[cfg(unix)]
+fn home_state_root(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let absolute =
+        |p: std::ffi::OsString| Some(std::path::PathBuf::from(p)).filter(|p| p.is_absolute());
+    xdg_state_home
+        .and_then(absolute)
+        .or_else(|| {
+            home.and_then(absolute)
+                .map(|h| h.join(".local").join("state"))
+        })
+        .map(|state| state.join("victauri"))
 }
 
 /// Whether a discovery directory is safe to trust (audit #15). On Unix the temp
@@ -650,6 +680,28 @@ mod tests {
         assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
         assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
         assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+        // R5B-LINDISC1: the home fallback is scanned after the per-user temp root, before
+        // the legacy one.
+        let home = home_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+            .expect("HOME is set in the test environment");
+        let at = |p: &std::path::Path| roots.iter().position(|r| r == p);
+        let tmp_root = std::env::temp_dir().join(format!("victauri-{euid}"));
+        assert!(at(&home) > at(&tmp_root), "{roots:?}");
+        assert!(at(&home) < Some(roots.len() - 1), "{roots:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_state_root_prefers_an_absolute_xdg_state_home() {
+        assert_eq!(
+            home_state_root(Some("/x/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/x/state/victauri"))
+        );
+        assert_eq!(
+            home_state_root(Some("rel".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/home/u/.local/state/victauri"))
+        );
+        assert_eq!(home_state_root(None, Some("rel".into())), None);
     }
 
     #[cfg(unix)]

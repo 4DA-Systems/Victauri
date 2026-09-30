@@ -85,7 +85,7 @@ fn parse_args(args: &[String]) -> (Option<u16>, Option<String>) {
 
 // ── Discovery ────────────────────────────────────────────────────────────────
 //
-// The plugin writes `<temp>/victauri/<pid>/port` (+ `metadata.json` with the app
+// The plugin writes `<root>/<pid>/port` (see `discovery_roots`; + `metadata.json` with the app
 // `identifier` / `product_name`) and may land on 7374+ when 7373 is taken, so a
 // fixed port can watch the wrong app or nothing at all. `/health` needs no auth,
 // so only the port is read — never the token.
@@ -166,11 +166,13 @@ enum Discovery {
 }
 
 /// The discovery roots the plugin may have written to, most specific first (mirrors the
-/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
-/// that directory is private to us, else `<temp>/victauri-<euid>` (a shared `/tmp/victauri`
-/// could be pre-created by another user, blocking discovery) — and the legacy
-/// `<temp>/victauri` is still read, subject to the same ownership check, for pre-0.9 plugins.
-/// Other platforms use `<temp>/victauri` (a per-user temp dir).
+/// plugin's `discovery_root`). On Unix the roots are per-user — `$XDG_RUNTIME_DIR/victauri`
+/// when that directory is private to us, then `<temp>/victauri-<euid>` (a shared
+/// `/tmp/victauri` could be pre-created by another user, blocking discovery), then the home
+/// fallback `$XDG_STATE_HOME/victauri` / `$HOME/.local/state/victauri` (where the plugin
+/// registers when `<temp>/victauri-<euid>` was taken over) — and the legacy `<temp>/victauri`
+/// is still read, subject to the same ownership check, for pre-0.9 plugins. Other platforms
+/// use `<temp>/victauri` (a per-user temp dir; Windows readers verify its ownership).
 fn discovery_roots() -> Vec<PathBuf> {
     let legacy = std::env::temp_dir().join("victauri");
     #[cfg(unix)]
@@ -192,6 +194,12 @@ fn discovery_roots() -> Vec<PathBuf> {
                 roots.push(runtime.join("victauri"));
             }
             roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+            // The plugin's fallback when `<temp>/victauri-<euid>` was taken over by another
+            // user (R5B-LINDISC1) — scanned after it, before the legacy root.
+            roots.extend(home_state_root(
+                std::env::var_os("XDG_STATE_HOME"),
+                std::env::var_os("HOME"),
+            ));
         }
         roots.push(legacy);
         roots
@@ -200,6 +208,26 @@ fn discovery_roots() -> Vec<PathBuf> {
     {
         vec![legacy]
     }
+}
+
+/// The plugin's per-user fallback discovery root under the home directory:
+/// `$XDG_STATE_HOME/victauri`, else `$HOME/.local/state/victauri` (each only when absolute).
+/// The plugin registers there when `<temp>/victauri-<euid>` is untrusted — e.g. another local
+/// user pre-created it, and sticky `/tmp` stops us deleting it (R5B-LINDISC1).
+#[cfg(unix)]
+fn home_state_root(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let absolute =
+        |p: std::ffi::OsString| Some(std::path::PathBuf::from(p)).filter(|p| p.is_absolute());
+    xdg_state_home
+        .and_then(absolute)
+        .or_else(|| {
+            home.and_then(absolute)
+                .map(|h| h.join(".local").join("state"))
+        })
+        .map(|state| state.join("victauri"))
 }
 
 /// [`discover_in`] over every discovery root; a pid found under several roots counts once.
@@ -563,8 +591,8 @@ async fn main() -> anyhow::Result<()> {
         println!("victauri-watchdog {}", env!("CARGO_PKG_VERSION"));
         println!("Crash-recovery sidecar for Victauri MCP server\n");
         println!("USAGE: victauri-watchdog [PORT] [--app <identifier>]\n");
-        println!("Without an explicit port, the port is discovered from");
-        println!("<temp>/victauri/<pid>/port (live apps only), falling back to 7373 when");
+        println!("Without an explicit port, the port is discovered from the per-user");
+        println!("discovery roots (<root>/<pid>/port, live apps only), falling back to 7373 when");
         println!("no --app is given. Once an app is found its identity is pinned: the");
         println!("watchdog follows only that app across restarts and never switches to a");
         println!("different one. With --app and no matching app, it reports the app DOWN.\n");
@@ -881,6 +909,28 @@ mod tests {
         assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
         assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
         assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+        // R5B-LINDISC1: the home fallback is scanned after the per-user temp root, before
+        // the legacy one.
+        let home = home_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+            .expect("HOME is set in the test environment");
+        let at = |p: &std::path::Path| roots.iter().position(|r| r == p);
+        let tmp_root = std::env::temp_dir().join(format!("victauri-{euid}"));
+        assert!(at(&home) > at(&tmp_root), "{roots:?}");
+        assert!(at(&home) < Some(roots.len() - 1), "{roots:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_state_root_prefers_an_absolute_xdg_state_home() {
+        assert_eq!(
+            home_state_root(Some("/x/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/x/state/victauri"))
+        );
+        assert_eq!(
+            home_state_root(Some("rel".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/home/u/.local/state/victauri"))
+        );
+        assert_eq!(home_state_root(None, Some("rel".into())), None);
     }
 
     fn app(pid: u32, port: u16, identity: Option<&str>) -> DiscoveredApp {

@@ -66,7 +66,7 @@ VictauriBuilder::new()
 
 If the preferred port is busy, Victauri tries the next 10 ports (9001-9010). The actual port is:
 - Printed to the log on startup
-- Written to the per-process discovery dir `<temp_dir>/victauri/<pid>/port` (next to the auth `token` and a `metadata.json` with the app identity)
+- Written to the per-process discovery dir `<root>/<pid>/port` (next to the auth `token` and a `metadata.json` with the app identity) — `<root>` is per-user; see [Security: discovery-directory protection](security.md#discovery-directory-protection)
 - Available via the `/info` endpoint
 - Stored in `VictauriState.port` (AtomicU16)
 
