@@ -381,26 +381,31 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
             r"
             var V = window.__VICTAURI__;
             function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
+            // Resolves true on `loadend`, false only if it never came. The requests go to the
+            // jsdom origin with no server behind it, and a refused localhost connection can
+            // take ~2 s to fail (Windows retries it) - the old 2 s fallback then fired first
+            // and the test read an entry that was genuinely still in flight.
             function loadend(x, ms) {
                 return new Promise(function(r) {
                     x.addEventListener('loadend', function() { r(true); }, { once: true });
-                    setTimeout(function() { r(false); }, ms || 2000);
+                    setTimeout(function() { r(false); }, ms || 15000);
                 });
             }
+            var ended = [];
             var x = new XMLHttpRequest();
-            x.open('GET', '/r5b/one'); var p = loadend(x); x.send(); await p;
+            x.open('GET', '/r5b/one'); var p = loadend(x); x.send(); ended.push(await p);
             var first = V.getNetworkLog('/r5b/', 10)[0];
             await sleep(80);
-            x.open('GET', '/r5b/two'); p = loadend(x); x.send(); await p;
+            x.open('GET', '/r5b/two'); p = loadend(x); x.send(); ended.push(await p);
             await sleep(80);
-            x.open('GET', '/r5b/three'); p = loadend(x); x.send(); await p;
+            x.open('GET', '/r5b/three'); p = loadend(x); x.send(); ended.push(await p);
             var log = V.getNetworkLog('/r5b/', 10);
 
             // Re-open while a (route-delayed) request is still pending.
             V.addRoute({ pattern: '/r5c/slow', action: 'delay', delay_ms: 150 });
             var y = new XMLHttpRequest();
             y.open('GET', '/r5c/slow'); y.send();
-            y.open('GET', '/r5c/after'); p = loadend(y); y.send(); await p;
+            y.open('GET', '/r5c/after'); p = loadend(y); y.send(); ended.push(await p);
             await sleep(300);
             var log2 = V.getNetworkLog('/r5c/', 10);
 
@@ -410,16 +415,17 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
             var events = [];
             z.addEventListener('error', function() { events.push('error'); });
             z.open('GET', '/r5d/blocked'); p = loadend(z, 500); z.send();
-            var ended = await p;
+            var blockedEnded = await p;
 
             return {
+                requests_ended: ended,
                 urls: log.map(function(e) { return e.url; }),
                 ids_distinct: new Set(log.map(function(e) { return e.id; })).size,
                 first_status: first.status, first_duration: first.duration_ms,
                 first_after: { status: log[0].status, duration: log[0].duration_ms },
                 pending: log.filter(function(e) { return e.status === 'pending'; }).length,
                 reopen: log2.map(function(e) { return e.url + '=' + e.status; }),
-                blocked_loadend: ended, blocked_events: events,
+                blocked_loadend: blockedEnded, blocked_events: events,
             };
             ",
         )],
@@ -429,6 +435,12 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
     };
     assert_all_pass(&results);
     let r = result(&results, 0);
+    // Every request really finished (loadend fired) before its entry was read.
+    assert_eq!(
+        r["requests_ended"],
+        serde_json::json!([true, true, true, true]),
+        "{r}"
+    );
     assert_eq!(
         r["urls"],
         serde_json::json!(["/r5b/one", "/r5b/two", "/r5b/three"]),
