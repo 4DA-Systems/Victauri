@@ -453,10 +453,19 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
         "a later request on the same XHR rewrote the first entry: {r}"
     );
     assert_eq!(r["first_after"]["status"], r["first_status"], "{r}");
-    assert_eq!(
-        r["reopen"],
-        serde_json::json!(["/r5c/slow=aborted", "/r5c/after=error"]),
-        "{r}"
+    // Re-opening mid-flight closes the first request's entry as `aborted`; the second request
+    // gets its own entry that reaches a final state. Which final state depends on the host (no
+    // server behind the jsdom origin -> `error`; a CI runner answered `404`), so only
+    // "finished, not pending/aborted" is asserted for it.
+    let reopen = r["reopen"].as_array().expect("reopen entries");
+    assert_eq!(reopen.len(), 2, "{r}");
+    assert_eq!(reopen[0], "/r5c/slow=aborted", "{r}");
+    let after = reopen[1].as_str().unwrap_or_default();
+    assert!(
+        after.starts_with("/r5c/after=")
+            && !after.ends_with("=pending")
+            && !after.ends_with("=aborted"),
+        "the re-opened request must reach a final state: {r}"
     );
     assert_eq!(r["blocked_loadend"], true, "{r}");
     assert_eq!(r["blocked_events"], serde_json::json!(["error"]), "{r}");
