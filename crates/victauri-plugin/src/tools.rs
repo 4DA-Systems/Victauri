@@ -40,6 +40,14 @@ pub fn page_window_query<T>(f: impl FnOnce() -> T) -> Result<T, String> {
     Ok(f())
 }
 
+/// IPC calls `victauri_get_ipc_log` returns when the page gives no `limit`.
+pub const PAGE_IPC_LOG_DEFAULT: usize = 100;
+/// Most IPC calls `victauri_get_ipc_log` returns, whatever `limit` the page asks for.
+pub const PAGE_IPC_LOG_MAX: usize = 1_000;
+/// Most `stale_calls` / `error_calls` entries (each the newest) `victauri_check_ipc_integrity`
+/// returns; the counts always cover the whole log.
+pub const PAGE_INTEGRITY_MAX_ENTRIES: usize = 100;
+
 /// The window a page-originated eval id belongs to.
 fn page_eval_window(id: &str) -> Option<&str> {
     let rest = id.strip_prefix(PAGE_EVAL_PREFIX)?;
@@ -81,12 +89,9 @@ pub async fn reserve_page_eval(
             crate::mcp::MAX_PENDING_EVALS
         ));
     }
-    Ok(crate::PendingSlot::insert(
-        &state.pending_evals,
-        &mut pending,
-        id,
-        tx,
-    ))
+    let slot = crate::PendingSlot::insert(&state.pending_evals, &mut pending, id, tx);
+    slot.bind_window(Some(label));
+    Ok(slot)
 }
 
 #[tauri::command]
@@ -151,8 +156,35 @@ pub fn victauri_eval_callback<R: Runtime>(
         state.page_loads.record_load(webview.label(), nonce);
         return Ok(());
     }
-    deliver_eval_result(Arc::clone(state.inner()), id, result);
+    accept_eval_result(
+        Arc::clone(state.inner()),
+        webview.label(),
+        || crate::bridge::default_window_label(webview.app_handle()),
+        id,
+        result,
+    );
     Ok(())
+}
+
+/// Deliver an eval result from webview `caller` — only if the eval was sent to that window
+/// (see [`crate::eval_result_accepted`]); a result from any other window is dropped. Returns
+/// whether it was accepted.
+fn accept_eval_result(
+    state: Arc<VictauriState>,
+    caller: &str,
+    default_label: impl FnOnce() -> Option<String>,
+    id: String,
+    result: String,
+) -> bool {
+    if !crate::eval_result_accepted(&id, caller, default_label) {
+        tracing::debug!(
+            window = caller,
+            "ignored an eval result from a window the eval was not sent to (or for no pending              eval)"
+        );
+        return false;
+    }
+    deliver_eval_result(state, id, result);
+    true
 }
 
 /// Hand an eval result to the caller waiting on `id` without blocking the calling (main)
@@ -229,12 +261,19 @@ pub fn victauri_get_ipc_log(
     state: State<'_, Arc<VictauriState>>,
     limit: Option<usize>,
 ) -> Result<Vec<IpcCall>, String> {
-    let mut calls = state.event_log.ipc_calls();
-    if let Some(limit) = limit {
-        let start = calls.len().saturating_sub(limit);
-        calls = calls[start..].to_vec();
-    }
-    Ok(calls)
+    Ok(page_ipc_log(&state, limit))
+}
+
+/// The newest `limit` IPC calls (default [`PAGE_IPC_LOG_DEFAULT`], at most
+/// [`PAGE_IPC_LOG_MAX`]), oldest first.
+///
+/// These page-callable commands are synchronous, i.e. they run on the UI thread (see the note
+/// above `victauri_get_window_state`), and page script can call them in a loop. So each does
+/// work bounded by its reply, not by the log: only the returned calls are cloned (a call carries
+/// its whole request/response body; cloning the full 10,000-event log per call janked the UI).
+fn page_ipc_log(state: &VictauriState, limit: Option<usize>) -> Vec<IpcCall> {
+    let limit = limit.unwrap_or(PAGE_IPC_LOG_DEFAULT).min(PAGE_IPC_LOG_MAX);
+    state.event_log.recent_ipc_calls(limit)
 }
 
 #[tauri::command]
@@ -268,16 +307,13 @@ pub fn victauri_verify_state(
 pub fn victauri_detect_ghost_commands(
     state: State<'_, Arc<VictauriState>>,
 ) -> Result<serde_json::Value, String> {
-    let ipc_calls = state.event_log.ipc_calls();
-    let frontend_commands: Vec<String> = ipc_calls
-        .iter()
-        .map(|c| c.command.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
+    serde_json::to_value(page_ghost_report(&state)).map_err(|e| e.to_string())
+}
 
-    let report = victauri_core::detect_ghost_commands(&frontend_commands, &state.registry);
-    serde_json::to_value(report).map_err(|e| e.to_string())
+/// Ghost-command report from the command NAMES in the log (no call is cloned).
+fn page_ghost_report(state: &VictauriState) -> victauri_core::GhostCommandReport {
+    let frontend_commands: Vec<String> = state.event_log.ipc_command_names().into_iter().collect();
+    victauri_core::detect_ghost_commands(&frontend_commands, &state.registry)
 }
 
 #[tauri::command]
@@ -285,9 +321,27 @@ pub fn victauri_check_ipc_integrity(
     state: State<'_, Arc<VictauriState>>,
     stale_threshold_ms: Option<i64>,
 ) -> Result<serde_json::Value, String> {
-    let threshold = stale_threshold_ms.unwrap_or(5000);
-    let report = victauri_core::check_ipc_integrity(&state.event_log, threshold);
-    serde_json::to_value(report).map_err(|e| e.to_string())
+    serde_json::to_value(page_integrity_report(&state, stale_threshold_ms))
+        .map_err(|e| e.to_string())
+}
+
+fn page_integrity_report(
+    state: &VictauriState,
+    stale_threshold_ms: Option<i64>,
+) -> victauri_core::IpcIntegrityReport {
+    // Scans the log in place (no call is cloned); the lists in the reply are capped to the
+    // newest entries, the counts still cover the whole log.
+    let mut report =
+        victauri_core::check_ipc_integrity(&state.event_log, stale_threshold_ms.unwrap_or(5000));
+    keep_newest(&mut report.stale_calls, PAGE_INTEGRITY_MAX_ENTRIES);
+    keep_newest(&mut report.error_calls, PAGE_INTEGRITY_MAX_ENTRIES);
+    report
+}
+
+/// Drop all but the last `max` entries of `v` (the log is oldest-first).
+fn keep_newest<T>(v: &mut Vec<T>, max: usize) {
+    let excess = v.len().saturating_sub(max);
+    v.drain(..excess);
 }
 
 #[cfg(test)]
@@ -316,6 +370,170 @@ mod tests {
             PAGE_WINDOW_QUERY_SLOTS.available_permits(),
             MAX_PAGE_WINDOW_QUERIES
         );
+    }
+
+    fn busy_state(calls: usize) -> VictauriState {
+        let mut state = VictauriState::for_tests();
+        state.event_log = victauri_core::EventLog::new(calls);
+        let body = serde_json::json!({ "payload": "x".repeat(1024) });
+        for i in 0..calls {
+            let result = if i % 2 == 0 {
+                victauri_core::IpcResult::Ok(body.clone())
+            } else {
+                victauri_core::IpcResult::Err(format!("failed: {}", "e".repeat(256)))
+            };
+            state
+                .event_log
+                .push(victauri_core::AppEvent::Ipc(IpcCall::new(
+                    format!("c{i}"),
+                    format!("cmd{}", i % 20),
+                    chrono::Utc::now(),
+                    result,
+                    Some(1),
+                    1024,
+                    "main",
+                )));
+        }
+        state
+    }
+
+    /// R5B-PAGEQ1: `victauri_get_ipc_log`, `victauri_detect_ghost_commands` and
+    /// `victauri_check_ipc_integrity` are page-callable SYNC commands, i.e. they run on the UI
+    /// thread, and each cloned the whole Rust IPC log (every call with its body) per call — a
+    /// page calling them in a loop janked the UI. The work and the replies are now bounded.
+    #[test]
+    fn page_ipc_queries_do_bounded_work_on_a_full_log() {
+        let state = busy_state(10_000);
+        let time = |f: &dyn Fn()| {
+            let started = std::time::Instant::now();
+            for _ in 0..5 {
+                f();
+            }
+            started.elapsed() / 5
+        };
+        let full_clone = time(&|| drop(state.event_log.ipc_calls()));
+        let log = time(&|| drop(page_ipc_log(&state, None)));
+        let ghosts = time(&|| drop(page_ghost_report(&state)));
+        let integrity = time(&|| drop(page_integrity_report(&state, None)));
+        eprintln!(
+            "10,000-call log: full clone {full_clone:?}; get_ipc_log {log:?}; detect_ghost_commands {ghosts:?}; check_ipc_integrity {integrity:?}"
+        );
+
+        assert_eq!(page_ipc_log(&state, None).len(), PAGE_IPC_LOG_DEFAULT);
+        assert_eq!(
+            page_ipc_log(&state, Some(usize::MAX)).len(),
+            PAGE_IPC_LOG_MAX
+        );
+        let newest = page_ipc_log(&state, Some(3));
+        let ids: Vec<&str> = newest.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["c9997", "c9998", "c9999"]);
+
+        let integrity = page_integrity_report(&state, None);
+        assert_eq!(integrity.total_calls, 10_000);
+        assert_eq!(integrity.errored, 5_000);
+        assert_eq!(integrity.error_calls.len(), PAGE_INTEGRITY_MAX_ENTRIES);
+        assert_eq!(
+            integrity.error_calls.last().map(|c| c.id.as_str()),
+            Some("c9999"),
+            "the newest entries are kept"
+        );
+
+        let ghosts = page_ghost_report(&state);
+        assert_eq!(ghosts.frontend_only.len(), 20);
+    }
+
+    /// R5B-EVALWIN1: `victauri_eval_callback` delivered a result for any pending eval id to
+    /// whichever window sent it. A result is now accepted only from the window the eval was sent
+    /// to — by label, or for an eval sent to the default window, from the window the default
+    /// resolves to.
+    #[tokio::test]
+    async fn eval_results_are_accepted_only_from_the_target_window() {
+        let state = Arc::new(VictauriState::for_tests());
+        let no_default = || None;
+
+        // A page eval for window "main".
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let slot = reserve_page_eval(&state, "main", tx).await.unwrap();
+        let id = slot.id().to_string();
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "other",
+            no_default,
+            id.clone(),
+            "forged".into()
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "another window's result was delivered"
+        );
+        assert!(accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            no_default,
+            id,
+            "real".into()
+        ));
+        assert_eq!(rx.await.unwrap(), "real");
+        drop(slot);
+
+        // An agent eval sent to the default window.
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        let slot = {
+            let mut pending = state.pending_evals.lock().await;
+            crate::PendingSlot::insert(&state.pending_evals, &mut pending, "agent-1".into(), tx)
+        };
+        slot.bind_window(None);
+        let main_is_default = || Some("main".to_string());
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "other",
+            main_is_default,
+            "agent-1".into(),
+            "x".into()
+        ));
+        assert!(rx.try_recv().is_err());
+        // Narrowed to the window it actually resolved to.
+        slot.bind_window(Some("side"));
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            main_is_default,
+            "agent-1".into(),
+            "x".into()
+        ));
+        assert!(accept_eval_result(
+            Arc::clone(&state),
+            "side",
+            main_is_default,
+            "agent-1".into(),
+            "ok".into()
+        ));
+        assert_eq!(rx.await.unwrap(), "ok");
+
+        // An eval that was never bound, and an id with no pending eval, are refused.
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let unbound = {
+            let mut pending = state.pending_evals.lock().await;
+            crate::PendingSlot::insert(&state.pending_evals, &mut pending, "agent-2".into(), tx)
+        };
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            main_is_default,
+            "agent-2".into(),
+            "x".into()
+        ));
+        assert!(!accept_eval_result(
+            Arc::clone(&state),
+            "main",
+            main_is_default,
+            "nope".into(),
+            "x".into()
+        ));
+        drop(unbound);
+        // The binding goes with the slot.
+        drop(slot);
+        assert!(!crate::eval_result_accepted("agent-1", "side", || None));
     }
 
     /// Tauri runs an `async` command on a tokio worker and extracts/drops its arguments and its

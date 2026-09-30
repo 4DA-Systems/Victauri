@@ -27,6 +27,12 @@ pub struct ServeLimits {
     /// Connections served at once; further clients wait in the listen backlog.
     pub max_connections: usize,
     /// A connection that has not delivered a complete request head within this is closed.
+    ///
+    /// Hyper starts this timer when it begins reading a head. For a connection's first request
+    /// that is once [`serve_hardened`] has seen its first byte and given it a request slot, so
+    /// the deadline is measured from the first byte (bytes that arrive while it waits for a slot
+    /// sit in the socket buffer and are parsed at once). For a kept-alive connection it runs
+    /// from the end of the previous response, so it is also the idle keep-alive timeout.
     pub header_read_timeout: Duration,
     /// Accepted connections that have not yet sent a byte (or wait for a request slot).
     pub max_pending: usize,
@@ -35,9 +41,19 @@ pub struct ServeLimits {
 }
 
 impl ServeLimits {
+    /// Header deadline 10 s (hyper's default is 30 s). Every client of this server — the
+    /// `victauri` CLI and bridge, `victauri-test`, MCP clients over HTTP — sends a complete
+    /// request head in one write, so any real head arrives in well under a millisecond; 10 s
+    /// still tolerates a machine stalled by a debugger or heavy load. What it bounds is a local
+    /// process that opens connections, sends one byte and stalls: each such connection holds a
+    /// request slot until the deadline, so keeping all 256 slots busy now takes 256 fresh
+    /// connections every 10 s — three times the reconnect rate 30 s needed. (It cannot be made a hard
+    /// guarantee: a loopback attacker who keeps reconnecting can always keep slots busy.) The
+    /// same timer closes idle keep-alive connections after 10 s; HTTP clients reopen them
+    /// transparently.
     pub const DEFAULT: Self = Self {
         max_connections: 256,
-        header_read_timeout: Duration::from_secs(30),
+        header_read_timeout: Duration::from_secs(10),
         max_pending: 1024,
         first_byte_timeout: Duration::from_secs(3),
     };
@@ -165,7 +181,7 @@ async fn admit(
 /// before any handler (or the `/mcp` transport) sees it.
 ///
 /// A client that sends headers and then trickles its body used to hold a connection — and one
-/// of the server's 64 request slots — for as long as it liked. Every route takes a small JSON
+/// of the server's request slots — for as long as it liked. Every route takes a small JSON
 /// body, so buffering it up front costs nothing.
 pub async fn read_body_with_deadline(request: Request, next: Next) -> Response {
     buffer_body(request, next, BODY_READ_TIMEOUT).await
@@ -323,6 +339,23 @@ mod tests {
         read_to_close(&mut silent, Duration::from_secs(5)).await;
     }
 
+    /// R5B-SLOWLORIS: after R5-NET1 a connection holds a request slot only once it has sent a
+    /// byte, but a local process could still fill all 256 slots with started-but-stalled request
+    /// heads and hold each for the whole header deadline. Real clients send a complete head in a
+    /// single write, so the deadline must be short.
+    #[test]
+    fn the_default_header_deadline_is_short() {
+        assert!(
+            ServeLimits::DEFAULT.header_read_timeout <= Duration::from_secs(10),
+            "{:?}",
+            ServeLimits::DEFAULT.header_read_timeout
+        );
+        assert!(
+            ServeLimits::DEFAULT.header_read_timeout > ServeLimits::DEFAULT.first_byte_timeout,
+            "a started head gets longer than a silent connection"
+        );
+    }
+
     /// Audit N4: connections are capped; a waiting client is served once a slot frees up.
     #[tokio::test]
     async fn connections_beyond_the_cap_wait_for_a_free_slot() {
@@ -379,12 +412,12 @@ mod tests {
     }
 
     /// R5-NET1: a connection that sends nothing is closed at the (short) first-byte deadline,
-    /// not the 30 s header deadline.
+    /// not the (longer) header deadline.
     #[tokio::test]
     async fn a_silent_connection_is_closed_at_the_first_byte_deadline() {
         let addr = spawn_server(ServeLimits {
             first_byte_timeout: Duration::from_millis(300),
-            ..limits(8, Duration::from_secs(30))
+            ..limits(8, ServeLimits::DEFAULT.header_read_timeout)
         })
         .await;
         let started = Instant::now();
@@ -408,7 +441,7 @@ mod tests {
         let server = tokio::spawn(serve_hardened(
             listener,
             app,
-            limits(2, Duration::from_secs(30)),
+            limits(2, ServeLimits::DEFAULT.header_read_timeout),
             async move {
                 let _ = stop_rx.await;
             },
@@ -432,7 +465,7 @@ mod tests {
         let addr = spawn_server(ServeLimits {
             max_pending: 2,
             first_byte_timeout: Duration::from_millis(400),
-            ..limits(8, Duration::from_secs(30))
+            ..limits(8, ServeLimits::DEFAULT.header_read_timeout)
         })
         .await;
         let _silent_a = tokio::net::TcpStream::connect(addr).await.unwrap();
@@ -562,7 +595,7 @@ mod tests {
         tokio::spawn(serve_hardened(
             listener,
             test_app(Arc::new(RateLimiterState::new(100))),
-            limits(8, Duration::from_secs(30)),
+            limits(8, ServeLimits::DEFAULT.header_read_timeout),
             std::future::pending::<()>(),
         ));
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();

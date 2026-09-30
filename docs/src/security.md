@@ -241,7 +241,18 @@ VictauriBuilder::new()
 ```
 
 Built-in patterns (when redaction is enabled):
-- API key values in JSON (`"api_key": "..."` becomes `"api_key": "[REDACTED]"`)
+- Values of sensitive JSON keys (`"api_key": "..."` becomes `"api_key": "[REDACTED]"`; any key
+  containing `token`, `secret`, `password`, `api_key`, `authorization`, `cookie`, … — booleans
+  such as `has_api_key: true` are kept). This applies when the whole output is JSON, to JSON
+  carried **inside** JSON string values (IPC/network request and response bodies are captured as
+  JSON-encoded strings) up to 4 levels deep, and to `"key": value` pairs found in plain text or
+  in a truncated JSON fragment (log fields are cut at 4 KB)
+- Credential parameters in URLs: the value of `access_token`, `refresh_token`, `id_token`,
+  `auth_token`, `token`, `api_key`/`apikey`, `key`, `client_secret`, `secret`, `password`,
+  `pwd`, `auth`, `sig`/`signature` and the AWS/GCS signing parameters after `?`, `&` or `#`
+  (`?access_token=abc&page=2` becomes `?access_token=[REDACTED]&page=2`). Only whole parameter
+  names match, so `?keyboard=` or `&tokens_used=` are left alone — but an innocuous parameter
+  literally named `key` or `auth` is redacted too
 - Bearer tokens in strings
 - Email addresses
 - Common secret key formats
@@ -255,6 +266,20 @@ Redaction is applied as a post-processing step to all tool output, regardless of
 > as a guard against *accidental* disclosure in shared transcripts — not as a control that contains
 > a hostile or prompt-injected client. The real boundary is auth + the privacy profile + not
 > pointing the tools at secrets you don't want an authorized local client to read.
+>
+> Known gaps, beyond deliberate splitting:
+> - **Only output is redacted, not what a tool can test.** Text probes answer yes/no about page
+>   content — `find_elements` text search (allowed even under `Observe`), `wait_for` text /
+>   `text_gone` (`Test`), and `assert_semantic` / `eval_js` (`FullControl`) — so a client can
+>   confirm a redacted value piecewise (does the page contain `sk-a`? `sk-ab`? …) without it ever
+>   appearing in an output.
+> - Key-based redaction recognises keys by name. A secret under an innocuous key
+>   (`{"value": "…"}`), in a non-JSON format (YAML, `key=value` config text outside a URL, HTTP
+>   headers other than `Authorization: Bearer`), or as a JSON object/array value found in plain
+>   text (only string and number values are matched there) passes through unless a value pattern
+>   catches it.
+> - A URL parameter is recognised only by the names listed above, and only after `?`, `&` or
+>   `#` (a secret in a URL *path* segment is not).
 
 ## Origin Guard
 

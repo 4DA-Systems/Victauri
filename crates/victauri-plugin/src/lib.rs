@@ -178,10 +178,59 @@ impl PendingSlot {
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
+
+    /// Record which window this eval's result must come from: `Some(label)` for that window,
+    /// `None` for the default window (resolved when the result arrives). Call before the eval
+    /// is delivered — a result for an unbound eval is refused (see [`eval_result_accepted`]).
+    /// May be called again to narrow `None` to the label the eval actually resolved to.
+    pub(crate) fn bind_window(&self, label: Option<&str>) {
+        let target = label.map_or(EvalTarget::DefaultWindow, |l| {
+            EvalTarget::Window(l.to_string())
+        });
+        eval_targets().insert(self.id.clone(), target);
+    }
+}
+
+/// The window an eval's result must come from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EvalTarget {
+    /// This window.
+    Window(String),
+    /// The default window, as resolved when the result arrives.
+    DefaultWindow,
+}
+
+/// Eval id -> the window its result must come from (entries live as long as their
+/// [`PendingSlot`]). Process-wide: eval ids are UUIDs, unique across every state.
+static EVAL_TARGETS: std::sync::LazyLock<std::sync::Mutex<HashMap<String, EvalTarget>>> =
+    std::sync::LazyLock::new(Default::default);
+
+fn eval_targets() -> std::sync::MutexGuard<'static, HashMap<String, EvalTarget>> {
+    EVAL_TARGETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether an eval result for `id` arriving from webview `caller` may be delivered: only from
+/// the window the eval was sent to (R5B-EVALWIN1). `default_label` resolves the default window
+/// (only called for an eval sent to it). A result for an id with no binding — not a pending eval,
+/// or one that was never bound — is refused.
+pub(crate) fn eval_result_accepted(
+    id: &str,
+    caller: &str,
+    default_label: impl FnOnce() -> Option<String>,
+) -> bool {
+    let target = eval_targets().get(id).cloned();
+    match target {
+        Some(EvalTarget::Window(label)) => label == caller,
+        Some(EvalTarget::DefaultWindow) => default_label().as_deref() == Some(caller),
+        None => false,
+    }
 }
 
 impl Drop for PendingSlot {
     fn drop(&mut self) {
+        eval_targets().remove(&self.id);
         // The map's lock is async and only held for map operations, so it is almost always
         // free; when it is not, finish the removal on the runtime (or block, outside one).
         if let Ok(mut map) = self.map.try_lock() {
@@ -716,6 +765,16 @@ impl VictauriBuilder {
     /// });
     /// # let _ = builder;
     /// ```
+    ///
+    /// # Threading
+    ///
+    /// The closure runs on tokio's **blocking pool** (under a deadline, with panics isolated),
+    /// never on the Tauri main thread. It must therefore not capture, clone or drop Tauri
+    /// handles (`AppHandle`, `Window`, `Webview`, `WebviewWindow`, …) nor call
+    /// `get_webview_window` / `webview_windows`: on Linux every Tauri handle carries a
+    /// non-atomic `Rc` owned by the main thread (tao's window set), and touching it from another
+    /// thread corrupts the host's heap. Read your own `Send + Sync` state (an `Arc`, a lock, an
+    /// atomic) instead, as above.
     #[must_use]
     pub fn probe<F>(mut self, name: impl Into<String>, probe: F) -> Self
     where
@@ -727,6 +786,16 @@ impl VictauriBuilder {
 
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
+    ///
+    /// # Threading
+    ///
+    /// The callback runs on a **tokio worker thread** (Tauri's async runtime), not on the main
+    /// thread, and blocks that worker while it runs — keep it short. Like a
+    /// [`probe`](Self::probe), it must not capture, clone or drop Tauri handles nor call
+    /// `get_webview_window` / `webview_windows` (on Linux that races the main thread's
+    /// non-atomic `Rc` and corrupts the heap) — moving a handle into the callback means it is
+    /// dropped on the worker. To act on the app, signal your own main-thread code instead (a
+    /// channel, an atomic, or state it reads).
     #[must_use]
     pub fn on_ready(mut self, f: impl FnOnce(u16) + Send + 'static) -> Self {
         self.on_ready = Some(Box::new(f));
@@ -871,11 +940,24 @@ impl VictauriBuilder {
 
             Ok(Builder::new("victauri")
                 .setup(move |app, _api| {
-                    // Tauri runs plugin setup on the main (UI) thread — record it so the bridge
-                    // can run main-thread callers inline instead of deadlocking on its lock, and
-                    // give the bridge a handle owned by that thread (see `bridge::on_main`).
-                    bridge::record_main_thread();
-                    bridge::install_main_app(app);
+                    // Record the main (UI) thread so the bridge can run main-thread callers
+                    // inline instead of deadlocking on its lock, and give the bridge a handle
+                    // owned by that thread (see `bridge::on_main`). Tauri runs setup there —
+                    // unless the app registered this plugin at runtime from a background thread
+                    // (`AppHandle::plugin`); then the adoption is posted to the main thread.
+                    match bridge::adopt_main_thread(app) {
+                        Ok(bridge::MainThreadAdoption::Inline) => {}
+                        Ok(bridge::MainThreadAdoption::Posted) => tracing::warn!(
+                            "Victauri: plugin setup ran off the main thread (registered at \
+                             runtime from a background thread?); the main-thread state is being \
+                             installed on the main thread — webview/window tools called before \
+                             it is will fail with \"not installed\""
+                        ),
+                        Err(e) => tracing::error!(
+                            "Victauri: could not reach the main thread to install its state \
+                             ({e}); webview and window tools will fail with \"not installed\""
+                        ),
+                    }
                     let startup_timeline = introspection::StartupTimeline::new();
                     let event_log = EventLog::new(event_capacity);
                     startup_timeline.mark("event_log_created");

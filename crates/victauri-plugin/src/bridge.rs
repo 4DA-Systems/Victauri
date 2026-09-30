@@ -204,6 +204,16 @@ fn find_window<'a, R: Runtime>(
     }
 }
 
+/// The label of the window a `None` label resolves to (see `find_window`). MAIN THREAD ONLY:
+/// it lists the webview windows, which clones their handles (see [`on_main`]) — for a sync
+/// Tauri command such as the eval callback.
+pub(crate) fn default_window_label<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<String> {
+    let windows = app.webview_windows();
+    find_window(&windows, None)
+        .ok()
+        .map(|window| window.label().to_string())
+}
+
 /// Serializes Victauri's main-thread round trips.
 ///
 /// **Correction (0.9.0): the heap corruption described below was NOT caused by concurrent round
@@ -271,17 +281,18 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// The Tauri main (UI) thread, recorded by the plugin's `setup` (which Tauri runs there).
+/// The Tauri main (UI) thread, recorded ON it by [`adopt_main_thread`] (from plugin `setup`).
 static MAIN_THREAD: std::sync::OnceLock<std::thread::ThreadId> = std::sync::OnceLock::new();
 
-/// Record the calling thread as the Tauri main thread. Called once from plugin `setup`.
-pub(crate) fn record_main_thread() {
+/// Record the calling thread as the Tauri main thread. Called on the main thread by
+/// [`adopt_main_thread`].
+fn record_main_thread() {
     let _ = MAIN_THREAD.set(std::thread::current().id());
 }
 
 thread_local! {
     /// An app handle owned by the main thread and only ever cloned or dropped there (installed
-    /// by [`install_main_app`] from plugin `setup`). `on_main` closures take their handle from
+    /// by [`install_main_app`] via [`adopt_main_thread`]). `on_main` closures take their handle from
     /// here instead of from a clone made on the calling thread — see [`on_main`] for why a
     /// Tauri handle must never be cloned or dropped off the main thread.
     static MAIN_APP: std::cell::RefCell<Option<Box<dyn std::any::Any>>> =
@@ -289,10 +300,77 @@ thread_local! {
 }
 
 /// Keep a main-thread-owned clone of `app` for `on_main` closures. Must be called ON the main
-/// thread (plugin `setup`, which Tauri runs there); a call from any other thread stores into that
-/// thread's slot, which no closure ever reads.
-pub(crate) fn install_main_app<R: Runtime>(app: &tauri::AppHandle<R>) {
+/// thread (see [`adopt_main_thread`]); a call from any other thread stores into that thread's
+/// slot, which no closure ever reads.
+fn install_main_app<R: Runtime>(app: &tauri::AppHandle<R>) {
     MAIN_APP.with(|slot| *slot.borrow_mut() = Some(Box::new(app.clone())));
+}
+
+/// How plugin setup adopted the Tauri main thread (see [`adopt_main_thread`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MainThreadAdoption {
+    /// Setup ran on the main thread: recorded and installed in place.
+    Inline,
+    /// Setup ran on another thread; recording and installation were posted to the main thread.
+    Posted,
+}
+
+/// Record the Tauri main thread and give it its own app handle ([`record_main_thread`] +
+/// [`install_main_app`]) — ON the main thread, wherever plugin `setup` happens to run.
+///
+/// Tauri normally runs plugin `setup` on the main thread, but an app may also register a plugin
+/// at runtime from a background thread (`AppHandle::plugin`), and `setup` then runs THERE.
+/// Recording that thread as "main" and installing the handle in its thread-local slot would
+/// leave every later [`on_main`] round trip failing with "the main-thread app handle is not
+/// installed" (the closures read the real main thread's slot, which stays empty).
+///
+/// Which thread is the main one is learned from Tauri itself: `run_on_main_thread` runs a
+/// closure inline when called ON the main thread and queues it otherwise, so a tiny probe tells
+/// the two apart. On the main thread the adoption happens in place (no handle is cloned
+/// anywhere else). Off it, the adoption is posted to the main thread with a handle cloned here —
+/// one unavoidable off-main clone, of the same kind `setup` itself already makes in that case
+/// (it clones the handle for the MCP server) — and round trips made before it runs fail cleanly
+/// with "not installed" instead of misbehaving.
+pub(crate) fn adopt_main_thread<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<MainThreadAdoption, String> {
+    adopt_on_main(
+        app,
+        |job| app.run_on_main_thread(job).map_err(|e| e.to_string()),
+        |main: &tauri::AppHandle<R>| {
+            record_main_thread();
+            install_main_app(main);
+        },
+    )
+}
+
+/// Generic core of [`adopt_main_thread`], testable with a fake main thread. `post` must run a
+/// job inline when called on the main thread and queue it there otherwise (Tauri's
+/// `run_on_main_thread` contract); `adopt` is always called on the main thread.
+fn adopt_on_main<H: Clone + Send + 'static>(
+    handle: &H,
+    post: impl Fn(Box<dyn FnOnce() + Send>) -> Result<(), String>,
+    adopt: impl Fn(&H) + Send + 'static,
+) -> Result<MainThreadAdoption, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let here = std::thread::current().id();
+    let ran_here = std::sync::Arc::new(AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&ran_here);
+    // Queued (off the main thread), this runs later on the main thread and finds a different
+    // thread id there, so it does nothing.
+    post(Box::new(move || {
+        if std::thread::current().id() == here {
+            flag.store(true, Ordering::Release);
+        }
+    }))?;
+    if ran_here.load(Ordering::Acquire) {
+        adopt(handle);
+        return Ok(MainThreadAdoption::Inline);
+    }
+    let owned = handle.clone();
+    post(Box::new(move || adopt(&owned)))?;
+    Ok(MainThreadAdoption::Posted)
 }
 
 /// The main thread's own app handle (a clone made HERE, on the main thread), if installed.
@@ -353,6 +431,14 @@ fn is_main_thread() -> bool {
 ///
 /// Round trips are additionally serialized through [`MAIN_DISPATCH_LOCK`] — see there for the
 /// heap corruption that requires it and the bisect that established it.
+///
+/// **Blocking.** Off the main thread this call BLOCKS its thread until the closure's outcome is
+/// known — up to its 10 s deadline, or about 20 s when the closure started just before it (see
+/// [`serialized_round_trip`]). On a multi-threaded tokio runtime it runs under `block_in_place`,
+/// so the runtime keeps serving other tasks. On a **current-thread** runtime that is impossible
+/// (`block_in_place` panics there), so the whole runtime — every task on it — stalls for that
+/// long while the UI is wedged. Victauri's own server runs on a multi-threaded runtime; do not
+/// call bridge methods from a current-thread runtime you care about.
 fn on_main<R, T, F>(app: &tauri::AppHandle<R>, what: &str, f: F) -> Result<T, String>
 where
     R: Runtime,
@@ -406,9 +492,17 @@ where
 }
 
 /// One serialized round trip: take `gate`'s lock (see [`MAIN_DISPATCH_LOCK`]), then hand `f` to `post`
-/// and wait for it. `timeout` bounds the WHOLE call, including the wait for the lock, so
-/// serializing cannot stack N callers into N * timeout when the UI wedges: each caller still
-/// gives up after `timeout` total, exactly as it did before the lock existed.
+/// and wait for it.
+///
+/// `timeout` is one deadline shared by everything BEFORE the closure starts — the wait for the
+/// lock, for an earlier abandoned closure still running, and for this closure to be picked up —
+/// so serializing cannot stack N callers into N * timeout when the UI wedges: a closure that has
+/// not started by the deadline is abandoned (it never runs) and the call returns at `timeout`.
+/// A closure that DID start before the deadline is waited for up to a further `timeout` (the
+/// `grace` passed to [`dispatch_and_wait`]) so its real outcome is reported rather than
+/// "timed out" for work that happened. So a call returns within `timeout` if its closure never
+/// started, and within about 2 × `timeout` in the worst case (it started just before the
+/// deadline and then ran long).
 fn serialized_round_trip<T, F>(
     gate: &'static DispatchGate,
     what: &str,
@@ -1392,6 +1486,95 @@ mod tests {
             || panic!("boom"),
         );
         assert!(out.unwrap_err().contains("panicked"));
+    }
+
+    /// A stand-in Tauri main thread: runs posted jobs in order, inline when posted from itself
+    /// (exactly what tauri-runtime-wry's `send_user_message` does).
+    struct FakeMainThread {
+        jobs: std::sync::mpsc::Sender<Box<dyn FnOnce() + Send>>,
+        id: std::thread::ThreadId,
+    }
+
+    impl FakeMainThread {
+        fn start() -> Self {
+            let (jobs, rx) = std::sync::mpsc::channel::<Box<dyn FnOnce() + Send>>();
+            let (id_tx, id_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                id_tx.send(std::thread::current().id()).unwrap();
+                while let Ok(job) = rx.recv() {
+                    job();
+                }
+            });
+            Self {
+                jobs,
+                id: id_rx.recv().unwrap(),
+            }
+        }
+
+        fn post(&self) -> impl Fn(Box<dyn FnOnce() + Send>) -> Result<(), String> + '_ {
+            move |job| {
+                if std::thread::current().id() == self.id {
+                    job();
+                    Ok(())
+                } else {
+                    self.jobs.send(job).map_err(|e| e.to_string())
+                }
+            }
+        }
+
+        /// Run `f` on the fake main thread and wait for it.
+        fn run<T: Send + 'static>(&self, f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.jobs
+                .send(Box::new(move || tx.send(f()).unwrap()))
+                .unwrap();
+            rx.recv().unwrap()
+        }
+    }
+
+    type Adopted = Arc<std::sync::Mutex<Vec<(std::thread::ThreadId, String)>>>;
+
+    fn recording_adopt(log: &Adopted) -> impl Fn(&String) + Send + 'static {
+        let log = Arc::clone(log);
+        move |h: &String| {
+            log.lock()
+                .unwrap()
+                .push((std::thread::current().id(), h.clone()));
+        }
+    }
+
+    /// R5B-MAIN1: Tauri lets an app register a plugin later from a background thread
+    /// (`AppHandle::plugin`), and then the plugin's `setup` runs THERE. Recording that thread as
+    /// "main" and installing the handle in its thread-local left every later `on_main` round
+    /// trip failing with "the main-thread app handle is not installed". Adoption must happen on
+    /// the real main thread.
+    #[test]
+    fn setup_off_the_main_thread_adopts_the_real_main_thread() {
+        let main = FakeMainThread::start();
+        let log: Adopted = Arc::default();
+        let handle = "app".to_string();
+        let outcome = super::adopt_on_main(&handle, main.post(), recording_adopt(&log));
+        assert_eq!(outcome, Ok(super::MainThreadAdoption::Posted));
+        // The posted adoption runs before anything posted after it.
+        main.run(|| ());
+        let adopted = log.lock().unwrap().clone();
+        assert_eq!(adopted, vec![(main.id, "app".to_string())]);
+    }
+
+    /// The normal case — setup on the main thread — adopts in place, before returning.
+    #[test]
+    fn setup_on_the_main_thread_adopts_inline() {
+        let main = Arc::new(FakeMainThread::start());
+        let log: Adopted = Arc::default();
+        let (m, l) = (Arc::clone(&main), Arc::clone(&log));
+        let outcome = main.run(move || {
+            let outcome = super::adopt_on_main(&"app".to_string(), m.post(), recording_adopt(&l));
+            // Adopted before `adopt_on_main` returned, not merely queued.
+            let adopted_now = l.lock().unwrap().len();
+            (outcome, adopted_now)
+        });
+        assert_eq!(outcome, (Ok(super::MainThreadAdoption::Inline), 1));
+        assert_eq!(log.lock().unwrap()[0].0, main.id);
     }
 
     #[test]

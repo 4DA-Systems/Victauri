@@ -4952,7 +4952,8 @@ impl VictauriMcpHandler {
     async fn probe_bridge(&self, webview_label: Option<&str>) -> Result<Option<String>, String> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _slot = self.reserve_pending(&id, tx).await?;
+        let slot = self.reserve_pending(&id, tx).await?;
+        slot.bind_window(webview_label);
         let probe = crate::js_bridge::eval_probe_script(&id);
         if let Err(e) = self.bridge.eval_webview(webview_label, &probe) {
             return Err(format!("eval injection failed: {e}"));
@@ -5144,10 +5145,12 @@ impl VictauriMcpHandler {
 
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _slot = self
+        let slot = self
             .reserve_pending(&id, tx)
             .await
             .map_err(|e| EvalFailure::new(NotSent, e))?;
+        // Only the target window may answer (a `None` label is narrowed once it has resolved).
+        slot.bind_window(webview_label);
 
         // Auto-prepend `return` so bare expressions produce a value — but ONLY
         // for single expressions. Multi-statement blocks (or code containing an
@@ -5188,6 +5191,7 @@ impl VictauriMcpHandler {
         let deliver_to = if target.is_empty() {
             webview_label
         } else {
+            slot.bind_window(Some(target.as_str()));
             Some(target.as_str())
         };
         let check = crate::js_bridge::eval_check_script(&id, armed_nonce.as_deref());
