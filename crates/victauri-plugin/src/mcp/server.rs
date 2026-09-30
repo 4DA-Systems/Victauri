@@ -478,22 +478,107 @@ fn discovery_dir() -> std::path::PathBuf {
     discovery_root().join(std::process::id().to_string())
 }
 
-/// The directory holding every `<pid>/` discovery entry of this user.
+/// The directory holding every `<pid>/` discovery entry of this user — decided ONCE per
+/// process, so the entry is written and later removed in the same place.
 ///
 /// On Unix it is per-user: `$XDG_RUNTIME_DIR/victauri` when that directory is private to us,
 /// else `<temp>/victauri-<euid>`. The old shared `/tmp/victauri` let any other local user
 /// pre-create it, after which the ownership check refused it and discovery was blocked for
-/// good. Windows and other platforms keep `<temp>/victauri` (their temp dir is per-user).
-/// Every reader (`victauri` CLI, `victauri-test`, `victauri-watchdog`) scans the same roots.
+/// good. `<temp>/victauri-<euid>` is predictable too, and sticky `/tmp` stops us deleting
+/// another user's pre-created copy, so when that root is untrusted (or cannot be created) the
+/// entry goes to a per-user root under the home directory instead —
+/// `$XDG_STATE_HOME/victauri`, else `$HOME/.local/state/victauri` — owner-only (0700) and
+/// verified like the others (R5B-LINDISC1). Windows and other platforms keep `<temp>/victauri`
+/// (their temp dir is per-user; Windows readers verify ownership). Every reader (`victauri`
+/// CLI, `victauri-test`, `victauri-watchdog`, the VS Code extension) scans the same roots, in
+/// order: runtime dir, `<temp>/victauri-<euid>`, the home state root, then the legacy
+/// `<temp>/victauri`.
 fn discovery_root() -> std::path::PathBuf {
-    #[cfg(unix)]
-    {
-        discovery_root_from(std::env::var_os("XDG_RUNTIME_DIR"), current_euid())
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        #[cfg(unix)]
+        {
+            let euid = current_euid();
+            select_discovery_root(
+                &discovery_root_from(std::env::var_os("XDG_RUNTIME_DIR"), euid),
+                euid.and_then(|_| {
+                    home_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+                }),
+            )
+        }
+        #[cfg(not(unix))]
+        {
+            std::env::temp_dir().join("victauri")
+        }
+    })
+    .clone()
+}
+
+/// `primary` when it is (or can be made) a private directory of ours; else the home state
+/// `fallback` when THAT can be; else `primary` anyway — whose ownership check then refuses it,
+/// so discovery fails closed exactly as before.
+#[cfg(unix)]
+fn select_discovery_root(
+    primary: &std::path::Path,
+    fallback: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if ensure_unix_private_dir(primary) {
+        return primary.to_path_buf();
     }
-    #[cfg(not(unix))]
+    if let Some(fallback) = fallback
+        && ensure_home_state_root(&fallback)
     {
-        std::env::temp_dir().join("victauri")
+        tracing::warn!(
+            "discovery root {} is not usable (another user may have created it); \
+             registering under {} instead",
+            primary.display(),
+            fallback.display()
+        );
+        return fallback;
     }
+    primary.to_path_buf()
+}
+
+/// The per-user discovery root under the home directory: `$XDG_STATE_HOME/victauri`, else
+/// `$HOME/.local/state/victauri` (each only when absolute).
+#[cfg(unix)]
+fn home_state_root(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let absolute =
+        |p: std::ffi::OsString| Some(std::path::PathBuf::from(p)).filter(|p| p.is_absolute());
+    xdg_state_home
+        .and_then(absolute)
+        .or_else(|| {
+            home.and_then(absolute)
+                .map(|h| h.join(".local").join("state"))
+        })
+        .map(|state| state.join("victauri"))
+}
+
+/// Create (0700) or accept the home state `root`: its parent must be a directory owned by us
+/// that no OTHER user can write (so nobody else can swap `victauri` out from under us), and
+/// `root` itself a private directory of ours — the same check every other root gets.
+#[cfg(unix)]
+fn ensure_home_state_root(root: &std::path::Path) -> bool {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    let (Some(parent), Some(euid)) = (root.parent(), current_euid()) else {
+        return false;
+    };
+    // Missing `~/.local/state` components are created owner-only.
+    if std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .is_err()
+    {
+        return false;
+    }
+    let parent_ok = std::fs::metadata(parent)
+        .is_ok_and(|m| m.is_dir() && m.uid() == euid && m.mode() & 0o002 == 0);
+    parent_ok && ensure_unix_private_dir(root)
 }
 
 #[cfg(unix)]
@@ -1634,6 +1719,68 @@ mod tests {
             discovery_root_from(Some("relative/run".into()), Some(euid)),
             fallback
         );
+    }
+
+    /// R5B-LINDISC1: another local user can pre-create the predictable `/tmp/victauri-<euid>`
+    /// (and sticky `/tmp` stops us deleting it); the app then never registered. An untrusted
+    /// primary root now falls back to the per-user home state root. (A root owned by another
+    /// account needs a second account to set up — see the WSL run; a symlink or a non-directory
+    /// at the primary path is refused by the same check.)
+    #[cfg(unix)]
+    #[test]
+    fn an_untrusted_primary_root_falls_back_to_the_home_state_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = tempfile::tempdir().unwrap();
+        let home = base.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fallback = home_state_root(None, Some(home.clone().into()));
+        let expected = home.join(".local").join("state").join("victauri");
+        assert_eq!(fallback.as_deref(), Some(expected.as_path()));
+
+        // Taken over: a symlink planted at the primary path.
+        let elsewhere = base.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let hijacked = base.path().join("victauri-hijacked");
+        std::os::unix::fs::symlink(&elsewhere, &hijacked).unwrap();
+        assert_eq!(select_discovery_root(&hijacked, fallback.clone()), expected);
+        assert!(unix_private_dir_is_trusted(&expected));
+        let mode = std::fs::metadata(&expected).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+        // Blocked by a plain file.
+        let blocked = base.path().join("victauri-blocked");
+        std::fs::write(&blocked, "x").unwrap();
+        assert_eq!(select_discovery_root(&blocked, fallback.clone()), expected);
+
+        // A usable primary is kept.
+        let fine = base.path().join("victauri-fine");
+        assert_eq!(select_discovery_root(&fine, fallback), fine);
+
+        // No usable fallback: the primary is returned and its check then refuses it.
+        assert_eq!(select_discovery_root(&hijacked, None), hijacked);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_state_root_prefers_an_absolute_xdg_state_home_and_guards_its_parent() {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            home_state_root(Some("/x/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/x/state/victauri"))
+        );
+        assert_eq!(
+            home_state_root(Some("rel/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/home/u/.local/state/victauri"))
+        );
+        assert_eq!(home_state_root(None, Some("rel".into())), None);
+        assert_eq!(home_state_root(None, None), None);
+
+        // A parent other users can write is refused (they could swap the root out).
+        let base = tempfile::tempdir().unwrap();
+        let open = base.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(!ensure_home_state_root(&open.join("victauri")));
     }
 
     #[cfg(unix)]

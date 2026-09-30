@@ -306,3 +306,163 @@ fn init_prints_a_hostile_identifier_on_one_escaped_line() {
         "{err}"
     );
 }
+
+/// R5B-DOCTOR1: `victauri doctor` printed `[FAIL]` items but always exited 0, so a CI step
+/// running it could never fail. A FAIL exits 1; warnings alone do not.
+#[test]
+fn doctor_exits_nonzero_when_a_check_fails() {
+    let iso = IsolatedTemp::new();
+    // No Cargo.toml here: the very first check FAILs.
+    let empty = iso.0.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let out = iso
+        .victauri(&["doctor"])
+        .current_dir(&empty)
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(err.contains("[FAIL]"), "{err}");
+    assert_eq!(out.status.code(), Some(1), "a FAIL must exit 1:\n{err}");
+}
+
+fn write_tauri_project(dir: &std::path::Path, tauri_dep: bool) {
+    std::fs::create_dir_all(dir).unwrap();
+    let deps = if tauri_dep { "tauri = \"2\"\n" } else { "" };
+    std::fs::write(
+        dir.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n{deps}"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("tauri.conf.json"),
+        json!({"identifier": "com.test.init"}).to_string(),
+    )
+    .unwrap();
+}
+
+/// R5B-INIT1: `init` canonicalizes the project root, which on Windows yields a `\?\C:\…`
+/// verbatim path — and printed it that way.
+#[test]
+fn init_never_prints_verbatim_windows_paths() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    // No tauri dependency → `init` warns and names the Cargo.toml path.
+    write_tauri_project(&project, false);
+    let out = iso
+        .victauri(&["init", "--path", project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("Cargo.toml"), "{err}");
+    assert!(!err.contains(r"\?\"), "verbatim path printed:\n{err}");
+}
+
+/// R5B-INIT2: with an existing `.mcp.json` that lacks Victauri, the suggested snippet must pin
+/// the bridge to the app exactly like the generated file does (`--app <identifier>`).
+#[test]
+fn init_suggestion_for_an_existing_mcp_json_pins_the_app() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    write_tauri_project(&project, true);
+    std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    let out = iso
+        .victauri(&["init", "--path", project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert!(
+        err.contains(r#""args": ["bridge", "--app", "com.test.init"]"#),
+        "the suggestion must pin the app:\n{err}"
+    );
+}
+
+/// R5B-PORTAPP1: with `VICTAURI_PORT` set, `--app` / `VICTAURI_APP` was silently ignored by
+/// victauri-test's discovery (so by every CLI command but the bridge) — the command drove
+/// whatever app held that port. Both set must agree; disagreement is a clear error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn victauri_port_with_a_different_app_selector_is_refused() {
+    let iso = IsolatedTemp::new();
+    let port = start_mock("com.test.portapp").await;
+    iso.write_entry(std::process::id(), port, "tok", "com.test.portapp");
+
+    // Discovery metadata for that port disagrees with the selector.
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw", "--app", "com.test.other"]);
+    cmd.env("VICTAURI_PORT", port.to_string());
+    let out = run(cmd).await;
+    let err = stderr(&out);
+    assert!(!out.status.success(), "must refuse:\n{err}");
+    assert!(
+        err.contains("VICTAURI_PORT") && err.contains("com.test.other"),
+        "{err}"
+    );
+    assert!(
+        !stdout(&out).contains("com.test.portapp"),
+        "drove the app anyway"
+    );
+
+    // No discovery entry for the port (explicit token too): `/info` still disagrees.
+    let other = start_mock("com.test.unlisted").await;
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw"]);
+    cmd.env("VICTAURI_PORT", other.to_string())
+        .env("VICTAURI_AUTH_TOKEN", "t")
+        .env("VICTAURI_APP", "com.test.portapp");
+    let out = run(cmd).await;
+    let err = stderr(&out);
+    assert!(!out.status.success(), "must refuse:\n{err}");
+    assert!(err.contains("com.test.unlisted"), "{err}");
+
+    // Agreeing selectors work.
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw", "--app", "com.test.portapp"]);
+    cmd.env("VICTAURI_PORT", port.to_string());
+    let out = run(cmd).await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("com.test.portapp"));
+}
+
+/// R5B-LINDISC1: when another user has pre-created `<temp>/victauri-<uid>` (sticky /tmp stops
+/// us removing it) the app registers under `$HOME/.local/state/victauri` instead — and every
+/// reader must look there. (0777 stands in for "another user's"; the WSL run used a real
+/// foreign-owned directory.)
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn readers_find_an_app_registered_under_the_home_state_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let iso = IsolatedTemp::new();
+    let port = start_mock("com.test.homeroot").await;
+    // The predictable per-user temp root exists but is untrusted.
+    let uid = std::os::unix::fs::MetadataExt::uid(&std::fs::metadata(iso.0.path()).unwrap());
+    let squatted = iso.0.path().join(format!("victauri-{uid}"));
+    std::fs::create_dir(&squatted).unwrap();
+    std::fs::set_permissions(&squatted, std::fs::Permissions::from_mode(0o777)).unwrap();
+    // The app's entry, where the plugin falls back to.
+    let home = iso.0.path().join("home");
+    let root = home.join(".local").join("state").join("victauri");
+    let dir = root.join(std::process::id().to_string());
+    std::fs::create_dir_all(&dir).unwrap();
+    for d in [&home, &root, &dir] {
+        std::fs::set_permissions(d, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    std::fs::write(dir.join("port"), port.to_string()).unwrap();
+    std::fs::write(dir.join("token"), "tok").unwrap();
+    std::fs::write(
+        dir.join("metadata.json"),
+        json!({"identifier": "com.test.homeroot"}).to_string(),
+    )
+    .unwrap();
+
+    let mut cmd = iso.victauri(&["invoke", "whoami", "--raw"]);
+    cmd.env("HOME", &home)
+        .env_remove("XDG_RUNTIME_DIR")
+        .env_remove("XDG_STATE_HOME");
+    let out = run(cmd).await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("com.test.homeroot"),
+        "{}",
+        stdout(&out)
+    );
+}

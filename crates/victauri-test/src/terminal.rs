@@ -58,9 +58,46 @@ pub fn multi_line(text: &str) -> String {
     out
 }
 
+/// For an untrusted multi-line message — a JS exception text, a server's error message:
+/// [`multi_line`], and additionally every line that would be read as a CI workflow command
+/// (`::error …` / `::warning …` for GitHub Actions, legacy `##[…]`, after any indentation) has
+/// its first character escaped, so it prints as text instead of forging an annotation or
+/// masking a secret (R5B-TERM3). Legitimate line breaks are kept.
+#[must_use]
+pub fn untrusted_multi_line(text: &str) -> String {
+    let safe = multi_line(text);
+    let mut out = String::with_capacity(safe.len());
+    for (i, line) in safe.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let body = line.trim_start();
+        if body.starts_with("::") || body.starts_with("##[") {
+            let indent = &line[..line.len() - body.len()];
+            let mut chars = body.chars();
+            let first = chars.next().unwrap_or(':');
+            out.push_str(indent);
+            push_escaped(&mut out, first);
+            out.push_str(chars.as_str());
+        } else {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn untrusted_multi_line_defuses_workflow_command_lines_only() {
+        assert_eq!(
+            untrusted_multi_line("ok\n::error::x\n\t  ::set-output\n##[group]g\na::b"),
+            "ok\n\\u{3a}:error::x\n\t  \\u{3a}:set-output\n\\u{23}#[group]g\na::b"
+        );
+        assert_eq!(untrusted_multi_line("a\r\nb\u{1b}"), "a\nb\\u{1b}");
+    }
 
     #[test]
     fn single_line_cannot_start_a_forged_ci_annotation() {

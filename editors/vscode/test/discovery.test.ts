@@ -9,6 +9,8 @@ import * as path from "node:path";
 import { authProbeVerdict, healthStatusMeansAlive } from "../src/client";
 import {
   DiscoveredServer,
+  discoveryRoots,
+  homeStateRoot,
   pidLiveness,
   resolveConnection,
   scanServers,
@@ -120,4 +122,71 @@ test("an authenticated /info 429 is not a successful auth probe", () => {
   assert.equal(authProbeVerdict(401), "unauthorized");
   assert.equal(authProbeVerdict(429), "rate-limited");
   assert.equal(authProbeVerdict(500), "error");
+});
+
+// R5B-WINDISC1: on a shared TEMP (e.g. C:\msys64\tmp) another user can plant
+// `victauri\<live pid>\{port,token,…}` pointing at a port they control. On Windows a discovery
+// directory is trusted only when the current user (or BUILTIN\Administrators, when this
+// token is a member) owns it. SYSTEM stands in for "another user" — setting that up needs an
+// elevated run; the test skips otherwise.
+test("windows: a discovery directory owned by another account is not trusted", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("windows only");
+    return;
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "victauri-vsc-owner-"));
+  try {
+    const mine = path.join(root, "201");
+    const planted = path.join(root, "202");
+    for (const [dir, port] of [
+      [mine, 7501],
+      [planted, 7502],
+    ] as const) {
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "port"), String(port));
+      fs.writeFileSync(path.join(dir, "token"), `tok-${port}`);
+    }
+    const setOwner = spawnSync("icacls", [planted, "/setowner", "*S-1-5-18", "/q"]);
+    if (setOwner.status !== 0) {
+      t.skip("cannot change a directory's owner (not elevated)");
+      return;
+    }
+    // Force the real owner check even though the test root sits inside the user profile.
+    const result = await scanServers((pid) => (pid >= 201 ? "own" : "dead"), [root], {
+      profileDir: "Z:\victauri-no-such-profile",
+    });
+    assert.deepEqual(
+      result.live.map((s) => s.pid),
+      [201],
+      "a planted entry's token must never be read"
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// R5B-LINDISC1: the plugin falls back to a per-user root under the home directory when the
+// predictable `<temp>/victauri-<uid>` was taken over by another user; the extension must scan it.
+test("homeStateRoot: $XDG_STATE_HOME/victauri, else ~/.local/state/victauri", () => {
+  assert.equal(homeStateRoot({ XDG_STATE_HOME: "/x/state", HOME: "/home/u" }), "/x/state/victauri");
+  assert.equal(
+    homeStateRoot({ XDG_STATE_HOME: "rel", HOME: "/home/u" }),
+    "/home/u/.local/state/victauri"
+  );
+  assert.equal(homeStateRoot({ HOME: "/home/u" }), "/home/u/.local/state/victauri");
+  assert.equal(homeStateRoot({ HOME: "rel" }), undefined);
+  assert.equal(homeStateRoot({}), undefined);
+});
+
+test("unix: the home fallback root is scanned after <temp>/victauri-<uid>, before the legacy root", async (t) => {
+  if (process.platform === "win32") {
+    t.skip("unix only");
+    return;
+  }
+  const roots = await discoveryRoots();
+  const home = homeStateRoot();
+  assert.ok(home, "HOME is set");
+  const at = roots.indexOf(home!);
+  assert.ok(at > 0 && at < roots.length - 1, JSON.stringify(roots));
+  assert.ok(roots[at - 1].endsWith(`victauri-${process.geteuid!()}`), JSON.stringify(roots));
 });

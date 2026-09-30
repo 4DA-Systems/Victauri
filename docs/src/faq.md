@@ -70,7 +70,7 @@ Check that:
 
 If the default port (7373) is busy, Victauri tries 7374-7383. The actual port is:
 - Printed to stdout/logs on startup
-- Written to the per-process discovery dir `<temp_dir>/victauri/<pid>/port` (next to the auth `token` and a `metadata.json` with the app identity)
+- Written to the per-process discovery dir `<root>/<pid>/port` (next to the auth `token` and a `metadata.json` with the app identity) — `<root>` is per-user; see [Security: discovery-directory protection](security.md#discovery-directory-protection)
 - Available via `GET /info` on the bound port
 - Discoverable by the `victauri check` CLI command
 

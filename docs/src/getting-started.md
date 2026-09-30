@@ -106,9 +106,11 @@ builder with `.auth_token("…")` (or the `VICTAURI_AUTH_TOKEN` env var).
 With your app running, check the health endpoint:
 
 Auth is on by default, so every endpoint except `/health` needs the Bearer token. The plugin
-writes it (and the bound port) to a per-process discovery directory:
-`<temp>/victauri/<pid>/token` (and `.../port`), where `<temp>` is your OS temp dir (`$TMPDIR`
-or `/tmp` on macOS/Linux, `%TEMP%` on Windows) and `<pid>` is the app's process id.
+writes it (and the bound port) to a per-process, per-user discovery directory
+`<root>/<pid>/token` (and `.../port`), where `<pid>` is the app's process id and `<root>` is
+`%TEMP%\victauri` on Windows; on macOS/Linux it is `$XDG_RUNTIME_DIR/victauri` when that
+directory is private to you, else `<temp>/victauri-<uid>` (`<temp>` = `$TMPDIR` or `/tmp`), or
+`~/.local/state/victauri` (`$XDG_STATE_HOME/victauri`) if that one is unusable.
 
 ```bash
 curl http://127.0.0.1:7373/health

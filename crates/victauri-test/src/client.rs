@@ -499,14 +499,24 @@ impl VictauriClient {
 
     /// Read the host app's identifier from the server's `/info` endpoint.
     async fn fetch_app_identifier(&self) -> Option<String> {
+        self.fetch_app_identity().await?.0
+    }
+
+    /// The host app's `(app_identifier, app_product_name)` from the server's `/info`
+    /// endpoint; `None` when it does not answer one.
+    async fn fetch_app_identity(&self) -> Option<(Option<String>, Option<String>)> {
         let mut req = self.http.get(format!("{}/info", self.base_url));
         if let Some(ref t) = self.auth_token {
             req = req.header("Authorization", format!("Bearer {t}"));
         }
         let info: Value = req.send().await.ok()?.json().await.ok()?;
-        info.get("app_identifier")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+        let field = |k: &str| {
+            info.get(k)
+                .and_then(Value::as_str)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        };
+        Some((field("app_identifier"), field("app_product_name")))
     }
 
     /// After a rediscovery re-handshake, confirm the server is still the app this
@@ -579,10 +589,41 @@ impl VictauriClient {
                 // Pin the app identity so a later rediscovery can only re-attach to
                 // this same app. `/info` is authoritative (it is the server we just
                 // reached); discovery metadata is the fallback for older plugins.
-                client.app_identifier = match client.fetch_app_identifier().await {
-                    Some(id) => Some(id),
-                    None => crate::discovery::identifier_for_port(port),
-                };
+                let (identifier, product_name) =
+                    client.fetch_app_identity().await.unwrap_or_default();
+                client.app_identifier =
+                    identifier.or_else(|| crate::discovery::identifier_for_port(port));
+                // An app selector must match the app actually reached — essential when
+                // `VICTAURI_PORT` names the endpoint (R5B-PORTAPP1), and a cheap re-check
+                // otherwise. An app whose identity is unknown (a pre-0.7.4 plugin) passes.
+                let selector = app
+                    .map(str::to_string)
+                    .or_else(crate::discovery::configured_app);
+                if let Some(selector) = selector
+                    && (client.app_identifier.is_some() || product_name.is_some())
+                    && !crate::discovery::identity_matches(
+                        client.app_identifier.as_deref(),
+                        product_name.as_deref(),
+                        &selector,
+                    )
+                {
+                    let found = client
+                        .app_identifier
+                        .clone()
+                        .or(product_name)
+                        .unwrap_or_default();
+                    let message = if crate::discovery::configured_port().is_some() {
+                        crate::discovery::port_app_mismatch(port, &found, &selector)
+                    } else {
+                        format!(
+                            "the server on port {port} is app '{}', not the selected '{}' — \
+                             refusing to drive a different app",
+                            crate::terminal::single_line(&found),
+                            crate::terminal::single_line(&selector)
+                        )
+                    };
+                    return Err(TestError::Other(message));
+                }
                 Ok(client)
             }
             Err(TestError::Connection { host, port, reason }) => {
@@ -860,10 +901,13 @@ impl VictauriClient {
                 return Ok(parsed);
             }
             let hint = if status == reqwest::StatusCode::UNAUTHORIZED {
-                " — auth token missing or wrong (auth is on by default; the token is in \
-                 <temp>/victauri/<pid>/token, or set VICTAURI_AUTH_TOKEN)"
+                format!(
+                    " — auth token missing or wrong (auth is on by default; the app writes it to \
+                     {}; or set VICTAURI_AUTH_TOKEN)",
+                    crate::discovery::TOKEN_LOCATIONS
+                )
             } else {
-                ""
+                String::new()
             };
             return Err(TestError::Connection {
                 host: host.to_string(),
@@ -1651,7 +1695,7 @@ impl VictauriClient {
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to get_ipc_calls_since")]
-    pub async fn ipc_calls_since(&mut self, checkpoint: usize) -> Result<Vec<Value>, TestError> {
+    pub async fn ipc_calls_since(&mut self, checkpoint: u64) -> Result<Vec<Value>, TestError> {
         // Timestamp filter, NOT positional skip: the server's log tools return a
         // capped sliding window of the NEWEST entries (default 100), so
         // `skip(checkpoint_length)` silently yields nothing the moment a busy app
@@ -1663,7 +1707,7 @@ impl VictauriClient {
             .filter(|e| {
                 e.get("timestamp")
                     .and_then(Value::as_u64)
-                    .map_or(checkpoint == 0, |t| t > checkpoint as u64)
+                    .map_or(checkpoint == 0, |t| t > checkpoint)
             })
             .collect())
     }
@@ -1697,10 +1741,7 @@ impl VictauriClient {
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn get_ipc_calls_since(
-        &mut self,
-        checkpoint: usize,
-    ) -> Result<Vec<Value>, TestError> {
+    pub async fn get_ipc_calls_since(&mut self, checkpoint: u64) -> Result<Vec<Value>, TestError> {
         #[allow(deprecated)]
         self.ipc_calls_since(checkpoint).await
     }
@@ -1743,14 +1784,14 @@ impl VictauriClient {
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to create_ipc_checkpoint")]
-    pub async fn ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+    pub async fn ipc_checkpoint(&mut self) -> Result<u64, TestError> {
         self.create_ipc_checkpoint().await
     }
 
     /// Snapshot the newest IPC-log timestamp, for use with `ipc_calls_since`.
     ///
-    /// Returns the maximum entry `timestamp` (epoch milliseconds) currently
-    /// visible in the IPC log, or `0` when the log is empty. Pass this value to
+    /// Returns the maximum entry `timestamp` (epoch milliseconds, a `u64` — epoch ms do not
+    /// fit a 32-bit `usize`) currently visible in the IPC log, or `0` when the log is empty. Pass this value to
     /// [`VictauriClient::ipc_calls_since`] to get only the calls that occurred
     /// after the checkpoint. For non-empty logs this method waits until the
     /// local clock has advanced past the checkpoint millisecond before it
@@ -1763,7 +1804,7 @@ impl VictauriClient {
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn create_ipc_checkpoint(&mut self) -> Result<usize, TestError> {
+    pub async fn create_ipc_checkpoint(&mut self) -> Result<u64, TestError> {
         // The checkpoint is the NEWEST entry timestamp (epoch ms), not the log
         // length: the log tools serve a capped sliding window, so a length
         // snapshot breaks (always-empty `calls_since`) once the app has logged
@@ -1775,7 +1816,7 @@ impl VictauriClient {
             .max()
             .unwrap_or(0);
         wait_past_ipc_checkpoint_ms(checkpoint_ms).await;
-        Ok(checkpoint_ms as usize)
+        Ok(checkpoint_ms)
     }
 
     // ── Typed Response Methods (Phase 4E) ────────────────────────────────────
@@ -2553,6 +2594,36 @@ pub fn assert_state_matches(verification: &Value) {
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    /// R5B-HINT1: the 401 hint named `<temp>/victauri/<pid>/token`, which 0.9 no longer writes
+    /// on Unix (per-user roots) — pointing a user at an empty directory.
+    #[tokio::test]
+    async fn unauthorized_hint_names_the_real_discovery_locations() {
+        let resp = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(401)
+                .body("unauthorized")
+                .unwrap(),
+        );
+        let Err(TestError::Connection { reason, .. }) =
+            VictauriClient::parse_response(resp, "127.0.0.1", 7373, 1).await
+        else {
+            panic!("a 401 must be a connection error");
+        };
+        assert!(
+            !reason.contains("<temp>/victauri/<pid>/token"),
+            "stale location: {reason}"
+        );
+        #[cfg(unix)]
+        assert!(
+            reason.contains("$XDG_RUNTIME_DIR/victauri/<pid>/token")
+                && reason.contains("victauri-<uid>/<pid>/token"),
+            "{reason}"
+        );
+        #[cfg(windows)]
+        assert!(reason.contains(r"%TEMP%\victauri\<pid>\token"), "{reason}");
+        assert!(reason.contains("VICTAURI_AUTH_TOKEN"), "{reason}");
+    }
 
     #[test]
     fn truncate_chars_never_splits_a_code_point() {

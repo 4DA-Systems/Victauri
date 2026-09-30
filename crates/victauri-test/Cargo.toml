@@ -29,8 +29,9 @@ base64 = "0.22"
 uuid = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-# Process liveness + owner check for discovery (`process.rs`), instead of spawning tasklist.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+# Process liveness + owner check for discovery, and the discovery-directory owner check
+# (`process.rs`), instead of spawning tasklist.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading"] }
 
 [dev-dependencies]
 axum = { workspace = true }

@@ -1185,8 +1185,10 @@ async fn ipc_checkpoint_waits_past_current_millisecond_boundary() {
         "content": [{"type": "text", "text": serde_json::to_string(&before).unwrap()}]
     }));
 
-    let cp = client.create_ipc_checkpoint().await.unwrap();
-    assert_eq!(cp, boundary as usize);
+    // R5B-CKPT1: an epoch-millisecond checkpoint is a `u64` — a `usize` truncated it on
+    // 32-bit targets (epoch ms exceed u32::MAX), silently breaking `get_ipc_calls_since`.
+    let cp: u64 = client.create_ipc_checkpoint().await.unwrap();
+    assert_eq!(cp, boundary);
 
     let after_ts = test_epoch_ms();
     assert!(

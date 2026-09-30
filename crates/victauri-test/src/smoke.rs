@@ -40,10 +40,14 @@ pub struct SmokeCheckResult {
     pub name: String,
     /// Whether the check passed.
     pub passed: bool,
-    /// Failure detail (empty when passed).
+    /// Failure detail (empty when passed), or the reason a skipped check did not run.
     pub detail: String,
     /// Wall-clock duration of this check.
     pub duration: Duration,
+    /// The check did not run because its precondition is not met (e.g. the recording
+    /// check while another client's recording is in progress). A skipped check counts as
+    /// passed; [`SmokeReport::to_summary`] shows it as `[SKIP]` with the reason.
+    pub skipped: bool,
 }
 
 /// Aggregate report from [`VictauriClient::smoke_test()`].
@@ -155,13 +159,17 @@ impl SmokeReport {
             self.duration.as_secs_f64(),
         ));
         for check in &self.checks {
-            let status = if check.passed { "PASS" } else { "FAIL" };
+            let status = match (check.passed, check.skipped) {
+                (true, true) => "SKIP",
+                (true, false) => "PASS",
+                (false, _) => "FAIL",
+            };
             out.push_str(&format!(
                 "  [{status}] {} ({:.0}ms)\n",
                 crate::terminal::single_line(&check.name),
                 check.duration.as_millis(),
             ));
-            if !check.passed && !check.detail.is_empty() {
+            if (!check.passed || check.skipped) && !check.detail.is_empty() {
                 out.push_str(&format!(
                     "         {}\n",
                     crate::terminal::single_line(&check.detail)
@@ -400,16 +408,46 @@ impl VictauriClient {
     /// event drain loop (2 seconds), stops recording, and verifies events
     /// were captured.
     ///
+    /// The app records one session at a time. If a recording is already in progress —
+    /// another client's, e.g. a concurrent `victauri record` — it is left running and this
+    /// check does not run (returns `Ok`); [`Self::smoke_test`] reports it as skipped.
+    ///
     /// # Errors
     ///
     /// Returns [`TestError::Assertion`] if recording captures zero events.
     pub async fn assert_recording_lifecycle(&mut self) -> Result<(), TestError> {
-        let _ = self.stop_recording().await;
-        self.start_recording(None).await?;
-        self.eval_js("console.log('victauri-smoke-test')").await?;
-        self.eval_js("document.title").await?;
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let session = self.stop_recording().await?;
+        self.recording_lifecycle_check().await.map(|_| ())
+    }
+
+    /// [`Self::assert_recording_lifecycle`]; `Ok(Some(reason))` when it was skipped.
+    ///
+    /// It never stops a recording it did not start (R5B-SMOKE1): it used to call
+    /// `stop_recording` first "to clean up", which ended — and discarded — any recording
+    /// already in progress. Starting first is race-free: the app refuses a second session.
+    async fn recording_lifecycle_check(&mut self) -> Result<Option<String>, TestError> {
+        match self.start_recording(None).await {
+            Ok(_) => {}
+            Err(TestError::ToolError(msg)) if msg.contains("already active") => {
+                return Ok(Some(
+                    "skipped: a recording is already in progress (another client, e.g. \
+                     `victauri record`); it was left running. Stop it to run this check."
+                        .to_string(),
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+        // From here on the recording is OURS: stop it on every path, or a failed eval would
+        // leave it running and every later smoke run would skip this check.
+        let activity = async {
+            self.eval_js("console.log('victauri-smoke-test')").await?;
+            self.eval_js("document.title").await?;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok::<(), TestError>(())
+        }
+        .await;
+        let stopped = self.stop_recording().await;
+        activity?;
+        let session = stopped?;
         let event_count = session
             .get("events")
             .and_then(Value::as_array)
@@ -419,7 +457,7 @@ impl VictauriClient {
                 "recording captured 0 events — drain loop may not be running".to_string(),
             ));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Assert that `/health` returns only `{"status":"ok"}`.
@@ -510,6 +548,7 @@ impl VictauriClient {
                     passed: result.is_ok(),
                     detail: result.err().map_or_else(String::new, |e| e.to_string()),
                     duration: start.elapsed(),
+                    skipped: false,
                 });
             }};
         }
@@ -536,10 +575,19 @@ impl VictauriClient {
             format!("heap < {:.0}MB", config.max_heap_mb),
             self.assert_heap_under_mb(config.max_heap_mb).await
         );
-        check!(
-            "recording lifecycle",
-            self.assert_recording_lifecycle().await
-        );
+        // Skippable: never ends a recording another client has in progress (R5B-SMOKE1).
+        let start = Instant::now();
+        let outcome = self.recording_lifecycle_check().await;
+        checks.push(SmokeCheckResult {
+            name: "recording lifecycle".to_string(),
+            passed: outcome.is_ok(),
+            skipped: matches!(outcome, Ok(Some(_))),
+            detail: match outcome {
+                Ok(reason) => reason.unwrap_or_default(),
+                Err(e) => e.to_string(),
+            },
+            duration: start.elapsed(),
+        });
         check!(
             "health endpoint hardened",
             self.assert_health_hardened().await
@@ -562,6 +610,7 @@ mod tests {
             passed: true,
             detail: String::new(),
             duration: Duration::from_millis(ms),
+            skipped: false,
         }
     }
 
@@ -571,6 +620,7 @@ mod tests {
             passed: false,
             detail: detail.to_string(),
             duration: Duration::from_millis(ms),
+            skipped: false,
         }
     }
 
@@ -712,6 +762,7 @@ mod tests {
                     "1 uncaught error(s): [uncaught] x\n::error file=src/main.rs::forged\u{1b}[2J"
                         .to_string(),
                 duration: Duration::from_millis(1),
+                skipped: false,
             }],
             duration: Duration::from_millis(1),
         };
@@ -721,5 +772,98 @@ mod tests {
             "a page-controlled line became a GitHub workflow command:\n{summary}"
         );
         assert!(!summary.contains('\u{1b}'), "raw ESC reached the terminal");
+    }
+
+    // ── R5B-SMOKE1: the smoke suite must not end someone else's recording ──
+
+    /// A mock whose `recording` tool behaves like the plugin's: one session at a time.
+    async fn recording_mock(
+        already_recording: bool,
+    ) -> (u16, std::sync::Arc<std::sync::atomic::AtomicU32>) {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+        let active = Arc::new(AtomicBool::new(already_recording));
+        let stops = Arc::new(AtomicU32::new(0));
+        let (a, st) = (Arc::clone(&active), Arc::clone(&stops));
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post(move |body: String| {
+                let (active, stops) = (Arc::clone(&a), Arc::clone(&st));
+                async move {
+                    let v: Value = serde_json::from_str(&body).unwrap_or_default();
+                    let id = v.get("id").cloned();
+                    let text = |t: String, err: bool| {
+                        serde_json::json!({"jsonrpc":"2.0","id":id,
+                            "result":{"content":[{"type":"text","text":t}],"isError":err}})
+                    };
+                    let reply = match v["method"].as_str().unwrap_or("") {
+                        "initialize" => serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
+                            "protocolVersion":"2025-06-18","capabilities":{},
+                            "serverInfo":{"name":"mock","version":"0"}}}),
+                        m if m.starts_with("notifications/") => serde_json::json!({}),
+                        _ => match (
+                            v["params"]["name"].as_str(),
+                            v["params"]["arguments"]["action"].as_str(),
+                        ) {
+                            (Some("recording"), Some("start")) => {
+                                if active.swap(true, Ordering::SeqCst) {
+                                    text("recording session already active".into(), true)
+                                } else {
+                                    text(r#"{"started":true,"session_id":"s"}"#.into(), false)
+                                }
+                            }
+                            (Some("recording"), Some("stop")) => {
+                                stops.fetch_add(1, Ordering::SeqCst);
+                                if active.swap(false, Ordering::SeqCst) {
+                                    text(r#"{"events":[{"type":"console"}]}"#.into(), false)
+                                } else {
+                                    text("no active recording session".into(), true)
+                                }
+                            }
+                            (Some("eval_js"), _) => text("null".into(), false),
+                            _ => text("not mocked".into(), true),
+                        },
+                    };
+                    axum::Json(reply)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (port, stops)
+    }
+
+    #[tokio::test]
+    async fn smoke_skips_the_recording_check_when_a_recording_is_in_progress() {
+        let (port, stops) = recording_mock(true).await;
+        let mut client = VictauriClient::connect_with_token(port, None)
+            .await
+            .unwrap();
+        let report = client.smoke_test().await.unwrap();
+        let rec = report
+            .checks
+            .iter()
+            .find(|c| c.name == "recording lifecycle")
+            .expect("recording check present");
+        assert_eq!(
+            stops.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the smoke suite stopped a recording it did not start"
+        );
+        assert!(rec.skipped && rec.passed, "{rec:?}");
+        assert!(rec.detail.contains("already in progress"), "{rec:?}");
+        assert!(report.to_summary().contains("[SKIP] recording lifecycle"));
+    }
+
+    #[tokio::test]
+    async fn the_recording_check_runs_and_stops_its_own_recording() {
+        let (port, stops) = recording_mock(false).await;
+        let mut client = VictauriClient::connect_with_token(port, None)
+            .await
+            .unwrap();
+        client.assert_recording_lifecycle().await.unwrap();
+        assert_eq!(stops.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }

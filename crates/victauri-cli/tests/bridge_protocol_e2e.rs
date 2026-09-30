@@ -33,23 +33,57 @@ struct Harness {
     _root: tempfile::TempDir,
 }
 
+/// Knobs for [`Harness::start_with`].
+#[derive(Default)]
+struct Opts<'a> {
+    /// Pass `--app <the discovery entry's identity>`.
+    app_arg: bool,
+    /// Extra environment, applied after the Victauri variables are cleared. A value of
+    /// `"{port}"` is replaced with the mock backend's port.
+    env: &'a [(&'a str, &'a str)],
+    /// Extra bridge arguments.
+    args: &'a [&'a str],
+    /// The identity the backend's `/info` reports; `None` = the discovery entry's own.
+    info_identity: Option<&'a str>,
+}
+
 impl Harness {
     /// Serve `mcp_routes` (plus `/health`) on an ephemeral port, write a discovery entry for it
     /// with a unique identity, and spawn the bridge. `app_arg` = pass `--app <identity>`;
     /// `env` is applied after the Victauri selector variables are cleared.
     async fn start(mcp_routes: Router, app_arg: bool, env: &[(&str, &str)]) -> Self {
-        let router = mcp_routes.route("/health", get(|| async { "ok" }));
+        Self::start_with(
+            mcp_routes,
+            Opts {
+                app_arg,
+                env,
+                ..Opts::default()
+            },
+        )
+        .await
+    }
+
+    async fn start_with(mcp_routes: Router, opts: Opts<'_>) -> Self {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let ident = format!("com.test.bridge-protocol.{unique}");
+        // `/info` reports the app's identity, like the real plugin (the bridge confirms it
+        // before binding an `--app`, R5B-BR6).
+        let info = json!({
+            "app_identifier": opts.info_identity.unwrap_or(ident.as_str()),
+            "app_product_name": "Proto",
+        });
+        let router = mcp_routes
+            .route("/health", get(|| async { "ok" }))
+            .route("/info", get(move || async move { axum::Json(info) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
 
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let ident = format!("com.test.bridge-protocol.{unique}");
         let root = tempfile::tempdir().unwrap();
         let pid = std::process::id();
         let dir = root.path().join("victauri").join(pid.to_string());
@@ -77,13 +111,19 @@ impl Harness {
         for var in ["VICTAURI_APP", "VICTAURI_PORT", "VICTAURI_AUTH_TOKEN"] {
             cmd.env_remove(var);
         }
-        for (k, v) in env {
+        for (k, v) in opts.env {
+            let v = if *v == "{port}" {
+                port.to_string()
+            } else {
+                (*v).to_string()
+            };
             cmd.env(k, v);
         }
         cmd.arg("bridge");
-        if app_arg {
+        if opts.app_arg {
             cmd.args(["--app", ident.as_str()]);
         }
+        cmd.args(opts.args);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -160,7 +200,14 @@ struct Backend {
     responses: Arc<AtomicU64>,
     /// Messages with neither a `method` nor a `result`/`error` that reached the backend.
     malformed: Arc<AtomicU64>,
+    /// `notifications/cancelled` that reached the backend.
+    cancelled: Arc<AtomicU64>,
+    /// `slow` tool calls that have FINISHED on the backend.
+    slow_done: Arc<AtomicU64>,
 }
+
+/// How long the mock's `slow` tool takes.
+const SLOW_CALL: Duration = Duration::from_secs(4);
 
 async fn stateless_mcp(
     axum::extract::State(b): axum::extract::State<Backend>,
@@ -212,6 +259,14 @@ async fn stateless_mcp(
                 .body(axum::body::Body::from_stream(body))
                 .unwrap()
         }
+        Some("tools/call") if v.pointer("/params/name") == Some(&json!("slow")) => {
+            b.tool_calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(SLOW_CALL).await;
+            b.slow_done.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({"jsonrpc":"2.0","id":id,
+                "result":{"content":[{"type":"text","text":"slow done"}]}}))
+            .into_response()
+        }
         Some("tools/call") => {
             b.tool_calls.fetch_add(1, Ordering::SeqCst);
             axum::Json(json!({"jsonrpc":"2.0","id":id,
@@ -219,6 +274,9 @@ async fn stateless_mcp(
             .into_response()
         }
         Some(m) if m.starts_with("notifications/") => {
+            if m == "notifications/cancelled" {
+                b.cancelled.fetch_add(1, Ordering::SeqCst);
+            }
             axum::http::StatusCode::ACCEPTED.into_response()
         }
         _ => axum::Json(json!({"jsonrpc":"2.0","id":id,"result":{}})).into_response(),
@@ -318,17 +376,20 @@ async fn a_client_response_is_forwarded_and_never_answered() {
 
     h.send(&json!({"jsonrpc":"2.0","id":"srv-1","result":{"roots":[]}}));
     h.send(&json!({"jsonrpc":"2.0","id":"srv-2","error":{"code":-1,"message":"declined"}}));
-    // The loop handles stdin in order, so the ping's reply is the next one — unless the
-    // bridge answered either response.
+    // Responses are forwarded by the ordered one-way task, and nothing is written for them, so
+    // the ping's reply is the next one — unless the bridge answered either response.
     h.send(&json!({"jsonrpc":"2.0","id":12,"method":"ping"}));
     let next = h.recv_reply();
     assert_eq!(
         next["id"], 12,
         "a client response must never be answered: {next}"
     );
-    assert_eq!(
-        backend.responses.load(Ordering::SeqCst),
-        2,
+    assert!(
+        wait_until(Duration::from_secs(10), || backend
+            .responses
+            .load(Ordering::SeqCst)
+            == 2)
+        .await,
         "responses are still forwarded to the backend"
     );
 
@@ -365,4 +426,175 @@ async fn a_tool_call_whose_sse_stream_dies_says_it_may_have_run() {
         1,
         "a possibly-executed tool call is never re-sent"
     );
+}
+
+/// Poll `cond` until it holds or `within` elapses.
+async fn wait_until(within: Duration, cond: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    cond()
+}
+
+/// The next reply, waiting on the async runtime's blocking pool (the mock backend shares the
+/// runtime, so the test thread must not block it).
+async fn next_reply(h: &Arc<Mutex<Harness>>) -> (Value, std::time::Instant) {
+    let h = Arc::clone(h);
+    tokio::task::spawn_blocking(move || {
+        let r = h.lock().unwrap().recv_reply();
+        (r, std::time::Instant::now())
+    })
+    .await
+    .unwrap()
+}
+
+/// R5B-BR5: the stdio loop awaited each forward before reading the next line, so one long
+/// `tools/call` (up to 330 s) stalled a `ping`, every parallel call, and the
+/// `notifications/cancelled` meant to stop it. Requests now run concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_tool_call_blocks_neither_ping_nor_cancel_nor_parallel_calls() {
+    let backend = Backend::default();
+    let h = Harness::start(backend_routes(&backend), true, &[]).await;
+    let h = Arc::new(Mutex::new(h));
+    let sent = std::time::Instant::now();
+    {
+        let mut h = h.lock().unwrap();
+        h.send(&json!({"jsonrpc":"2.0","id":30,"method":"tools/call",
+            "params":{"name":"slow","arguments":{}}}));
+        h.send(&json!({"jsonrpc":"2.0","id":31,"method":"tools/call",
+            "params":{"name":"slow","arguments":{}}}));
+        h.send(&json!({"jsonrpc":"2.0","id":32,"method":"ping"}));
+        h.send(&json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+            "params":{"requestId":30,"reason":"user"}}));
+    }
+
+    // The ping is answered at once, ahead of both slow calls.
+    let (ping, at) = next_reply(&h).await;
+    assert_eq!(
+        ping["id"], 32,
+        "ping must not queue behind a slow call: {ping}"
+    );
+    assert!(at - sent < SLOW_CALL / 2, "ping took {:?}", at - sent);
+
+    // The cancellation reaches the backend while the call it cancels is still running.
+    assert!(
+        wait_until(SLOW_CALL / 2, || backend.cancelled.load(Ordering::SeqCst)
+            == 1)
+        .await,
+        "notifications/cancelled did not reach the backend promptly"
+    );
+    assert_eq!(
+        backend.slow_done.load(Ordering::SeqCst),
+        0,
+        "the cancel must arrive while the call is in flight"
+    );
+
+    // Both slow calls ran in parallel: together they take ~one SLOW_CALL, not two.
+    let (a, _) = next_reply(&h).await;
+    let (b, done) = next_reply(&h).await;
+    let mut ids = [a["id"].as_i64().unwrap(), b["id"].as_i64().unwrap()];
+    ids.sort_unstable();
+    assert_eq!(ids, [30, 31], "{a} {b}");
+    assert!(
+        done - sent < SLOW_CALL * 3 / 2,
+        "parallel calls were serialized: {:?}",
+        done - sent
+    );
+    assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 2);
+}
+
+/// R5B-BR6: `--app` binds by discovery metadata + PID liveness. After a crash the app's stale
+/// entry can carry a PID that was reused by another of our processes while a DIFFERENT app
+/// (auth disabled) now holds the port — the bridge then silently drove the wrong app. It now
+/// confirms the identity the server itself reports on `/info` before forwarding anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_whose_info_reports_another_identity_is_never_driven() {
+    let backend = Backend::default();
+    let mut h = Harness::start_with(
+        backend_routes(&backend),
+        Opts {
+            app_arg: true,
+            info_identity: Some("com.someone.else"),
+            ..Opts::default()
+        },
+    )
+    .await;
+    h.send(&json!({"jsonrpc":"2.0","id":40,"method":"tools/call",
+        "params":{"name":"invoke_command","arguments":{"command":"quit_app"}}}));
+    let r = h.recv_reply();
+    assert_eq!(r["id"], 40, "{r}");
+    let msg = r["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("must refuse, got: {r}"));
+    assert!(
+        msg.contains("com.someone.else"),
+        "names what it found: {msg}"
+    );
+    assert_eq!(
+        backend.tool_calls.load(Ordering::SeqCst),
+        0,
+        "nothing may be sent to a server that is not the selected app"
+    );
+}
+
+/// R5B-PORTAPP1: with `VICTAURI_PORT` set, `--app` / `VICTAURI_APP` was silently ignored — the
+/// bridge drove whatever app held that port. When both are set they must agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn victauri_port_and_a_different_app_selector_are_refused_clearly() {
+    for (env, args) in [
+        (
+            &[("VICTAURI_PORT", "{port}")][..],
+            &["--app", "com.other.app"][..],
+        ),
+        (
+            &[
+                ("VICTAURI_PORT", "{port}"),
+                ("VICTAURI_APP", "com.other.app"),
+            ][..],
+            &[][..],
+        ),
+    ] {
+        let backend = Backend::default();
+        let mut h = Harness::start_with(
+            backend_routes(&backend),
+            Opts {
+                env,
+                args,
+                ..Opts::default()
+            },
+        )
+        .await;
+        h.send(&json!({"jsonrpc":"2.0","id":50,"method":"tools/call",
+            "params":{"name":"get_plugin_info","arguments":{}}}));
+        let r = h.recv_reply();
+        let msg = r["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("must refuse, got: {r}"));
+        assert!(
+            msg.contains("VICTAURI_PORT") && msg.contains("com.other.app"),
+            "{msg}"
+        );
+        assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // Agreeing selectors still work.
+    let backend = Backend::default();
+    let mut h = Harness::start_with(
+        backend_routes(&backend),
+        Opts {
+            app_arg: true,
+            env: &[("VICTAURI_PORT", "{port}")],
+            ..Opts::default()
+        },
+    )
+    .await;
+    h.send(&json!({"jsonrpc":"2.0","id":51,"method":"tools/call",
+        "params":{"name":"get_plugin_info","arguments":{}}}));
+    let r = h.recv_reply();
+    assert!(r.get("result").is_some(), "{r}");
+    assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 1);
 }

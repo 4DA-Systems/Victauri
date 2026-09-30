@@ -40,6 +40,13 @@ struct Mock {
     /// Counts `notifications/initialized` the bridge forwards to the BACKEND after its
     /// handshake — proves the MCP lifecycle is completed for a stateful backend (audit M2).
     initialized_count: Arc<AtomicU64>,
+    /// The app identity `/info` reports (the bridge confirms it before binding `--app`).
+    identity: Arc<std::sync::Mutex<String>>,
+}
+
+/// `/info`, reporting the mock's app identity like the real plugin.
+async fn info(State(s): State<Mock>) -> Json<Value> {
+    Json(json!({"app_identifier": s.identity.lock().unwrap().clone()}))
 }
 
 struct ChildGuard {
@@ -147,12 +154,14 @@ async fn bridge_selects_by_identity_forwards_and_survives_restart() {
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
         initialized_count: Arc::new(AtomicU64::new(0)),
+        identity: Arc::default(),
     };
 
     // Start the mock backend on an ephemeral port.
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/mcp", post(mcp))
+        .route("/info", get(info))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -167,6 +176,7 @@ async fn bridge_selects_by_identity_forwards_and_survives_restart() {
         .unwrap()
         .as_nanos();
     let ident = format!("com.test.e2e-bridge.{unique}");
+    *mock.identity.lock().unwrap() = ident.clone();
     let pid = std::process::id();
     let iso = IsolatedTemp::new();
     let dir = iso.discovery_dir(pid);
@@ -445,10 +455,13 @@ async fn bridge_cold_start_serves_handshake_then_goes_live_when_app_appears() {
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
         initialized_count: Arc::new(AtomicU64::new(0)),
+        identity: Arc::default(),
     };
+    *mock.identity.lock().unwrap() = ident.clone();
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/mcp", post(mcp))
+        .route("/info", get(info))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -530,10 +543,12 @@ async fn bridge_reresolves_and_wont_reuse_a_stale_cached_backend() {
         init_count: Arc::new(AtomicU64::new(0)),
         toolcall_ok: Arc::new(AtomicU64::new(0)),
         initialized_count: Arc::new(AtomicU64::new(0)),
+        identity: Arc::default(),
     };
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/mcp", post(mcp))
+        .route("/info", get(info))
         .with_state(mock.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -546,6 +561,7 @@ async fn bridge_reresolves_and_wont_reuse_a_stale_cached_backend() {
         .unwrap()
         .as_nanos();
     let ident = format!("com.test.reresolve.{unique}");
+    *mock.identity.lock().unwrap() = ident.clone();
     let pid = std::process::id();
     let iso = IsolatedTemp::new();
     let dir = iso.discovery_dir(pid);

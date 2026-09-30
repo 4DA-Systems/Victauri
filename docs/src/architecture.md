@@ -139,7 +139,7 @@ Three read-on-demand resources expose live state (the `subscribe` capability is 
 
 ## Port Fallback
 
-If port 7373 is already in use (e.g., another Tauri app running Victauri), the server tries ports 7374 through 7383. The actual bound port is written to the per-process discovery directory (`<temp>/victauri/<pid>/port`, alongside the auth `token` and `metadata.json`) for client discovery and cleaned up on shutdown.
+If port 7373 is already in use (e.g., another Tauri app running Victauri), the server tries ports 7374 through 7383. The actual bound port is written to the per-process discovery directory (`<root>/<pid>/port`, alongside the auth `token` and `metadata.json`; `<root>` is per-user — see [Security](security.md#discovery-directory-protection)) for client discovery and cleaned up on shutdown.
 
 ## Release Safety
 

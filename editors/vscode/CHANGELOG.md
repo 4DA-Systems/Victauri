@@ -6,6 +6,19 @@ All notable changes to the Victauri VS Code extension will be documented in this
 
 Version-synced with the Victauri 0.9.0 release. Extension changes:
 
+- **Discovery also scans the plugin's home-directory fallback root on Unix.** When another
+  local user has pre-created the predictable `/tmp/victauri-<uid>`, the plugin now registers
+  under `$XDG_STATE_HOME/victauri` (default `~/.local/state/victauri`); the extension scans it
+  after `<temp>/victauri-<uid>`, before the legacy root, with the same ownership checks.
+- **A discovery entry planted by another Windows user is no longer trusted.** Discovery
+  trusted every directory under `%TEMP%\victauri` on Windows. When `TEMP` is shared (an app
+  launched from MSYS2 uses `C:\msys64\tmp`), another user could plant
+  `victauri\<live pid>\{port,token}` pointing at a port they control and receive the
+  extension's requests. A discovery directory outside your user profile is now used only if
+  you own it (or `BUILTIN\Administrators` does and you are a member — the plugin's own rule),
+  checked with one batched, cached `Get-Acl` call (10 s timeout; it fails closed). The default
+  `%LOCALAPPDATA%\Temp`, inside your profile, needs no check: Windows gives no other
+  non-admin user access to a profile.
 - **The auth token stops following a port its app no longer owns.** The extension resolved the
   port and token once and then sent the token to that port every poll, forever — after the
   app exited, any local process that bound the port received it. Before each token-bearing

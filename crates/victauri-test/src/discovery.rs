@@ -1,6 +1,7 @@
 //! Per-process server discovery for CI parallelism.
 //!
-//! Victauri servers write discovery files to `<temp>/victauri/<pid>/` with
+//! Victauri servers write discovery files to a per-user `<root>/<pid>/` (see
+//! `discovery_roots`) with
 //! port, token, and metadata. This module scans those directories and returns
 //! the live server(s). A directory is deleted only when its owning process is
 //! definitely dead — never merely because its port did not answer a probe (a
@@ -10,11 +11,13 @@
 use std::path::PathBuf;
 
 /// The discovery roots the plugin may have written to, most specific first (mirrors the
-/// plugin's `discovery_root`). On Unix the root is per-user — `$XDG_RUNTIME_DIR/victauri` when
-/// that directory is private to us, else `<temp>/victauri-<euid>` (a shared `/tmp/victauri`
-/// could be pre-created by another user, blocking discovery) — and the legacy
-/// `<temp>/victauri` is still read, subject to the same ownership check, for pre-0.9 plugins.
-/// Other platforms use `<temp>/victauri` (a per-user temp dir).
+/// plugin's `discovery_root`). On Unix the roots are per-user — `$XDG_RUNTIME_DIR/victauri`
+/// when that directory is private to us, then `<temp>/victauri-<euid>` (a shared
+/// `/tmp/victauri` could be pre-created by another user, blocking discovery), then the home
+/// fallback `$XDG_STATE_HOME/victauri` / `$HOME/.local/state/victauri` (where the plugin
+/// registers when `<temp>/victauri-<euid>` was taken over) — and the legacy `<temp>/victauri`
+/// is still read, subject to the same ownership check, for pre-0.9 plugins. Other platforms
+/// use `<temp>/victauri` (a per-user temp dir; Windows readers verify its ownership).
 #[cfg(not(test))]
 fn discovery_roots() -> Vec<PathBuf> {
     real_discovery_roots()
@@ -32,6 +35,16 @@ fn discovery_roots() -> Vec<PathBuf> {
             .to_path_buf(),
     ]
 }
+
+/// Where a running app's auth token lives, for error messages — the same roots
+/// [`discovery_roots`] scans, in the same order.
+#[cfg(unix)]
+pub const TOKEN_LOCATIONS: &str = "$XDG_RUNTIME_DIR/victauri/<pid>/token (when that \
+     directory is private to you), else <temp>/victauri-<uid>/<pid>/token, or \
+     ~/.local/state/victauri/<pid>/token when that one was not usable";
+/// Where a running app's auth token lives, for error messages.
+#[cfg(not(unix))]
+pub const TOKEN_LOCATIONS: &str = r"%TEMP%\victauri\<pid>\token";
 
 #[cfg_attr(all(test, not(unix)), allow(dead_code))]
 fn real_discovery_roots() -> Vec<PathBuf> {
@@ -55,6 +68,12 @@ fn real_discovery_roots() -> Vec<PathBuf> {
                 roots.push(runtime.join("victauri"));
             }
             roots.push(std::env::temp_dir().join(format!("victauri-{euid}")));
+            // The plugin's fallback when `<temp>/victauri-<euid>` was taken over by another
+            // user (R5B-LINDISC1) — scanned after it, before the legacy root.
+            roots.extend(home_state_root(
+                std::env::var_os("XDG_STATE_HOME"),
+                std::env::var_os("HOME"),
+            ));
         }
         roots.push(legacy);
         roots
@@ -65,12 +84,31 @@ fn real_discovery_roots() -> Vec<PathBuf> {
     }
 }
 
+/// The plugin's per-user fallback discovery root under the home directory:
+/// `$XDG_STATE_HOME/victauri`, else `$HOME/.local/state/victauri` (each only when absolute).
+/// The plugin registers there when `<temp>/victauri-<euid>` is untrusted — e.g. another local
+/// user pre-created it, and sticky `/tmp` stops us deleting it (R5B-LINDISC1).
+#[cfg(unix)]
+fn home_state_root(
+    xdg_state_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let absolute =
+        |p: std::ffi::OsString| Some(std::path::PathBuf::from(p)).filter(|p| p.is_absolute());
+    xdg_state_home
+        .and_then(absolute)
+        .or_else(|| {
+            home.and_then(absolute)
+                .map(|h| h.join(".local").join("state"))
+        })
+        .map(|state| state.join("victauri"))
+}
+
 /// Whether a discovery directory is safe to trust (audit #15). On Unix the temp
 /// root (e.g. `/tmp`) is world-writable, so an attacker can plant a fake `<pid>`
 /// dir pointing at a server they control to steal the token / forge results. We
 /// trust a dir only if it is a real directory (not a symlink), owned by the current
-/// effective user, and not group/other-writable. On Windows the temp dir is already
-/// per-user, and the writer restricts ACLs via `icacls`, so no extra check is needed.
+/// effective user, and not group/other-writable. (Windows has its own owner check below.)
 #[cfg(unix)]
 fn dir_is_trusted(path: &std::path::Path) -> bool {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -121,7 +159,18 @@ fn uid_from_exclusive_probe(probe: &std::path::Path) -> Option<u32> {
     uid
 }
 
-#[cfg(not(unix))]
+/// Windows: a real directory (a symlink or junction is not `is_dir()` under
+/// `symlink_metadata`) OWNED by the current user (see
+/// [`crate::process::dir_owned_by_current_user`]). `%TEMP%` is normally per-user, but it can
+/// be shared (an app launched from MSYS2 uses `C:\msys64\tmp`), where another user could
+/// plant `victauri\<live pid>\` entries pointing at a port they control (R5B-WINDISC1).
+#[cfg(windows)]
+fn dir_is_trusted(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && crate::process::dir_owned_by_current_user(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn dir_is_trusted(_path: &std::path::Path) -> bool {
     true
 }
@@ -187,8 +236,9 @@ pub fn try_resolve_connection(app: Option<&str>) -> Result<(u16, Option<String>)
     let app = app.map(str::to_string).or_else(configured_app);
     let port = configured_port();
     let token = configured_token();
-    // Only scan when the answer depends on discovery (an explicit port + token does not).
-    let servers = if port.is_some() && token.is_some() {
+    // Only scan when the answer depends on discovery (an explicit port + token with no app
+    // selector does not; a selector is checked against that port's entry — R5B-PORTAPP1).
+    let servers = if port.is_some() && token.is_some() && app.is_none() {
         Vec::new()
     } else {
         find_live_servers()
@@ -204,8 +254,17 @@ fn resolve_from(
     servers: &[DiscoveredServer],
 ) -> Result<(u16, Option<String>), String> {
     // An explicit port is the caller naming the endpoint: pair it with the explicit token,
-    // else with the token of the one live entry on exactly that port.
+    // else with the token of the one live entry on exactly that port. An app selector set as
+    // well must AGREE with that port's app (R5B-PORTAPP1) — it used to be silently ignored, so
+    // the client drove whatever app held the port. (The client re-checks `/info` on connect,
+    // which also covers a port with no discovery entry.)
     if let Some(port) = explicit_port {
+        if let (Some(app), Some(entry)) = (app, unique_server_on_port(servers, port))
+            && (entry.identifier.is_some() || entry.product_name.is_some())
+            && !entry.matches_app(app)
+        {
+            return Err(port_app_mismatch(port, &entry.label(), app));
+        }
         let token = explicit_token.or_else(|| unique_token_for_port(servers, port));
         return Ok((port, token));
     }
@@ -256,6 +315,16 @@ fn resolve_from(
         ([], None) => Ok((DEFAULT_PORT, None)),
         (many, _) => Err(ambiguity_message(many.iter().copied())),
     }
+}
+
+/// `VICTAURI_PORT` and an app selector name different apps.
+pub fn port_app_mismatch(port: u16, found: &str, app: &str) -> String {
+    format!(
+        "VICTAURI_PORT={port} is app {}, but the app selector (--app / VICTAURI_APP) is '{}'. \
+         Unset one of them, or point VICTAURI_PORT at that app's port.",
+        crate::terminal::single_line(found),
+        crate::terminal::single_line(app)
+    )
 }
 
 /// "Several apps match" — names each as `identifier (port N, pid P)` and how to pick one
@@ -435,12 +504,11 @@ impl DiscoveredServer {
     /// case-insensitive, like `victauri bridge --app`) — never a substring, so `com.example`
     /// can't silently bind `com.example.other`.
     fn matches_app(&self, app: &str) -> bool {
-        let is = |field: &Option<String>| {
-            field
-                .as_deref()
-                .is_some_and(|v| v.eq_ignore_ascii_case(app))
-        };
-        is(&self.identifier) || is(&self.product_name)
+        identity_matches(
+            self.identifier.as_deref(),
+            self.product_name.as_deref(),
+            app,
+        )
     }
 
     /// `identifier (port N, pid P)` — the label `victauri bridge` prints, plus the pid.
@@ -462,12 +530,24 @@ fn unique_connection(servers: &[DiscoveredServer]) -> Option<(u16, Option<String
 }
 
 fn unique_token_for_port(servers: &[DiscoveredServer], port: u16) -> Option<String> {
+    unique_server_on_port(servers, port)?.token.clone()
+}
+
+/// The ONE live entry advertising `port`; `None` when there is none, or several.
+fn unique_server_on_port(servers: &[DiscoveredServer], port: u16) -> Option<&DiscoveredServer> {
     let mut matching = servers.iter().filter(|server| server.port == port);
     let server = matching.next()?;
     if matching.next().is_some() {
         return None;
     }
-    server.token.clone()
+    Some(server)
+}
+
+/// Whether an app selector names this identity: the bundle identifier or the product name,
+/// EXACTLY (ASCII case-insensitive) — the rule discovery, `/info` checks and the CLI bridge share.
+pub fn identity_matches(identifier: Option<&str>, product_name: Option<&str>, app: &str) -> bool {
+    identifier.is_some_and(|v| v.eq_ignore_ascii_case(app))
+        || product_name.is_some_and(|v| v.eq_ignore_ascii_case(app))
 }
 
 fn find_live_servers() -> Vec<DiscoveredServer> {
@@ -600,6 +680,28 @@ mod tests {
         assert!(roots.contains(&std::env::temp_dir().join(format!("victauri-{euid}"))));
         assert_eq!(roots.last(), Some(&std::env::temp_dir().join("victauri")));
         assert_ne!(roots[0], std::env::temp_dir().join("victauri"));
+        // R5B-LINDISC1: the home fallback is scanned after the per-user temp root, before
+        // the legacy one.
+        let home = home_state_root(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
+            .expect("HOME is set in the test environment");
+        let at = |p: &std::path::Path| roots.iter().position(|r| r == p);
+        let tmp_root = std::env::temp_dir().join(format!("victauri-{euid}"));
+        assert!(at(&home) > at(&tmp_root), "{roots:?}");
+        assert!(at(&home) < Some(roots.len() - 1), "{roots:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn home_state_root_prefers_an_absolute_xdg_state_home() {
+        assert_eq!(
+            home_state_root(Some("/x/state".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/x/state/victauri"))
+        );
+        assert_eq!(
+            home_state_root(Some("rel".into()), Some("/home/u".into())),
+            Some(std::path::PathBuf::from("/home/u/.local/state/victauri"))
+        );
+        assert_eq!(home_state_root(None, Some("rel".into())), None);
     }
 
     #[cfg(unix)]
@@ -954,6 +1056,79 @@ mod tests {
             Ok((7373, Some("a".to_string())))
         );
         assert_eq!(resolve_from(None, None, None, &[]), Ok((7373, None)));
+    }
+
+    /// Hand `path` to `NT AUTHORITY\SYSTEM` — the stand-in for "another user" (needs an
+    /// elevated test run; `false` when that is not possible, and the caller skips).
+    #[cfg(windows)]
+    fn give_to_system(path: &std::path::Path) -> bool {
+        std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/setowner", "*S-1-5-18", "/q"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// R5B-WINDISC1: on a shared TEMP another user can plant `victauri\<live pid>\…`; the
+    /// readers must refuse a root or entry directory this user does not own.
+    #[cfg(windows)]
+    #[test]
+    fn windows_discovery_refuses_directories_owned_by_another_user() {
+        let write_entry = |base: &std::path::Path, pid: &str| {
+            let dir = base.join(pid);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("port"), "7373").unwrap();
+            std::fs::write(dir.join("token"), format!("tok-{pid}")).unwrap();
+            dir
+        };
+        // A planted entry in a root we own.
+        let base = tempfile::tempdir().unwrap();
+        write_entry(base.path(), "10");
+        let planted = write_entry(base.path(), "11");
+        if !give_to_system(&planted) {
+            eprintln!("skipped: cannot change a directory's owner (not elevated)");
+            return;
+        }
+        let servers = find_live_servers_in(base.path(), |_| Liveness::Own, |_| true);
+        let pids: Vec<u32> = servers.iter().map(|s| s.pid).collect();
+        assert_eq!(pids, [10], "the planted entry's token must never be used");
+        assert!(
+            planted.exists(),
+            "a foreign directory is never deleted either"
+        );
+
+        // A planted ROOT: nothing under it is trusted, even entries we own.
+        let root = tempfile::tempdir().unwrap();
+        write_entry(root.path(), "12");
+        assert!(give_to_system(root.path()));
+        assert!(find_live_servers_in(root.path(), |_| Liveness::Own, |_| true).is_empty());
+    }
+
+    /// R5B-PORTAPP1: an explicit port and an app selector must agree.
+    #[test]
+    fn an_explicit_port_and_a_disagreeing_app_selector_are_refused() {
+        let servers = vec![
+            named(20, 7373, "a", "com.a.app", "A"),
+            named(21, 7374, "b", "com.b.app", "B"),
+        ];
+        let err = resolve_from(Some(7373), None, Some("com.b.app"), &servers).unwrap_err();
+        assert!(
+            err.contains("VICTAURI_PORT=7373") && err.contains("com.a.app"),
+            "{err}"
+        );
+        assert!(err.contains("com.b.app"), "{err}");
+        // With an explicit token too.
+        assert!(resolve_from(Some(7373), Some("t".into()), Some("com.b.app"), &servers).is_err());
+        // Agreeing (by identifier or product name, any case) is fine.
+        assert_eq!(
+            resolve_from(Some(7374), None, Some("b"), &servers),
+            Ok((7374, Some("b".to_string())))
+        );
+        // No discovery entry on the port: left to the client's `/info` check.
+        assert_eq!(
+            resolve_from(Some(7999), None, Some("com.b.app"), &servers),
+            Ok((7999, None))
+        );
     }
 
     #[test]
