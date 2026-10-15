@@ -603,7 +603,7 @@ async fn save_settings(settings: Settings) -> Result<(), AppError> {
 }
 ```
 
-This generates a command schema at compile time — zero runtime cost. Commands become discoverable through `get_registry` and natural language via `resolve_command`.
+This generates a command schema at compile time. The schema is registered through `inventory` in every build profile, release included: a small static table plus a startup constructor. Commands become discoverable through `get_registry` and natural language via `resolve_command`.
 
 To auto-discover all instrumented commands:
 

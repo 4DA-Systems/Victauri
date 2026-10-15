@@ -924,7 +924,7 @@ Tested HEAD exhaustively against live 4DA (real app: 3 windows, 383 commands, 30
 - **`VictauriBuilder::db_search_paths([...])`** lets `query_db`/`introspect db_health` reach databases outside the OS app-data dir (e.g. an app's project/working dir). Configured roots win auto-discovery; absolute paths allowed only within an allowed root. 4DA registers `../data` so its real DB is reachable.
 - **`query_db` blocks the write form of PRAGMA** (`PRAGMA x = y`) explicitly (connection was already READ_ONLY).
 - **Minor:** `window get_state` on an unknown label errors (was `[]`); `window resize` rejects zero dimensions; `eval_js` timeout message explains the syntax-error case.
-- **Known limitation (not safely fixable):** a JS *syntax error* in eval'd code surfaces only as the 30 s timeout — WebView2 does not fire a `window` error event for eval parse errors, and a Rust-side syntax heuristic risks false-positives on valid code (regex/strings). Documented in the timeout message.
+- **Superseded:** a JS *syntax error* in eval'd code used to surface only as the 30 s timeout. It now fails fast with `JavaScript parse error:` (`PARSE_ERROR_PREFIX` in `mcp/mod.rs`), using a separate parse-check script.
 - **Parity gaps vs CDP/Playwright (by design):** synthetic events (`isTrusted:false`); no network interception/mock/block (passive logging only); no cookie set; no iframe traversal; no JS/CSS coverage, tracing, throttling, file upload/download, or multi-tab.
 
 ## Current State (2026-05-28)
