@@ -22,7 +22,9 @@ heavy network traffic) — which surfaces edge cases that synthetic demo apps do
 1. A Tauri app with `victauri-plugin` running and its MCP server reachable on
    `127.0.0.1:7373` (the scripts assume `auth_disabled()` — for an
    auth-enabled server, add `-H "Authorization: Bearer <token>"` to the `tool()`
-   helpers, or read the token from `<temp>/victauri/<pid>/token`).
+   helpers, reading the token from `<root>/<pid>/token`; `<root>` is `%TEMP%\victauri` on
+   Windows and, on macOS/Linux, `$XDG_RUNTIME_DIR/victauri`, else `<temp>/victauri-<uid>`,
+   else `~/.local/state/victauri`).
 2. `curl` and `jq` on PATH.
 
 ## Running

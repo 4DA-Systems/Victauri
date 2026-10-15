@@ -116,7 +116,10 @@ directory is private to you, else `<temp>/victauri-<uid>` (`<temp>` = `$TMPDIR` 
 curl http://127.0.0.1:7373/health
 # Returns: ok  (unauthenticated liveness probe)
 
-TOKEN=$(cat "${TMPDIR:-/tmp}"/victauri/*/token | head -n1)   # single running app
+# single running app; checks the per-user roots described above, newest first
+TOKEN=$(cat "$(ls -t ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR"/victauri/*/token} \
+  "${TMPDIR:-/tmp}"/victauri-"$(id -u)"/*/token "$HOME"/.local/state/victauri/*/token \
+  2>/dev/null | head -n1)")
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
 # Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.9.0",...}
 ```
