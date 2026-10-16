@@ -116,7 +116,10 @@ directory is private to you, else `<temp>/victauri-<uid>` (`<temp>` = `$TMPDIR` 
 curl http://127.0.0.1:7373/health
 # Returns: ok  (unauthenticated liveness probe)
 
-TOKEN=$(cat "${TMPDIR:-/tmp}"/victauri/*/token | head -n1)   # single running app
+# single running app; checks the discovery roots described above, in the plugin's order
+if [ "$OS" = Windows_NT ]; then ROOTS="${TMPDIR:-/tmp}/victauri"   # Git Bash: /tmp is %TEMP%
+else ROOTS="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/victauri} ${TMPDIR:-/tmp}/victauri-$(id -u) $HOME/.local/state/victauri"; fi
+TOKEN=$(cat "$(for r in $ROOTS; do ls -t "$r"/*/token 2>/dev/null; done | head -n1)")
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
 # Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.9.0",...}
 ```

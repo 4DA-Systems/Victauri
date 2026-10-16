@@ -396,8 +396,15 @@ fn cmd_init(root: &Path) -> Result<()> {
         remaining_steps
             .push("Add .plugin(victauri_plugin::init()) to your Tauri builder".to_string());
     }
-    remaining_steps.push("Start your app:  pnpm tauri dev".to_string());
+    remaining_steps.push(format!("Start your app:  {}", tauri_dev_command(&root)));
     remaining_steps.push("Run the tests:   VICTAURI_E2E=1 cargo test --test smoke".to_string());
+    if cfg!(windows) {
+        remaining_steps.push(
+            "On Windows, run the tests with a separate CARGO_TARGET_DIR: the running app locks \
+             its .exe, and cargo test rebuilds it"
+                .to_string(),
+        );
+    }
     remaining_steps.push("Try the CLI:     victauri check".to_string());
 
     eprintln!("\nVictauri initialized. Next steps:");
@@ -2198,6 +2205,23 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
     commands
 }
 
+/// The dev command for the project's package manager, picked from the lockfile in `root`
+/// or its parent (init may run from `src-tauri/`). Defaults to npm, the create-tauri-app
+/// default.
+fn tauri_dev_command(root: &Path) -> &'static str {
+    let dirs = [Some(root), root.parent()];
+    let has = |file: &str| dirs.iter().flatten().any(|d| d.join(file).exists());
+    if has("pnpm-lock.yaml") {
+        "pnpm tauri dev"
+    } else if has("yarn.lock") {
+        "yarn tauri dev"
+    } else if has("bun.lockb") || has("bun.lock") {
+        "bun tauri dev"
+    } else {
+        "npm run tauri dev"
+    }
+}
+
 fn extract_fn_name(line: &str) -> Option<String> {
     let i = line.find("fn ")?;
     let rest = &line[i + 3..];
@@ -2214,8 +2238,7 @@ fn generate_integration_test_with_commands(commands: &[String]) -> String {
 //!
 //! Run with: VICTAURI_E2E=1 cargo test --test integration
 
-use serde_json::json;
-use victauri_test::{e2e_test, VictauriClient};
+use victauri_test::VictauriClient;
 
 fn skip_unless_e2e() -> bool {
     if !victauri_test::is_e2e() {
@@ -2244,13 +2267,19 @@ async fn full_stack_health_check() {
 }
 
 // ── Command tests ────────────────────────────────────────────────────────
-// Generated from discovered #[tauri::command] functions.
-// Adapt each test to match your command's expected arguments and behavior.
+// Generated from discovered #[tauri::command] functions. Each test proves the
+// command has a registered handler: it is called with no arguments, so a
+// "missing required key" error still passes, and only "not found" fails.
+// Pass real arguments (e.g. `Some(serde_json::json!({"name": "Ada"}))`) and
+// assert on the result to test behavior.
 
 "#,
     );
 
     for cmd in commands {
+        // Tauri says "Command <name> not found"; match case-insensitively, as the
+        // plugin's own ghost detection does.
+        let cmd_lower = cmd.to_lowercase();
         out.push_str(&format!(
             r#"#[tokio::test]
 async fn command_{cmd}() {{
@@ -2258,11 +2287,12 @@ async fn command_{cmd}() {{
     let mut client = VictauriClient::discover().await.unwrap();
 
     let result = client.invoke_command("{cmd}", None).await;
-    assert!(
-        result.is_ok(),
-        "{cmd} should respond without error: {{:?}}",
-        result.err()
-    );
+    if let Err(e) = &result {{
+        assert!(
+            !format!("{{e:?}}").to_lowercase().contains("command {cmd_lower} not found"),
+            "{cmd} has no registered handler: {{e:?}}"
+        );
+    }}
 }}
 
 "#,
@@ -2814,6 +2844,31 @@ mod tests {
         assert!(content.contains("command_increment"));
         assert!(content.contains("invoke_command(\"greet\""));
         assert!(content.contains("invoke_command(\"increment\""));
+    }
+
+    /// A command that needs arguments (create-tauri-app's `greet(name)`) errors with
+    /// "missing required key" when called bare. The generated test must still pass then,
+    /// and fail only when the handler is missing.
+    #[test]
+    fn generated_command_tests_fail_only_on_missing_handler() {
+        let content = generate_integration_test_with_commands(&["greet".to_string()]);
+        // Tauri capitalises "Command <name> not found", so the check must ignore case.
+        assert!(content.contains(r#".to_lowercase().contains("command greet not found")"#));
+        assert!(!content.contains("result.is_ok()"));
+        assert!(content.contains(r#"json!({"name": "Ada"})"#));
+        assert!(!content.contains("use serde_json::json;"));
+        assert!(!content.contains("e2e_test"));
+    }
+
+    #[test]
+    fn tauri_dev_command_follows_lockfile() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(tauri_dev_command(dir.path()), "npm run tauri dev");
+        let app = dir.path().join("src-tauri");
+        std::fs::create_dir(&app).unwrap();
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), "").unwrap();
+        assert_eq!(tauri_dev_command(dir.path()), "pnpm tauri dev");
+        assert_eq!(tauri_dev_command(&app), "pnpm tauri dev");
     }
 
     #[test]

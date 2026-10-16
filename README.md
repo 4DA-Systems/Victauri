@@ -40,7 +40,7 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 - **Cross-boundary state checking** — compare DOM state against Rust backend state and catch the drift between them
 - **Time-travel recording** — record interactions, checkpoint state, replay sequences, generate test files
 - **Cross-platform, no WebDriver** — the same tool surface on macOS, Windows, and Linux (no CDP dependency); runs headless in CI under `xvfb`. Platform limits are documented, not hidden: trusted (OS-level) input is Windows-only (other platforms fall back to synthetic events), and window screenshots need X11/XWayland on Linux (pure Wayland fails with a clear error)
-- **Zero runtime cost in release** — the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. Add `victauri-plugin` as a normal `[dependencies]` entry (the app binary cannot see `[dev-dependencies]`); the crate still compiles in, so to keep it out of release binaries entirely make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature
+- **Zero runtime cost in release** — the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. Add `victauri-plugin` as a normal `[dependencies]` entry (the app binary cannot see `[dev-dependencies]`); the crate still compiles in, so to keep it out of release binaries entirely make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature. **SQLite note:** the default `bundled-sqlite` feature turns on `rusqlite/bundled`, and Cargo feature unification applies it to *your app's* `rusqlite` too, in release builds as well. If your app links a system SQLite or SQLCipher, use `default-features = false, features = ["sqlite"]`
 
 **Bonus — for AI agents:** the same server speaks MCP, so Claude Code, Cursor, Windsurf, and any MCP client get this full-stack access for interactive debugging — no extra setup.
 
@@ -82,12 +82,13 @@ victauri init
 
 This will:
 - Add `victauri-plugin` and `victauri-test` to your `Cargo.toml`
-- Create starter smoke tests in your `tests/` directory
-- Print the next steps to wire the plugin
+- Add `.plugin(victauri_plugin::init())` to your Tauri builder when it finds one
+- Create `capabilities/victauri.json` (grants `victauri:default`), `.mcp.json`, starter tests in `tests/`, a CI workflow, and a CLAUDE.md block
+- Print any steps it could not do itself
 
 ### Wire the plugin
 
-Add one line to your Tauri builder:
+Skip this if `init` reported that it patched your builder. Otherwise add one line:
 
 ```rust
 // src-tauri/src/main.rs (or lib.rs)
@@ -98,16 +99,18 @@ tauri::Builder::default()
     .expect("error while running tauri application");
 ```
 
-In release builds, `init()` returns a no-op plugin — the server never starts, so there's zero runtime cost and no feature flags needed.
+In release builds, `init()` returns a no-op plugin: the server never starts and the linker strips it, so no feature flags are needed. The plugin's dependencies are still compiled, and `#[inspectable]` command metadata is still registered (see the release-build note above).
 
 ### Run tests
 
 Start your app, then run the smoke suite:
 
 ```bash
-pnpm tauri dev                                   # start your app
-VICTAURI_E2E=1 cargo test --test smoke           # run tests
+npm run tauri dev                                # start your app (or pnpm/yarn/bun tauri dev)
+VICTAURI_E2E=1 cargo test --test smoke           # run tests, in a second terminal
 ```
+
+On Windows the running app locks its `.exe`, and `cargo test` rebuilds it, so give the test run its own target directory: `CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke`.
 
 Or use the CLI for instant validation:
 
@@ -344,8 +347,8 @@ Victauri runs **inside** the Tauri process — same thread pool, same memory spa
 
 | | Embedded (Victauri) | External process |
 |---|---|---|
-| **Tool response** | <1ms (function call) | 5-50ms (IPC + serialization) |
-| **State accuracy** | Zero drift (reads live state) | Stale (snapshot + transfer) |
+| **Tool response** | Backend tools: one localhost HTTP hop plus an in-process call (no extra process). Webview tools: about 10-30 ms JS round trip | Same HTTP hop, plus a relay through a separate process |
+| **State accuracy** | Backend state read live from the process. Webview-side logs (IPC, console) are bounded page buffers | Whatever the external tool can observe |
 | **Backend access** | Full (AppHandle, DB, state) | Limited (webview only) |
 | **Setup** | One line in Cargo.toml | Separate process + config |
 | **Release build** | `init()` is a no-op (zero runtime cost) | Must be disabled manually |

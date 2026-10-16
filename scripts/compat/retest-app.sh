@@ -155,10 +155,20 @@ done
 echo "server reachable at $BASE"
 
 # Auth is ON by default — read the auto-generated Bearer token the plugin wrote to
-# its discovery dir (`<temp>/victauri/<pid>/token`), exactly like a real client, so
-# the smoke battery can authenticate. Only one app runs at a time, so the newest
-# token file is ours. Without this every /api/tools call 401s and nothing passes.
-VICTAURI_TOKEN="$(cat "$(ls -t "${TMPDIR:-/tmp}"/victauri/*/token /tmp/victauri/*/token 2>/dev/null | head -1)" 2>/dev/null || true)"
+# its discovery dir, exactly like a real client, so the smoke battery can
+# authenticate. Since 0.9.0 the Unix discovery root is per-user (plugin
+# `discovery_root` in mcp/server.rs): `$XDG_RUNTIME_DIR/victauri`, else
+# `<temp>/victauri-<uid>`, else `$XDG_STATE_HOME/victauri` / `~/.local/state/victauri`.
+# The pre-0.9 shared `<temp>/victauri` is kept for older plugins. Only one app runs at
+# a time, so the newest token file is ours. Without this every /api/tools call 401s.
+uid="$(id -u)"
+token_file="$(ls -t \
+  ${XDG_RUNTIME_DIR:+"$XDG_RUNTIME_DIR"/victauri/*/token} \
+  "${TMPDIR:-/tmp}"/victauri-"$uid"/*/token /tmp/victauri-"$uid"/*/token \
+  ${XDG_STATE_HOME:+"$XDG_STATE_HOME"/victauri/*/token} "$HOME"/.local/state/victauri/*/token \
+  "${TMPDIR:-/tmp}"/victauri/*/token /tmp/victauri/*/token \
+  2>/dev/null | head -1)"
+VICTAURI_TOKEN="$(cat "$token_file" 2>/dev/null || true)"
 export VICTAURI_TOKEN
 if [ -n "$VICTAURI_TOKEN" ]; then echo "discovered auth token (${#VICTAURI_TOKEN} chars)"; else echo "WARNING: no auth token found — tool calls may 401"; fi
 

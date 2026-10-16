@@ -1233,20 +1233,6 @@ fn emit_security_banner(port: u16) {
     );
 }
 
-/// Initialize the Victauri plugin with default settings (port 7373 or `VICTAURI_PORT` env var).
-///
-/// In debug builds: starts the embedded MCP server with **authentication enabled**
-/// (auto-generated token written to the per-user discovery directory (`<root>/<pid>/token`; the root is `%TEMP%\victauri` on
-/// Windows, and on Unix `$XDG_RUNTIME_DIR/victauri`, `<temp>/victauri-<uid>` or
-/// `~/.local/state/victauri`)), injects the JS
-/// bridge, and registers all Tauri command handlers.
-///
-/// In release builds: returns a no-op plugin. The MCP server, JS bridge, and
-/// all introspection tools are completely stripped — zero overhead, zero attack surface.
-///
-/// Setting the `VICTAURI_DISABLE=1` environment variable forces the no-op plugin
-/// even in a debug build — a hard kill-switch for shared environments or a release
-/// profile compiled with `debug-assertions = true`. When the server does activate
 /// Resolve configured `db_search_paths` against multiple stable anchors so a
 /// relative path is found regardless of the launch CWD.
 ///
@@ -1312,6 +1298,22 @@ fn resolve_db_search_paths_against(
     out
 }
 
+/// Initialize the Victauri plugin with default settings (port 7373 or `VICTAURI_PORT` env var).
+///
+/// In debug builds: starts the embedded MCP server with **authentication enabled**
+/// (auto-generated token written to the per-user discovery directory (`<root>/<pid>/token`; the root is `%TEMP%\victauri` on
+/// Windows, and on Unix `$XDG_RUNTIME_DIR/victauri`, `<temp>/victauri-<uid>` or
+/// `~/.local/state/victauri`)), injects the JS
+/// bridge, and registers all Tauri command handlers.
+///
+/// In release builds: returns a no-op plugin. The MCP server never starts and the
+/// linker dead-strips it, the JS bridge and the introspection tools. The crate's
+/// dependencies are still compiled (the gate is `debug_assertions`, not a Cargo
+/// feature), and `#[inspectable]` command metadata is still registered.
+///
+/// Setting the `VICTAURI_DISABLE=1` environment variable forces the no-op plugin
+/// even in a debug build — a hard kill-switch for shared environments or a release
+/// profile compiled with `debug-assertions = true`. When the server does activate
 /// it always logs a prominent startup banner, so it can never run silently.
 ///
 /// For custom configuration, use `VictauriBuilder::new().port(8080).build()`.
