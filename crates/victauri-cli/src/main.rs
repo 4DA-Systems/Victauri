@@ -2277,6 +2277,9 @@ async fn full_stack_health_check() {
     );
 
     for cmd in commands {
+        // Tauri says "Command <name> not found"; match case-insensitively, as the
+        // plugin's own ghost detection does.
+        let cmd_lower = cmd.to_lowercase();
         out.push_str(&format!(
             r#"#[tokio::test]
 async fn command_{cmd}() {{
@@ -2286,7 +2289,7 @@ async fn command_{cmd}() {{
     let result = client.invoke_command("{cmd}", None).await;
     if let Err(e) = &result {{
         assert!(
-            !format!("{{e:?}}").contains("command {cmd} not found"),
+            !format!("{{e:?}}").to_lowercase().contains("command {cmd_lower} not found"),
             "{cmd} has no registered handler: {{e:?}}"
         );
     }}
@@ -2849,7 +2852,8 @@ mod tests {
     #[test]
     fn generated_command_tests_fail_only_on_missing_handler() {
         let content = generate_integration_test_with_commands(&["greet".to_string()]);
-        assert!(content.contains(r#"contains("command greet not found")"#));
+        // Tauri capitalises "Command <name> not found", so the check must ignore case.
+        assert!(content.contains(r#".to_lowercase().contains("command greet not found")"#));
         assert!(!content.contains("result.is_ok()"));
         assert!(content.contains(r#"json!({"name": "Ada"})"#));
         assert!(!content.contains("use serde_json::json;"));
