@@ -74,6 +74,16 @@ Additionally, [tauri-apps/tauri#12673](https://github.com/tauri-apps/tauri/issue
 
 **Risk level:** Low — service workers require `https://` or `http://localhost` origin, so they only affect apps using `tauri-plugin-localhost`. Most Tauri apps use the `tauri://` protocol which doesn't support service workers.
 
+### Tauri's postMessage IPC fallback (and Android)
+
+When one custom-protocol IPC `fetch()` fails — a blocked scheme, a CSP `connect-src` that does not allow `ipc:` / `http://ipc.localhost`, a service worker — Tauri logs `IPC custom protocol failed, Tauri will now use the postMessage interface instead` and sends every later IPC call of that page over `window.ipc.postMessage`. On Android it always uses postMessage.
+
+Victauri captures that path too (command, args, status, duration, response body; entries tagged `transport: "post_message"`) — see [Architecture](architecture.md#ipc-layer). Calls captured this way are not replayed by `recording replay`.
+
+**Detection:** `get_diagnostics` reports `info.ipc_capture` and warns `ipc-postmessage-fallback` (severity `low` when capture is still full, `high` when only requests, or nothing, can be seen). The IPC-derived reports (`detect_ghost_commands`, `check_ipc_integrity`, `introspect coverage / command_catalog / command_timings`) carry the same `ipc_capture` object.
+
+**Fix the cause, not the symptom:** on desktop the fallback almost always means something is breaking the custom protocol. Check the app's CSP and service worker; Tauri's own IPC is faster over the custom protocol.
+
 ### Alternative IPC Transports
 
 #### rspc / tauri-specta
@@ -156,7 +166,7 @@ resolver on a tokio worker, whatever the command body does.
 
 Victauri is tested with Tauri 2.0 through 2.11. Key compatibility facts:
 - `js_init_script()` API is stable across all 2.x releases
-- The `fetch()` → `ipc.localhost` IPC transport is unchanged since Tauri 2.0
+- The `fetch()` → `ipc.localhost` IPC transport, and its `window.ipc.postMessage` fallback, are unchanged since Tauri 2.0 (the bridge captures both; verified against Tauri 2.11 and 2.12's `ipc-protocol.js` / `core.js`)
 - Plugin init scripts run in IIFE isolation since April 2024 — no global scope conflicts
 - The `plugin:victauri|` namespace prefix is automatically excluded from IPC logs
 

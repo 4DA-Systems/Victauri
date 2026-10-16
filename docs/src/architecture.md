@@ -37,7 +37,26 @@ The JS bridge is injected into every webview via `js_init_script()` (persistent 
 
 ### IPC Layer
 
-Tauri 2.0 sends IPC via `fetch()` to `http://ipc.localhost/<command>` on Windows (WebView2) and to the custom `ipc://localhost/<command>` scheme on macOS (WKWebView) and Linux (WebKitGTK). Victauri's fetch interceptor matches both and derives the IPC log from them (observe-only — it logs real IPC traffic but cannot block, delay, or fault it):
+Tauri 2 has two webview-to-Rust IPC transports (Tauri's `scripts/ipc-protocol.js`):
+
+1. **Custom-protocol `fetch()`** — the desktop default: `http://ipc.localhost/<command>` on Windows (WebView2), `ipc://localhost/<command>` on macOS (WKWebView) and Linux (WebKitGTK). The response comes back as the fetch response.
+2. **`window.ipc.postMessage`** (provided by wry) — used **always on Android**, and on desktop **for the rest of the page's life after one custom-protocol fetch fails** (a blocked scheme, a CSP error, a service worker). Tauri logs `IPC custom protocol failed, Tauri will now use the postMessage interface instead` and never goes back to fetch until the page reloads. The response comes back as an eval of `window.__TAURI_INTERNALS__.runCallback(id, value)`.
+
+Victauri captures both into one IPC log (observe-only — it logs real IPC traffic but cannot block, delay, or fault it):
+
+- **fetch path** — the fetch interceptor records command, args, status (from the `Tauri-Response` header), duration and response body.
+- **postMessage path** — `window.ipc` and every `__TAURI_INTERNALS__` method are frozen, so this path cannot be wrapped. The bridge observes it at the two points it can reach: the request when Tauri serializes the IPC message (`JSON.stringify(message, replacer)` right before `window.ipc.postMessage`), and the response when Tauri delivers it through the callback stored for that call in `__TAURI_INTERNALS__.callbacks`. Entries carry the same fields plus `transport: "post_message"`. The invoke key in the message is never kept. A fetch attempt that Tauri retried over postMessage counts once (the postMessage entry); the failed fetch stays visible in the network log. Because page script can stage a serialization and a callback without a real call, `recording replay` skips postMessage-captured calls.
+
+`get_diagnostics` reports which transport is in use and how complete capture is, as `info.ipc_capture` (`transport`: `fetch` / `post_message_fallback` / `post_message` / `unknown`; `capture`: `full` / `requests_only` / `none` / `unknown`), and adds an `ipc-postmessage-fallback` warning when Tauri has switched. `detect_ghost_commands`, `check_ipc_integrity`, and `introspect` `coverage` / `command_catalog` / `command_timings` carry the same `ipc_capture` object, so a report built from a partial IPC picture says so. `requests_only` means the callback table was not reachable, so responses (and outcomes) are unknown; `none` means the switch was detected but no postMessage traffic could be observed.
+
+What the IPC log does **not** capture:
+
+- **Rust → JS events** (`emit` / `Emitter`) — these arrive as evals, not IPC calls. Window lifecycle events and the events you name in `VictauriBuilder::listen_events` are captured separately (`introspect event_bus`); other app events are not.
+- **Channel messages** (`tauri::ipc::Channel`) — streamed to a JS callback by eval, or fetched in chunks; only the `plugin:__TAURI_CHANNEL__|fetch` requests for large chunks appear, as IPC calls, not the messages themselves.
+- **Isolation-pattern payloads** — with `"pattern": { "use": "isolation" }` the args are encrypted by the isolation iframe before they are sent, so the command name, status and timing are logged but the args are not readable.
+- **Alternative transports** that bypass Tauri's IPC entirely (tauri-invoke-http, sidecars) — see [Compatibility](compatibility.md).
+
+Built on that log:
 
 - **Command registry** — Discover all available commands with metadata
 - **IPC log** — Full history of command invocations with timing

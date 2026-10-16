@@ -793,7 +793,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Detect ghost commands (frontend calls with no backend handler) by IPC OUTCOME, not by guessing from Victauri's registry. Returns: `confirmed_ghosts` = commands invoked that NEVER returned success and errored 'not found' — real missing-handler bugs, HIGH confidence and independent of whether the app uses #[inspectable]; `verified_handlers` = count of commands that returned success at least once (they provably HAVE a handler, so they are never flagged — this is why a real command like `set_language` is no longer a false positive); `frontend_only` = the WEAKER candidate tier (invoked, never observed succeeding, NOT a Tauri/plugin framework builtin, and absent from the introspection registry) — confirm against the app's `tauri::generate_handler!` before filing; `excluded_builtins` = framework `plugin:*` commands (never app ghosts); `registry_only` = registered commands never invoked (informational). The `reliability` field describes only `frontend_only`; `confirmed_ghosts` is high-confidence regardless. Reads the JS-side IPC interception log (ACCUMULATES all session traffic). For a clean signal scope with `since_ms` (e.g. 5000) — invoke the suspect action, then call this with `since_ms` — or `logs {action:'clear'}` then exercise the app.",
+        description = "Detect ghost commands (frontend calls with no backend handler) by IPC OUTCOME, not by guessing from Victauri's registry. Returns: `confirmed_ghosts` = commands invoked that NEVER returned success and errored 'not found' — real missing-handler bugs, HIGH confidence and independent of whether the app uses #[inspectable]; `verified_handlers` = count of commands that returned success at least once (they provably HAVE a handler, so they are never flagged — this is why a real command like `set_language` is no longer a false positive); `frontend_only` = the WEAKER candidate tier (invoked, never observed succeeding, NOT a Tauri/plugin framework builtin, and absent from the introspection registry) — confirm against the app's `tauri::generate_handler!` before filing; `excluded_builtins` = framework `plugin:*` commands (never app ghosts); `registry_only` = registered commands never invoked (informational). The `reliability` field describes only `frontend_only`; `confirmed_ghosts` is high-confidence regardless. Reads the JS-side IPC interception log (ACCUMULATES all session traffic). For a clean signal scope with `since_ms` (e.g. 5000) — invoke the suspect action, then call this with `since_ms` — or `logs {action:'clear'}` then exercise the app. `ipc_capture` reports how complete the underlying IPC picture is (a `capture` other than `full` means calls may be missing).",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -824,7 +824,15 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("failed to parse IPC log JSON: {e}")),
         };
 
-        json_result(&build_ghost_report(&outcomes, &self.state.registry))
+        let mut report = build_ghost_report(&outcomes, &self.state.registry);
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert(
+                "ipc_capture".to_string(),
+                self.ipc_capture_status(params.webview_label.as_deref())
+                    .await,
+            );
+        }
+        json_result(&report)
     }
 
     #[tool(
@@ -1238,7 +1246,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Run environment diagnostics: detect service workers (break IPC interception), closed shadow DOM (invisible to snapshots), iframes (bridge absent), large DOM warnings, and CSP status. Call this first when connecting to an unfamiliar app.",
+        description = "Run environment diagnostics: IPC capture completeness (`info.ipc_capture`: the Tauri IPC transport in use — fetch, or the postMessage fallback Tauri switches to after a custom-protocol failure — and whether capture is full, requests-only or none), service workers (break IPC interception), closed shadow DOM (invisible to snapshots), iframes (bridge absent), large DOM warnings, and CSP status. Call this first when connecting to an unfamiliar app.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2191,7 +2199,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, or were answered by a route rule are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
+        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, were answered by a route rule, or were captured on Tauri's postMessage IPC path are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2408,6 +2416,12 @@ impl VictauriMcpHandler {
                         _ if call.mocked => Some(
                             "the original call was answered by a route rule in the page, not the backend".to_string(),
                         ),
+                        // Observed on Tauri's postMessage path: the bridge saw the call's
+                        // serialization and response callback, which page script can stage
+                        // without a real call, so its delivery is unproven.
+                        _ if call.is_post_message() => Some(
+                            "the original call was captured on Tauri's postMessage IPC path, where the bridge cannot prove it was really sent".to_string(),
+                        ),
                         victauri_core::IpcResult::Ok(_) if call.arg_size_bytes > 0 => Some(
                             "the original call had arguments, which recordings do not capture".to_string(),
                         ),
@@ -2495,8 +2509,9 @@ impl VictauriMcpHandler {
                     "skipped": skipped,
                     "note": "commands are re-invoked WITHOUT arguments (recordings do not capture \
                              them), each in the window that recorded it, and their side effects \
-                             happen again; calls that had arguments, failed, never completed, or \
-                             were answered by a route rule are skipped",
+                             happen again; calls that had arguments, failed, never completed, \
+                             were answered by a route rule, or were captured on Tauri's \
+                             postMessage IPC path are skipped",
                     "results": replay_results,
                 });
                 json_result(&result)
@@ -3199,7 +3214,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation).",
+        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms; entries captured on Tauri's postMessage IPC fallback carry transport:'post_message', see get_diagnostics ipc_capture), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3409,9 +3424,13 @@ impl VictauriMcpHandler {
                     });
                 }
 
+                let ipc_capture = self
+                    .ipc_capture_status(params.webview_label.as_deref())
+                    .await;
                 let result = serde_json::json!({
                     "commands": stats,
                     "total_commands_profiled": driven_count,
+                    "ipc_capture": ipc_capture,
                     // The store stops tracking NEW command names at its cap; say so rather
                     // than let a missing command look like one that never ran.
                     "saturated": driven_count >= COMMAND_TIMINGS_CAP,
@@ -3480,14 +3499,18 @@ impl VictauriMcpHandler {
                 } else if ipc_calls_observed == 0 {
                     Some(
                         "No IPC calls were observed on the live log. If the app is actively \
-                         making calls, confirm the target webview and that Tauri IPC routes \
-                         through fetch to ipc.localhost (some commands use the native channel).",
+                         making calls, confirm the target webview and check `ipc_capture`: \
+                         a `capture` other than `full` means the IPC picture is partial.",
                     )
                 } else {
                     None
                 };
+                let ipc_capture = self
+                    .ipc_capture_status(params.webview_label.as_deref())
+                    .await;
 
                 let result = serde_json::json!({
+                    "ipc_capture": ipc_capture,
                     "registered_commands": registered.len(),
                     "invoked_commands": invoked.len(),
                     "ipc_calls_observed": ipc_calls_observed,
@@ -3526,8 +3549,12 @@ impl VictauriMcpHandler {
                             .unwrap_or(false)
                     })
                     .count();
+                let ipc_capture = self
+                    .ipc_capture_status(params.webview_label.as_deref())
+                    .await;
 
                 let result = serde_json::json!({
+                    "ipc_capture": ipc_capture,
                     "catalog": catalog,
                     "observed_count": observed,
                     "registered_count": registry.len(),
@@ -4890,6 +4917,28 @@ impl VictauriMcpHandler {
         ))
     }
 
+    /// The window's IPC capture status (`getIpcCaptureStatus`): which Tauri IPC transport the
+    /// page uses and how completely the bridge captures it. Best effort — `null` when it cannot
+    /// be read (an older bridge, an unreachable window) — so it never fails the tool it
+    /// annotates. Every IPC-log-derived report carries it, so a report built from a partial
+    /// IPC picture says so instead of looking complete.
+    async fn ipc_capture_status(&self, webview_label: Option<&str>) -> serde_json::Value {
+        match self
+            .eval_with_return_timeout(
+                IPC_CAPTURE_STATUS_JS,
+                webview_label,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+        {
+            Ok(raw) => page_json::parse_page_json::<serde_json::Value>(&raw)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or(serde_json::Value::Null),
+            Err(_) => serde_json::Value::Null,
+        }
+    }
+
     async fn eval_bridge(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
         match self.eval_with_return(code, webview_label).await {
             Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
@@ -5740,9 +5789,12 @@ pub fn ipc_integrity_js(threshold_ms: i64) -> String {
                 var stale = pending.filter(function(c) {{ return (now - c.timestamp) > threshold; }});
                 var errored = log.filter(function(c) {{ return c.status === 'error'; }});
                 var netCount = (V?.getNetworkLog(null, 0, {{ bodies: false }}) || []).length;
+                var capture = (V && V.getIpcCaptureStatus) ? V.getIpcCaptureStatus() : null;
                 var warning = null;
-                if (log.length === 0 && netCount > 5) {{
-                    warning = 'Zero IPC calls captured but ' + netCount + ' network requests observed. IPC capture may not be working — verify the app uses Tauri IPC via fetch to ipc.localhost.';
+                if (capture && (capture.capture === 'none' || capture.capture === 'requests_only')) {{
+                    warning = capture.note;
+                }} else if (log.length === 0 && netCount > 5) {{
+                    warning = 'Zero IPC calls captured but ' + netCount + ' network requests observed. IPC capture may not be working — check ipc_capture / get_diagnostics.';
                 }}
                 function withBodies(list) {{
                     list = list.slice(0, 20);
@@ -5765,7 +5817,8 @@ pub fn ipc_integrity_js(threshold_ms: i64) -> String {
                     error_count: errored.length,
                     stale_calls: withBodies(stale),
                     errored_calls: withBodies(errored),
-                    warning: warning
+                    warning: warning,
+                    ipc_capture: capture
                 }};
             }})()"
     )
@@ -5796,6 +5849,9 @@ pub fn slow_ipc_js(threshold_ms: u64, limit: usize) -> String {
             }})()",
     )
 }
+
+/// Reads the bridge's IPC capture status (`null` on a bridge without it).
+const IPC_CAPTURE_STATUS_JS: &str = "return (window.__VICTAURI__ && typeof window.__VICTAURI__.getIpcCaptureStatus === 'function') ? window.__VICTAURI__.getIpcCaptureStatus() : null";
 
 /// Build a JS expression that takes an array of log entries (`source_expr`),
 /// keeps at most `limit` of the most recent, and truncates any per-entry field

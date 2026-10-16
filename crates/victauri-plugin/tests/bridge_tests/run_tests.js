@@ -7,6 +7,7 @@
 //   "bridge_script": "...",    // The full JS bridge source to inject
 //   "setup_html": "...",       // HTML to set as document body
 //   "setup_js": "...",         // Optional JS to run after bridge injection
+//   "pre_bridge_js": "...",    // Optional JS to run BEFORE bridge injection (Tauri's scripts)
 //   "tests": [{ "name": "...", "code": "..." }]
 // }
 //
@@ -335,6 +336,24 @@ async function run() {
       window.Request = Request;
       window.Response = Response;
       window.Headers = Headers;
+    }
+
+    // Optional script run BEFORE the bridge — as Tauri's own init scripts (core.js,
+    // ipc-protocol.js, wry's `window.ipc`) run before a plugin's.
+    const preBridgeJs = test.pre_bridge_js || testDef.pre_bridge_js || "";
+    if (preBridgeJs) {
+      try {
+        window.eval(preBridgeJs);
+      } catch (e) {
+        results.push({
+          name: test.name,
+          passed: false,
+          result: null,
+          error: "Pre-bridge JS failed: " + e.message,
+        });
+        dom.window.close();
+        continue;
+      }
     }
 
     // Inject the bridge script

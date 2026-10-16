@@ -320,6 +320,48 @@ async fn mocked_ipc_is_recorded_as_mocked_and_never_replayed() {
     assert!(body.contains("route rule"), "{body}");
 }
 
+// A call captured on Tauri's postMessage IPC path is observed from its serialization and its
+// response callback — page script can stage both without a real call — so it is recorded
+// with its transport and never replayed. Any other transport value is page data and dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_message_ipc_is_recorded_with_its_transport_and_never_replayed() {
+    let state = state();
+    let page = PageBridge::new(&state);
+    let bridge: Arc<dyn WebviewBridge> = Arc::new(page.clone());
+    let h = VictauriMcpHandler::new(state.clone(), Arc::clone(&bridge));
+    let _ = call(&h, "recording", json!({"action": "start"})).await;
+    let now = chrono::Utc::now().timestamp_millis();
+    page.push(
+        &json!({"type": "ipc", "command": "quit_app", "status": "ok",
+                "transport": "post_message", "arg_size_bytes": 0,
+                "timestamp": now, "seq_ts": now})
+        .to_string(),
+    );
+    page.push(
+        &json!({"type": "ipc", "command": "get_counter", "status": "ok",
+                "transport": "<script>forged</script>", "arg_size_bytes": 0,
+                "timestamp": now + 1, "seq_ts": now + 1})
+        .to_string(),
+    );
+    assert_eq!(drain(&state, &bridge).await, Some(2));
+    let calls = state.recorder.ipc_replay_sequence();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].transport.as_deref(), Some("post_message"));
+    assert!(calls[0].is_post_message());
+    assert_eq!(
+        calls[1].transport, None,
+        "an unknown transport value must not be stored"
+    );
+
+    let r = call(&h, "recording", json!({"action": "replay"})).await;
+    let body = text(&r);
+    assert!(
+        page.invoked_in("quit_app").is_empty(),
+        "a postMessage-captured call was replayed for real: {body}"
+    );
+    assert!(body.contains("postMessage"), "{body}");
+}
+
 fn ipc_in(command: &str, label: &str) -> AppEvent {
     AppEvent::Ipc(IpcCall::new(
         format!("c-{command}"),

@@ -464,6 +464,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - **No remote access** — localhost only, no port forwarding
 - **Same-origin frames only** — same-origin iframes are traversed; cross-origin frames are marked and skipped
 - **No live frontend-IPC control** — `fault` injection applies to commands driven through Victauri's own `invoke_command`, not the app's real frontend IPC (that path sits below the layer the JS bridge can reach without CDP)
+- **Not every webview↔Rust message is in the IPC log** — command calls are captured on both of Tauri's transports (custom-protocol fetch and the `postMessage` fallback; `get_diagnostics` reports which is in use and whether capture is complete), but Rust→JS events outside `listen_events`, `Channel` messages, and isolation-pattern args are not. See [Architecture → IPC Layer](docs/src/architecture.md#ipc-layer)
 - **Pre-1.0** — API may change (semver-checked in CI)
 
 ---

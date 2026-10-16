@@ -349,6 +349,243 @@ const INIT_SCRIPT_BODY: &str = r#"
         try { p = decodeURIComponent(p); } catch (e) {}
         return p.indexOf('plugin:victauri|') === 0;
     }
+
+    // ── IPC transport ────────────────────────────────────────────────────────
+    //
+    // Tauri 2 has two IPC transports (tauri `scripts/ipc-protocol.js`):
+    //  - the custom-protocol `fetch()` above (desktop default), which the fetch interceptor logs;
+    //  - `window.ipc.postMessage` (wry), used ALWAYS on Android, and on desktop for the rest of
+    //    the page's life after ONE custom-protocol fetch fails (blocked scheme, CSP, a service
+    //    worker): Tauri warns 'IPC custom protocol failed, Tauri will now use the postMessage
+    //    interface instead' and sets `customProtocolIpcFailed` for good.
+    // `window.ipc` and every `__TAURI_INTERNALS__` method are frozen / non-configurable, so the
+    // postMessage path cannot be wrapped. Victauri observes it at two points it CAN reach:
+    //  - the message serialization: Tauri's processIpcMessage calls the global
+    //    `JSON.stringify(message, replacer)` on `{cmd, callback, error, payload, options,
+    //    __TAURI_INVOKE_KEY__}` right before `window.ipc.postMessage(data)` — the request;
+    //  - Tauri's callback table (`__TAURI_INTERNALS__.callbacks`, a plain Map): the response is
+    //    delivered by `runCallback(id, data)`, which calls the function stored under the call's
+    //    callback (ok) or error id, so the two entries are wrapped for that one call.
+    // Captured calls go into networkLog (so every IPC reader sees them) tagged
+    // `transport: 'post_message'`. The invoke key is never retained.
+    var POST_MESSAGE_IPC_PREFIX = 'postmessage-ipc://localhost/';
+    var FALLBACK_WARNING_PREFIX = 'IPC custom protocol failed';
+    var ipcCapture = {
+        fetch_seen: false,          // any custom-protocol IPC fetch (incl. Victauri's own)
+        fetch_calls: 0,             // app IPC calls logged from fetch
+        post_message_seen: false,   // any postMessage IPC observed (incl. Victauri's own)
+        post_message_calls: 0,      // app IPC calls logged from postMessage
+        post_message_responses: 0,  // of those, responses captured
+        responses_hooked: null,     // could the callback table be reached (null = not tried)
+        fallback_detected_via: null,
+        fallback_at: null,
+    };
+    function noteIpcFallback(via) {
+        if (ipcCapture.fallback_detected_via === null) {
+            ipcCapture.fallback_detected_via = via;
+            ipcCapture.fallback_at = Date.now();
+        }
+    }
+    // The (still URL-encoded) IPC command path of a network-log entry, or null when the entry
+    // is not an IPC call. A fetch Tauri retried over postMessage is not a call of its own (the
+    // postMessage entry is), so it reads as plain (failed) network traffic.
+    function ipcEntryPath(n) {
+        if (n.transport === 'post_message') return typeof n.ipc_path === 'string' ? n.ipc_path : null;
+        if (n.superseded_by_post_message === true) return null;
+        return ipcCommandPath(n.url);
+    }
+    // Is this entry part of the IPC log (incl. a superseded fetch attempt)?
+    function isIpcEntry(n) {
+        return n.transport === 'post_message' || isIpcUrl(n.url);
+    }
+    function flushAllIpcWaiters() {
+        for (var w = ipcWaiters.length - 1; w >= 0; w--) {
+            try { ipcWaiters[w](); } catch (e) {}
+        }
+        ipcWaiters.length = 0;
+    }
+    // A header value from a fetch `init.headers` (only a genuine `Headers`, as Tauri passes).
+    function initHeader(init, name) {
+        if (!HEADERS_GET || init === undefined || init === null) return null;
+        try {
+            var h = init.headers;
+            if (h === undefined || h === null) return null;
+            return REFLECT_APPLY(HEADERS_GET, h, [name]);
+        } catch (e) { return null; }
+    }
+    // Tauri's callback table, or null (brand-checked: only a genuine Map).
+    function tauriCallbackMap() {
+        try {
+            var internals = window.__TAURI_INTERNALS__;
+            var m = internals ? internals.callbacks : null;
+            if (m === null || m === undefined || typeof m !== 'object') return null;
+            REFLECT_APPLY(MAP_HAS, m, [0]); // throws for anything but a real Map
+            return m;
+        } catch (e) { return null; }
+    }
+    function tauriPatternIsIsolation() {
+        try {
+            var p = window.__TAURI_INTERNALS__.__TAURI_PATTERN__;
+            return !!p && p.pattern === 'isolation';
+        } catch (e) { return false; }
+    }
+    // A detached, size-bounded copy of an IPC response value (as the fetch path stores it).
+    function capturedIpcValue(v) {
+        if (v === undefined || v === null) return null;
+        try {
+            if (ARRAY_BUFFER_CTOR && v instanceof ARRAY_BUFFER_CTOR) return bodyOmitted(v.byteLength, 'application/octet-stream');
+            if (IS_ARRAY_BUFFER_VIEW && IS_ARRAY_BUFFER_VIEW(v)) return bodyOmitted(v.byteLength, 'application/octet-stream');
+        } catch (e) {}
+        var t = typeof v;
+        if (t === 'string') return v.length > MAX_IPC_BODY ? bodyOmitted(v.length, null) : v;
+        if (t === 'number' || t === 'boolean') return v;
+        if (t !== 'object') return '[body omitted: ' + t + ']';
+        var s;
+        try { s = PRISTINE_STRINGIFY(v); } catch (e) { return '[body omitted: not serializable]'; }
+        if (s === undefined) return null;
+        if (s.length > MAX_IPC_BODY) return bodyOmitted(s.length, null);
+        try { return PRISTINE_PARSE(s); } catch (e) { return null; }
+    }
+    function settlePostMessageIpc(entry, isError, data) {
+        if (entry.status !== 'pending') return;
+        entry.status = 'ok'; // the response was delivered; the command outcome is ipc_response
+        entry.ipc_response = isError ? 'error' : 'ok';
+        entry.duration_ms = Date.now() - entry.timestamp;
+        ipcCapture.post_message_responses++;
+        if (window.__VICTAURI__._captureIpcBodies !== false) entry.response_body = capturedIpcValue(data);
+        flushAllIpcWaiters();
+    }
+    // Wrap the function Tauri stored under `id` so delivering the response also settles `entry`.
+    // The original is always called, with the original `this` and arguments.
+    function wrapTauriCallback(map, id, entry, isError) {
+        var orig;
+        try { orig = REFLECT_APPLY(MAP_GET, map, [id]); } catch (e) { return false; }
+        if (typeof orig !== 'function') return false;
+        var wrapped = function() {
+            try { settlePostMessageIpc(entry, isError, arguments[0]); } catch (e) {}
+            return REFLECT_APPLY(orig, this, arguments);
+        };
+        try { REFLECT_APPLY(MAP_SET, map, [id, wrapped]); return true; } catch (e) { return false; }
+    }
+    // A fetch attempt Tauri retried over postMessage (same callback id) is superseded.
+    function markFetchSuperseded(callbackId) {
+        for (var i = networkLog.length - 1; i >= 0; i--) {
+            var n = networkLog[i];
+            if (n.transport !== 'post_message' && n.ipc_callback === callbackId) {
+                n.superseded_by_post_message = true;
+                return;
+            }
+        }
+    }
+    function postMessageCallLogged(callbackId) {
+        for (var i = networkLog.length - 1; i >= 0; i--) {
+            var n = networkLog[i];
+            if (n.transport === 'post_message' && n.ipc_callback === callbackId) return true;
+        }
+        return false;
+    }
+    // Called (after serialization) for every `JSON.stringify(value, <function>)`. `out` is the
+    // serialized string. Only Tauri's IPC message shape is acted on.
+    function observePostMessageIpc(msg, out) {
+        if (!hasOwn(msg, '__TAURI_INVOKE_KEY__')) return;
+        var cmd = msg.cmd, cb = msg.callback, er = msg.error;
+        if (typeof cmd !== 'string' || typeof cb !== 'number' || typeof er !== 'number') return;
+        var map = tauriCallbackMap();
+        // A real invoke registers both callbacks just before serializing its message; a
+        // look-alike object page script serializes (to plant a fake call) has no such pair.
+        if (map && (!REFLECT_APPLY(MAP_HAS, map, [cb]) || !REFLECT_APPLY(MAP_HAS, map, [er]))) return;
+        if (postMessageCallLogged(cb)) return; // the same message serialized again
+        var blocked = false;
+        try { var o = msg.options; blocked = !!o && o.customProtocolIpcBlocked === true; } catch (e) {}
+        ipcCapture.post_message_seen = true;
+        ipcCapture.responses_hooked = !!map;
+        if (blocked) {
+            noteIpcFallback('custom_protocol_blocked');
+            markFetchSuperseded(cb);
+        }
+        if (cmd.indexOf('plugin:victauri|') === 0) return; // Victauri's own plumbing
+
+        var path = ENCODE_URI_COMPONENT(cmd);
+        var entry = {
+            id: ++networkCounter, method: 'POST', url: POST_MESSAGE_IPC_PREFIX + path,
+            timestamp: Date.now(), status: 'pending', duration_ms: null,
+            transport: 'post_message', ipc_path: path, ipc_callback: cb,
+        };
+        // Args, from the message as serialized (Tauri's replacer applied). Parsed only when
+        // small; the parsed message (which holds the invoke key) is dropped right here.
+        var payloadJson;
+        var parsed = null;
+        if (out.length <= MAX_IPC_BODY * 2) {
+            try { parsed = PRISTINE_PARSE(out); } catch (e) { parsed = null; }
+        }
+        var payload = (parsed && typeof parsed === 'object') ? parsed.payload : undefined;
+        parsed = null;
+        if (payload !== undefined) {
+            try { payloadJson = PRISTINE_STRINGIFY(payload); } catch (e) { payloadJson = undefined; }
+        }
+        entry.arg_size_bytes = payloadJson !== undefined ? ipcArgSize(payloadJson) : (payload === undefined ? out.length : 1);
+        if (window.__VICTAURI__._captureIpcBodies !== false) {
+            if (tauriPatternIsIsolation()) entry.request_args = '[encrypted: Tauri isolation pattern]';
+            else if (payload === undefined) entry.request_args = bodyOmitted(out.length, null);
+            else if (payloadJson !== undefined && payloadJson.length > MAX_IPC_BODY) entry.request_args = bodyOmitted(payloadJson.length, null);
+            else entry.request_args = payload;
+        }
+        if (map) {
+            var okHooked = wrapTauriCallback(map, cb, entry, false);
+            var errHooked = wrapTauriCallback(map, er, entry, true);
+            if (!okHooked || !errHooked) ipcCapture.responses_hooked = false;
+        }
+        if (!map || ipcCapture.responses_hooked === false) {
+            // Without the callback table the response is invisible: never leave the call
+            // 'pending' forever (that would wedge ipc_idle and read as a stuck call).
+            entry.status = 'unobserved';
+            entry.response_capture = false;
+        }
+        ipcCapture.post_message_calls++;
+        networkLog.push(entry);
+        if (networkLog.length > CAP_NETWORK) networkLog.shift();
+    }
+    function ipcCaptureStatus() {
+        var c = ipcCapture;
+        var transport;
+        if (c.fallback_detected_via !== null) transport = 'post_message_fallback';
+        else if (c.post_message_seen) transport = 'post_message';
+        else if (c.fetch_seen) transport = 'fetch';
+        else transport = 'unknown';
+        var capture;
+        if (transport === 'fetch') capture = 'full';
+        else if (transport === 'unknown') capture = 'unknown';
+        else if (!c.post_message_seen) capture = 'none';
+        else capture = c.responses_hooked === false ? 'requests_only' : 'full';
+        var note;
+        if (transport === 'unknown') {
+            note = 'No Tauri IPC observed in this page yet.';
+        } else if (transport === 'fetch') {
+            note = 'IPC runs over Tauri\'s custom-protocol fetch: command, args, status, duration and response body are captured.';
+        } else {
+            note = (transport === 'post_message_fallback'
+                ? 'Tauri switched this page to its postMessage IPC fallback after a custom-protocol fetch failed (blocked scheme, CSP or a service worker); it stays there until the page reloads. '
+                : 'Tauri uses postMessage IPC in this page (always on Android). ');
+            if (capture === 'full') {
+                note += 'Victauri captures these calls from the serialized IPC message and Tauri\'s response callback (command, args, status, duration, response body), tagged transport:"post_message". They are not replayed by `recording replay`: the page could stage such a call, so its delivery cannot be proven.';
+            } else if (capture === 'requests_only') {
+                note += 'Tauri\'s callback table is not reachable, so only REQUESTS are captured (command, args); their outcome is logged as status "unknown".';
+            } else {
+                note += 'Victauri could NOT observe the postMessage traffic: the IPC log, ghost detection, command_catalog, coverage and command_timings are BLIND to calls made since the switch.';
+            }
+        }
+        return {
+            transport: transport,
+            capture: capture,
+            fetch_calls: c.fetch_calls,
+            post_message_calls: c.post_message_calls,
+            post_message_responses: c.post_message_responses,
+            fallback_detected_via: c.fallback_detected_via,
+            fallback_at: c.fallback_at,
+            note: note,
+        };
+    }
+
     var navigationLog = [];
     var dialogLog = [];
     var interactionLog = [];
@@ -593,6 +830,17 @@ const INIT_SCRIPT_BODY: &str = r#"
     var URL_HASH_GET = URL_PROTO && protoGetter(URL_PROTO, 'hash');
     var BASE_URI_GET = typeof Node === 'function' ? protoGetter(Node.prototype, 'baseURI') : null;
     var AGENT_KEY = '__VICTAURI_AGENT_KEY__';
+    // For the postMessage-fallback IPC capture (see "IPC transport" below).
+    var ENCODE_URI_COMPONENT = encodeURIComponent;
+    var MAP_GET = Map.prototype.get;
+    var MAP_SET = Map.prototype.set;
+    var MAP_HAS = Map.prototype.has;
+    var ARRAY_BUFFER_CTOR = typeof ArrayBuffer === 'function' ? ArrayBuffer : null;
+    var IS_ARRAY_BUFFER_VIEW = (ARRAY_BUFFER_CTOR && typeof ArrayBuffer.isView === 'function') ? ArrayBuffer.isView : null;
+    var HEADERS_GET = null;
+    try {
+        if (typeof window.Headers === 'function') HEADERS_GET = window.Headers.prototype.get;
+    } catch (e) { HEADERS_GET = null; }
 
     // Page script can plant `toJSON` on Object.prototype / Array.prototype, which JSON.stringify
     // consults on EVERY object it serializes: that forged eval results (including the
@@ -766,7 +1014,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     // (plain network traffic, or Victauri's own `plugin:victauri|*` plumbing).
     var IPC_LOG_VICTAURI_PREFIX = 'plugin%3Avictauri%7C';
     function ipcCallCommand(n) {
-        var raw = ipcCommandPath(n.url);
+        var raw = ipcEntryPath(n);
         if (raw === null || raw.indexOf(IPC_LOG_VICTAURI_PREFIX) === 0) return null;
         try { return decodeURIComponent(raw); } catch (e) { return raw; }
     }
@@ -789,6 +1037,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         // error (ipc_response 'error') > ok.
         var st;
         if (n.status === 'pending') { st = 'pending'; }
+        // A postMessage call whose response Victauri cannot observe: outcome unknown.
+        else if (n.status === 'unobserved') { st = 'unknown'; }
         else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
         else if (n.ipc_response === 'error') { st = 'error'; }
         else { st = 'ok'; }
@@ -813,6 +1063,8 @@ const INIT_SCRIPT_BODY: &str = r#"
             duration_ms: n.duration_ms,
             error: errText,
         };
+        // Only non-default transports are tagged (fetch is the default; no field = fetch).
+        if (n.transport === 'post_message') e.transport = 'post_message';
         if (bodies) {
             e.args = cloneJson(n.request_args) || {};
             // Nullish, not falsy: a command returning 0 / false / '' is a real result.
@@ -853,7 +1105,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (isPending && skipPending) return;
             var key = isPending ? n.timestamp : n.timestamp + (n.duration_ms || 0);
             var mocked = n.mocked === true || n.blocked === true;
-            var raw = ipcCommandPath(n.url);
+            var raw = ipcEntryPath(n);
             if (raw === null) {
                 // Plain network traffic. IPC requests are emitted once, as `ipc` events —
                 // not a second time as `network`.
@@ -868,11 +1120,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             // `Tauri-Response: error` header is a failed command.
             var st;
             if (isPending) st = 'pending';
+            else if (n.status === 'unobserved') st = 'unknown';
             else if (n.status !== 200 && n.status !== 'ok') st = 'error';
             else if (n.ipc_response === 'error') st = 'error';
             else st = 'ok';
             var iev = { type: 'ipc', command: cmd, status: st, duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp, seq_ts: key };
             if (mocked) iev.mocked = true;
+            if (n.transport === 'post_message') iev.transport = 'post_message';
             emit(iev, key, n);
         });
         navigationLog.forEach(function(n) {
@@ -1305,6 +1559,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             return entries;
         },
 
+        // Which Tauri IPC transport this page uses and how completely Victauri captures it:
+        // { transport: 'fetch'|'post_message_fallback'|'post_message'|'unknown',
+        //   capture: 'full'|'requests_only'|'none'|'unknown', counters, note }.
+        getIpcCaptureStatus: function() { return ipcCaptureStatus(); },
+
         waitForIpcComplete: function(timeoutMs) {
             // Inspect the newest IPC call in place: copying the whole log to read one entry
             // cost as much as a full `getIpcLog()` (R5-JS1).
@@ -1572,7 +1831,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     } else if (opts.condition === 'url' && opts.value) {
                         met = window.location.href.indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'ipc_idle') {
-                        met = networkLog.filter(function(n) { return isIpcUrl(n.url); }).every(function(n) { return n.status !== 'pending'; });
+                        met = networkLog.filter(function(n) { return isIpcEntry(n); }).every(function(n) { return n.status !== 'pending'; });
                     } else if (opts.condition === 'network_idle') {
                         met = networkLog.every(function(n) { return n.status !== 'pending'; });
                     }
@@ -2040,6 +2299,21 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }
             }
 
+            // IPC capture completeness: which Tauri IPC transport this page uses and how much
+            // of it Victauri sees. A degraded state is a warning — every IPC-derived tool
+            // (logs ipc, ghost detection, command_catalog, coverage, timings) depends on it.
+            var ipcStatus = ipcCaptureStatus();
+            diag.info.ipc_capture = ipcStatus;
+            if (ipcStatus.transport === 'post_message_fallback' || ipcStatus.capture === 'requests_only' || ipcStatus.capture === 'none') {
+                diag.warnings.push({
+                    id: 'ipc-postmessage-fallback',
+                    severity: ipcStatus.capture === 'full' ? 'low' : 'high',
+                    message: ipcStatus.note,
+                    details: { transport: ipcStatus.transport, capture: ipcStatus.capture,
+                               fallback_detected_via: ipcStatus.fallback_detected_via }
+                });
+            }
+
             // Environment info
             diag.info.bridge_version = window.__VICTAURI__.version;
             diag.info.user_agent = navigator.userAgent;
@@ -2137,7 +2411,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     var AGENT_OPS = OBJ_CREATE(null);
     AGENT_OPS.clearIpcLog = function() {
         for (var i = networkLog.length - 1; i >= 0; i--) {
-            if (isIpcUrl(networkLog[i].url)) networkLog.splice(i, 1);
+            if (isIpcEntry(networkLog[i])) networkLog.splice(i, 1);
         }
         return { ok: true };
     };
@@ -2701,6 +2975,16 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     function hookConsole(level) {
         console[level] = function() {
+            // Tauri announces its permanent switch to postMessage IPC with this warning. (Page
+            // script can forge it; that only reports capture as degraded — the safe direction.)
+            if (level === 'warn') {
+                try {
+                    var first = arguments[0];
+                    if (typeof first === 'string' && first.lastIndexOf(FALLBACK_WARNING_PREFIX, 0) === 0) {
+                        noteIpcFallback('console_warning');
+                    }
+                } catch (e) {}
+            }
             try {
                 var msg = '';
                 var skippedArgs = 0;
@@ -2949,7 +3233,16 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var isVictauriInternal = isVictauriInternalUrl(url);
                 var entry = { id: id, method: method.toUpperCase(), url: loggedUrl(url), timestamp: Date.now(), status: 'pending', duration_ms: null };
 
+                if (isIpc) ipcCapture.fetch_seen = true;
                 if (isIpc && !isVictauriInternal) {
+                    ipcCapture.fetch_calls++;
+                    // Tauri's callback id for this call: if the custom protocol fails, Tauri
+                    // retries the SAME message over postMessage, and this attempt is superseded.
+                    var cbHeader = initHeader(init, 'Tauri-Callback');
+                    if (cbHeader !== null && cbHeader !== undefined) {
+                        var cbNum = +cbHeader;
+                        if (cbNum === cbNum) entry.ipc_callback = cbNum; // not NaN
+                    }
                     var reqBody = init ? init.body : null;
                     // Size of the IPC request body as sent (0 for none / `{}`), so a
                     // consumer can tell whether a call carried arguments even when they
@@ -3249,6 +3542,28 @@ const INIT_SCRIPT_BODY: &str = r#"
                 throw e;
             }
         };
+    })();
+
+    // ── postMessage IPC observation (see "IPC transport" above) ──────────────
+    //
+    // `JSON.stringify` is wrapped so the message Tauri serializes for `window.ipc.postMessage`
+    // can be observed. The wrapper returns exactly what the native call returns (or throws
+    // what it throws) and inspects nothing unless a FUNCTION replacer was passed — Tauri's
+    // processIpcMessage always passes one — so ordinary page calls only pay one typeof check.
+    // The bridge's own serialization uses NATIVE_STRINGIFY (captured above), never this.
+    (function interceptPostMessageIpc() {
+        var J = window.JSON;
+        if (!J || typeof NATIVE_STRINGIFY !== 'function') return;
+        var stringify = function stringify(value, replacer, space) {
+            'use strict';
+            var out = REFLECT_APPLY(NATIVE_STRINGIFY, J, arguments);
+            if (typeof replacer === 'function' && typeof out === 'string'
+                && value !== null && typeof value === 'object') {
+                try { observePostMessageIpc(value, out); } catch (e) {}
+            }
+            return out;
+        };
+        try { J.stringify = stringify; } catch (e) {}
     })();
 
     // ── Navigation Tracking ──────────────────────────────────────────────────
