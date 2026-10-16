@@ -474,6 +474,141 @@ jobs:
       - name: Plugin unit tests (incl. query_db / db_health)
         run: cargo test -p victauri-plugin --features sqlite --lib
 
+  # Tauri 3 canary. victauri-plugin accepts `tauri >=2, <=<newest tested 3.x pre-release>` and its
+  # `tauri-v3` feature selects the Tauri 3 API spellings. Tauri 2 and 3 can never share a lockfile
+  # (`links = "Tauri"`), so the demo app is built against Tauri 3 from its own workspace,
+  # `examples/tauri3`, then driven live. NOT required (not in `ci-success`, and
+  # `continue-on-error`): a breaking Tauri 3 pre-release must show up here without blocking Tauri 2
+  # work. Make it required once Tauri 3 is stable.
+  tauri3:
+    name: Tauri 3 canary (${{ matrix.os }})
+    continue-on-error: true
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/linux-deps
+        with:
+          xvfb: "true"
+
+      # Tauri 3's MSRV is 1.95 (the workspace's is 1.88); stable covers both.
+      - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
+        with:
+          toolchain: stable
+          components: clippy
+
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+        with:
+          workspaces: examples/tauri3 -> target
+          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Flag a newer Tauri 3 pre-release than the one pinned
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          pinned=$(sed -n 's/^tauri = "=\(.*\)"$/\1/p' examples/tauri3/Cargo.toml)
+          newest=$(curl -sf -A "victauri-ci (github.com/4DA-Systems/victauri)" \
+            'https://crates.io/api/v1/crates/tauri/versions?per_page=20' \
+            | jq -r '[.versions[] | select(.yanked | not) | .num | select(startswith("3."))][0] // empty')
+          echo "pinned tauri: $pinned, newest 3.x on crates.io: ${newest:-<none>}"
+          if [ -n "$newest" ] && [ "$newest" != "$pinned" ]; then
+            echo "::warning::tauri $newest is out — bump examples/tauri3 and the victauri-plugin tauri range (now $pinned)"
+          fi
+
+      # `cargo clippy` lints only workspace members, and victauri-plugin is a path dependency of
+      # this workspace — so drive clippy-driver as the rustc wrapper instead; the crate's own
+      # [lints] (clippy::all = deny, …) then apply to its `tauri-v3` code paths.
+      - name: Clippy victauri-plugin in its Tauri 3 configuration
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: target-tauri3-clippy
+        run: RUSTC_WRAPPER="$(rustup which clippy-driver)" cargo check --manifest-path examples/tauri3/Cargo.toml -p victauri-plugin
+
+      - name: Build the demo app against Tauri 3 (victauri-plugin `tauri-v3`)
+        run: cargo build --manifest-path examples/tauri3/Cargo.toml
+
+      - name: Prove introspection live on Tauri 3 (${{ matrix.os }})
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN=./examples/tauri3/target/debug/demo-app-tauri3
+          [ "$RUNNER_OS" = "Windows" ] && BIN=$BIN.exe
+
+          case "$RUNNER_OS" in
+            Linux)
+              export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_ALWAYS_SOFTWARE=1
+              xvfb-run -a --server-args="-screen 0 1280x800x24" "$BIN" > app.log 2>&1 &
+              ;;
+            *)
+              "$BIN" > app.log 2>&1 &
+              ;;
+          esac
+          APP_PID=$!
+
+          up=false
+          for i in $(seq 1 90); do
+            if curl -sf http://127.0.0.1:7373/health >/dev/null 2>&1; then
+              echo "MCP server up after ${i}s"; up=true; break
+            fi
+            kill -0 "$APP_PID" 2>/dev/null || { echo "::error::app exited before the server came up"; cat app.log; exit 1; }
+            sleep 1
+          done
+          [ "$up" = true ] || { echo "::error::MCP server never became reachable"; cat app.log; kill "$APP_PID" 2>/dev/null || true; exit 1; }
+
+          B=http://127.0.0.1:7373/api/tools
+          fail() { echo "::error::$1"; echo '--- app.log ---'; cat app.log; kill "$APP_PID" 2>/dev/null || true; exit 1; }
+          call() { curl -sf -X POST "$B/$1" -H 'content-type: application/json' --data-binary "$2"; }
+
+          wv=false
+          for i in $(seq 1 45); do
+            r=$(call eval_js '{"code":"return 6*7"}' 2>/dev/null || true)
+            if echo "$r" | grep -q '42'; then echo "webview eval-able after ${i} tries"; wv=true; break; fi
+            sleep 2
+          done
+          [ "$wv" = true ] || fail "webview never became eval-able (last: ${r:-none})"
+
+          info=$(call get_plugin_info '{}');                                  echo "[0 plugin  ] $(echo "$info" | jq -c '.result.app')"
+          echo "$info" | grep -q 'victauri-demo-tauri3' || fail "bound to the wrong app"
+          dom=$(call dom_snapshot '{}');                                      echo "[1 dom     ] snapshot bytes -> ${#dom}"
+          echo "$dom" | grep -q 'Victauri Demo'  || fail "dom_snapshot"
+          ipc=$(call invoke_command '{"command":"greet","args":{"name":"t3"}}'); echo "[2 ipc->rust] greet       -> $ipc"
+          echo "$ipc" | grep -q 'Hello, t3'      || fail "invoke_command"
+          log=$(call logs '{"action":"ipc","limit":20}')
+          echo "$log" | jq -e '.result | map(select(.command == "greet")) | length >= 1' >/dev/null \
+            || fail "the IPC log did not capture greet (IPC scheme changed?): $log"
+          echo "[3 ipc log ] greet captured"
+          win=$(call window '{"action":"get_state","label":"main"}');         echo "[4 window  ] $win"
+          echo "$win" | grep -q '"visible":true' || fail "window get_state"
+          reg=$(call get_registry '{}'); n=$(echo "$reg" | jq '.result | length'); echo "[5 registry] $n commands"
+          [ "${n:-0}" -ge 1 ]                    || fail "get_registry"
+          shot=$(call screenshot '{}' || true)
+          # A warning, not a failure: hosted runners may lack the capture permission/compositor
+          # (macOS screen recording, Windows Graphics Capture) — the same reason live-app skips it.
+          if echo "$shot" | grep -q 'iVBORw0KGgo'; then echo "[6 screenshot] PNG ok"; else echo "::warning::screenshot: ${shot:0:300}"; fi
+          diag=$(call get_diagnostics '{}');                                  echo "[7 diag    ] $(echo "$diag" | jq -c '.result.info.url')"
+
+          echo "PROVEN on $RUNNER_OS with Tauri 3: webview + DOM + IPC→Rust + IPC log + windows + registry + screenshot."
+          kill "$APP_PID" 2>/dev/null || true
+
+      - name: Upload app log on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tauri3-app-log-${{ matrix.os }}
+          path: app.log
+          if-no-files-found: ignore
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest

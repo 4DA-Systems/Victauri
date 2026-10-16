@@ -945,7 +945,7 @@ impl VictauriBuilder {
             let probes = self.probes;
             let js_init = js_bridge::init_script(&self.bridge_capacities);
 
-            Ok(Builder::new("victauri")
+            let builder = Builder::new("victauri")
                 .setup(move |app, _api| {
                     // Record the main (UI) thread so the bridge can run main-thread callers
                     // inline instead of deadlocking on its lock, and give the bridge a handle
@@ -1143,8 +1143,15 @@ impl VictauriBuilder {
                         }
                         _ => {}
                     }
-                })
-                .js_init_script(js_init)
+                });
+            // The persistent bridge script (main frame only — iframes are walked from the parent).
+            // Tauri 3 renamed `js_init_script` to `initialization_script`, same semantics.
+            #[cfg(feature = "tauri-v3")]
+            let builder = builder.initialization_script(js_init);
+            #[cfg(not(feature = "tauri-v3"))]
+            let builder = builder.js_init_script(js_init);
+
+            Ok(builder
                 .invoke_handler(tauri::generate_handler![
                     tools::victauri_eval_js,
                     tools::victauri_eval_callback,

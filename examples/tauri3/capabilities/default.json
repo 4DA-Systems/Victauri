@@ -1,0 +1,10 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for the Tauri 3 build of the demo app",
+  "windows": ["main", "notifications"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "victauri:default"
+  ]
+}

@@ -1,0 +1,23 @@
+{
+  "productName": "victauri-demo-tauri3",
+  "identifier": "com.example.victauri-demo-tauri3",
+  "build": {
+    "frontendDist": "../demo-app/frontend"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Victauri Demo (Tauri 3)",
+        "width": 900,
+        "height": 600,
+        "resizable": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["../demo-app/icons/icon.ico", "../demo-app/icons/icon.png"]
+  }
+}

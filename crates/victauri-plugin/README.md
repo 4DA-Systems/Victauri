@@ -66,6 +66,28 @@ victauri-plugin = { version = "0.9", default-features = false, features = ["sqli
 
 (With `default-features = false` and no `sqlite`, the plugin has no rusqlite dependency at all.)
 
+### Tauri 3 (pre-release)
+
+| Feature | Default | What it does |
+|---|---|---|
+| `tauri-v3` | off | Build against Tauri 3: the Tauri 3 API spellings and the Tauri 3 permission build step. |
+
+The plugin's `tauri` requirement spans Tauri 2 **and** Tauri 3 (`>=2.0.0, <=3.0.0-alpha.5` today —
+the ceiling is the newest Tauri 3 pre-release it has been built against). `tauri` allows one copy
+per build, so cargo picks whichever major your app uses. On Tauri 3, also turn on `tauri-v3`:
+
+```toml
+[dependencies]
+tauri = "=3.0.0-alpha.5"
+tauri-runtime-wry = "=3.0.0-alpha.5"  # Tauri 3 apps select their webview runtime
+victauri-plugin = { version = "0.9", features = ["tauri-v3"] }
+```
+
+`tauri-v3` must match your app's Tauri major: without it a Tauri 3 app fails to compile
+victauri-plugin (`no method named js_init_script`), and with it a Tauri 2 app does too
+(`no method named initialization_script`). Nothing else changes — same tools, same `init()` /
+`VictauriBuilder`, same `victauri:default` capability.
+
 ## Tools
 
 35 MCP tools across three layers -- webview, IPC, and Rust backend (full catalog in the [tools reference](https://4da-systems.github.io/Victauri/tools-reference.html)):

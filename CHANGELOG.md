@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Tauri 3 support (pre-release), without dropping Tauri 2.** victauri-plugin's `tauri`
+  requirement now spans Tauri 2 and the tested Tauri 3 pre-releases (`>=2.0.0, <=3.0.0-alpha.5`);
+  `tauri` allows one copy per build (`links = "Tauri"`), so cargo resolves it onto the app's own
+  Tauri. Tauri 3 apps enable the new `tauri-v3` feature, which selects the Tauri 3 API spelling
+  (`initialization_script`) and the Tauri 3 permission build step. Tauri 2 apps change nothing.
+  Verified live against Tauri `3.0.0-alpha.5` on Windows (WebView2) and Linux (WebKitGTK, X11):
+  the demo app's integration (26/26) and adversarial (22/22) suites pass on both, and on Linux a
+  12-thread, 720-call concurrent soak finishes with no errors and the host alive. New `examples/tauri3` (the demo app
+  built against Tauri 3, its own workspace) and a non-required `tauri3` CI canary job.
+
+### Changed
+
+- victauri-plugin no longer enables Tauri's `wry` feature (a Tauri 3 `tauri` has no such feature,
+  so requesting it would rule Tauri 3 out). The plugin is runtime-generic, like Tauri's own plugins;
+  the app selects its runtime, and Tauri 2's default features already include `wry`. Only a Tauri 2
+  app that sets `default-features = false` on `tauri` AND relied on Victauri to turn `wry` on is
+  affected — add `"wry"` to its `tauri` features.
+
 ### Fixed — IPC capture on Tauri's postMessage transport
 
 Tauri 2 sends IPC over a custom-protocol `fetch()` on desktop, but after ONE failed

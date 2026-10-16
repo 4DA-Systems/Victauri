@@ -10,6 +10,9 @@ members = [
     "examples/demo-app",
     "examples/gauntlet-app",
 ]
+# Its own workspace: it builds against Tauri 3, which cannot share this lockfile with Tauri 2
+# (`links = "Tauri"`).
+exclude = ["examples/tauri3"]
 
 [workspace.package]
 version = "0.9.0"
