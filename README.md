@@ -82,12 +82,13 @@ victauri init
 
 This will:
 - Add `victauri-plugin` and `victauri-test` to your `Cargo.toml`
-- Create starter smoke tests in your `tests/` directory
-- Print the next steps to wire the plugin
+- Add `.plugin(victauri_plugin::init())` to your Tauri builder when it finds one
+- Create `capabilities/victauri.json` (grants `victauri:default`), `.mcp.json`, starter tests in `tests/`, a CI workflow, and a CLAUDE.md block
+- Print any steps it could not do itself
 
 ### Wire the plugin
 
-Add one line to your Tauri builder:
+Skip this if `init` reported that it patched your builder. Otherwise add one line:
 
 ```rust
 // src-tauri/src/main.rs (or lib.rs)
@@ -105,9 +106,11 @@ In release builds, `init()` returns a no-op plugin: the server never starts and 
 Start your app, then run the smoke suite:
 
 ```bash
-pnpm tauri dev                                   # start your app
-VICTAURI_E2E=1 cargo test --test smoke           # run tests
+npm run tauri dev                                # start your app (or pnpm/yarn/bun tauri dev)
+VICTAURI_E2E=1 cargo test --test smoke           # run tests, in a second terminal
 ```
+
+On Windows the running app locks its `.exe`, and `cargo test` rebuilds it, so give the test run its own target directory: `CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke`.
 
 Or use the CLI for instant validation:
 
