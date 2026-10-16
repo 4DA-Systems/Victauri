@@ -805,6 +805,7 @@ Install with `cargo install victauri-cli`, then:
 
 ```bash
 victauri init                                     # Scaffold test directory with starter tests
+victauri init --optional                          # Same, Victauri behind a `victauri` Cargo feature
 victauri check                                    # Connect to running app, report health
 victauri check --junit report.xml                 # Same, with JUnit XML output
 victauri test                                     # Run 11 built-in smoke checks

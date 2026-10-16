@@ -40,7 +40,7 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 - **Cross-boundary state checking** — compare DOM state against Rust backend state and catch the drift between them
 - **Time-travel recording** — record interactions, checkpoint state, replay sequences, generate test files
 - **Cross-platform, no WebDriver** — the same tool surface on macOS, Windows, and Linux (no CDP dependency); runs headless in CI under `xvfb`. Platform limits are documented, not hidden: trusted (OS-level) input is Windows-only (other platforms fall back to synthetic events), and window screenshots need X11/XWayland on Linux (pure Wayland fails with a clear error)
-- **Zero runtime cost in release** — the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. Add `victauri-plugin` as a normal `[dependencies]` entry (the app binary cannot see `[dev-dependencies]`); the crate still compiles in, so to keep it out of release binaries entirely make it an optional dependency behind a Cargo feature and gate the `.plugin(...)` call on that feature. **SQLite note:** the default `bundled-sqlite` feature turns on `rusqlite/bundled`, and Cargo feature unification applies it to *your app's* `rusqlite` too, in release builds as well. If your app links a system SQLite or SQLCipher, use `default-features = false, features = ["sqlite"]`
+- **Zero runtime cost in release** — the server is gated behind `#[cfg(debug_assertions)]`, so `init()` is a no-op and nothing listens in release builds. Add `victauri-plugin` as a normal `[dependencies]` entry (the app binary cannot see `[dev-dependencies]`); the crate still compiles in, so to keep it out of release binaries entirely make it an optional dependency behind a Cargo feature (`victauri init --optional` scaffolds it). **SQLite note:** the default `bundled-sqlite` feature turns on `rusqlite/bundled`, and Cargo feature unification applies it to *your app's* `rusqlite` too, in release builds as well. If your app links a system SQLite or SQLCipher, use `default-features = false, features = ["sqlite"]`
 
 **Bonus — for AI agents:** the same server speaks MCP, so Claude Code, Cursor, Windsurf, and any MCP client get this full-stack access for interactive debugging — no extra setup.
 
@@ -99,7 +99,16 @@ tauri::Builder::default()
     .expect("error while running tauri application");
 ```
 
-In release builds, `init()` returns a no-op plugin: the server never starts and the linker strips it, so no feature flags are needed. The plugin's dependencies are still compiled, and `#[inspectable]` command metadata is still registered (see the release-build note above).
+In release builds, `init()` returns a no-op plugin: the server never starts and the linker strips it, so no feature flags are needed. `#[inspectable]` likewise compiles none of its metadata (descriptions, intents, examples) into a release build. The plugin's dependencies are still compiled (see below).
+
+**Zero release footprint.** As an ordinary dependency the crate still *compiles* into a release
+build (inert; the linker drops the unreachable server, but the default `bundled-sqlite` feature
+adds SQLite's C code — about +1.7 MB without LTO, ~58 KB with LTO in a fresh project — and also
+switches your app's own `rusqlite`, if any, to bundled). `victauri init --optional` instead
+scaffolds Victauri as an optional dependency behind a `victauri` Cargo feature, so release
+builds contain none of it; you then start the app with the feature on
+(`npm run tauri dev -- --features victauri`, or `pnpm tauri dev --features victauri`).
+See [Getting Started → Zero release footprint](docs/src/getting-started.md#zero-release-footprint-optional-dependency).
 
 ### Run tests
 

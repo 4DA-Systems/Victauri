@@ -94,9 +94,43 @@ pub async fn reserve_page_eval(
     Ok(slot)
 }
 
+/// The webview that sent a command, BORROWED from Tauri's invoke message — the argument type of
+/// the two `async` page commands.
+///
+/// Tauri runs an `async` command on a tokio worker: the invoke message and the resolver (each
+/// holding a `Webview`) move there, and every command argument is extracted there. A
+/// `tauri::WebviewWindow` / `Webview` / `AppHandle` argument is a CLONE of the message's handle,
+/// made and dropped on that worker — and on Linux every Tauri handle carries a non-atomic `Rc`
+/// (see `bridge::on_main`), so each such clone/drop races the main thread. This type borrows
+/// the message's own handle instead (`InvokeMessage::webview_ref`): the command reads the
+/// label and posts to the main thread through the borrowed `AppHandle`
+/// (`run_on_main_thread` does not clone), so Victauri adds no handle clone or drop off the
+/// main thread. (Tauri's own message/resolver still travel to and are dropped on the worker —
+/// that is inherent to every async command in every Tauri app, and cannot be changed from a
+/// plugin without changing what a page receives from `invoke`.)
+pub struct CallingWebview<'a, R: Runtime>(&'a tauri::Webview<R>);
+
+impl<'de, R: Runtime> tauri::ipc::CommandArg<'de, R> for CallingWebview<'de, R> {
+    fn from_command(
+        command: tauri::ipc::CommandItem<'de, R>,
+    ) -> Result<Self, tauri::ipc::InvokeError> {
+        Ok(Self(command.message.webview_ref()))
+    }
+}
+
+impl<R: Runtime> CallingWebview<'_, R> {
+    fn label(&self) -> &str {
+        self.0.label()
+    }
+
+    fn app_handle(&self) -> &tauri::AppHandle<R> {
+        self.0.app_handle()
+    }
+}
+
 #[tauri::command]
 pub async fn victauri_eval_js<R: Runtime>(
-    webview: tauri::WebviewWindow<R>,
+    webview: CallingWebview<'_, R>,
     state: State<'_, Arc<VictauriState>>,
     code: String,
 ) -> Result<String, String> {
@@ -206,7 +240,7 @@ fn deliver_eval_result(state: Arc<VictauriState>, id: String, result: String) {
 
 #[tauri::command]
 pub async fn victauri_dom_snapshot<R: Runtime>(
-    webview: tauri::WebviewWindow<R>,
+    webview: CallingWebview<'_, R>,
     state: State<'_, Arc<VictauriState>>,
 ) -> Result<String, String> {
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -242,7 +276,8 @@ pub async fn victauri_dom_snapshot<R: Runtime>(
 // resolver there, and every Tauri handle among them carries a non-atomic `Rc` on Linux (see
 // `bridge::on_main`). As sync commands they run on the main thread, where those handles belong.
 // `victauri_eval_js` / `victauri_dom_snapshot` must stay `async` — they wait for the page's
-// callback — so a page that calls them still takes Tauri's async-command path.
+// callback — so a page that calls them still takes Tauri's async-command path; they take no
+// Tauri handle argument, only a borrowed [`CallingWebview`].
 #[tauri::command]
 pub fn victauri_get_window_state<R: Runtime>(
     app: tauri::AppHandle<R>,
@@ -558,6 +593,35 @@ mod tests {
             source.contains("pub fn victauri_eval_callback<R: Runtime>("),
             "victauri_eval_callback must stay a synchronous command"
         );
+
+        // ...and those two take no Tauri handle by value: Tauri extracts an async command's
+        // arguments ON the tokio worker, so a `WebviewWindow` / `Webview` / `Window` /
+        // `AppHandle` argument is a handle cloned (and later dropped) off the main thread. They
+        // borrow the invoke message's webview through `CallingWebview` instead.
+        for name in ["victauri_eval_js", "victauri_dom_snapshot"] {
+            let start = source
+                .find(&format!("pub async fn {name}<"))
+                .unwrap_or_else(|| panic!("{name} not found"));
+            let params = &source[start..];
+            let params = &params[..params.find(") ->").expect("signature end")];
+            assert!(
+                params.contains("CallingWebview<'_, R>"),
+                "{name} must take the calling webview as a borrowed CallingWebview: {params}"
+            );
+            for handle in ["WebviewWindow<", "Webview<", "Window<", "AppHandle<"] {
+                let by_value = params
+                    .split(',')
+                    .map(|p| p.split_once(':').map_or("", |(_, ty)| ty.trim()))
+                    .any(|ty| {
+                        ty.starts_with(handle) || ty.starts_with(&format!("tauri::{handle}"))
+                    });
+                assert!(
+                    !by_value,
+                    "{name} takes a Tauri handle ({handle}..) by value — it would be cloned and \
+                     dropped on a tokio worker: {params}"
+                );
+            }
+        }
     }
 
     /// Every `.rs` file under this crate's `src/`, as `(path, source)`.

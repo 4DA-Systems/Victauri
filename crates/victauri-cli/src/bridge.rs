@@ -602,8 +602,10 @@ fn error_for_request(msg: &Value, code: i64, message: &str) -> String {
 fn unreachable_message() -> String {
     "Victauri backend not reachable: no running Tauri app with the Victauri plugin (debug \
      build) was found. Start the app (e.g. `npm run tauri dev` / `pnpm tauri dev`); the bridge \
-     connects automatically when it comes up — no reconnect needed. If several Victauri apps \
-     run, select one with `--app <bundle-identifier>` or the VICTAURI_APP env var."
+     connects automatically when it comes up — no reconnect needed. If the app gates Victauri \
+     behind a Cargo feature (`victauri init --optional`), start it with that feature \
+     (`npm run tauri dev -- --features victauri` / `pnpm tauri dev --features victauri`). If several Victauri apps run, select one with \
+     `--app <bundle-identifier>` or the VICTAURI_APP env var."
         .to_string()
 }
 

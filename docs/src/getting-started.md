@@ -19,7 +19,81 @@ Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 victauri-plugin = "0.9"
 ```
 
-The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin (zero runtime cost) thanks to the `#[cfg(debug_assertions)]` gate — no feature flags needed. The crate still compiles into your binary (inert in release). For a zero compiled-footprint release, make it an optional dependency behind a Cargo feature (`victauri-plugin = { version = "0.9", optional = true }` + `[features] victauri = ["dep:victauri-plugin"]`) and gate the `.plugin(...)` call with `#[cfg(feature = "victauri")]`. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
+The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin thanks to the `#[cfg(debug_assertions)]` gate: no server starts, nothing listens, and `#[inspectable]` emits none of its metadata. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
+
+What an ordinary dependency still costs a release build is **compile time and some binary
+size**, not runtime: the crate and its dependencies (axum, rmcp, ...) are compiled, and the
+linker discards the server code it never reaches (Tauri still embeds the plugin's permission
+names in the app's ACL) — but the default `bundled-sqlite` feature
+compiles SQLite's C code into the build, and it also switches your app's own `rusqlite` (if
+any) to bundled SQLite, because Cargo unifies features. Measured on a fresh create-tauri-app
+style project: about +1.7 MB on the release executable without LTO, about +58 KB with LTO.
+If you want none of that, use the feature-gated setup below.
+
+### Zero release footprint (optional dependency)
+
+`victauri init --optional` scaffolds this for you. It makes Victauri an **optional**
+dependency behind a `victauri` Cargo feature, so a build without the feature (your release
+build) compiles **no** Victauri code at all:
+
+```toml
+[dependencies]
+victauri-plugin = { version = "0.9", optional = true }
+victauri-core = { version = "0.9", optional = true }   # only if you use #[inspectable]
+
+[features]
+victauri = ["dep:victauri-plugin", "dep:victauri-core"]
+```
+
+```rust
+fn main() {
+    with_victauri(tauri::Builder::default())
+        // ... your other plugins and setup
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
+
+#[cfg(feature = "victauri")]
+fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder.plugin(victauri_plugin::init()).plugin(
+        // A capability FILE naming `victauri:default` would break every build without the
+        // feature (Tauri rejects permissions of plugins that are not in the build), so grant
+        // it at runtime instead (Tauri's default `dynamic-acl` feature).
+        tauri::plugin::Builder::<R>::new("victauri-capability")
+            .setup(|app, _api| {
+                tauri::Manager::add_capability(
+                    app,
+                    tauri::ipc::CapabilityBuilder::new("victauri")
+                        .window("*")
+                        .permission("victauri:default"),
+                )?;
+                Ok(())
+            })
+            .build(),
+    )
+}
+
+#[cfg(not(feature = "victauri"))]
+fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder
+}
+```
+
+Then run the app **with** the feature, and build releases without it:
+
+```bash
+pnpm tauri dev --features victauri          # npm: npm run tauri dev -- --features victauri
+pnpm tauri build                            # release: feature off, no Victauri code
+```
+
+The trade-off is that one flag: a plain `tauri dev` builds without Victauri, and the agent's
+tool calls then report the backend unreachable. That is why it is opt-in rather than the
+default. (Tauri's `build.features` in `tauri.conf.json` applies to `tauri build` too, so it
+cannot turn the feature on for dev only; a `"dev"` script in `package.json` that passes
+`--features victauri` is the usual way to make it automatic.) If you annotate commands with
+`#[inspectable]`, write it as `#[cfg_attr(feature = "victauri", victauri_plugin::inspectable)]`
+so feature-off builds do not need the crate. In this setup, skip Step 3's capability file —
+the wiring above grants the permission.
 
 ## Step 2: Initialize the Plugin
 
