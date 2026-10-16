@@ -396,9 +396,24 @@ Get plugin version, uptime, configuration, and capabilities.
 
 ### get_diagnostics
 
-Get detailed diagnostic information about the plugin state.
+Environment diagnostics for a webview: service workers, closed shadow DOM, iframes, DOM size,
+CSP, and IPC capture completeness.
 
-**Parameters:** None.
+**Parameters:** `webview_label` (optional).
+
+`info.ipc_capture` says which Tauri IPC transport the page uses and how much of it Victauri sees:
+
+| Field | Values |
+|---|---|
+| `transport` | `fetch` (custom protocol, desktop default) · `post_message_fallback` (Tauri switched after a custom-protocol failure) · `post_message` (always postMessage, e.g. Android) · `unknown` (no IPC yet) |
+| `capture` | `full` · `requests_only` (responses unobservable; calls logged with status `unknown`) · `none` (switch detected, traffic invisible) · `unknown` |
+| `fetch_calls`, `post_message_calls`, `post_message_responses` | counters for this page |
+| `fallback_detected_via`, `fallback_at` | `console_warning` / `custom_protocol_blocked`, and when |
+| `note` | plain-language explanation |
+
+When Tauri has switched to postMessage, `warnings` includes `ipc-postmessage-fallback`. The same
+object is attached as `ipc_capture` to `detect_ghost_commands`, `check_ipc_integrity`, and
+`introspect` `coverage` / `command_catalog` / `command_timings`.
 
 ---
 
@@ -640,7 +655,7 @@ Access all captured logs from the application.
 |--------|-----------|-------------|
 | `console` | `since`, `level` | Console log entries |
 | `network` | `since` | Network request log |
-| `ipc` | `since`, `limit` | IPC command log |
+| `ipc` | `since`, `limit` | IPC command log (calls captured on Tauri's postMessage fallback carry `transport: "post_message"`) |
 | `navigation` | — | Navigation history |
 | `dialogs` | — | Dialog interactions |
 | `events` | `since` | Event stream |
@@ -712,6 +727,12 @@ page-scoped (cleared on reload).
 > does not touch the app's real frontend IPC either: it only applies to commands
 > you drive through `invoke_command`. Neither tool can reproduce a failure a user
 > clicking the UI would hit.
+>
+> **A `block` rule on a Tauri IPC URL switches the page to postMessage IPC.** The
+> blocked fetch rejects, which Tauri treats as a broken custom protocol: it
+> retries that call over `window.ipc.postMessage` and uses postMessage for the
+> rest of the page's life (until a reload). Victauri still captures those calls
+> (`transport: "post_message"`) and `get_diagnostics` reports the switch.
 
 ---
 

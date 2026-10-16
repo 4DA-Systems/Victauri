@@ -30,6 +30,13 @@ pub struct IpcCall {
     /// fake success into a real invocation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mocked: bool,
+    /// The IPC transport the call was captured on, when it is not Tauri's default
+    /// custom-protocol fetch: `"post_message"` for a call observed on Tauri's
+    /// `window.ipc.postMessage` path (always used on Android; used on desktop after a
+    /// custom-protocol failure). The bridge sees such a call's serialization and response
+    /// callback, not its delivery, so `recording replay` skips it. `None` = fetch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<String>,
 }
 
 /// Outcome of an IPC call: pending, success with a JSON value, or error.
@@ -86,6 +93,7 @@ impl IpcCall {
             arg_size_bytes,
             webview_label: webview_label.into(),
             mocked: false,
+            transport: None,
         }
     }
 
@@ -94,6 +102,29 @@ impl IpcCall {
     pub fn with_mocked(mut self, mocked: bool) -> Self {
         self.mocked = mocked;
         self
+    }
+
+    /// Record the IPC transport the call was captured on (`None` = the default fetch).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use victauri_core::{IpcCall, IpcResult};
+    ///
+    /// let call = IpcCall::new("c1", "greet", chrono::Utc::now(), IpcResult::Pending, None, 0, "main")
+    ///     .with_transport(Some("post_message".to_string()));
+    /// assert_eq!(call.transport.as_deref(), Some("post_message"));
+    /// ```
+    #[must_use]
+    pub fn with_transport(mut self, transport: Option<String>) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Whether the call was observed on Tauri's postMessage IPC path rather than fetch.
+    #[must_use]
+    pub fn is_post_message(&self) -> bool {
+        self.transport.as_deref() == Some("post_message")
     }
 }
 

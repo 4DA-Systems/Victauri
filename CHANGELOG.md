@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — IPC capture on Tauri's postMessage transport
+
+Tauri 2 sends IPC over a custom-protocol `fetch()` on desktop, but after ONE failed
+custom-protocol fetch (a blocked scheme, a CSP error, a service worker — or a `route` `block`
+rule on an IPC URL) it switches the page to `window.ipc.postMessage` for good, and on Android it
+always uses postMessage. Victauri only intercepted the fetch path, so on the fallback the IPC log
+— and ghost detection, `command_catalog`, `coverage`, `command_timings` and integrity checks
+built on it — went silently empty.
+
+- The bridge now captures postMessage-path IPC too: the request when Tauri serializes the IPC
+  message, the response through the call's entry in Tauri's callback table. Entries carry the
+  same fields (command, args, status, duration, response body) plus `transport: "post_message"`;
+  the invoke key is never kept. A fetch attempt Tauri retried over postMessage counts once.
+- New `ipc_capture` status (`transport`: `fetch` / `post_message_fallback` / `post_message` /
+  `unknown`; `capture`: `full` / `requests_only` / `none` / `unknown`) in `get_diagnostics`
+  (`info.ipc_capture`, plus an `ipc-postmessage-fallback` warning), and attached to
+  `detect_ghost_commands`, `check_ipc_integrity` and `introspect` `coverage` / `command_catalog`
+  / `command_timings`. Bridge method `getIpcCaptureStatus()`.
+- `recording replay` skips postMessage-captured calls (page script could stage one). Additive:
+  `IpcCall::transport` + `IpcCall::with_transport` / `is_post_message`.
+- Docs list what the IPC log does not capture: Rust→JS events outside `listen_events`, `Channel`
+  messages, isolation-pattern args.
+
 ## [0.9.0] - 2026-09-30
 
 A correctness-and-hardening release built from four audit rounds: a full-surface review (three

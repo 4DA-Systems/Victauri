@@ -683,6 +683,7 @@ mod tests {
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
                 mocked: false,
+                transport: None,
             }),
         }]);
         let code = generate_test_default(&session);
@@ -704,6 +705,7 @@ mod tests {
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
                 mocked: false,
+                transport: None,
             }),
         }]);
         let code = generate_test_default(&session);
@@ -725,6 +727,7 @@ mod tests {
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
                 mocked: false,
+                transport: None,
             }),
         }]);
         let opts = CodegenOptions {
@@ -1127,6 +1130,7 @@ mod tests {
                     arg_size_bytes: 42,
                     webview_label: "main".to_string(),
                     mocked: false,
+                    transport: None,
                 }),
             },
             // 4: StateChange caused by save_draft
@@ -1320,6 +1324,7 @@ mod tests {
                 arg_size_bytes: 0,
                 webview_label: "main".to_string(),
                 mocked: false,
+                transport: None,
             }),
         }]);
         let opts = CodegenOptions {

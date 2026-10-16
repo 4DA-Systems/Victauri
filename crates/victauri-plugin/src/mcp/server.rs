@@ -1304,7 +1304,13 @@ pub(super) fn parse_bridge_event_from(
                         .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX)),
                     label.to_string(),
                 )
-                .with_mocked(ev.get("mocked").and_then(serde_json::Value::as_bool) == Some(true)),
+                .with_mocked(ev.get("mocked").and_then(serde_json::Value::as_bool) == Some(true))
+                // Only the one known non-default transport is accepted: the value is page
+                // data, so it is never stored verbatim.
+                .with_transport(
+                    (ev.get("transport").and_then(|t| t.as_str()) == Some("post_message"))
+                        .then(|| "post_message".to_string()),
+                ),
             )
         }
         "network" => AppEvent::state_change(
