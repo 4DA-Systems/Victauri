@@ -18,6 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the demo app's integration (26/26) and adversarial (22/22) suites pass on both, and on Linux a
   12-thread, 720-call concurrent soak finishes with no errors and the host alive. New `examples/tauri3` (the demo app
   built against Tauri 3, its own workspace) and a non-required `tauri3` CI canary job.
+- **`victauri setup <client>…`** (CLI): wire Victauri into AI agent clients in one command —
+  `claude`, `cursor`, `vscode` (alias `copilot`), `windsurf` (alias `devin`), `codex`, `gemini`,
+  `zed`, `roo`, or `all`. Each gets `victauri bridge --app <identifier>` in that client's MCP
+  config plus agent instructions (CLAUDE.md block + `.claude/skills/victauri/SKILL.md` for Claude
+  Code; an AGENTS.md block for the rest; a GEMINI.md block importing AGENTS.md for Gemini CLI).
+  `--dry-run` shows the changes; `--no-instructions` writes only MCP config.
+- **`victauri init --client <clients>`** runs the same wiring during `init` (default `claude`, so
+  plain `victauri init` produces the same files as before plus the Claude Code skill).
+- **Comparison page** (`docs/src/comparison.md`): Victauri vs hypothesi/mcp-server-tauri,
+  WebdriverIO's Tauri service, tauri-pilot, Playwright/CDP on WebView2 and CrabNebula DevTools,
+  including where each of them is the better choice.
 
 ### Changed
 
@@ -26,6 +37,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the app selects its runtime, and Tauri 2's default features already include `wry`. Only a Tauri 2
   app that sets `default-features = false` on `tauri` AND relied on Victauri to turn `wry` on is
   affected — add `"wry"` to its `tauri` features.
+- `victauri init` now **merges** a `victauri` server into an existing `.mcp.json` instead of
+  printing a snippet to paste. Config merges never clobber: the entry is inserted as text (JSONC
+  comments, formatting and key order survive) and the result is re-parsed and verified before it
+  is written atomically; an existing `victauri` entry is never changed; a malformed file is left
+  untouched with the entry to add by hand. User-level files (Windsurf/Devin, `~/.codex`) are only
+  written with `--user-config`.
+- `victauri doctor` passes when *any* supported client's project config has a `victauri` server
+  (it used to warn unless `.mcp.json` existed).
 
 ### Fixed — IPC capture on Tauri's postMessage transport
 
@@ -49,6 +68,11 @@ built on it — went silently empty.
   `IpcCall::transport` + `IpcCall::with_transport` / `is_post_message`.
 - Docs list what the IPC log does not capture: Rust→JS events outside `listen_events`, `Channel`
   messages, isolation-pattern args.
+
+### Fixed
+
+- The CLI README showed `victauri init ./my-tauri-app`; `init` takes `--path`.
+
 
 ## [0.9.0] - 2026-09-30
 

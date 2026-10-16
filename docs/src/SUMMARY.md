@@ -11,3 +11,4 @@
 - [Configuration](./configuration.md)
 - [Security](./security.md)
 - [FAQ](./faq.md)
+- [Comparison](./comparison.md)

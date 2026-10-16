@@ -360,24 +360,88 @@ fn init_never_prints_verbatim_windows_paths() {
     assert!(!err.contains(r"\?\"), "verbatim path printed:\n{err}");
 }
 
-/// R5B-INIT2: with an existing `.mcp.json` that lacks Victauri, the suggested snippet must pin
-/// the bridge to the app exactly like the generated file does (`--app <identifier>`).
+/// R5B-INIT2: an existing `.mcp.json` that lacks Victauri is now merged into (it used to get
+/// a printed snippet) — the merged entry must pin the bridge to the app exactly like a
+/// generated file does (`--app <identifier>`), keep the user's other servers, and re-running
+/// must leave the file byte-for-byte unchanged.
 #[test]
-fn init_suggestion_for_an_existing_mcp_json_pins_the_app() {
+fn init_merges_into_an_existing_mcp_json_and_pins_the_app() {
     let iso = IsolatedTemp::new();
     let project = iso.0.path().join("project");
     write_tauri_project(&project, true);
-    std::fs::write(project.join(".mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+    )
+    .unwrap();
     let out = iso
         .victauri(&["init", "--path", project.to_str().unwrap()])
         .output()
         .unwrap();
     let err = stderr(&out);
     assert!(out.status.success(), "{err}");
-    assert!(
-        err.contains(r#""args": ["bridge", "--app", "com.test.init"]"#),
-        "the suggestion must pin the app:\n{err}"
+    let merged = std::fs::read_to_string(project.join(".mcp.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
+    assert_eq!(v["mcpServers"]["other"]["command"], "x");
+    assert_eq!(
+        v["mcpServers"]["victauri"]["args"],
+        json!(["bridge", "--app", "com.test.init"]),
+        "{err}"
     );
+    let again = iso
+        .victauri(&["init", "--path", project.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(again.status.success());
+    assert_eq!(
+        std::fs::read_to_string(project.join(".mcp.json")).unwrap(),
+        merged
+    );
+}
+
+/// `victauri setup all` wires every project-level client, skips the user-level-only one
+/// (Windsurf/Devin) unless `--user-config` is given, and never touches the home directory.
+#[test]
+fn setup_all_writes_project_configs_and_skips_user_level_without_the_flag() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    write_tauri_project(&project, true);
+    let home = iso.0.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let out = iso
+        .victauri(&["setup", "all", "--path", project.to_str().unwrap()])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("APPDATA", home.join("AppData"))
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("CODEX_HOME")
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    for rel in [
+        ".mcp.json",
+        ".cursor/mcp.json",
+        ".vscode/mcp.json",
+        ".codex/config.toml",
+        ".gemini/settings.json",
+        ".zed/settings.json",
+        ".roo/mcp.json",
+        "CLAUDE.md",
+        "AGENTS.md",
+        "GEMINI.md",
+        ".claude/skills/victauri/SKILL.md",
+    ] {
+        let text = std::fs::read_to_string(project.join(rel)).unwrap_or_default();
+        assert!(text.contains("victauri"), "{rel} missing:\n{err}");
+    }
+    assert!(err.contains("--user-config"), "{err}");
+    assert!(
+        std::fs::read_dir(&home).unwrap().next().is_none(),
+        "nothing may be written to the home directory without --user-config"
+    );
+    // No Cargo/test scaffolding: setup only wires agents.
+    assert!(!project.join("tests").exists());
 }
 
 /// R5B-PORTAPP1: with `VICTAURI_PORT` set, `--app` / `VICTAURI_APP` was silently ignored by
