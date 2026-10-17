@@ -5020,10 +5020,18 @@ fn drain_case(name: &str, code: &str) -> TestCase {
         name: name.into(),
         code: code.into(),
         setup_html: None,
-        // jsdom has no Response; a route `fulfill` needs one.
+        // jsdom has no Response; a route `fulfill` needs one (with `headers.get`: the bridge reads
+        // a mocked IPC call's `Tauri-Response` from the response it built, as Tauri does).
         setup_js: Some(
-            r"window.Response = function(body, init) { this.status = init.status; this.body = body; };"
-                .into(),
+            r"window.Response = function(body, init) {
+                this.status = init.status; this.body = body;
+                var h = init.headers || {};
+                this.headers = { get: function(n) {
+                    for (var k in h) { if (k.toLowerCase() === n.toLowerCase()) return h[k]; }
+                    return null;
+                } };
+            };"
+            .into(),
         ),
     }
 }
@@ -5091,7 +5099,7 @@ fn recording_drain_reads_each_event_exactly_once() {
                 "a route-mocked IPC call is marked mocked in the stream and the drain",
                 r"
                     var v = window.__VICTAURI__;
-                    v.addRoute({ pattern: 'http://ipc.localhost/quit_app', match_type: 'exact', action: 'fulfill', status: 200, body: 'null' });
+                    v.addRoute({ pattern: 'http://ipc.localhost/quit_app', match_type: 'exact', action: 'fulfill', status: 200, body: 'null', headers: { 'Tauri-Response': 'ok' } });
                     await fetch('http://ipc.localhost/quit_app', { method: 'POST' });
                     v._agent('__AGENT_KEY__').clearRoutes();
                     await fetch('http://ipc.localhost/real_cmd', { method: 'POST', body: '{}' });

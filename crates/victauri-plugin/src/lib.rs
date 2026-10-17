@@ -1316,7 +1316,7 @@ fn resolve_db_search_paths_against(
 /// In release builds: returns a no-op plugin. The MCP server never starts and the
 /// linker dead-strips it, the JS bridge and the introspection tools. The crate's
 /// dependencies are still compiled (the gate is `debug_assertions`, not a Cargo
-/// feature), and `#[inspectable]` command metadata is still registered.
+/// feature); `#[inspectable]` registers no command metadata in a release build.
 ///
 /// Setting the `VICTAURI_DISABLE=1` environment variable forces the no-op plugin
 /// even in a debug build — a hard kill-switch for shared environments or a release

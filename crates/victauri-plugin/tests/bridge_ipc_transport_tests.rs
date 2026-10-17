@@ -480,3 +480,239 @@ fn a_forged_fallback_warning_reports_degraded_never_healthy() {
     assert_eq!(r["transport"], "post_message_fallback", "{r}");
     assert_eq!(r["capture"], "none", "{r}");
 }
+
+/// An app with `useHttpsScheme` (Windows, Android) sends IPC to `https://ipc.localhost/`. The
+/// bridge used to recognise only http:// and ipc://, so such an app's IPC log was empty and
+/// `ipc_capture` said "no IPC observed yet" while it made calls (red team H1).
+#[test]
+fn https_scheme_ipc_is_captured_and_route_aware() {
+    let code = format!(
+        "{DRIVE_THREE}
+        var V = window.__VICTAURI__;
+        var rule = V.addRoute({{ pattern: 'https://ipc.localhost/never_called', match_type: 'exact',
+                                 action: 'delay', delay_ms: 1 }});
+        return {{ app: out, fetched: window.__vtestBackend.fetched, log: V.getIpcLog(),
+                 status: V.getIpcCaptureStatus(), note: rule.ipc_note || null }};"
+    );
+    let Some(r) = run_one("https scheme", "{ httpsScheme: true }", &code) else {
+        return;
+    };
+    assert_eq!(r["app"]["greet"], "Hello, Ada!", "{r}");
+    assert!(r["fetched"].to_string().contains("greet"), "{r}");
+    let cmds: Vec<&str> = r["log"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["command"].as_str().unwrap())
+        .collect();
+    assert_eq!(cmds, ["greet", "fail", "add"], "{r}");
+    assert_eq!(r["status"]["transport"], "fetch", "{r}");
+    assert!(
+        r["note"].is_string(),
+        "a rule on an https IPC URL is recognised as IPC: {r}"
+    );
+}
+
+/// Page script can register a callback pair itself (`transformCallback` is public), so a
+/// postMessage-shaped message proves nothing. It must not hide or rename a real fetch call
+/// that is still in flight (red team F1, T2), and Tauri's callback ids stay out of
+/// `getNetworkLog` (they let a page re-plant a completed call's ids — T3).
+#[test]
+fn staged_postmessage_lookalikes_cannot_hide_or_rename_real_calls() {
+    let code = r"
+        var I = window.__TAURI_INTERNALS__;
+        var V = window.__VICTAURI__;
+        var p = I.invoke('fail', {});
+        var keys = Array.from(I.callbacks.keys());
+        JSON.stringify({ cmd: 'harmless_cmd', callback: keys[keys.length - 2], error: keys[keys.length - 1],
+                         payload: {}, options: { customProtocolIpcBlocked: true }, __TAURI_INVOKE_KEY__: 'x' },
+                       function (k, v) { return v; });
+        try { await p; } catch (e) {}
+        await new Promise(function (r) { setTimeout(r, 20); });
+        var net = V.getNetworkLog(null, 0, {});
+        return {
+            log: V.getIpcLog().map(function (e) { return [e.command, e.status, e.transport || 'fetch']; }),
+            status: V.getIpcCaptureStatus(),
+            netHasCallbackIds: net.some(function (n) { return 'ipc_callback' in n; }),
+        };
+    ";
+    let Some(r) = run_one("lookalikes", "{}", code) else {
+        return;
+    };
+    assert_eq!(
+        r["log"],
+        serde_json::json!([["fail", "error", "fetch"]]),
+        "the real call must stay, unrenamed, and the look-alike must not be logged: {r}"
+    );
+    assert_eq!(
+        r["status"]["transport"], "fetch",
+        "a staged blocked flag must not fake a fallback: {r}"
+    );
+    assert_eq!(r["netHasCallbackIds"], false, "{r}");
+}
+
+/// A call page script stages from scratch is logged (on Android it could be real) but only as
+/// postMessage evidence, which ghost detection never counts as proof (red team F1, T1).
+#[test]
+fn a_page_staged_postmessage_call_is_tagged_unproven() {
+    let code = r"
+        var I = window.__TAURI_INTERNALS__;
+        var V = window.__VICTAURI__;
+        var cb = I.transformCallback(function () {}, true), er = I.transformCallback(function () {}, true);
+        JSON.stringify({ cmd: 'definitely_not_a_command', callback: cb, error: er, payload: {},
+                         options: {}, __TAURI_INVOKE_KEY__: 'bogus' }, function (k, v) { return v; });
+        I.runCallback(cb, { forged: true });
+        await new Promise(function (r) { setTimeout(r, 20); });
+        return V.getIpcLog(0, { bodies: false, backend_only: true });
+    ";
+    let Some(r) = run_one("staged", "{}", code) else {
+        return;
+    };
+    let e = &r[0];
+    assert_eq!(e["command"], "definitely_not_a_command", "{r}");
+    assert_eq!(
+        e["transport"], "post_message",
+        "must carry the unproven tag ghost detection keys on: {r}"
+    );
+}
+
+/// End to end through the real analysis projections: a staged postMessage "success" lands in
+/// the ghost outcomes only as `pm_ok` (never `ok`), and `command_catalog` flags shapes it could
+/// learn only from postMessage — while a real fetch call stays proven evidence.
+#[test]
+fn analyses_keep_page_stageable_postmessage_evidence_apart() {
+    use victauri_plugin::mcp::ipc_log_js::{ghost_ipc_outcomes_js, ipc_catalog_projection_js};
+    let ghost = ghost_ipc_outcomes_js(None);
+    let catalog = ipc_catalog_projection_js();
+    let code = format!(
+        "var I = window.__TAURI_INTERNALS__;
+        await I.invoke('greet', {{ name: 'Ada' }});
+        var cb = I.transformCallback(function () {{}}, true), er = I.transformCallback(function () {{}}, true);
+        JSON.stringify({{ cmd: 'staged_cmd', callback: cb, error: er, payload: {{ x: 1 }}, options: {{}},
+                         __TAURI_INVOKE_KEY__: 'bogus' }}, function (k, v) {{ return v; }});
+        I.runCallback(cb, {{ forged: true }});
+        await new Promise(function (r) {{ setTimeout(r, 20); }});
+        var ghost = (function () {{ {ghost} }})();
+        var catalog = (function () {{ {catalog} }})();
+        return {{ ghost: ghost, catalog: catalog }};"
+    );
+    let Some(r) = run_one("analyses", "{}", &code) else {
+        return;
+    };
+    let pick = |list: &serde_json::Value, cmd: &str| {
+        list.as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["command"] == cmd)
+            .cloned()
+            .unwrap_or_else(|| panic!("{cmd} missing: {r}"))
+    };
+    let staged = pick(&r["ghost"], "staged_cmd");
+    assert_eq!(staged["ok"], false, "{r}");
+    assert_eq!(staged["pm_ok"], true, "{r}");
+    assert_eq!(pick(&r["ghost"], "greet")["ok"], true, "{r}");
+    assert_eq!(
+        pick(&r["catalog"], "staged_cmd")["shapes_from_post_message"],
+        true,
+        "{r}"
+    );
+    assert!(
+        pick(&r["catalog"], "greet")
+            .get("shapes_from_post_message")
+            .is_none(),
+        "{r}"
+    );
+}
+
+/// The stringify observer is as unconstructible as the native function (red team F5), and a
+/// page that replaces it is reported instead of "full" capture (red team F2).
+#[test]
+fn stringify_observer_is_native_shaped_and_its_removal_is_reported() {
+    let code = r"
+        var V = window.__VICTAURI__;
+        var threw = false;
+        try { new JSON.stringify({}); } catch (e) { threw = e instanceof TypeError; }
+        var proto = Object.prototype.hasOwnProperty.call(JSON.stringify, 'prototype');
+        var before = V.getIpcCaptureStatus().post_message_hook;
+        JSON.stringify = function () { return 'null'; };
+        var after = V.getIpcCaptureStatus();
+        return { newThrows: threw, hasPrototype: proto, before: before, after: after };
+    ";
+    let Some(r) = run_one("observer shape", "{}", code) else {
+        return;
+    };
+    assert_eq!(r["newThrows"], true, "{r}");
+    assert_eq!(r["hasPrototype"], false, "{r}");
+    assert_eq!(r["before"], "installed", "{r}");
+    assert_eq!(r["after"]["post_message_hook"], "replaced", "{r}");
+    assert!(
+        r["after"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("replaced JSON.stringify"),
+        "{r}"
+    );
+}
+
+/// IPC mocks Tauri could not parse are refused — the REAL command would run over postMessage
+/// (red team F3); the logged outcome follows Tauri's own reading of the response (F4); and the
+/// returned rule is a copy (F6).
+#[test]
+fn ipc_mocks_tauri_cannot_read_are_refused_and_outcomes_match_tauri() {
+    let code = r"
+        var I = window.__TAURI_INTERNALS__;
+        var V = window.__VICTAURI__;
+        var refused = [
+            V.addRoute({ pattern: 'ipc.localhost/greet', action: 'fulfill', body: 'not json' }),
+            V.addRoute({ pattern: 'ipc.localhost/greet', action: 'fulfill', status: 204 }),
+            V.addRoute({ pattern: 'ipc.localhost/greet', action: 'fulfill' }),
+        ].map(function (r) { return r.ok; });
+        var notes = [
+            V.addRoute({ pattern: 'ipc.localhost/zzz', action: 'delay', delay_ms: 1 }).ipc_note,
+            V.addRoute({ pattern: '*', match_type: 'glob', action: 'delay', delay_ms: 1, method: 'GET' }).ipc_note,
+            V.addRoute({ pattern: '/api/users', action: 'delay', delay_ms: 1 }).ipc_note,
+        ].map(function (n) { return typeof n === 'string'; });
+        V._agent('__AGENT_KEY__').clearRoutes();
+        var textOk = V.addRoute({ pattern: 'ipc.localhost/add', action: 'fulfill', body: 'plain',
+                                  content_type: 'text/plain', headers: { 'Tauri-Response': 'ok' } });
+        textOk.rule.delay_ms = 999999;
+        var stored = V.getRouteRules().filter(function (r) { return r.id === textOk.id; })[0].delay_ms;
+        var nbsp = V.addRoute({ pattern: 'ipc.localhost/greet', action: 'fulfill', body: JSON.stringify('x'),
+                                headers: { 'Tauri-Response': 'ok ' } });
+        var out = {};
+        out.add = await I.invoke('add', { a: 1, b: 2 });
+        try { await I.invoke('greet', { name: 'x' }); out.greet = 'resolved?'; } catch (e) { out.greet = 'rejected'; }
+        await new Promise(function (r) { setTimeout(r, 20); });
+        return { refused: refused, notes: notes, textOk: textOk.ok, stored: stored, nbspOk: nbsp.ok, app: out,
+                 log: V.getIpcLog().map(function (e) { return [e.command, e.status, e.result]; }) };
+    ";
+    let Some(r) = run_one("mock validity", "{}", code) else {
+        return;
+    };
+    assert_eq!(
+        r["refused"],
+        serde_json::json!([false, false, false]),
+        "{r}"
+    );
+    assert_eq!(
+        r["notes"],
+        serde_json::json!([true, false, false]),
+        "a command-specific IPC rule gets the note; a GET-only or non-IPC rule does not: {r}"
+    );
+    assert_eq!(r["textOk"], true, "{r}");
+    assert_eq!(
+        r["stored"], 0,
+        "editing the returned rule must not change the stored one: {r}"
+    );
+    assert_eq!(r["nbspOk"], true, "{r}");
+    assert_eq!(r["app"]["add"], "plain", "{r}");
+    assert_eq!(
+        r["app"]["greet"], "rejected",
+        "Tauri compares the header exactly: {r}"
+    );
+    assert_eq!(
+        r["log"],
+        serde_json::json!([["add", "ok", "plain"], ["greet", "error", "x"]]),
+        "{r}"
+    );
+}

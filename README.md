@@ -446,7 +446,7 @@ Use the built-in composite action to run Victauri smoke tests in CI:
     xvfb-run -a ./target/debug/my-app &
     sleep 3
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.9.0
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.0
   with:
     max-load-ms: 10000
     max-heap-mb: 512
@@ -496,7 +496,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - **No production use** — debug builds only, by design
 - **No remote access** — localhost only, no port forwarding
 - **Same-origin frames only** — same-origin iframes are traversed; cross-origin frames are marked and skipped
-- **No live frontend-IPC control** — `fault` injection applies to commands driven through Victauri's own `invoke_command`, not the app's real frontend IPC (that path sits below the layer the JS bridge can reach without CDP)
+- **Frontend-IPC control is fetch-transport only** — `fault` injection applies to commands driven through Victauri's own `invoke_command`; to change what the app's real `invoke` gets, a `route` rule mocks or delays it on Tauri's fetch transport (the desktop default), but not over postMessage (Android, or after a fallback)
 - **Not every webview↔Rust message is in the IPC log** — command calls are captured on both of Tauri's transports (custom-protocol fetch and the `postMessage` fallback; `get_diagnostics` reports which is in use and whether capture is complete), but Rust→JS events outside `listen_events`, `Channel` messages, and isolation-pattern args are not. See [Architecture → IPC Layer](docs/src/architecture.md#ipc-layer)
 - **Pre-1.0** — API may change (semver-checked in CI)
 

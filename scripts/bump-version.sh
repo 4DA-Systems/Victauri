@@ -136,6 +136,10 @@ if ! $DRY_RUN; then
     echo ""
     echo "Updating Cargo.lock..."
     (cd "$ROOT" && cargo check --workspace 2>&1 | tail -1)
+    # examples/tauri3 is its own workspace (Tauri 3 cannot share the root lockfile) and CI builds
+    # it with --locked, so its path-dependency versions must follow the bump too.
+    echo "Updating examples/tauri3/Cargo.lock..."
+    (cd "$ROOT/examples/tauri3" && cargo update -p victauri-plugin -p victauri-core -p victauri-macros --offline 2>&1 | tail -1)
 fi
 
 echo ""

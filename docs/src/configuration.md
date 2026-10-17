@@ -32,7 +32,7 @@ the default features off and keep only `sqlite`:
 
 ```toml
 [dependencies]
-victauri-plugin = { version = "0.9", default-features = false, features = ["sqlite"] }
+victauri-plugin = { version = "0.10", default-features = false, features = ["sqlite"] }
 ```
 
 With `default-features = false` and no `sqlite` feature, the plugin has no rusqlite dependency

@@ -2675,7 +2675,7 @@ impl VictauriMcpHandler {
             Note: fetch supports all behaviors; XHR supports block/delay (fulfill is fetch-only). \
             Top-level navigation, sub-resource (img/css), and WebSocket traffic are not intercepted. \
             Tauri IPC: on the fetch transport (desktop, until a fallback) a rule matching an IPC URL \
-            (http://ipc.localhost/<cmd> or ipc://localhost/<cmd>) DOES change what the app's real \
+            (http(s)://ipc.localhost/<cmd> or ipc://localhost/<cmd>) DOES change what the app's real \
             `invoke` gets. `fulfill` mocks the command (the Rust handler never runs; invoke resolves \
             only with a `Tauri-Response: ok` header, else rejects with the body); `delay` holds the \
             call back; `block` does NOT fail it (Tauri retries over postMessage and stays there until \
@@ -3925,9 +3925,10 @@ impl VictauriMcpHandler {
         description = "Probe a backend command handler under failure by faulting it for chaos engineering. \
             Simulate slow commands, backend errors, dropped responses, and corrupted data. \
             SCOPE: faults apply ONLY to commands you run via this server's `invoke_command` tool — \
-            they do NOT intercept the app's real user-driven IPC (window.__TAURI_INTERNALS__.invoke), \
-            which runs below the layer Victauri can reach. Use this to test a handler's error path when \
-            YOU drive it; it does not reproduce a failure a user clicking the UI would see.\n\n\
+            they do NOT touch the app's real user-driven IPC (window.__TAURI_INTERNALS__.invoke). Use \
+            this to test a handler's error path when YOU drive it. To make a call the user's click \
+            triggers fail or slow down, use a `route` rule on its IPC URL instead (fetch transport \
+            only).\n\n\
             Actions:\n\
             - `inject`: Add a fault rule (requires `command`, `fault_type`). Optional: `delay_ms` \
               (max 120000), `error_message`, `max_triggers`. `delay` sleeps then runs the command; \

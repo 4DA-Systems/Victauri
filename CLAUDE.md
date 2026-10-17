@@ -184,6 +184,37 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
+## Current State (2026-10-18)
+
+### v0.10.0 candidate (`release/0.10-prep`, NOT published — gated on a full adversarial audit)
+
+Built from the 2026-10-16 adversarial adoption audit (Victauri leads on depth — DB, IPC bodies,
+`app_state`, contracts, time-travel, security — but trailed on Tauri 3, IPC completeness,
+release footprint and agent-client setup). Merged to main, each with a full green CI on its own
+SHA: #77 (compat harness reads the 0.9 per-user discovery roots — it had been red since 0.9.0;
+doc/scaffold accuracy; RUSTSEC quinn-proto/rustls lock bump), #79 (IPC captured on Tauri's
+postMessage transport — it switches after ONE failed custom-protocol fetch, and always on Android
+— via a transparent `JSON.stringify` wrapper + Tauri's callbacks Map; `ipc_capture` status
+everywhere), #80 (one crate for Tauri 2 AND 3: `tauri = ">=2.0.0, <=3.0.0-alpha.5"` + a
+`tauri-v3` feature, since renamed `tauri2`/`tauri3` deps both `links = "Tauri"`; non-required
+Tauri 3 canary CI job on 3 OSes), #78 (`victauri setup <client>` for 8 clients, JSONC-preserving
+merges, AGENTS.md + Claude skill, honest `docs/src/comparison.md`), #81 (`#[inspectable]`
+metadata debug-only — strings 1→0 in the release binary; `init --optional`; `CallingWebview`
+borrow so page commands clone no Tauri handle off the main thread).
+
+Release-prep fixes on top: **`route` rules DO control real Tauri IPC on the fetch transport**
+(the old "observe-only" claim came from a page an earlier `block` had already switched to
+postMessage) — IPC log entries are now tagged `mocked`/`route_rule`/`route_delay_ms`, evidence
+analyses read `getIpcLog({backend_only|unrouted})`, `route add` returns an `ipc_note`; WebKitGTK
+`hsts-storage.sqlite` no longer outranks the app DB in `query_db` auto-selection on Linux.
+Merge-time fix: `init` follows the manifest (`project_is_feature_gated`), not the `--optional`
+flag — `--optional` on an ordinary dependency used to skip the capability file (app blind).
+
+Known, not fixed: Tauri 3's CEF runtime unverified (needs newer MSVC/SDK); postMessage IPC is
+observe-only (route cannot touch it); two `db_health` tests flake only under heavy machine load
+(process-global SQLite open hook in parallel tests; 556/556 on reruns); the local pre-push gate
+once reported "4/4 cached" for a never-gated tree (gate-runner cache keying — investigate).
+
 ## Current State (2026-09-27)
 
 ### v0.9.0 round 4 — adversarial audit + live E2E of the candidate (2026-09-28/29)

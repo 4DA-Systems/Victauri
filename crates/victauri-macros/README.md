@@ -13,8 +13,8 @@ depend on `victauri-core` directly (whether you import the macro as
 
 ```toml
 [dependencies]
-victauri-plugin = "0.9"
-victauri-core = "0.9"
+victauri-plugin = "0.10"
+victauri-core = "0.10"
 ```
 
 ```rust

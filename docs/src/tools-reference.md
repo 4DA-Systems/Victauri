@@ -852,7 +852,7 @@ checkpoints or inspects the `-wal` file (`wal_checkpoint` is reported as "not ru
 
 Probe a backend command handler under failure for chaos engineering.
 
-> **Scope:** faults apply **only** to commands you run via the `invoke_command` tool — they do **not** intercept the app's real user-driven IPC (`window.__TAURI_INTERNALS__.invoke`), which Tauri serves below the JS layer Victauri can reach. Use `fault` to test a handler's error path when *you* drive it (e.g. "does my error branch return the right shape on a DB failure?"). It does not reproduce a failure a user clicking the UI would experience — that path is not interceptable cross-platform without CDP.
+> **Scope:** faults apply **only** to commands you run via the `invoke_command` tool — they do **not** touch the app's real user-driven IPC (`window.__TAURI_INTERNALS__.invoke`). Use `fault` to test a handler's error path when *you* drive it (e.g. "does my error branch return the right shape on a DB failure?"). To make a call the *user's* click triggers fail or slow down, use a [`route`](#route) rule on its IPC URL (`fulfill` without a `Tauri-Response: ok` header, or `delay`) — that works on Tauri's fetch transport only.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
