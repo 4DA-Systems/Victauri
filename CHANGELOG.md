@@ -153,6 +153,22 @@ pinned by a regression test.
   method, so like the native function it cannot be called with `new` and has no `prototype`;
   `addRoute` returns a copy of the stored rule; an XHR to an IPC URL records Tauri's
   `Tauri-Response` outcome (a "not found" logged as ok and could verify a ghost).
+- **CLI (`setup` / `init`), against a hostile or hand-edited project:** an existing `victauri`
+  server that does not run the bridge (another program, a shell one-liner, a URL, or a binary the
+  repo ships at a relative path) was reported "already configured" by `setup` and passed by
+  `doctor`; it is now flagged `[!]` with the escaped command it actually runs (`doctor` warns),
+  still never overwritten. The atomic write keeps the original file's Unix mode (a 0600 token-
+  bearing config no longer becomes 0644; new user-level files are 0600) and refuses a read-only
+  file. Comments inside an empty `{ }` survive the JSONC merge; TOML merges (Codex config,
+  Cargo.toml) keep a BOM and CRLF line endings. `init --optional` only patches a
+  `tauri::Builder::default()` in code — not one in a comment or string — and needs exactly one.
+  Inline-table `[dependencies]` sections are read and extended, not clobbered; a malformed one is
+  a clear error, not a panic. One refused file no longer aborts `setup` half-way (it is reported
+  skipped with the entry to add by hand; a symlink inside the project still aborts before
+  anything is written). An app that gates the plugin behind its own feature name gets that name
+  everywhere (wiring, CI, instructions). The by-hand Codex entry is valid TOML, and an identifier
+  starting with `-` is written as `--app=<id>`. The `--optional` docs say the runtime grant needs
+  Tauri's `dynamic-acl` feature (on by default).
 - **Docs and descriptions:** the README, tools reference and `fault` description no longer say the
   app's real IPC is out of reach; `testing.md` and `init()`'s rustdoc no longer say `#[inspectable]`
   registers metadata in release; the compatibility page states what CI actually covers; the
