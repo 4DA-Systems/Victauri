@@ -28,6 +28,8 @@ victauri-macros = { workspace = true }
 # trick as the rusqlite range below). No runtime feature (`wry`) is requested: the plugin is generic
 # over `R: Runtime`, and on Tauri 3 the runtime is chosen by the app (`Builder::runtime`), not by a
 # `tauri` feature. On Tauri 3 also enable this crate's `tauri-v3` feature (see [features]).
+# A crate depending on this one without a `tauri` dependency of its own gets the newest version
+# the range admits — a Tauri 3 pre-release — so always depend on `tauri` directly (apps do).
 #
 # The upper bound is the newest Tauri 3 pre-release this crate has been built against; widen it
 # together with the `tauri3` CI job (`NEWEST` there) — pre-releases only match a comparator that

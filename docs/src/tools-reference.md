@@ -719,20 +719,32 @@ page-scoped (cleared on reload).
 > (`fulfill` is fetch-only). Top-level navigation, sub-resources (img/css), and
 > WebSocket frames are not intercepted.
 >
-> **Tauri IPC is observe-only.** The app's real `invoke` traffic
-> (`http://ipc.localhost/…` on Windows, `ipc://localhost/…` on macOS/Linux) is
-> *logged* (`logs ipc`, and a rule may even show up in `matches`), but a rule
-> does **not** control it — Tauri serves real IPC below the JS `fetch` layer the
-> bridge can reach, so the call still goes through, undelayed. The `fault` tool
-> does not touch the app's real frontend IPC either: it only applies to commands
-> you drive through `invoke_command`. Neither tool can reproduce a failure a user
-> clicking the UI would hit.
+> **Rules on Tauri IPC change what the app's real `invoke` gets.** On the fetch
+> transport (`http://ipc.localhost/<cmd>` on Windows, `ipc://localhost/<cmd>` on
+> macOS/Linux — the desktop default until a fallback), Tauri's `invoke` goes
+> through the page's `fetch`, so a matching rule takes effect (verified live on
+> Windows, Tauri 2.11.5):
 >
-> **A `block` rule on a Tauri IPC URL switches the page to postMessage IPC.** The
-> blocked fetch rejects, which Tauri treats as a broken custom protocol: it
-> retries that call over `window.ipc.postMessage` and uses postMessage for the
-> rest of the page's life (until a reload). Victauri still captures those calls
-> (`transport: "post_message"`) and `get_diagnostics` reports the switch.
+> - **`fulfill` mocks the command.** The Rust handler never runs. `invoke`
+>   resolves with the body only when `headers` include `"Tauri-Response": "ok"`;
+>   otherwise it rejects with the body — which is how to make a command *fail*
+>   for a user clicking the UI. The body must be valid for `content_type`, or
+>   Tauri treats the fetch as failed and switches the page to postMessage IPC.
+> - **`delay` holds the call back** before it reaches the backend.
+> - **`block` does NOT fail the call.** The blocked fetch rejects, which Tauri
+>   treats as a broken custom protocol: it retries that call over
+>   `window.ipc.postMessage` (the backend still runs it) and uses postMessage for
+>   the rest of the page's life (until a reload). Victauri still captures those
+>   calls (`transport: "post_message"`) and `get_diagnostics` reports the switch.
+>
+> The IPC log tags calls a rule touched: `mocked: true` (and `route_rule`) when a
+> rule answered it, `route_delay_ms` when one held it back. Mocked calls never
+> reached the backend, so ghost detection, `command_catalog` and `coverage` leave
+> them out; `command_timings` also leaves out delayed calls. `add` returns an
+> `ipc_note` whenever a rule can match an IPC URL (a broad pattern such as `*` or
+> `localhost` does too). postMessage IPC (always on Android; on desktop after a
+> fallback) is not affected by rules. The `fault` tool is separate: it acts on
+> commands you drive through `invoke_command`.
 
 ---
 
@@ -840,7 +852,7 @@ checkpoints or inspects the `-wal` file (`wal_checkpoint` is reported as "not ru
 
 Probe a backend command handler under failure for chaos engineering.
 
-> **Scope:** faults apply **only** to commands you run via the `invoke_command` tool — they do **not** intercept the app's real user-driven IPC (`window.__TAURI_INTERNALS__.invoke`), which Tauri serves below the JS layer Victauri can reach. Use `fault` to test a handler's error path when *you* drive it (e.g. "does my error branch return the right shape on a DB failure?"). It does not reproduce a failure a user clicking the UI would experience — that path is not interceptable cross-platform without CDP.
+> **Scope:** faults apply **only** to commands you run via the `invoke_command` tool — they do **not** touch the app's real user-driven IPC (`window.__TAURI_INTERNALS__.invoke`). Use `fault` to test a handler's error path when *you* drive it (e.g. "does my error branch return the right shape on a DB failure?"). To make a call the *user's* click triggers fail or slow down, use a [`route`](#route) rule on its IPC URL (`fulfill` without a `Tauri-Response: ok` header, or `delay`) — that works on Tauri's fetch transport only.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|

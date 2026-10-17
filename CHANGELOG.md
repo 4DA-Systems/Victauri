@@ -7,13 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-18
+
+Built from an adversarial adoption audit (2026-10-16) of what stands between Victauri and being
+the verifiable introspection and control tool for Tauri: **Tauri 3 support** alongside Tauri 2,
+**complete IPC capture** across both of Tauri's IPC transports, an **honest IPC log** when a
+`route` rule mocks real IPC, **one-command setup for 8 agent clients**, and a **zero release
+footprint** option. Minor bump: victauri-plugin no longer enables Tauri's `wry` feature, which
+can break a Tauri 2 build that disabled `tauri`'s default features (see MIGRATION.md).
+
 ### Added
 
 - **Tauri 3 support (pre-release), without dropping Tauri 2.** victauri-plugin's `tauri`
-  requirement now spans Tauri 2 and the tested Tauri 3 pre-releases (`>=2.0.0, <=3.0.0-alpha.5`);
-  `tauri` allows one copy per build (`links = "Tauri"`), so cargo resolves it onto the app's own
-  Tauri. Tauri 3 apps enable the new `tauri-v3` feature, which selects the Tauri 3 API spelling
-  (`initialization_script`) and the Tauri 3 permission build step. Tauri 2 apps change nothing.
+  requirement now spans Tauri 2 and the Tauri 3 pre-releases (`>=2.0.0, <=3.0.0-alpha.5`; the
+  `tauri-v3` build needs alpha.4 or newer, and alpha.4/alpha.5 are what was built — a version
+  requirement cannot exclude alpha.0–alpha.3 while admitting 2.x). `tauri` allows one copy per
+  build (`links = "Tauri"`), so cargo resolves it onto the app's own Tauri — which is why a crate
+  that depends on victauri-plugin must also depend on `tauri` itself (on its own, cargo would pick
+  the newest version the range admits, a Tauri 3 pre-release). Tauri 3 apps enable the new
+  `tauri-v3` feature, which selects the Tauri 3 API spelling (`initialization_script`) and the
+  Tauri 3 permission build step. Tauri 2 apps change nothing.
   Verified live against Tauri `3.0.0-alpha.5` on Windows (WebView2) and Linux (WebKitGTK, X11):
   the demo app's integration (26/26) and adversarial (22/22) suites pass on both, and on Linux a
   12-thread, 720-call concurrent soak finishes with no errors and the host alive. New `examples/tauri3` (the demo app
@@ -77,14 +90,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now borrow the invoke message's own webview (`InvokeMessage::webview_ref`) and post to the main
   thread through the borrowed `AppHandle`. The page-facing contract (`invoke(..., { code })` →
   result string) is unchanged. A source guard test now also rejects a Tauri handle taken by value
-  by either command.
+  by either command. What remains is Tauri's own: like every async command in any Tauri app, the
+  invoke message and resolver (each holding a `Webview`) are still moved to and dropped on the
+  tokio worker; removing that would need a different page contract.
 
 ### Fixed — IPC capture on Tauri's postMessage transport
 
 Tauri 2 sends IPC over a custom-protocol `fetch()` on desktop, but after ONE failed
 custom-protocol fetch (a blocked scheme, a CSP error, a service worker — or a `route` `block`
 rule on an IPC URL) it switches the page to `window.ipc.postMessage` for good, and on Android it
-always uses postMessage. Victauri only intercepted the fetch path, so on the fallback the IPC log
+always sends commands over postMessage (only `Channel` data fetches still use the custom
+protocol there). Victauri only intercepted the fetch path, so on the fallback the IPC log
 — and ghost detection, `command_catalog`, `coverage`, `command_timings` and integrity checks
 built on it — went silently empty.
 
@@ -99,11 +115,102 @@ built on it — went silently empty.
   / `command_timings`. Bridge method `getIpcCaptureStatus()`.
 - `recording replay` skips postMessage-captured calls (page script could stage one). Additive:
   `IpcCall::transport` + `IpcCall::with_transport` / `is_post_message`.
+- Responses on the postMessage path come from Tauri's `__TAURI_INTERNALS__.callbacks` table,
+  added in Tauri 2.6; on Tauri 2.0–2.5 only requests are captured there (`requests_only`).
 - Docs list what the IPC log does not capture: Rust→JS events outside `listen_events`, `Channel`
   messages, isolation-pattern args.
 
+### Security — pre-audit red team (four lenses; no Critical/High open)
+
+Four adversarial lenses — CLI file writes, the JS bridge's IPC capture, the plugin's Rust /
+Tauri 3 / build surface, and every release-note claim plus the supply chain — attacked this
+candidate before the external audit. Every finding below was reproduced before its fix and is
+pinned by a regression test.
+
+- **postMessage IPC is page-forgeable, so it is no longer evidence.** Tauri's callback functions
+  (`transformCallback`, `runCallback`, the callbacks Map) are page-callable, so page script could
+  stage a postMessage-shaped "successful" call to a non-existent command — ghost detection then
+  counted it as a verified handler — rename a real in-flight call, or re-plant a completed call's
+  callback ids to erase it. Now: a postMessage message reusing the ids of a live or answered
+  fetch call is ignored (only a fetch that really failed, or a mock Tauri could not read, is
+  superseded); ghost detection keeps postMessage-only commands in a new `post_message_only` tier
+  (never `verified_handlers`, never `confirmed_ghosts`); `command_catalog` prefers fetch-transport
+  calls for shapes and flags `shapes_from_post_message`; Tauri's callback ids no longer appear in
+  `getNetworkLog`.
+- **`https://ipc.localhost` IPC was invisible.** An app with `useHttpsScheme` (Windows, Android)
+  sends IPC to `https://ipc.localhost/<cmd>`; the bridge recognised only `http://` and `ipc://`, so
+  its IPC log and every analysis built on it were empty while `ipc_capture` said "no IPC observed
+  yet". All three schemes are recognised now, by capture and by `route`.
+- **An IPC mock Tauri cannot read ran the real command.** A `fulfill` with no body, a non-JSON
+  body or a 204 under `application/json` makes Tauri's `response.json()` throw; Tauri then retries
+  the REAL command over postMessage and stays on postMessage. `route add` now refuses such a rule
+  on an IPC URL and says why. A mocked call's logged outcome and body follow Tauri's own reading of
+  the response (`Headers.get('Tauri-Response') === 'ok'`; body by content type up to the first
+  comma). `routeMatchesIpc` also recognises command-specific patterns (`ipc.localhost/greet`),
+  which the first version of the `ipc_note` check missed.
+- **Smaller bridge fixes:** `ipc_capture` reports `post_message_hook: "replaced"` (and `capture:
+  "none"` on the postMessage path) when page code replaces `JSON.stringify`; the observer is a
+  method, so like the native function it cannot be called with `new` and has no `prototype`;
+  `addRoute` returns a copy of the stored rule; an XHR to an IPC URL records Tauri's
+  `Tauri-Response` outcome (a "not found" logged as ok and could verify a ghost).
+- **CLI (`setup` / `init`), against a hostile or hand-edited project:** an existing `victauri`
+  server that does not run the bridge (another program, a shell one-liner, a URL, or a binary the
+  repo ships at a relative path) was reported "already configured" by `setup` and passed by
+  `doctor`; it is now flagged `[!]` with the escaped command it actually runs (`doctor` warns),
+  still never overwritten. The atomic write keeps the original file's Unix mode (a 0600 token-
+  bearing config no longer becomes 0644; new user-level files are 0600) and refuses a read-only
+  file. Comments inside an empty `{ }` survive the JSONC merge; TOML merges (Codex config,
+  Cargo.toml) keep a BOM and CRLF line endings. `init --optional` only patches a
+  `tauri::Builder::default()` in code — not one in a comment or string — and needs exactly one.
+  Inline-table `[dependencies]` sections are read and extended, not clobbered; a malformed one is
+  a clear error, not a panic. One refused file no longer aborts `setup` half-way (it is reported
+  skipped with the entry to add by hand; a symlink inside the project still aborts before
+  anything is written). An app that gates the plugin behind its own feature name gets that name
+  everywhere (wiring, CI, instructions). The by-hand Codex entry is valid TOML, and an identifier
+  starting with `-` is written as `--app=<id>`. The `--optional` docs say the runtime grant needs
+  Tauri's `dynamic-acl` feature (on by default).
+- **Docs and descriptions:** the README, tools reference and `fault` description no longer say the
+  app's real IPC is out of reach; `testing.md` and `init()`'s rustdoc no longer say `#[inspectable]`
+  registers metadata in release; the compatibility page states what CI actually covers; the
+  comparison page is corrected on tauri-pilot's OS-level keys, `aix`'s maintainer, hypothesi's
+  real-device mobile support, CrabNebula's releases and WebdriverIO's mocking/recording.
+- **Dependencies:** the lockfile carries quinn-proto 0.11.19 / rustls 0.23.46 (RUSTSEC-2026-0339,
+  -0341, -0342, -0346 … -0349 — published after 0.9.0); `cargo audit` and `cargo deny` are clean.
+
+### Fixed — `route` rules on Tauri IPC: what they do, and an honest IPC log
+
+The docs and the `route` tool description said Tauri IPC was observe-only. Measured live
+(Windows, Tauri 2.11.5), that is false on Tauri's fetch transport: a `fulfill` rule on an IPC
+URL answers the app's real `invoke` in the page — the Rust handler never runs — and `delay`
+holds the call back (1,510 ms measured for a 1,500 ms rule). Worse, the IPC log recorded a
+mocked response as a genuine backend `ok`, so a mocked success made ghost detection count a
+non-existent command as a verified handler, and `command_catalog` / `coverage` / timings
+learned shapes and latencies the backend never produced. (The old "matches but does not
+control" observation came from a page an earlier `block` had already switched to
+postMessage IPC.)
+
+- IPC log entries a rule touched are tagged: `mocked: true` + `route_rule` when a rule
+  answered the call, `route_delay_ms` when one held it back. A mocked call's `status` follows
+  Tauri's own rule — `invoke` resolves only on `Tauri-Response: ok`, otherwise it rejects — so
+  the log shows the outcome the page actually got.
+- Ghost detection, `command_catalog` and `coverage` read the log with the new `getIpcLog`
+  option `backend_only` (no mocked or blocked calls); `command_timings` uses `unrouted` (also
+  no delayed calls). `logs ipc`, `slow_ipc` and `check_ipc_integrity` still show every call.
+- `route add` returns an `ipc_note` whenever the rule can match an IPC URL (a broad pattern
+  such as `*` or `localhost` too), saying exactly what happens: `fulfill` mocks (and how to
+  make the call resolve or reject), `delay` delays, and `block` does NOT fail the call — Tauri
+  retries it over postMessage and stays there until reload.
+- The `route` tool description, tools reference, architecture and comparison pages now
+  describe this; the comparison's "where the others win" entry narrows to transport-independent
+  invoke mocking (postMessage IPC — Android, or after a fallback — is still observe-only).
+
 ### Fixed
 
+- `query_db` auto-selection on Linux picked WebKitGTK's `hsts-storage.sqlite` (which sits in
+  the app data dir next to the app's own database) over the app's database. WebKitGTK's
+  stores (`hsts-storage`, and the `localstorage`, `ResourceLoadStatistics` and `MediaKeys`
+  directories) are now treated as webview internals, and the demo app's adversarial suite
+  asserts that auto-selection picks `demo.db` on every engine (it only printed the choice).
 - The CLI README showed `victauri init ./my-tauri-app`; `init` takes `--path`.
 
 

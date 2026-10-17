@@ -174,6 +174,15 @@ if (-not $DryRun) {
     } finally {
         Pop-Location
     }
+    # examples/tauri3 is its own workspace (Tauri 3 cannot share the root lockfile) and CI builds
+    # it with --locked, so its path-dependency versions must follow the bump too.
+    Write-Host "Updating examples\tauri3\Cargo.lock..." -ForegroundColor Cyan
+    Push-Location (Join-Path $root "examples\tauri3")
+    try {
+        cargo update -p victauri-plugin -p victauri-core -p victauri-macros --offline 2>&1 | Select-Object -Last 1
+    } finally {
+        Pop-Location
+    }
 }
 
 Write-Host "`n--- Version bump complete: $OldVersion -> $NewVersion ---" -ForegroundColor Cyan

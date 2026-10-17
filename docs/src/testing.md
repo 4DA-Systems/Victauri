@@ -8,7 +8,7 @@ Add the test crate to your dev dependencies:
 
 ```toml
 [dev-dependencies]
-victauri-test = "0.9"
+victauri-test = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -603,7 +603,7 @@ async fn save_settings(settings: Settings) -> Result<(), AppError> {
 }
 ```
 
-This generates a command schema at compile time. The schema is registered through `inventory` in every build profile, release included: a small static table plus a startup constructor. Commands become discoverable through `get_registry` and natural language via `resolve_command`.
+This generates a command schema at compile time. In debug builds the schema is registered through `inventory`; in a release build nothing is registered and `<fn>__schema()` returns only the name and the async flag. Commands become discoverable through `get_registry` and natural language via `resolve_command`.
 
 To auto-discover all instrumented commands:
 
@@ -845,7 +845,7 @@ Victauri tests run in CI without special infrastructure. Pick the approach that 
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.9.0
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.0
   with:
     max-load-ms: 5000
     max-heap-mb: 256

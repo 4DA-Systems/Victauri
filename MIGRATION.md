@@ -1,6 +1,40 @@
 # Migration Guide
 
-## Unreleased (0.9.x) — `#[inspectable]` metadata is debug-only
+## v0.9.0 → v0.10.0
+
+Bump `victauri-plugin` / `victauri-test` (and `victauri-core` if you depend on it) from `"0.9"`
+to `"0.10"`. Most apps need nothing else. Why a minor bump: one Cargo-feature change below can
+break a Tauri 2 build that relied on it, and several behaviours changed.
+
+**Tauri 2 apps with `default-features = false` on `tauri`.** victauri-plugin no longer turns on
+Tauri's `wry` feature (Tauri 3 has no such feature, and the plugin is runtime-generic like
+Tauri's own plugins). Tauri 2's default features include `wry`, so most apps are unaffected; if
+yours disables defaults and compiled only because Victauri enabled `wry`, add `"wry"` to your
+`tauri` features.
+
+**Tauri 3 (pre-release) apps** enable this crate's `tauri-v3` feature:
+`victauri-plugin = { version = "0.10", features = ["tauri-v3"] }`. Getting it wrong in either
+direction fails to compile with a clear error (`no method named js_init_script` /
+`initialization_script`).
+
+**`route` rules on Tauri IPC.** They were documented as observe-only; on Tauri's fetch transport
+they are not. `fulfill` mocks the command (the handler never runs) and `delay` delays it; `block`
+does NOT fail the call (Tauri retries it over postMessage). To make a command fail as the user
+would see it, `fulfill` without a `"Tauri-Response": "ok"` header. Calls a rule touched are now
+tagged in the IPC log (`mocked`, `route_rule`, `route_delay_ms`) and left out of ghost
+detection, `command_catalog`, `coverage` and `command_timings`.
+
+**IPC log fields.** Entries may carry `transport: "post_message"` (Tauri's postMessage
+fallback, now captured) and the route tags above. `IpcCall` gains `transport` (additive; the
+struct is `#[non_exhaustive]`). Consumers that match on the exact key set of a log entry should
+tolerate new keys.
+
+**CLI.** `victauri init` now merges a `victauri` server into an existing `.mcp.json` (it used to
+print a snippet to paste), writes a Claude Code skill next to the CLAUDE.md block, and accepts
+`--client` / `--optional`; `victauri setup <client>` wires other agent clients. An existing
+`victauri` entry is never changed.
+
+### `#[inspectable]` metadata is debug-only
 
 No API change. In a **release** build of your crate, `#[inspectable]` no longer registers the
 command for auto-discovery (`victauri_core::auto_discovered_commands()` /

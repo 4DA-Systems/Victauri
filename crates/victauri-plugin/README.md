@@ -8,7 +8,7 @@ Add the dependency:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.9"
+victauri-plugin = "0.10"
 ```
 
 Wire it into your Tauri app:
@@ -61,7 +61,7 @@ enabling only `sqlite`:
 
 ```toml
 [dependencies]
-victauri-plugin = { version = "0.9", default-features = false, features = ["sqlite"] }
+victauri-plugin = { version = "0.10", default-features = false, features = ["sqlite"] }
 ```
 
 (With `default-features = false` and no `sqlite`, the plugin has no rusqlite dependency at all.)
@@ -80,7 +80,7 @@ per build, so cargo picks whichever major your app uses. On Tauri 3, also turn o
 [dependencies]
 tauri = "=3.0.0-alpha.5"
 tauri-runtime-wry = "=3.0.0-alpha.5"  # Tauri 3 apps select their webview runtime
-victauri-plugin = { version = "0.9", features = ["tauri-v3"] }
+victauri-plugin = { version = "0.10", features = ["tauri-v3"] }
 ```
 
 `tauri-v3` must match your app's Tauri major: without it a Tauri 3 app fails to compile

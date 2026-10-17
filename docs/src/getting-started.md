@@ -16,7 +16,7 @@ Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.9"
+victauri-plugin = "0.10"
 ```
 
 The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin thanks to the `#[cfg(debug_assertions)]` gate: no server starts, nothing listens, and `#[inspectable]` emits none of its metadata. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
@@ -38,8 +38,8 @@ build) compiles **no** Victauri code at all:
 
 ```toml
 [dependencies]
-victauri-plugin = { version = "0.9", optional = true }
-victauri-core = { version = "0.9", optional = true }   # only if you use #[inspectable]
+victauri-plugin = { version = "0.10", optional = true }
+victauri-core = { version = "0.10", optional = true }   # only if you use #[inspectable]
 
 [features]
 victauri = ["dep:victauri-plugin", "dep:victauri-core"]
@@ -195,7 +195,7 @@ if [ "$OS" = Windows_NT ]; then ROOTS="${TMPDIR:-/tmp}/victauri"   # Git Bash: /
 else ROOTS="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/victauri} ${TMPDIR:-/tmp}/victauri-$(id -u) $HOME/.local/state/victauri"; fi
 TOKEN=$(cat "$(for r in $ROOTS; do ls -t "$r"/*/token 2>/dev/null; done | head -n1)")
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.9.0",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.10.0",...}
 ```
 
 Or use the Victauri CLI:
@@ -216,8 +216,8 @@ crate victauri_core`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.9"
-victauri-core = "0.9"
+victauri-plugin = "0.10"
+victauri-core = "0.10"
 ```
 
 ```rust

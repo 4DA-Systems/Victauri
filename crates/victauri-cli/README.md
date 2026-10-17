@@ -61,11 +61,15 @@ outside the project is written without `--user-config`. Opt out by deleting the 
 With `--optional`, the dependencies are `optional = true` behind a `victauri` Cargo feature, the
 builder is wrapped as `with_victauri(tauri::Builder::default())` (a function generated for both
 feature states), and the `victauri:default` permission is granted at runtime instead of by a
-capability file — a file naming it would break every build without the feature. Builds without
-the feature, such as `tauri build`, then contain no Victauri code. Start the app with
-`npm run tauri dev -- --features victauri` (or `pnpm tauri dev --features victauri`). The
-generated CLAUDE.md / AGENTS.md / skill say so too, and `victauri setup` adds the same note
-when it finds `victauri-plugin` is an optional dependency.
+capability file — a file naming it would break every build without the feature. That runtime
+grant (`tauri::Manager::add_capability`) needs Tauri's `dynamic-acl` feature, which is on by
+default; if your app depends on `tauri` with `default-features = false`, add `dynamic-acl` to its
+features. Builds without the feature, such as `tauri build`, then contain no Victauri code. Start
+the app with `npm run tauri dev -- --features victauri` (or `pnpm tauri dev --features victauri`).
+The generated CLAUDE.md / AGENTS.md / skill say so too, and `victauri setup` adds the same note
+when it finds `victauri-plugin` is an optional dependency. If your app already gates
+`victauri-plugin` behind a feature of its own (e.g. `devtools = ["dep:victauri-plugin"]`),
+`init` and `setup` use that feature's name instead of adding `victauri`.
 
 ### `victauri doctor`
 
@@ -75,7 +79,7 @@ Comprehensive diagnostic — checks every step from project structure to live to
 victauri doctor
 ```
 
-Checks: project structure, Tauri dependency, plugin dependency, test dependency, plugin wiring in source, an agent client configured (any project-level MCP config with a `victauri` server), capabilities, test files, server connectivity, plugin info, JS bridge, DOM snapshot, IPC integrity.
+Checks: project structure, Tauri dependency, plugin dependency, test dependency, plugin wiring in source, an agent client configured (any project-level MCP config with a `victauri` server that runs `victauri bridge` — one that runs anything else is a warning), capabilities, test files, server connectivity, plugin info, JS bridge, DOM snapshot, IPC integrity.
 
 ### `victauri check`
 
