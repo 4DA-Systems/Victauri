@@ -259,9 +259,14 @@ fn bridge_args(app: Option<&str>) -> Vec<String> {
 
 /// Whether `command` names the Victauri CLI: `victauri`, or a path to `victauri` /
 /// `victauri.exe` (either separator — a config may have been written on another OS).
+/// The bare `victauri` on PATH, or an ABSOLUTE path to a binary of that name. A relative path
+/// (`./tools/victauri.exe`) is rejected: a committed config cannot know where the repo was
+/// cloned, so a relative path points at a binary the repository itself ships.
 fn is_victauri_binary(command: &str) -> bool {
     let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
-    name.eq_ignore_ascii_case("victauri") || name.eq_ignore_ascii_case("victauri.exe")
+    let named = name.eq_ignore_ascii_case("victauri") || name.eq_ignore_ascii_case("victauri.exe");
+    let bare = name.len() == command.len();
+    named && (bare || Path::new(command).is_absolute() || command.starts_with('/'))
 }
 
 /// `None` when an existing server `entry` (JSON shape: `command` + `args`, or Zed's older
@@ -1697,6 +1702,14 @@ mod tests {
             unexpected_command(&serde_json::json!({"command": "victauri", "args": ["check"]}))
                 .is_some()
         );
+        // A binary the repository itself ships, reached by a relative path, is not the bridge.
+        for shipped in ["./tools/victauri.exe", "tools\\victauri", "../victauri"] {
+            assert!(
+                unexpected_command(&serde_json::json!({"command": shipped, "args": ["bridge"]}))
+                    .is_some(),
+                "{shipped}"
+            );
+        }
         assert!(
             unexpected_command(
                 &serde_json::json!({"command": "victauri-evil", "args": ["bridge"]})
