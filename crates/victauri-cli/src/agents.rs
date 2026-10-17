@@ -266,7 +266,19 @@ fn is_victauri_binary(command: &str) -> bool {
     let name = command.rsplit(['/', '\\']).next().unwrap_or(command);
     let named = name.eq_ignore_ascii_case("victauri") || name.eq_ignore_ascii_case("victauri.exe");
     let bare = name.len() == command.len();
-    named && (bare || Path::new(command).is_absolute() || command.starts_with('/'))
+    named && (bare || looks_absolute(command))
+}
+
+/// Absolute in either OS's syntax: a project config may be written on one OS and read on
+/// another, so `C:\tools\victauri.exe` counts on Linux too (`Path::is_absolute` would say no).
+fn looks_absolute(command: &str) -> bool {
+    let b = command.as_bytes();
+    command.starts_with('/')
+        || command.starts_with("\\\\")
+        || (b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && (b[2] == b'\\' || b[2] == b'/'))
 }
 
 /// `None` when an existing server `entry` (JSON shape: `command` + `args`, or Zed's older
@@ -1703,7 +1715,22 @@ mod tests {
                 .is_some()
         );
         // A binary the repository itself ships, reached by a relative path, is not the bridge.
-        for shipped in ["./tools/victauri.exe", "tools\\victauri", "../victauri"] {
+        for abs in [
+            "C:\\tools\\victauri.exe",
+            "c:/tools/victauri",
+            "\\\\srv\\share\\victauri.exe",
+        ] {
+            assert!(
+                is_victauri_binary(abs),
+                "{abs} is absolute on every host OS"
+            );
+        }
+        for shipped in [
+            "./tools/victauri.exe",
+            "tools\\victauri",
+            "../victauri",
+            "C:victauri",
+        ] {
             assert!(
                 unexpected_command(&serde_json::json!({"command": shipped, "args": ["bridge"]}))
                     .is_some(),
