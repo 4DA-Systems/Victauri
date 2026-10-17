@@ -29,6 +29,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Comparison page** (`docs/src/comparison.md`): Victauri vs hypothesi/mcp-server-tauri,
   WebdriverIO's Tauri service, tauri-pilot, Playwright/CDP on WebView2 and CrabNebula DevTools,
   including where each of them is the better choice.
+- **`victauri init --optional`** scaffolds the zero-release-footprint setup: `victauri-plugin` /
+  `victauri-core` as optional dependencies behind a `victauri` Cargo feature, a
+  `with_victauri(...)` wrapper that compiles in both feature states, the `victauri:default`
+  permission granted at runtime (a capability file naming it would break builds without the
+  feature), and `--features victauri` in the generated CI workflow and in every generated
+  instruction file (CLAUDE.md, AGENTS.md, the Claude Code skill; `victauri setup` adds the same
+  note when it finds `victauri-plugin` is an optional dependency). The
+  default `victauri init` is unchanged (an ordinary dependency, inert in release); README and the
+  getting-started guide now spell out what each choice costs, including the `bundled-sqlite` note.
+  Verified on a scratch Tauri app: both feature states build in debug and release; with the
+  feature, `eval_js` and the page-callable commands work live (the runtime grant is effective);
+  without it, the dependency graph has no Victauri crate and the release executable contains no
+  `victauri` byte sequence at all.
+- `victauri doctor` accepts the runtime `victauri:default` grant instead of asking for a
+  capability file, and the bridge's "backend not reachable" message names `--features victauri`.
 
 ### Changed
 
@@ -45,6 +60,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   written with `--user-config`.
 - `victauri doctor` passes when *any* supported client's project config has a `victauri` server
   (it used to warn unless `.mcp.json` existed).
+- **`#[inspectable]` compiles no metadata into release builds.** The `inventory` auto-discovery
+  registration is now emitted under `#[cfg(debug_assertions)]` (evaluated in the consumer's
+  profile), and in release the `<fn>__schema()` companion returns only the command name (and
+  whether it is async). Before, every instrumented command's description / intent / examples /
+  argument types shipped in release binaries and an `inventory` constructor ran at startup, even
+  though the plugin is a no-op there. Measured on the demo app (release, `codegen-units = 1`):
+  all 21 description strings present before, 0 after; executable 8,935,424 → 8,880,128 bytes.
+  `__schema()` still exists in every profile, so code passing it to `VictauriBuilder::commands`
+  or `register_commands!` keeps compiling. See MIGRATION.md if you read schema metadata or call
+  `auto_discovered_commands()` in a release build.
+- **The page-callable `victauri_eval_js` / `victauri_dom_snapshot` commands no longer clone a
+  Tauri handle off the main thread.** They are `async` (they wait for the page), so Tauri extracts
+  their arguments on a tokio worker; their `WebviewWindow` argument was a handle clone made and
+  dropped there — the class of off-main `Rc` traffic behind the 0.9.0 Linux heap corruption. They
+  now borrow the invoke message's own webview (`InvokeMessage::webview_ref`) and post to the main
+  thread through the borrowed `AppHandle`. The page-facing contract (`invoke(..., { code })` →
+  result string) is unchanged. A source guard test now also rejects a Tauri handle taken by value
+  by either command.
 
 ### Fixed — IPC capture on Tauri's postMessage transport
 

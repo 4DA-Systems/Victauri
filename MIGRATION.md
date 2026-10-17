@@ -1,5 +1,15 @@
 # Migration Guide
 
+## Unreleased (0.9.x) — `#[inspectable]` metadata is debug-only
+
+No API change. In a **release** build of your crate, `#[inspectable]` no longer registers the
+command for auto-discovery (`victauri_core::auto_discovered_commands()` /
+`CommandRegistry::from_auto_discovery()` / `VictauriBuilder::auto_discover()` see nothing), and
+`<fn>__schema()` returns only the name and the async flag (no description, intent, category,
+examples, argument or return types). The Victauri plugin is a no-op in release, so this only
+matters if you read that metadata yourself in a release build — for example a test run with
+`cargo test --release` asserting on a schema. Gate such tests with `#[cfg(debug_assertions)]`.
+
 ## v0.8.8 → v0.9.0 (public data types are `#[non_exhaustive]` — a one-time break)
 
 **Bump the requirement:** `victauri-plugin = "0.9"`, `victauri-test = "0.9"` (and `victauri-core`

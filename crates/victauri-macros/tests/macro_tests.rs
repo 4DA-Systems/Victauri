@@ -1,4 +1,7 @@
 #![allow(dead_code)]
+// Most tests read the schema metadata, which `#[inspectable]` compiles in only under
+// `debug_assertions`; under `cargo test --release` they are compiled out.
+#![cfg_attr(not(debug_assertions), allow(unused_imports))]
 
 use victauri_core::registry::CommandInfo;
 
@@ -38,6 +41,7 @@ fn save_user_preferences(prefs: String) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn inspectable_generates_schema_fn() {
     let info: CommandInfo = save_api_key__schema();
@@ -55,6 +59,7 @@ fn inspectable_generates_schema_fn() {
     assert!(info.examples.is_empty());
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn inspectable_async_fn() {
     let info: CommandInfo = load_user__schema();
@@ -68,6 +73,7 @@ fn inspectable_async_fn() {
     assert!(!info.args[1].required);
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn inspectable_default_description() {
     let info: CommandInfo = simple_command__schema();
@@ -75,6 +81,7 @@ fn inspectable_default_description() {
     assert_eq!(info.args.len(), 0);
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn inspectable_with_intent_annotations() {
     let info: CommandInfo = save_user_preferences__schema();
@@ -91,6 +98,9 @@ fn inspectable_with_intent_annotations() {
     assert_eq!(info.args[0].name, "prefs");
 }
 
+// Auto-discovery registration is emitted only under `debug_assertions` (in the consumer's
+// profile), so these hold in debug builds; `release_builds_register_nothing` pins the other side.
+#[cfg(debug_assertions)]
 #[test]
 fn auto_discovery_finds_inspectable_commands() {
     let discovered = victauri_core::auto_discovered_commands();
@@ -119,6 +129,7 @@ fn auto_discovery_finds_inspectable_commands() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn auto_discovery_preserves_metadata() {
     let discovered = victauri_core::auto_discovered_commands();
@@ -134,6 +145,7 @@ fn auto_discovery_preserves_metadata() {
     assert_eq!(prefs_cmd.args[0].name, "prefs");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn registry_from_auto_discovery() {
     let registry = victauri_core::CommandRegistry::from_auto_discovery();
@@ -150,6 +162,22 @@ fn registry_from_auto_discovery() {
         registry.get("load_user").is_some(),
         "registry should contain load_user"
     );
+}
+
+/// `cargo test --release`: a release build carries no `#[inspectable]` registration (no
+/// startup constructor, no metadata strings), while the `__schema()` companions still work.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_builds_register_nothing() {
+    assert!(
+        victauri_core::auto_discovered_commands().is_empty(),
+        "release builds must not register #[inspectable] commands"
+    );
+    let info = save_api_key__schema();
+    assert_eq!(info.name, "save_api_key");
+    assert!(info.description.is_none(), "metadata is debug-only");
+    assert!(info.args.is_empty(), "metadata is debug-only");
+    assert!(save_user_preferences__schema().examples.is_empty());
 }
 
 // ── IPC argument keys (audit: the registry advertised Rust names, but Tauri invokes
@@ -183,6 +211,7 @@ fn with_injected(
     page_size
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn arg_keys_follow_tauris_camel_case_default() {
     let info = large_payload__schema();
@@ -195,6 +224,7 @@ fn arg_keys_follow_tauris_camel_case_default() {
     assert_eq!(save_api_key__schema().args[0].key, None);
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn rename_all_snake_case_keeps_rust_names() {
     let info = snake_keys__schema();
@@ -202,6 +232,7 @@ fn rename_all_snake_case_keeps_rust_names() {
     assert_eq!(info.args[0].key, None);
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn rename_sets_the_invoked_command_name() {
     let info = original_name__schema();
@@ -209,6 +240,7 @@ fn rename_sets_the_invoked_command_name() {
     assert_eq!(info.args[0].invoke_key(), "userId");
 }
 
+#[cfg(debug_assertions)] // metadata is debug-only (see `release_builds_register_nothing`)
 #[test]
 fn injected_framework_args_are_skipped_even_with_paths_in_generics() {
     let info = with_injected__schema();

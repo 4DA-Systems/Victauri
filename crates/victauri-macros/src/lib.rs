@@ -48,6 +48,20 @@ use syn::{ItemFn, parse_macro_input};
 /// // At setup:
 /// state.registry.register(save_api_key__schema());
 /// ```
+///
+/// # Release builds
+///
+/// Everything Victauri-specific is gated on `debug_assertions`, evaluated in YOUR crate's
+/// profile (the Victauri plugin is a no-op in release, so nothing could read it):
+///
+/// - the auto-discovery registration (what `VictauriBuilder::auto_discover()` collects) is not
+///   emitted, so a release build has no startup constructor for it;
+/// - the `<fn>__schema()` companion still exists — code passing it to
+///   `VictauriBuilder::commands(...)` or `register_commands!` keeps compiling — but returns
+///   only the command name (and whether it is async): the description, intent, category,
+///   examples and argument/return types are not compiled in.
+///
+/// So none of the metadata strings ship in a release binary.
 #[proc_macro_attribute]
 pub fn inspectable(attr: TokenStream, item: TokenStream) -> TokenStream {
     let input = parse_macro_input!(item as ItemFn);
@@ -55,6 +69,11 @@ pub fn inspectable(attr: TokenStream, item: TokenStream) -> TokenStream {
         Ok(a) => a,
         Err(e) => return e.to_compile_error().into(),
     };
+    TokenStream::from(expand(input, attrs))
+}
+
+/// The expansion of `#[inspectable]` (split out so it can be unit-tested with `proc_macro2`).
+fn expand(input: ItemFn, attrs: InspectableAttrs) -> proc_macro2::TokenStream {
     let command_options = tauri_command_options(&input.attrs);
 
     let fn_name = &input.sig.ident;
@@ -111,24 +130,34 @@ pub fn inspectable(attr: TokenStream, item: TokenStream) -> TokenStream {
             // Built via constructors, not a struct literal: `CommandInfo` and
             // `CommandArg` are `#[non_exhaustive]`, and this code expands in the
             // user's crate.
-            victauri_core::registry::CommandInfo::new(#command_name)
+            #[cfg(debug_assertions)]
+            let info = victauri_core::registry::CommandInfo::new(#command_name)
                 .with_description(#description)
                 .with_args(vec![#(#arg_tokens),*])
                 .with_return_type(#return_type)
                 .with_async(#is_async)
                 #intent_token
                 #category_token
-                .with_examples(vec![#(#example_tokens),*])
+                .with_examples(vec![#(#example_tokens),*]);
+            // Release (the consumer's profile): the name only, so none of the metadata
+            // strings ship — see "Release builds" above.
+            #[cfg(not(debug_assertions))]
+            let info = victauri_core::registry::CommandInfo::new(#command_name)
+                .with_async(#is_async);
+            info
         }
 
+        // Debug builds only, in the consumer's profile — see "Release builds" above.
+        #[cfg(debug_assertions)]
         victauri_core::inventory::submit! {
             victauri_core::registry::CommandInfoFactory(#schema_fn_name)
         }
     };
 
-    TokenStream::from(expanded)
+    expanded
 }
 
+#[derive(Default)]
 struct InspectableAttrs {
     description: Option<String>,
     intent: Option<String>,
@@ -195,14 +224,7 @@ fn invoke_key(name: &str, snake_case: bool) -> String {
 }
 
 fn parse_attrs(attr: TokenStream) -> syn::Result<InspectableAttrs> {
-    let mut attrs = InspectableAttrs {
-        description: None,
-        intent: None,
-        category: None,
-        examples: Vec::new(),
-        rename: None,
-        snake_case: None,
-    };
+    let mut attrs = InspectableAttrs::default();
 
     let parser = syn::meta::parser(|meta| {
         if meta.path.is_ident("description") {
@@ -327,6 +349,85 @@ mod tests {
             "#[command(root = \"crate\", rename_all = \"snake_case\")] fn f() {}",
         ));
         assert_eq!(o.snake_case, Some(true));
+    }
+
+    /// The inventory registration (and with it every description/intent/example string and the
+    /// startup constructor) must exist only in debug builds of the CONSUMER, while the
+    /// `__schema()` companion stays available in every profile.
+    #[test]
+    fn registration_is_gated_on_debug_assertions_but_schema_fn_is_not() {
+        let item =
+            syn::parse_str::<ItemFn>("#[tauri::command] fn greet(name: String) -> String { name }")
+                .unwrap();
+        let attrs = InspectableAttrs {
+            description: Some("Greet a person by name".into()),
+            ..InspectableAttrs::default()
+        };
+        let file: syn::File = syn::parse2(expand(item, attrs)).unwrap();
+        let debug_only = |attrs: &[syn::Attribute]| {
+            attrs.iter().any(|a| {
+                a.path().is_ident("cfg")
+                    && a.parse_args::<syn::Ident>()
+                        .is_ok_and(|i| i == "debug_assertions")
+            })
+        };
+
+        let mut saw_schema_fn = false;
+        let mut saw_submit = false;
+        for item in &file.items {
+            match item {
+                syn::Item::Fn(f) if f.sig.ident == "greet__schema" => {
+                    saw_schema_fn = true;
+                    assert!(
+                        !debug_only(&f.attrs),
+                        "the schema companion must exist in every profile"
+                    );
+                    // The metadata is built only in the debug `let`; the release one has no
+                    // description string.
+                    let lets: Vec<&syn::Local> = f
+                        .block
+                        .stmts
+                        .iter()
+                        .filter_map(|s| match s {
+                            syn::Stmt::Local(l) => Some(l),
+                            _ => None,
+                        })
+                        .collect();
+                    assert_eq!(lets.len(), 2, "one debug and one release `let info`");
+                    for local in lets {
+                        let text = quote!(#local).to_string();
+                        if debug_only(&local.attrs) {
+                            assert!(text.contains("Greet a person by name"), "{text}");
+                        } else {
+                            assert!(
+                                local.attrs.iter().any(|a| quote!(#a)
+                                    .to_string()
+                                    .contains("not (debug_assertions)")),
+                                "{text}"
+                            );
+                            assert!(!text.contains("Greet a person by name"), "{text}");
+                            assert!(!text.contains("with_description"), "{text}");
+                        }
+                    }
+                }
+                syn::Item::Macro(m)
+                    if m.mac
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|s| s.ident == "submit") =>
+                {
+                    saw_submit = true;
+                    assert!(
+                        debug_only(&m.attrs),
+                        "inventory::submit! must be #[cfg(debug_assertions)]"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_schema_fn, "no greet__schema fn in the expansion");
+        assert!(saw_submit, "no inventory::submit! in the expansion");
     }
 
     #[test]

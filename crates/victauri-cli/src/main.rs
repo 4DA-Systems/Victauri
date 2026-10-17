@@ -42,6 +42,13 @@ enum Commands {
         /// Codex then uses `~/.codex/config.toml` instead of the project's `.codex/config.toml`)
         #[arg(long)]
         user_config: bool,
+        /// Put Victauri behind an opt-in `victauri` Cargo feature (optional dependencies +
+        /// feature-gated wiring), so builds without the feature — e.g. your release build —
+        /// compile none of it. Run the app with `tauri dev --features victauri`.
+        /// Without this flag the plugin is an ordinary dependency: always compiled, inert in
+        /// release builds.
+        #[arg(long)]
+        optional: bool,
     },
     /// Wire Victauri into AI agent clients: MCP config + agent instructions, merged into
     /// existing files (never clobbered) and idempotent
@@ -199,9 +206,10 @@ async fn main() -> Result<()> {
             path,
             clients,
             user_config,
+            optional,
         } => {
             let root = path.unwrap_or_else(|| PathBuf::from("."));
-            cmd_init_with(&root, &agents::expand(&clients), user_config)?;
+            cmd_init_with(&root, &agents::expand(&clients), user_config, optional)?;
         }
         Commands::Setup {
             clients,
@@ -218,6 +226,8 @@ async fn main() -> Result<()> {
                     user_config,
                     instructions: !no_instructions,
                     dry_run,
+                    // Detected from Cargo.toml in `cmd_setup`.
+                    feature_gated: false,
                 },
             )?;
         }
@@ -277,11 +287,16 @@ async fn main() -> Result<()> {
 
 /// `victauri init` with the default agent client (Claude Code), as before `--client` existed.
 #[cfg(test)]
-fn cmd_init(root: &Path) -> Result<()> {
-    cmd_init_with(root, &[agents::Client::Claude], false)
+fn cmd_init(root: &Path, optional: bool) -> Result<()> {
+    cmd_init_with(root, &[agents::Client::Claude], false, optional)
 }
 
-fn cmd_init_with(root: &Path, clients: &[agents::Client], user_config: bool) -> Result<()> {
+fn cmd_init_with(
+    root: &Path,
+    clients: &[agents::Client],
+    user_config: bool,
+    optional: bool,
+) -> Result<()> {
     let root = std::fs::canonicalize(root)
         .with_context(|| format!("directory not found: {}", display_path(root)))?;
 
@@ -303,13 +318,39 @@ fn cmd_init_with(root: &Path, clients: &[agents::Client], user_config: bool) -> 
     ensure_inside_project(&root, &cargo_toml_path)?;
 
     // Step 1: Add dependencies to Cargo.toml
-    let added = add_dependencies(&cargo_toml_path)?;
-    if added {
-        eprintln!(
-            "  [+] Added Victauri dependencies to Cargo.toml (victauri-plugin, victauri-core; dev: victauri-test, tokio)"
-        );
+    let deps = add_dependencies(&cargo_toml_path, optional)?;
+    if deps.changed {
+        if optional {
+            eprintln!(
+                "  [+] Added optional Victauri dependencies + a `victauri` feature to Cargo.toml \
+                 (victauri-plugin, victauri-core; dev: victauri-test, tokio)"
+            );
+        } else {
+            eprintln!(
+                "  [+] Added Victauri dependencies to Cargo.toml (victauri-plugin, victauri-core; dev: victauri-test, tokio)"
+            );
+        }
     } else {
         eprintln!("  [=] Dependencies already present in Cargo.toml");
+    }
+    if optional && deps.plugin_is_unconditional {
+        eprintln!(
+            "  [!] victauri-plugin is already an ordinary (non-optional) dependency, so it is left as"
+        );
+        eprintln!(
+            "      is. To feature-gate an existing setup, follow \"Zero release footprint\" in the"
+        );
+        eprintln!("      getting-started guide.");
+    }
+    // Every later step follows what the manifest really is, not the flag: `--optional` leaves
+    // an ordinary dependency alone (so the app is NOT gated, and still needs a capability
+    // file), and a plain `init` on an app that was set up with `--optional` must keep it gated
+    // (a capability file naming `victauri:default` would break every build without the feature).
+    let gated = project_is_feature_gated(&root);
+    if gated && !optional {
+        eprintln!(
+            "  [=] victauri-plugin is an optional dependency: keeping the feature-gated setup"
+        );
     }
 
     // Step 2: Auto-patch main.rs/lib.rs with plugin wiring
@@ -320,17 +361,40 @@ fn cmd_init_with(root: &Path, clients: &[agents::Client], user_config: bool) -> 
     let mut patched = false;
     if src_dir.exists() {
         ensure_inside_project(&root, &src_dir.join("main.rs"))?;
-        patched = try_patch_tauri_builder(&src_dir)?;
+        patched = try_patch_tauri_builder(&src_dir, gated)?;
     }
     if !patched {
         eprintln!("  [!] Could not auto-patch your Tauri builder.");
-        eprintln!("      Add this line manually:\n");
-        eprintln!("        .plugin(victauri_plugin::init())\n");
+        if gated {
+            eprintln!(
+                "      Wrap your builder as `with_victauri(tauri::Builder::default())` and add:\n"
+            );
+            eprintln!("{}", indent_block(optional_wiring_snippet()));
+        } else {
+            eprintln!("      Add this line manually:\n");
+            eprintln!("        .plugin(victauri_plugin::init())\n");
+        }
     }
 
     // Step 4: Create Tauri capability for Victauri
     let capabilities_dir = find_capabilities_dir(&cargo_toml_path);
-    if let Some(caps_dir) = capabilities_dir {
+    if gated {
+        // A static capability naming `victauri:default` makes every build WITHOUT the feature
+        // fail (Tauri rejects a permission of a plugin that is not in the build), so the
+        // feature-gated wiring grants it at runtime instead — see `optional_wiring_snippet`.
+        eprintln!(
+            "  [=] No capability file needed: the feature-gated wiring grants 'victauri:default'"
+        );
+        if let Some(caps_dir) = &capabilities_dir
+            && scan_victauri_capability(caps_dir).granted
+        {
+            eprintln!(
+                "  [!] A capability file under capabilities/ grants 'victauri:default': a build"
+            );
+            eprintln!("      without the `victauri` feature will fail to resolve it. Remove that");
+            eprintln!("      permission (the generated wiring grants it when the feature is on).");
+        }
+    } else if let Some(caps_dir) = capabilities_dir {
         let cap_path = caps_dir.join("victauri.json");
         ensure_inside_project(&root, &cap_path)?;
         if cap_path.exists() {
@@ -411,7 +475,7 @@ fn cmd_init_with(root: &Path, clients: &[agents::Client], user_config: bool) -> 
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| ".".to_string());
-        write_new_file(&ci_path, &generate_ci_workflow(&app_dir))?;
+        write_new_file(&ci_path, &generate_ci_workflow(&app_dir, gated))?;
         eprintln!("  [+] Created .github/workflows/victauri.yml (CI pipeline)");
     }
 
@@ -431,6 +495,7 @@ fn cmd_init_with(root: &Path, clients: &[agents::Client], user_config: bool) -> 
         user_config,
         instructions: true,
         dry_run: false,
+        feature_gated: gated,
     };
     let reports = agents::setup(
         &root,
@@ -443,10 +508,25 @@ fn cmd_init_with(root: &Path, clients: &[agents::Client], user_config: bool) -> 
     // Step 8: Print summary
     let mut remaining_steps = Vec::new();
     if !patched {
-        remaining_steps
-            .push("Add .plugin(victauri_plugin::init()) to your Tauri builder".to_string());
+        remaining_steps.push(if gated {
+            "Wire `with_victauri(...)` into your Tauri builder (snippet above)".to_string()
+        } else {
+            "Add .plugin(victauri_plugin::init()) to your Tauri builder".to_string()
+        });
     }
-    remaining_steps.push(format!("Start your app:  {}", tauri_dev_command(&root)));
+    if gated {
+        let dev = tauri_dev_command(&root);
+        remaining_steps.push(format!(
+            "Start your app WITH the feature:  {}",
+            with_victauri_feature(dev)
+        ));
+        remaining_steps.push(format!(
+            "Release builds (`{}`) leave the feature off: no Victauri code at all",
+            dev.replacen(" dev", " build", 1)
+        ));
+    } else {
+        remaining_steps.push(format!("Start your app:  {}", tauri_dev_command(&root)));
+    }
     remaining_steps.push("Run the tests:   VICTAURI_E2E=1 cargo test --test smoke".to_string());
     if cfg!(windows) {
         remaining_steps.push(
@@ -481,10 +561,14 @@ fn cmd_setup(root: &Path, options: &agents::Options) -> Result<()> {
              found, so the bridge is not pinned (it uses the single running app)\n"
         ),
     }
+    let options = agents::Options {
+        feature_gated: options.feature_gated || project_is_feature_gated(&root),
+        ..options.clone()
+    };
     let reports = agents::setup(
         &root,
         app_id.as_deref(),
-        options,
+        &options,
         &agents::UserDirs::from_env(),
     )?;
     agents::print_reports(&root, &reports, options.dry_run);
@@ -891,10 +975,14 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
         .map(|p| p.join("src"))
         .unwrap_or_default();
     let mut plugin_wired = false;
+    // `init --optional` grants the permission at runtime, in source (a capability file naming
+    // it would break builds without the feature) — see `optional_wiring_snippet`.
+    let mut runtime_grant = false;
     for filename in ["lib.rs", "main.rs"] {
         let path = src_dir.join(filename);
         if path.exists() {
             let content = std::fs::read_to_string(&path).unwrap_or_default();
+            runtime_grant |= grants_victauri_at_runtime(&content);
             if content.contains("victauri_plugin") {
                 eprintln!("  [PASS] Plugin wired in {filename}");
                 plugin_wired = true;
@@ -930,7 +1018,12 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     let caps_dir = find_capabilities_dir(&cargo_path);
     if let Some(ref caps) = caps_dir {
         let scan = scan_victauri_capability(caps);
-        if !scan.granted {
+        if !scan.granted && runtime_grant {
+            eprintln!(
+                "  [PASS] 'victauri:default' granted at runtime (feature-gated `add_capability`)"
+            );
+            pass_count += 1;
+        } else if !scan.granted {
             eprintln!("  [WARN] No capability grants 'victauri:default'");
             eprintln!("         Without it Tauri's ACL silently blocks Victauri — every");
             eprintln!("         eval_js / dom_snapshot will time out with no error.");
@@ -1437,7 +1530,77 @@ fn run_tests_with_output(filter: Option<&str>, changed_file: Option<&str>) {
     eprintln!("\n\x1b[90mWaiting for changes...\x1b[0m");
 }
 
-fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
+/// The feature-gated wiring `victauri init --optional` appends to the file holding the Tauri
+/// builder. Both feature states compile: without the `victauri` feature `with_victauri` is the
+/// identity and no Victauri item is referenced.
+///
+/// The permission is granted at runtime (`add_capability`, Tauri's default `dynamic-acl`
+/// feature) rather than in a capability file because a static grant of `victauri:default`
+/// fails every build WITHOUT the feature: Tauri resolves capabilities against the plugins in
+/// the build and rejects one it does not know.
+fn optional_wiring_snippet() -> &'static str {
+    r#"
+/// Victauri — an MCP server inside the app for AI agents (debug builds only). Compiled only
+/// with the `victauri` Cargo feature (`tauri dev --features victauri`), so a build without it
+/// contains no Victauri code at all. Added by `victauri init --optional`.
+#[cfg(feature = "victauri")]
+fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder.plugin(victauri_plugin::init()).plugin(
+        // Grant `victauri:default` to every window at runtime: a capability FILE naming it would
+        // break builds without the feature (Tauri rejects permissions of plugins not built in).
+        tauri::plugin::Builder::<R>::new("victauri-capability")
+            .setup(|app, _api| {
+                tauri::Manager::add_capability(
+                    app,
+                    tauri::ipc::CapabilityBuilder::new("victauri")
+                        .window("*")
+                        .permission("victauri:default"),
+                )?;
+                Ok(())
+            })
+            .build(),
+    )
+}
+
+/// Without the `victauri` feature: the builder, unchanged.
+#[cfg(not(feature = "victauri"))]
+fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
+    builder
+}
+"#
+}
+
+/// Whether `source` grants `victauri:default` at runtime the way [`optional_wiring_snippet`]
+/// does (a `CapabilityBuilder` permission), so `doctor` does not demand a capability file.
+fn grants_victauri_at_runtime(source: &str) -> bool {
+    source.contains("add_capability") && source.contains(".permission(\"victauri:default\")")
+}
+
+/// Patch `content` for `init --optional`: wrap the first `tauri::Builder::default()` as
+/// `with_victauri(tauri::Builder::default())` and append [`optional_wiring_snippet`]. `None`
+/// when there is no such builder expression to wrap.
+fn patch_optional_wiring(content: &str) -> Option<String> {
+    const BUILDER: &str = "tauri::Builder::default()";
+    let at = content.find(BUILDER)?;
+    let eol = if content.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
+    let mut out = String::with_capacity(content.len() + 2048);
+    out.push_str(&content[..at]);
+    out.push_str("with_victauri(");
+    out.push_str(BUILDER);
+    out.push(')');
+    out.push_str(&content[at + BUILDER.len()..]);
+    if !out.ends_with('\n') {
+        out.push_str(eol);
+    }
+    out.push_str(&optional_wiring_snippet().replace('\n', eol));
+    Some(out)
+}
+
+fn try_patch_tauri_builder(src_dir: &Path, optional: bool) -> Result<bool> {
     for filename in ["lib.rs", "main.rs"] {
         let path = src_dir.join(filename);
         if !path.exists() {
@@ -1456,6 +1619,20 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
 
         if !content.contains("tauri::Builder") {
             continue;
+        }
+
+        if optional {
+            let Some(new_content) = patch_optional_wiring(&content) else {
+                continue;
+            };
+            refuse_symlink(&path)?;
+            std::fs::write(&path, new_content)
+                .with_context(|| format!("failed to write {}", display_path(&path)))?;
+            eprintln!(
+                "  [+] Patched {} with feature-gated `with_victauri(...)` wiring",
+                display_path(&path)
+            );
+            return Ok(true);
         }
 
         // Try to find a safe insertion point:
@@ -1909,17 +2086,62 @@ fn find_src_tauri(root: &Path) -> Option<PathBuf> {
     if p.exists() { Some(p) } else { None }
 }
 
-fn add_dependencies(cargo_toml_path: &Path) -> Result<bool> {
+/// What [`add_dependencies`] did.
+struct DepsOutcome {
+    /// Whether the manifest was changed.
+    changed: bool,
+    /// `victauri-plugin` was already an ordinary (non-optional) dependency (only reported for
+    /// `--optional`, which then leaves it alone).
+    plugin_is_unconditional: bool,
+}
+
+/// A Victauri runtime dependency entry: the bare version, or with `optional = true`.
+fn victauri_dep(optional: bool) -> toml_edit::Item {
+    if optional {
+        let mut dep = toml_edit::InlineTable::new();
+        dep.insert("version", env!("CARGO_PKG_VERSION").into());
+        dep.insert("optional", true.into());
+        toml_edit::value(dep)
+    } else {
+        toml_edit::value(env!("CARGO_PKG_VERSION"))
+    }
+}
+
+/// Whether `[dependencies].<dep>` is present and marked `optional = true`.
+fn dep_is_optional(doc: &toml_edit::DocumentMut, dep: &str) -> bool {
+    doc.get("dependencies")
+        .and_then(|t| t.get(dep))
+        .and_then(|d| d.get("optional"))
+        .and_then(toml_edit::Item::as_bool)
+        .unwrap_or(false)
+}
+
+/// Whether the project's `victauri-plugin` is an optional dependency (`init --optional`).
+/// Unreadable or unparsable manifests count as not gated.
+fn project_is_feature_gated(root: &Path) -> bool {
+    let Ok((cargo_toml, _)) = detect_project(root) else {
+        return false;
+    };
+    std::fs::read_to_string(cargo_toml)
+        .ok()
+        .and_then(|c| c.parse::<toml_edit::DocumentMut>().ok())
+        .is_some_and(|doc| dep_is_optional(&doc, "victauri-plugin"))
+}
+
+fn add_dependencies(cargo_toml_path: &Path, optional: bool) -> Result<DepsOutcome> {
     let content = std::fs::read_to_string(cargo_toml_path)?;
     let mut doc = content
         .parse::<toml_edit::DocumentMut>()
         .context("failed to parse Cargo.toml")?;
 
     let mut changed = false;
+    let plugin_is_unconditional = optional
+        && has_dep(&doc, "dependencies", "victauri-plugin")
+        && !dep_is_optional(&doc, "victauri-plugin");
 
     if !has_dep(&doc, "dependencies", "victauri-plugin") {
         ensure_table(&mut doc, "dependencies");
-        doc["dependencies"]["victauri-plugin"] = toml_edit::value(env!("CARGO_PKG_VERSION"));
+        doc["dependencies"]["victauri-plugin"] = victauri_dep(optional);
         changed = true;
     }
 
@@ -1929,8 +2151,27 @@ fn add_dependencies(cargo_toml_path: &Path) -> Result<bool> {
     // graph via victauri-plugin, so this adds no compile cost.
     if !has_dep(&doc, "dependencies", "victauri-core") {
         ensure_table(&mut doc, "dependencies");
-        doc["dependencies"]["victauri-core"] = toml_edit::value(env!("CARGO_PKG_VERSION"));
+        doc["dependencies"]["victauri-core"] = victauri_dep(optional);
         changed = true;
+    }
+
+    // `--optional`: the `victauri` feature that turns both on. (`dep:` keeps Cargo from also
+    // creating implicit `victauri-plugin` / `victauri-core` features.)
+    if optional && !plugin_is_unconditional {
+        ensure_table(&mut doc, "features");
+        let has_feature = doc
+            .get("features")
+            .and_then(|f| f.as_table())
+            .is_some_and(|f| f.contains_key("victauri"));
+        if !has_feature {
+            let mut members = toml_edit::Array::new();
+            members.push("dep:victauri-plugin");
+            if dep_is_optional(&doc, "victauri-core") {
+                members.push("dep:victauri-core");
+            }
+            doc["features"]["victauri"] = toml_edit::value(members);
+            changed = true;
+        }
     }
 
     if !has_dep(&doc, "dev-dependencies", "victauri-test") {
@@ -1958,7 +2199,10 @@ fn add_dependencies(cargo_toml_path: &Path) -> Result<bool> {
         refuse_symlink(cargo_toml_path)?;
         std::fs::write(cargo_toml_path, doc.to_string())?;
     }
-    Ok(changed)
+    Ok(DepsOutcome {
+        changed,
+        plugin_is_unconditional,
+    })
 }
 
 fn has_dep(doc: &toml_edit::DocumentMut, table: &str, dep: &str) -> bool {
@@ -2121,6 +2365,16 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
     commands
 }
 
+/// `dev` with the `victauri` Cargo feature turned on. `npm run` needs `--` before arguments
+/// meant for the script; pnpm, yarn and bun pass them through.
+fn with_victauri_feature(dev: &str) -> String {
+    if dev.starts_with("npm run ") {
+        format!("{dev} -- --features victauri")
+    } else {
+        format!("{dev} --features victauri")
+    }
+}
+
 /// The dev command for the project's package manager, picked from the lockfile in `root`
 /// or its parent (init may run from `src-tauri/`). Defaults to npm, the create-tauri-app
 /// default.
@@ -2225,7 +2479,7 @@ async fn command_{cmd}() {{
 /// `beforeBuildCommand` (the frontend build) first and embeds the built frontend, so the
 /// binary does not need a dev server — while a debug build keeps Victauri enabled (it is a
 /// no-op in release builds).
-fn generate_ci_workflow(app_dir: &str) -> String {
+fn generate_ci_workflow(app_dir: &str, optional: bool) -> String {
     r#"# Victauri E2E tests — runs smoke + integration tests against your Tauri app.
 # Generated by `victauri init`. Customize as needed.
 #
@@ -2278,7 +2532,7 @@ jobs:
       # `tauri build --debug` runs your beforeBuildCommand (frontend build) first and embeds
       # the built frontend, so no dev server is needed. A debug build keeps Victauri enabled.
       - name: Build app (debug, frontend embedded)
-        run: npx tauri build --debug --no-bundle
+        run: npx tauri build --debug --no-bundle__FEATURES__
 
       - name: Start app under xvfb
         working-directory: __APP_DIR__
@@ -2314,6 +2568,11 @@ jobs:
 "#
     .replace("__VICTAURI_VERSION__", env!("CARGO_PKG_VERSION"))
     .replace("__APP_DIR__", app_dir)
+    // `init --optional`: Victauri is compiled in only with the `victauri` feature.
+    .replace(
+        "__FEATURES__",
+        if optional { " --features victauri" } else { "" },
+    )
 }
 
 #[cfg(test)]
@@ -2383,7 +2642,7 @@ mod tests {
         )
         .unwrap();
 
-        let added = add_dependencies(&cargo).unwrap();
+        let added = add_dependencies(&cargo, false).unwrap().changed;
         assert!(added);
 
         let content = std::fs::read_to_string(&cargo).unwrap();
@@ -2401,8 +2660,8 @@ mod tests {
         )
         .unwrap();
 
-        add_dependencies(&cargo).unwrap();
-        let second = add_dependencies(&cargo).unwrap();
+        add_dependencies(&cargo, false).unwrap();
+        let second = add_dependencies(&cargo, false).unwrap().changed;
         assert!(!second, "second call should report no changes");
     }
 
@@ -2417,7 +2676,7 @@ mod tests {
         )
         .unwrap();
 
-        let patched = try_patch_tauri_builder(&src).unwrap();
+        let patched = try_patch_tauri_builder(&src, false).unwrap();
         assert!(patched, "should have patched the file");
 
         let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
@@ -2430,6 +2689,204 @@ mod tests {
     }
 
     #[test]
+    fn optional_deps_are_optional_and_feature_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo,
+            "[package]\nname = \"test-app\"\nversion = \"0.1.0\"\n\n[dependencies]\ntauri = \"2\"\n",
+        )
+        .unwrap();
+
+        let outcome = add_dependencies(&cargo, true).unwrap();
+        assert!(outcome.changed);
+        assert!(!outcome.plugin_is_unconditional);
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&cargo).unwrap().parse().unwrap();
+        for dep in ["victauri-plugin", "victauri-core"] {
+            assert!(dep_is_optional(&doc, dep), "{dep} must be optional");
+            assert_eq!(
+                doc["dependencies"][dep]["version"].as_str(),
+                Some(env!("CARGO_PKG_VERSION"))
+            );
+        }
+        let feature: Vec<&str> = doc["features"]["victauri"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(feature, ["dep:victauri-plugin", "dep:victauri-core"]);
+        // dev-dependencies are unaffected: the tests talk to the app over HTTP.
+        assert!(doc["dev-dependencies"].get("victauri-test").is_some());
+
+        assert!(
+            !add_dependencies(&cargo, true).unwrap().changed,
+            "idempotent"
+        );
+    }
+
+    #[test]
+    fn optional_mode_leaves_an_unconditional_plugin_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo,
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nvictauri-plugin = \"0.9\"\n",
+        )
+        .unwrap();
+        let outcome = add_dependencies(&cargo, true).unwrap();
+        assert!(outcome.plugin_is_unconditional);
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&cargo).unwrap().parse().unwrap();
+        assert_eq!(doc["dependencies"]["victauri-plugin"].as_str(), Some("0.9"));
+        assert!(
+            doc.get("features")
+                .is_none_or(|f| f.get("victauri").is_none()),
+            "no feature that would not gate anything"
+        );
+    }
+
+    #[test]
+    fn optional_patch_wraps_the_builder_and_gates_both_states() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            "pub fn run() {\r\n    tauri::Builder::default()\r\n        .run(tauri::generate_context!())\r\n        .unwrap();\r\n}\r\n",
+        )
+        .unwrap();
+
+        assert!(try_patch_tauri_builder(&src, true).unwrap());
+        let content = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+        assert!(content.contains("with_victauri(tauri::Builder::default())"));
+        // The plugin is only referenced under the feature, and there is a no-feature twin.
+        assert_eq!(content.matches("#[cfg(feature = \"victauri\")]").count(), 1);
+        assert_eq!(
+            content
+                .matches("#[cfg(not(feature = \"victauri\"))]")
+                .count(),
+            1
+        );
+        let gated = content
+            .split("#[cfg(not(feature = \"victauri\"))]")
+            .nth(1)
+            .unwrap();
+        assert!(!gated.contains("victauri_plugin"), "{gated}");
+        // The permission is granted at runtime, never via a capability file.
+        assert!(content.contains(".permission(\"victauri:default\")"));
+        assert!(
+            grants_victauri_at_runtime(&content),
+            "doctor must see the runtime grant"
+        );
+        assert!(!grants_victauri_at_runtime("fn main() {}"));
+        // Line endings preserved: no bare LF introduced.
+        assert!(!content.replace("\r\n", "").contains('\n'), "mixed EOLs");
+        // Idempotent: a second run finds `victauri_plugin` and changes nothing.
+        assert!(try_patch_tauri_builder(&src, true).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(src.join("lib.rs")).unwrap(),
+            content
+        );
+    }
+
+    #[test]
+    fn optional_patch_needs_a_builder_expression() {
+        assert!(patch_optional_wiring("fn main() { let b = tauri::Builder::new(); }").is_none());
+    }
+
+    /// `init` follows the manifest, not the flag: `--optional` on an app whose plugin is
+    /// already an ordinary dependency must still grant `victauri:default` by capability file
+    /// (else the app is blind), and a plain `init` on a feature-gated app must not add one
+    /// (else every build without the feature fails).
+    #[test]
+    fn init_follows_the_manifest_not_the_flag() {
+        let scaffold = |deps: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            let app = dir.path().join("src-tauri");
+            std::fs::create_dir_all(app.join("src")).unwrap();
+            std::fs::create_dir_all(app.join("capabilities")).unwrap();
+            std::fs::write(
+                app.join("Cargo.toml"),
+                format!("[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\ntauri = \"2\"\n{deps}"),
+            )
+            .unwrap();
+            std::fs::write(
+                app.join("src").join("main.rs"),
+                "fn main() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n",
+            )
+            .unwrap();
+            dir
+        };
+        let cap = |d: &tempfile::TempDir| {
+            d.path()
+                .join("src-tauri")
+                .join("capabilities")
+                .join("victauri.json")
+                .exists()
+        };
+        let claude =
+            |d: &tempfile::TempDir| std::fs::read_to_string(d.path().join("CLAUDE.md")).unwrap();
+
+        let ordinary = scaffold("victauri-plugin = \"0.9\"\n");
+        cmd_init(ordinary.path(), true).unwrap();
+        assert!(
+            cap(&ordinary),
+            "--optional on an ordinary dep must keep the capability file"
+        );
+        assert!(!claude(&ordinary).contains("--features victauri"));
+
+        let gated = scaffold(
+            "victauri-plugin = { version = \"0.9\", optional = true }\n\n[features]\nvictauri = [\"dep:victauri-plugin\"]\n",
+        );
+        cmd_init(gated.path(), false).unwrap();
+        assert!(
+            !cap(&gated),
+            "plain init on a gated app must not add a capability file"
+        );
+        assert!(claude(&gated).contains("--features victauri"));
+    }
+
+    #[test]
+    fn optional_init_writes_no_capability_file_and_runs_with_the_feature() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("src-tauri");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(app.join("capabilities")).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\ntauri = \"2\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("src").join("main.rs"),
+            "fn main() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n",
+        )
+        .unwrap();
+
+        cmd_init(dir.path(), true).unwrap();
+
+        assert!(!app.join("capabilities").join("victauri.json").exists());
+        let ci = std::fs::read_to_string(
+            dir.path()
+                .join(".github")
+                .join("workflows")
+                .join("victauri.yml"),
+        )
+        .unwrap();
+        assert!(ci.contains("npx tauri build --debug --no-bundle --features victauri"));
+        let claude = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(claude.contains("--features victauri"));
+        assert!(claude.trim_end().ends_with("<!-- VICTAURI:END -->"));
+
+        // The default (non-optional) workflow has no feature flag.
+        assert!(
+            generate_ci_workflow("src-tauri", false)
+                .contains("npx tauri build --debug --no-bundle\n")
+        );
+        assert!(!agents::claude_md_block(false).contains("--features victauri"));
+    }
+
+    #[test]
     fn patch_tauri_builder_keeps_crlf_line_endings() {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("src");
@@ -2439,7 +2896,7 @@ mod tests {
             "fn main() {\r\n    tauri::Builder::default()\r\n        .run(tauri::generate_context!())\r\n        .unwrap();\r\n}\r\n",
         )
         .unwrap();
-        assert!(try_patch_tauri_builder(&src).unwrap());
+        assert!(try_patch_tauri_builder(&src, false).unwrap());
         let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
         assert!(content.contains("victauri_plugin::init()"));
         assert_eq!(
@@ -2461,7 +2918,7 @@ mod tests {
         )
         .unwrap();
 
-        let patched = try_patch_tauri_builder(&src).unwrap();
+        let patched = try_patch_tauri_builder(&src, false).unwrap();
         assert!(patched, "should report true (already present)");
 
         let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
@@ -2483,7 +2940,7 @@ mod tests {
         )
         .unwrap();
 
-        let patched = try_patch_tauri_builder(&src).unwrap();
+        let patched = try_patch_tauri_builder(&src, false).unwrap();
         assert!(patched);
 
         let content = std::fs::read_to_string(src.join("lib.rs")).unwrap();
@@ -2497,7 +2954,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("main.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
 
-        let patched = try_patch_tauri_builder(&src).unwrap();
+        let patched = try_patch_tauri_builder(&src, false).unwrap();
         assert!(!patched, "should return false when no tauri::Builder found");
     }
 
@@ -2533,14 +2990,14 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::os::unix::fs::symlink(&outside, src.join("main.rs")).unwrap();
-        assert!(try_patch_tauri_builder(&src).is_err());
+        assert!(try_patch_tauri_builder(&src, false).is_err());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
 
         let manifest = dir.path().join("outside.toml");
         std::fs::write(&manifest, "[package]\nname = \"x\"\n\n[dependencies]\n").unwrap();
         let link = dir.path().join("Cargo.toml");
         std::os::unix::fs::symlink(&manifest, &link).unwrap();
-        assert!(add_dependencies(&link).is_err());
+        assert!(add_dependencies(&link, false).is_err());
         assert!(
             !std::fs::read_to_string(&manifest)
                 .unwrap()
@@ -2583,7 +3040,7 @@ mod tests {
         let outside = dir.path().join("outside.md");
         std::fs::write(&outside, "keep").unwrap();
         std::os::unix::fs::symlink(&outside, dir.path().join("CLAUDE.md")).unwrap();
-        let err = cmd_init(dir.path()).unwrap_err();
+        let err = cmd_init(dir.path(), false).unwrap_err();
         assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
     }
@@ -2713,6 +3170,38 @@ mod tests {
     }
 
     #[test]
+    fn feature_flag_follows_the_package_manager() {
+        assert_eq!(
+            with_victauri_feature("npm run tauri dev"),
+            "npm run tauri dev -- --features victauri"
+        );
+        assert_eq!(
+            with_victauri_feature("pnpm tauri dev"),
+            "pnpm tauri dev --features victauri"
+        );
+    }
+
+    #[test]
+    fn setup_detects_a_feature_gated_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[dependencies]\ntauri = \"2\"\nvictauri-plugin = \"0.9\"\n",
+        )
+        .unwrap();
+        assert!(!project_is_feature_gated(dir.path()));
+        std::fs::write(
+            &manifest,
+            "[dependencies]\ntauri = \"2\"\nvictauri-plugin = { version = \"0.9\", optional = true }\n",
+        )
+        .unwrap();
+        assert!(project_is_feature_gated(dir.path()));
+        std::fs::write(&manifest, "not toml [").unwrap();
+        assert!(!project_is_feature_gated(dir.path()));
+    }
+
+    #[test]
     fn tauri_dev_command_follows_lockfile() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(tauri_dev_command(dir.path()), "npm run tauri dev");
@@ -2725,7 +3214,7 @@ mod tests {
 
     #[test]
     fn ci_workflow_is_valid_yaml() {
-        let content = generate_ci_workflow("src-tauri");
+        let content = generate_ci_workflow("src-tauri", false);
         let version = env!("CARGO_PKG_VERSION");
         assert!(content.contains(&format!("victauri-test@v{version}")));
         assert!(content.contains(&format!("victauri-version: \"{version}\"")));
@@ -2757,7 +3246,7 @@ mod tests {
             "[package]\nname = \"test-app\"\nversion = \"0.1.0\"\n",
         )
         .unwrap();
-        add_dependencies(&cargo).unwrap();
+        add_dependencies(&cargo, false).unwrap();
         let doc: toml_edit::DocumentMut = std::fs::read_to_string(&cargo).unwrap().parse().unwrap();
         assert!(doc["dependencies"].get("victauri-core").is_some());
         let tokio = doc["dev-dependencies"]["tokio"].as_inline_table().unwrap();
@@ -2845,7 +3334,7 @@ mod tests {
 
     #[test]
     fn claude_md_section_has_key_instructions() {
-        let content = agents::claude_md_block();
+        let content = agents::claude_md_block(false);
         assert!(content.contains("Victauri"));
         assert!(content.contains("invoke_command"));
         assert!(content.contains("victauri bridge"));
@@ -2914,7 +3403,7 @@ mod tests {
             if !try_symlink_dir(&outside, &project.join(linked)) {
                 return;
             }
-            let err = cmd_init(&project).expect_err("init must refuse");
+            let err = cmd_init(&project, false).expect_err("init must refuse");
             assert!(format!("{err:#}").contains("symbolic link"), "{err:#}");
             assert_eq!(
                 std::fs::read_dir(&outside).unwrap().count(),
@@ -2936,7 +3425,7 @@ mod tests {
         if !try_symlink_dir(&outside, &project.join("src-tauri")) {
             return;
         }
-        assert!(cmd_init(&project).is_err());
+        assert!(cmd_init(&project, false).is_err());
         assert_eq!(
             std::fs::read_to_string(outside.join("Cargo.toml")).unwrap(),
             before
@@ -3012,7 +3501,7 @@ mod tests {
         // R4-DOC1: the generated block told agents the token lives at
         // `<temp>/victauri/<pid>/token` — on Unix 0.9 writes to a per-user root, and the
         // legacy shared root can be attacker-planted.
-        let content = agents::claude_md_block();
+        let content = agents::claude_md_block(false);
         assert!(
             !content.contains("<temp>/victauri/<pid>/token"),
             "{content}"

@@ -10,7 +10,7 @@ cargo install victauri-cli
 
 ## Commands
 
-### `victauri init [--path <dir>] [--client <clients>]`
+### `victauri init [--path <dir>] [--client <clients>] [--optional]`
 
 Zero-config setup for any Tauri project. Detects your project, adds dependencies, auto-patches your Tauri builder to wire the plugin, creates capabilities, generates starter test files, and wires your AI agent client.
 
@@ -18,6 +18,7 @@ Zero-config setup for any Tauri project. Detects your project, adds dependencies
 victauri init
 victauri init --path ./my-tauri-app
 victauri init --client claude,cursor,vscode
+victauri init --optional        # zero release footprint: Victauri behind a `victauri` feature
 ```
 
 What it does:
@@ -56,6 +57,15 @@ is written. An existing `victauri` entry is left exactly as it is, so re-running
 nothing. A malformed file is left untouched and the entry to add by hand is printed. Nothing
 outside the project is written without `--user-config`. Opt out by deleting the entry, the
 `VICTAURI:BEGIN … VICTAURI:END` block, or `.claude/skills/victauri/`.
+
+With `--optional`, the dependencies are `optional = true` behind a `victauri` Cargo feature, the
+builder is wrapped as `with_victauri(tauri::Builder::default())` (a function generated for both
+feature states), and the `victauri:default` permission is granted at runtime instead of by a
+capability file — a file naming it would break every build without the feature. Builds without
+the feature, such as `tauri build`, then contain no Victauri code. Start the app with
+`npm run tauri dev -- --features victauri` (or `pnpm tauri dev --features victauri`). The
+generated CLAUDE.md / AGENTS.md / skill say so too, and `victauri setup` adds the same note
+when it finds `victauri-plugin` is an optional dependency.
 
 ### `victauri doctor`
 
