@@ -1284,6 +1284,9 @@ const WEBVIEW_DB_BASENAMES: &[&str] = &[
     "affiliation database",
     "site characteristics database",
     "webdata",
+    // WebKitGTK (Linux) writes its stores straight into the app data dir, next to the app's
+    // own database — not under a `webkit` directory as WKWebView does — so these are named.
+    "hsts-storage",
 ];
 
 /// Directory names (matched case-insensitively, anywhere in the path) that belong to a
@@ -1303,6 +1306,10 @@ const WEBVIEW_DIR_NAMES: &[&str] = &[
     "blob_storage",
     "shared proto db",
     "websql",
+    // WebKitGTK's own directories inside the app data dir (Chromium spells it "local storage").
+    "localstorage",
+    "resourceloadstatistics",
+    "mediakeys",
 ];
 
 /// Whether a discovered database path is a `WebView`/browser-engine internal store rather
@@ -3049,6 +3056,16 @@ mod tests {
             "/app/Local Storage/leveldb.db"
         )));
         assert!(is_webview_internal(Path::new("/app/data/web data")));
+        // WebKitGTK keeps its stores in the app data dir itself (it outranked demo.db).
+        assert!(is_webview_internal(Path::new(
+            "/home/u/.local/share/com.victauri.demo/hsts-storage.sqlite"
+        )));
+        assert!(is_webview_internal(Path::new(
+            "/home/u/.local/share/com.victauri.demo/localstorage/file__0.localstorage"
+        )));
+        assert!(!is_webview_internal(Path::new(
+            "/home/u/.local/share/com.victauri.demo/demo.db"
+        )));
         // Real application DBs are NOT flagged.
         assert!(!is_webview_internal(Path::new("/app/data/4da.db")));
         assert!(!is_webview_internal(Path::new("/app/data/app.sqlite")));

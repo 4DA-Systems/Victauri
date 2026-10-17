@@ -212,11 +212,15 @@ adv!(query_db_blocks_all_writes, base, {
     )
     .await;
     assert_eq!(result(&ok)["rows"][0]["n"], json!(3));
-    // Which database auto-selection picks on this engine (informational).
+    // Auto-selection must pick the demo's own database on every engine, never one of the
+    // webview's stores beside it (WebKitGTK's hsts-storage.sqlite used to win on Linux).
     let auto = call(&base, "query_db", json!({"query":"SELECT 1"})).await;
-    eprintln!(
-        "query_db auto-selected: {}",
-        auto["result"]["database"].as_str().unwrap_or("<error>")
+    let picked = auto["result"]["database"].as_str().unwrap_or("<error>");
+    assert!(
+        std::path::Path::new(picked)
+            .file_name()
+            .is_some_and(|n| n == "demo.db"),
+        "query_db auto-selected {picked}, not demo.db: {auto}"
     );
 });
 

@@ -2674,10 +2674,15 @@ impl VictauriMcpHandler {
             - `matches`: log of intercepted requests.\n\
             Note: fetch supports all behaviors; XHR supports block/delay (fulfill is fetch-only). \
             Top-level navigation, sub-resource (img/css), and WebSocket traffic are not intercepted. \
-            Tauri IPC (ipc.localhost) is OBSERVE-ONLY: such calls appear in `matches`, but block/\
-            fulfill/delay do NOT take effect on them — Tauri serves IPC below the JS fetch layer, so \
-            it cannot be controlled cross-platform without CDP. There is no IPC-control tool; the \
-            `fault` tool only affects commands you drive via `invoke_command`, not real user IPC.",
+            Tauri IPC: on the fetch transport (desktop, until a fallback) a rule matching an IPC URL \
+            (http://ipc.localhost/<cmd> or ipc://localhost/<cmd>) DOES change what the app's real \
+            `invoke` gets. `fulfill` mocks the command (the Rust handler never runs; invoke resolves \
+            only with a `Tauri-Response: ok` header, else rejects with the body); `delay` holds the \
+            call back; `block` does NOT fail it (Tauri retries over postMessage and stays there until \
+            reload). Mocked calls are tagged `mocked` in the IPC log and kept out of ghost detection, \
+            command_catalog, coverage and timings; `add` returns an `ipc_note` when a rule can match \
+            IPC. postMessage IPC (Android, after a fallback) is not affected. The `fault` tool \
+            instead acts on commands you drive via `invoke_command`.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

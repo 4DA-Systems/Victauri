@@ -697,6 +697,39 @@ const INIT_SCRIPT_BODY: &str = r#"
         return null;
     }
 
+    // What a rule does to Tauri IPC, when it can match an IPC URL (a broad pattern such as `*`
+    // or `localhost` does too). Tauri's fetch transport runs through the page's `fetch`, so a
+    // rule really changes what the app's `invoke` gets — say exactly how.
+    function routeIpcNote(r) {
+        var probes = ['http://ipc.localhost/__victauri_probe__', 'ipc://localhost/__victauri_probe__'];
+        var hits = false;
+        for (var i = 0; i < probes.length && !hits; i++) {
+            var forms = routeUrlForms(probes[i]);
+            for (var f = 0; f < forms.length && !hits; f++) {
+                try { hits = routeRuleHits(r, forms[f]); } catch (e) { hits = false; }
+            }
+        }
+        if (!hits) return null;
+        var scope = ' Applies to the fetch transport only (desktop, until a fallback): IPC sent over'
+            + ' postMessage (Android, or after a fallback) is not affected.';
+        if (r.action === 'fulfill') {
+            return 'This rule ANSWERS matching Tauri IPC calls in the page: the app\'s invoke gets'
+                + ' this mock and the Rust handler never runs. invoke resolves only when the headers'
+                + ' include "Tauri-Response": "ok" (otherwise it rejects with the body). The body must'
+                + ' be valid for content_type, or Tauri treats the IPC fetch as failed and switches the'
+                + ' page to postMessage IPC until it reloads. Mocked calls are tagged `mocked` in the'
+                + ' IPC log and left out of ghost detection, command_catalog, coverage and timings.' + scope;
+        }
+        if (r.action === 'block') {
+            return 'Blocking a Tauri IPC fetch does NOT fail the call: Tauri retries it over'
+                + ' postMessage (the backend still runs it) and keeps the page on postMessage IPC'
+                + ' until it reloads. To make a command fail, use `fulfill` without a'
+                + ' "Tauri-Response": "ok" header.';
+        }
+        return 'Matching Tauri IPC calls are held back before reaching the backend; their logged'
+            + ' duration includes the delay (`route_delay_ms`), so command_timings leaves them out.' + scope;
+    }
+
     function recordRouteMatch(rule, url, method) {
         rule.triggered = (rule.triggered || 0) + 1;
         routeMatchLog.push({
@@ -1029,6 +1062,18 @@ const INIT_SCRIPT_BODY: &str = r#"
     // deep copies, so the page cannot rewrite a logged call through it. Without `bodies`, the
     // request args and result are left out and the error text is capped.
     var MAX_IPC_ERROR_TEXT = 4096;
+    // Tauri's verdict on a mocked IPC response: `headers.get('Tauri-Response') === 'ok'`.
+    // Header names are case-insensitive and repeated names join with ", " (as `Headers`
+    // does); read from the rule's own header object, not a page-replaceable `Headers`.
+    function mockedTauriResponse(hdrs) {
+        var vals = [];
+        for (var k in hdrs) {
+            if (Object.prototype.hasOwnProperty.call(hdrs, k) && ('' + k).toLowerCase() === 'tauri-response') {
+                vals.push(('' + hdrs[k]).trim());
+            }
+        }
+        return vals.join(', ') === 'ok' ? 'ok' : 'error';
+    }
     function ipcLogEntry(n, bodies) {
         // Classify by COMMAND outcome, not just HTTP status. Tauri returns
         // HTTP 200 for a failed command (incl. "command not found") and signals
@@ -1065,6 +1110,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         };
         // Only non-default transports are tagged (fetch is the default; no field = fetch).
         if (n.transport === 'post_message') e.transport = 'post_message';
+        // A `route` rule answered this call in the page (`mocked`: the backend never ran) or
+        // held it back (`route_delay_ms` is part of `duration_ms`). Analysis built on the log
+        // (ghost detection, command_catalog, coverage, timings) skips mocked calls.
+        if (n.mocked === true) e.mocked = true;
+        if (typeof n.route_delay_ms === 'number') e.route_delay_ms = n.route_delay_ms;
+        if (typeof n.route_rule === 'number') e.route_rule = n.route_rule;
         if (bodies) {
             e.args = cloneJson(n.request_args) || {};
             // Nullish, not falsy: a command returning 0 / false / '' is a real result.
@@ -1541,6 +1592,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         // froze the UI thread for ~1 s on every read (R5-JS1).
         getIpcLog: function(limit, opts) {
             var bodies = !(opts && opts.bodies === false);
+            // `backend_only`: leave out calls a `route` rule answered or blocked in the page —
+            // the backend never saw them, so they are no evidence about its handlers.
+            // `unrouted`: also leave out calls a `route` rule delayed (their duration includes
+            // the injected delay). Analysis (ghosts, catalog, coverage, timings) uses these.
+            var unrouted = !!(opts && opts.unrouted === true);
+            var backendOnly = unrouted || !!(opts && opts.backend_only === true);
             var idSet = null;
             if (opts && opts.ids) {
                 idSet = OBJ_CREATE(null);
@@ -1551,6 +1608,8 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var n = networkLog[i];
                 if (idSet && !idSet['' + n.id]) continue;
                 if (ipcCallCommand(n) === null) continue;
+                if (backendOnly && (n.mocked === true || n.blocked === true)) continue;
+                if (unrouted && typeof n.route_delay_ms === 'number') continue;
                 picked.push(n);
             }
             var start = (typeof limit === 'number' && limit > 0 && picked.length > limit) ? picked.length - limit : 0;
@@ -1649,7 +1708,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                 triggered: 0,
             };
             routeRules.push(r);
-            return { ok: true, id: r.id, rule: r };
+            var out = { ok: true, id: r.id, rule: r };
+            var ipcNote = routeIpcNote(r);
+            if (ipcNote) out.ipc_note = ipcNote;
+            return out;
         },
 
         getRouteRules: function() { return copyEntries(routeRules); },
@@ -3276,6 +3338,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var route = matchRoute(url, method);
                 if (route) {
                     recordRouteMatch(route, url, method);
+                    entry.route_rule = route.id;
                     if (route.action === 'block') {
                         entry.status = 'blocked';
                         entry.blocked = true;
@@ -3299,8 +3362,13 @@ const INIT_SCRIPT_BODY: &str = r#"
                             entry.status = status;
                             entry.status_text = route.status_text;
                             entry.mocked = true;
+                            if (route.delay_ms > 0) entry.route_delay_ms = route.delay_ms;
                             entry.duration_ms = Date.now() - entry.timestamp;
                             if (isIpc) {
+                                // The page's invoke resolves only when this mocked response
+                                // carries `Tauri-Response: ok` (ipc-protocol.js); anything else
+                                // rejects. Log the outcome the page actually got.
+                                entry.ipc_response = mockedTauriResponse(hdrs);
                                 if (bodyStr === null) entry.response_body = null;
                                 else if (bodyStr.length > MAX_IPC_BODY) entry.response_body = bodyOmitted(bodyStr.length, null);
                                 else { try { entry.response_body = PRISTINE_PARSE(bodyStr); } catch (e) { entry.response_body = bodyStr; } }
@@ -3323,6 +3391,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                         });
                     }
                     if (route.action === 'delay' && route.delay_ms > 0) {
+                        entry.route_delay_ms = route.delay_ms;
                         return new Promise(function(resolve, reject) {
                             setTimeout(function() { doRealFetch().then(resolve, reject); }, route.delay_ms);
                         });

@@ -403,6 +403,71 @@ fn oversized_postmessage_bodies_are_bounded_and_clear_works() {
     assert_eq!(r["after"], 0, "{r}");
 }
 
+/// A `route` rule on an IPC URL controls what the page's real `invoke` gets (fetch
+/// transport): `fulfill` answers it in the page — the backend never runs — and `delay` holds
+/// it back. The log must say so, classify a mocked call the way Tauri does (resolved only on
+/// `Tauri-Response: ok`), and the evidence views must leave mocked calls out: otherwise a
+/// mocked success would "verify" a handler that does not exist.
+#[test]
+fn route_answered_ipc_is_marked_and_kept_out_of_evidence() {
+    let code = r"
+        var I = window.__TAURI_INTERNALS__;
+        var V = window.__VICTAURI__;
+        V.addRoute({ pattern: 'ipc.localhost/ghost_cmd', action: 'fulfill',
+                     body: JSON.stringify('forged'), headers: { 'Tauri-Response': 'ok' } });
+        V.addRoute({ pattern: 'ipc.localhost/greet', action: 'fulfill', body: JSON.stringify('mock error') });
+        V.addRoute({ pattern: 'ipc.localhost/add', action: 'delay', delay_ms: 30 });
+        var out = {};
+        out.ghost = await I.invoke('ghost_cmd', {});
+        try { await I.invoke('greet', { name: 'Ada' }); out.greet = 'resolved?'; } catch (e) { out.greet = e; }
+        out.add = await I.invoke('add', { a: 1, b: 2 });
+        await new Promise(function (r) { setTimeout(r, 20); });
+        function view(opts) { return V.getIpcLog(0, opts).map(function (e) { return e.command; }); }
+        return {
+            app: out,
+            backendSaw: window.__vtestBackend.fetched,
+            log: V.getIpcLog(),
+            backendOnly: view({ bodies: false, backend_only: true }),
+            unrouted: view({ bodies: false, unrouted: true }),
+            status: V.getIpcCaptureStatus(),
+        };
+    ";
+    let Some(r) = run_one("route on ipc", "{}", code) else {
+        return;
+    };
+    // The page got exactly what the rules said, and the backend saw only the delayed call.
+    assert_eq!(r["app"]["ghost"], "forged", "{r}");
+    assert_eq!(r["app"]["greet"], "mock error", "{r}");
+    assert_eq!(r["app"]["add"]["sum"], 3, "{r}");
+    let fetched = r["backendSaw"].to_string();
+    assert!(
+        !fetched.contains("ghost_cmd") && !fetched.contains("greet"),
+        "{r}"
+    );
+    assert!(fetched.contains("add"), "{r}");
+
+    let log = r["log"].as_array().expect("log array");
+    assert_eq!(log.len(), 3, "{r}");
+    let (ghost, greet, add) = (&log[0], &log[1], &log[2]);
+    assert_eq!(ghost["mocked"], true, "{r}");
+    assert_eq!(ghost["status"], "ok", "Tauri-Response: ok resolves: {r}");
+    assert!(ghost["route_rule"].is_number(), "{r}");
+    assert_eq!(greet["mocked"], true, "{r}");
+    assert_eq!(
+        greet["status"], "error",
+        "no Tauri-Response: ok means the page's invoke rejected: {r}"
+    );
+    assert!(add.get("mocked").is_none(), "{r}");
+    assert_eq!(add["route_delay_ms"], 30, "{r}");
+    assert_eq!(add["status"], "ok", "{r}");
+
+    // Evidence views: mocked calls never count; timings also drop the delayed call.
+    assert_eq!(r["backendOnly"], serde_json::json!(["add"]), "{r}");
+    assert_eq!(r["unrouted"], serde_json::json!([]), "{r}");
+    // A mocked response does not switch Tauri's transport.
+    assert_eq!(r["status"]["transport"], "fetch", "{r}");
+}
+
 #[test]
 fn a_forged_fallback_warning_reports_degraded_never_healthy() {
     let code = r"

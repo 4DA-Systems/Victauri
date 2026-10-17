@@ -64,7 +64,7 @@ pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter}\
+        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) || null; }})\
          .filter(function(x){{ return x; }})"
     )
@@ -89,7 +89,7 @@ pub fn ghost_ipc_outcomes_js(since_ms: Option<i64>) -> String {
     };
     format!(
         "return (function() {{\
-         \n  var log = (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter};\
+         \n  var log = (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter};\
          \n  var byCmd = {{}};\
          \n  for (var i = 0; i < log.length; i++) {{\
          \n    var c = log[i]; if (!c || !c.command) continue;\
@@ -264,7 +264,7 @@ pub fn ipc_timing_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter}\
+        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, unrouted: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) ? {{ command: c.command, \
          duration_ms: (typeof c.duration_ms === 'number' ? c.duration_ms : null) }} : null; }})\
          .filter(function(x){{ return x; }})"
@@ -371,7 +371,7 @@ pub fn ipc_catalog_projection_js() -> String {
             return typeof v;\
         }\
         var V = window.__VICTAURI__;\
-        var log = V && V.getIpcLog ? (V.getIpcLog(0, { bodies: false }) || []) : [];\
+        var log = V && V.getIpcLog ? (V.getIpcLog(0, { bodies: false, backend_only: true }) || []) : [];\
         var cat = Object.create(null), meta = Object.create(null);\
         for (var i = 0; i < log.length; i++){\
             var e = log[i]; if (!e || !e.command) continue;\
@@ -1112,8 +1112,8 @@ mod ghost_projection_tests {
     fn projects_whole_log_when_since_absent() {
         let js = ghost_ipc_projection_js(None);
         assert!(
-            js.contains("getIpcLog(0, { bodies: false })"),
-            "body-free view: {js}"
+            js.contains("getIpcLog(0, { bodies: false, backend_only: true })"),
+            "body-free, backend-only view: {js}"
         );
         assert!(js.contains(".map("));
         // No time window applied.
@@ -1136,6 +1136,21 @@ mod ghost_projection_tests {
     fn ignores_nonpositive_since() {
         assert!(!ghost_ipc_projection_js(Some(0)).contains("Date.now()"));
         assert!(!ghost_ipc_projection_js(Some(-10)).contains("Date.now()"));
+    }
+
+    /// A `route` rule can answer an IPC call in the page; such a call is no evidence about
+    /// the backend, so every evidence-based analysis must ask for backend-only entries
+    /// (timings also drop route-delayed calls, whose duration includes the injected delay).
+    #[test]
+    fn analyses_exclude_route_answered_calls() {
+        for js in [
+            ghost_ipc_projection_js(None),
+            super::ghost_ipc_outcomes_js(None),
+            super::ipc_catalog_projection_js(),
+        ] {
+            assert!(js.contains("backend_only: true"), "{js}");
+        }
+        assert!(super::ipc_timing_projection_js(None).contains("unrouted: true"));
     }
 }
 

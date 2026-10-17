@@ -40,7 +40,7 @@ we will correct it.
 | **IPC capture with bodies** | Yes: request args and response body, captured continuously | Yes: opt-in monitor recording command, args, result, error and duration | Not documented (it can mock the invoke API) | No: the network log records sizes, not bodies | Partial: Tauri IPC appears as network requests on Windows | Yes: a "Calls" view with arguments and return values |
 | **App-defined backend state** | Yes: `app_state` probes registered by the app | Fixed metadata (app, Tauri version, windows) | No | No | No | No (shows config, logs and spans) |
 | **Recording / replay** | Yes: event recording with checkpoints, export/import, replay of argument-free IPC commands | Not documented | No (test-runner based) | Yes: record and replay UI interactions, export to a shell script | Playwright tracing (Windows only) | Not documented |
-| **Network mocking** | `route`: block, fulfill or delay fetch/XHR. Tauri IPC is observe-only | Not documented | Mocks Tauri's invoke API | Not documented | Yes: `page.route` | No |
+| **Network mocking** | `route`: block, fulfill or delay fetch/XHR; on the fetch transport it also mocks or delays the app's real Tauri IPC (tagged in the IPC log) | Not documented | Mocks Tauri's invoke API | Not documented | Yes: `page.route` | No |
 | **IPC contract / schema-drift checks** | Yes (`introspect contract_*`, `command_catalog`) | Not documented | No | No | No | No |
 | **Default bind address** | `127.0.0.1` only (port 7373, falls back through 7383) | `0.0.0.0`, documented as being for remote-device support; `Config::localhost_only()` is available | Embedded driver: `127.0.0.1:4445` | Unix socket / Windows named pipe (no TCP) | Whatever `--remote-debugging-port` is set to | `127.0.0.1:3033` on desktop, all interfaces on mobile |
 | **Authentication** | On by default: a per-run Bearer token in an owner-only, per-user discovery directory, plus DNS-rebinding and Origin guards | None documented | None documented | Owner-only socket or pipe permissions; no separate handshake | Not documented by Playwright | None documented |
@@ -72,9 +72,11 @@ Be clear-eyed about these before you choose:
   grant `victauri:default`, because it sits below Tauri's permission layer.
 - **Native input outside Windows.** Victauri's trusted (OS-level) input is Windows-only. On
   macOS and Linux it falls back to synthetic DOM events (`isTrusted: false`).
-- **Faulting the real frontend IPC.** Victauri's `fault` tool and `route` rules do not
-  intercept the app's own `invoke()` calls; they apply to commands Victauri drives. The
-  WebdriverIO service's invoke mocking targets the frontend's own calls.
+- **Mocking the real frontend IPC on every transport.** Victauri's `route` rules mock or delay
+  the app's own `invoke()` calls only on Tauri's fetch transport (the desktop default); IPC sent
+  over postMessage (always on Android, and on desktop after a fallback) is observed but not
+  controlled, and the `fault` tool applies only to commands Victauri drives. The WebdriverIO
+  service mocks at the invoke API itself, independent of transport.
 - **A human-facing UI.** For browsing logs, tracing spans and IPC calls by eye, CrabNebula
   DevTools has a far better interface. Victauri has no GUI beyond a VS Code extension.
 

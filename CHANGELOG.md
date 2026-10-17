@@ -102,8 +102,40 @@ built on it — went silently empty.
 - Docs list what the IPC log does not capture: Rust→JS events outside `listen_events`, `Channel`
   messages, isolation-pattern args.
 
+### Fixed — `route` rules on Tauri IPC: what they do, and an honest IPC log
+
+The docs and the `route` tool description said Tauri IPC was observe-only. Measured live
+(Windows, Tauri 2.11.5), that is false on Tauri's fetch transport: a `fulfill` rule on an IPC
+URL answers the app's real `invoke` in the page — the Rust handler never runs — and `delay`
+holds the call back (1,510 ms measured for a 1,500 ms rule). Worse, the IPC log recorded a
+mocked response as a genuine backend `ok`, so a mocked success made ghost detection count a
+non-existent command as a verified handler, and `command_catalog` / `coverage` / timings
+learned shapes and latencies the backend never produced. (The old "matches but does not
+control" observation came from a page an earlier `block` had already switched to
+postMessage IPC.)
+
+- IPC log entries a rule touched are tagged: `mocked: true` + `route_rule` when a rule
+  answered the call, `route_delay_ms` when one held it back. A mocked call's `status` follows
+  Tauri's own rule — `invoke` resolves only on `Tauri-Response: ok`, otherwise it rejects — so
+  the log shows the outcome the page actually got.
+- Ghost detection, `command_catalog` and `coverage` read the log with the new `getIpcLog`
+  option `backend_only` (no mocked or blocked calls); `command_timings` uses `unrouted` (also
+  no delayed calls). `logs ipc`, `slow_ipc` and `check_ipc_integrity` still show every call.
+- `route add` returns an `ipc_note` whenever the rule can match an IPC URL (a broad pattern
+  such as `*` or `localhost` too), saying exactly what happens: `fulfill` mocks (and how to
+  make the call resolve or reject), `delay` delays, and `block` does NOT fail the call — Tauri
+  retries it over postMessage and stays there until reload.
+- The `route` tool description, tools reference, architecture and comparison pages now
+  describe this; the comparison's "where the others win" entry narrows to transport-independent
+  invoke mocking (postMessage IPC — Android, or after a fallback — is still observe-only).
+
 ### Fixed
 
+- `query_db` auto-selection on Linux picked WebKitGTK's `hsts-storage.sqlite` (which sits in
+  the app data dir next to the app's own database) over the app's database. WebKitGTK's
+  stores (`hsts-storage`, and the `localstorage`, `ResourceLoadStatistics` and `MediaKeys`
+  directories) are now treated as webview internals, and the demo app's adversarial suite
+  asserts that auto-selection picks `demo.db` on every engine (it only printed the choice).
 - The CLI README showed `victauri init ./my-tauri-app`; `init` takes `--path`.
 
 
