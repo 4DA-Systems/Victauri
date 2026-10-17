@@ -16,13 +16,23 @@ readme = "README.md"
 exclude = ["tests/"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Not `all-features`: `tauri-v3` must match the resolved `tauri` major, and docs.rs resolves Tauri 2.
+features = ["sqlite", "bundled-sqlite"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 victauri-core = { workspace = true, features = ["schema", "middleware"] }
 victauri-macros = { workspace = true }
-tauri = { workspace = true, features = ["wry"] }
+# Tauri 2 OR Tauri 3 — whichever the app itself depends on. `tauri` declares `links = "Tauri"`, so
+# a build can hold exactly one, and cargo unifies this range onto the app's own tauri (the same
+# trick as the rusqlite range below). No runtime feature (`wry`) is requested: the plugin is generic
+# over `R: Runtime`, and on Tauri 3 the runtime is chosen by the app (`Builder::runtime`), not by a
+# `tauri` feature. On Tauri 3 also enable this crate's `tauri-v3` feature (see [features]).
+#
+# The upper bound is the newest Tauri 3 pre-release this crate has been built against; widen it
+# together with the `tauri3` CI job (`NEWEST` there) — pre-releases only match a comparator that
+# names the same major.minor.patch, so `<4` alone would NOT admit `3.0.0-alpha.*`.
+tauri = { version = ">=2.0.0, <=3.0.0-alpha.5", default-features = false }
 rmcp = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
@@ -54,9 +64,17 @@ sqlite = ["dep:rusqlite"]
 # links a system SQLite or SQLCipher keeps its own with
 # `default-features = false, features = ["sqlite"]`.
 bundled-sqlite = ["sqlite", "rusqlite?/bundled"]
+# Build against Tauri 3 (the app depends on `tauri = "3"`). Selects the Tauri 3 API spellings
+# (`initialization_script`, `Manager::run_on_main_thread`, …) and the Tauri 3 permission build
+# step. Leaving it off with a Tauri 3 app (or turning it on with a Tauri 2 app) fails to compile —
+# a single build can only ever link one `tauri`.
+tauri-v3 = ["dep:tauri-plugin-v3"]
 
 [build-dependencies]
 tauri-plugin = { version = "2", features = ["build"] }
+# The Tauri 3 permission generator, used by build.rs only under `tauri-v3`. A build-dependency
+# with no `links`, so it can sit in the lockfile beside `tauri-plugin` 2.
+tauri-plugin-v3 = { package = "tauri-plugin", version = "=3.0.0-alpha.4", features = ["build"], optional = true }
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

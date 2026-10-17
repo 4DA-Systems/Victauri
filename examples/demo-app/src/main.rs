@@ -521,7 +521,13 @@ fn main() {
     let pipeline = Arc::new(PipelineState::default());
     let probe_pipeline = Arc::clone(&pipeline);
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    // Tauri 3 selects the webview runtime when the app is built instead of through a `tauri`
+    // Cargo feature. `examples/tauri3` compiles this same file against Tauri 3 and sets the cfg.
+    #[cfg(victauri_tauri3)]
+    let builder = builder.runtime(tauri_runtime_wry::Wry::default());
+
+    builder
         .plugin(
             victauri_plugin::VictauriBuilder::new()
                 .auth_disabled()

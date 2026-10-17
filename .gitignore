@@ -1,4 +1,6 @@
 /target
+# The Tauri 3 canary is its own workspace (examples/tauri3/Cargo.toml).
+/examples/tauri3/target/
 **/*.rs.bk
 *.pdb
 .env
