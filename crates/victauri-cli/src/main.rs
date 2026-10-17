@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 //! CLI for Victauri — scaffold tests, diagnose running apps, and record sessions.
 
+mod agents;
 mod bridge;
+mod jsonc;
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +29,54 @@ enum Commands {
         /// Path to the Tauri project root (default: current directory)
         #[arg(short, long)]
         path: Option<PathBuf>,
+        /// AI agent client(s) to wire up (comma-separated or repeated; default: claude).
+        /// Same as running `victauri setup <client>` afterwards.
+        #[arg(
+            long = "client",
+            value_enum,
+            value_delimiter = ',',
+            default_value = "claude"
+        )]
+        clients: Vec<agents::ClientArg>,
+        /// Allow writing user-level client config (Windsurf/Devin has no project-level config;
+        /// Codex then uses `~/.codex/config.toml` instead of the project's `.codex/config.toml`)
+        #[arg(long)]
+        user_config: bool,
+    },
+    /// Wire Victauri into AI agent clients: MCP config + agent instructions, merged into
+    /// existing files (never clobbered) and idempotent
+    #[command(after_help = "\
+Clients and the files they get (inside the project unless noted):
+  claude    .mcp.json, CLAUDE.md block, .claude/skills/victauri/SKILL.md
+  cursor    .cursor/mcp.json, AGENTS.md block
+  vscode    .vscode/mcp.json (GitHub Copilot agent mode), AGENTS.md block
+  windsurf  user-level Windsurf/Devin Desktop mcp_config.json (needs --user-config), AGENTS.md
+  codex     .codex/config.toml (Codex loads it for trusted projects), AGENTS.md block
+            with --user-config: ~/.codex/config.toml (or $CODEX_HOME) instead
+  gemini    .gemini/settings.json, AGENTS.md block, GEMINI.md block importing AGENTS.md
+  zed       .zed/settings.json (context_servers), AGENTS.md block
+  roo       .roo/mcp.json, AGENTS.md block
+  all       every client above
+
+Each client runs `victauri bridge --app <identifier>` (identifier read from tauri.conf.json).
+An existing \"victauri\" entry is never overwritten. Opt out by deleting the entry, the
+VICTAURI:BEGIN..END block, or .claude/skills/victauri/.")]
+    Setup {
+        /// Client(s) to set up
+        #[arg(value_enum, required = true, value_delimiter = ',')]
+        clients: Vec<agents::ClientArg>,
+        /// Path to the project root (default: current directory)
+        #[arg(short, long)]
+        path: Option<PathBuf>,
+        /// Allow writing user-level client config (outside the project)
+        #[arg(long)]
+        user_config: bool,
+        /// Only write MCP config — skip CLAUDE.md / AGENTS.md / skill instructions
+        #[arg(long)]
+        no_instructions: bool,
+        /// Show what would change without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Connect to a running Tauri app and report status
     Check {
@@ -145,9 +195,31 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Init { path } => {
+        Commands::Init {
+            path,
+            clients,
+            user_config,
+        } => {
             let root = path.unwrap_or_else(|| PathBuf::from("."));
-            cmd_init(&root)?;
+            cmd_init_with(&root, &agents::expand(&clients), user_config)?;
+        }
+        Commands::Setup {
+            clients,
+            path,
+            user_config,
+            no_instructions,
+            dry_run,
+        } => {
+            let root = path.unwrap_or_else(|| PathBuf::from("."));
+            cmd_setup(
+                &root,
+                &agents::Options {
+                    clients: agents::expand(&clients),
+                    user_config,
+                    instructions: !no_instructions,
+                    dry_run,
+                },
+            )?;
         }
         Commands::Check { junit, target } => {
             cmd_check(junit.as_deref(), &target).await?;
@@ -203,7 +275,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// `victauri init` with the default agent client (Claude Code), as before `--client` existed.
+#[cfg(test)]
 fn cmd_init(root: &Path) -> Result<()> {
+    cmd_init_with(root, &[agents::Client::Claude], false)
+}
+
+fn cmd_init_with(root: &Path, clients: &[agents::Client], user_config: bool) -> Result<()> {
     let root = std::fs::canonicalize(root)
         .with_context(|| format!("directory not found: {}", display_path(root)))?;
 
@@ -248,37 +326,6 @@ fn cmd_init(root: &Path) -> Result<()> {
         eprintln!("  [!] Could not auto-patch your Tauri builder.");
         eprintln!("      Add this line manually:\n");
         eprintln!("        .plugin(victauri_plugin::init())\n");
-    }
-
-    // Step 3: Create .mcp.json for AI agent connection
-    let mcp_json_path = root.join(".mcp.json");
-    ensure_inside_project(&root, &mcp_json_path)?;
-    if mcp_json_path.exists() {
-        let content = std::fs::read_to_string(&mcp_json_path).unwrap_or_default();
-        if content.contains("victauri") {
-            eprintln!("  [=] .mcp.json already configured for Victauri");
-        } else {
-            eprintln!("  [!] .mcp.json exists but doesn't reference Victauri.");
-            eprintln!("      Add this to your mcpServers (the bridge auto-discovers the port —");
-            eprintln!("      prefer it over a fixed url so agents never bind the wrong app):\n");
-            // The same `--app <identifier>` pin the generated file carries (R5B-INIT2).
-            eprintln!(
-                "        {}\n",
-                mcp_server_entry_snippet(read_app_identifier(root.as_path()).as_deref())
-            );
-        }
-    } else {
-        let app_id = read_app_identifier(root.as_path());
-        write_new_file(&mcp_json_path, &generate_mcp_json(app_id.as_deref()))?;
-        match app_id {
-            // The identifier comes from the (possibly untrusted) project's tauri.conf.json:
-            // never print its control characters raw (R4-TERM1).
-            Some(id) => eprintln!(
-                "  [+] Created .mcp.json (bridge pinned to app '{}')",
-                victauri_test::terminal::single_line(&id)
-            ),
-            None => eprintln!("  [+] Created .mcp.json (AI agent configuration)"),
-        }
     }
 
     // Step 4: Create Tauri capability for Victauri
@@ -368,27 +415,30 @@ fn cmd_init(root: &Path) -> Result<()> {
         eprintln!("  [+] Created .github/workflows/victauri.yml (CI pipeline)");
     }
 
-    // Step 7: Add Victauri section to CLAUDE.md for AI agent guidance
-    let claude_md_path = root.join("CLAUDE.md");
-    ensure_inside_project(&root, &claude_md_path)?;
-    if claude_md_path.exists() {
-        let content = std::fs::read_to_string(&claude_md_path).unwrap_or_default();
-        // Detect a prior insertion by our sentinel marker, not a loose substring —
-        // the old `contains("victauri")` check skipped any file that merely mentioned
-        // Victauri, and couldn't tell its own block apart from the user's text (audit #24).
-        if content.contains("VICTAURI:BEGIN") {
-            eprintln!("  [=] CLAUDE.md already has the Victauri block (VICTAURI markers present)");
-        } else {
-            append_to_regular_file(&claude_md_path, generate_claude_md_section())?;
-            eprintln!(
-                "  [+] Appended a Victauri block to CLAUDE.md (between <!-- VICTAURI:BEGIN --> and"
-            );
-            eprintln!("      <!-- VICTAURI:END --> markers — delete that block to opt out)");
-        }
-    } else {
-        write_new_file(&claude_md_path, generate_claude_md_section())?;
-        eprintln!("  [+] Created CLAUDE.md with Victauri agent instructions");
+    // Step 7: Wire the AI agent client(s): MCP config merged into existing files (never
+    // clobbered) + agent instructions (CLAUDE.md block / skill / AGENTS.md).
+    let app_id = read_app_identifier(root.as_path());
+    if let Some(id) = &app_id {
+        // The identifier comes from the (possibly untrusted) project's tauri.conf.json:
+        // never print its control characters raw (R4-TERM1).
+        eprintln!(
+            "  [*] Agent bridge pinned to app '{}'",
+            victauri_test::terminal::single_line(id)
+        );
     }
+    let options = agents::Options {
+        clients: clients.to_vec(),
+        user_config,
+        instructions: true,
+        dry_run: false,
+    };
+    let reports = agents::setup(
+        &root,
+        app_id.as_deref(),
+        &options,
+        &agents::UserDirs::from_env(),
+    )?;
+    agents::print_reports(&root, &reports, false);
 
     // Step 8: Print summary
     let mut remaining_steps = Vec::new();
@@ -412,6 +462,44 @@ fn cmd_init(root: &Path) -> Result<()> {
         eprintln!("  {}. {step}", i + 1);
     }
 
+    Ok(())
+}
+
+/// `victauri setup <client>…` — wire agent clients only (no Cargo/plugin/test scaffolding).
+fn cmd_setup(root: &Path, options: &agents::Options) -> Result<()> {
+    let root = std::fs::canonicalize(root)
+        .with_context(|| format!("directory not found: {}", display_path(root)))?;
+    let app_id = read_app_identifier(&root);
+    let prefix = if options.dry_run { "[dry run] " } else { "" };
+    match &app_id {
+        Some(id) => eprintln!(
+            "{prefix}Wiring Victauri into your agent client(s) — bridge pinned to app '{}'\n",
+            victauri_test::terminal::single_line(id)
+        ),
+        None => eprintln!(
+            "{prefix}Wiring Victauri into your agent client(s) — no tauri.conf.json identifier \
+             found, so the bridge is not pinned (it uses the single running app)\n"
+        ),
+    }
+    let reports = agents::setup(
+        &root,
+        app_id.as_deref(),
+        options,
+        &agents::UserDirs::from_env(),
+    )?;
+    agents::print_reports(&root, &reports, options.dry_run);
+    let skipped = reports
+        .iter()
+        .filter(|r| matches!(r.status, agents::Status::Skipped(_)))
+        .count();
+    eprintln!();
+    if skipped > 0 {
+        eprintln!("{skipped} item(s) skipped — see [!] above.");
+    }
+    eprintln!(
+        "Install the CLI on PATH if you have not: cargo install victauri-cli (the configs run \
+         `victauri bridge`). Then start your app; your agent connects even before it is up."
+    );
     Ok(())
 }
 
@@ -821,21 +909,21 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
         fail_count += 1;
     }
 
-    // Check 6: .mcp.json
-    let mcp_path = cwd.join(".mcp.json");
-    if mcp_path.exists() {
-        let content = std::fs::read_to_string(&mcp_path).unwrap_or_default();
-        if content.contains("7373") || content.contains("victauri") {
-            eprintln!("  [PASS] .mcp.json configured for Victauri");
-            pass_count += 1;
-        } else {
-            eprintln!("  [WARN] .mcp.json exists but may not reference Victauri");
-            warn_count += 1;
-        }
-    } else {
-        eprintln!("  [WARN] No .mcp.json found (needed for AI agent connection)");
-        eprintln!("         Run: victauri init");
+    // Check 6: an agent client is wired (any project-level MCP config with a victauri server)
+    let configured = agents::configured_project_clients(&cwd);
+    if configured.is_empty() {
+        eprintln!("  [WARN] No agent client configured for Victauri in this project");
+        eprintln!(
+            "         Run: victauri setup <claude|cursor|vscode|windsurf|codex|gemini|zed|roo|all>"
+        );
         warn_count += 1;
+    } else {
+        let names: Vec<&str> = configured.iter().map(|(name, _)| *name).collect();
+        eprintln!(
+            "  [PASS] Agent client(s) configured for Victauri: {}",
+            names.join(", ")
+        );
+        pass_count += 1;
     }
 
     // Check 7: Capabilities — the #1 silent integration failure.
@@ -1426,57 +1514,6 @@ fn try_patch_tauri_builder(src_dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Generate the `.mcp.json` for AI-agent connection. Uses the `victauri bridge` stdio
-/// proxy (NOT a fixed `url:`) so the agent is connected by *discovery* — the bridge resolves
-/// the live backend port at connect time and re-resolves on restart, and `--app <identifier>`
-/// guarantees it binds the RIGHT app even when several Victauri apps are running.
-///
-/// No `--wait`: the bridge answers the MCP handshake locally and connects to the app lazily,
-/// so it never blocks startup whether or not the app is running yet (`--wait` is now a no-op).
-///
-/// Built with `serde_json` (never string interpolation): the identifier comes from the
-/// project's `tauri.conf.json`, and a value containing quotes, backslashes or control
-/// characters must be escaped, not spliced into the document.
-fn generate_mcp_json(app: Option<&str>) -> String {
-    let args: Vec<&str> = match app {
-        Some(id) => vec!["bridge", "--app", id],
-        None => vec!["bridge"],
-    };
-    let doc = serde_json::json!({
-        "mcpServers": {
-            "victauri": {
-                "command": "victauri",
-                "args": args,
-            }
-        }
-    });
-    // Serializing a `Value` built from strings cannot fail; fall back defensively anyway.
-    let mut out = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| {
-        r#"{"mcpServers":{"victauri":{"command":"victauri","args":["bridge"]}}}"#.to_string()
-    });
-    out.push('\n');
-    out
-}
-
-/// The `"victauri": {…}` entry to paste into an existing `.mcp.json` — the same bridge args
-/// [`generate_mcp_json`] writes, so a hand-merged config is pinned to the app too (R5B-INIT2).
-/// Each value is JSON-encoded (the identifier is untrusted project data) and the line is
-/// printed with control characters escaped.
-fn mcp_server_entry_snippet(app: Option<&str>) -> String {
-    let mut args = vec!["bridge"];
-    if let Some(id) = app {
-        args.extend(["--app", id]);
-    }
-    let args: Vec<String> = args
-        .iter()
-        .map(|a| serde_json::Value::from(*a).to_string())
-        .collect();
-    victauri_test::terminal::single_line(&format!(
-        "\"victauri\": {{ \"command\": \"victauri\", \"args\": [{}] }}",
-        args.join(", ")
-    ))
-}
-
 /// Refuse to operate on `path` if it is a symbolic link.
 ///
 /// `victauri init` writes into a project directory that may come from an untrusted clone; a
@@ -1608,26 +1645,6 @@ fn write_new_file(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
-/// Append `contents` to an existing regular file, refusing if `path` is a symlink.
-fn append_to_regular_file(path: &Path, contents: &str) -> Result<()> {
-    refuse_symlink(path)?;
-    let meta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("failed to stat {}", display_path(path)))?;
-    if !meta.is_file() {
-        anyhow::bail!(
-            "refusing to append to {}: not a regular file",
-            display_path(path)
-        );
-    }
-    let mut file = std::fs::OpenOptions::new()
-        .append(true)
-        .open(path)
-        .with_context(|| format!("failed to append to {}", display_path(path)))?;
-    std::io::Write::write_all(&mut file, contents.as_bytes())
-        .with_context(|| format!("failed to write to {}", display_path(path)))?;
-    Ok(())
-}
-
 /// Read the Tauri bundle identifier from the project's `tauri.conf.json` so the generated
 /// `.mcp.json` can pin the bridge to this specific app (multi-app zero-config).
 fn read_app_identifier(root: &Path) -> Option<String> {
@@ -1641,107 +1658,6 @@ fn read_app_identifier(root: &Path) -> Option<String> {
         }
     }
     None
-}
-
-fn generate_claude_md_section() -> &'static str {
-    r#"
-<!-- VICTAURI:BEGIN (added by `victauri init` — delete this block to opt out) -->
-## Victauri (App Inspection & Testing)
-
-This app has **Victauri** integrated — an MCP server embedded inside the Tauri process
-that gives full-stack access to the webview DOM, IPC layer, Rust backend, and native
-windows. Available when the app is running in debug mode.
-
-**Use Victauri MCP tools for all app inspection and testing tasks.** Victauri runs inside
-the app process with direct AppHandle access (Rust-side tools answer in well under a
-millisecond; webview tools are a JS round trip) — it sees everything, not just the webview.
-
-Key Victauri tools (the read-only backend/DB introspection below has no CDP/Playwright
-equivalent — and on macOS/Linux CDP can't attach to a Tauri webview at all):
-- `invoke_command` — call any registered Tauri command directly (also records timing and
-  honours fault injection; an eval-capable tool can also reach `__TAURI_INTERNALS__.invoke`)
-- `verify_state` — cross-boundary frontend/backend state verification
-- `detect_ghost_commands` — find frontend calls absent from the introspection registry (read the `reliability` field: only a real "no backend handler" bug when the registry mirrors the app's full command set; with no/partial `#[inspectable]` it lists real, uninstrumented commands)
-- `check_ipc_integrity` — verify IPC pipeline health
-- `introspect` — command timings, IPC command catalog (real arg/result shapes), contract
-  testing, coverage, startup timing, capabilities, DB health, event bus
-- `fault` — inject faults (delay, error, drop, corrupt) into commands **driven through
-  Victauri's own `invoke_command`** — it tests a handler's error path when *you* call it; it
-  does NOT intercept the app's real frontend IPC (a user clicking the UI is unaffected)
-- `explain` — natural-language narration of what happened in the app
-- `get_memory_stats` — real OS process memory stats
-- `inspect` — `audit_accessibility` (WCAG checks), `get_performance` (navigation timing, JS
-  heap, resource loading), `get_styles`, `get_bounding_boxes`, `highlight`
-
-### Connecting reliably (read this before reaching for CDP)
-
-`.mcp.json` connects through `victauri bridge` — a stdio proxy that **discovers the running
-app's port at connect time and re-discovers on restart**, so you are never pinned to a stale
-or wrong port. Do **not** replace it with a fixed `"url": "http://127.0.0.1:7373/mcp"`: a
-hardcoded port can point at a *different* Victauri app (e.g. a leftover demo) and every call
-then fails with `422`/`404`. The bridge avoids that by design.
-
-- **The server connects even before the app is running.** The bridge answers the MCP
-  handshake itself, so `victauri` shows up connected in a fresh terminal whether or not the
-  app is up. While the app is down the tool list is a static fallback and a tool *call*
-  returns a clear "backend not reachable — start the app" error (not a hang). Start the app
-  (`npm run tauri dev` / `pnpm tauri dev`) and the bridge connects automatically — tools go
-  live with **no `/mcp` reconnect**. So if a call reports the backend unreachable, the fix is
-  to start/await the app, not to switch to CDP.
-- **First contact:** call `get_plugin_info` once and check `app.identifier` — confirm you
-  reached the intended app, not another Victauri instance.
-- **Multiple apps running?** Pin the bridge with `--app <bundle-identifier>` in `.mcp.json`
-  (`"args": ["bridge", "--app", "com.your.app"]`), or set `VICTAURI_APP`. `init` bakes this in
-  automatically when it can read your identifier.
-- **If a tool call fails after an app rebuild/restart:** the bridge re-resolves the backend
-  automatically — just retry (the transport is stateless by default, so there is usually no
-  session to lose). If the MCP path is genuinely wedged, the **sessionless
-  REST API is the fallback, NOT CDP**: `POST http://127.0.0.1:<port>/api/tools/<tool>` with
-  the app's Bearer token (same capabilities, no session). Run `victauri check` (add
-  `--app <bundle-identifier>` if several apps run) to see the endpoint; the token is the
-  `token` file in the app's `<pid>` directory under the **per-user** discovery root —
-  `$XDG_RUNTIME_DIR/victauri/` (else `/tmp/victauri-<uid>/`) on Linux/macOS,
-  `%TEMP%\victauri\` on Windows. Never take a token from a shared, world-writable directory
-  such as a bare `/tmp/victauri/`: another local user can plant entries there.
-
-### Awaiting async backend work (don't guess with sleeps)
-
-Many Tauri commands are **fire-and-forget**: they spawn background work and return
-immediately (often `null`) while the real work runs. Don't poll by hand or sprinkle fixed
-`sleep`s — use `wait_for` to await true completion:
-
-- **Pollable status (no app changes):** `wait_for` with `condition: "expression"` evaluates a
-  JS expression every poll until it is truthy (or equals `expected`). It may `await`, so you
-  can await a status command directly:
-  `wait_for { condition: "expression", value: "(await window.__TAURI_INTERNALS__.invoke('get_status')).running === false" }`.
-  Level-triggered and race-free.
-- **Completion event:** `wait_for` with `condition: "event"` blocks until a named Tauri event
-  fires, with a `since_ms` look-back so an event emitted in the gap after your `invoke_command`
-  is still caught: `wait_for { condition: "event", value: "analysis-complete" }`. (Custom events
-  must be registered via `VictauriBuilder::listen_events(&["…"])`.)
-
-The robust pattern is `invoke_command(...)` then `wait_for(expression|event, ...)` — never a bare sleep.
-
-### Reading app-specific backend state
-
-If the app registers state probes (`VictauriBuilder::probe("name", || json!({...}))`), call
-`app_state` to read domain state directly from the Rust process — no IPC round-trip, no log
-grepping. `app_state` with no args lists probe names; `app_state { probe: "name" }` returns its
-snapshot. Use this for pipeline/queue/cache internals (version, depth, stats) instead of
-reverse-engineering them from `query_db` + logs.
-
-### Driving specific code paths & mutating test state
-
-- To exercise a specific backend code path, call the relevant command via `invoke_command`
-  (with args). If the path you need isn't reachable from any command, that's an app gap — add a
-  small debug command and drive it.
-- `query_db` is intentionally **read-only**. To mutate state for a test, go through the app's
-  own commands with `invoke_command` (which respects app invariants) rather than writing the DB.
-
-Prefer Victauri over Playwright or CDP for any Tauri-app task it handles; fall back to
-Playwright only for browser-only work unrelated to this app.
-<!-- VICTAURI:END -->
-"#
 }
 
 /// Count the elements in a `dom_snapshot` result (`{tree, stale_refs, format}`).
@@ -2597,59 +2513,6 @@ mod tests {
     }
 
     #[test]
-    fn mcp_server_entry_snippet_pins_the_app_like_the_generated_file() {
-        assert_eq!(
-            mcp_server_entry_snippet(Some("com.x.app")),
-            r#""victauri": { "command": "victauri", "args": ["bridge", "--app", "com.x.app"] }"#
-        );
-        assert_eq!(
-            mcp_server_entry_snippet(None),
-            r#""victauri": { "command": "victauri", "args": ["bridge"] }"#
-        );
-        // Hostile identifier: JSON-escaped, and no raw control characters reach the terminal.
-        let s = mcp_server_entry_snippet(Some("a\"b\n::error"));
-        assert!(!s.contains('\n') && s.contains(r#"a\"b"#), "{s}");
-    }
-
-    #[test]
-    fn mcp_json_has_correct_structure() {
-        let content = generate_mcp_json(None);
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        assert_eq!(
-            parsed["mcpServers"]["victauri"]["command"]
-                .as_str()
-                .unwrap(),
-            "victauri"
-        );
-        let args = parsed["mcpServers"]["victauri"]["args"].as_array().unwrap();
-        assert!(args.iter().any(|a| a.as_str() == Some("bridge")));
-    }
-
-    #[test]
-    fn mcp_json_pins_app_identifier() {
-        let content = generate_mcp_json(Some("com.4da.app"));
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let args = parsed["mcpServers"]["victauri"]["args"].as_array().unwrap();
-        assert!(args.iter().any(|a| a.as_str() == Some("--app")));
-        assert!(args.iter().any(|a| a.as_str() == Some("com.4da.app")));
-    }
-
-    #[test]
-    fn mcp_json_escapes_hostile_identifier() {
-        // A tauri.conf.json identifier is attacker-controllable in a cloned repo. It must be
-        // escaped as ONE JSON string, never able to inject extra args or keys.
-        let hostile = "x\", \"--evil\"], \"command\": \"sh\\\n";
-        let content = generate_mcp_json(Some(hostile));
-        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
-        let server = &parsed["mcpServers"]["victauri"];
-        assert_eq!(server["command"].as_str(), Some("victauri"));
-        let args = server["args"].as_array().unwrap();
-        assert_eq!(args.len(), 3);
-        assert_eq!(args[2].as_str(), Some(hostile));
-        assert_eq!(server.as_object().unwrap().len(), 2);
-    }
-
-    #[test]
     fn write_new_file_creates_and_never_clobbers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("new.txt");
@@ -2658,16 +2521,6 @@ mod tests {
         // A second write must fail rather than overwrite.
         assert!(write_new_file(&path, "other").is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello");
-    }
-
-    #[test]
-    fn append_refuses_non_regular_file() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(append_to_regular_file(dir.path(), "x").is_err());
-        let f = dir.path().join("CLAUDE.md");
-        std::fs::write(&f, "a").unwrap();
-        append_to_regular_file(&f, "b").unwrap();
-        assert_eq!(std::fs::read_to_string(&f).unwrap(), "ab");
     }
 
     #[cfg(unix)]
@@ -2702,10 +2555,9 @@ mod tests {
         let outside = dir.path().join("outside.txt");
         std::fs::write(&outside, "original").unwrap();
 
-        // Symlink to an existing file: append must refuse and leave the target untouched.
+        // Symlink to an existing file: a create must refuse and leave the target untouched.
         let claude_md = dir.path().join("CLAUDE.md");
         std::os::unix::fs::symlink(&outside, &claude_md).unwrap();
-        assert!(append_to_regular_file(&claude_md, "INJECTED").is_err());
         assert!(write_new_file(&claude_md, "INJECTED").is_err());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original");
 
@@ -2993,7 +2845,7 @@ mod tests {
 
     #[test]
     fn claude_md_section_has_key_instructions() {
-        let content = generate_claude_md_section();
+        let content = agents::claude_md_block();
         assert!(content.contains("Victauri"));
         assert!(content.contains("invoke_command"));
         assert!(content.contains("victauri bridge"));
@@ -3160,7 +3012,7 @@ mod tests {
         // R4-DOC1: the generated block told agents the token lives at
         // `<temp>/victauri/<pid>/token` — on Unix 0.9 writes to a per-user root, and the
         // legacy shared root can be attacker-planted.
-        let content = generate_claude_md_section();
+        let content = agents::claude_md_block();
         assert!(
             !content.contains("<temp>/victauri/<pid>/token"),
             "{content}"

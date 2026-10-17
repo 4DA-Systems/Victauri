@@ -119,14 +119,37 @@ victauri test                                    # 11 built-in smoke checks
 victauri check                                   # server health + IPC diagnostics
 ```
 
-### Connect an AI agent
+### Use with your agent
+
+One command per client. Each writes (or merges into) that client's MCP config, pointing at
+`victauri bridge --app <your identifier>`, plus agent instructions telling it to prefer
+Victauri over CDP/Playwright, verify it reached the right app, and await async work with
+`wait_for`:
+
+| Client | Command | Writes |
+|---|---|---|
+| Claude Code | `victauri setup claude` (also what plain `victauri init` does) | `.mcp.json`, CLAUDE.md block, `.claude/skills/victauri/SKILL.md` |
+| Cursor | `victauri setup cursor` | `.cursor/mcp.json`, AGENTS.md block |
+| VS Code / GitHub Copilot | `victauri setup vscode` | `.vscode/mcp.json`, AGENTS.md block |
+| Windsurf / Devin Desktop | `victauri setup windsurf --user-config` | user-level `mcp_config.json` (it has no project config), AGENTS.md block |
+| OpenAI Codex | `victauri setup codex` | `.codex/config.toml` (trusted projects; `--user-config` for `~/.codex`), AGENTS.md block |
+| Gemini CLI | `victauri setup gemini` | `.gemini/settings.json`, AGENTS.md block, GEMINI.md import |
+| Zed | `victauri setup zed` | `.zed/settings.json`, AGENTS.md block |
+| Roo Code | `victauri setup roo` | `.roo/mcp.json`, AGENTS.md block |
+| All of the above | `victauri setup all` | every project-level file above |
+
+Existing configs are merged, never overwritten (comments in JSONC files survive), re-running
+changes nothing, and `--dry-run` shows what would change. See
+[how Victauri compares](docs/src/comparison.md) to other Tauri agent and test tools.
+
+### Connect an AI agent by hand
 
 Add `.mcp.json` to your project root (created automatically by `victauri init`):
 
 ```json
 {
   "mcpServers": {
-    "my-app": {
+    "victauri": {
       "command": "victauri",
       "args": ["bridge"]
     }
@@ -449,6 +472,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - [**Configuration**](docs/src/configuration.md) — Port, auth, privacy, capacity tuning
 - [**Security**](docs/src/security.md) — Threat model, privacy profiles, redaction
 - [**FAQ**](docs/src/faq.md) — Common questions and troubleshooting
+- [**Comparison**](docs/src/comparison.md) — Victauri vs other Tauri agent/test tools, where each one wins
 - [**VS Code Extension**](editors/vscode/) — Live inspection from your editor
 - [**Demo App**](examples/demo-app/) — Reference app with 21 instrumented commands
 - [**Agent Session**](examples/agent-session.md) — Real AI agent transcript
