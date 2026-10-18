@@ -94,6 +94,19 @@ use tauri::{Listener, Manager, RunEvent, Runtime};
 use tokio::sync::{Mutex, oneshot, watch};
 use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 
+// A `tauri-v3` setting that does not match the app's Tauri major otherwise fails with a bare
+// E0599 (`no method named js_init_script` / `initialization_script`). These name the fix.
+#[cfg(feature = "tauri-v3")]
+const _: () = assert!(
+    tauri::VERSION.as_bytes()[0] == b'3',
+    "victauri-plugin: the `tauri-v3` feature is on, but the app links Tauri 2 — remove `tauri-v3`"
+);
+#[cfg(not(feature = "tauri-v3"))]
+const _: () = assert!(
+    tauri::VERSION.as_bytes()[0] == b'2',
+    "victauri-plugin: the app links Tauri 3 — enable victauri-plugin's `tauri-v3` feature"
+);
+
 pub use error::BuilderError;
 pub use privacy::PrivacyProfile;
 
