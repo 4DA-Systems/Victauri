@@ -742,7 +742,9 @@ fn connect_failure_message(detail: &str) -> String {
         return format!("Could not choose a Victauri app to connect to:\n{detail}");
     }
     let lower = detail.to_lowercase();
-    let hint = if lower.contains("401") || lower.contains("unauthorized") {
+    // "HTTP 401" / "Unauthorized", never a bare "401": the detail names the port, and a port
+    // such as 40143 contains those digits.
+    let hint = if lower.contains("http 401") || lower.contains("unauthorized") {
         "Auth is ON by default. `discover()` auto-reads the per-pid discovery token, so a 401 usually \
          means a stale/old CLI that predates token discovery, or a token mismatch. Fix: update this \
          CLI (cargo install victauri-cli --force); set VICTAURI_AUTH_TOKEN to the app's token; or \
@@ -757,8 +759,9 @@ fn connect_failure_message(detail: &str) -> String {
          MCP handshake (symptom: \"no mcp-session-id header\"). Update the CLI to match the plugin:  \
          cargo install victauri-cli --force"
     } else {
-        "Is your Tauri app running? Try:  pnpm run tauri dev\n\
-         The app must have victauri-plugin wired into its builder."
+        "Is your Tauri app running (a debug build)? e.g.  npm run tauri dev  /  pnpm tauri dev\n\
+         (add --features victauri if `victauri init --optional` set it up). The app must have \
+         victauri-plugin wired into its builder."
     };
     format!("Could not connect to Victauri server: {detail}\n\n{hint}")
 }
@@ -3934,7 +3937,21 @@ mod tests {
     fn connect_failure_message_does_not_overclassify_generic_sessions() {
         let message = connect_failure_message("session expired after idle timeout");
         assert!(!message.contains("version skew"));
-        assert!(message.contains("Is your Tauri app running?"));
+        assert!(message.contains("Is your Tauri app running"));
+    }
+
+    /// A port that contains the digits 401 is not an auth failure; an HTTP 401 is.
+    #[test]
+    fn connect_failure_message_reads_401_only_as_an_http_status() {
+        let refused = connect_failure_message(
+            "connection failed (127.0.0.1:40143): error sending request: connection refused",
+        );
+        assert!(!refused.contains("Auth is ON"), "{refused}");
+        assert!(refused.contains("Is your Tauri app running"), "{refused}");
+        let auth = connect_failure_message(
+            "connection failed (127.0.0.1:7373): tool call returned HTTP 401 Unauthorized",
+        );
+        assert!(auth.contains("Auth is ON"), "{auth}");
     }
 
     #[test]
