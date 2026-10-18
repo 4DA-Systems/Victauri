@@ -34,6 +34,7 @@ use crate::{display_path, ensure_inside_project, keep_text_style, refuse_symlink
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ClientArg {
     /// Claude Code — `.mcp.json` + CLAUDE.md block + `.claude/skills/victauri/SKILL.md`
+    #[value(alias = "claude-code")]
     Claude,
     /// Cursor — `.cursor/mcp.json` + AGENTS.md block
     Cursor,
@@ -1122,13 +1123,20 @@ equivalent — and on macOS/Linux CDP can't attach to a Tauri webview at all):
 - `invoke_command` — call any registered Tauri command directly (also records timing and
   honours fault injection; an eval-capable tool can also reach `__TAURI_INTERNALS__.invoke`)
 - `verify_state` — cross-boundary frontend/backend state verification
-- `detect_ghost_commands` — find frontend calls absent from the introspection registry (read the `reliability` field: only a real "no backend handler" bug when the registry mirrors the app's full command set; with no/partial `#[inspectable]` it lists real, uninstrumented commands)
+- `detect_ghost_commands` — outcome-based: `confirmed_ghosts` (invoked, never succeeded,
+  errored "not found") are real missing handlers whatever the registry holds; `frontend_only`
+  is a weaker tier (read `reliability`); `post_message_only` calls are unproven (page script
+  can stage them)
 - `check_ipc_integrity` — verify IPC pipeline health
 - `introspect` — command timings, IPC command catalog (real arg/result shapes), contract
   testing, coverage, startup timing, capabilities, DB health, event bus
 - `fault` — inject faults (delay, error, drop, corrupt) into commands **driven through
   Victauri's own `invoke_command`** — it tests a handler's error path when *you* call it; it
   does NOT intercept the app's real frontend IPC (a user clicking the UI is unaffected)
+- `route` — to make a call the *user's* click triggers fail, slow down or return a mock, add a
+  rule on its IPC URL (`ipc.localhost/<command>`): `fulfill` answers it in the page (it
+  resolves only with the header `"Tauri-Response": "ok"`), `delay` holds it back. Fetch
+  transport only; mocked calls are tagged `mocked` in the IPC log and kept out of analyses
 - `explain` — natural-language narration of what happened in the app
 - `get_memory_stats` — real OS process memory stats
 - `inspect` — `audit_accessibility` (WCAG checks), `get_performance` (navigation timing, JS
@@ -1161,7 +1169,8 @@ then fails with `422`/`404`. The bridge avoids that by design.
   the app's Bearer token (same capabilities, no session). Run `victauri check` (add
   `--app <bundle-identifier>` if several apps run) to see the endpoint; the token is the
   `token` file in the app's `<pid>` directory under the **per-user** discovery root —
-  `$XDG_RUNTIME_DIR/victauri/` (else `/tmp/victauri-<uid>/`) on Linux/macOS,
+  `$XDG_RUNTIME_DIR/victauri/`, else `$TMPDIR/victauri-<uid>/` (`/tmp` on most Linux), else
+  `$XDG_STATE_HOME/victauri/` (`~/.local/state/victauri/`) on Linux/macOS,
   `%TEMP%\victauri\` on Windows. Never take a token from a shared, world-writable directory
   such as a bare `/tmp/victauri/`: another local user can plant entries there.
 

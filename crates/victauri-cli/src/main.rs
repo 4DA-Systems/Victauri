@@ -193,9 +193,45 @@ struct AppTarget {
 
 /// Connect to the running app `target` selects (see [`AppTarget`]).
 async fn connect(target: &AppTarget) -> Result<victauri_test::VictauriClient> {
-    victauri_test::VictauriClient::discover_app(target.app.as_deref())
+    discover_target(target)
         .await
         .map_err(|e| anyhow::anyhow!("{}", connect_failure_message(&e.to_string())))
+}
+
+/// Whether a discovery error is "several apps are running and nothing selects one".
+fn is_ambiguous_app(err: &str) -> bool {
+    err.contains("Multiple Victauri apps are running")
+}
+
+/// [`victauri_test::VictauriClient::discover_app`] for `target`. When several Victauri apps
+/// are running and neither `--app` nor `VICTAURI_APP` picks one, the app of the Tauri
+/// project in the current directory (its `tauri.conf.json` identifier — the pin `init` /
+/// `setup` write into the agent configs) is used, and that is said.
+async fn discover_target(
+    target: &AppTarget,
+) -> std::result::Result<victauri_test::VictauriClient, victauri_test::TestError> {
+    let first = victauri_test::VictauriClient::discover_app(target.app.as_deref()).await;
+    match first {
+        Err(e)
+            if target.app.is_none()
+                && std::env::var("VICTAURI_APP").map_or(true, |a| a.trim().is_empty())
+                && is_ambiguous_app(&e.to_string()) =>
+        {
+            let Some(id) = std::env::current_dir()
+                .ok()
+                .and_then(|dir| read_app_identifier(&dir))
+            else {
+                return Err(e);
+            };
+            eprintln!(
+                "Several Victauri apps are running; using this project's app '{}' \
+                 (pass --app to choose another).",
+                victauri_test::terminal::single_line(&id)
+            );
+            victauri_test::VictauriClient::discover_app(Some(&id)).await
+        }
+        other => other,
+    }
 }
 
 #[tokio::main]
@@ -1154,7 +1190,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     // Check 9: Server connectivity
     eprintln!();
     eprintln!("  Checking server connectivity...");
-    match victauri_test::VictauriClient::discover_app(target.app.as_deref()).await {
+    match discover_target(target).await {
         Ok(mut client) => {
             eprintln!("  [PASS] Connected to Victauri server");
             pass_count += 1;
@@ -1228,6 +1264,12 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
                 eprintln!("  [FAIL] IPC integrity check failed");
                 fail_count += 1;
             }
+        }
+        Err(err) if is_ambiguous_app(&err.to_string()) => {
+            // Servers ARE running — "not running" would send the user the wrong way.
+            eprintln!("  [WARN] Several Victauri apps are running and none was selected");
+            eprintln!("         {err}");
+            warn_count += 1;
         }
         Err(err) => {
             // discover() enriches the connection error with a discovery diagnosis
