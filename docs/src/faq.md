@@ -151,7 +151,7 @@ The JS bridge may not have loaded yet. This can happen if:
 
 ### IPC log is empty
 
-IPC logging works by intercepting `fetch()` calls to Tauri's IPC URLs — `http://ipc.localhost/` on Windows (WebView2), `ipc://localhost/` on macOS (WKWebView) and Linux (WebKitGTK) — and, when Tauri falls back to `window.ipc.postMessage` (always on Android; on desktop after a custom-protocol failure), by observing the IPC message and its response callback. If your IPC log is empty:
+IPC logging works by intercepting `fetch()` calls to Tauri's IPC URLs — `http://ipc.localhost/` on Windows (WebView2; `https://ipc.localhost/` with `useHttpsScheme`), `ipc://localhost/` on macOS (WKWebView) and Linux (WebKitGTK) — and, when Tauri falls back to `window.ipc.postMessage` (always on Android; on desktop after a custom-protocol failure), by observing the IPC message and its response callback. If your IPC log is empty:
 - Run `get_diagnostics` and read `info.ipc_capture`: `capture` other than `full` means part of the IPC traffic cannot be seen, and the `note` says which part
 - Verify the app has actually made IPC calls (check network tab in dev tools)
 - The bridge's fetch interceptor must load before the first IPC call

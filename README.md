@@ -48,8 +48,8 @@ That same server also speaks [MCP](https://modelcontextprotocol.io), so any AI a
 
 Victauri is a **development-time dependency you add to your own app's source and rebuild** (a normal `[dependencies]` entry — not `[dev-dependencies]`, which the app binary cannot use) — not a tool you attach to an already-running or shipped app. It works when **all four** hold:
 
-1. **Tauri 2.** Tauri 1.x apps can't host it — their `webkit2gtk-sys 0.18` and Victauri's `2.x` both link the native `web_kit2` library, an unresolvable cargo conflict. (Tauri 2 is the current major; Tauri 1 is legacy.)
-2. **Built from source** with the plugin wired in — one line in `Cargo.toml`, `.plugin(victauri_plugin::init())`, and a `victauri:default` capability. There is no inject-into-a-foreign-binary path.
+1. **Tauri 2, or a Tauri 3 pre-release** (turn on `victauri-plugin`'s `tauri-v3` feature — see the [plugin README](crates/victauri-plugin/README.md#tauri-3-pre-release)). Tauri 1.x apps can't host it — their `webkit2gtk-sys 0.18` and Victauri's `2.x` both link the native `web_kit2` library, an unresolvable cargo conflict. (Tauri 2 is the current major; Tauri 1 is legacy.)
+2. **Built from source** with the plugin wired in — one line in `Cargo.toml`, `.plugin(victauri_plugin::init())`, and the `victauri:default` permission (a capability file, or the runtime grant `victauri init --optional` generates). There is no inject-into-a-foreign-binary path.
 3. **A debug build.** The server is `#[cfg(debug_assertions)]`-gated, so `init()` is a no-op and nothing listens in release. It's a dev/test-time tool by design.
 4. **Each window grants `victauri:default`.** Tauri's per-window permission ACL silently blinds the bridge without it; the `window introspectability` tool detects and explains this.
 
@@ -57,8 +57,8 @@ Victauri is a **development-time dependency you add to your own app's source and
 
 | ✅ Works on | ❌ Won't work on |
 |---|---|
-| Your own Tauri 2 app during development | Tauri 1.x apps |
-| Any Tauri 2 app you can build from source (debug) | Release / production builds |
+| Your own Tauri 2 (or Tauri 3 pre-release) app during development | Tauri 1.x apps |
+| Any Tauri 2/3 app you can build from source (debug) | Release / production builds |
 | Any frontend framework, any of the 3 OSes | A binary you didn't build (no source) |
 | | Non-Tauri apps (Electron, native, plain web) |
 
@@ -81,9 +81,9 @@ victauri init
 ```
 
 This will:
-- Add `victauri-plugin` and `victauri-test` to your `Cargo.toml`
+- Add `victauri-plugin` and `victauri-core` (dev: `victauri-test`, `tokio`) to your `Cargo.toml`
 - Add `.plugin(victauri_plugin::init())` to your Tauri builder when it finds one
-- Create `capabilities/victauri.json` (grants `victauri:default`), `.mcp.json`, starter tests in `tests/`, a CI workflow, and a CLAUDE.md block
+- Create `capabilities/victauri.json` (grants `victauri:default`), `.mcp.json`, starter tests in `tests/`, a CI workflow, a CLAUDE.md block and a Claude Code skill (`.claude/skills/victauri/SKILL.md`)
 - Print any steps it could not do itself
 
 ### Wire the plugin
@@ -116,7 +116,7 @@ Start your app, then run the smoke suite:
 
 ```bash
 npm run tauri dev                                # start your app (or pnpm/yarn/bun tauri dev)
-VICTAURI_E2E=1 cargo test --test smoke           # run tests, in a second terminal
+cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke   # in a second terminal (the tests live in src-tauri/tests)
 ```
 
 On Windows the running app locks its `.exe`, and `cargo test` rebuilds it, so give the test run its own target directory: `CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke`.
@@ -140,10 +140,10 @@ Victauri over CDP/Playwright, verify it reached the right app, and await async w
 | Claude Code | `victauri setup claude` (also what plain `victauri init` does) | `.mcp.json`, CLAUDE.md block, `.claude/skills/victauri/SKILL.md` |
 | Cursor | `victauri setup cursor` | `.cursor/mcp.json`, AGENTS.md block |
 | VS Code / GitHub Copilot | `victauri setup vscode` | `.vscode/mcp.json`, AGENTS.md block |
-| Windsurf / Devin Desktop | `victauri setup windsurf --user-config` | user-level `mcp_config.json` (it has no project config), AGENTS.md block |
+| Windsurf / Devin Desktop | `victauri setup windsurf --user-config` | user-level `mcp_config.json` (the only config it documents), AGENTS.md block |
 | OpenAI Codex | `victauri setup codex` | `.codex/config.toml` (trusted projects; `--user-config` for `~/.codex`), AGENTS.md block |
 | Gemini CLI | `victauri setup gemini` | `.gemini/settings.json`, AGENTS.md block, GEMINI.md import |
-| Zed | `victauri setup zed` | `.zed/settings.json`, AGENTS.md block |
+| Zed | `victauri setup zed` | `.zed/settings.json`, AGENTS.md block (Zed reads only the first rules file it finds — a `.rules` / `.cursorrules` hides AGENTS.md) |
 | Roo Code | `victauri setup roo` | `.roo/mcp.json`, AGENTS.md block |
 | All of the above | `victauri setup all` | every project-level file above |
 
@@ -446,7 +446,7 @@ Use the built-in composite action to run Victauri smoke tests in CI:
     xvfb-run -a ./target/debug/my-app &
     sleep 3
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.9.0
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.0
   with:
     max-load-ms: 10000
     max-heap-mb: 512
@@ -496,7 +496,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - **No production use** — debug builds only, by design
 - **No remote access** — localhost only, no port forwarding
 - **Same-origin frames only** — same-origin iframes are traversed; cross-origin frames are marked and skipped
-- **No live frontend-IPC control** — `fault` injection applies to commands driven through Victauri's own `invoke_command`, not the app's real frontend IPC (that path sits below the layer the JS bridge can reach without CDP)
+- **Frontend-IPC control is fetch-transport only** — `fault` injection applies to commands driven through Victauri's own `invoke_command`; to change what the app's real `invoke` gets, a `route` rule mocks or delays it on Tauri's fetch transport (the desktop default), but not over postMessage (Android, or after a fallback)
 - **Not every webview↔Rust message is in the IPC log** — command calls are captured on both of Tauri's transports (custom-protocol fetch and the `postMessage` fallback; `get_diagnostics` reports which is in use and whether capture is complete), but Rust→JS events outside `listen_events`, `Channel` messages, and isolation-pattern args are not. See [Architecture → IPC Layer](docs/src/architecture.md#ipc-layer)
 - **Pre-1.0** — API may change (semver-checked in CI)
 

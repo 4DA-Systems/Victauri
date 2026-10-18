@@ -16,7 +16,8 @@ readme = "README.md"
 exclude = ["tests/"]
 
 [package.metadata.docs.rs]
-# Not `all-features`: `tauri-v3` must match the resolved `tauri` major, and docs.rs resolves Tauri 2.
+# Not `all-features`: `tauri-v3` must match the resolved `tauri` major. docs.rs builds with the
+# Cargo.lock packaged in the crate (it only regenerates an invalid one), which pins Tauri 2.
 features = ["sqlite", "bundled-sqlite"]
 rustdoc-args = ["--cfg", "docsrs"]
 
@@ -28,6 +29,8 @@ victauri-macros = { workspace = true }
 # trick as the rusqlite range below). No runtime feature (`wry`) is requested: the plugin is generic
 # over `R: Runtime`, and on Tauri 3 the runtime is chosen by the app (`Builder::runtime`), not by a
 # `tauri` feature. On Tauri 3 also enable this crate's `tauri-v3` feature (see [features]).
+# A crate depending on this one without a `tauri` dependency of its own gets the newest version
+# the range admits — a Tauri 3 pre-release — so always depend on `tauri` directly (apps do).
 #
 # The upper bound is the newest Tauri 3 pre-release this crate has been built against; widen it
 # together with the `tauri3` CI job (`NEWEST` there) — pre-releases only match a comparator that
@@ -49,10 +52,10 @@ base64 = "0.22"
 regex = "1"
 url = { workspace = true }
 flate2 = "1"
-tower = { version = "0.5", features = ["limit"] }
+tower = { version = "0.5.3", features = ["limit"] }
 # Serve loop with a header-read timer and a connection cap (axum::serve sets neither).
-hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1"] }
+hyper = { version = "1.9", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["server-auto", "tokio", "service", "http1"] }
 rusqlite = { workspace = true, optional = true }
 
 [features]
@@ -64,10 +67,11 @@ sqlite = ["dep:rusqlite"]
 # links a system SQLite or SQLCipher keeps its own with
 # `default-features = false, features = ["sqlite"]`.
 bundled-sqlite = ["sqlite", "rusqlite?/bundled"]
-# Build against Tauri 3 (the app depends on `tauri = "3"`). Selects the Tauri 3 API spellings
-# (`initialization_script`, `Manager::run_on_main_thread`, …) and the Tauri 3 permission build
-# step. Leaving it off with a Tauri 3 app (or turning it on with a Tauri 2 app) fails to compile —
-# a single build can only ever link one `tauri`.
+# Build against Tauri 3 (the app depends on `tauri = "3"`). Selects Tauri 3's
+# `initialization_script` (renamed from `js_init_script`) and the Tauri 3 permission build step;
+# the rest of the code compiles unchanged on both majors. Leaving it off with a Tauri 3 app (or
+# turning it on with a Tauri 2 app) fails to build, with a message naming the fix — a single
+# build can only ever link one `tauri`.
 tauri-v3 = ["dep:tauri-plugin-v3"]
 
 [build-dependencies]
@@ -79,7 +83,7 @@ tauri-plugin-v3 = { package = "tauri-plugin", version = "=3.0.0-alpha.4", featur
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 uuid = { workspace = true }
-tower = { version = "0.5", features = ["util"] }
+tower = { version = "0.5.3", features = ["util"] }
 http-body-util = "0.1"
 tempfile = "3"
 proptest = "1"

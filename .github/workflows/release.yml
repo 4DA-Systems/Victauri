@@ -67,7 +67,10 @@ jobs:
           - binary: victauri-cli
             bin-name: victauri
             target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            # Pinned: the binary's minimum glibc is the runner's (24.04 → GLIBC_2.39, as
+            # 0.9.0 shipped). `ubuntu-latest` moving to a newer image would silently drop
+            # every distro older than it. Older distros: `cargo install victauri-cli`.
+            os: ubuntu-24.04
             asset-name: victauri-cli-linux-x86_64
             use-cross: false
           - binary: victauri-cli
@@ -93,7 +96,10 @@ jobs:
           - binary: victauri-watchdog
             bin-name: victauri-watchdog
             target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            # Pinned: the binary's minimum glibc is the runner's (24.04 → GLIBC_2.39, as
+            # 0.9.0 shipped). `ubuntu-latest` moving to a newer image would silently drop
+            # every distro older than it. Older distros: `cargo install victauri-cli`.
+            os: ubuntu-24.04
             asset-name: victauri-watchdog-linux-x86_64
             use-cross: false
           - binary: victauri-watchdog

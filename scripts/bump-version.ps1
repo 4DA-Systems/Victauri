@@ -1,4 +1,5 @@
 #!/usr/bin/env pwsh
+#Requires -Version 7
 # bump-version.ps1 — Bumps all version references across the Victauri workspace.
 #
 # Usage:
@@ -128,7 +129,7 @@ Update-File ".github\actions\victauri-test\action.yml" "default: `"$OldVersion`"
 #   - `victauri-test@vX.Y.Z` GitHub Action refs -> new full version
 $newMajorMinor = ($NewVersion -split '\.')[0..1] -join '.'
 $pinDocs = @('README.md', 'docs\src\getting-started.md', 'docs\src\testing.md',
-    'docs\src\testing-tauri-apps.md', 'crates\victauri-plugin\README.md',
+    'docs\src\testing-tauri-apps.md', 'docs\src\configuration.md', 'crates\victauri-plugin\README.md',
     'crates\victauri-test\README.md', 'crates\victauri-macros\README.md')
 $actionDocs = @('README.md', 'docs\src\testing.md', 'docs\src\testing-tauri-apps.md')
 $installPin = '(victauri-(?:core|macros|plugin|test)\s*=\s*(?:\{\s*version\s*=\s*)?")\d+\.\d+(")'
@@ -174,6 +175,15 @@ if (-not $DryRun) {
     } finally {
         Pop-Location
     }
+    # examples/tauri3 is its own workspace (Tauri 3 cannot share the root lockfile) and CI builds
+    # it with --locked, so its path-dependency versions must follow the bump too.
+    Write-Host "Updating examples\tauri3\Cargo.lock..." -ForegroundColor Cyan
+    Push-Location (Join-Path $root "examples\tauri3")
+    try {
+        cargo update -p victauri-plugin -p victauri-core -p victauri-macros --offline 2>&1 | Select-Object -Last 1
+    } finally {
+        Pop-Location
+    }
 }
 
 Write-Host "`n--- Version bump complete: $OldVersion -> $NewVersion ---" -ForegroundColor Cyan
@@ -188,6 +198,7 @@ Remaining manual steps:
   1. Update CHANGELOG.md with release notes
   2. Update MIGRATION.md if there are breaking/behavior changes
   3. Update CLAUDE.md Current State date and new feature descriptions
+  3b. Update SECURITY.md's supported-versions table (new minor: Yes; previous: security fixes only)
   4. Run: cargo test --workspace
   5. Run: cargo clippy --workspace --all-targets
   6. Commit, push, publish: cargo publish -p <crate> for each crate

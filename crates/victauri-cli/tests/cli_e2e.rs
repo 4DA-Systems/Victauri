@@ -219,8 +219,12 @@ async fn two_running_apps_are_named_and_selectable_with_app() {
         err.contains("--app") && err.contains("VICTAURI_APP"),
         "{err}"
     );
+    // The ports are random: one such as 40143 contains "401", so they are removed first.
+    let advice = err
+        .replace(&port_a.to_string(), "<port>")
+        .replace(&port_b.to_string(), "<port>");
     assert!(
-        !err.contains("Is your Tauri app running") && !err.contains("401"),
+        !advice.contains("Is your Tauri app running") && !advice.contains("401"),
         "no misleading connection advice:\n{err}"
     );
 

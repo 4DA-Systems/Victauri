@@ -1247,7 +1247,8 @@ async fn discover_and_select(wait: bool, app: Option<&str>) -> Result<ServerInfo
             Selection::None => {
                 bail!(
                     "Could not connect to Victauri server.\n\
-                     Is your Tauri app running (debug build)? Start it with: pnpm run tauri dev"
+                     Is your Tauri app running (debug build)? Start it with e.g. \
+                     `npm run tauri dev` / `pnpm tauri dev`"
                 );
             }
             Selection::Ambiguous(labels) => {

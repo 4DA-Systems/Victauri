@@ -24,7 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scaffold a Victauri test directory with starter tests
+    /// Set up Victauri in a Tauri project: dependencies, plugin wiring, capability, starter
+    /// tests, CI workflow and agent-client config
     Init {
         /// Path to the Tauri project root (default: current directory)
         #[arg(short, long)]
@@ -192,9 +193,45 @@ struct AppTarget {
 
 /// Connect to the running app `target` selects (see [`AppTarget`]).
 async fn connect(target: &AppTarget) -> Result<victauri_test::VictauriClient> {
-    victauri_test::VictauriClient::discover_app(target.app.as_deref())
+    discover_target(target)
         .await
         .map_err(|e| anyhow::anyhow!("{}", connect_failure_message(&e.to_string())))
+}
+
+/// Whether a discovery error is "several apps are running and nothing selects one".
+fn is_ambiguous_app(err: &str) -> bool {
+    err.contains("Multiple Victauri apps are running")
+}
+
+/// [`victauri_test::VictauriClient::discover_app`] for `target`. When several Victauri apps
+/// are running and neither `--app` nor `VICTAURI_APP` picks one, the app of the Tauri
+/// project in the current directory (its `tauri.conf.json` identifier — the pin `init` /
+/// `setup` write into the agent configs) is used, and that is said.
+async fn discover_target(
+    target: &AppTarget,
+) -> std::result::Result<victauri_test::VictauriClient, victauri_test::TestError> {
+    let first = victauri_test::VictauriClient::discover_app(target.app.as_deref()).await;
+    match first {
+        Err(e)
+            if target.app.is_none()
+                && std::env::var("VICTAURI_APP").map_or(true, |a| a.trim().is_empty())
+                && is_ambiguous_app(&e.to_string()) =>
+        {
+            let Some(id) = std::env::current_dir()
+                .ok()
+                .and_then(|dir| read_app_identifier(&dir))
+            else {
+                return Err(e);
+            };
+            eprintln!(
+                "Several Victauri apps are running; using this project's app '{}' \
+                 (pass --app to choose another).",
+                victauri_test::terminal::single_line(&id)
+            );
+            victauri_test::VictauriClient::discover_app(Some(&id)).await
+        }
+        other => other,
+    }
 }
 
 #[tokio::main]
@@ -227,7 +264,7 @@ async fn main() -> Result<()> {
                     instructions: !no_instructions,
                     dry_run,
                     // Detected from Cargo.toml in `cmd_setup`.
-                    feature_gated: false,
+                    feature: None,
                 },
             )?;
         }
@@ -316,6 +353,32 @@ fn cmd_init_with(
     // (R4-FS1): a cloned repo whose `src-tauri`, `src`, `capabilities`, `tests` or `.github`
     // is a symlink would otherwise redirect these writes into another project.
     ensure_inside_project(&root, &cargo_toml_path)?;
+    // ...and all of them are checked BEFORE the first write: a refused path found half-way
+    // (say a junctioned `.claude`) would otherwise leave a half-initialized project.
+    let crate_dir = cargo_toml_path.parent().unwrap_or(&root).to_path_buf();
+    let tests_dir_planned =
+        find_src_tauri(&root).map_or_else(|| root.join("tests"), |p| p.join("tests"));
+    for planned in [
+        crate_dir.join("src").join("main.rs"),
+        crate_dir.join("src").join("lib.rs"),
+        crate_dir.join("capabilities").join("victauri.json"),
+        tests_dir_planned.join("smoke.rs"),
+        tests_dir_planned.join("integration.rs"),
+        root.join(".github").join("workflows").join("victauri.yml"),
+    ] {
+        ensure_inside_project(&root, &planned)?;
+    }
+    agents::preflight(
+        &root,
+        &agents::Options {
+            clients: clients.to_vec(),
+            user_config,
+            instructions: true,
+            dry_run: false,
+            feature: None,
+        },
+        &agents::UserDirs::from_env(),
+    )?;
 
     // Step 1: Add dependencies to Cargo.toml
     let deps = add_dependencies(&cargo_toml_path, optional)?;
@@ -346,10 +409,15 @@ fn cmd_init_with(
     // an ordinary dependency alone (so the app is NOT gated, and still needs a capability
     // file), and a plain `init` on an app that was set up with `--optional` must keep it gated
     // (a capability file naming `victauri:default` would break every build without the feature).
-    let gated = project_is_feature_gated(&root);
-    if gated && !optional {
+    // The feature named is the one that really enables the plugin — `victauri` from
+    // `--optional`, or the app's own (`devtools = ["dep:victauri-plugin"]`).
+    let feature = project_victauri_feature(&root);
+    if let Some(f) = &feature
+        && !optional
+    {
         eprintln!(
-            "  [=] victauri-plugin is an optional dependency: keeping the feature-gated setup"
+            "  [=] victauri-plugin is an optional dependency (feature `{f}`): keeping the \
+             feature-gated setup"
         );
     }
 
@@ -361,15 +429,15 @@ fn cmd_init_with(
     let mut patched = false;
     if src_dir.exists() {
         ensure_inside_project(&root, &src_dir.join("main.rs"))?;
-        patched = try_patch_tauri_builder(&src_dir, gated)?;
+        patched = try_patch_tauri_builder(&src_dir, feature.as_deref())?;
     }
     if !patched {
         eprintln!("  [!] Could not auto-patch your Tauri builder.");
-        if gated {
+        if let Some(f) = &feature {
             eprintln!(
                 "      Wrap your builder as `with_victauri(tauri::Builder::default())` and add:\n"
             );
-            eprintln!("{}", indent_block(optional_wiring_snippet()));
+            eprintln!("{}", indent_block(&optional_wiring_snippet(f)));
         } else {
             eprintln!("      Add this line manually:\n");
             eprintln!("        .plugin(victauri_plugin::init())\n");
@@ -378,7 +446,7 @@ fn cmd_init_with(
 
     // Step 4: Create Tauri capability for Victauri
     let capabilities_dir = find_capabilities_dir(&cargo_toml_path);
-    if gated {
+    if let Some(f) = &feature {
         // A static capability naming `victauri:default` makes every build WITHOUT the feature
         // fail (Tauri rejects a permission of a plugin that is not in the build), so the
         // feature-gated wiring grants it at runtime instead — see `optional_wiring_snippet`.
@@ -391,7 +459,7 @@ fn cmd_init_with(
             eprintln!(
                 "  [!] A capability file under capabilities/ grants 'victauri:default': a build"
             );
-            eprintln!("      without the `victauri` feature will fail to resolve it. Remove that");
+            eprintln!("      without the `{f}` feature will fail to resolve it. Remove that");
             eprintln!("      permission (the generated wiring grants it when the feature is on).");
         }
     } else if let Some(caps_dir) = capabilities_dir {
@@ -475,7 +543,10 @@ fn cmd_init_with(
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .filter(|p| !p.is_empty())
             .unwrap_or_else(|| ".".to_string());
-        write_new_file(&ci_path, &generate_ci_workflow(&app_dir, gated))?;
+        write_new_file(
+            &ci_path,
+            &generate_ci_workflow(&app_dir, feature.as_deref()),
+        )?;
         eprintln!("  [+] Created .github/workflows/victauri.yml (CI pipeline)");
     }
 
@@ -495,7 +566,7 @@ fn cmd_init_with(
         user_config,
         instructions: true,
         dry_run: false,
-        feature_gated: gated,
+        feature: feature.clone(),
     };
     let reports = agents::setup(
         &root,
@@ -508,17 +579,17 @@ fn cmd_init_with(
     // Step 8: Print summary
     let mut remaining_steps = Vec::new();
     if !patched {
-        remaining_steps.push(if gated {
+        remaining_steps.push(if feature.is_some() {
             "Wire `with_victauri(...)` into your Tauri builder (snippet above)".to_string()
         } else {
             "Add .plugin(victauri_plugin::init()) to your Tauri builder".to_string()
         });
     }
-    if gated {
+    if let Some(f) = &feature {
         let dev = tauri_dev_command(&root);
         remaining_steps.push(format!(
             "Start your app WITH the feature:  {}",
-            with_victauri_feature(dev)
+            with_victauri_feature(dev, f)
         ));
         remaining_steps.push(format!(
             "Release builds (`{}`) leave the feature off: no Victauri code at all",
@@ -562,7 +633,10 @@ fn cmd_setup(root: &Path, options: &agents::Options) -> Result<()> {
         ),
     }
     let options = agents::Options {
-        feature_gated: options.feature_gated || project_is_feature_gated(&root),
+        feature: options
+            .feature
+            .clone()
+            .or_else(|| project_victauri_feature(&root)),
         ..options.clone()
     };
     let reports = agents::setup(
@@ -572,18 +646,37 @@ fn cmd_setup(root: &Path, options: &agents::Options) -> Result<()> {
         &agents::UserDirs::from_env(),
     )?;
     agents::print_reports(&root, &reports, options.dry_run);
-    let skipped = reports
+    let attention = reports
         .iter()
-        .filter(|r| matches!(r.status, agents::Status::Skipped(_)))
+        .filter(|r| {
+            matches!(
+                r.status,
+                agents::Status::Skipped(_) | agents::Status::Unexpected(_)
+            )
+        })
         .count();
     eprintln!();
-    if skipped > 0 {
-        eprintln!("{skipped} item(s) skipped — see [!] above.");
+    if attention > 0 {
+        eprintln!("{attention} item(s) need attention — see [!] above.");
     }
     eprintln!(
         "Install the CLI on PATH if you have not: cargo install victauri-cli (the configs run \
          `victauri bridge`). Then start your app; your agent connects even before it is up."
     );
+    // A `victauri` entry that does not run the bridge is never overwritten, so the client is
+    // NOT wired: fail, so a script or CI step running `setup` cannot read it as success.
+    let foreign = reports
+        .iter()
+        .filter(|r| matches!(r.status, agents::Status::Unexpected(_)))
+        .count();
+    if foreign > 0 && !options.dry_run {
+        bail!(
+            "{foreign} existing `victauri` server entr{} not run the Victauri bridge (kept as is \
+             — see [!] above); remove or fix {} and run setup again",
+            if foreign == 1 { "y does" } else { "ies do" },
+            if foreign == 1 { "it" } else { "them" }
+        );
+    }
     Ok(())
 }
 
@@ -649,7 +742,9 @@ fn connect_failure_message(detail: &str) -> String {
         return format!("Could not choose a Victauri app to connect to:\n{detail}");
     }
     let lower = detail.to_lowercase();
-    let hint = if lower.contains("401") || lower.contains("unauthorized") {
+    // "HTTP 401" / "Unauthorized", never a bare "401": the detail names the port, and a port
+    // such as 40143 contains those digits.
+    let hint = if lower.contains("http 401") || lower.contains("unauthorized") {
         "Auth is ON by default. `discover()` auto-reads the per-pid discovery token, so a 401 usually \
          means a stale/old CLI that predates token discovery, or a token mismatch. Fix: update this \
          CLI (cargo install victauri-cli --force); set VICTAURI_AUTH_TOKEN to the app's token; or \
@@ -664,8 +759,9 @@ fn connect_failure_message(detail: &str) -> String {
          MCP handshake (symptom: \"no mcp-session-id header\"). Update the CLI to match the plugin:  \
          cargo install victauri-cli --force"
     } else {
-        "Is your Tauri app running? Try:  pnpm run tauri dev\n\
-         The app must have victauri-plugin wired into its builder."
+        "Is your Tauri app running (a debug build)? e.g.  npm run tauri dev  /  pnpm tauri dev\n\
+         (add --features victauri if `victauri init --optional` set it up). The app must have \
+         victauri-plugin wired into its builder."
     };
     format!("Could not connect to Victauri server: {detail}\n\n{hint}")
 }
@@ -950,7 +1046,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
 
     // Check 3: Victauri plugin dependency
     let cargo_content = std::fs::read_to_string(&cargo_path).unwrap_or_default();
-    if cargo_content.contains("victauri-plugin") {
+    if manifest_has_dependency(&cargo_content, "victauri-plugin") {
         eprintln!("  [PASS] victauri-plugin dependency present");
         pass_count += 1;
     } else {
@@ -960,7 +1056,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     }
 
     // Check 4: Victauri test dependency
-    if cargo_content.contains("victauri-test") {
+    if manifest_has_dependency(&cargo_content, "victauri-test") {
         eprintln!("  [PASS] victauri-test dependency present");
         pass_count += 1;
     } else {
@@ -981,9 +1077,10 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     for filename in ["lib.rs", "main.rs"] {
         let path = src_dir.join(filename);
         if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            runtime_grant |= grants_victauri_at_runtime(&content);
-            if content.contains("victauri_plugin") {
+            // Code only: a commented-out `.plugin(victauri_plugin::init())` is not wiring.
+            let source = std::fs::read_to_string(&path).unwrap_or_default();
+            runtime_grant |= grants_victauri_at_runtime(&source);
+            if rust_code_only(&source).contains("victauri_plugin") {
                 eprintln!("  [PASS] Plugin wired in {filename}");
                 plugin_wired = true;
                 pass_count += 1;
@@ -1006,12 +1103,30 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
         );
         warn_count += 1;
     } else {
-        let names: Vec<&str> = configured.iter().map(|(name, _)| *name).collect();
-        eprintln!(
-            "  [PASS] Agent client(s) configured for Victauri: {}",
-            names.join(", ")
-        );
-        pass_count += 1;
+        // A `victauri` entry that runs something other than `victauri bridge` is not "wired"
+        // — it may be a stale hand edit, or a cloned repo's command under a trusted name.
+        let (good, odd): (Vec<_>, Vec<_>) = configured.iter().partition(|c| c.unexpected.is_none());
+        if !good.is_empty() {
+            let names: Vec<&str> = good.iter().map(|c| c.label).collect();
+            eprintln!(
+                "  [PASS] Agent client(s) configured for Victauri: {}",
+                names.join(", ")
+            );
+            pass_count += 1;
+        }
+        for c in odd {
+            eprintln!(
+                "  [WARN] {} has a \"victauri\" MCP server that does NOT run `victauri bridge`",
+                c.label
+            );
+            eprintln!(
+                "         {} runs: {}",
+                display_path(&c.path),
+                c.unexpected.as_deref().unwrap_or_default()
+            );
+            eprintln!("         Check it is yours, or replace it with `victauri bridge`.");
+            warn_count += 1;
+        }
     }
 
     // Check 7: Capabilities — the #1 silent integration failure.
@@ -1078,7 +1193,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     // Check 9: Server connectivity
     eprintln!();
     eprintln!("  Checking server connectivity...");
-    match victauri_test::VictauriClient::discover_app(target.app.as_deref()).await {
+    match discover_target(target).await {
         Ok(mut client) => {
             eprintln!("  [PASS] Connected to Victauri server");
             pass_count += 1;
@@ -1152,6 +1267,12 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
                 eprintln!("  [FAIL] IPC integrity check failed");
                 fail_count += 1;
             }
+        }
+        Err(err) if is_ambiguous_app(&err.to_string()) => {
+            // Servers ARE running — "not running" would send the user the wrong way.
+            eprintln!("  [WARN] Several Victauri apps are running and none was selected");
+            eprintln!("         {err}");
+            warn_count += 1;
         }
         Err(err) => {
             // discover() enriches the connection error with a discovery diagnosis
@@ -1530,24 +1651,28 @@ fn run_tests_with_output(filter: Option<&str>, changed_file: Option<&str>) {
     eprintln!("\n\x1b[90mWaiting for changes...\x1b[0m");
 }
 
-/// The feature-gated wiring `victauri init --optional` appends to the file holding the Tauri
-/// builder. Both feature states compile: without the `victauri` feature `with_victauri` is the
-/// identity and no Victauri item is referenced.
+/// The feature-gated wiring `victauri init` appends to the file holding the Tauri builder of
+/// an app that gates Victauri behind the Cargo `feature` (`--optional`'s `victauri`, or the
+/// app's own feature that enables `dep:victauri-plugin`). Both feature states compile:
+/// without the feature `with_victauri` is the identity and no Victauri item is referenced.
+/// `feature` is a plain Cargo feature name (see [`is_plain_feature_name`]).
 ///
 /// The permission is granted at runtime (`add_capability`, Tauri's default `dynamic-acl`
 /// feature) rather than in a capability file because a static grant of `victauri:default`
 /// fails every build WITHOUT the feature: Tauri resolves capabilities against the plugins in
 /// the build and rejects one it does not know.
-fn optional_wiring_snippet() -> &'static str {
+fn optional_wiring_snippet(feature: &str) -> String {
     r#"
 /// Victauri — an MCP server inside the app for AI agents (debug builds only). Compiled only
-/// with the `victauri` Cargo feature (`tauri dev --features victauri`), so a build without it
-/// contains no Victauri code at all. Added by `victauri init --optional`.
-#[cfg(feature = "victauri")]
+/// with the `__FEATURE__` Cargo feature (`tauri dev --features __FEATURE__`), so a build without
+/// it contains no Victauri code at all. Added by `victauri init`.
+#[cfg(feature = "__FEATURE__")]
 fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder.plugin(victauri_plugin::init()).plugin(
         // Grant `victauri:default` to every window at runtime: a capability FILE naming it would
         // break builds without the feature (Tauri rejects permissions of plugins not built in).
+        // `add_capability` needs Tauri's `dynamic-acl` feature — on by default; if you build
+        // tauri with `default-features = false`, enable `dynamic-acl` for this to compile.
         tauri::plugin::Builder::<R>::new("victauri-capability")
             .setup(|app, _api| {
                 tauri::Manager::add_capability(
@@ -1562,26 +1687,181 @@ fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
     )
 }
 
-/// Without the `victauri` feature: the builder, unchanged.
-#[cfg(not(feature = "victauri"))]
+/// Without the `__FEATURE__` feature: the builder, unchanged.
+#[cfg(not(feature = "__FEATURE__"))]
 fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builder<R> {
     builder
 }
 "#
+    .replace("__FEATURE__", feature)
 }
 
 /// Whether `source` grants `victauri:default` at runtime the way [`optional_wiring_snippet`]
 /// does (a `CapabilityBuilder` permission), so `doctor` does not demand a capability file.
 fn grants_victauri_at_runtime(source: &str) -> bool {
-    source.contains("add_capability") && source.contains(".permission(\"victauri:default\")")
+    // `.permission("victauri:default")` needs its string literal, which `rust_code_only` blanks;
+    // so look for the literal in the source at a place the code-only text says is code.
+    let code = rust_code_only(source);
+    code.contains("add_capability")
+        && source
+            .match_indices(".permission(\"victauri:default\")")
+            .any(|(at, _)| code[at..].starts_with(".permission("))
 }
 
-/// Patch `content` for `init --optional`: wrap the first `tauri::Builder::default()` as
-/// `with_victauri(tauri::Builder::default())` and append [`optional_wiring_snippet`]. `None`
-/// when there is no such builder expression to wrap.
-fn patch_optional_wiring(content: &str) -> Option<String> {
+/// Whether the Cargo manifest `content` declares `name` as a dependency (normal, dev or build,
+/// including `[target.'cfg(..)'.*]` tables). A mention in a comment or a string does not count.
+fn manifest_has_dependency(content: &str, name: &str) -> bool {
+    let Ok(doc) = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .parse::<toml_edit::DocumentMut>()
+    else {
+        return false;
+    };
+    let in_tables = |t: &dyn toml_edit::TableLike| {
+        ["dependencies", "dev-dependencies", "build-dependencies"]
+            .iter()
+            .any(|k| {
+                t.get(k)
+                    .and_then(toml_edit::Item::as_table_like)
+                    .is_some_and(|deps| deps.contains_key(name))
+            })
+    };
+    in_tables(doc.as_table())
+        || doc
+            .get("target")
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(|targets| {
+                targets
+                    .iter()
+                    .filter_map(|(_, t)| t.as_table_like())
+                    .any(in_tables)
+            })
+}
+
+/// `src` with every comment and every string / char literal (delimiters included) replaced by
+/// spaces, byte for byte — so searches on the result match only real code, at the same byte
+/// offsets and on the same lines as in `src` (newlines are kept). Handles nested block
+/// comments, escapes, raw strings (`r#"…"#`, `br"…"`) and tells char literals (`'"'`) from
+/// lifetimes (`'a`).
+fn rust_code_only(src: &str) -> String {
+    let b = src.as_bytes();
+    let mut out = b.to_vec();
+    let blank = |out: &mut Vec<u8>, from: usize, to: usize| {
+        for byte in &mut out[from..to.min(b.len())] {
+            if *byte != b'\n' && *byte != b'\r' {
+                *byte = b' ';
+            }
+        }
+    };
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        match (b[i], b.get(i + 1)) {
+            (b'/', Some(b'/')) => {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+            }
+            (b'/', Some(b'*')) => {
+                let mut depth = 0usize;
+                while i < b.len() {
+                    if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                blank(&mut out, start, i);
+            }
+            (b'"', _) => {
+                i += 1;
+                while i < b.len() && b[i] != b'"' {
+                    i += if b[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+                blank(&mut out, start, i);
+            }
+            // A raw string: `r` (optionally after `b` / `c`) that does not end an identifier,
+            // then `#`s and a quote. It ends at a quote followed by as many `#`s.
+            (b'r', _)
+                if (i == 0
+                    || !ident(b[i - 1])
+                    || (matches!(b[i - 1], b'b' | b'c') && (i < 2 || !ident(b[i - 2]))))
+                    && {
+                        let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+                        b.get(i + 1 + hashes) == Some(&b'"')
+                    } =>
+            {
+                let hashes = b[i + 1..].iter().take_while(|c| **c == b'#').count();
+                i += hashes + 2;
+                while i < b.len() {
+                    if b[i] == b'"'
+                        && b[i + 1..].iter().take(hashes).all(|c| *c == b'#')
+                        && b.len() >= i + 1 + hashes
+                    {
+                        i += 1 + hashes;
+                        break;
+                    }
+                    i += 1;
+                }
+                blank(&mut out, start, i);
+            }
+            (b'\'', Some(b'\\')) => {
+                // An escaped char literal (`'\''`, `'\n'`, `'\u{1F600}'`).
+                i += 3;
+                while i < b.len() && b[i] != b'\'' && b[i] != b'\n' {
+                    i += 1;
+                }
+                i += 1;
+                blank(&mut out, start, i);
+            }
+            (b'\'', Some(&next)) => {
+                // `'x'` (x one UTF-8 char) is a char literal; anything else (`'a`, `'static`)
+                // is a lifetime or label — code.
+                let len = match next {
+                    0x00..=0x7f => 1,
+                    0xc0..=0xdf => 2,
+                    0xe0..=0xef => 3,
+                    _ => 4,
+                };
+                if b.get(i + 1 + len) == Some(&b'\'') {
+                    i += len + 2;
+                    blank(&mut out, start, i);
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    // Only bytes inside comments / literals were replaced, each by an ASCII space (all bytes
+    // of a multi-byte character together), so this is valid UTF-8.
+    String::from_utf8(out).unwrap_or_default()
+}
+
+/// Patch `content` for a feature-gated app: wrap THE `tauri::Builder::default()` as
+/// `with_victauri(tauri::Builder::default())` and append [`optional_wiring_snippet`]. Only an
+/// occurrence in code counts (not one in a comment or string), and there must be exactly
+/// one — with none or several it is not clear which builder is the app's, so `None` (the
+/// caller prints the snippet to add by hand instead of guessing).
+fn patch_optional_wiring(content: &str, feature: &str) -> Option<String> {
     const BUILDER: &str = "tauri::Builder::default()";
-    let at = content.find(BUILDER)?;
+    let code = rust_code_only(content);
+    let mut found = code.match_indices(BUILDER).map(|(at, _)| at);
+    let at = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
     let eol = if content.contains("\r\n") {
         "\r\n"
     } else {
@@ -1596,11 +1876,14 @@ fn patch_optional_wiring(content: &str) -> Option<String> {
     if !out.ends_with('\n') {
         out.push_str(eol);
     }
-    out.push_str(&optional_wiring_snippet().replace('\n', eol));
+    out.push_str(&optional_wiring_snippet(feature).replace('\n', eol));
     Some(out)
 }
 
-fn try_patch_tauri_builder(src_dir: &Path, optional: bool) -> Result<bool> {
+/// Wire the plugin into `src/lib.rs` or `src/main.rs`: `.plugin(victauri_plugin::init())` for
+/// an ordinary dependency, or the [`patch_optional_wiring`] wrapper when Victauri is behind
+/// the Cargo `feature`. Mentions in comments and strings are ignored throughout.
+fn try_patch_tauri_builder(src_dir: &Path, feature: Option<&str>) -> Result<bool> {
     for filename in ["lib.rs", "main.rs"] {
         let path = src_dir.join(filename);
         if !path.exists() {
@@ -1608,8 +1891,9 @@ fn try_patch_tauri_builder(src_dir: &Path, optional: bool) -> Result<bool> {
         }
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", display_path(&path)))?;
+        let code = rust_code_only(&content);
 
-        if content.contains("victauri_plugin") {
+        if code.contains("victauri_plugin") {
             eprintln!(
                 "  [=] {} already references victauri_plugin",
                 display_path(&path)
@@ -1617,12 +1901,12 @@ fn try_patch_tauri_builder(src_dir: &Path, optional: bool) -> Result<bool> {
             return Ok(true);
         }
 
-        if !content.contains("tauri::Builder") {
+        if !code.contains("tauri::Builder") {
             continue;
         }
 
-        if optional {
-            let Some(new_content) = patch_optional_wiring(&content) else {
+        if let Some(feature) = feature {
+            let Some(new_content) = patch_optional_wiring(&content, feature) else {
                 continue;
             };
             refuse_symlink(&path)?;
@@ -1637,15 +1921,30 @@ fn try_patch_tauri_builder(src_dir: &Path, optional: bool) -> Result<bool> {
 
         // Try to find a safe insertion point:
         // Look for `.run(tauri::generate_context` or `.build(tauri::generate_context`
-        // and insert `.plugin(victauri_plugin::init())` before that line.
+        // and insert `.plugin(victauri_plugin::init())` before that line. The search runs on
+        // the code-only text (same lines), so a commented-out `.run(...)` is not picked.
+        // Inserting a line is only valid Rust when `.run(…)` / `.build(…)` STARTS its line and
+        // continues a method chain on the previous code line. A one-line builder
+        // (`tauri::Builder::default().run(…)`) or a builder held in a variable
+        // (`builder.run(…)`) would get a dangling `.plugin(…)` statement that does not compile;
+        // those get the by-hand hint instead.
         let lines: Vec<&str> = content.lines().collect();
+        let code_lines: Vec<&str> = code.lines().collect();
         let mut insert_idx = None;
-        for (i, line) in lines.iter().enumerate() {
+        for (i, line) in code_lines.iter().enumerate() {
             let trimmed = line.trim();
             if trimmed.contains(".run(tauri::generate_context")
                 || trimmed.contains(".build(tauri::generate_context")
             {
-                insert_idx = Some(i);
+                let continues_chain = code_lines[..i]
+                    .iter()
+                    .rev()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .is_some_and(|prev| !prev.ends_with([';', '{', '}']));
+                if trimmed.starts_with('.') && continues_chain {
+                    insert_idx = Some(i);
+                }
                 break;
             }
         }
@@ -2076,7 +2375,22 @@ fn detect_project(root: &Path) -> Result<(PathBuf, bool)> {
     };
 
     let content = std::fs::read_to_string(&cargo_toml).context("failed to read Cargo.toml")?;
-    let is_tauri = content.contains("tauri");
+    // A virtual workspace manifest (`[workspace]`, no `[package]`) cannot take dependencies:
+    // adding them breaks every cargo command in the repository. The app crate is a member.
+    if let Ok(doc) = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&content)
+        .parse::<toml_edit::DocumentMut>()
+        && doc.contains_key("workspace")
+        && !doc.contains_key("package")
+    {
+        bail!(
+            "{} is a virtual workspace manifest (no [package]); run init on the Tauri app crate: \
+             victauri init --path <the member that depends on tauri>",
+            display_path(&cargo_toml)
+        );
+    }
+    let is_tauri = manifest_has_dependency(&content, "tauri");
 
     Ok((cargo_toml, is_tauri))
 }
@@ -2107,76 +2421,157 @@ fn victauri_dep(optional: bool) -> toml_edit::Item {
     }
 }
 
-/// Whether `[dependencies].<dep>` is present and marked `optional = true`.
+/// Whether `[dependencies].<dep>` is present and marked `optional = true`. The section and
+/// the entry may be ordinary or inline tables.
 fn dep_is_optional(doc: &toml_edit::DocumentMut, dep: &str) -> bool {
     doc.get("dependencies")
+        .and_then(toml_edit::Item::as_table_like)
         .and_then(|t| t.get(dep))
+        .and_then(toml_edit::Item::as_table_like)
         .and_then(|d| d.get("optional"))
         .and_then(toml_edit::Item::as_bool)
         .unwrap_or(false)
 }
 
-/// Whether the project's `victauri-plugin` is an optional dependency (`init --optional`).
-/// Unreadable or unparsable manifests count as not gated.
-fn project_is_feature_gated(root: &Path) -> bool {
-    let Ok((cargo_toml, _)) = detect_project(root) else {
-        return false;
+/// Whether `name` is a plain Cargo feature name: ASCII letters, digits, `_`, `-`, `+`, `.`,
+/// starting with a letter, digit or `_`. The name is written into generated Rust
+/// (`cfg(feature = "…")`), YAML, Markdown and terminal output, and the manifest may come from
+/// an untrusted clone — so nothing else is used.
+fn is_plain_feature_name(name: &str) -> bool {
+    name.chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
+}
+
+/// The `[features]` entry that turns on the optional dependency `dep` (a member `dep:<dep>`,
+/// `<dep>`, or `<dep>/<feature>` — not the weak `<dep>?/…`). A feature named `victauri` wins;
+/// otherwise the first one in file order.
+fn feature_enabling(doc: &toml_edit::DocumentMut, dep: &str) -> Option<String> {
+    let features = doc.get("features")?.as_table_like()?;
+    let enables = |item: &toml_edit::Item| {
+        item.as_array().is_some_and(|members| {
+            members
+                .iter()
+                .filter_map(toml_edit::Value::as_str)
+                .any(|m| {
+                    m.strip_prefix("dep:") == Some(dep)
+                        || m == dep
+                        || m.strip_prefix(dep)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                })
+        })
     };
-    std::fs::read_to_string(cargo_toml)
-        .ok()
-        .and_then(|c| c.parse::<toml_edit::DocumentMut>().ok())
-        .is_some_and(|doc| dep_is_optional(&doc, "victauri-plugin"))
+    let found: Vec<String> = features
+        .iter()
+        .filter(|(name, item)| is_plain_feature_name(name) && enables(item))
+        .map(|(name, _)| name.to_string())
+        .collect();
+    found
+        .iter()
+        .find(|n| *n == "victauri")
+        .or_else(|| found.first())
+        .cloned()
+}
+
+/// The Cargo feature that compiles Victauri into the app when `victauri-plugin` is an
+/// optional dependency: the feature that enables it (`init --optional`'s `victauri`, or the
+/// app's own, e.g. `devtools = ["dep:victauri-plugin"]`), else Cargo's implicit feature named
+/// after the dependency. `None` = an ordinary dependency (not gated).
+fn victauri_feature(doc: &toml_edit::DocumentMut) -> Option<String> {
+    if !dep_is_optional(doc, "victauri-plugin") {
+        return None;
+    }
+    Some(feature_enabling(doc, "victauri-plugin").unwrap_or_else(|| "victauri-plugin".into()))
+}
+
+/// [`victauri_feature`] for the project at `root`. Unreadable or unparsable manifests count
+/// as not gated.
+fn project_victauri_feature(root: &Path) -> Option<String> {
+    let (cargo_toml, _) = detect_project(root).ok()?;
+    let content = std::fs::read_to_string(cargo_toml).ok()?;
+    let doc = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&content)
+        .parse::<toml_edit::DocumentMut>()
+        .ok()?;
+    victauri_feature(&doc)
 }
 
 fn add_dependencies(cargo_toml_path: &Path, optional: bool) -> Result<DepsOutcome> {
     let content = std::fs::read_to_string(cargo_toml_path)?;
     let mut doc = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&content)
         .parse::<toml_edit::DocumentMut>()
         .context("failed to parse Cargo.toml")?;
 
     let mut changed = false;
-    let plugin_is_unconditional = optional
-        && has_dep(&doc, "dependencies", "victauri-plugin")
-        && !dep_is_optional(&doc, "victauri-plugin");
+    let plugin_present = has_dep(&doc, "dependencies", "victauri-plugin");
+    let plugin_is_unconditional =
+        optional && plugin_present && !dep_is_optional(&doc, "victauri-plugin");
 
-    if !has_dep(&doc, "dependencies", "victauri-plugin") {
-        ensure_table(&mut doc, "dependencies");
-        doc["dependencies"]["victauri-plugin"] = victauri_dep(optional);
+    if !plugin_present {
+        table_mut(&mut doc, "dependencies")?.insert("victauri-plugin", victauri_dep(optional));
         changed = true;
     }
+    // From here on, follow what the manifest says, not the flag: a plain `init` on an app
+    // whose plugin is already optional must keep everything Victauri behind its feature.
+    let gated = dep_is_optional(&doc, "victauri-plugin");
 
     // `#[inspectable]` (re-exported as `victauri_plugin::inspectable`) expands to code that
     // names `victauri_core::...` by path, so the app crate must depend on victauri-core
     // directly or every annotated command fails with E0433. It is already in the build
-    // graph via victauri-plugin, so this adds no compile cost.
+    // graph via victauri-plugin, so this adds no compile cost. Optional exactly when the
+    // plugin is (a non-optional core next to a gated plugin would ship in release builds).
+    let mut core_added = false;
     if !has_dep(&doc, "dependencies", "victauri-core") {
-        ensure_table(&mut doc, "dependencies");
-        doc["dependencies"]["victauri-core"] = victauri_dep(optional);
+        table_mut(&mut doc, "dependencies")?.insert("victauri-core", victauri_dep(gated));
+        core_added = true;
         changed = true;
     }
 
-    // `--optional`: the `victauri` feature that turns both on. (`dep:` keeps Cargo from also
-    // creating implicit `victauri-plugin` / `victauri-core` features.)
-    if optional && !plugin_is_unconditional {
-        ensure_table(&mut doc, "features");
-        let has_feature = doc
-            .get("features")
-            .and_then(|f| f.as_table())
-            .is_some_and(|f| f.contains_key("victauri"));
-        if !has_feature {
-            let mut members = toml_edit::Array::new();
+    // The feature that turns both on. An app's own feature that already enables the plugin
+    // is used as is (plus a newly added optional core); otherwise `init` adds `victauri`.
+    // (`dep:` keeps Cargo from also creating implicit `victauri-plugin` / `victauri-core`
+    // features.)
+    if gated {
+        if let Some(feature) = feature_enabling(&doc, "victauri-plugin") {
+            if core_added
+                && let Some(members) = table_mut(&mut doc, "features")?
+                    .get_mut(&feature)
+                    .and_then(toml_edit::Item::as_array_mut)
+            {
+                members.push("dep:victauri-core");
+                changed = true;
+            }
+        } else {
+            let core_optional = dep_is_optional(&doc, "victauri-core");
+            let features = table_mut(&mut doc, "features")?;
+            let mut members = match features.get("victauri") {
+                // A `victauri` feature that does not enable the plugin yet: extend it.
+                Some(item) => item.as_array().cloned().with_context(|| {
+                    "Cargo.toml's `features.victauri` is not a list — add \
+                     \"dep:victauri-plugin\" to the feature that should enable Victauri"
+                })?,
+                None => toml_edit::Array::new(),
+            };
+            let has =
+                |members: &toml_edit::Array, m: &str| members.iter().any(|v| v.as_str() == Some(m));
             members.push("dep:victauri-plugin");
-            if dep_is_optional(&doc, "victauri-core") {
+            if (core_added || core_optional) && !has(&members, "dep:victauri-core") {
                 members.push("dep:victauri-core");
             }
-            doc["features"]["victauri"] = toml_edit::value(members);
+            features.insert("victauri", toml_edit::value(members));
             changed = true;
         }
     }
 
     if !has_dep(&doc, "dev-dependencies", "victauri-test") {
-        ensure_table(&mut doc, "dev-dependencies");
-        doc["dev-dependencies"]["victauri-test"] = toml_edit::value(env!("CARGO_PKG_VERSION"));
+        table_mut(&mut doc, "dev-dependencies")?
+            .insert("victauri-test", toml_edit::value(env!("CARGO_PKG_VERSION")));
         changed = true;
     }
 
@@ -2184,20 +2579,21 @@ fn add_dependencies(cargo_toml_path: &Path, optional: bool) -> Result<DepsOutcom
     // dependency, so without this the scaffolded tests do not compile. Skip if tokio is
     // already a regular dependency with the needed features left to the user.
     if !has_dep(&doc, "dev-dependencies", "tokio") && !has_dep(&doc, "dependencies", "tokio") {
-        ensure_table(&mut doc, "dev-dependencies");
         let mut tokio = toml_edit::InlineTable::new();
         tokio.insert("version", "1".into());
         let mut features = toml_edit::Array::new();
         features.push("macros");
         features.push("rt-multi-thread");
         tokio.insert("features", toml_edit::Value::Array(features));
-        doc["dev-dependencies"]["tokio"] = toml_edit::value(tokio);
+        table_mut(&mut doc, "dev-dependencies")?.insert("tokio", toml_edit::value(tokio));
         changed = true;
     }
 
     if changed {
         refuse_symlink(cargo_toml_path)?;
-        std::fs::write(cargo_toml_path, doc.to_string())?;
+        // toml_edit drops a BOM and writes LF: keep the manifest's own (a CRLF manifest must
+        // not become a whole-file diff).
+        std::fs::write(cargo_toml_path, keep_text_style(&content, &doc.to_string()))?;
     }
     Ok(DepsOutcome {
         changed,
@@ -2205,15 +2601,47 @@ fn add_dependencies(cargo_toml_path: &Path, optional: bool) -> Result<DepsOutcom
     })
 }
 
+/// Whether the section `table` (an ordinary `[table]` or an inline `table = { … }`) has `dep`.
 fn has_dep(doc: &toml_edit::DocumentMut, table: &str, dep: &str) -> bool {
     doc.get(table)
-        .and_then(|t| t.as_table())
+        .and_then(toml_edit::Item::as_table_like)
         .is_some_and(|t| t.contains_key(dep))
 }
 
-fn ensure_table(doc: &mut toml_edit::DocumentMut, key: &str) {
+/// The section `key` to insert into, created as a `[key]` table if absent. An existing inline
+/// table is used as is (inserting into it, never replacing it); a section that is not a
+/// table at all (`dependencies = 1`) is an error, not a panic or a silent overwrite.
+fn table_mut<'a>(
+    doc: &'a mut toml_edit::DocumentMut,
+    key: &str,
+) -> Result<&'a mut dyn toml_edit::TableLike> {
     if !doc.contains_key(key) {
         doc[key] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc[key].as_table_like_mut().with_context(|| {
+        format!(
+            "Cargo.toml's `{key}` is not a table — add the Victauri entries to it by hand \
+             (Cargo.toml left untouched)"
+        )
+    })
+}
+
+/// Re-apply `original`'s UTF-8 BOM and dominant line ending to `edited` — a re-serialization
+/// by `toml_edit`, which drops the BOM and writes LF — so a merge into the user's file adds
+/// lines instead of rewriting every one of them.
+fn keep_text_style(original: &str, edited: &str) -> String {
+    let body = edited.strip_prefix('\u{feff}').unwrap_or(edited);
+    let crlf = original.matches("\r\n").count();
+    let lf = original.matches('\n').count() - crlf;
+    let body = if crlf > lf {
+        body.replace("\r\n", "\n").replace('\n', "\r\n")
+    } else {
+        body.to_string()
+    };
+    if original.starts_with('\u{feff}') {
+        format!("\u{feff}{body}")
+    } else {
+        body
     }
 }
 
@@ -2331,6 +2759,8 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
 
     for path in rs_files {
         if let Ok(content) = std::fs::read_to_string(&path) {
+            // Code only: a commented-out command would get a generated test that fails.
+            let content = rust_code_only(&content);
             let mut in_command_attr = false;
             for line in content.lines() {
                 let trimmed = line.trim();
@@ -2365,13 +2795,13 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
     commands
 }
 
-/// `dev` with the `victauri` Cargo feature turned on. `npm run` needs `--` before arguments
-/// meant for the script; pnpm, yarn and bun pass them through.
-fn with_victauri_feature(dev: &str) -> String {
+/// `dev` with the Cargo `feature` that enables Victauri turned on. `npm run` needs `--`
+/// before arguments meant for the script; pnpm, yarn and bun pass them through.
+fn with_victauri_feature(dev: &str, feature: &str) -> String {
     if dev.starts_with("npm run ") {
-        format!("{dev} -- --features victauri")
+        format!("{dev} -- --features {feature}")
     } else {
-        format!("{dev} --features victauri")
+        format!("{dev} --features {feature}")
     }
 }
 
@@ -2479,7 +2909,7 @@ async fn command_{cmd}() {{
 /// `beforeBuildCommand` (the frontend build) first and embeds the built frontend, so the
 /// binary does not need a dev server — while a debug build keeps Victauri enabled (it is a
 /// no-op in release builds).
-fn generate_ci_workflow(app_dir: &str, optional: bool) -> String {
+fn generate_ci_workflow(app_dir: &str, feature: Option<&str>) -> String {
     r#"# Victauri E2E tests — runs smoke + integration tests against your Tauri app.
 # Generated by `victauri init`. Customize as needed.
 #
@@ -2568,10 +2998,10 @@ jobs:
 "#
     .replace("__VICTAURI_VERSION__", env!("CARGO_PKG_VERSION"))
     .replace("__APP_DIR__", app_dir)
-    // `init --optional`: Victauri is compiled in only with the `victauri` feature.
+    // A feature-gated app: Victauri is compiled in only with its feature.
     .replace(
         "__FEATURES__",
-        if optional { " --features victauri" } else { "" },
+        &feature.map_or_else(String::new, |f| format!(" --features {f}")),
     )
 }
 
@@ -2676,7 +3106,7 @@ mod tests {
         )
         .unwrap();
 
-        let patched = try_patch_tauri_builder(&src, false).unwrap();
+        let patched = try_patch_tauri_builder(&src, None).unwrap();
         assert!(patched, "should have patched the file");
 
         let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
@@ -2756,7 +3186,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(try_patch_tauri_builder(&src, true).unwrap());
+        assert!(try_patch_tauri_builder(&src, Some("victauri")).unwrap());
         let content = std::fs::read_to_string(src.join("lib.rs")).unwrap();
         assert!(content.contains("with_victauri(tauri::Builder::default())"));
         // The plugin is only referenced under the feature, and there is a no-feature twin.
@@ -2782,7 +3212,7 @@ mod tests {
         // Line endings preserved: no bare LF introduced.
         assert!(!content.replace("\r\n", "").contains('\n'), "mixed EOLs");
         // Idempotent: a second run finds `victauri_plugin` and changes nothing.
-        assert!(try_patch_tauri_builder(&src, true).unwrap());
+        assert!(try_patch_tauri_builder(&src, Some("victauri")).unwrap());
         assert_eq!(
             std::fs::read_to_string(src.join("lib.rs")).unwrap(),
             content
@@ -2791,7 +3221,10 @@ mod tests {
 
     #[test]
     fn optional_patch_needs_a_builder_expression() {
-        assert!(patch_optional_wiring("fn main() { let b = tauri::Builder::new(); }").is_none());
+        assert!(
+            patch_optional_wiring("fn main() { let b = tauri::Builder::new(); }", "victauri")
+                .is_none()
+        );
     }
 
     /// `init` follows the manifest, not the flag: `--optional` on an app whose plugin is
@@ -2880,10 +3313,10 @@ mod tests {
 
         // The default (non-optional) workflow has no feature flag.
         assert!(
-            generate_ci_workflow("src-tauri", false)
+            generate_ci_workflow("src-tauri", None)
                 .contains("npx tauri build --debug --no-bundle\n")
         );
-        assert!(!agents::claude_md_block(false).contains("--features victauri"));
+        assert!(!agents::claude_md_block(None).contains("--features victauri"));
     }
 
     #[test]
@@ -2896,7 +3329,7 @@ mod tests {
             "fn main() {\r\n    tauri::Builder::default()\r\n        .run(tauri::generate_context!())\r\n        .unwrap();\r\n}\r\n",
         )
         .unwrap();
-        assert!(try_patch_tauri_builder(&src, false).unwrap());
+        assert!(try_patch_tauri_builder(&src, None).unwrap());
         let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
         assert!(content.contains("victauri_plugin::init()"));
         assert_eq!(
@@ -2918,7 +3351,7 @@ mod tests {
         )
         .unwrap();
 
-        let patched = try_patch_tauri_builder(&src, false).unwrap();
+        let patched = try_patch_tauri_builder(&src, None).unwrap();
         assert!(patched, "should report true (already present)");
 
         let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
@@ -2940,11 +3373,130 @@ mod tests {
         )
         .unwrap();
 
-        let patched = try_patch_tauri_builder(&src, false).unwrap();
+        let patched = try_patch_tauri_builder(&src, None).unwrap();
         assert!(patched);
 
         let content = std::fs::read_to_string(src.join("lib.rs")).unwrap();
         assert!(content.contains("victauri_plugin::init()"));
+    }
+
+    /// A virtual workspace manifest cannot take dependencies: `init` must refuse it (and point
+    /// at `--path`) instead of breaking every cargo command in the repository.
+    #[test]
+    fn init_refuses_a_virtual_workspace_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = "[workspace]\nmembers = [\"apps/desktop/src-tauri\"]\nresolver = \"2\"\n";
+        std::fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
+        let err = cmd_init(dir.path(), false).unwrap_err().to_string();
+        assert!(
+            err.contains("virtual workspace") && err.contains("--path"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        // A workspace ROOT that is also a package is an ordinary app manifest.
+        assert!(manifest_has_dependency(
+            "[package]\nname = \"a\"\n[workspace]\n[dependencies]\ntauri = \"2\"\n",
+            "tauri"
+        ));
+    }
+
+    /// `doctor`'s dependency check reads the manifest, not its text: a comment or a string
+    /// mentioning the crate is not a dependency.
+    #[test]
+    fn manifest_dependency_check_ignores_comments() {
+        assert!(!manifest_has_dependency(
+            "[package]\nname = \"a\"\n# victauri-plugin = \"0.10\"\n[dependencies]\ntauri = \"2\"\n",
+            "victauri-plugin"
+        ));
+        assert!(manifest_has_dependency(
+            "[target.'cfg(debug_assertions)'.dependencies]\nvictauri-plugin = \"0.10\"\n",
+            "victauri-plugin"
+        ));
+        assert!(manifest_has_dependency(
+            "[dev-dependencies]\nvictauri-test = { version = \"0.10\" }\n",
+            "victauri-test"
+        ));
+        // ...and a commented-out runtime grant is not a grant.
+        assert!(!grants_victauri_at_runtime(
+            "// app.add_capability(x.permission(\"victauri:default\"))\nfn main() {}\n"
+        ));
+        assert!(!grants_victauri_at_runtime(
+            "fn main() { add_capability(); }\n// .permission(\"victauri:default\")\n"
+        ));
+    }
+
+    /// A path `init`'s agent wiring would refuse is found BEFORE anything is written, so the
+    /// project is never left half-initialized.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_before_writing_when_an_agent_path_is_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("src-tauri");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        let manifest =
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\ntauri = \"2\"\n";
+        std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+        let lib = "pub fn run() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .expect(\"x\");\n}\n";
+        std::fs::write(app.join("src/lib.rs"), lib).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(".claude")).unwrap();
+
+        assert!(cmd_init(dir.path(), false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(app.join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.join("src/lib.rs")).unwrap(),
+            lib
+        );
+        assert!(!app.join("tests").exists());
+        assert!(!dir.path().join(".github").exists());
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    /// Only a `.run(…)` / `.build(…)` that starts its line and continues a method chain gets the
+    /// inserted `.plugin(…)` line — anywhere else the insertion is a dangling statement that does
+    /// not compile, so the file is left alone and `init` prints the by-hand hint.
+    #[test]
+    fn patch_tauri_builder_never_writes_a_dangling_plugin_line() {
+        let refused = [
+            "pub fn run() {\n    tauri::Builder::default().run(tauri::generate_context!()).expect(\"x\");\n}\n",
+            "pub fn run() {\n    let builder = tauri::Builder::default().plugin(p::init());\n    builder.run(tauri::generate_context!()).expect(\"x\");\n}\n",
+            "fn main() {\n    let app = tauri::Builder::default().build(tauri::generate_context!()).expect(\"x\");\n    app.run(|_, _| {});\n}\n",
+        ];
+        for src_text in refused {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("lib.rs"), src_text).unwrap();
+            assert!(!try_patch_tauri_builder(&src, None).unwrap(), "{src_text}");
+            assert_eq!(
+                std::fs::read_to_string(src.join("lib.rs")).unwrap(),
+                src_text
+            );
+        }
+        let chained = [
+            // A chain on a builder variable is a chain too.
+            "pub fn run() {\n    let builder = tauri::Builder::default();\n    builder\n        .run(tauri::generate_context!())\n        .expect(\"x\");\n}\n",
+            "fn main() {\n    let app = tauri::Builder::default()\n        .build(tauri::generate_context!())\n        .expect(\"x\");\n    app.run(|_, _| {});\n}\n",
+            "pub fn run() {\n    tauri::Builder::default()\n        .plugin(p::init())\n        // a note\n\n        .run(tauri::generate_context!())\n        .expect(\"x\");\n}\n",
+        ];
+        for src_text in chained {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("lib.rs"), src_text).unwrap();
+            assert!(try_patch_tauri_builder(&src, None).unwrap(), "{src_text}");
+            let out = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+            assert!(
+                out.contains("        .plugin(victauri_plugin::init())\n"),
+                "{out}"
+            );
+        }
     }
 
     #[test]
@@ -2954,7 +3506,7 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("main.rs"), "fn main() { println!(\"hello\"); }\n").unwrap();
 
-        let patched = try_patch_tauri_builder(&src, false).unwrap();
+        let patched = try_patch_tauri_builder(&src, None).unwrap();
         assert!(!patched, "should return false when no tauri::Builder found");
     }
 
@@ -2990,7 +3542,7 @@ mod tests {
         let src = dir.path().join("src");
         std::fs::create_dir_all(&src).unwrap();
         std::os::unix::fs::symlink(&outside, src.join("main.rs")).unwrap();
-        assert!(try_patch_tauri_builder(&src, false).is_err());
+        assert!(try_patch_tauri_builder(&src, None).is_err());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), original);
 
         let manifest = dir.path().join("outside.toml");
@@ -3136,6 +3688,17 @@ mod tests {
         let commands = scan_tauri_commands(dir.path());
         assert!(commands.contains(&"greet".to_string()));
         assert!(commands.contains(&"get_count".to_string()));
+
+        std::fs::write(
+            dir.path().join("old.rs"),
+            "// #[tauri::command]\n// fn retired() {}\n/* #[tauri::command]\nfn gone() {} */\n",
+        )
+        .unwrap();
+        let commands = scan_tauri_commands(dir.path());
+        assert!(
+            !commands.iter().any(|c| c == "retired" || c == "gone"),
+            "{commands:?}"
+        );
     }
 
     #[test]
@@ -3169,14 +3732,36 @@ mod tests {
         assert!(!content.contains("e2e_test"));
     }
 
+    /// The MCP Registry rejects (422) a `server.json` that breaks its schema; the 0.9.0 one
+    /// never listed because its description was over the 100-character limit. The fields
+    /// the schema bounds, and the version the release publishes, are checked here.
+    #[test]
+    fn server_json_fits_the_mcp_registry_schema() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../server.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return; // not in a packaged crate
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let description = doc["description"].as_str().unwrap();
+        assert!(
+            (1..=100).contains(&description.chars().count()),
+            "description is {} chars (registry max 100)",
+            description.chars().count()
+        );
+        assert!(doc["name"].as_str().unwrap().len() <= 200);
+        assert_eq!(doc["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(doc["packages"][0]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(doc["packages"][0]["identifier"], "victauri-cli");
+    }
+
     #[test]
     fn feature_flag_follows_the_package_manager() {
         assert_eq!(
-            with_victauri_feature("npm run tauri dev"),
+            with_victauri_feature("npm run tauri dev", "victauri"),
             "npm run tauri dev -- --features victauri"
         );
         assert_eq!(
-            with_victauri_feature("pnpm tauri dev"),
+            with_victauri_feature("pnpm tauri dev", "victauri"),
             "pnpm tauri dev --features victauri"
         );
     }
@@ -3190,15 +3775,38 @@ mod tests {
             "[dependencies]\ntauri = \"2\"\nvictauri-plugin = \"0.9\"\n",
         )
         .unwrap();
-        assert!(!project_is_feature_gated(dir.path()));
+        assert_eq!(project_victauri_feature(dir.path()), None);
+        // Optional with no feature naming it: Cargo's implicit feature.
         std::fs::write(
             &manifest,
             "[dependencies]\ntauri = \"2\"\nvictauri-plugin = { version = \"0.9\", optional = true }\n",
         )
         .unwrap();
-        assert!(project_is_feature_gated(dir.path()));
+        assert_eq!(
+            project_victauri_feature(dir.path()).as_deref(),
+            Some("victauri-plugin")
+        );
+        // The app's own feature that enables it — `victauri` preferred when both do.
+        std::fs::write(
+            &manifest,
+            "[dependencies]\nvictauri-plugin = { version = \"0.9\", optional = true }\n\n[features]\ndefault = []\ndevtools = [\"dep:victauri-plugin\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_victauri_feature(dir.path()).as_deref(),
+            Some("devtools")
+        );
+        std::fs::write(
+            &manifest,
+            "[dependencies]\nvictauri-plugin = { version = \"0.9\", optional = true }\n\n[features]\nall = [\"victauri-plugin/sqlite\"]\nvictauri = [\"dep:victauri-plugin\"]\nweak = [\"victauri-plugin?/x\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            project_victauri_feature(dir.path()).as_deref(),
+            Some("victauri")
+        );
         std::fs::write(&manifest, "not toml [").unwrap();
-        assert!(!project_is_feature_gated(dir.path()));
+        assert_eq!(project_victauri_feature(dir.path()), None);
     }
 
     #[test]
@@ -3214,7 +3822,7 @@ mod tests {
 
     #[test]
     fn ci_workflow_is_valid_yaml() {
-        let content = generate_ci_workflow("src-tauri", false);
+        let content = generate_ci_workflow("src-tauri", None);
         let version = env!("CARGO_PKG_VERSION");
         assert!(content.contains(&format!("victauri-test@v{version}")));
         assert!(content.contains(&format!("victauri-version: \"{version}\"")));
@@ -3329,12 +3937,26 @@ mod tests {
     fn connect_failure_message_does_not_overclassify_generic_sessions() {
         let message = connect_failure_message("session expired after idle timeout");
         assert!(!message.contains("version skew"));
-        assert!(message.contains("Is your Tauri app running?"));
+        assert!(message.contains("Is your Tauri app running"));
+    }
+
+    /// A port that contains the digits 401 is not an auth failure; an HTTP 401 is.
+    #[test]
+    fn connect_failure_message_reads_401_only_as_an_http_status() {
+        let refused = connect_failure_message(
+            "connection failed (127.0.0.1:40143): error sending request: connection refused",
+        );
+        assert!(!refused.contains("Auth is ON"), "{refused}");
+        assert!(refused.contains("Is your Tauri app running"), "{refused}");
+        let auth = connect_failure_message(
+            "connection failed (127.0.0.1:7373): tool call returned HTTP 401 Unauthorized",
+        );
+        assert!(auth.contains("Auth is ON"), "{auth}");
     }
 
     #[test]
     fn claude_md_section_has_key_instructions() {
-        let content = agents::claude_md_block(false);
+        let content = agents::claude_md_block(None);
         assert!(content.contains("Victauri"));
         assert!(content.contains("invoke_command"));
         assert!(content.contains("victauri bridge"));
@@ -3501,7 +4123,7 @@ mod tests {
         // R4-DOC1: the generated block told agents the token lives at
         // `<temp>/victauri/<pid>/token` — on Unix 0.9 writes to a per-user root, and the
         // legacy shared root can be attacker-planted.
-        let content = agents::claude_md_block(false);
+        let content = agents::claude_md_block(None);
         assert!(
             !content.contains("<temp>/victauri/<pid>/token"),
             "{content}"
@@ -3578,5 +4200,203 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
         }
+    }
+
+    /// An identifier starting with `-` cannot follow `--app` as its own argument (clap reads
+    /// it as a flag) — which is why `setup` writes `--app=<id>`; the bridge must accept that.
+    #[test]
+    fn bridge_accepts_a_dash_leading_identifier_in_equals_form() {
+        use clap::Parser;
+        assert!(Cli::try_parse_from(["victauri", "bridge", "--app", "-x.app"]).is_err());
+        let cli = Cli::try_parse_from(["victauri", "bridge", "--app=-x.app"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Bridge { app: Some(ref a), .. } if a == "-x.app"
+        ));
+    }
+
+    const BUILDER_MAIN: &str = "fn main() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n";
+
+    /// A mention of `tauri::Builder::default()` in a comment or string is not the builder:
+    /// the wrapper must land on the real one, and with two real builders nothing is patched.
+    #[test]
+    fn optional_patch_ignores_comments_and_strings_and_needs_one_builder() {
+        let src = format!(
+            "// Uses tauri::Builder::default() below.\n/* tauri::Builder::default() /* nested */ \
+             tauri::Builder::default() */\nconst S: &str = \"tauri::Builder::default()\";\n\
+             const R: &str = r#\"tauri::Builder::default() \"quoted\"\"#;\nconst C: char = '\"';\n\
+             fn f<'a>(x: &'a str) -> &'a str {{ x }}\n{BUILDER_MAIN}"
+        );
+        let out = patch_optional_wiring(&src, "victauri").unwrap();
+        assert_eq!(
+            out.matches("with_victauri(tauri::Builder::default())")
+                .count(),
+            1
+        );
+        let real = out
+            .find("with_victauri(tauri::Builder::default())")
+            .unwrap();
+        assert!(real > out.find("fn main()").unwrap(), "{out}");
+        // Every mention outside code is untouched.
+        assert!(out.starts_with(&src[..src.find("fn main()").unwrap()]));
+
+        let two = format!("{BUILDER_MAIN}fn other() {{ let _ = tauri::Builder::default(); }}\n");
+        assert!(patch_optional_wiring(&two, "victauri").is_none());
+        assert!(patch_optional_wiring("// tauri::Builder::default()\n", "victauri").is_none());
+    }
+
+    /// The plain (`.plugin(...)`) patch and the "already wired" check also ignore comments:
+    /// a commented-out `victauri_plugin` is not wiring, and a commented-out `.run(...)` is not
+    /// the insertion point.
+    #[test]
+    fn plain_patch_ignores_commented_out_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("main.rs"),
+            "// TODO: .plugin(victauri_plugin::init())\nfn main() {\n    tauri::Builder::default()\n        // .run(tauri::generate_context!()) old\n        .run(tauri::generate_context!())\n        .unwrap();\n}\n",
+        )
+        .unwrap();
+        assert!(try_patch_tauri_builder(&src, None).unwrap());
+        let content = std::fs::read_to_string(src.join("main.rs")).unwrap();
+        assert!(
+            content.contains(
+                "        // .run(tauri::generate_context!()) old\n        .plugin(victauri_plugin::init())\n        .run("
+            ),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn rust_code_only_keeps_offsets_and_lines() {
+        let src = "let s = \"é // x\"; // ü\n/* a\n b */ let c = b'\\''; 'outer: loop {}\n";
+        let code = rust_code_only(src);
+        assert_eq!(code.len(), src.len());
+        assert_eq!(code.lines().count(), src.lines().count());
+        assert!(
+            code.contains("let s =") && code.contains("let c = b") && code.contains("'outer: loop")
+        );
+        assert!(!code.contains("//") && !code.contains('é') && !code.contains("a\n b"));
+    }
+
+    /// `toml_edit` drops a BOM and writes LF: a CRLF / BOM manifest must keep both.
+    #[test]
+    fn add_deps_keeps_bom_and_crlf() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &cargo,
+            "\u{feff}[package]\r\nname = \"a\"\r\nversion = \"0.1.0\"\r\n\r\n[dependencies]\r\ntauri = \"2\"\r\n",
+        )
+        .unwrap();
+        assert!(add_dependencies(&cargo, false).unwrap().changed);
+        let out = std::fs::read_to_string(&cargo).unwrap();
+        assert!(out.starts_with("\u{feff}[package]\r\n"), "{out:?}");
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "CRLF kept: {out:?}"
+        );
+        assert!(out.contains("victauri-plugin"));
+        assert_eq!(keep_text_style("a\nb\n", "a\nb\nc\n"), "a\nb\nc\n");
+    }
+
+    /// Inline-table sections are real sections: never treated as absent (and clobbered), and
+    /// a section that is not a table at all is an error, not a panic.
+    #[test]
+    fn add_deps_handles_inline_and_malformed_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join("Cargo.toml");
+
+        std::fs::write(
+            &cargo,
+            "dev-dependencies = { tokio = { version = \"1\", features = [\"full\"] } }\n\n[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        add_dependencies(&cargo, false).unwrap();
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&cargo).unwrap().parse().unwrap();
+        let dev = doc["dev-dependencies"].as_table_like().unwrap();
+        assert_eq!(
+            dev.get("tokio").unwrap()["features"][0].as_str(),
+            Some("full")
+        );
+        assert!(dev.contains_key("victauri-test"));
+
+        std::fs::write(
+            &cargo,
+            "dependencies = { victauri-plugin = { path = \"../p\", optional = true } }\n\n[package]\nname = \"a\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        add_dependencies(&cargo, false).unwrap();
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(&cargo).unwrap().parse().unwrap();
+        assert_eq!(
+            doc["dependencies"]["victauri-plugin"]["path"].as_str(),
+            Some("../p"),
+            "kept, not replaced"
+        );
+        assert!(dep_is_optional(&doc, "victauri-plugin"));
+        assert!(
+            dep_is_optional(&doc, "victauri-core"),
+            "core gated with the plugin"
+        );
+        assert_eq!(victauri_feature(&doc).as_deref(), Some("victauri"));
+
+        let bad = "dependencies = 1\n\n[package]\nname = \"a\"\nversion = \"0.1.0\"\n";
+        std::fs::write(&cargo, bad).unwrap();
+        let Err(err) = add_dependencies(&cargo, false) else {
+            panic!("a non-table section must be refused");
+        };
+        assert!(format!("{err:#}").contains("not a table"), "{err:#}");
+        assert_eq!(std::fs::read_to_string(&cargo).unwrap(), bad);
+    }
+
+    /// An app that already gates the plugin behind its OWN feature: plain `init` uses that
+    /// feature's name everywhere (wiring, CI, instructions) and adds victauri-core as an
+    /// optional dependency enabled by it — never a `victauri` feature nobody turns on.
+    #[test]
+    fn init_uses_the_apps_own_feature_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("src-tauri");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\ntauri = \"2\"\nvictauri-plugin = { version = \"0.9\", optional = true }\n\n[features]\ndevtools = [\"dep:victauri-plugin\"]\n",
+        )
+        .unwrap();
+        std::fs::write(app.join("src").join("main.rs"), BUILDER_MAIN).unwrap();
+
+        cmd_init(dir.path(), false).unwrap();
+
+        let doc: toml_edit::DocumentMut = std::fs::read_to_string(app.join("Cargo.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            doc["features"].get("victauri").is_none(),
+            "no unused `victauri` feature"
+        );
+        let devtools: Vec<&str> = doc["features"]["devtools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(devtools, ["dep:victauri-plugin", "dep:victauri-core"]);
+        assert!(dep_is_optional(&doc, "victauri-core"));
+
+        let main = std::fs::read_to_string(app.join("src").join("main.rs")).unwrap();
+        assert!(main.contains("#[cfg(feature = \"devtools\")]"), "{main}");
+        assert!(main.contains("#[cfg(not(feature = \"devtools\"))]"));
+        assert!(!main.contains("feature = \"victauri\""));
+        let ci =
+            std::fs::read_to_string(dir.path().join(".github/workflows/victauri.yml")).unwrap();
+        assert!(ci.contains("--no-bundle --features devtools\n"), "{ci}");
+        let claude = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(claude.contains("--features devtools") && !claude.contains("--features victauri"));
+        assert!(!app.join("capabilities").join("victauri.json").exists());
+        assert!(
+            optional_wiring_snippet("devtools").contains("dynamic-acl"),
+            "the snippet says what add_capability needs"
+        );
     }
 }

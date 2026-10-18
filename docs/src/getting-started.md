@@ -16,7 +16,7 @@ Add `victauri-plugin` to your app's `src-tauri/Cargo.toml`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.9"
+victauri-plugin = "0.10"
 ```
 
 The plugin runs inside your app process. In release builds, `init()` returns a no-op plugin thanks to the `#[cfg(debug_assertions)]` gate: no server starts, nothing listens, and `#[inspectable]` emits none of its metadata. Do **not** move it to `[dev-dependencies]` — dev-dependencies are only visible to tests/examples/benches, so the app binary would no longer compile.
@@ -38,8 +38,8 @@ build) compiles **no** Victauri code at all:
 
 ```toml
 [dependencies]
-victauri-plugin = { version = "0.9", optional = true }
-victauri-core = { version = "0.9", optional = true }   # only if you use #[inspectable]
+victauri-plugin = { version = "0.10", optional = true }
+victauri-core = { version = "0.10", optional = true }   # only if you use #[inspectable]
 
 [features]
 victauri = ["dep:victauri-plugin", "dep:victauri-core"]
@@ -97,7 +97,7 @@ the wiring above grants the permission.
 
 ## Step 2: Initialize the Plugin
 
-Add `victauri_plugin::init()` to your Tauri builder in `src-tauri/src/main.rs`:
+Add `victauri_plugin::init()` to your Tauri builder in `src-tauri/src/lib.rs` (create-tauri-app's `run()`; older templates use `src-tauri/src/main.rs`):
 
 ```rust
 fn main() {
@@ -165,6 +165,11 @@ in automatically when it can read your `tauri.conf.json`:
 }
 ```
 
+The CLI (`victauri check`, `doctor`, `test`, …) run inside a Tauri project, and `cargo test`
+run inside the app crate, pick that project's app the same way when several Victauri apps are
+running (by the `identifier` in its `tauri.conf.json`). Anywhere else, select one with
+`--app <bundle-identifier>` or the `VICTAURI_APP` environment variable.
+
 ### Authentication
 
 Auth is **enabled by default** (the token is auto-generated and auto-discovered — the bridge
@@ -188,14 +193,14 @@ directory is private to you, else `<temp>/victauri-<uid>` (`<temp>` = `$TMPDIR` 
 
 ```bash
 curl http://127.0.0.1:7373/health
-# Returns: ok  (unauthenticated liveness probe)
+# Returns: {"status":"ok"}  (unauthenticated liveness probe)
 
 # single running app; checks the discovery roots described above, in the plugin's order
 if [ "$OS" = Windows_NT ]; then ROOTS="${TMPDIR:-/tmp}/victauri"   # Git Bash: /tmp is %TEMP%
 else ROOTS="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/victauri} ${TMPDIR:-/tmp}/victauri-$(id -u) $HOME/.local/state/victauri"; fi
 TOKEN=$(cat "$(for r in $ROOTS; do ls -t "$r"/*/token 2>/dev/null; done | head -n1)")
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.9.0",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.10.0",...}
 ```
 
 Or use the Victauri CLI:
@@ -216,8 +221,8 @@ crate victauri_core`:
 
 ```toml
 [dependencies]
-victauri-plugin = "0.9"
-victauri-core = "0.9"
+victauri-plugin = "0.10"
+victauri-core = "0.10"
 ```
 
 ```rust

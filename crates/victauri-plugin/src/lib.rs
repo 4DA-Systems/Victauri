@@ -94,6 +94,19 @@ use tauri::{Listener, Manager, RunEvent, Runtime};
 use tokio::sync::{Mutex, oneshot, watch};
 use victauri_core::{CommandRegistry, EventLog, EventRecorder};
 
+// A `tauri-v3` setting that does not match the app's Tauri major otherwise fails with a bare
+// E0599 (`no method named js_init_script` / `initialization_script`). These name the fix.
+#[cfg(feature = "tauri-v3")]
+const _: () = assert!(
+    tauri::VERSION.as_bytes()[0] == b'3',
+    "victauri-plugin: the `tauri-v3` feature is on, but the app links Tauri 2 — remove `tauri-v3`"
+);
+#[cfg(not(feature = "tauri-v3"))]
+const _: () = assert!(
+    tauri::VERSION.as_bytes()[0] == b'2',
+    "victauri-plugin: the app links Tauri 3 — enable victauri-plugin's `tauri-v3` feature"
+);
+
 pub use error::BuilderError;
 pub use privacy::PrivacyProfile;
 
@@ -123,15 +136,36 @@ pub use victauri_macros::inspectable;
 #[macro_export]
 macro_rules! register_commands {
     ($app:expr, $($schema_call:expr),+ $(,)?) => {{
+        // `try_state` is a `tauri::Manager` method: import the trait here, so the macro works
+        // without the caller importing it (it failed with E0599 otherwise).
+        #[allow(unused_imports)]
+        use $crate::__private_tauri::Manager as _;
         // `try_state` (not `state`) so this is a no-op in RELEASE builds: there
         // `init()` returns a no-op plugin that never manages `VictauriState`, and
         // `state()` would PANIC on the missing type. Registration is debug-only.
-        if let Some(state) = $app.try_state::<std::sync::Arc<$crate::VictauriState>>() {
+        if let Some(state) = $app.try_state::<::std::sync::Arc<$crate::VictauriState>>() {
             $(
                 state.registry.register($schema_call);
             )+
         }
     }};
+}
+
+/// Not public API: the `tauri` crate this plugin was built against, for [`register_commands!`].
+#[doc(hidden)]
+pub use tauri as __private_tauri;
+
+/// [`register_commands!`] compiles in a module that imports nothing (the documented
+/// `.setup(|app| …)` shape): it brings `tauri::Manager` into scope itself.
+#[cfg(test)]
+#[allow(dead_code)]
+mod register_commands_needs_no_imports {
+    fn setup<R: tauri::Runtime>(app: &mut tauri::App<R>) {
+        crate::register_commands!(app, crate::CommandInfo::new("greet"));
+    }
+    fn setup_handle<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+        crate::register_commands!(app, crate::CommandInfo::new("greet"));
+    }
 }
 
 const DEFAULT_PORT: u16 = 7373;
@@ -1144,7 +1178,8 @@ impl VictauriBuilder {
                         _ => {}
                     }
                 });
-            // The persistent bridge script (main frame only — iframes are walked from the parent).
+            // The persistent bridge script: main frame only where Tauri's plugin init script is (2.11
+            // and 3.0 are; iframes are walked from the parent) — Tauri 2.0 injects it into every frame.
             // Tauri 3 renamed `js_init_script` to `initialization_script`, same semantics.
             #[cfg(feature = "tauri-v3")]
             let builder = builder.initialization_script(js_init);
@@ -1316,7 +1351,7 @@ fn resolve_db_search_paths_against(
 /// In release builds: returns a no-op plugin. The MCP server never starts and the
 /// linker dead-strips it, the JS bridge and the introspection tools. The crate's
 /// dependencies are still compiled (the gate is `debug_assertions`, not a Cargo
-/// feature), and `#[inspectable]` command metadata is still registered.
+/// feature); `#[inspectable]` registers no command metadata in a release build.
 ///
 /// Setting the `VICTAURI_DISABLE=1` environment variable forces the no-op plugin
 /// even in a debug build — a hard kill-switch for shared environments or a release

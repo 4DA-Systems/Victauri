@@ -407,6 +407,7 @@ CSP, and IPC capture completeness.
 |---|---|
 | `transport` | `fetch` (custom protocol, desktop default) · `post_message_fallback` (Tauri switched after a custom-protocol failure) · `post_message` (always postMessage, e.g. Android) · `unknown` (no IPC yet) |
 | `capture` | `full` · `requests_only` (responses unobservable; calls logged with status `unknown`) · `none` (switch detected, traffic invisible) · `unknown` |
+| `post_message_hook` | `installed` · `replaced` (page code swapped `JSON.stringify`; postMessage capture is then `none`) · `missing` |
 | `fetch_calls`, `post_message_calls`, `post_message_responses` | counters for this page |
 | `fallback_detected_via`, `fallback_at` | `console_warning` / `custom_protocol_blocked`, and when |
 | `note` | plain-language explanation |
@@ -414,6 +415,13 @@ CSP, and IPC capture completeness.
 When Tauri has switched to postMessage, `warnings` includes `ipc-postmessage-fallback`. The same
 object is attached as `ipc_capture` to `detect_ghost_commands`, `check_ipc_integrity`, and
 `introspect` `coverage` / `command_catalog` / `command_timings`.
+
+postMessage-captured calls are unproven (Tauri's callback functions are page-callable, so page
+script can stage one): ghost detection keeps them in a separate `post_message_only` tier and
+`command_catalog` prefers fetch-transport shapes (`shapes_from_post_message`). `coverage` and
+`command_timings` do count them — on Android every call travels over postMessage. An IPC entry
+whose callback ids two different commands claimed is flagged `ids_contested` with
+`contested_commands`.
 
 ---
 
@@ -690,7 +698,6 @@ page-scoped (cleared on reload).
 | `clear` | `id` | Remove a rule by id |
 | `clear_all` | — | Remove all rules |
 | `matches` | `limit` | Log of intercepted requests |
-| `status_text` | string | no | `fulfill`: mock response status text |
 
 **`add` parameters:**
 
@@ -700,8 +707,9 @@ page-scoped (cleared on reload).
 | `match_type` | string | no | `substring` (default), `glob` (`*` matches any run of characters; every other character, including `?`, is literal), `regex`, `exact` |
 | `method` | string | no | Restrict to one HTTP method |
 | `behavior` | string | no | `block` (abort), `fulfill` (mock — default), `delay` |
-| `status` | number | no | Mock response status (fulfill, default 200) |
-| `headers` | object | no | Mock response headers (fulfill) |
+| `status` | number | no | Mock response status (fulfill, default 200; ignored by Tauri's `invoke` on an IPC URL) |
+| `status_text` | string | no | Mock response status text (fulfill) |
+| `headers` | object | no | Mock response headers (fulfill; an IPC mock needs `"Tauri-Response": "ok"` to resolve `invoke`) |
 | `body` | any | no | Mock response body (fulfill) |
 | `content_type` | string | no | Mock content-type (fulfill, default `application/json`) |
 | `delay_ms` | number | no | Latency to inject (delay; also delays a fulfill) |
@@ -719,20 +727,40 @@ page-scoped (cleared on reload).
 > (`fulfill` is fetch-only). Top-level navigation, sub-resources (img/css), and
 > WebSocket frames are not intercepted.
 >
-> **Tauri IPC is observe-only.** The app's real `invoke` traffic
-> (`http://ipc.localhost/…` on Windows, `ipc://localhost/…` on macOS/Linux) is
-> *logged* (`logs ipc`, and a rule may even show up in `matches`), but a rule
-> does **not** control it — Tauri serves real IPC below the JS `fetch` layer the
-> bridge can reach, so the call still goes through, undelayed. The `fault` tool
-> does not touch the app's real frontend IPC either: it only applies to commands
-> you drive through `invoke_command`. Neither tool can reproduce a failure a user
-> clicking the UI would hit.
+> **Rules on Tauri IPC change what the app's real `invoke` gets.** On the fetch
+> transport (`http://ipc.localhost/<cmd>` on Windows — `https://ipc.localhost/<cmd>` with `useHttpsScheme` — `ipc://localhost/<cmd>` on
+> macOS/Linux — the desktop default until a fallback), Tauri's `invoke` goes
+> through the page's `fetch`, so a matching rule takes effect (verified live on
+> Windows, Tauri 2.11.5):
 >
-> **A `block` rule on a Tauri IPC URL switches the page to postMessage IPC.** The
-> blocked fetch rejects, which Tauri treats as a broken custom protocol: it
-> retries that call over `window.ipc.postMessage` and uses postMessage for the
-> rest of the page's life (until a reload). Victauri still captures those calls
-> (`transport: "post_message"`) and `get_diagnostics` reports the switch.
+> - **`fulfill` mocks the command.** The Rust handler never runs. `invoke`
+>   resolves with the body only when `headers` include `"Tauri-Response": "ok"`;
+>   otherwise it rejects with the body — which is how to make a command *fail*
+>   for a user clicking the UI. Tauri reads the body by `content_type`, and a mock
+>   it could not read (no body, a non-JSON body or a 204 under `application/json`)
+>   would make it run the REAL command over postMessage. So `add` refuses such a
+>   rule when its pattern names the IPC host, and refuses any mock the `Response`
+>   constructor rejects (an invalid header, a non-ByteString `status_text`). A
+>   broader pattern (`greet`, `*/greet`) is accepted with an `ipc_warning`; a
+>   matching IPC call then gets a Tauri error from Victauri (logged
+>   `mock_unreadable`) — the real command never runs.
+> - **`delay` holds the call back** before it reaches the backend.
+> - **`block` does NOT fail the call.** The blocked fetch rejects, which Tauri
+>   treats as a broken custom protocol: it retries that call over
+>   `window.ipc.postMessage` (the backend still runs it) and uses postMessage for
+>   the rest of the page's life (until a reload). Victauri still captures those
+>   calls (`transport: "post_message"`) and `get_diagnostics` reports the switch.
+>
+> The IPC log tags calls a rule touched: `mocked: true` (and `route_rule`) when a
+> rule answered it, `route_delay_ms` when one held it back. Mocked calls never
+> reached the backend, so ghost detection, `command_catalog` and `coverage` leave
+> them out; `command_timings` also leaves out delayed calls. A mocked call's
+> `status` follows `Tauri-Response`, as the app's `invoke` does (the HTTP status is
+> ignored). `add` returns an
+> `ipc_note` whenever a rule can match an IPC URL (a broad pattern such as `*` or
+> `localhost` does too). postMessage IPC (always on Android; on desktop after a
+> fallback) is not affected by rules. The `fault` tool is separate: it acts on
+> commands you drive through `invoke_command`.
 
 ---
 
@@ -840,7 +868,7 @@ checkpoints or inspects the `-wal` file (`wal_checkpoint` is reported as "not ru
 
 Probe a backend command handler under failure for chaos engineering.
 
-> **Scope:** faults apply **only** to commands you run via the `invoke_command` tool — they do **not** intercept the app's real user-driven IPC (`window.__TAURI_INTERNALS__.invoke`), which Tauri serves below the JS layer Victauri can reach. Use `fault` to test a handler's error path when *you* drive it (e.g. "does my error branch return the right shape on a DB failure?"). It does not reproduce a failure a user clicking the UI would experience — that path is not interceptable cross-platform without CDP.
+> **Scope:** faults apply **only** to commands you run via the `invoke_command` tool — they do **not** touch the app's real user-driven IPC (`window.__TAURI_INTERNALS__.invoke`). Use `fault` to test a handler's error path when *you* drive it (e.g. "does my error branch return the right shape on a DB failure?"). To make a call the *user's* click triggers fail or slow down, use a [`route`](#route) rule on its IPC URL (`fulfill` without a `Tauri-Response: ok` header, or `delay`) — that works on Tauri's fetch transport only.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|

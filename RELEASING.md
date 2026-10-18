@@ -62,9 +62,13 @@ publish the crates to crates.io in dependency order → GitHub Release.
 
 Then list the release in the **MCP Registry** (`server.json`, name
 `io.github.4DA-Systems/victauri` — the namespace is the GitHub login and is matched
-case-sensitively): `mcp-publisher login github && mcp-publisher publish`. The registry reads the
-`mcp-name:` line from the README of the *published* `victauri-cli` version, so it must be right
-before the crate is uploaded.
+case-sensitively): run the **MCP Registry** workflow (`gh workflow run mcp-registry.yml`) once the
+crates are on crates.io. It logs in with the workflow's GitHub OIDC token (no secret, no
+interactive login), checks that server.json's version is published and its description fits the
+schema (≤ 100 characters), and runs a pinned, checksum-verified `mcp-publisher publish`. (By hand:
+`mcp-publisher login github && mcp-publisher publish`.) The registry reads the `mcp-name:` line
+from the README of the *published* `victauri-cli` version, so it must be right before the crate
+is uploaded.
 
 ## VS Code extension — `vscode-v*` (decoupled)
 

@@ -8,7 +8,7 @@ Add the test crate to your dev dependencies:
 
 ```toml
 [dev-dependencies]
-victauri-test = "0.9"
+victauri-test = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -28,7 +28,7 @@ Run it:
 
 ```bash
 pnpm tauri dev                                   # start your app
-VICTAURI_E2E=1 cargo test --test smoke           # run tests
+cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke   # run tests (from the app crate)
 ```
 
 ## Test Client
@@ -42,10 +42,11 @@ use victauri_test::VictauriClient;
 
 #[tokio::test]
 async fn test_my_app() {
-    let client = VictauriClient::connect(7373).await.unwrap();
+    // discover() finds the running app and its auth token (see below).
+    let mut client = VictauriClient::discover().await.unwrap();
 
     let title = client.eval_js("document.title").await.unwrap();
-    assert!(title.contains("My App"));
+    assert!(title.to_string().contains("My App"));
 
     client.click("e3").await.unwrap();
     client.fill("e5", "hello@example.com").await.unwrap();
@@ -54,16 +55,21 @@ async fn test_my_app() {
 
 ### Auto-Discovery
 
-`discover()` reads the port and auth token from temp files written by the plugin:
+`discover()` reads the port and auth token from the discovery files the plugin writes. With
+several Victauri apps running, `cargo test` inside a Tauri app crate picks that crate's app (its
+`tauri.conf.json` identifier); otherwise select one with `VICTAURI_APP` or `discover_app(Some(…))`:
 
 ```rust
 let mut client = VictauriClient::discover().await.unwrap();
 ```
 
+`VictauriClient::connect(7373)` connects to a fixed port WITHOUT a token, so it only works
+against an app built with `auth_disabled()`.
+
 ### With Authentication
 
 ```rust
-let client = VictauriClient::connect_with_token(7373, "my-secret-token")
+let mut client = VictauriClient::connect_with_token(7373, Some("my-secret-token"))
     .await
     .unwrap();
 ```
@@ -603,7 +609,7 @@ async fn save_settings(settings: Settings) -> Result<(), AppError> {
 }
 ```
 
-This generates a command schema at compile time. The schema is registered through `inventory` in every build profile, release included: a small static table plus a startup constructor. Commands become discoverable through `get_registry` and natural language via `resolve_command`.
+This generates a command schema at compile time. In debug builds the schema is registered through `inventory`; in a release build nothing is registered and `<fn>__schema()` returns only the name and the async flag. Commands become discoverable through `get_registry` and natural language via `resolve_command`.
 
 To auto-discover all instrumented commands:
 
@@ -845,7 +851,7 @@ Victauri tests run in CI without special infrastructure. Pick the approach that 
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.9.0
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.0
   with:
     max-load-ms: 5000
     max-heap-mb: 256

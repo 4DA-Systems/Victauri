@@ -58,9 +58,11 @@ impl std::fmt::Display for TestError {
                     f,
                     "connection failed ({host}:{port}): {reason}\n\
                      \n  Possible fixes:\n\
-                     \x20 - Is your Tauri app running? Start it with: pnpm tauri dev\n\
+                     \x20 - Is your Tauri app running (a debug build)? e.g. `npm run tauri dev` /\n\
+                     \x20   `pnpm tauri dev` (add `--features victauri` if `victauri init --optional`\n\
+                     \x20   set it up)\n\
                      \x20 - Check that victauri-plugin is wired in your Tauri builder\n\
-                     \x20 - Try a different port: VICTAURI_PORT={port} cargo test\n\
+                     \x20 - If the app runs on another port, set VICTAURI_PORT to that port\n\
                      \x20 - Run `victauri doctor` for full diagnostics"
                 )
             }

@@ -1,0 +1,56 @@
+name: MCP Registry
+
+# Publish server.json to the MCP Registry (io.github.4DA-Systems/victauri) with GitHub OIDC:
+# the registry grants this repository's owner namespace from the workflow's identity token, so
+# no secret and no interactive `mcp-publisher login` is needed.
+#
+# Manual, and only after the crates are live: the registry verifies the `victauri-cli` crate
+# named in server.json (its README carries `mcp-name: io.github.4DA-Systems/victauri`), so the
+# version must already be on crates.io. (A GitHub Release created by release.yml's GITHUB_TOKEN
+# does not trigger other workflows, hence workflow_dispatch.)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Publish server.json
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      id-token: write # GitHub OIDC login to the MCP Registry
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check server.json matches a published crate
+        run: |
+          version="$(jq -r .version server.json)"
+          pkg_version="$(jq -r '.packages[0].version' server.json)"
+          crate="$(jq -r '.packages[0].identifier' server.json)"
+          desc_len="$(jq -r '.description | length' server.json)"
+          echo "server.json $version, package $crate $pkg_version, description $desc_len chars"
+          [ "$version" = "$pkg_version" ] || { echo "::error::server.json version $version != package version $pkg_version"; exit 1; }
+          [ "$desc_len" -le 100 ] || { echo "::error::description is $desc_len chars (registry max 100)"; exit 1; }
+          code="$(curl -s -o /dev/null -w '%{http_code}' -H 'User-Agent: victauri-mcp-registry-workflow (github.com/4DA-Systems/Victauri)' \
+            "https://crates.io/api/v1/crates/$crate/$pkg_version")"
+          [ "$code" = "200" ] || { echo "::error::$crate $pkg_version is not on crates.io (HTTP $code): publish the crates first"; exit 1; }
+
+      # Pinned release + checksum (the registry docs install `latest`; a release workflow must not).
+      - name: Install mcp-publisher v1.8.1
+        run: |
+          curl -fsSL -o mcp-publisher.tar.gz \
+            "https://github.com/modelcontextprotocol/registry/releases/download/v1.8.1/mcp-publisher_linux_amd64.tar.gz"
+          echo "a06c9096dcb9727c13555b6be26c7effa707b01f06a4c561ba7a3635443cf2cc  mcp-publisher.tar.gz" | sha256sum -c -
+          tar xzf mcp-publisher.tar.gz mcp-publisher
+
+      - name: Log in (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish
+        run: ./mcp-publisher publish

@@ -657,11 +657,14 @@ pub struct RouteParams {
     pub method: Option<String>,
     /// What the rule does: block, fulfill, delay (for add). Defaults to fulfill.
     pub behavior: Option<RouteBehavior>,
-    /// Mock response status code (for fulfill). Default 200.
+    /// Mock response status code (for fulfill). Default 200. On a Tauri IPC URL the status is
+    /// ignored: the app's `invoke` resolves only when `headers` include
+    /// `"Tauri-Response": "ok"`, and rejects with the body otherwise.
     pub status: Option<u16>,
     /// Mock response status text (for fulfill).
     pub status_text: Option<String>,
-    /// Mock response headers as a JSON object (for fulfill).
+    /// Mock response headers as a JSON object (for fulfill). For a Tauri IPC mock to resolve
+    /// the app's `invoke`, include `"Tauri-Response": "ok"`.
     pub headers: Option<serde_json::Value>,
     /// Mock response body (for fulfill). Strings sent as-is; other JSON is serialized.
     pub body: Option<serde_json::Value>,

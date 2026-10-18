@@ -336,9 +336,14 @@ pub fn insert_server(
     let value_text = pretty_at(value, &unit, &member, nl);
     let after = skip_ws(b, open + 1);
     let new_text = if b.get(after) == Some(&b'}') {
-        // Empty object: replace its inside with the single member.
+        // Empty object: the single member goes after whatever sits between the braces. That
+        // is only whitespace in strict JSON, but in JSONC it can be a comment (`{ // TODO }`,
+        // `{ /* project settings */ }`) — `blank` shows it as spaces, so it must be kept from
+        // `text`, not dropped. Trailing whitespace goes (the member starts its own line, so a
+        // `//` comment stays closed by that newline).
+        let inside = text[open + 1..after].trim_end();
         format!(
-            "{}{nl}{member}{key_json}: {value_text}{nl}{base}{}",
+            "{}{inside}{nl}{member}{key_json}: {value_text}{nl}{base}{}",
             &text[..=open],
             &text[after..]
         )
@@ -483,6 +488,44 @@ mod tests {
         assert_eq!(v["servers"]["a"]["command"], "a");
         assert_eq!(v["servers"]["victauri"], entry());
         assert_eq!(v["inputs"], serde_json::json!([]));
+    }
+
+    /// Filling an EMPTY object must keep a comment written between its braces (it used to be
+    /// deleted along with the whitespace there).
+    #[test]
+    fn filling_an_empty_object_keeps_comments_inside_it() {
+        let vscode = "{\n  \"servers\": { // TODO\n  }\n}\n";
+        let out = written(insert_server(Some(vscode), "servers", "victauri", &entry()));
+        assert!(out.contains("// TODO"), "{out}");
+        assert_eq!(parse(&out)["servers"]["victauri"], entry());
+        assert!(
+            out.starts_with("{\n  \"servers\": { // TODO\n    \"victauri\": {"),
+            "{out}"
+        );
+
+        let zed = "{ /* project settings */ }";
+        let out = written(insert_server(
+            Some(zed),
+            "context_servers",
+            "victauri",
+            &entry(),
+        ));
+        assert!(out.contains("/* project settings */"), "{out}");
+        assert_eq!(parse(&out)["context_servers"]["victauri"], entry());
+
+        let block = "{\r\n  \"mcpServers\": {\r\n    /* a */\r\n    // b\r\n  }\r\n}\r\n";
+        let out = written(insert_server(
+            Some(block),
+            "mcpServers",
+            "victauri",
+            &entry(),
+        ));
+        assert!(out.contains("/* a */") && out.contains("// b"), "{out}");
+        assert!(
+            !out.replace("\r\n", "").contains('\n'),
+            "CRLF kept: {out:?}"
+        );
+        assert_eq!(parse(&out)["mcpServers"]["victauri"], entry());
     }
 
     #[test]

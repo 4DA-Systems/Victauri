@@ -5,7 +5,7 @@ trade-offs, and the right one depends on what you need. This page tries to be fa
 where another tool is the better choice, it says so.
 
 Facts about other projects come from their own documentation and source, checked on
-**2026-10-16**, with links. If something here is out of date or wrong, please open an issue and
+**2026-10-18**, with links. If something here is out of date or wrong, please open an issue and
 we will correct it.
 
 ## The short version
@@ -16,7 +16,7 @@ we will correct it.
   all through one MCP server that is authenticated and localhost-only by default. It is
   desktop-only and young.
 - **hypothesi/mcp-server-tauri** is the closest alternative for AI agents. It has much better
-  distribution (an installer for about a dozen MCP clients, agent skills, a Claude Code plugin,
+  distribution (an installer for 11 MCP clients, agent skills, a Claude Code plugin,
   a Gemini extension), and it supports **mobile** (Android and iOS emulators and simulators).
 - **WebdriverIO's Tauri service** is the choice if you want **W3C WebDriver** and a standard
   JavaScript test runner (Mocha, Jasmine, Cucumber) with its reporters.
@@ -37,21 +37,21 @@ we will correct it.
 | **Primary audience** | AI agents and Rust tests | AI agents | Test suites (JS) | CLI and AI agents | Test suites (JS/TS/Python/…) | Humans (DevTools UI) |
 | **Interface** | MCP (Streamable HTTP, plus a stdio bridge) and REST, embedded in the app | MCP (stdio Node server) ↔ WebSocket ↔ Tauri plugin | W3C WebDriver | CLI; `tauri-pilot mcp` stdio server; JSON-RPC to the plugin | Chrome DevTools Protocol | gRPC / gRPC-web to a web UI |
 | **Database access** | Yes: `query_db` and `db_health` on the app's SQLite, read-only (enforced by SQLite's authorizer) | Not documented | Not documented | Not documented | No (webview only) | Not documented |
-| **IPC capture with bodies** | Yes: request args and response body, captured continuously | Yes: opt-in monitor recording command, args, result, error and duration | Not documented (it can mock the invoke API) | No: the network log records sizes, not bodies | Partial: Tauri IPC appears as network requests on Windows | Yes: a "Calls" view with arguments and return values |
+| **IPC capture with bodies** | Yes: request args and response body, captured continuously | Yes: opt-in monitor recording command, args, result, error and duration | Records the calls its own invoke mocks receive (`mock.calls` / `mock.results`); no passive capture documented | No: the network log records sizes, not bodies | Partial: Tauri IPC appears as network requests on Windows | Yes: a "Calls" view with arguments and return values |
 | **App-defined backend state** | Yes: `app_state` probes registered by the app | Fixed metadata (app, Tauri version, windows) | No | No | No | No (shows config, logs and spans) |
 | **Recording / replay** | Yes: event recording with checkpoints, export/import, replay of argument-free IPC commands | Not documented | No (test-runner based) | Yes: record and replay UI interactions, export to a shell script | Playwright tracing (Windows only) | Not documented |
-| **Network mocking** | `route`: block, fulfill or delay fetch/XHR. Tauri IPC is observe-only | Not documented | Mocks Tauri's invoke API | Not documented | Yes: `page.route` | No |
+| **Network mocking** | `route`: block, fulfill or delay fetch/XHR; on the fetch transport it also mocks or delays the app's real Tauri IPC (tagged in the IPC log) | Not documented | Mocks Tauri's invoke API (native mode patches `window.__TAURI__.core`, so it needs `withGlobalTauri`) | Not documented | Yes: `page.route` | No |
 | **IPC contract / schema-drift checks** | Yes (`introspect contract_*`, `command_catalog`) | Not documented | No | No | No | No |
 | **Default bind address** | `127.0.0.1` only (port 7373, falls back through 7383) | `0.0.0.0`, documented as being for remote-device support; `Config::localhost_only()` is available | Embedded driver: `127.0.0.1:4445` | Unix socket / Windows named pipe (no TCP) | Whatever `--remote-debugging-port` is set to | `127.0.0.1:3033` on desktop, all interfaces on mobile |
 | **Authentication** | On by default: a per-run Bearer token in an owner-only, per-user discovery directory, plus DNS-rebinding and Origin guards | None documented | None documented | Owner-only socket or pipe permissions; no separate handshake | Not documented by Playwright | None documented |
 | **Release builds** | Inert by default: the plugin gates itself on `debug_assertions` | Users are told to wrap it in `#[cfg(debug_assertions)]` themselves | The docs warn never to ship it in production | Debug-only | Do not ship the debug port | The docs advise disabling it in production |
 | **Desktop platforms** | Windows, macOS, Linux | Windows, macOS, Linux | Windows, macOS, Linux | Windows, macOS, Linux | **Windows only** | Windows, macOS, Linux |
-| **Mobile** | **No** | **Yes**: Android and iOS (emulators and simulators) | Not documented | **Yes**: Android (via ADB) and the iOS Simulator | No | Android emulator documented |
-| **Trusted (OS-level) input** | Windows only (`SendInput`); synthetic events elsewhere | Not documented | Via WebDriver | Not documented | Via CDP (Windows) | No |
+| **Mobile** | **No** | **Yes**: Android and iOS (emulators, simulators and real devices on the LAN) | The plugin's source has Android and iOS code paths; the service docs cover desktop only | **Yes**: Android (via ADB) and the iOS Simulator | No | Android emulator documented |
+| **Trusted (OS-level) input** | Windows only (`SendInput`); synthetic events elsewhere | No: synthetic DOM events (`MouseEvent` / `KeyboardEvent` dispatched in the page) | The default embedded driver dispatches synthetic DOM events | Keys: OS-level via `enigo` (`isTrusted: true`) on Windows, macOS and Linux; clicks are synthetic | Via CDP (Windows) | No |
 | **Standards / test runner** | Rust: `victauri-test` with `cargo test`, JUnit XML from the CLI, a GitHub Action. **Not** WebDriver | MCP only | **W3C WebDriver** + WDIO runner and reporters | TOML scenarios with `--junit` | Playwright Test | None |
-| **Agent onboarding** | `victauri setup <client>` for 8 clients: Claude Code, Cursor, VS Code/Copilot, Windsurf/Devin, Codex, Gemini CLI, Zed, Roo; plus CLAUDE.md, AGENTS.md and a Claude Code skill | Installer via the third-party `aix` tool for 11 clients, plus agent skills, a Claude Code plugin marketplace entry and a Gemini extension | n/a | Agent skill via `npx skills add` | n/a | n/a |
-| **License** | Apache-2.0 | MIT | MIT | MIT | Apache-2.0 | Apache-2.0/MIT for `wire` and `devtools`; PolyForm Noncommercial for the rest |
-| **Maturity (2026-10-16)** | v0.9.0; repo created 2026-04; 4 GitHub stars | v0.13.1; created 2025-11; ~320 stars; frequent releases | `@wdio/tauri-service` 1.5.0; official Tauri docs point to it | v0.8.1; created 2026-04; ~86 stars | Mature (Playwright) | ~430 stars; tags up to v0.3.5 |
+| **Agent onboarding** | `victauri setup <client>` for 8 clients: Claude Code, Cursor, VS Code/Copilot, Windsurf/Devin, Codex, Gemini CLI, Zed, Roo; plus CLAUDE.md, AGENTS.md and a Claude Code skill | Installer via `aix` (a separate tool from the same maintainer) for 11 clients, plus agent skills, a Claude Code plugin marketplace entry and a Gemini extension | n/a | Agent skill via `npx skills add` | n/a | n/a |
+| **License** | Apache-2.0 | MIT | MIT | MIT | Apache-2.0 | Rust crates MIT OR Apache-2.0; the web UI (`clients/web`) PolyForm Noncommercial |
+| **Maturity (2026-10-18)** | v0.10.0; repo created 2026-04; 4 GitHub stars | v0.13.1; created 2025-11; ~320 stars; frequent releases | `@wdio/tauri-service` 1.5.0; official Tauri docs point to it | v0.8.1; created 2026-04; ~86 stars | Mature (Playwright) | ~430 stars; `tauri-plugin-devtools` v2.2.2 and a v3.0.0-alpha.0 (2026-09) |
 
 ## Where the others win
 
@@ -72,9 +72,12 @@ Be clear-eyed about these before you choose:
   grant `victauri:default`, because it sits below Tauri's permission layer.
 - **Native input outside Windows.** Victauri's trusted (OS-level) input is Windows-only. On
   macOS and Linux it falls back to synthetic DOM events (`isTrusted: false`).
-- **Faulting the real frontend IPC.** Victauri's `fault` tool and `route` rules do not
-  intercept the app's own `invoke()` calls; they apply to commands Victauri drives. The
-  WebdriverIO service's invoke mocking targets the frontend's own calls.
+- **Mocking the real frontend IPC on every transport.** Victauri's `route` rules mock or delay
+  the app's own `invoke()` calls only on Tauri's fetch transport (the desktop default); IPC sent
+  over postMessage (always on Android, and on desktop after a fallback) is observed but not
+  controlled, and the `fault` tool applies only to commands Victauri drives. The WebdriverIO
+  service mocks at the invoke API itself (native mode needs `withGlobalTauri`), independent of
+  transport.
 - **A human-facing UI.** For browsing logs, tracing spans and IPC calls by eye, CrabNebula
   DevTools has a far better interface. Victauri has no GUI beyond a VS Code extension.
 
@@ -86,11 +89,12 @@ Be clear-eyed about these before you choose:
 - **One process, both sides of the boundary.** The MCP server runs inside the Tauri process, so
   backend tools need no webview round trip, and `verify_state` can compare frontend and backend
   state in one call.
-- **Locked down by default.** It binds only to localhost, requires authentication by default, has
-  host and origin guards, and is inert in release builds without any action on your part. See
-  [Security](./security.md).
+- **Locked down by default, over HTTP.** It binds only to localhost, requires a per-run token by
+  default, has host and origin guards, and is inert in release builds without any action on your
+  part (tauri-pilot reaches a similar posture differently: debug-only, with an owner-only socket
+  and no TCP listener). See [Security](./security.md).
 - **The same tools on all three desktop engines** (WebView2, WKWebView, WebKitGTK), with no CDP
-  dependency.
+  dependency — as the other embedded tools also manage; only the CDP route is Windows-only.
 
 ## Sources
 
@@ -108,7 +112,7 @@ Be clear-eyed about these before you choose:
   [tauri-driver README](https://github.com/tauri-apps/tauri/blob/dev/crates/tauri-driver/README.md)
 - WebdriverIO: [Tauri service docs](https://webdriver.io/docs/desktop-testing/tauri),
   [service README](https://github.com/webdriverio/desktop-mobile/blob/main/packages/tauri-service/README.md),
-  [`tauri-plugin-wdio-webdriver`](https://docs.rs/crate/tauri-plugin-wdio-webdriver/1.3.0/source/README.md)
+  [`tauri-plugin-wdio-webdriver`](https://docs.rs/crate/tauri-plugin-wdio-webdriver/1.5.0/source/README.md)
 - tauri-pilot: [README](https://github.com/mpiton/tauri-pilot/blob/main/README.md),
   [SECURITY.md](https://github.com/mpiton/tauri-pilot/blob/main/SECURITY.md),
   [bridge.js](https://github.com/mpiton/tauri-pilot/blob/main/crates/tauri-plugin-pilot/js/bridge.js)

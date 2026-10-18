@@ -64,7 +64,7 @@ pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter}\
+        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) || null; }})\
          .filter(function(x){{ return x; }})"
     )
@@ -89,17 +89,21 @@ pub fn ghost_ipc_outcomes_js(since_ms: Option<i64>) -> String {
     };
     format!(
         "return (function() {{\
-         \n  var log = (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter};\
+         \n  var log = (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter};\
          \n  var byCmd = {{}};\
          \n  for (var i = 0; i < log.length; i++) {{\
          \n    var c = log[i]; if (!c || !c.command) continue;\
-         \n    var e = byCmd[c.command] || {{ command: c.command, ok: false, err: null }};\
-         \n    if (c.status === 'ok') {{ e.ok = true; }}\
+         \n    var e = byCmd[c.command] || {{ command: c.command, ok: false, err: null, pm_ok: false, pm_err: null }};\
+         \n    /* postMessage outcomes run through page-callable Tauri functions, so page script can \
+         stage them: they are kept apart and never prove (or disprove) a handler. */\
+         \n    var pm = c.transport === 'post_message';\
+         \n    if (c.status === 'ok') {{ if (pm) e.pm_ok = true; else e.ok = true; }}\
          \n    else if (c.status === 'error') {{\
          \n      var body = ((c.result != null ? String(c.result) : '') + ' ' + (c.error != null ? String(c.error) : ''));\
-         \n      var sample = body.slice(0, 160).toLowerCase();\
+         \n      var sample = body.trim().slice(0, 160).toLowerCase();\
          \n      /* keep the most diagnostic sample: a 'not found' error always wins over a generic one */\
-         \n      if (!e.err || sample.indexOf('not found') !== -1) {{ e.err = sample; }}\
+         \n      if (pm) {{ if (!e.pm_err || sample.indexOf('not found') !== -1) e.pm_err = sample; }}\
+         \n      else if (!e.err || sample.indexOf('not found') !== -1) {{ e.err = sample; }}\
          \n    }}\
          \n    byCmd[c.command] = e;\
          \n  }}\
@@ -122,6 +126,13 @@ pub struct IpcOutcome {
     /// command never errored.
     #[serde(default)]
     pub err: Option<String>,
+    /// Success observed only over Tauri's postMessage transport. Those outcomes run through
+    /// page-callable Tauri functions, so page script can stage them: never proof of a handler.
+    #[serde(default)]
+    pub pm_ok: bool,
+    /// An error sample observed only over postMessage (likewise unproven).
+    #[serde(default)]
+    pub pm_err: Option<String>,
 }
 
 /// Tauri framework/plugin commands (e.g. `plugin:event|emit`, `plugin:updater|check`) are
@@ -193,8 +204,33 @@ pub fn build_ghost_report(
     }
     let confirmed_names: HashSet<&str> = confirmed.iter().map(|(n, _)| *n).collect();
 
+    // Commands seen ONLY over Tauri's postMessage transport (always on Android; on desktop
+    // after a fallback). Their outcomes run through page-callable Tauri functions, so page
+    // script can stage them: listed with what was observed, neither verified nor a ghost.
+    let post_message_only: Vec<serde_json::Value> = outcomes
+        .iter()
+        .filter(|o| {
+            !o.ok
+                && o.err.is_none()
+                && (o.pm_ok || o.pm_err.is_some())
+                && !is_framework_builtin(&o.command)
+        })
+        .map(|o| {
+            serde_json::json!({
+                "name": o.command,
+                "observed_ok": o.pm_ok,
+                "error": o.pm_err,
+            })
+        })
+        .collect();
+    let post_message_only_names: HashSet<&str> = post_message_only
+        .iter()
+        .filter_map(|v| v["name"].as_str())
+        .collect();
+
     // Corrected `frontend_only`: registry-absent candidates, minus proven handlers, minus
-    // framework builtins, minus the already-listed confirmed ghosts.
+    // framework builtins, minus the already-listed confirmed ghosts and postMessage-only
+    // commands (reported in their own tier).
     let frontend_only: Vec<_> = report
         .frontend_only
         .iter()
@@ -202,6 +238,7 @@ pub fn build_ghost_report(
             !handled.contains(g.name.as_str())
                 && !is_framework_builtin(&g.name)
                 && !confirmed_names.contains(g.name.as_str())
+                && !post_message_only_names.contains(g.name.as_str())
         })
         .cloned()
         .collect();
@@ -223,12 +260,16 @@ pub fn build_ghost_report(
          set_language is no longer a false positive). `frontend_only` ({fe}) is the weaker \
          candidate tier: invoked, never observed succeeding, not a framework builtin, and absent \
          from the introspection registry ({registry_total} known) — confirm against the app's \
-         generate_handler! before filing. `excluded_builtins` are Tauri/plugin framework \
-         commands, never app ghosts. The `reliability` field describes only `frontend_only`; \
-         `confirmed_ghosts` is high-confidence regardless.",
+         generate_handler! before filing. `post_message_only` ({pm}) were seen only over \
+         Tauri's postMessage IPC transport (Android, or after a fallback): page script can \
+         stage those outcomes, so they neither verify a handler nor confirm a ghost. Calls a \
+         `route` rule answered in the page are left out entirely. `excluded_builtins` are \
+         Tauri/plugin framework commands, never app ghosts. The `reliability` field describes \
+         only `frontend_only`; `confirmed_ghosts` is high-confidence regardless.",
         confirmed = confirmed.len(),
         verified = handled.len(),
         fe = frontend_only.len(),
+        pm = post_message_only.len(),
     );
 
     serde_json::json!({
@@ -238,6 +279,7 @@ pub fn build_ghost_report(
             .collect::<Vec<_>>(),
         "verified_handlers": handled.len(),
         "frontend_only": frontend_only,
+        "post_message_only": post_message_only,
         "excluded_builtins": excluded_builtins,
         "registry_only": report.registry_only,
         "total_frontend_commands": report.total_frontend_commands,
@@ -264,7 +306,7 @@ pub fn ipc_timing_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false }}) || []){filter}\
+        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, unrouted: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) ? {{ command: c.command, \
          duration_ms: (typeof c.duration_ms === 'number' ? c.duration_ms : null) }} : null; }})\
          .filter(function(x){{ return x; }})"
@@ -371,21 +413,27 @@ pub fn ipc_catalog_projection_js() -> String {
             return typeof v;\
         }\
         var V = window.__VICTAURI__;\
-        var log = V && V.getIpcLog ? (V.getIpcLog(0, { bodies: false }) || []) : [];\
+        var log = V && V.getIpcLog ? (V.getIpcLog(0, { bodies: false, backend_only: true }) || []) : [];\
         var cat = Object.create(null), meta = Object.create(null);\
         for (var i = 0; i < log.length; i++){\
             var e = log[i]; if (!e || !e.command) continue;\
             var c = cat[e.command];\
             if (!c){\
                 c = cat[e.command] = { command: e.command, call_count: 0, error_count: 0, arg_shape: null, result_shape: null, last_status: null };\
-                meta[e.command] = { first: e.id, ok: null };\
+                meta[e.command] = { first: e.id, firstPm: false, ok: null, okPm: false };\
             }\
             c.call_count++;\
             var isErr = (e.status && e.status !== 'ok') || (e.error != null);\
             if (isErr) c.error_count++;\
             c.last_status = e.status || (isErr ? 'error' : 'ok');\
-            if (!isErr && meta[e.command].ok === null) meta[e.command].ok = e.id;\
+            /* Shapes come from fetch-transport calls when there are any: postMessage calls can \
+               be staged by page script. A fetch call replaces a postMessage pick once. */\
+            var pm = e.transport === 'post_message', mm = meta[e.command];\
+            if (!pm && mm.firstPm) { mm.first = e.id; mm.firstPm = false; }\
+            else if (mm.first === e.id) { mm.firstPm = pm; }\
+            if (!isErr && (mm.ok === null || (mm.okPm && !pm))) { mm.ok = e.id; mm.okPm = pm; }\
         }\
+        for (var mk in meta){ if (meta[mk].firstPm || (meta[mk].ok !== null && meta[mk].okPm)) cat[mk].shapes_from_post_message = true; }\
         /* Bodies only for the <= 2 calls per command whose shapes are reported: the first \
            call (args) and the first successful one (result; else the first call). */\
         var ids = [];\
@@ -441,6 +489,13 @@ pub fn merge_command_catalog(
             "arg_shape": e.get("arg_shape").cloned().unwrap_or(serde_json::Value::Null),
             "result_shape": e.get("result_shape").cloned().unwrap_or(serde_json::Value::Null),
         });
+        // Shapes learned only from postMessage-transport calls, which page script can stage.
+        if e.get("shapes_from_post_message")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            entry["shapes_from_post_message"] = serde_json::json!(true);
+        }
         attach_registry_metadata(&mut entry, reg.get(name).copied());
         out.push(entry);
     }
@@ -1112,8 +1167,8 @@ mod ghost_projection_tests {
     fn projects_whole_log_when_since_absent() {
         let js = ghost_ipc_projection_js(None);
         assert!(
-            js.contains("getIpcLog(0, { bodies: false })"),
-            "body-free view: {js}"
+            js.contains("getIpcLog(0, { bodies: false, backend_only: true })"),
+            "body-free, backend-only view: {js}"
         );
         assert!(js.contains(".map("));
         // No time window applied.
@@ -1136,6 +1191,21 @@ mod ghost_projection_tests {
     fn ignores_nonpositive_since() {
         assert!(!ghost_ipc_projection_js(Some(0)).contains("Date.now()"));
         assert!(!ghost_ipc_projection_js(Some(-10)).contains("Date.now()"));
+    }
+
+    /// A `route` rule can answer an IPC call in the page; such a call is no evidence about
+    /// the backend, so every evidence-based analysis must ask for backend-only entries
+    /// (timings also drop route-delayed calls, whose duration includes the injected delay).
+    #[test]
+    fn analyses_exclude_route_answered_calls() {
+        for js in [
+            ghost_ipc_projection_js(None),
+            super::ghost_ipc_outcomes_js(None),
+            super::ipc_catalog_projection_js(),
+        ] {
+            assert!(js.contains("backend_only: true"), "{js}");
+        }
+        assert!(super::ipc_timing_projection_js(None).contains("unrouted: true"));
     }
 }
 
@@ -1473,7 +1543,42 @@ mod ghost_report_tests {
             command: command.to_string(),
             ok,
             err: err.map(str::to_string),
+            pm_ok: false,
+            pm_err: None,
         }
+    }
+
+    /// Outcomes seen only over Tauri's postMessage transport run through page-callable Tauri
+    /// functions (red team F1: a page staged a "successful" call to a non-existent command).
+    /// They must neither verify a handler nor confirm a ghost — they get their own tier.
+    #[test]
+    fn postmessage_only_outcomes_neither_verify_nor_confirm() {
+        let registry = CommandRegistry::new();
+        let staged_ok = IpcOutcome {
+            pm_ok: true,
+            ..outcome("definitely_not_a_command", false, None)
+        };
+        let staged_not_found = IpcOutcome {
+            pm_err: Some("command real_cmd not found".to_string()),
+            ..outcome("real_cmd", false, None)
+        };
+        // Fetch evidence still wins when both exist.
+        let proven = IpcOutcome {
+            pm_ok: true,
+            ..outcome("greet", true, None)
+        };
+        let v = build_ghost_report(&[staged_ok, staged_not_found, proven], &registry);
+        assert_eq!(v["verified_handlers"], 1, "{v}");
+        assert!(v["confirmed_ghosts"].as_array().unwrap().is_empty(), "{v}");
+        assert!(v["frontend_only"].as_array().unwrap().is_empty(), "{v}");
+        let pm: Vec<&str> = v["post_message_only"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(pm, ["definitely_not_a_command", "real_cmd"], "{v}");
+        assert_eq!(v["post_message_only"][0]["observed_ok"], true, "{v}");
     }
 
     #[test]

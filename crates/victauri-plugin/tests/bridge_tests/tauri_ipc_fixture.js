@@ -12,7 +12,8 @@
 // `window.__TAURI_INTERNALS__.runCallback(id, value)`).
 //
 // Configure BEFORE this script runs with `window.__vtestTauriConfig = { os, failCustomProtocol,
-// hideCallbacks }`: `os` 'windows' (default) | 'linux' | 'android'; `failCustomProtocol`
+// hideCallbacks, httpsScheme }` (`httpsScheme`: the app sets `useHttpsScheme`, so IPC goes to
+// `https://ipc.localhost/`): `os` 'windows' (default) | 'linux' | 'android'; `failCustomProtocol`
 // makes every custom-protocol fetch reject (blocked scheme / CSP); `hideCallbacks` omits the
 // `__TAURI_INTERNALS__.callbacks` debug property (a hypothetical future Tauri).
 (function () {
@@ -70,7 +71,7 @@
   var prevFetch = window.fetch;
   window.fetch = function (input, init) {
     var url = typeof input === 'string' ? input : String(input);
-    var m = /^(?:http:\/\/ipc\.localhost|ipc:\/\/localhost)\/(.*)$/.exec(url);
+    var m = /^(?:https?:\/\/ipc\.localhost|ipc:\/\/localhost)\/(.*)$/.exec(url);
     if (!m) return prevFetch.apply(this, arguments);
     if (backend.failCustomProtocol) {
       return Promise.reject(new TypeError('Failed to fetch'));
@@ -105,7 +106,7 @@
     }
 
     const osName = OS
-    const protocolScheme = 'http'
+    const protocolScheme = cfg.httpsScheme ? 'https' : 'http'
 
     Object.defineProperty(window.__TAURI_INTERNALS__, 'convertFileSrc', {
       value: function (filePath, protocol = 'asset') {

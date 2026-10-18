@@ -532,10 +532,10 @@ jobs:
         shell: bash
         env:
           CARGO_TARGET_DIR: target-tauri3-clippy
-        run: RUSTC_WRAPPER="$(rustup which clippy-driver)" cargo check --manifest-path examples/tauri3/Cargo.toml -p victauri-plugin
+        run: RUSTC_WRAPPER="$(rustup which clippy-driver)" cargo check --locked --manifest-path examples/tauri3/Cargo.toml -p victauri-plugin
 
       - name: Build the demo app against Tauri 3 (victauri-plugin `tauri-v3`)
-        run: cargo build --manifest-path examples/tauri3/Cargo.toml
+        run: cargo build --locked --manifest-path examples/tauri3/Cargo.toml
 
       - name: Prove introspection live on Tauri 3 (${{ matrix.os }})
         shell: bash
@@ -595,10 +595,10 @@ jobs:
           shot=$(call screenshot '{}' || true)
           # A warning, not a failure: hosted runners may lack the capture permission/compositor
           # (macOS screen recording, Windows Graphics Capture) — the same reason live-app skips it.
-          if echo "$shot" | grep -q 'iVBORw0KGgo'; then echo "[6 screenshot] PNG ok"; else echo "::warning::screenshot: ${shot:0:300}"; fi
+          if echo "$shot" | grep -q 'iVBORw0KGgo'; then echo "[6 screenshot] PNG ok"; shot_ok=" + screenshot"; else echo "::warning::screenshot: ${shot:0:300}"; shot_ok=" (screenshot NOT proven — see warning)"; fi
           diag=$(call get_diagnostics '{}');                                  echo "[7 diag    ] $(echo "$diag" | jq -c '.result.info.url')"
 
-          echo "PROVEN on $RUNNER_OS with Tauri 3: webview + DOM + IPC→Rust + IPC log + windows + registry + screenshot."
+          echo "PROVEN on $RUNNER_OS with Tauri 3: webview + DOM + IPC→Rust + IPC log + windows + registry${shot_ok}."
           kill "$APP_PID" 2>/dev/null || true
 
       - name: Upload app log on failure

@@ -243,8 +243,48 @@ pub fn try_resolve_connection(app: Option<&str>) -> Result<(u16, Option<String>)
     } else {
         find_live_servers()
     };
-    resolve_from(port, token, app.as_deref(), &servers)
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR").map(std::path::PathBuf::from);
+    resolve_in_crate(
+        port,
+        token,
+        app.as_deref(),
+        &servers,
+        manifest_dir.as_deref(),
+    )
 }
+
+/// [`resolve_from`], except that when several apps are running and nothing selects one, a
+/// run inside a Tauri app crate (`manifest_dir` — `cargo test` sets `CARGO_MANIFEST_DIR`)
+/// means THAT app: its `tauri.conf.json` identifier selects it.
+fn resolve_in_crate(
+    port: Option<u16>,
+    token: Option<String>,
+    app: Option<&str>,
+    servers: &[DiscoveredServer],
+    manifest_dir: Option<&std::path::Path>,
+) -> Result<(u16, Option<String>), String> {
+    let resolved = resolve_from(port, token.clone(), app, servers);
+    if app.is_none()
+        && let Err(why) = &resolved
+        && why.starts_with(AMBIGUOUS_PREFIX)
+        && let Some(id) = manifest_dir.and_then(tauri_conf_identifier)
+    {
+        return resolve_from(port, token, Some(&id), servers);
+    }
+    resolved
+}
+
+/// The `identifier` in `dir`'s `tauri.conf.json`, if there is one.
+fn tauri_conf_identifier(dir: &std::path::Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("tauri.conf.json")).ok()?;
+    let conf: serde_json::Value = serde_json::from_str(&text).ok()?;
+    conf.get("identifier")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|id| !id.is_empty())
+}
+
+const AMBIGUOUS_PREFIX: &str = "Multiple Victauri apps are running";
 
 /// Pure core of [`try_resolve_connection`].
 fn resolve_from(
@@ -332,7 +372,7 @@ pub fn port_app_mismatch(port: u16, found: &str, app: &str) -> String {
 fn ambiguity_message<'a>(servers: impl Iterator<Item = &'a DiscoveredServer>) -> String {
     let labels: Vec<String> = servers.map(DiscoveredServer::label).collect();
     format!(
-        "Multiple Victauri apps are running:\n  {}\nSelect one with `--app <bundle-identifier>` \
+        "{AMBIGUOUS_PREFIX}:\n  {}\nSelect one with `--app <bundle-identifier>` \
          (victauri CLI) or the VICTAURI_APP env var, or pin the port with VICTAURI_PORT.",
         labels.join("\n  ")
     )
@@ -862,6 +902,41 @@ mod tests {
             identifier: identifier.map(str::to_string),
             product_name: None,
         }
+    }
+
+    /// Several apps running and nothing selecting one: a run inside a Tauri app crate uses
+    /// that crate's app (its tauri.conf.json identifier) instead of failing as ambiguous —
+    /// only then: an explicit selector, a single app and a non-Tauri crate are unchanged.
+    #[test]
+    fn an_ambiguous_run_inside_a_tauri_crate_picks_that_crates_app() {
+        let servers = vec![
+            server(20, 7373, "other", Some("com.other.app")),
+            server(21, 7374, "mine", Some("com.mine.app")),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tauri.conf.json"),
+            r#"{"identifier": "com.mine.app"}"#,
+        )
+        .unwrap();
+        let crate_dir = Some(dir.path());
+        assert_eq!(
+            resolve_in_crate(None, None, None, &servers, crate_dir),
+            Ok((7374, Some("mine".to_string())))
+        );
+        // An explicit selector still wins.
+        assert_eq!(
+            resolve_in_crate(None, None, Some("com.other.app"), &servers, crate_dir),
+            Ok((7373, Some("other".to_string())))
+        );
+        // No tauri.conf.json (not a Tauri crate): still the ambiguity error.
+        let plain = tempfile::tempdir().unwrap();
+        assert!(
+            resolve_in_crate(None, None, None, &servers, Some(plain.path()))
+                .unwrap_err()
+                .starts_with(AMBIGUOUS_PREFIX)
+        );
+        assert!(resolve_in_crate(None, None, None, &servers, None).is_err());
     }
 
     #[test]
