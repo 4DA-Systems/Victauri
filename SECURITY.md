@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---------|-----------|
-| 0.9.x   | Yes       |
-| 0.8.x   | Security fixes only |
-| < 0.8   | No        |
+| 0.10.x  | Yes       |
+| 0.9.x   | Security fixes only |
+| < 0.9   | No        |
 
 ## Reporting a Vulnerability
 
@@ -53,6 +53,11 @@ Victauri is a **debug-only development tool**. Key security properties:
 - The MCP server binds exclusively to `127.0.0.1` (not `0.0.0.0`)
 - Bearer token authentication is **enabled by default** (auto-generated token) and protects every endpoint except `/health`
 - The `/health` endpoint is unauthenticated by design (for watchdog polling)
+- `query_db` / `db_health` are read-only (SQLite's authorizer) and path-contained to the app's data
+  dirs and configured `db_search_paths`. Their auto-selection skips WebView/browser-engine stores
+  (cookies, local storage, …) so an agent does not inspect the wrong database — that is a
+  selection rule, not an access boundary: an explicit `path` inside the allowed roots, an engine
+  store included, can still be queried by the authenticated agent
 
 ## Contact
 

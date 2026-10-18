@@ -5,7 +5,7 @@ trade-offs, and the right one depends on what you need. This page tries to be fa
 where another tool is the better choice, it says so.
 
 Facts about other projects come from their own documentation and source, checked on
-**2026-10-16**, with links. If something here is out of date or wrong, please open an issue and
+**2026-10-18**, with links. If something here is out of date or wrong, please open an issue and
 we will correct it.
 
 ## The short version
@@ -16,7 +16,7 @@ we will correct it.
   all through one MCP server that is authenticated and localhost-only by default. It is
   desktop-only and young.
 - **hypothesi/mcp-server-tauri** is the closest alternative for AI agents. It has much better
-  distribution (an installer for about a dozen MCP clients, agent skills, a Claude Code plugin,
+  distribution (an installer for 11 MCP clients, agent skills, a Claude Code plugin,
   a Gemini extension), and it supports **mobile** (Android and iOS emulators and simulators).
 - **WebdriverIO's Tauri service** is the choice if you want **W3C WebDriver** and a standard
   JavaScript test runner (Mocha, Jasmine, Cucumber) with its reporters.
@@ -46,11 +46,11 @@ we will correct it.
 | **Authentication** | On by default: a per-run Bearer token in an owner-only, per-user discovery directory, plus DNS-rebinding and Origin guards | None documented | None documented | Owner-only socket or pipe permissions; no separate handshake | Not documented by Playwright | None documented |
 | **Release builds** | Inert by default: the plugin gates itself on `debug_assertions` | Users are told to wrap it in `#[cfg(debug_assertions)]` themselves | The docs warn never to ship it in production | Debug-only | Do not ship the debug port | The docs advise disabling it in production |
 | **Desktop platforms** | Windows, macOS, Linux | Windows, macOS, Linux | Windows, macOS, Linux | Windows, macOS, Linux | **Windows only** | Windows, macOS, Linux |
-| **Mobile** | **No** | **Yes**: Android and iOS (emulators, simulators and real devices on the LAN) | Not documented | **Yes**: Android (via ADB) and the iOS Simulator | No | Android emulator documented |
-| **Trusted (OS-level) input** | Windows only (`SendInput`); synthetic events elsewhere | Not documented | The default embedded driver dispatches synthetic DOM events | Keys: OS-level via `enigo` (`isTrusted: true`) on Windows, macOS and Linux; clicks are synthetic | Via CDP (Windows) | No |
+| **Mobile** | **No** | **Yes**: Android and iOS (emulators, simulators and real devices on the LAN) | The plugin's source has Android and iOS code paths; the service docs cover desktop only | **Yes**: Android (via ADB) and the iOS Simulator | No | Android emulator documented |
+| **Trusted (OS-level) input** | Windows only (`SendInput`); synthetic events elsewhere | No: synthetic DOM events (`MouseEvent` / `KeyboardEvent` dispatched in the page) | The default embedded driver dispatches synthetic DOM events | Keys: OS-level via `enigo` (`isTrusted: true`) on Windows, macOS and Linux; clicks are synthetic | Via CDP (Windows) | No |
 | **Standards / test runner** | Rust: `victauri-test` with `cargo test`, JUnit XML from the CLI, a GitHub Action. **Not** WebDriver | MCP only | **W3C WebDriver** + WDIO runner and reporters | TOML scenarios with `--junit` | Playwright Test | None |
 | **Agent onboarding** | `victauri setup <client>` for 8 clients: Claude Code, Cursor, VS Code/Copilot, Windsurf/Devin, Codex, Gemini CLI, Zed, Roo; plus CLAUDE.md, AGENTS.md and a Claude Code skill | Installer via `aix` (a separate tool from the same maintainer) for 11 clients, plus agent skills, a Claude Code plugin marketplace entry and a Gemini extension | n/a | Agent skill via `npx skills add` | n/a | n/a |
-| **License** | Apache-2.0 | MIT | MIT | MIT | Apache-2.0 | Apache-2.0/MIT for `wire` and `devtools`; PolyForm Noncommercial for the rest |
+| **License** | Apache-2.0 | MIT | MIT | MIT | Apache-2.0 | Rust crates MIT OR Apache-2.0; the web UI (`clients/web`) PolyForm Noncommercial |
 | **Maturity (2026-10-18)** | v0.10.0; repo created 2026-04; 4 GitHub stars | v0.13.1; created 2025-11; ~320 stars; frequent releases | `@wdio/tauri-service` 1.5.0; official Tauri docs point to it | v0.8.1; created 2026-04; ~86 stars | Mature (Playwright) | ~430 stars; `tauri-plugin-devtools` v2.2.2 and a v3.0.0-alpha.0 (2026-09) |
 
 ## Where the others win
@@ -112,7 +112,7 @@ Be clear-eyed about these before you choose:
   [tauri-driver README](https://github.com/tauri-apps/tauri/blob/dev/crates/tauri-driver/README.md)
 - WebdriverIO: [Tauri service docs](https://webdriver.io/docs/desktop-testing/tauri),
   [service README](https://github.com/webdriverio/desktop-mobile/blob/main/packages/tauri-service/README.md),
-  [`tauri-plugin-wdio-webdriver`](https://docs.rs/crate/tauri-plugin-wdio-webdriver/1.3.0/source/README.md)
+  [`tauri-plugin-wdio-webdriver`](https://docs.rs/crate/tauri-plugin-wdio-webdriver/1.5.0/source/README.md)
 - tauri-pilot: [README](https://github.com/mpiton/tauri-pilot/blob/main/README.md),
   [SECURITY.md](https://github.com/mpiton/tauri-pilot/blob/main/SECURITY.md),
   [bridge.js](https://github.com/mpiton/tauri-pilot/blob/main/crates/tauri-plugin-pilot/js/bridge.js)

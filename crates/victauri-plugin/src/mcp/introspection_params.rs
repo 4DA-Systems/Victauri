@@ -110,13 +110,11 @@ pub enum FaultKind {
 /// Parameters for the `fault` compound tool.
 ///
 /// SCOPE (important): injected faults apply ONLY to commands executed through
-/// Victauri's own `invoke_command` tool. They do NOT intercept the application's
-/// real frontend-driven IPC (`window.__TAURI_INTERNALS__.invoke` → Tauri's native
-/// transport), which runs below the JS layer Victauri can reach. Use `fault` to
-/// probe a backend handler's behavior under failure when YOU drive the command
-/// (e.g. "does my error path return the right shape on a DB error?"). It does not
-/// reproduce a failure a user clicking the UI would experience — that path is not
-/// interceptable cross-platform without CDP.
+/// Victauri's own `invoke_command` tool. They do NOT touch the application's real
+/// user-driven IPC (`window.__TAURI_INTERNALS__.invoke`). Use `fault` to probe a backend
+/// handler's behavior under failure when YOU drive the command (e.g. "does my error path
+/// return the right shape on a DB error?"). To make a call the user's click triggers fail or
+/// slow down, use a `route` rule on its IPC URL (fetch transport only).
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FaultParams {
     /// Which fault action to perform.

@@ -1178,7 +1178,8 @@ impl VictauriBuilder {
                         _ => {}
                     }
                 });
-            // The persistent bridge script (main frame only — iframes are walked from the parent).
+            // The persistent bridge script: main frame only where Tauri's plugin init script is (2.11
+            // and 3.0 are; iframes are walked from the parent) — Tauri 2.0 injects it into every frame.
             // Tauri 3 renamed `js_init_script` to `initialization_script`, same semantics.
             #[cfg(feature = "tauri-v3")]
             let builder = builder.initialization_script(js_init);

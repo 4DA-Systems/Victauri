@@ -196,7 +196,7 @@ doc/scaffold accuracy; RUSTSEC quinn-proto/rustls lock bump), #79 (IPC captured 
 postMessage transport — it switches after ONE failed custom-protocol fetch, and always on Android
 — via a transparent `JSON.stringify` wrapper + Tauri's callbacks Map; `ipc_capture` status
 everywhere), #80 (one crate for Tauri 2 AND 3: `tauri = ">=2.0.0, <=3.0.0-alpha.5"` + a
-`tauri-v3` feature, since renamed `tauri2`/`tauri3` deps both `links = "Tauri"`; non-required
+`tauri-v3` feature; non-required
 Tauri 3 canary CI job on 3 OSes), #78 (`victauri setup <client>` for 8 clients, JSONC-preserving
 merges, AGENTS.md + Claude skill, honest `docs/src/comparison.md`), #81 (`#[inspectable]`
 metadata debug-only — strings 1→0 in the release binary; `init --optional`; `CallingWebview`

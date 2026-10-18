@@ -120,6 +120,90 @@ built on it — went silently empty.
 - Docs list what the IPC log does not capture: Rust→JS events outside `listen_events`, `Channel`
   messages, isolation-pattern args.
 
+### Security — adversarial audit (2026-10-18)
+
+Seven lenses attacked the candidate: network/auth, the JS bridge against a hostile page, the CLI
+against a hostile project, plugin Rust / Tauri 3 / threading, every public claim, supply chain
+and release, and a fresh outside user installing the packaged crates. Plus live runs inside 4DA
+on its real database. No Critical or High security finding; every fix below was reproduced
+before it was made and is pinned by a test that failed first.
+
+- **An IPC mock Tauri cannot read never runs the real command.** Such a mock makes Tauri's
+  `response.json()` throw, and Tauri then retries the REAL command over postMessage and keeps the
+  page there. The pre-audit refusal missed three ways in: a pattern that does not name the IPC
+  host (`greet`, `*/greet` — the natural way to write one), a content type with surrounding
+  spaces (`Headers` trims it), and a mock the `Response` constructor rejects (an invalid header,
+  a non-ByteString `status_text`). `route add` now builds every `fulfill` once (refusing what the
+  constructor rejects) and judges the content type as Tauri reads it; a broader pattern is
+  accepted with an `ipc_warning`, and a matching IPC call is answered with a Tauri error from
+  Victauri (`mock_unreadable` in the log) — fail closed.
+- **A mocked call can no longer be erased.** A mocked fetch was treated as one Tauri might retry,
+  so page script re-planting its callback ids could stage a look-alike that erased or renamed
+  it and faked a postMessage fallback. A mocked call is answered, never retried.
+- **Contested callback ids are flagged.** When two different commands are serialized under one
+  call's ids (page code running during Tauri's genuine fetch → postMessage retry can do this),
+  the entry carries `ids_contested` and `contested_commands` instead of silently keeping the
+  first (page-chosen) name.
+- **IPC outcome by Tauri's own rule.** `Tauri-Response` decides a call's status, as it decides
+  the app's `invoke`: a mock's HTTP status is ignored (a 500 with `Tauri-Response: ok` resolves
+  the app's call and is now logged `ok`), and a 200 with no `Tauri-Response` — an OPTIONS
+  preflight a page can send to any IPC URL, which runs no command — is `unknown`, never proof
+  that a handler exists.
+- **Page hooks get no live evidence.** A real response's status, `Tauri-Response` and body are
+  read through the native `Response` / `Headers` getters (a patched `Headers.prototype.get`
+  turned "command not found" into a verified handler), and the bridge's IPC log, route rules and
+  route matches are appended, trimmed and walked without `Array.prototype` methods a page can
+  replace (a `push` hook received the live entries and could strip `mocked` or rewrite a stored
+  rule). IPC URL spellings fetch accepts but a raw prefix check missed (`HTTP://IPC.LOCALHOST/…`,
+  `:80`) are normalized and logged. Ghost error samples are trimmed.
+- **CLI trust check (bypass of the pre-audit fix).** An existing `victauri` entry was trusted when
+  its command named `victauri` and its first argument was `bridge`, whatever else it set. It is
+  now trusted only when nothing redirects it — `url` / `httpUrl` / `serverUrl` / `headers`, a
+  non-`stdio` `type`, a non-empty `env` (`PATH`, `LD_PRELOAD`), `cwd` (also in Zed's nested
+  command and Codex's env tables) — and its binary is bare `victauri` or a LOCAL absolute path: a
+  UNC / device path (`\\host\share\…`, `//host/…` — Windows would run a remote binary and send it
+  NTLM credentials) and `/proc/self/cwd/…` (inside the cloned repo) are not. `victauri setup`
+  exits non-zero when such an entry blocks the wiring.
+- **`init` never writes Rust that does not compile.** The `.plugin(victauri_plugin::init())` line
+  was inserted before any line containing `.run(tauri::generate_context` and reported
+  "Patched" — a one-line builder got a dangling statement. It is inserted only into a method
+  chain; otherwise `init` prints the line to add. `init` also checks every path it will write
+  (agent configs included) before its first write — a junctioned `.claude` left a
+  half-initialized project — and refuses a virtual workspace manifest (it added `[dependencies]`
+  that broke every cargo command), pointing at `--path`.
+- **`doctor` reads code, not comments.** Its dependency checks parse the manifest, and its wiring
+  and runtime-grant checks ignore commented-out code; `init`'s command scan ignores
+  commented-out commands (each got a generated test that failed).
+- **The right app with several running.** `victauri check` / `doctor` / `test` / … inside a
+  Tauri project, and `cargo test` inside the app crate, pick that project's app (its
+  `tauri.conf.json` identifier) instead of failing as ambiguous; `doctor` no longer reports
+  "server not running" when several servers are. Connection hints name `npm run tauri dev` /
+  `pnpm tauri dev` and `--features victauri`, and no longer suggest the same port again.
+  `victauri setup claude-code` is accepted as an alias.
+- **`register_commands!` needs no import.** It called `try_state` as a method, so the documented
+  `.setup(|app| register_commands!(app, …))` failed with E0599 unless the file imported
+  `tauri::Manager`. The macro now imports the trait itself.
+- **A wrong `tauri-v3` setting names the fix** (a const assertion on `tauri::VERSION`) instead of
+  a bare E0599.
+- **`query_db` auto-selection.** WebKitGTK's `serviceworkers/`, `itp/`, `deviceidhashsalts/`,
+  `CacheStorage/` and a top-level `databases/` are engine stores; engine directory names are
+  matched only below the searched root, so a data dir under a folder named `WebKit` or
+  `LocalStorage` no longer hides every database in it. (The exclusion steers auto-selection only;
+  an explicit `path` can still be queried — see the security guide.)
+- **Supply chain and release.** Dependency floors that could never resolve were raised (hyper
+  1.9, hyper-util 0.1.20, tower 0.5.3, chrono 0.4.44); the CLI moves to notify 8, dropping the
+  unmaintained `instant` (RUSTSEC-2024-0384) from what `cargo install --locked` builds.
+  `server.json`'s description was 155 characters against the MCP Registry schema's 100, so
+  publishing it failed (0.9.0 was never listed); it is 98 now and a test checks the
+  schema-bounded fields. The Linux release binaries are built on `ubuntu-24.04` (glibc 2.39, as
+  0.9.0 shipped) instead of `ubuntu-latest`, which moves to a newer image.
+  `bump-version.ps1` requires PowerShell 7, and the Tauri 3 CI job's Linux check runs `--locked`.
+- **Docs.** Corrected: the wrong-`tauri-v3` error text, what `tauri-v3` switches, the README's
+  "Tauri 2 only" requirement, `testing.md`'s client snippets (they did not compile), where the
+  generated tests run, `/health`'s body, the agent guidance `setup` writes (outcome-based ghost
+  tiers, `route` for user-triggered IPC, the discovery-root order), the comparison page
+  (CrabNebula's licence, two cells, dates), and the IPC URL lists (`https://ipc.localhost`).
+
 ### Security — pre-audit red team (four lenses; no Critical/High open)
 
 Four adversarial lenses — CLI file writes, the JS bridge's IPC capture, the plugin's Rust /

@@ -464,6 +464,11 @@ above).
   (`safe_within` + symlink skipping), but the *content* is returned verbatim. Enable redaction or use a
   lower profile if this breadth is a concern. (`app_info` never returns secret-looking env vars —
   `*_TOKEN` / `*_KEY` / `*_SECRET` / `*_PASSWORD` / `PRIVATE` are dropped.)
+- **The WebView-store exclusion is a selection rule, not an access boundary.** When no `path` is
+  given, `query_db` / `db_health` skip browser-engine stores (Chromium/WebView2 profiles, WKWebView
+  and WebKitGTK stores such as cookies, local storage, service workers) so the agent inspects the
+  app's own database. An explicit `path` inside the allowed roots — an engine store included — can
+  still be queried by the authenticated agent.
 - **Pure Wayland `screenshot` fails safely.** Wayland deliberately does not expose a window's
   screen position to its own client, so Victauri cannot capture just the requested app window
   without compositor-specific integration. Victauri refuses the available full-desktop fallback

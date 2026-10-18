@@ -97,7 +97,7 @@ the wiring above grants the permission.
 
 ## Step 2: Initialize the Plugin
 
-Add `victauri_plugin::init()` to your Tauri builder in `src-tauri/src/main.rs`:
+Add `victauri_plugin::init()` to your Tauri builder in `src-tauri/src/lib.rs` (create-tauri-app's `run()`; older templates use `src-tauri/src/main.rs`):
 
 ```rust
 fn main() {
@@ -165,6 +165,11 @@ in automatically when it can read your `tauri.conf.json`:
 }
 ```
 
+The CLI (`victauri check`, `doctor`, `test`, …) run inside a Tauri project, and `cargo test`
+run inside the app crate, pick that project's app the same way when several Victauri apps are
+running (by the `identifier` in its `tauri.conf.json`). Anywhere else, select one with
+`--app <bundle-identifier>` or the `VICTAURI_APP` environment variable.
+
 ### Authentication
 
 Auth is **enabled by default** (the token is auto-generated and auto-discovered — the bridge
@@ -188,7 +193,7 @@ directory is private to you, else `<temp>/victauri-<uid>` (`<temp>` = `$TMPDIR` 
 
 ```bash
 curl http://127.0.0.1:7373/health
-# Returns: ok  (unauthenticated liveness probe)
+# Returns: {"status":"ok"}  (unauthenticated liveness probe)
 
 # single running app; checks the discovery roots described above, in the plugin's order
 if [ "$OS" = Windows_NT ]; then ROOTS="${TMPDIR:-/tmp}/victauri"   # Git Bash: /tmp is %TEMP%

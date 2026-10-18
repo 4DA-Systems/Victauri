@@ -24,7 +24,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Scaffold a Victauri test directory with starter tests
+    /// Set up Victauri in a Tauri project: dependencies, plugin wiring, capability, starter
+    /// tests, CI workflow and agent-client config
     Init {
         /// Path to the Tauri project root (default: current directory)
         #[arg(short, long)]

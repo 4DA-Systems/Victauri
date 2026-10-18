@@ -39,7 +39,7 @@ The JS bridge is injected into every webview via `js_init_script()` (persistent 
 
 Tauri 2 has two webview-to-Rust IPC transports (Tauri's `scripts/ipc-protocol.js`):
 
-1. **Custom-protocol `fetch()`** — the desktop default: `http://ipc.localhost/<command>` on Windows (WebView2), `ipc://localhost/<command>` on macOS (WKWebView) and Linux (WebKitGTK). The response comes back as the fetch response.
+1. **Custom-protocol `fetch()`** — the desktop default: `http://ipc.localhost/<command>` on Windows (WebView2; `https://ipc.localhost/<command>` for apps with `useHttpsScheme`, also on Android), `ipc://localhost/<command>` on macOS (WKWebView) and Linux (WebKitGTK). The response comes back as the fetch response.
 2. **`window.ipc.postMessage`** (provided by wry) — used **always on Android**, and on desktop **for the rest of the page's life after one custom-protocol fetch fails** (a blocked scheme, a CSP error, a service worker). Tauri logs `IPC custom protocol failed, Tauri will now use the postMessage interface instead` and never goes back to fetch until the page reloads. The response comes back as an eval of `window.__TAURI_INTERNALS__.runCallback(id, value)`.
 
 Victauri captures both into one IPC log. On the fetch transport a `route` rule can also mock or delay real IPC (see [`route`](tools-reference.md#route)); such calls are tagged `mocked` / `route_delay_ms` and kept out of the evidence-based analyses. postMessage IPC is observe-only:

@@ -28,7 +28,7 @@ Run it:
 
 ```bash
 pnpm tauri dev                                   # start your app
-VICTAURI_E2E=1 cargo test --test smoke           # run tests
+cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke   # run tests (from the app crate)
 ```
 
 ## Test Client
@@ -42,10 +42,11 @@ use victauri_test::VictauriClient;
 
 #[tokio::test]
 async fn test_my_app() {
-    let client = VictauriClient::connect(7373).await.unwrap();
+    // discover() finds the running app and its auth token (see below).
+    let mut client = VictauriClient::discover().await.unwrap();
 
     let title = client.eval_js("document.title").await.unwrap();
-    assert!(title.contains("My App"));
+    assert!(title.to_string().contains("My App"));
 
     client.click("e3").await.unwrap();
     client.fill("e5", "hello@example.com").await.unwrap();
@@ -54,16 +55,21 @@ async fn test_my_app() {
 
 ### Auto-Discovery
 
-`discover()` reads the port and auth token from temp files written by the plugin:
+`discover()` reads the port and auth token from the discovery files the plugin writes. With
+several Victauri apps running, `cargo test` inside a Tauri app crate picks that crate's app (its
+`tauri.conf.json` identifier); otherwise select one with `VICTAURI_APP` or `discover_app(Some(…))`:
 
 ```rust
 let mut client = VictauriClient::discover().await.unwrap();
 ```
 
+`VictauriClient::connect(7373)` connects to a fixed port WITHOUT a token, so it only works
+against an app built with `auth_disabled()`.
+
 ### With Authentication
 
 ```rust
-let client = VictauriClient::connect_with_token(7373, "my-secret-token")
+let mut client = VictauriClient::connect_with_token(7373, Some("my-secret-token"))
     .await
     .unwrap();
 ```

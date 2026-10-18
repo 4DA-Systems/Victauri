@@ -105,7 +105,7 @@ replace_in_file ".github/actions/victauri-test/action.yml" "default: \"$OLD_VERS
 #   - `victauri-<crate> = "X.Y"` install pins (and `{ version = "X.Y", ... }`) -> new major.minor
 #   - `victauri-test@vX.Y.Z` GitHub Action refs -> new full version
 NEW_MM="${NEW_VERSION%.*}"
-PIN_DOCS=(README.md docs/src/getting-started.md docs/src/testing.md docs/src/testing-tauri-apps.md
+PIN_DOCS=(README.md docs/src/getting-started.md docs/src/testing.md docs/src/testing-tauri-apps.md docs/src/configuration.md
           crates/victauri-plugin/README.md crates/victauri-test/README.md crates/victauri-macros/README.md)
 ACTION_DOCS=(README.md docs/src/testing.md docs/src/testing-tauri-apps.md)
 for f in "${PIN_DOCS[@]}"; do
@@ -155,6 +155,7 @@ Remaining manual steps:
   1. Update CHANGELOG.md with release notes
   2. Update MIGRATION.md if there are breaking/behavior changes
   3. Update CLAUDE.md Current State date and new feature descriptions
+  3b. Update SECURITY.md's supported-versions table (new minor: Yes; previous: security fixes only)
   4. Run: cargo test --workspace
   5. Run: cargo clippy --workspace --all-targets
   6. Commit, push, publish: cargo publish -p <crate> for each crate
