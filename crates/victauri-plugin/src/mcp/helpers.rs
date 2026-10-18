@@ -100,7 +100,7 @@ pub fn ghost_ipc_outcomes_js(since_ms: Option<i64>) -> String {
          \n    if (c.status === 'ok') {{ if (pm) e.pm_ok = true; else e.ok = true; }}\
          \n    else if (c.status === 'error') {{\
          \n      var body = ((c.result != null ? String(c.result) : '') + ' ' + (c.error != null ? String(c.error) : ''));\
-         \n      var sample = body.slice(0, 160).toLowerCase();\
+         \n      var sample = body.trim().slice(0, 160).toLowerCase();\
          \n      /* keep the most diagnostic sample: a 'not found' error always wins over a generic one */\
          \n      if (pm) {{ if (!e.pm_err || sample.indexOf('not found') !== -1) e.pm_err = sample; }}\
          \n      else if (!e.err || sample.indexOf('not found') !== -1) {{ e.err = sample; }}\

@@ -322,14 +322,27 @@ const INIT_SCRIPT_BODY: &str = r#"
     // `https://ipc.localhost/<cmd>` too: an app that sets `useHttpsScheme` (Windows, Android)
     // gets Tauri's `protocolScheme` 'https' (tauri manager/webview.rs, core.js convertFileSrc).
     var IPC_PREFIXES = ['http://ipc.localhost/', 'https://ipc.localhost/', 'ipc://localhost/'];
+    // A spelling fetch accepts but the raw prefix check misses (`HTTP://IPC.LOCALHOST/x`,
+    // `http://ipc.localhost:80/x`, a leading space, backslashes) is tried again on the URL as
+    // the URL parser normalizes it. Only when it can be one (it names `ipc`), and not for huge
+    // strings (a data: URL never is).
+    var IPC_NORMALIZE_MAX = 8192;
+    function ipcPrefixPath(url) {
+        for (var pi = 0; pi < IPC_PREFIXES.length; pi++) {
+            if (REFLECT_APPLY(STR_INDEXOF, url, [IPC_PREFIXES[pi]]) === 0) {
+                return REFLECT_APPLY(STR_SUBSTRING, url, [IPC_PREFIXES[pi].length]);
+            }
+        }
+        return null;
+    }
     function ipcCommandPath(url) {
         if (typeof url !== 'string') {
             try { url = String(url); } catch (e) { return null; }
         }
-        for (var pi = 0; pi < IPC_PREFIXES.length; pi++) {
-            if (url.indexOf(IPC_PREFIXES[pi]) === 0) return url.substring(IPC_PREFIXES[pi].length);
-        }
-        return null;
+        var p = ipcPrefixPath(url);
+        if (p !== null || url.length > IPC_NORMALIZE_MAX || !URL_CTOR || !URL_HREF_GET) return p;
+        if (REFLECT_APPLY(STR_INDEXOF, REFLECT_APPLY(STR_TO_LOWER, url, []), ['ipc']) === -1) return null;
+        try { return ipcPrefixPath(REFLECT_APPLY(URL_HREF_GET, new URL_CTOR(url), [])); } catch (e) { return null; }
     }
     function isIpcUrl(url) { return ipcCommandPath(url) !== null; }
     // The URL as stored in the network / route-match logs (R5B-DATAURL1). A log holds up to
@@ -484,19 +497,20 @@ const INIT_SCRIPT_BODY: &str = r#"
         return null;
     }
     // Tauri retries a call over postMessage (same callback ids) only after its fetch FAILED:
-    // the fetch rejected (logged 'error' / 'blocked'), or a route mock gave it a body Tauri could
-    // not parse. A fetch still in flight or answered cleanly is not retried, so a postMessage
-    // message reusing its ids is a page-staged look-alike — it must neither hide the real call
-    // nor be logged (red team F1: page script could rename or erase a real call this way).
+    // the fetch rejected (logged 'error' / 'blocked'). A fetch still in flight or answered — a
+    // route mock included: a mock Tauri could not read is never served (see the fetch
+    // wrapper), so Tauri never retries a mocked call — is not retried, so a postMessage message
+    // reusing its ids is a page-staged look-alike: it must neither hide the real call nor be
+    // logged (red team F1: page script could rename or erase a real call this way).
     function fetchWasRetriable(n) {
-        return n.status === 'error' || n.status === 'blocked' || n.blocked === true || n.mocked === true;
+        return n.status === 'error' || n.status === 'blocked' || n.blocked === true;
     }
-    function postMessageCallLogged(callbackId) {
+    function postMessageCallFor(callbackId) {
         for (var i = networkLog.length - 1; i >= 0; i--) {
             var n = networkLog[i];
-            if (n.transport === 'post_message' && n.ipc_callback === callbackId) return true;
+            if (n.transport === 'post_message' && n.ipc_callback === callbackId) return n;
         }
-        return false;
+        return null;
     }
     // Called (after serialization) for every `JSON.stringify(value, <function>)`. `out` is the
     // serialized string. Only Tauri's IPC message shape is acted on.
@@ -508,7 +522,21 @@ const INIT_SCRIPT_BODY: &str = r#"
         // A real invoke registers both callbacks just before serializing its message; a
         // look-alike object page script serializes (to plant a fake call) has no such pair.
         if (map && (!REFLECT_APPLY(MAP_HAS, map, [cb]) || !REFLECT_APPLY(MAP_HAS, map, [er]))) return;
-        if (postMessageCallLogged(cb)) return; // the same message serialized again
+        var logged = postMessageCallFor(cb);
+        if (logged !== null) {
+            // The same ids serialized again. Tauri re-serializes its own message unchanged, so a
+            // DIFFERENT command under the same ids means page script staged one of the two (it
+            // can reach the callback table) — and which one came first proves nothing. Keep the
+            // entry, but say both names were claimed for it.
+            var again = ENCODE_URI_COMPONENT(cmd);
+            if (again !== logged.ipc_path) {
+                logged.ids_contested = true;
+                var names = logged.contested_commands || [safeDecode(logged.ipc_path)];
+                if (names.length < 8) names[names.length] = cmd;
+                logged.contested_commands = names;
+            }
+            return;
+        }
         var prior = fetchCallFor(cb);
         if (prior !== null && !fetchWasRetriable(prior)) return; // look-alike of a live/answered fetch
         var blocked = false;
@@ -559,8 +587,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             entry.response_capture = false;
         }
         ipcCapture.post_message_calls++;
-        networkLog.push(entry);
-        if (networkLog.length > CAP_NETWORK) networkLog.shift();
+        appendCapped(networkLog, entry, CAP_NETWORK);
     }
     function ipcCaptureStatus() {
         var c = ipcCapture;
@@ -743,28 +770,44 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         return false;
     }
-    // The Content-Type a mocked response carries, as `Headers` combines it (repeated names,
-    // any case, joined with ", "), and the part Tauri's ipc-protocol.js switches on.
-    function mockContentTypeHead(r) {
-        var vals = [r.content_type];
-        for (var k in r.headers) {
-            if (Object.prototype.hasOwnProperty.call(r.headers, k) && ('' + k).toLowerCase() === 'content-type') {
-                vals.push('' + r.headers[k]);
-            }
+    // The Response a `fulfill` rule serves, and its body text (null for a null-body status).
+    // Throws whatever the Response constructor throws (an invalid header name or value, a
+    // status text that is not a ByteString, …) — `addRoute` builds it once to refuse such a rule.
+    function buildMockResponse(route) {
+        var status = route.status;
+        if (typeof status !== 'number' || status !== Math.floor(status) || status < 200 || status > 599) {
+            throw new RangeError('victauri: route #' + route.id + ' fulfill status must be an integer in 200-599, got ' + status);
         }
-        var ct = vals.join(', ');
-        var comma = ct.indexOf(',');
-        return comma < 0 ? ct : ct.slice(0, comma);
+        // The Response constructor throws if a null-body status carries a body.
+        var nullBody = status === 204 || status === 205 || status === 304;
+        var bodyStr = nullBody ? null
+            : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
+        var hdrs = { 'content-type': route.content_type };
+        for (var k in route.headers) { if (hasOwn(route.headers, k)) hdrs[k] = route.headers[k]; }
+        var Ctor = RESPONSE_CTOR || Response;
+        return { resp: new Ctor(bodyStr, { status: status, statusText: route.status_text, headers: hdrs }), body: bodyStr };
     }
-    // Why Tauri could not read this IPC mock (its `response.json()` would throw), or null.
+    // The part of a response's Content-Type that Tauri's ipc-protocol.js switches on: the
+    // header as `Headers` gives it (trimmed, repeated names joined with ", "), up to the first comma.
+    function tauriContentTypeHead(resp) {
+        var ct = respHeader(resp, 'content-type') || '';
+        var comma = REFLECT_APPLY(STR_INDEXOF, ct, [',']);
+        return comma < 0 ? ct : REFLECT_APPLY(STR_SUBSTRING, ct, [0, comma]);
+    }
+    // Why Tauri could not read this rule's mock as an IPC response (its `response.json()` would
+    // throw, so Tauri would run the REAL command over postMessage), or null.
+    // Whether this realm has a `Response` constructor to build mocks with (every webview does).
+    function canBuildResponses() {
+        return RESPONSE_CTOR !== null || typeof Response === 'function';
+    }
     function ipcMockUnparsable(r) {
-        if (mockContentTypeHead(r) !== 'application/json') return null; // text() / arrayBuffer() never throw
-        if (r.status === 204 || r.status === 205 || r.status === 304) {
-            return 'status ' + r.status + ' carries no body, which Tauri reads as JSON.';
-        }
-        if (typeof r.body !== 'string') return null; // serialized as JSON
-        try { PRISTINE_PARSE(r.body); return null; } catch (e) {
-            return 'its body is not valid JSON (' + (r.body === '' ? 'empty' : 'e.g. an unquoted string') + '), and Tauri reads it as JSON.';
+        if (!canBuildResponses()) return null; // nothing to judge; a fulfill cannot be served here either
+        var built;
+        try { built = buildMockResponse(r); } catch (e) { return 'the mock response cannot be built (' + e + ').'; }
+        if (tauriContentTypeHead(built.resp) !== 'application/json') return null; // text() / arrayBuffer() never throw
+        if (built.body === null) return 'status ' + r.status + ' carries no body, which Tauri reads as JSON.';
+        try { PRISTINE_PARSE(built.body); return null; } catch (e) {
+            return 'its body is not valid JSON (' + (built.body === '' ? 'empty' : 'e.g. an unquoted string') + '), and Tauri reads it as JSON.';
         }
     }
     function routeIpcNote(r) {
@@ -790,12 +833,11 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     function recordRouteMatch(rule, url, method) {
         rule.triggered = (rule.triggered || 0) + 1;
-        routeMatchLog.push({
+        appendCapped(routeMatchLog, {
             rule_id: rule.id, action: rule.action, url: loggedUrl(url),
             method: (method || 'GET').toUpperCase(), timestamp: Date.now(),
             trigger_count: rule.triggered,
-        });
-        if (routeMatchLog.length > CAP_ROUTE_MATCHES) routeMatchLog.shift();
+        }, CAP_ROUTE_MATCHES);
     }
 
     function checkActionable(el) {
@@ -890,6 +932,20 @@ const INIT_SCRIPT_BODY: &str = r#"
     var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
     var SET_TIMEOUT = window.setTimeout.bind(window);
     var REFLECT_APPLY = Reflect.apply;
+    // The bridge's own logs (network/IPC, route rules, route matches) are appended, trimmed and
+    // walked without calling an `Array.prototype` method page script can replace: a hook there
+    // is called with the LIVE array / entry as `this` / argument, and could rewrite a logged
+    // call or a stored rule behind the copy-on-read hardening.
+    var ARRAY_SHIFT = Array.prototype.shift;
+    var ARRAY_SPLICE = Array.prototype.splice;
+    function appendCapped(arr, item, cap) {
+        arr[arr.length] = item;
+        if (arr.length > cap) REFLECT_APPLY(ARRAY_SHIFT, arr, []);
+    }
+    function removeAt(arr, i) { REFLECT_APPLY(ARRAY_SPLICE, arr, [i, 1]); }
+    var STR_INDEXOF = String.prototype.indexOf;
+    var STR_SUBSTRING = String.prototype.substring;
+    var STR_TO_LOWER = String.prototype.toLowerCase;
     // Native `Request` getters. They brand-check (throw for anything but a genuine Request), so
     // they tell a real Request apart from a look-alike object and read what fetch really uses —
     // an own `url` property planted on a Request instance cannot shadow them.
@@ -932,6 +988,37 @@ const INIT_SCRIPT_BODY: &str = r#"
     try {
         if (typeof window.Headers === 'function') HEADERS_GET = window.Headers.prototype.get;
     } catch (e) { HEADERS_GET = null; }
+    // The native Response getters / methods: the IPC outcome (`Tauri-Response`), status and body
+    // of a REAL response are read through these, not through `Response.prototype` / `Headers`
+    // methods page script can replace to turn a "command not found" into a verified handler.
+    var RESPONSE_CTOR = typeof window.Response === 'function' ? window.Response : null;
+    var RESPONSE_HEADERS_GET = RESPONSE_CTOR ? protoGetter(RESPONSE_CTOR.prototype, 'headers') : null;
+    var RESPONSE_STATUS_GET = RESPONSE_CTOR ? protoGetter(RESPONSE_CTOR.prototype, 'status') : null;
+    var RESPONSE_STATUS_TEXT_GET = RESPONSE_CTOR ? protoGetter(RESPONSE_CTOR.prototype, 'statusText') : null;
+    var RESPONSE_CLONE = RESPONSE_CTOR ? RESPONSE_CTOR.prototype.clone : null;
+    var RESPONSE_TEXT = RESPONSE_CTOR ? RESPONSE_CTOR.prototype.text : null;
+    // `name` of a Response's headers, read natively when the Response is a genuine one (else
+    // through the object's own methods: a non-native Response has nothing better to offer).
+    function respHeader(resp, name) {
+        if (HEADERS_GET && RESPONSE_HEADERS_GET) {
+            try { return REFLECT_APPLY(HEADERS_GET, REFLECT_APPLY(RESPONSE_HEADERS_GET, resp, []), [name]); } catch (e) {}
+        }
+        try { return resp.headers.get(name); } catch (e) { return null; }
+    }
+    // The body text of a copy of `resp` (the app keeps reading the original). Never throws:
+    // a failure is a rejected promise the caller ignores.
+    function respTextCopy(resp) {
+        try {
+            if (RESPONSE_CLONE && RESPONSE_TEXT) {
+                try { return REFLECT_APPLY(RESPONSE_TEXT, REFLECT_APPLY(RESPONSE_CLONE, resp, []), []); } catch (e) {}
+            }
+            return resp.clone().text();
+        } catch (e) { return Promise.reject(e); }
+    }
+    function respField(resp, getter, name) {
+        if (getter) { try { return REFLECT_APPLY(getter, resp, []); } catch (e) {} }
+        try { return resp[name]; } catch (e) { return undefined; }
+    }
 
     // Page script can plant `toJSON` on Object.prototype / Array.prototype, which JSON.stringify
     // consults on EVERY object it serializes: that forged eval results (including the
@@ -1104,6 +1191,9 @@ const INIT_SCRIPT_BODY: &str = r#"
     // A network-log entry's IPC command name, or null when it is not an app IPC call
     // (plain network traffic, or Victauri's own `plugin:victauri|*` plumbing).
     var IPC_LOG_VICTAURI_PREFIX = 'plugin%3Avictauri%7C';
+    function safeDecode(raw) {
+        try { return decodeURIComponent(raw); } catch (e) { return raw; }
+    }
     function ipcCallCommand(n) {
         var raw = ipcEntryPath(n);
         if (raw === null || raw.indexOf(IPC_LOG_VICTAURI_PREFIX) === 0) return null;
@@ -1120,22 +1210,25 @@ const INIT_SCRIPT_BODY: &str = r#"
     // deep copies, so the page cannot rewrite a logged call through it. Without `bodies`, the
     // request args and result are left out and the error text is capped.
     var MAX_IPC_ERROR_TEXT = 4096;
-    function ipcLogEntry(n, bodies) {
-        // Classify by COMMAND outcome, not just HTTP status. Tauri returns
-        // HTTP 200 for a failed command (incl. "command not found") and signals
-        // the real result via the `Tauri-Response` header captured as ipc_response.
-        // Precedence: pending > transport error (HTTP >= 400 / 'error') > command
-        // error (ipc_response 'error') > ok.
-        var st;
-        if (n.status === 'pending') { st = 'pending'; }
+    // The outcome of one IPC entry, by Tauri's own rule (ipc-protocol.js): `invoke` resolves only
+    // when `Tauri-Response` is 'ok' and rejects otherwise — the HTTP status is 200 for a failed
+    // command too, and a mock's status is ignored entirely. Every Tauri 2/3 POST answer that
+    // reached a handler carries the header; a 200 without one (an OPTIONS preflight, say) ran no
+    // command, so it is 'unknown' — never proof that a handler exists.
+    function ipcOutcome(n) {
+        if (n.status === 'pending') return 'pending';
         // A postMessage call whose response Victauri cannot observe: outcome unknown.
-        else if (n.status === 'unobserved') { st = 'unknown'; }
-        else if (n.status !== 200 && n.status !== 'ok') { st = 'error'; }
-        else if (n.ipc_response === 'error') { st = 'error'; }
-        else { st = 'ok'; }
+        if (n.status === 'unobserved') return 'unknown';
+        if (n.mocked !== true && n.status !== 200 && n.status !== 'ok') return 'error';
+        if (n.ipc_response === 'ok') return 'ok';
+        if (n.ipc_response === 'error') return 'error';
+        return n.mocked === true ? 'error' : 'unknown';
+    }
+    function ipcLogEntry(n, bodies) {
+        var st = ipcOutcome(n);
         var errText = null;
         if (st === 'error') {
-            if (n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
+            if (n.mocked !== true && n.status !== 200 && n.status !== 'ok' && n.status !== 'pending') {
                 errText = 'HTTP ' + n.status;
             } else if (n.response_body != null) {
                 // Command-level error: the body carries the error message.
@@ -1156,6 +1249,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         };
         // Only non-default transports are tagged (fetch is the default; no field = fetch).
         if (n.transport === 'post_message') e.transport = 'post_message';
+        // Two different commands were serialized under this call's callback ids: page script
+        // staged one of them, and which is the real one is unknowable.
+        if (n.ids_contested === true) {
+            e.ids_contested = true;
+            e.contested_commands = cloneJson(n.contested_commands);
+        }
+        if (typeof n.mock_unreadable === 'string') e.mock_unreadable = n.mock_unreadable;
         // A `route` rule answered this call in the page (`mocked`: the backend never ran) or
         // held it back (`route_delay_ms` is part of `duration_ms`). Analysis built on the log
         // (ghost detection, command_catalog, coverage, timings) skips mocked calls.
@@ -1197,9 +1297,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         mutationLog.forEach(function(m) {
             emit({ type: 'dom_mutation', count: m.count, timestamp: m.timestamp }, m.timestamp, m);
         });
-        networkLog.forEach(function(n) {
+        // Indexed, not `networkLog.forEach`: a page hook on Array.prototype.forEach would get
+        // the live log (see appendCapped).
+        for (var ni = 0; ni < networkLog.length; ni++) {
+            var n = networkLog[ni];
             var isPending = n.status === 'pending';
-            if (isPending && skipPending) return;
+            if (isPending && skipPending) continue;
             var key = isPending ? n.timestamp : n.timestamp + (n.duration_ms || 0);
             var mocked = n.mocked === true || n.blocked === true;
             var raw = ipcEntryPath(n);
@@ -1209,23 +1312,15 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var nev = { type: 'network', method: n.method, url: n.url, status: n.status, duration_ms: n.duration_ms, timestamp: n.timestamp, seq_ts: key };
                 if (mocked) nev.mocked = true;
                 emit(nev, key, n);
-                return;
+                continue;
             }
-            if (raw.indexOf(IPC_VICTAURI_PREFIX) === 0) return;
-            var cmd; try { cmd = decodeURIComponent(raw); } catch(e) { cmd = raw; }
-            // Same classification as getIpcLog: HTTP 200 with a
-            // `Tauri-Response: error` header is a failed command.
-            var st;
-            if (isPending) st = 'pending';
-            else if (n.status === 'unobserved') st = 'unknown';
-            else if (n.status !== 200 && n.status !== 'ok') st = 'error';
-            else if (n.ipc_response === 'error') st = 'error';
-            else st = 'ok';
-            var iev = { type: 'ipc', command: cmd, status: st, duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp, seq_ts: key };
+            if (REFLECT_APPLY(STR_INDEXOF, raw, [IPC_VICTAURI_PREFIX]) === 0) continue;
+            // Same classification as getIpcLog (Tauri's own reading of the response).
+            var iev = { type: 'ipc', command: safeDecode(raw), status: ipcOutcome(n), duration_ms: n.duration_ms, arg_size_bytes: n.arg_size_bytes || 0, timestamp: n.timestamp, seq_ts: key };
             if (mocked) iev.mocked = true;
             if (n.transport === 'post_message') iev.transport = 'post_message';
             emit(iev, key, n);
-        });
+        }
         navigationLog.forEach(function(n) {
             emit({ type: 'navigation', url: n.url, nav_type: n.type, timestamp: n.timestamp }, n.timestamp, n);
         });
@@ -1656,11 +1751,11 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (ipcCallCommand(n) === null) continue;
                 if (backendOnly && (n.mocked === true || n.blocked === true)) continue;
                 if (unrouted && typeof n.route_delay_ms === 'number') continue;
-                picked.push(n);
+                picked[picked.length] = n; // not .push: a page hook would get the live entry
             }
             var start = (typeof limit === 'number' && limit > 0 && picked.length > limit) ? picked.length - limit : 0;
             var entries = [];
-            for (var k = start; k < picked.length; k++) entries.push(ipcLogEntry(picked[k], bodies));
+            for (var k = start; k < picked.length; k++) entries[entries.length] = ipcLogEntry(picked[k], bodies);
             return entries;
         },
 
@@ -1708,11 +1803,17 @@ const INIT_SCRIPT_BODY: &str = r#"
         // Filtered and limited BEFORE copying (R5-JS1). `opts.bodies === false` leaves out
         // the captured IPC request args / response bodies (e.g. to count entries cheaply).
         getNetworkLog: function(filter, limit, opts) {
-            var log = networkLog;
-            if (filter) {
-                log = log.filter(function(e) { return e.url.indexOf(filter) !== -1; });
+            // Indexed copies, not .filter / .slice on the live log (see appendCapped).
+            var log = [];
+            for (var li = 0; li < networkLog.length; li++) {
+                var le = networkLog[li];
+                if (!filter || REFLECT_APPLY(STR_INDEXOF, '' + le.url, ['' + filter]) !== -1) log[log.length] = le;
             }
-            if (typeof limit === 'number' && limit > 0) log = log.slice(-limit);
+            if (typeof limit === 'number' && limit > 0 && log.length > limit) {
+                var tail = [];
+                for (var ti = log.length - limit; ti < log.length; ti++) tail[tail.length] = log[ti];
+                log = tail;
+            }
             var noBodies = !!(opts && opts.bodies === false);
             var out = new Array(log.length);
             for (var i = 0; i < log.length; i++) {
@@ -1756,9 +1857,18 @@ const INIT_SCRIPT_BODY: &str = r#"
                 times: typeof rule.times === 'number' ? rule.times : 0,
                 triggered: 0,
             };
+            if (r.action === 'fulfill' && canBuildResponses()) {
+                // Build the mock once now: one the Response constructor rejects (an invalid
+                // header name or value, a status text that is not a ByteString) would make every
+                // matching fetch reject — and an IPC fetch that rejects is retried FOR REAL.
+                try { buildMockResponse(r); } catch (e) {
+                    --routeCounter;
+                    return { ok: false, error: 'this fulfill rule\'s mock response cannot be built: ' + e };
+                }
+            }
             var hitsIpc = routeMatchesIpc(r);
-            var unparsable = hitsIpc && r.action === 'fulfill' ? ipcMockUnparsable(r) : null;
-            if (unparsable) {
+            var unparsable = r.action === 'fulfill' ? ipcMockUnparsable(r) : null;
+            if (unparsable && hitsIpc) {
                 --routeCounter;
                 return { ok: false, error: 'this fulfill rule matches Tauri IPC URLs, but ' + unparsable
                     + ' Tauri would then treat the IPC fetch as failed, run the REAL command over'
@@ -1766,17 +1876,28 @@ const INIT_SCRIPT_BODY: &str = r#"
                     + ' body (e.g. "\\"text\\"" or an object), use content_type "text/plain", or narrow'
                     + ' the pattern so it does not match Tauri IPC URLs (http(s)://ipc.localhost, ipc://localhost).' };
             }
-            routeRules.push(r);
+            routeRules[routeRules.length] = r; // not .push (see appendCapped)
             // A copy: the stored rule was validated, and page script must not edit it afterwards.
             var out = { ok: true, id: r.id, rule: cloneJson(r) };
             if (hitsIpc) out.ipc_note = routeIpcNote(r);
+            // A command-specific pattern that does not name the IPC host (`greet`, `*/greet`)
+            // can still match a Tauri IPC URL. Such a call never gets this mock (Tauri would run
+            // the real command over postMessage): it gets an error from Victauri instead.
+            else if (unparsable) {
+                out.ipc_warning = 'If this rule matches a Tauri IPC call, Tauri could not read the mock: '
+                    + unparsable + ' Such a call is answered with a Tauri error from Victauri instead'
+                    + ' (logged `mock_unreadable`), so the real command does not run.';
+            }
             return out;
         },
 
         getRouteRules: function() { return copyEntries(routeRules); },
 
         getRouteMatches: function(limit) {
-            return copyEntries(limit ? routeMatchLog.slice(-limit) : routeMatchLog);
+            var from = (limit > 0 && routeMatchLog.length > limit) ? routeMatchLog.length - limit : 0;
+            var picked = [];
+            for (var i = from; i < routeMatchLog.length; i++) picked[picked.length] = routeMatchLog[i];
+            return copyEntries(picked);
         },
 
         // Agent-only operations (clear logs / route rules, dialog auto-responses, animation
@@ -1952,9 +2073,15 @@ const INIT_SCRIPT_BODY: &str = r#"
                     } else if (opts.condition === 'url' && opts.value) {
                         met = window.location.href.indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'ipc_idle') {
-                        met = networkLog.filter(function(n) { return isIpcEntry(n); }).every(function(n) { return n.status !== 'pending'; });
+                        met = true;
+                        for (var wi = 0; wi < networkLog.length; wi++) {
+                            if (isIpcEntry(networkLog[wi]) && networkLog[wi].status === 'pending') { met = false; break; }
+                        }
                     } else if (opts.condition === 'network_idle') {
-                        met = networkLog.every(function(n) { return n.status !== 'pending'; });
+                        met = true;
+                        for (var wj = 0; wj < networkLog.length; wj++) {
+                            if (networkLog[wj].status === 'pending') { met = false; break; }
+                        }
                     }
 
                     // The condition is checked BEFORE the deadline test, so the last check lands
@@ -2532,7 +2659,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     var AGENT_OPS = OBJ_CREATE(null);
     AGENT_OPS.clearIpcLog = function() {
         for (var i = networkLog.length - 1; i >= 0; i--) {
-            if (isIpcEntry(networkLog[i])) networkLog.splice(i, 1);
+            if (isIpcEntry(networkLog[i])) removeAt(networkLog, i);
         }
         return { ok: true };
     };
@@ -2542,7 +2669,9 @@ const INIT_SCRIPT_BODY: &str = r#"
     AGENT_OPS.clearDialogLog = function() { dialogLog.length = 0; return { ok: true }; };
     AGENT_OPS.clearRoute = function(id) {
         var before = routeRules.length;
-        routeRules = routeRules.filter(function(r) { return r.id !== id; });
+        var kept = [];
+        for (var i = 0; i < routeRules.length; i++) if (routeRules[i].id !== id) kept[kept.length] = routeRules[i];
+        routeRules = kept;
         return { ok: true, removed: before - routeRules.length };
     };
     AGENT_OPS.clearRoutes = function() {
@@ -3383,8 +3512,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }
 
                 if (!isVictauriInternal) {
-                    networkLog.push(entry);
-                    if (networkLog.length > CAP_NETWORK) networkLog.shift();
+                    appendCapped(networkLog, entry, CAP_NETWORK);
                 }
 
                 var self = this;
@@ -3407,20 +3535,23 @@ const INIT_SCRIPT_BODY: &str = r#"
                     }
                     if (route.action === 'fulfill') {
                         var makeResp = function() {
-                            var status = route.status;
-                            if (typeof status !== 'number' || status !== Math.floor(status) || status < 200 || status > 599) {
-                                throw new RangeError('victauri: route #' + route.id + ' fulfill status must be an integer in 200-599, got ' + status);
-                            }
-                            // The Response constructor throws if a null-body status carries a body.
-                            var nullBody = status === 204 || status === 205 || status === 304;
-                            var bodyStr = nullBody ? null
-                                : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
-                            var hdrs = { 'content-type': route.content_type };
-                            for (var k in route.headers) { if (Object.prototype.hasOwnProperty.call(route.headers, k)) hdrs[k] = route.headers[k]; }
-                            var resp = new Response(bodyStr, { status: status, statusText: route.status_text, headers: hdrs });
-                            entry.status = status;
-                            entry.status_text = route.status_text;
+                            // An IPC call must never get a mock Tauri cannot read: Tauri would
+                            // treat the fetch as failed and run the REAL command over postMessage
+                            // (and stay on postMessage). `add` refuses rules that name the IPC
+                            // host; a broader pattern (`greet`, `*/greet`) lands here, and the
+                            // call gets a Tauri error from Victauri instead — fail closed.
+                            var unreadable = isIpc ? ipcMockUnparsable(route) : null;
+                            var built = unreadable === null ? buildMockResponse(route) : buildMockResponse({
+                                id: route.id, status: 200, status_text: '', content_type: 'text/plain',
+                                headers: { 'Tauri-Response': 'error' },
+                                body: 'victauri: route #' + route.id + ' would answer this IPC call with a mock Tauri cannot read ('
+                                    + unreadable + ') Victauri answered with this error instead; the real command did not run.',
+                            });
+                            var resp = built.resp, bodyStr = built.body;
+                            entry.status = respField(resp, RESPONSE_STATUS_GET, 'status');
+                            entry.status_text = respField(resp, RESPONSE_STATUS_TEXT_GET, 'statusText');
                             entry.mocked = true;
+                            if (unreadable !== null) entry.mock_unreadable = unreadable;
                             if (route.delay_ms > 0) entry.route_delay_ms = route.delay_ms;
                             entry.duration_ms = Date.now() - entry.timestamp;
                             if (isIpc) {
@@ -3428,19 +3559,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                                 // of THIS response (ipc-protocol.js): it resolves only when
                                 // `headers.get('Tauri-Response') === 'ok'`, and takes the body as
                                 // JSON / text / an ArrayBuffer by `content-type` up to the first
-                                // comma. Read through the captured `Headers.get`, not page code.
-                                var mh = function(name) {
-                                    if (HEADERS_GET) {
-                                        try { return REFLECT_APPLY(HEADERS_GET, resp.headers, [name]); } catch (e) {}
-                                    }
-                                    // No genuine `Headers` (none at bridge init, or `Response` is
-                                    // not the native one): the object's own getter.
-                                    try { return resp.headers.get(name); } catch (e) { return null; }
-                                };
-                                entry.ipc_response = mh('Tauri-Response') === 'ok' ? 'ok' : 'error';
-                                var ctFull = mh('content-type') || '';
-                                var comma = ctFull.indexOf(',');
-                                var ctHead = comma < 0 ? ctFull : ctFull.slice(0, comma);
+                                // comma. Read through the captured getters, not page code.
+                                entry.ipc_response = respHeader(resp, 'Tauri-Response') === 'ok' ? 'ok' : 'error';
+                                var ctFull = respHeader(resp, 'content-type') || '';
+                                var ctHead = tauriContentTypeHead(resp);
                                 if (bodyStr === null) entry.response_body = null;
                                 else if (bodyStr.length > MAX_IPC_BODY) entry.response_body = bodyOmitted(bodyStr.length, null);
                                 else if (ctHead === 'application/json') { try { entry.response_body = PRISTINE_PARSE(bodyStr); } catch (e) { entry.response_body = bodyStr; } }
@@ -3475,24 +3597,20 @@ const INIT_SCRIPT_BODY: &str = r#"
 
                 function doRealFetch() {
                     return REFLECT_APPLY(origFetch, self, fetchArgs(fetchInput)).then(function(response) {
-                        entry.status = response.status;
-                        entry.status_text = response.statusText;
+                        // Native getters: page script cannot reshape what the real response said.
+                        entry.status = respField(response, RESPONSE_STATUS_GET, 'status');
+                        entry.status_text = respField(response, RESPONSE_STATUS_TEXT_GET, 'statusText');
                         entry.duration_ms = Date.now() - entry.timestamp;
 
                         if (isIpc) {
                             // Capture Tauri's command-outcome signal. The HTTP status is 200
                             // for BOTH a successful command AND a failed/"not found" one — the
                             // real Ok/Err result is carried in the `Tauri-Response` header
-                            // ('ok' | 'error'). Without this, every IPC call logs as "ok",
-                            // which blinds ghost detection (an unregistered command looks like
-                            // a verified handler). 'ok' | 'error' | null (older Tauri / no hdr).
-                            try { entry.ipc_response = response.headers.get('Tauri-Response'); } catch (e) {}
-                            var ct = null, clen = -1;
-                            try {
-                                ct = response.headers.get('Content-Type');
-                                var cl = response.headers.get('Content-Length');
-                                if (cl !== null && cl !== '' && isFinite(Number(cl))) clen = Number(cl);
-                            } catch (e) {}
+                            // ('ok' | 'error'; absent on a non-POST answer, which ran nothing).
+                            entry.ipc_response = respHeader(response, 'Tauri-Response');
+                            var ct = respHeader(response, 'Content-Type'), clen = -1;
+                            var cl = respHeader(response, 'Content-Length');
+                            if (cl !== null && cl !== '' && isFinite(Number(cl))) clen = Number(cl);
                             if (window.__VICTAURI__._captureIpcBodies !== false && !isTextualContentType(ct)) {
                                 // Binary (e.g. raw tauri::ipc::Response bytes): never read it.
                                 entry.response_body = bodyOmitted(clen, ct);
@@ -3501,8 +3619,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                                 entry.response_body = bodyOmitted(clen, null);
                                 flushIpcWaiters();
                             } else if (window.__VICTAURI__._captureIpcBodies !== false) {
-                                var cloned = response.clone();
-                                cloned.text().then(function(text) {
+                                respTextCopy(response).then(function(text) {
                                     if (text.length > MAX_IPC_BODY) {
                                         entry.response_body = bodyOmitted(text.length, null);
                                         return;
@@ -3562,12 +3679,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             entry.duration_ms = Date.now() - entry.timestamp;
         }
         function xhrLog(entry) {
-            networkLog.push(entry);
-            if (networkLog.length > CAP_NETWORK) networkLog.shift();
+            appendCapped(networkLog, entry, CAP_NETWORK);
         }
         function xhrUnlog(entry) {
             for (var i = networkLog.length - 1; i >= 0; i--) {
-                if (networkLog[i] === entry) { networkLog.splice(i, 1); return; }
+                if (networkLog[i] === entry) { removeAt(networkLog, i); return; }
             }
         }
         function xhrHook(xhr, st) {
