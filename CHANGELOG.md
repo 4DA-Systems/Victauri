@@ -125,8 +125,10 @@ built on it — went silently empty.
 Seven lenses attacked the candidate: network/auth, the JS bridge against a hostile page, the CLI
 against a hostile project, plugin Rust / Tauri 3 / threading, every public claim, supply chain
 and release, and a fresh outside user installing the packaged crates. Plus live runs inside 4DA
-on its real database. No Critical or High security finding; every fix below was reproduced
-before it was made and is pinned by a test that failed first.
+on its real database. No Critical or High security finding. Every behaviour fix below was
+reproduced before it was made; the bridge, CLI trust, `init`, `doctor`, discovery,
+`register_commands!`, `server.json` and database-selection fixes are pinned by tests that failed
+before them (docs, the release-runner pin, dependency floors and hint text are not test-pinned).
 
 - **An IPC mock Tauri cannot read never runs the real command.** Such a mock makes Tauri's
   `response.json()` throw, and Tauri then retries the REAL command over postMessage and keeps the

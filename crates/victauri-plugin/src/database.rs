@@ -1316,8 +1316,8 @@ const WEBVIEW_DIR_NAMES: &[&str] = &[
     "cachestorage",
 ];
 
-/// WebKitGTK directory names too generic to match anywhere: an engine store only as a DIRECT
-/// child of a searched data dir (WebKitGTK's WebSQL `databases/`), where an app's own nested
+/// `WebKitGTK` directory names too generic to match anywhere: an engine store only as a DIRECT
+/// child of a searched data dir (`WebKitGTK`'s `WebSQL` `databases/`), where an app's own nested
 /// `databases/` folder elsewhere stays an app candidate.
 #[cfg(feature = "sqlite")]
 const WEBVIEW_ROOT_DIR_NAMES: &[&str] = &["databases"];
