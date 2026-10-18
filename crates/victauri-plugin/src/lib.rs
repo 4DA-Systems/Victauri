@@ -136,15 +136,36 @@ pub use victauri_macros::inspectable;
 #[macro_export]
 macro_rules! register_commands {
     ($app:expr, $($schema_call:expr),+ $(,)?) => {{
+        // `try_state` is a `tauri::Manager` method: import the trait here, so the macro works
+        // without the caller importing it (it failed with E0599 otherwise).
+        #[allow(unused_imports)]
+        use $crate::__private_tauri::Manager as _;
         // `try_state` (not `state`) so this is a no-op in RELEASE builds: there
         // `init()` returns a no-op plugin that never manages `VictauriState`, and
         // `state()` would PANIC on the missing type. Registration is debug-only.
-        if let Some(state) = $app.try_state::<std::sync::Arc<$crate::VictauriState>>() {
+        if let Some(state) = $app.try_state::<::std::sync::Arc<$crate::VictauriState>>() {
             $(
                 state.registry.register($schema_call);
             )+
         }
     }};
+}
+
+/// Not public API: the `tauri` crate this plugin was built against, for [`register_commands!`].
+#[doc(hidden)]
+pub use tauri as __private_tauri;
+
+/// [`register_commands!`] compiles in a module that imports nothing (the documented
+/// `.setup(|app| …)` shape): it brings `tauri::Manager` into scope itself.
+#[cfg(test)]
+#[allow(dead_code)]
+mod register_commands_needs_no_imports {
+    fn setup<R: tauri::Runtime>(app: &mut tauri::App<R>) {
+        crate::register_commands!(app, crate::CommandInfo::new("greet"));
+    }
+    fn setup_handle<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+        crate::register_commands!(app, crate::CommandInfo::new("greet"));
+    }
 }
 
 const DEFAULT_PORT: u16 = 7373;

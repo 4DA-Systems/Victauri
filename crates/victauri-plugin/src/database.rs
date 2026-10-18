@@ -1310,23 +1310,52 @@ const WEBVIEW_DIR_NAMES: &[&str] = &[
     "localstorage",
     "resourceloadstatistics",
     "mediakeys",
+    "serviceworkers",
+    "itp",
+    "deviceidhashsalts",
+    "cachestorage",
 ];
+
+/// WebKitGTK directory names too generic to match anywhere: an engine store only as a DIRECT
+/// child of a searched data dir (WebKitGTK's WebSQL `databases/`), where an app's own nested
+/// `databases/` folder elsewhere stays an app candidate.
+#[cfg(feature = "sqlite")]
+const WEBVIEW_ROOT_DIR_NAMES: &[&str] = &["databases"];
 
 /// Whether a discovered database path is a `WebView`/browser-engine internal store rather
 /// than the application's own database (audit / red-team "wrong DB" finding).
 #[cfg(feature = "sqlite")]
 #[must_use]
 pub fn is_webview_internal(path: &Path) -> bool {
+    is_webview_internal_under(path, None)
+}
+
+/// [`is_webview_internal`] for a database found under the search `root`: directory names are
+/// matched only BELOW the root — a root that itself sits under a folder named `WebKit` or
+/// `LocalStorage` must not turn every app database into an "engine internal" — and the
+/// root-only names ([`WEBVIEW_ROOT_DIR_NAMES`]) apply to its direct children.
+#[cfg(feature = "sqlite")]
+fn is_webview_internal_under(path: &Path, root: Option<&Path>) -> bool {
     if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
         let name = name.to_ascii_lowercase();
         if WEBVIEW_DB_BASENAMES.iter().any(|n| name == *n) {
             return true;
         }
     }
-    path.components().any(|c| {
-        let seg = c.as_os_str().to_string_lossy().to_ascii_lowercase();
-        WEBVIEW_DIR_NAMES.iter().any(|d| seg == *d)
-    })
+    let relative = root.and_then(|r| path.strip_prefix(r).ok());
+    let dirs = relative.unwrap_or(path).parent().unwrap_or(Path::new(""));
+    let lower = |c: std::path::Component<'_>| c.as_os_str().to_string_lossy().to_ascii_lowercase();
+    if dirs
+        .components()
+        .any(|c| WEBVIEW_DIR_NAMES.contains(&lower(c).as_str()))
+    {
+        return true;
+    }
+    relative.is_some()
+        && dirs
+            .components()
+            .next()
+            .is_some_and(|c| WEBVIEW_ROOT_DIR_NAMES.contains(&lower(c).as_str()))
 }
 
 /// A discovered database candidate with the metadata needed to disambiguate which DB the
@@ -1358,7 +1387,7 @@ pub fn classify_databases(dirs: &[PathBuf]) -> Vec<DbCandidate> {
                 continue;
             }
             let size_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
-            let webview_internal = is_webview_internal(&path);
+            let webview_internal = is_webview_internal_under(&path, Some(dir));
             candidates.push(DbCandidate {
                 path,
                 size_bytes,
@@ -3070,6 +3099,51 @@ mod tests {
         assert!(!is_webview_internal(Path::new("/app/data/4da.db")));
         assert!(!is_webview_internal(Path::new("/app/data/app.sqlite")));
         assert!(!is_webview_internal(Path::new("/app/notes.db")));
+        // More WebKitGTK stores it writes into the app data dir.
+        let root = Path::new("/home/u/.local/share/com.x.app");
+        for store in [
+            "serviceworkers/ServiceWorkerRegistrations-8.sqlite3",
+            "itp/observations.db",
+            "deviceidhashsalts/x.db",
+            "CacheStorage/x/records.db",
+            "databases/Databases.db",
+        ] {
+            assert!(
+                is_webview_internal_under(&root.join(store), Some(root)),
+                "{store}"
+            );
+        }
+        // ...but `databases` only as a direct child: an app's own nested folder is the app's.
+        assert!(!is_webview_internal_under(
+            &root.join("data/databases/app.db"),
+            Some(root)
+        ));
+    }
+
+    /// Engine directory names are matched only BELOW the searched root: a data dir that sits
+    /// under a folder named `WebKit` / `LocalStorage` must not hide every database in it.
+    #[test]
+    fn engine_dir_names_above_the_search_root_do_not_count() {
+        for root in [
+            "/home/u/WebKit/myapp/data",
+            "D:/work/LocalStorage/myapp/data",
+        ] {
+            let root = Path::new(root);
+            assert!(!is_webview_internal_under(&root.join("app.db"), Some(root)));
+            assert!(is_webview_internal_under(
+                &root.join("IndexedDB/x.sqlite3"),
+                Some(root)
+            ));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("WebKit").join("app");
+        std::fs::create_dir_all(&root).unwrap();
+        write_sqlite(&root.join("app.db"), 10);
+        let picked = select_app_database(std::slice::from_ref(&root));
+        assert!(
+            picked.as_ref().is_ok_and(|p| p.ends_with("app.db")),
+            "{picked:?}"
+        );
     }
 
     #[test]

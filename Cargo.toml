@@ -79,7 +79,7 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4.44", features = ["serde"] }
 url = "2"
 # A range, so an app's own rusqlite is reused (links = "sqlite3" allows one per build). `bundled`
 # is NOT forced here: victauri-plugin turns it on through its `bundled-sqlite` default feature.
