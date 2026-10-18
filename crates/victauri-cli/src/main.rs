@@ -316,6 +316,32 @@ fn cmd_init_with(
     // (R4-FS1): a cloned repo whose `src-tauri`, `src`, `capabilities`, `tests` or `.github`
     // is a symlink would otherwise redirect these writes into another project.
     ensure_inside_project(&root, &cargo_toml_path)?;
+    // ...and all of them are checked BEFORE the first write: a refused path found half-way
+    // (say a junctioned `.claude`) would otherwise leave a half-initialized project.
+    let crate_dir = cargo_toml_path.parent().unwrap_or(&root).to_path_buf();
+    let tests_dir_planned =
+        find_src_tauri(&root).map_or_else(|| root.join("tests"), |p| p.join("tests"));
+    for planned in [
+        crate_dir.join("src").join("main.rs"),
+        crate_dir.join("src").join("lib.rs"),
+        crate_dir.join("capabilities").join("victauri.json"),
+        tests_dir_planned.join("smoke.rs"),
+        tests_dir_planned.join("integration.rs"),
+        root.join(".github").join("workflows").join("victauri.yml"),
+    ] {
+        ensure_inside_project(&root, &planned)?;
+    }
+    agents::preflight(
+        &root,
+        &agents::Options {
+            clients: clients.to_vec(),
+            user_config,
+            instructions: true,
+            dry_run: false,
+            feature: None,
+        },
+        &agents::UserDirs::from_env(),
+    )?;
 
     // Step 1: Add dependencies to Cargo.toml
     let deps = add_dependencies(&cargo_toml_path, optional)?;
@@ -600,6 +626,20 @@ fn cmd_setup(root: &Path, options: &agents::Options) -> Result<()> {
         "Install the CLI on PATH if you have not: cargo install victauri-cli (the configs run \
          `victauri bridge`). Then start your app; your agent connects even before it is up."
     );
+    // A `victauri` entry that does not run the bridge is never overwritten, so the client is
+    // NOT wired: fail, so a script or CI step running `setup` cannot read it as success.
+    let foreign = reports
+        .iter()
+        .filter(|r| matches!(r.status, agents::Status::Unexpected(_)))
+        .count();
+    if foreign > 0 && !options.dry_run {
+        bail!(
+            "{foreign} existing `victauri` server entr{} not run the Victauri bridge (kept as is \
+             — see [!] above); remove or fix {} and run setup again",
+            if foreign == 1 { "y does" } else { "ies do" },
+            if foreign == 1 { "it" } else { "them" }
+        );
+    }
     Ok(())
 }
 
@@ -966,7 +1006,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
 
     // Check 3: Victauri plugin dependency
     let cargo_content = std::fs::read_to_string(&cargo_path).unwrap_or_default();
-    if cargo_content.contains("victauri-plugin") {
+    if manifest_has_dependency(&cargo_content, "victauri-plugin") {
         eprintln!("  [PASS] victauri-plugin dependency present");
         pass_count += 1;
     } else {
@@ -976,7 +1016,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     }
 
     // Check 4: Victauri test dependency
-    if cargo_content.contains("victauri-test") {
+    if manifest_has_dependency(&cargo_content, "victauri-test") {
         eprintln!("  [PASS] victauri-test dependency present");
         pass_count += 1;
     } else {
@@ -997,9 +1037,10 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     for filename in ["lib.rs", "main.rs"] {
         let path = src_dir.join(filename);
         if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            runtime_grant |= grants_victauri_at_runtime(&content);
-            if content.contains("victauri_plugin") {
+            // Code only: a commented-out `.plugin(victauri_plugin::init())` is not wiring.
+            let source = std::fs::read_to_string(&path).unwrap_or_default();
+            runtime_grant |= grants_victauri_at_runtime(&source);
+            if rust_code_only(&source).contains("victauri_plugin") {
                 eprintln!("  [PASS] Plugin wired in {filename}");
                 plugin_wired = true;
                 pass_count += 1;
@@ -1612,7 +1653,44 @@ fn with_victauri<R: tauri::Runtime>(builder: tauri::Builder<R>) -> tauri::Builde
 /// Whether `source` grants `victauri:default` at runtime the way [`optional_wiring_snippet`]
 /// does (a `CapabilityBuilder` permission), so `doctor` does not demand a capability file.
 fn grants_victauri_at_runtime(source: &str) -> bool {
-    source.contains("add_capability") && source.contains(".permission(\"victauri:default\")")
+    // `.permission("victauri:default")` needs its string literal, which `rust_code_only` blanks;
+    // so look for the literal in the source at a place the code-only text says is code.
+    let code = rust_code_only(source);
+    code.contains("add_capability")
+        && source
+            .match_indices(".permission(\"victauri:default\")")
+            .any(|(at, _)| code[at..].starts_with(".permission("))
+}
+
+/// Whether the Cargo manifest `content` declares `name` as a dependency (normal, dev or build,
+/// including `[target.'cfg(..)'.*]` tables). A mention in a comment or a string does not count.
+fn manifest_has_dependency(content: &str, name: &str) -> bool {
+    let Ok(doc) = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(content)
+        .parse::<toml_edit::DocumentMut>()
+    else {
+        return false;
+    };
+    let in_tables = |t: &dyn toml_edit::TableLike| {
+        ["dependencies", "dev-dependencies", "build-dependencies"]
+            .iter()
+            .any(|k| {
+                t.get(k)
+                    .and_then(toml_edit::Item::as_table_like)
+                    .is_some_and(|deps| deps.contains_key(name))
+            })
+    };
+    in_tables(doc.as_table())
+        || doc
+            .get("target")
+            .and_then(toml_edit::Item::as_table_like)
+            .is_some_and(|targets| {
+                targets
+                    .iter()
+                    .filter_map(|(_, t)| t.as_table_like())
+                    .any(in_tables)
+            })
 }
 
 /// `src` with every comment and every string / char literal (delimiters included) replaced by
@@ -1799,14 +1877,28 @@ fn try_patch_tauri_builder(src_dir: &Path, feature: Option<&str>) -> Result<bool
         // Look for `.run(tauri::generate_context` or `.build(tauri::generate_context`
         // and insert `.plugin(victauri_plugin::init())` before that line. The search runs on
         // the code-only text (same lines), so a commented-out `.run(...)` is not picked.
+        // Inserting a line is only valid Rust when `.run(…)` / `.build(…)` STARTS its line and
+        // continues a method chain on the previous code line. A one-line builder
+        // (`tauri::Builder::default().run(…)`) or a builder held in a variable
+        // (`builder.run(…)`) would get a dangling `.plugin(…)` statement that does not compile;
+        // those get the by-hand hint instead.
         let lines: Vec<&str> = content.lines().collect();
+        let code_lines: Vec<&str> = code.lines().collect();
         let mut insert_idx = None;
-        for (i, line) in code.lines().enumerate() {
+        for (i, line) in code_lines.iter().enumerate() {
             let trimmed = line.trim();
             if trimmed.contains(".run(tauri::generate_context")
                 || trimmed.contains(".build(tauri::generate_context")
             {
-                insert_idx = Some(i);
+                let continues_chain = code_lines[..i]
+                    .iter()
+                    .rev()
+                    .map(|l| l.trim())
+                    .find(|l| !l.is_empty())
+                    .is_some_and(|prev| !prev.ends_with([';', '{', '}']));
+                if trimmed.starts_with('.') && continues_chain {
+                    insert_idx = Some(i);
+                }
                 break;
             }
         }
@@ -2237,7 +2329,22 @@ fn detect_project(root: &Path) -> Result<(PathBuf, bool)> {
     };
 
     let content = std::fs::read_to_string(&cargo_toml).context("failed to read Cargo.toml")?;
-    let is_tauri = content.contains("tauri");
+    // A virtual workspace manifest (`[workspace]`, no `[package]`) cannot take dependencies:
+    // adding them breaks every cargo command in the repository. The app crate is a member.
+    if let Ok(doc) = content
+        .strip_prefix('\u{feff}')
+        .unwrap_or(&content)
+        .parse::<toml_edit::DocumentMut>()
+        && doc.contains_key("workspace")
+        && !doc.contains_key("package")
+    {
+        bail!(
+            "{} is a virtual workspace manifest (no [package]); run init on the Tauri app crate: \
+             victauri init --path <the member that depends on tauri>",
+            display_path(&cargo_toml)
+        );
+    }
+    let is_tauri = manifest_has_dependency(&content, "tauri");
 
     Ok((cargo_toml, is_tauri))
 }
@@ -2606,6 +2713,8 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
 
     for path in rs_files {
         if let Ok(content) = std::fs::read_to_string(&path) {
+            // Code only: a commented-out command would get a generated test that fails.
+            let content = rust_code_only(&content);
             let mut in_command_attr = false;
             for line in content.lines() {
                 let trimmed = line.trim();
@@ -3225,6 +3334,125 @@ mod tests {
         assert!(content.contains("victauri_plugin::init()"));
     }
 
+    /// A virtual workspace manifest cannot take dependencies: `init` must refuse it (and point
+    /// at `--path`) instead of breaking every cargo command in the repository.
+    #[test]
+    fn init_refuses_a_virtual_workspace_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = "[workspace]\nmembers = [\"apps/desktop/src-tauri\"]\nresolver = \"2\"\n";
+        std::fs::write(dir.path().join("Cargo.toml"), manifest).unwrap();
+        let err = cmd_init(dir.path(), false).unwrap_err().to_string();
+        assert!(
+            err.contains("virtual workspace") && err.contains("--path"),
+            "{err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        // A workspace ROOT that is also a package is an ordinary app manifest.
+        assert!(manifest_has_dependency(
+            "[package]\nname = \"a\"\n[workspace]\n[dependencies]\ntauri = \"2\"\n",
+            "tauri"
+        ));
+    }
+
+    /// `doctor`'s dependency check reads the manifest, not its text: a comment or a string
+    /// mentioning the crate is not a dependency.
+    #[test]
+    fn manifest_dependency_check_ignores_comments() {
+        assert!(!manifest_has_dependency(
+            "[package]\nname = \"a\"\n# victauri-plugin = \"0.10\"\n[dependencies]\ntauri = \"2\"\n",
+            "victauri-plugin"
+        ));
+        assert!(manifest_has_dependency(
+            "[target.'cfg(debug_assertions)'.dependencies]\nvictauri-plugin = \"0.10\"\n",
+            "victauri-plugin"
+        ));
+        assert!(manifest_has_dependency(
+            "[dev-dependencies]\nvictauri-test = { version = \"0.10\" }\n",
+            "victauri-test"
+        ));
+        // ...and a commented-out runtime grant is not a grant.
+        assert!(!grants_victauri_at_runtime(
+            "// app.add_capability(x.permission(\"victauri:default\"))\nfn main() {}\n"
+        ));
+        assert!(!grants_victauri_at_runtime(
+            "fn main() { add_capability(); }\n// .permission(\"victauri:default\")\n"
+        ));
+    }
+
+    /// A path `init`'s agent wiring would refuse is found BEFORE anything is written, so the
+    /// project is never left half-initialized.
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_before_writing_when_an_agent_path_is_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("src-tauri");
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        let manifest =
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\ntauri = \"2\"\n";
+        std::fs::write(app.join("Cargo.toml"), manifest).unwrap();
+        let lib = "pub fn run() {\n    tauri::Builder::default()\n        .run(tauri::generate_context!())\n        .expect(\"x\");\n}\n";
+        std::fs::write(app.join("src/lib.rs"), lib).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(".claude")).unwrap();
+
+        assert!(cmd_init(dir.path(), false).is_err());
+        assert_eq!(
+            std::fs::read_to_string(app.join("Cargo.toml")).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read_to_string(app.join("src/lib.rs")).unwrap(),
+            lib
+        );
+        assert!(!app.join("tests").exists());
+        assert!(!dir.path().join(".github").exists());
+        assert_eq!(std::fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    /// Only a `.run(…)` / `.build(…)` that starts its line and continues a method chain gets the
+    /// inserted `.plugin(…)` line — anywhere else the insertion is a dangling statement that does
+    /// not compile, so the file is left alone and `init` prints the by-hand hint.
+    #[test]
+    fn patch_tauri_builder_never_writes_a_dangling_plugin_line() {
+        let refused = [
+            "pub fn run() {\n    tauri::Builder::default().run(tauri::generate_context!()).expect(\"x\");\n}\n",
+            "pub fn run() {\n    let builder = tauri::Builder::default().plugin(p::init());\n    builder.run(tauri::generate_context!()).expect(\"x\");\n}\n",
+            "fn main() {\n    let app = tauri::Builder::default().build(tauri::generate_context!()).expect(\"x\");\n    app.run(|_, _| {});\n}\n",
+        ];
+        for src_text in refused {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("lib.rs"), src_text).unwrap();
+            assert!(!try_patch_tauri_builder(&src, None).unwrap(), "{src_text}");
+            assert_eq!(
+                std::fs::read_to_string(src.join("lib.rs")).unwrap(),
+                src_text
+            );
+        }
+        let chained = [
+            // A chain on a builder variable is a chain too.
+            "pub fn run() {\n    let builder = tauri::Builder::default();\n    builder\n        .run(tauri::generate_context!())\n        .expect(\"x\");\n}\n",
+            "fn main() {\n    let app = tauri::Builder::default()\n        .build(tauri::generate_context!())\n        .expect(\"x\");\n    app.run(|_, _| {});\n}\n",
+            "pub fn run() {\n    tauri::Builder::default()\n        .plugin(p::init())\n        // a note\n\n        .run(tauri::generate_context!())\n        .expect(\"x\");\n}\n",
+        ];
+        for src_text in chained {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("lib.rs"), src_text).unwrap();
+            assert!(try_patch_tauri_builder(&src, None).unwrap(), "{src_text}");
+            let out = std::fs::read_to_string(src.join("lib.rs")).unwrap();
+            assert!(
+                out.contains("        .plugin(victauri_plugin::init())\n"),
+                "{out}"
+            );
+        }
+    }
+
     #[test]
     fn patch_tauri_builder_no_builder_returns_false() {
         let dir = tempfile::tempdir().unwrap();
@@ -3414,6 +3642,17 @@ mod tests {
         let commands = scan_tauri_commands(dir.path());
         assert!(commands.contains(&"greet".to_string()));
         assert!(commands.contains(&"get_count".to_string()));
+
+        std::fs::write(
+            dir.path().join("old.rs"),
+            "// #[tauri::command]\n// fn retired() {}\n/* #[tauri::command]\nfn gone() {} */\n",
+        )
+        .unwrap();
+        let commands = scan_tauri_commands(dir.path());
+        assert!(
+            !commands.iter().any(|c| c == "retired" || c == "gone"),
+            "{commands:?}"
+        );
     }
 
     #[test]
