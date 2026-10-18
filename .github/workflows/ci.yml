@@ -532,7 +532,7 @@ jobs:
         shell: bash
         env:
           CARGO_TARGET_DIR: target-tauri3-clippy
-        run: RUSTC_WRAPPER="$(rustup which clippy-driver)" cargo check --manifest-path examples/tauri3/Cargo.toml -p victauri-plugin
+        run: RUSTC_WRAPPER="$(rustup which clippy-driver)" cargo check --locked --manifest-path examples/tauri3/Cargo.toml -p victauri-plugin
 
       - name: Build the demo app against Tauri 3 (victauri-plugin `tauri-v3`)
         run: cargo build --locked --manifest-path examples/tauri3/Cargo.toml

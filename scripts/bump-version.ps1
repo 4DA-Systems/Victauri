@@ -1,4 +1,5 @@
 #!/usr/bin/env pwsh
+#Requires -Version 7
 # bump-version.ps1 — Bumps all version references across the Victauri workspace.
 #
 # Usage:

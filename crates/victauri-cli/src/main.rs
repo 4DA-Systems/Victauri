@@ -3686,6 +3686,28 @@ mod tests {
         assert!(!content.contains("e2e_test"));
     }
 
+    /// The MCP Registry rejects (422) a `server.json` that breaks its schema; the 0.9.0 one
+    /// never listed because its description was over the 100-character limit. The fields
+    /// the schema bounds, and the version the release publishes, are checked here.
+    #[test]
+    fn server_json_fits_the_mcp_registry_schema() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../server.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return; // not in a packaged crate
+        };
+        let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let description = doc["description"].as_str().unwrap();
+        assert!(
+            (1..=100).contains(&description.chars().count()),
+            "description is {} chars (registry max 100)",
+            description.chars().count()
+        );
+        assert!(doc["name"].as_str().unwrap().len() <= 200);
+        assert_eq!(doc["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(doc["packages"][0]["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(doc["packages"][0]["identifier"], "victauri-cli");
+    }
+
     #[test]
     fn feature_flag_follows_the_package_manager() {
         assert_eq!(
