@@ -184,9 +184,39 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-10-18)
+## Current State (2026-10-19)
 
-### v0.10.0 candidate (`release/0.10-prep`, NOT published — gated on a full adversarial audit)
+### v0.10.0 — PUBLISHED 2026-10-19 after a seven-lens adversarial audit
+
+All six crates live on crates.io (published locally from `020f6b2` with an operator token,
+env-only; the CI `CARGO_REGISTRY_TOKEN` is stale — `release.yml`'s publish step skips "already
+exists"), tag `v0.10.0`, GitHub Release with 8 binaries + `SHA256SUMS` (Linux built on the pinned
+`ubuntu-24.04`, GLIBC ≤ 2.39), and — for the first time — listed on the MCP Registry
+(`io.github.4DA-Systems/victauri` 0.10.0, active) via the new OIDC workflow
+`.github/workflows/mcp-registry.yml` (manual; run after the crates are live). PR #82 squash-merged
+as `020f6b2`; main CI 26/26. 4DA bump: 4DA PR #999 (`"0.9"` → `"0.10"`, no code change).
+
+The audit (lenses on isolated worktrees: network/auth, JS bridge vs hostile page, CLI vs hostile
+project, plugin Rust/Tauri 3/threading, claims, supply chain/release, fresh consumer) found no
+Critical/High. Fixed before publish: an IPC mock Tauri could not read ran the REAL command (now
+fail-closed: `mock_unreadable` / `ipc_warning`); a mocked call was erasable via re-planted callback
+ids; `server.json` description over the registry's 100-char limit (why 0.9.0 never listed);
+`register_commands!` needed `use tauri::Manager`; CLI trust check ignored `env`/`url`/`cwd`/UNC/
+`/proc` in an existing entry; `init` wrote dangling `.plugin()` lines, half-initialized projects and
+broke virtual workspace manifests; IPC outcome now follows `Tauri-Response` (a header-less 200 is
+`unknown`); the bridge's logs avoid page-replaceable `Array.prototype` methods; several running
+apps → the CLI and `cargo test` pick the project's app; a port containing "401" no longer reads as
+an auth error. Verified live: 4DA on its real DB (sweep 38/38, soaks ~199k calls), demo app,
+compatibility retest (Kanri / En Croissant / Lettura 15/15), a fresh create-tauri-app consumer
+built from the packaged `.crate` files, Tauri 3 example live.
+
+**Known, tracked:** a whole-process stall (even `/health` frozen ~90 s) seen in 4DA soaks
+reproduced on 0.9.0 too — it was 4DA's scheduled curve fit blocking the runtime (4DA #998). The
+Victauri-side hardening (own server runtime from draft PR #73 + one overall deadline per eval
+call) is issue #83, planned for 0.10.1. `/api/v1/me` on crates.io answers 403 for every API token
+now ("only on the website") — it cannot be used to validate a publish token.
+
+### v0.10.0 candidate history (`release/0.10-prep`)
 
 Built from the 2026-10-16 adversarial adoption audit (Victauri leads on depth — DB, IPC bodies,
 `app_state`, contracts, time-travel, security — but trailed on Tauri 3, IPC completeness,
