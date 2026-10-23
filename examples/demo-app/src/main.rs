@@ -383,6 +383,29 @@ fn list_notifications(state: tauri::State<'_, AppState>) -> Vec<Notification> {
     state.notifications.lock().unwrap().clone()
 }
 
+// ── The classic "blocking call in async code" bug (runtime-isolation demo) ──
+
+#[tauri::command]
+#[inspectable(
+    description = "Pin every async-runtime worker with blocking work for `seconds` (demo of the classic 'blocking call in async code' bug)",
+    intent = "saturate the async runtime",
+    category = "debug",
+    example = "hang the async runtime"
+)]
+fn saturate_async_runtime(seconds: u64) -> u64 {
+    // Twice as many tasks as cores (Tokio's default worker count), each doing a blocking sleep
+    // on an async worker: every worker of Tauri's runtime is stuck until they finish — what a
+    // scheduled job blocking the runtime did to a real app (and, before Victauri ran its server
+    // on its own runtime, to Victauri inside it).
+    let workers = std::thread::available_parallelism().map_or(8, std::num::NonZero::get) as u64 * 2;
+    for _ in 0..workers {
+        tauri::async_runtime::spawn(async move {
+            std::thread::sleep(std::time::Duration::from_secs(seconds.min(60)));
+        });
+    }
+    workers
+}
+
 // ── Fire-and-forget pipeline (async-completion demo) ───────────────────────
 
 #[tauri::command]
@@ -553,6 +576,7 @@ fn main() {
                     get_app_state__schema(),
                     run_pipeline__schema(),
                     pipeline_status__schema(),
+                    saturate_async_runtime__schema(),
                 ])
                 .listen_events(&["notification-added", "pipeline-complete"])
                 .probe("pipeline", move || probe_pipeline.snapshot())
@@ -583,6 +607,7 @@ fn main() {
             get_app_state,
             run_pipeline,
             pipeline_status,
+            saturate_async_runtime,
         ])
         .setup(|app| {
             // Main thread: take the one handle background work may borrow.
