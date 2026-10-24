@@ -752,3 +752,63 @@ e2e_test!(
         assert!(reloads > 0, "reloader should have run at least once");
     }
 );
+
+// ────────────────────────────────────────────────────────────────────────────
+// Runtime isolation — the server keeps answering while the app blocks its own runtime
+// ────────────────────────────────────────────────────────────────────────────
+
+e2e_test!(
+    server_stays_responsive_while_the_app_blocks_its_async_runtime,
+    |client| async move {
+        // #83 (seen live in 4DA): a scheduled job blocked every worker of Tauri's async runtime
+        // for ~90 s, and because Victauri's server shared that runtime, /health and every
+        // Rust-side tool froze with it — exactly when an agent needs to look inside. The server
+        // now runs on its own runtime, so these must keep answering while the app is pinned.
+        use std::time::{Duration, Instant};
+
+        const PINNED_SECS: u64 = 4;
+        let pinned = client
+            .invoke_command(
+                "saturate_async_runtime",
+                Some(json!({ "seconds": PINNED_SECS })),
+            )
+            .await
+            .expect("the (synchronous) saturating command returns at once");
+        assert!(pinned.as_u64().unwrap_or(0) > 0, "{pinned:?}");
+        let pinned_at = Instant::now();
+        tokio::time::sleep(Duration::from_millis(300)).await; // let the tasks occupy the workers
+
+        let http = reqwest::Client::new();
+        let health_url = format!("{}/health", client.base_url());
+        let mut slowest = Duration::ZERO;
+        while pinned_at.elapsed() < Duration::from_secs(PINNED_SECS - 1) {
+            let t = Instant::now();
+            let health = http
+                .get(&health_url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .expect("/health answers while the app's runtime is pinned");
+            assert!(health.status().is_success(), "{}", health.status());
+            client
+                .get_memory_stats()
+                .await
+                .expect("a Rust-side tool answers while the app's runtime is pinned");
+            client
+                .app_state(Some("pipeline"))
+                .await
+                .expect("an app_state probe answers while the app's runtime is pinned");
+            slowest = slowest.max(t.elapsed());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            slowest < Duration::from_millis(1500),
+            "the server starved behind the app's blocked runtime: slowest round {slowest:?} \
+             (before the isolated runtime, /health alone took seconds here)"
+        );
+
+        // Leave no pinned runtime to the next test.
+        let left = Duration::from_secs(PINNED_SECS + 1).saturating_sub(pinned_at.elapsed());
+        tokio::time::sleep(left).await;
+    }
+);

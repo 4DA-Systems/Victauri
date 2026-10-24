@@ -1094,7 +1094,7 @@ impl VictauriBuilder {
                     let ready_state = state.clone();
                     let server_finished = state.task_tracker.track_guarded("mcp_server");
                     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-                    tauri::async_runtime::spawn(async move {
+                    spawn_server_isolated(async move {
                         let _finished = server_finished;
                         match mcp::start_server_reporting_port(
                             app_handle,
@@ -1201,6 +1201,45 @@ impl VictauriBuilder {
                     tools::victauri_check_ipc_integrity,
                 ])
                 .build())
+        }
+    }
+}
+
+/// Run the MCP server on its **own** Tokio runtime (dedicated OS threads) instead of Tauri's
+/// shared async runtime.
+///
+/// An app that blocks its async workers — a synchronous call inside an `async` command, a
+/// CPU-bound loop on a Tokio task — used to take Victauri down with it: `/health`, the REST and
+/// MCP endpoints and every Rust-side tool stopped answering until the app let go (measured live
+/// in 4DA: everything frozen for ~90 s while a scheduled job pinned the runtime). That is
+/// exactly when an agent needs to look inside. On its own runtime the server keeps answering;
+/// only the tools that genuinely need the app's main thread or webview wait on those.
+/// Multi-threaded, because the bridge relies on `block_in_place`. Falls back to Tauri's runtime
+/// if a dedicated one cannot be built.
+#[cfg(debug_assertions)]
+fn spawn_server_isolated<F>(server: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("victauri-mcp")
+        .enable_all()
+        .build();
+    match runtime {
+        Ok(rt) => {
+            let spawned = std::thread::Builder::new()
+                .name("victauri-mcp-runtime".into())
+                .spawn(move || rt.block_on(server));
+            if let Err(e) = spawned {
+                tracing::error!("Victauri MCP server thread could not start: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Victauri: dedicated runtime unavailable ({e}); sharing the app's async runtime"
+            );
+            tauri::async_runtime::spawn(server);
         }
     }
 }

@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency advisories published after 0.10.0** (lockfile only, semver-compatible):
+  `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382, certificate verification could accept
+  distrusted intermediates), `webpki-roots` 1.0.7 → 1.0.11 (RUSTSEC-2026-0381, bundled roots
+  trusted distrusted emSign intermediates), `tokio` 1.52.1 → 1.54.1 (RUSTSEC-2026-0386, unsound
+  `AsyncFd` constructors; Victauri does not call them). They reach `cargo install victauri-cli
+  --locked` through the published lockfile, which is what a 0.10.1 fixes. Victauri's own HTTP
+  traffic is plain localhost; no Victauri code path verifies a remote certificate.
+
+### Fixed
+
+- **The server keeps answering while the app blocks its own async runtime** (#83). Victauri's
+  MCP/REST server ran on Tauri's shared Tokio runtime, so an app that blocked its workers — a
+  synchronous call inside an `async` command, a CPU-bound task, a scheduled job — froze
+  `/health`, the REST and MCP endpoints and every Rust-side tool with it, exactly when an agent
+  needs to look inside (measured live in 4DA: everything frozen for ~90 s). The server now runs
+  on its own 2-thread runtime (falling back to Tauri's if one cannot be built); only tools that
+  genuinely need the app's main thread or webview wait on those. The demo app's new
+  `saturate_async_runtime` command and the E2E test
+  `server_stays_responsive_while_the_app_blocks_its_async_runtime` prove it (shared runtime:
+  3.7 s stalls; own runtime: answers throughout).
+- **An eval's timeout covers the whole call** (#83). The liveness probe, the injection and the
+  parse check are main-thread round trips, and the wait for the result started its own full
+  timeout only after them — on a busy UI thread a "30 s" `eval_js` (and every tool built on it)
+  could run for about two minutes. All steps now share one deadline: a main-thread round trip
+  waits to *start* only as long as the call has left (a closure not picked up in time is
+  abandoned and never runs, so the call reports that the code did NOT run), and a call out of
+  time before its code was sent says exactly that. A closure that already started is still
+  waited for, so "did my code run" stays truthful. Two floors keep short timeouts from turning
+  load into false failures: sending gets at least 2.5 s (the liveness probe always keeps its
+  full 2 s — a shorter one cannot tell a dead page from a busy one), and code that reached the
+  page gets at least min(timeout, 1 s) to answer. A call now ends within about
+  max(timeout, 2.5 s) + min(timeout, 1 s), plus the grace of a main-thread step that had
+  already started.
+
 ## [0.10.0] - 2026-10-18
 
 Built from an adversarial adoption audit (2026-10-16) of what stands between Victauri and being
