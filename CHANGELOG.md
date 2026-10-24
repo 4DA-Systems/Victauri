@@ -26,7 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits to *start* only as long as the call has left (a closure not picked up in time is
   abandoned and never runs, so the call reports that the code did NOT run), and a call out of
   time before its code was sent says exactly that. A closure that already started is still
-  waited for, so "did my code run" stays truthful.
+  waited for, so "did my code run" stays truthful. Two floors keep short timeouts from turning
+  load into false failures: sending gets at least 2.5 s (the liveness probe always keeps its
+  full 2 s — a shorter one cannot tell a dead page from a busy one), and code that reached the
+  page gets at least min(timeout, 1 s) to answer. A call now ends within about
+  max(timeout, 2.5 s) + min(timeout, 1 s), plus the grace of a main-thread step that had
+  already started.
 
 ## [0.10.0] - 2026-10-18
 
