@@ -5498,6 +5498,7 @@ version = "0.10.1"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "clap",
  "ctrlc",
  "futures-util",

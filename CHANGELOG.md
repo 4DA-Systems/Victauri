@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.10.1] - 2026-10-25
 
+### Added
+
+- **`victauri tools` and `victauri call` — every tool from a plain shell.** Until now the
+  shell reached only app commands (`victauri invoke`); the other 34 tools needed an MCP client,
+  or `curl` plus the discovered port and token. Shell-first agents (Codex without MCP, Pi,
+  OpenClaw) and CI scripts now run any tool as a command: `victauri call query_db
+  query="SELECT 1"` prints the result as JSON on stdout. Arguments are `key=value` (string),
+  `key:=json` (any JSON value), a leading JSON object, or `--args-file <path|->` (the reliable
+  form in Windows PowerShell, which strips quotes inside JSON arguments). Image results
+  (`screenshot`, `animation scrub`, `trace frames`) are decoded and saved with `--out`, never
+  printed as base64. Exit codes: 0 success, 1 the tool reported an error (`{"error": …}` on
+  stdout), 2 bad arguments or no app reachable. `victauri tools [name]` lists the tools, or one
+  tool's arguments, from the live input schemas; with no app running it lists the built-in
+  names and descriptions. Both use the same discovery, trust checks, `--app` pinning and token
+  as `invoke`, take no port/URL/token flag, never print the token, and pass server-supplied
+  text through the terminal sanitizer. A failed call checks for CLI↔plugin version skew. The
+  agent guidance `victauri setup` writes now names `victauri call` as the fallback before raw
+  REST. `victauri-test` gains `VictauriClient::call_tool_raw` (the complete MCP result: every
+  content block and `isError`) and `VictauriClient::list_tools` (live tool schemas); `call_tool`
+  is unchanged.
+
 ### Security
 
 - **Dependency advisories published after 0.10.0** (#86; lockfile only, semver-compatible):

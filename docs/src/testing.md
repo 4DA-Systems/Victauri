@@ -818,6 +818,9 @@ victauri test                                     # Run 11 built-in smoke checks
 victauri test --max-load-ms 5000 --max-heap-mb 256 # With custom thresholds
 victauri record --output tests/flow.rs            # Record interactions → generate Rust test
 victauri coverage --threshold 80                  # Report IPC coverage, fail if below 80%
+victauri tools                                    # List the running app's tools
+victauri call query_db query="SELECT 1"           # Call any tool from the shell → JSON on stdout
+victauri call screenshot --out shot.png           # Image results are saved to a file
 victauri watch                                    # Re-run tests on file changes
 victauri watch --filter smoke                     # Only re-run specific test file
 ```

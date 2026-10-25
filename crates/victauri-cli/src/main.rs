@@ -3,6 +3,7 @@
 
 mod agents;
 mod bridge;
+mod call;
 mod jsonc;
 
 use std::path::{Path, PathBuf};
@@ -147,6 +148,61 @@ VICTAURI:BEGIN..END block, or .claude/skills/victauri/.")]
         #[arg(short, long)]
         args: Option<String>,
         /// Print raw JSON output (no formatting)
+        #[arg(long)]
+        raw: bool,
+        #[command(flatten)]
+        target: AppTarget,
+    },
+    /// List the running app's Victauri tools, or show one tool's arguments
+    #[command(after_help = "\
+Examples:
+  victauri tools                 every tool, one line each
+  victauri tools query_db        its description and arguments
+  victauri tools --json          MCP tool objects with their input schemas
+
+With no app reachable, lists the built-in tool names and descriptions (argument schemas
+come from the running app).")]
+    Tools {
+        /// Show this tool's full description and arguments
+        name: Option<String>,
+        /// Print JSON instead of text
+        #[arg(long)]
+        json: bool,
+        #[command(flatten)]
+        target: AppTarget,
+    },
+    /// Call any Victauri tool on the running app from the shell and print its result as JSON
+    #[command(after_help = "\
+Arguments (combine freely; later sources override earlier ones):
+  key=value          a string            selector=#save
+  key:=json          any JSON value      limit:=5   deep:='{\"a\":[1,2]}'
+  '{...}'            a JSON object, as the first argument
+  --args-file PATH   a JSON object from a file; `-` reads stdin
+
+Examples:
+  victauri call dom_snapshot
+  victauri call query_db query=\"SELECT count(*) FROM items\"
+  victauri call interact action=click ref_id=e12
+  victauri call invoke_command command=get_settings
+  victauri call screenshot --out shot.png
+  echo '{\"action\":\"list\"}' | victauri call window --args-file -
+
+Output: the tool's result as JSON on stdout. Image results are saved with --out (never
+printed as base64). Exit codes: 0 success, 1 the tool reported an error ({\"error\": …} on
+stdout), 2 bad arguments or no app reachable.")]
+    Call {
+        /// Tool name (`victauri tools` lists them)
+        tool: String,
+        /// Arguments: a JSON object and/or key=value / key:=json pairs
+        args: Vec<String>,
+        /// Read the arguments as a JSON object from this file (`-` = stdin)
+        #[arg(long, value_name = "PATH")]
+        args_file: Option<String>,
+        /// Save image results (screenshot, filmstrip, trace frames) here; several images are
+        /// numbered `<stem>-1.<ext>`, `<stem>-2.<ext>`, …
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+        /// Print compact one-line JSON
         #[arg(long)]
         raw: bool,
         #[command(flatten)]
@@ -308,6 +364,33 @@ async fn main() -> Result<()> {
             target,
         } => {
             cmd_invoke(&command, args.as_deref(), raw, &target).await?;
+        }
+        Commands::Tools { name, json, target } => {
+            let code = cmd_tools(name.as_deref(), json, &target).await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
+        Commands::Call {
+            tool,
+            args,
+            args_file,
+            out,
+            raw,
+            target,
+        } => {
+            let code = cmd_call(
+                &tool,
+                &args,
+                args_file.as_deref(),
+                out.as_deref(),
+                raw,
+                &target,
+            )
+            .await?;
+            if code != 0 {
+                std::process::exit(code);
+            }
         }
         Commands::Coverage {
             threshold,
@@ -1381,6 +1464,245 @@ async fn cmd_invoke(
     }
 
     Ok(())
+}
+
+/// Print `value` as JSON on stdout: pretty, or one line with `raw`.
+fn print_json(value: &serde_json::Value, raw: bool) -> Result<()> {
+    if raw {
+        println!("{}", serde_json::to_string(value)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
+}
+
+/// Warn on a CLI↔plugin `major.minor` skew. One extra Rust-side call, so `call` only does it
+/// after a failure (where skew is a likely cause) and the success path stays one round trip.
+async fn warn_on_plugin_skew(client: &mut victauri_test::VictauriClient) {
+    if let Ok(info) = client.get_plugin_info().await
+        && let Some(version) = info.get("version").and_then(serde_json::Value::as_str)
+    {
+        warn_on_version_skew(version);
+    }
+}
+
+/// The built-in tool names (the baked manifest the bridge serves while the app is down).
+fn builtin_tool_names() -> Vec<String> {
+    bridge::fallback_tools()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Result<i32> {
+    use victauri_test::terminal::{single_line, untrusted_multi_line};
+
+    // The live list carries each tool's real input schema and honors the app's disabled
+    // tools; with no app reachable, the baked manifest still answers "what exists".
+    let (tools, app) = match discover_target(target).await {
+        Ok(mut client) => {
+            warn_on_plugin_skew(&mut client).await;
+            let app = client.app_identifier().map(str::to_string);
+            match client.list_tools().await {
+                Ok(tools) => (tools, app),
+                Err(e) => {
+                    eprintln!(
+                        "error: the app did not list its tools: {}",
+                        untrusted_multi_line(&e.to_string())
+                    );
+                    return Ok(call::EXIT_USAGE);
+                }
+            }
+        }
+        Err(e) => {
+            let reason = e.to_string();
+            let first_line = reason.lines().next().unwrap_or_default();
+            eprintln!(
+                "note: no Victauri app reachable ({}) — listing the built-in tools; argument \
+                 schemas come from the running app.",
+                single_line(first_line)
+            );
+            (bridge::fallback_tools(), None)
+        }
+    };
+    let source = if app.is_some() { "live" } else { "builtin" };
+
+    let Some(name) = name else {
+        if json_out {
+            print_json(
+                &serde_json::json!({ "source": source, "app": app, "tools": tools }),
+                false,
+            )?;
+        } else {
+            match &app {
+                Some(id) => println!("{} tools on {}:", tools.len(), single_line(id)),
+                None => println!("{} built-in tools (no app reachable):", tools.len()),
+            }
+            for line in tools.iter().filter_map(call::summary_line) {
+                println!("  {}", single_line(&line));
+            }
+            println!();
+            println!(
+                "`victauri tools <name>` shows a tool's arguments; \
+                 `victauri call <name> key=value …` runs it."
+            );
+        }
+        return Ok(0);
+    };
+
+    let Some(tool) = tools.iter().find(|t| t["name"].as_str() == Some(name)) else {
+        let known: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+        eprintln!("error: no tool named '{}'", single_line(name));
+        let near = call::suggestions(name, &known);
+        if !near.is_empty() {
+            eprintln!("  did you mean: {}", near.join(", "));
+        }
+        eprintln!("  `victauri tools` lists them");
+        return Ok(call::EXIT_USAGE);
+    };
+
+    if json_out {
+        print_json(tool, false)?;
+        return Ok(0);
+    }
+    println!("{name}");
+    println!();
+    println!(
+        "{}",
+        untrusted_multi_line(tool["description"].as_str().unwrap_or("(no description)"))
+    );
+    println!();
+    let lines = call::schema_lines(&tool["inputSchema"]);
+    if app.is_none() {
+        println!("Arguments: start the app to see them (schemas come from the running app).");
+    } else if lines.is_empty() {
+        println!("Arguments: none");
+    } else {
+        println!("Arguments:");
+        for line in &lines {
+            println!("{}", single_line(line));
+        }
+        println!();
+        println!("Full input schema: victauri tools {name} --json");
+    }
+    Ok(0)
+}
+
+async fn cmd_call(
+    tool: &str,
+    args: &[String],
+    args_file: Option<&str>,
+    out: Option<&Path>,
+    raw: bool,
+    target: &AppTarget,
+) -> Result<i32> {
+    use victauri_test::terminal::{single_line, untrusted_multi_line};
+
+    let file_json = match args_file {
+        Some("-") => {
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                .context("failed to read the arguments from stdin")?;
+            Some(text)
+        }
+        Some(path) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("failed to read --args-file {path}"))?,
+        ),
+        None => None,
+    };
+    let arguments = match call::build_arguments(file_json.as_deref(), args) {
+        Ok(arguments) => arguments,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Ok(call::EXIT_USAGE);
+        }
+    };
+
+    let mut client = match discover_target(target).await {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("{}", connect_failure_message(&e.to_string()));
+            return Ok(call::EXIT_USAGE);
+        }
+    };
+
+    let result = match client.call_tool_raw(tool, arguments).await {
+        Ok(result) => result,
+        // The server refused the call (unknown tool, invalid arguments, a disabled tool).
+        Err(victauri_test::TestError::Mcp { message, .. }) => {
+            print_json(&serde_json::json!({ "error": message }), raw)?;
+            eprintln!("error: {}", untrusted_multi_line(&message));
+            let names = builtin_tool_names();
+            if !names.iter().any(|n| n == tool) {
+                let known: Vec<&str> = names.iter().map(String::as_str).collect();
+                let near = call::suggestions(tool, &known);
+                if !near.is_empty() {
+                    eprintln!("  did you mean: {}", near.join(", "));
+                }
+                eprintln!(
+                    "  '{}' is not a Victauri tool (`victauri tools` lists them). To run one of \
+                     the app's own Tauri commands: victauri call invoke_command command={}",
+                    single_line(tool),
+                    single_line(tool)
+                );
+            }
+            warn_on_plugin_skew(&mut client).await;
+            return Ok(call::EXIT_TOOL_ERROR);
+        }
+        Err(e) => {
+            let detail = e.to_string();
+            eprintln!("error: {}", untrusted_multi_line(&detail));
+            if matches!(&e, victauri_test::TestError::Request(r) if r.is_timeout()) {
+                eprintln!(
+                    "  the app did not answer in time — the tool may still have run; check its \
+                     effect before calling again"
+                );
+            }
+            return Ok(call::EXIT_USAGE);
+        }
+    };
+
+    let rendered = match call::render(&result) {
+        Ok(rendered) => rendered,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Ok(call::EXIT_TOOL_ERROR);
+        }
+    };
+
+    if rendered.is_error {
+        let message = call::error_message(&rendered.text);
+        print_json(&serde_json::json!({ "error": message }), raw)?;
+        eprintln!("error: {}", untrusted_multi_line(&message));
+        warn_on_plugin_skew(&mut client).await;
+        return Ok(call::EXIT_TOOL_ERROR);
+    }
+
+    let mut saved = Vec::new();
+    if let Some(out) = out {
+        let count = rendered.images.len();
+        if count == 0 {
+            eprintln!("note: the result has no image; --out was not used");
+        }
+        for (i, image) in rendered.images.iter().enumerate() {
+            let path = call::image_path(out, i, count, &image.mime_type);
+            std::fs::write(&path, &image.bytes)
+                .with_context(|| format!("failed to write {}", path.display()))?;
+            saved.push(path);
+        }
+    } else if !rendered.images.is_empty() {
+        eprintln!(
+            "note: {} image(s) in the result were not printed — pass --out <file> to save them",
+            rendered.images.len()
+        );
+    }
+
+    print_json(
+        &call::success_json(rendered.text, &rendered.images, &saved),
+        raw,
+    )?;
+    Ok(0)
 }
 
 async fn cmd_coverage(

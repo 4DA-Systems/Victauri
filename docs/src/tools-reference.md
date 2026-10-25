@@ -2,7 +2,9 @@
 
 Victauri exposes 35 MCP tools organized into standalone tools (one action per call) and compound tools (multiple actions via an `action` parameter).
 
-All tools are accessible via MCP at `/mcp` or REST at `POST /api/tools/{tool_name}`.
+All tools are accessible via MCP at `/mcp`, REST at `POST /api/tools/{tool_name}`, or the shell:
+`victauri call <tool> key=value key:=<json>` prints the result as JSON (`victauri tools <tool>`
+shows a tool's arguments; see the [CLI README](https://github.com/4DA-Systems/victauri/tree/main/crates/victauri-cli#victauri-tools--victauri-call)).
 
 > **Common parameters.** Every tool that touches a webview accepts `webview_label` (aliases `window`, `window_label`) to pick the window; without it the default window is used (`main`, else the first visible one). Every compound tool takes a required `action` string naming the operation.
 
