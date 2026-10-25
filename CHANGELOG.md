@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- **Dependency advisories published after 0.10.0** (#86; lockfile only, semver-compatible):
+  `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382, certificate verification may accept
+  distrusted emSign intermediates), `webpki-roots` 1.0.7 → 1.0.10 (RUSTSEC-2026-0381, the bundled
+  roots allowed trust in those intermediates), `tokio` 1.52.1 → 1.53.3 (RUSTSEC-2026-0386, unsound
+  `AsyncFd` constructors, which Victauri does not call; 1.53.3 rather than 1.54.x stays clear of
+  1.54.0's RUSTSEC-2026-0384). They reach `cargo install victauri-cli --locked` through the
+  published lockfile, which is what 0.10.1 fixes. Victauri's own HTTP traffic is plain
+  localhost; no Victauri code path verifies a remote certificate.
+
 ### Fixed
 
 - **The server keeps answering while the app blocks its own async runtime** (#83). Victauri's
