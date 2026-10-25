@@ -193,6 +193,9 @@ pub type PendingCallbacks = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>
 pub(crate) struct PendingSlot {
     map: PendingCallbacks,
     id: String,
+    /// Reserved by a page command, so it may be dropped on the APP's runtime (see
+    /// [`lock_pending_unqueued`]).
+    on_app_runtime: bool,
 }
 
 impl PendingSlot {
@@ -208,7 +211,15 @@ impl PendingSlot {
         Self {
             map: Arc::clone(map),
             id,
+            on_app_runtime: false,
         }
+    }
+
+    /// Mark a slot reserved by a page command (on the app's runtime): a removal it leaves for
+    /// later must never queue on the lock there.
+    pub(crate) fn reserved_on_app_runtime(mut self) -> Self {
+        self.on_app_runtime = true;
+        self
     }
 
     /// The reserved eval id.
@@ -265,6 +276,26 @@ pub(crate) fn eval_result_accepted(
     }
 }
 
+/// Take the [`PendingCallbacks`] lock WITHOUT joining its wait queue — for code that may run on
+/// the APP's async runtime (the page commands, a slot dropped there).
+///
+/// tokio's `Mutex` is fair: on release the lock is handed straight to the first QUEUED waiter,
+/// even if that task cannot be polled yet. A waiter queued on the app's runtime while the app
+/// pins it (a blocking call in async code) would then hold the lock until the app lets go, and
+/// every agent eval — on Victauri's own runtime — would hang in `reserve_pending` with it. A
+/// task that only ever `try_lock`s is never handed the lock while it is not running. Every map
+/// operation is a few non-awaiting lines, so the retry loop spins at most briefly.
+pub(crate) async fn lock_pending_unqueued(
+    map: &PendingCallbacks,
+) -> tokio::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<String>>> {
+    loop {
+        if let Ok(guard) = map.try_lock() {
+            return guard;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
 impl Drop for PendingSlot {
     fn drop(&mut self) {
         eval_targets().remove(&self.id);
@@ -277,6 +308,12 @@ impl Drop for PendingSlot {
         let map = Arc::clone(&self.map);
         let id = std::mem::take(&mut self.id);
         match tokio::runtime::Handle::try_current() {
+            // A page command's slot is dropped on the app's runtime: never queue there.
+            Ok(rt) if self.on_app_runtime => {
+                rt.spawn(async move {
+                    lock_pending_unqueued(&map).await.remove(&id);
+                });
+            }
             Ok(rt) => {
                 rt.spawn(async move {
                     map.lock().await.remove(&id);

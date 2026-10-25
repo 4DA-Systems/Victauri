@@ -325,8 +325,9 @@ const MIN_RESULT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1)
 const PROBE_ANSWER_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Extra eval time a page-side `wait_for` gets beyond its own `timeout_ms`, for sending the code
-/// (see `wait_for`).
-const WAIT_FOR_SEND_SLACK_MS: u64 = 12_000;
+/// (see `wait_for`): the probe's start wait (≤ 10 s) + its answer window (2 s) + the
+/// injection's own start wait (≤ 10 s), plus 2 s margin.
+const WAIT_FOR_SEND_SLACK_MS: u64 = 24_000;
 /// An abandoned `trace` auto-stops after this long (it captures a window every interval).
 const MAX_TRACE_DURATION: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 /// Cap on the base64 bytes returned by one `trace frames` call.
@@ -915,8 +916,9 @@ impl VictauriMcpHandler {
         );
         // `waitFor` starts its own `timeout_ms` clock only once the code runs, while the eval's
         // timeout covers the whole call — so the slack must also cover SENDING the code on a busy
-        // UI thread (a main-thread round trip may wait up to 10 s to start, plus the liveness
-        // probe's 2 s), or the condition's own answer would be cut off as an eval timeout.
+        // UI thread (the probe AND the injection are main-thread round trips that may each wait
+        // up to 10 s to start, plus the probe's 2 s answer window), or the condition's own
+        // answer would be cut off as an eval timeout.
         let eval_timeout = std::time::Duration::from_millis(timeout_ms + WAIT_FOR_SEND_SLACK_MS);
         match self
             .eval_with_return_timeout(&code, params.webview_label.as_deref(), eval_timeout)
@@ -5297,6 +5299,21 @@ impl VictauriMcpHandler {
             .await
         {
             Ok(nonce) => nonce,
+            // The probe's own delivery was not picked up within the send window: a busy UI
+            // thread, not a dead page or a failed injection of the agent's code.
+            Err(e) if e.contains("(it will not run)") => {
+                return Err(EvalFailure::new(
+                    NotSent,
+                    format!(
+                        "eval ran out of time before the code was sent ({} elapsed, timeout {}) \
+                         — the app's UI thread is busy (the liveness probe could not be \
+                         delivered: {e}). The code did NOT run; retry when the app is \
+                         responsive, or pass a longer timeout.",
+                        format_timeout(started.elapsed()),
+                        format_timeout(timeout)
+                    ),
+                ));
+            }
             Err(e) => {
                 return Err(EvalFailure::new(
                     NotSent,
@@ -5381,6 +5398,19 @@ impl VictauriMcpHandler {
                     format!(
                         "eval delivery did not finish: {e}. The code may or may not have run — \
                          check the app's state before re-running it."
+                    ),
+                )
+            } else if e.contains("(it will not run)") {
+                // The UI thread did not pick the delivery up within the call's send window —
+                // the same exhaustion as the check above, one step later: same diagnosis.
+                EvalFailure::new(
+                    NotSent,
+                    format!(
+                        "eval ran out of time before the code was sent ({} elapsed, timeout {}) \
+                         — the app's UI thread is busy ({e}). The code did NOT run; retry when \
+                         the app is responsive, or pass a longer timeout.",
+                        format_timeout(started.elapsed()),
+                        format_timeout(timeout)
                     ),
                 )
             } else {
@@ -9211,6 +9241,165 @@ mod command_policy_dispatch_tests {
             "{}",
             failure.message
         );
+    }
+
+    /// Lens B (0.10.1 audit): the page commands (`victauri_eval_js` / `victauri_dom_snapshot`)
+    /// run on the APP's runtime and take `pending_evals` with a fair-queued `.lock().await`. If
+    /// such a waiter is queued when a Victauri map op releases the lock, tokio hands the lock to
+    /// THAT task — which cannot run while the app pins its runtime. Every agent eval then hangs
+    /// in `reserve_pending` (unbounded, before any deadline) until the app lets go.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_page_eval_queued_on_a_pinned_app_runtime_cannot_hang_agent_evals() {
+        let state = eval_state_with_timeout(1_000);
+        let recording = RecordingBridge::answering(state.pending_evals.clone());
+        recording.answer_evals_with(r#"{"__victauri_ok":2,"__victauri_type":"value"}"#);
+        let h = VictauriMcpHandler::new(state.clone(), Arc::new(MainWindowBridge(recording)));
+        // Tauri's runtime, reduced to one worker.
+        let app_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        // A Victauri map operation is in flight when the page asks for the lock.
+        let guard = state.pending_evals.lock().await;
+        let page_state = state.clone();
+        app_rt.spawn(async move {
+            let (tx, _rx) = tokio::sync::oneshot::channel();
+            let _slot = crate::tools::reserve_page_eval(&page_state, "main", tx).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // The app blocks its runtime (a blocking call inside async code) for 6 s.
+        app_rt.spawn(async { std::thread::sleep(std::time::Duration::from_secs(6)) });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(guard);
+
+        let started = std::time::Instant::now();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(12),
+            h.eval_outcome("1 + 1", Some("main"), std::time::Duration::from_secs(1)),
+        )
+        .await;
+        let took = started.elapsed();
+        app_rt.shutdown_background();
+        // Documented bound: max(timeout, 2.5 s) + 2 s = 4.5 s.
+        assert!(
+            took < std::time::Duration::from_millis(4_500),
+            "a 1 s agent eval hung {took:?} behind a page eval queued on the app's pinned \
+             runtime (outcome: {:?})",
+            out.map(|r| r.map_err(|f| f.message))
+        );
+    }
+
+    /// LENS-A-1: `wait_for`'s 12 s send slack assumed ONE main-thread start wait (10 s) plus the
+    /// probe's 2 s answer — but the probe AND the injection each wait up to 10 s to start. On a
+    /// UI thread that takes 6.5 s to pick up each round trip (inside every budget, so a real
+    /// `on_main` would run them, not abandon them), the code reaches the page at ~13 s; the
+    /// page's `waitFor` answers after its own 10 s (at ~23 s), past the eval's 22 s deadline —
+    /// so a page answer (here: the condition was met at 9.9 s of page time) is reported as
+    /// "eval timed out … an unresolved promise".
+    #[tokio::test]
+    async fn a_page_side_wait_for_answer_is_not_cut_off_by_slow_sending() {
+        let state = eval_state_with_timeout(30_000);
+        let recording = RecordingBridge::answering(state.pending_evals.clone());
+        recording.answer_evals_after(
+            r#"{"__victauri_ok":{"ok":true,"elapsed_ms":9900},"__victauri_type":"value"}"#,
+            std::time::Duration::from_millis(9_900),
+        );
+        let bridge = SlowUiBridge(
+            MainWindowBridge(recording),
+            std::time::Duration::from_millis(6_500),
+        );
+        let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+        let r = call(
+            &h,
+            "wait_for",
+            json!({"condition": "selector", "value": "#x", "timeout_ms": 10_000,
+                   "webview_label": "main"}),
+        )
+        .await;
+        let text = result_text(&r);
+        assert!(
+            !text.contains("timed out"),
+            "the page's own wait_for answer was cut off by the send slack: {text}"
+        );
+        assert!(text.contains("\"ok\":true"), "{text}");
+    }
+
+    /// LENS-A-2: a budget-honoring busy UI (a closure not picked up within the round trip's
+    /// start budget is abandoned, as `on_main` does): 1.3 s pickup latency. The probe takes
+    /// 1.3 s of the 2.5 s send window, the injection gets 1.2 s and is abandoned. The call is
+    /// truthfully `NotSent`, but its message is the bare bridge error — not the "ran out of time
+    /// before the code was sent … UI thread is busy … pass a longer timeout" diagnosis the same
+    /// exhaustion gets one step earlier.
+    #[tokio::test]
+    async fn an_injection_abandoned_for_lack_of_budget_gets_the_busy_ui_diagnosis() {
+        struct BudgetedSlowUi(MainWindowBridge, std::time::Duration);
+        impl WebviewBridge for BudgetedSlowUi {
+            fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
+                let budget = crate::bridge::start_timeout();
+                if self.1 > budget {
+                    std::thread::sleep(budget);
+                    return Err(
+                        "eval_webview did not complete on the main thread: timed out \
+                                before it started (it will not run)"
+                            .to_string(),
+                    );
+                }
+                std::thread::sleep(self.1);
+                self.0.eval_webview(label, script)
+            }
+            fn get_window_states(&self, label: Option<&str>) -> Vec<WindowState> {
+                self.0.get_window_states(label)
+            }
+            fn list_window_labels(&self) -> Vec<String> {
+                self.0.list_window_labels()
+            }
+            fn get_native_handle(&self, label: Option<&str>) -> Result<isize, String> {
+                self.0.get_native_handle(label)
+            }
+            fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
+                self.0.manage_window(label, action)
+            }
+            fn resize_window(&self, label: Option<&str>, w: u32, h: u32) -> Result<(), String> {
+                self.0.resize_window(label, w, h)
+            }
+            fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
+                self.0.move_window(label, x, y)
+            }
+            fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
+                self.0.set_window_title(label, title)
+            }
+        }
+        // 1.3 s: the injection is the step that runs out; 2.7 s: the probe itself does.
+        for latency_ms in [1_300, 2_700] {
+            let state = eval_state_with_timeout(1_000);
+            let recording = RecordingBridge::answering(state.pending_evals.clone());
+            let bridge = BudgetedSlowUi(
+                MainWindowBridge(recording),
+                std::time::Duration::from_millis(latency_ms),
+            );
+            let h = VictauriMcpHandler::new(state, Arc::new(bridge));
+            let failure = h
+                .eval_outcome(
+                    "1 + 1",
+                    Some("main"),
+                    std::time::Duration::from_millis(1_000),
+                )
+                .await
+                .expect_err("the delivery could not start in time");
+            assert_eq!(
+                failure.kind,
+                EvalFailureKind::NotSent,
+                "{}",
+                failure.message
+            );
+            assert!(
+                failure.message.contains("UI thread is busy")
+                    && failure.message.contains("longer timeout"),
+                "{latency_ms} ms: no busy-UI diagnosis / remedy: {}",
+                failure.message
+            );
+        }
     }
 
     async fn hanging_eval(h: &VictauriMcpHandler) -> (String, std::time::Duration) {

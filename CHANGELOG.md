@@ -55,15 +55,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gets at least min(timeout, 1 s) to answer, counted after the parse check; a result that has
   arrived is never reported as a timeout. A call now ends within max(timeout, 2.5 s) + 2 s (a
   probe dispatched just before the send deadline keeps its 2 s), plus the grace of a main-thread
-  step that had already started. `wait_for`'s page-side conditions get 12 s of extra eval time
-  (was 5 s) so sending on a busy UI thread cannot cut off the condition's own answer.
+  step that had already started. A call that runs out of send time at any step (before the
+  probe, during it, or at the injection) gets the same "ran out of time before the code was
+  sent — the app's UI thread is busy" diagnosis. `wait_for`'s page-side conditions get 24 s of
+  extra eval time (was 5 s) — room for both main-thread start waits (up to 10 s each) and the
+  probe's 2 s — so sending on a busy UI thread cannot cut off the condition's own answer.
+- **A page-originated eval can no longer stall every agent eval while the app blocks its
+  runtime.** The page commands (`victauri_eval_js` / `victauri_dom_snapshot`) run on the app's
+  runtime and queued on the pending-eval lock; tokio's mutex hands a released lock to the first
+  queued waiter, so a waiter whose runtime the app had just pinned held it until the app let go,
+  and every agent eval waited behind it (a 1 s `eval_js` took ~6 s and blamed a busy UI thread).
+  Code that may run on the app's runtime now never queues on that lock.
 
 ### Release process
 
 - **crates.io publishing uses Trusted Publishing (OIDC)** — the release workflow no longer
   reads a stored `CARGO_REGISTRY_TOKEN`; it exchanges the run's GitHub OIDC token for a
   short-lived crates.io token that is revoked when the job ends (see RELEASING.md for the
-  one-time per-crate setup).
+  one-time per-crate setup — configure **all six** crates before tagging: the token covers only
+  configured crates, so a missing one stops the publish after the earlier crates are live).
+  When every crate is already on crates.io at the tag's version (a local publish, or a re-run),
+  the workflow skips authentication and publishing and still cuts the GitHub Release.
 
 ## [0.10.0] - 2026-10-18
 

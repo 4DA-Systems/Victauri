@@ -784,14 +784,17 @@ e2e_test!(
             .invoke_command_with_timeout("async_runtime_ping", None, 800)
             .await;
         assert!(
-            ping.is_err(),
+            ping.as_ref()
+                .is_err_and(|e| e.to_string().contains("timed out")),
             "the app's async runtime was not saturated, so this test proves nothing: {ping:?}"
         );
 
         let http = reqwest::Client::new();
         let health_url = format!("{}/health", client.base_url());
         let mut slowest = Duration::ZERO;
-        while pinned_at.elapsed() < Duration::from_secs(PINNED_SECS - 1) {
+        // Stop probing well before the pin ends, so the ping below can show the runtime was
+        // still pinned when the probing finished.
+        while pinned_at.elapsed() < Duration::from_secs(PINNED_SECS - 2) {
             let t = Instant::now();
             let health = http
                 .get(&health_url)
@@ -830,9 +833,11 @@ e2e_test!(
             .invoke_command_with_timeout("async_runtime_ping", None, 30_000)
             .await
             .expect("the app's async runtime is free again after the pin");
+        let freed_after = pinned_at.elapsed();
         assert!(
-            pinned_at.elapsed() >= Duration::from_secs(PINNED_SECS - 1),
-            "the runtime was free before the pin ended — the control above was not real"
+            freed_after >= Duration::from_millis(PINNED_SECS * 1000 - 700),
+            "the runtime was free after {freed_after:?}, before the {PINNED_SECS} s pin ended — \
+             it was not pinned for the whole probing window, so the rounds above prove nothing"
         );
     }
 );

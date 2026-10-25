@@ -63,7 +63,8 @@ pub async fn reserve_page_eval(
     tx: tokio::sync::oneshot::Sender<String>,
 ) -> Result<crate::PendingSlot, String> {
     let id = format!("{PAGE_EVAL_PREFIX}{}:{label}", uuid::Uuid::new_v4());
-    let mut pending = state.pending_evals.lock().await;
+    // This runs on the APP's runtime: never queue on the lock there (see the helper).
+    let mut pending = crate::lock_pending_unqueued(&state.pending_evals).await;
     let mut page_pending = 0;
     let mut window_pending = 0;
     for key in pending.keys().filter(|k| k.starts_with(PAGE_EVAL_PREFIX)) {
@@ -89,7 +90,8 @@ pub async fn reserve_page_eval(
             crate::mcp::MAX_PENDING_EVALS
         ));
     }
-    let slot = crate::PendingSlot::insert(&state.pending_evals, &mut pending, id, tx);
+    let slot = crate::PendingSlot::insert(&state.pending_evals, &mut pending, id, tx)
+        .reserved_on_app_runtime();
     slot.bind_window(Some(label));
     Ok(slot)
 }
@@ -233,8 +235,12 @@ fn deliver_eval_result(state: Arc<VictauriState>, id: String, result: String) {
         return;
     }
     let server_runtime = state.server_runtime.get().cloned();
+    // Without a server runtime this runs on the app's runtime: never queue on the lock there.
     let deliver = async move {
-        if let Some(tx) = state.pending_evals.lock().await.remove(&id) {
+        if let Some(tx) = crate::lock_pending_unqueued(&state.pending_evals)
+            .await
+            .remove(&id)
+        {
             let _ = tx.send(result);
         }
     };

@@ -17,8 +17,10 @@ timeout (`timeout_ms` on `invoke_command`) if the work legitimately needs it.
 blocking pool), so it keeps answering while the app's runtime is blocked. A probe that spawns
 Tokio tasks (`tokio::spawn`, `Handle::current()`) now spawns them on Victauri's runtime rather
 than the app's, and they are cancelled when that runtime shuts down at exit; spawn through
-`tauri::async_runtime` if a task must live on the app's runtime. `on_ready` still runs on the
-app's runtime.
+`tauri::async_runtime` if a task must live on the app's runtime — and always if it holds a
+Tauri handle (`AppHandle`, `Webview`, `WebviewWindow`): cancelling it at exit drops that handle
+on Victauri's thread, and on Linux dropping a Tauri handle off the main thread can corrupt the
+heap. `on_ready` still runs on the app's runtime.
 
 **`/health` answers while the app's async runtime is blocked.** It reports that Victauri's
 server is alive, no longer (as a side effect) that the app's runtime is free. A watchdog or
