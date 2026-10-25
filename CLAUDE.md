@@ -216,6 +216,19 @@ race — tokio's `sleep_until` on a past deadline is Pending on its first poll, 
 `biased` + a final `try_recv` are kept as defence in depth. Gate: 2,087 workspace tests, all
 three clippy configs, docs; demo E2E 27/27 live on Windows; semver-checks: no update required.
 
+**Added on top (2026-10-26, PR #89, fast-forwarded as `385428a`): `victauri tools` + `victauri
+call`** — every tool from a plain shell, prompted by an audit of HKUDS/CLI-Anything (57k stars;
+its only Tauri harness, cc-switch, writes the app's SQLite behind the running app and
+re-implements its switch logic in Python — already drifted from cc-switch v4). `call` takes
+`k=v` / `k:=json` / a leading JSON object / `--args-file -` (Windows PowerShell 5.1 strips the
+quotes inside JSON args to native programs — verified live), prints JSON, saves images with
+`--out`, exits 0/1/2. Same discovery/trust/`--app`/token path as `invoke`; no port/URL/token
+flag. `victauri-test` gained `call_tool_raw` + `list_tools` (transport loop moved unchanged into
+a private `rpc()`). Pure logic in `crates/victauri-cli/src/call.rs`; e2e in
+`tests/call_e2e.rs` (token-enforcing mock). Live: demo app + read-only 4DA; ~20 ms/call. A
+CLI-Hub `public_registry.json` entry is drafted in `.claude/plans/cli-hub-listing.md`
+(gitignored) — submit only after 0.10.1 is on crates.io and with the operator's OK.
+
 ## Current State (2026-10-19)
 
 ### v0.10.0 — PUBLISHED 2026-10-19 after a seven-lens adversarial audit
