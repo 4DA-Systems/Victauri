@@ -352,6 +352,10 @@ pub struct VictauriState {
     pub(crate) drain_watermarks: introspection::DrainWatermarks,
     /// Per-window page-load generations (bumped by each bridge ready signal).
     pub(crate) page_loads: introspection::PageLoads,
+    /// The runtime Victauri's server runs on (set when it starts on its own runtime): work the
+    /// server's calls depend on is spawned here, never on the app's runtime, which an app can
+    /// block (see `spawn_server_isolated`).
+    pub(crate) server_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 impl VictauriState {
@@ -393,6 +397,7 @@ impl VictauriState {
             probes: introspection::AppStateProbes::default(),
             drain_watermarks: introspection::DrainWatermarks::default(),
             page_loads: introspection::PageLoads::default(),
+            server_runtime: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1037,6 +1042,7 @@ impl VictauriBuilder {
                         probes: introspection::AppStateProbes::default(),
                         drain_watermarks: introspection::DrainWatermarks::default(),
                         page_loads: introspection::PageLoads::default(),
+                        server_runtime: std::sync::OnceLock::new(),
                     });
                     state.startup_timeline.mark("state_created");
 
@@ -1094,7 +1100,7 @@ impl VictauriBuilder {
                     let ready_state = state.clone();
                     let server_finished = state.task_tracker.track_guarded("mcp_server");
                     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-                    spawn_server_isolated(async move {
+                    spawn_server_isolated(&ready_state.server_runtime, async move {
                         let _finished = server_finished;
                         match mcp::start_server_reporting_port(
                             app_handle,
@@ -1214,10 +1220,11 @@ impl VictauriBuilder {
 /// in 4DA: everything frozen for ~90 s while a scheduled job pinned the runtime). That is
 /// exactly when an agent needs to look inside. On its own runtime the server keeps answering;
 /// only the tools that genuinely need the app's main thread or webview wait on those.
-/// Multi-threaded, because the bridge relies on `block_in_place`. Falls back to Tauri's runtime
-/// if a dedicated one cannot be built.
+/// Multi-threaded, because the bridge relies on `block_in_place`. Its handle is published in
+/// `runtime_slot` so work the server's calls depend on is spawned there too. Falls back to
+/// Tauri's runtime if a dedicated runtime cannot be built or its thread cannot start.
 #[cfg(debug_assertions)]
-fn spawn_server_isolated<F>(server: F)
+fn spawn_server_isolated<F>(runtime_slot: &std::sync::OnceLock<tokio::runtime::Handle>, server: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
@@ -1226,20 +1233,54 @@ where
         .thread_name("victauri-mcp")
         .enable_all()
         .build();
-    match runtime {
-        Ok(rt) => {
-            let spawned = std::thread::Builder::new()
-                .name("victauri-mcp-runtime".into())
-                .spawn(move || rt.block_on(server));
-            if let Err(e) = spawned {
-                tracing::error!("Victauri MCP server thread could not start: {e}");
-            }
-        }
+    let rt = match runtime {
+        Ok(rt) => rt,
         Err(e) => {
             tracing::warn!(
                 "Victauri: dedicated runtime unavailable ({e}); sharing the app's async runtime"
             );
             tauri::async_runtime::spawn(server);
+            return;
+        }
+    };
+    let handle = rt.handle().clone();
+    // The runtime and the server travel to the thread together; if the thread cannot start,
+    // both come back here so the server can still run on the app's runtime.
+    let parcel = Arc::new(std::sync::Mutex::new(Some((rt, server))));
+    let for_thread = Arc::clone(&parcel);
+    // (Linux shows at most 15 bytes of a thread name.)
+    let spawned = std::thread::Builder::new()
+        .name("victauri-mcp-rt".into())
+        .spawn(move || {
+            let taken = for_thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((rt, server)) = taken {
+                rt.block_on(server);
+                // Blocking work still running at exit (a hung probe, a slow disk) must not pin
+                // this thread forever: dropping a runtime waits for it without limit.
+                rt.shutdown_timeout(std::time::Duration::from_secs(1));
+            }
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = runtime_slot.set(handle);
+        }
+        Err(e) => {
+            tracing::error!(
+                "Victauri: MCP server thread could not start ({e}); sharing the app's async \
+                 runtime"
+            );
+            let taken = parcel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((rt, server)) = taken {
+                // Not a plain drop: dropping a runtime inside another runtime's context panics.
+                rt.shutdown_background();
+                tauri::async_runtime::spawn(server);
+            }
         }
     }
 }

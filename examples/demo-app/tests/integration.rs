@@ -778,6 +778,16 @@ e2e_test!(
         let pinned_at = Instant::now();
         tokio::time::sleep(Duration::from_millis(300)).await; // let the tasks occupy the workers
 
+        // Positive control: the app's runtime really is pinned — an async command (which runs on
+        // it) cannot answer until it is free. Without this the test could pass vacuously.
+        let ping = client
+            .invoke_command_with_timeout("async_runtime_ping", None, 800)
+            .await;
+        assert!(
+            ping.is_err(),
+            "the app's async runtime was not saturated, so this test proves nothing: {ping:?}"
+        );
+
         let http = reqwest::Client::new();
         let health_url = format!("{}/health", client.base_url());
         let mut slowest = Duration::ZERO;
@@ -798,6 +808,13 @@ e2e_test!(
                 .app_state(Some("pipeline"))
                 .await
                 .expect("an app_state probe answers while the app's runtime is pinned");
+            // A webview round trip too: the eval goes through the main thread and its result
+            // comes back through a sync command — neither may wait on the app's runtime.
+            let two = client
+                .eval_js("1 + 1")
+                .await
+                .expect("eval_js answers while the app's runtime is pinned");
+            assert_eq!(two, json!(2), "{two:?}");
             slowest = slowest.max(t.elapsed());
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
@@ -807,8 +824,15 @@ e2e_test!(
              (before the isolated runtime, /health alone took seconds here)"
         );
 
-        // Leave no pinned runtime to the next test.
-        let left = Duration::from_secs(PINNED_SECS + 1).saturating_sub(pinned_at.elapsed());
-        tokio::time::sleep(left).await;
+        // Leave no pinned runtime to the next test: the runtime is free again once the async
+        // command answers (every pinning task ends at the same deadline).
+        client
+            .invoke_command_with_timeout("async_runtime_ping", None, 30_000)
+            .await
+            .expect("the app's async runtime is free again after the pin");
+        assert!(
+            pinned_at.elapsed() >= Duration::from_secs(PINNED_SECS - 1),
+            "the runtime was free before the pin ended — the control above was not real"
+        );
     }
 );

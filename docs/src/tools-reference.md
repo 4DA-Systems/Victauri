@@ -185,7 +185,7 @@ Invoke a Tauri command from the backend.
 |------|------|----------|-------------|
 | `command` | string | yes | Command name |
 | `args` | object | no | Arguments to pass |
-| `timeout_ms` | integer | no | How long to wait for the result (default: the plugin eval timeout, 30 s; max 300000). Raise it for legitimately slow commands. `victauri-test`: `invoke_command_with_timeout` |
+| `timeout_ms` | integer | no | Time budget for the whole call — sending the command and waiting for its result (default: the plugin eval timeout, 30 s; max 300000). Raise it for legitimately slow commands. `victauri-test`: `invoke_command_with_timeout` |
 
 **Example:**
 ```json

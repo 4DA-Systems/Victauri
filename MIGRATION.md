@@ -2,20 +2,28 @@
 
 ## v0.10.0 → v0.10.1
 
-No API change; consumers on `"0.10"` pick it up with `cargo update`. Two behaviours change:
+No API change; consumers on `"0.10"` pick it up with `cargo update`. Three behaviours change:
 
 **`eval_js` (and every tool built on it) honours its timeout for the whole call.** It used to
 time only the wait for the result, after the liveness probe, injection and parse check had each
 taken their own main-thread wait, so on a busy UI thread a call could run far past its timeout.
-A call now ends within about max(timeout, 2.5 s) + min(timeout, 1 s). On a slow UI thread you
-may see `eval timed out … before the code was sent … The code did NOT run` where 0.10.0 would
-have waited longer and succeeded; raise the timeout if the work legitimately needs it.
+A call now ends within max(timeout, 2.5 s) + 2 s (plus the grace of a main-thread step that had
+already started). On a slow UI thread you may see `eval ran out of time before the code was
+sent … The code did NOT run` where 0.10.0 would have waited longer and succeeded; raise the
+timeout (`timeout_ms` on `invoke_command`) if the work legitimately needs it.
 
 **The MCP/REST server runs on its own Tokio runtime**, not the app's. Server-side code — your
-`VictauriBuilder::probe` closures included — now runs on Victauri's 2-thread runtime, so it
-keeps answering while the app's runtime is blocked. A probe that spawns Tokio tasks
-(`tokio::spawn`, `Handle::current()`) now spawns them on Victauri's runtime rather than the
-app's; spawn through `tauri::async_runtime` if a task must live on the app's runtime.
+`VictauriBuilder::probe` closures included — now runs on Victauri's runtime (probes on its
+blocking pool), so it keeps answering while the app's runtime is blocked. A probe that spawns
+Tokio tasks (`tokio::spawn`, `Handle::current()`) now spawns them on Victauri's runtime rather
+than the app's, and they are cancelled when that runtime shuts down at exit; spawn through
+`tauri::async_runtime` if a task must live on the app's runtime. `on_ready` still runs on the
+app's runtime.
+
+**`/health` answers while the app's async runtime is blocked.** It reports that Victauri's
+server is alive, no longer (as a side effect) that the app's runtime is free. A watchdog or
+script that used `/health` to detect a wedged app runtime should call a tool that needs the app
+instead, e.g. an `invoke_command` of one of its async commands with a short `timeout_ms`.
 
 ## v0.9.0 → v0.10.0
 

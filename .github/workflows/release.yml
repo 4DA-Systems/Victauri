@@ -230,7 +230,7 @@ jobs:
   # dependency's build script and proc-macro. When this ran in the publish job, a malicious
   # build script could write `$GITHUB_ENV` / `$GITHUB_PATH` / `~/.cargo/config.toml` (e.g.
   # swap the `cargo` the next step runs, or add a credential provider) and so execute in
-  # the later step that holds CARGO_REGISTRY_TOKEN (round-4 audit R4-REL1). A separate job
+  # the later step that holds the crates.io token (round-4 audit R4-REL1). A separate job
   # gets a fresh runner: nothing it writes reaches the publish job.
   # ─────────────────────────────────────────────────────────────────────
   verify-packages:
@@ -269,9 +269,13 @@ jobs:
     # packages to verify (in their own secret-free job) and CI to be green before making
     # the version irreversible.
     needs: [test, build, verify-packages, require-ci-green]
-    # Least privilege for the job that holds the crates.io token (audit #8).
+    # Least privilege for the job that holds the crates.io token (audit #8). `id-token: write`
+    # is for crates.io Trusted Publishing: the job exchanges a GitHub OIDC token (bound to this
+    # repo, this workflow file and the `release` environment) for a ~30-minute crates.io token,
+    # which the auth action revokes when the job ends. No long-lived publish token is stored.
     permissions:
       contents: read
+      id-token: write
     # Gate behind a protected Environment. Add required reviewers in
     # repo Settings → Environments → release to require approval before publish.
     environment: release
@@ -309,9 +313,17 @@ jobs:
 
       # No rust-cache in this job: a restored target/ is code the job would then run.
 
+      # Trusted Publishing. Each crate must list this publisher on crates.io (crate Settings →
+      # Trusted Publishing → GitHub: owner `4DA-Systems`, repository `Victauri`, workflow
+      # `release.yml`, environment `release`); without that this step fails and nothing is
+      # published.
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
       - name: Publish crates in dependency order
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
         run: |
           publish() {
             echo "Publishing $1..."

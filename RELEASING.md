@@ -9,7 +9,7 @@ fails loudly if any published version falls behind the repo.
 
 | Secret | Used by | Scope |
 |---|---|---|
-| `CARGO_REGISTRY_TOKEN` | core release → crates.io | crates.io API token. Store it as a secret of the **`release` environment** (Settings → Environments → release), not as a repository secret: only an environment secret is behind that environment's required reviewers — a repository secret is readable by any workflow run on any branch. (Or drop the token entirely for crates.io Trusted Publishing.) |
+| *(none for crates.io)* | core release → crates.io | **Trusted Publishing (OIDC)** since 0.10.1: the `publish` job exchanges a GitHub OIDC token for a ~30-minute crates.io token (`rust-lang/crates-io-auth-action`, revoked when the job ends). One-time setup, by a crate owner, for **each of the six crates** on crates.io: crate → Settings → Trusted Publishing → Add → GitHub, owner `4DA-Systems`, repository `Victauri`, workflow `release.yml`, environment `release`. Optionally then enable "trusted publishing only" on each crate and delete any old `CARGO_REGISTRY_TOKEN` secret — the workflow no longer reads it. |
 | `VSCE_PAT` | VS Code release → Marketplace | Azure DevOps PAT, *Marketplace → Manage* (publisher `4da-systems`) |
 | `OVSX_TOKEN` *(optional)* | VS Code release → Open VSX | open-vsx.org token (Cursor / VSCodium / agent IDEs) |
 

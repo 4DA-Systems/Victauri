@@ -184,6 +184,38 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
+## Current State (2026-10-25)
+
+### v0.10.1 — release candidate (`release/0.10.1-prep`), self-red-teamed, NOT published
+
+Issue #83 (PR #85's code, superseded by the release PR) on top of main's #86 lockfile
+(tokio 1.53.3 — not 1.54.x: 1.54.0 has RUSTSEC-2026-0384 and 1.54.1 was inside a 3-day release
+hold — rustls-webpki 0.103.16, webpki-roots 1.0.10). The server runs on its own Tokio runtime
+(`spawn_server_isolated`: 2 workers + blocking pool on a dedicated thread, handle in
+`VictauriState::server_runtime`, falls back to Tauri's runtime if build OR thread spawn fails,
+`shutdown_timeout(1s)` at exit); eval results are delivered there too (`deliver_eval_result`).
+One deadline per eval call (`bridge::CallBudget` caps how long each main-thread round trip
+waits to START; `MIN_SEND_WINDOW` 2.5 s; result floor min(timeout, 1 s) re-applied AFTER the
+parse check; the ready wait leaves the probe its 2 s; `page_replaced` probes are cut to the
+deadline). Bound: max(timeout, 2.5 s) + 2 s + grace of a started step.
+
+A four-lens self red team (runtime isolation, eval deadline, release/supply chain, upgrade
+impact) found no Critical/High; two lenses independently found the same three Mediums, all
+fixed with fail-first tests: the parse check could eat the result floor (an answer just after
+it was reported as a timeout → retry ran a command twice), the ready wait ate the send window
+(a capability-less window got "UI thread busy" instead of "bridge not responding"), and the
+eval-result fallback spawned on the app's (blockable) runtime. Also fixed: a started-but-unknown
+injection reported "did NOT run" (now Aborted, "may have run"), filmstrip compose/encode and DB
+discovery ran on the 2 async workers (now blocking pool), the demo pinned the runtime 2× too
+long (shared deadline), the E2E test had no positive control (new `async_runtime_ping`) and no
+eval while pinned, `wait_for` slack 5 s → 12 s, `invoke_command` gave "pass timeout_ms" advice
+for never-sent calls, CHANGELOG link refs were never updated for 0.10.0. Release workflow now
+publishes via crates.io **Trusted Publishing** (the operator must add the GitHub publisher on
+each of the 6 crates — RELEASING.md). Disproved: the "result already in rx loses a coin flip"
+race — tokio's `sleep_until` on a past deadline is Pending on its first poll, so `rx` wins;
+`biased` + a final `try_recv` are kept as defence in depth. Gate: 2,087 workspace tests, all
+three clippy configs, docs; demo E2E 27/27 live on Windows; semver-checks: no update required.
+
 ## Current State (2026-10-19)
 
 ### v0.10.0 — PUBLISHED 2026-10-19 after a seven-lens adversarial audit
@@ -1163,7 +1195,7 @@ Tested against 4 third-party open-source Tauri 2 apps with fully built frontends
 - **victauri-test**: Typed MCP HTTP client (`VictauriClient`) with auto-session management (initialize + notifications/initialized). 23 convenience methods for tool calls (eval_js, dom_snapshot, click, fill, etc). 6 standalone assertion helpers: `assert_json_eq`, `assert_json_truthy`, `assert_no_a11y_violations`, `assert_performance_budget`, `assert_ipc_healthy`, `assert_state_matches`. 11 client assertion methods: `assert_eval_works`, `assert_dom_snapshot_valid`, `assert_screenshot_ok`, `assert_windows_exist`, `assert_ipc_integrity_ok`, `assert_accessible`, `assert_dom_complete_under`, `assert_heap_under_mb`, `assert_no_uncaught_errors`, `assert_recording_lifecycle`, `assert_health_hardened`. Built-in `smoke_test()` suite (11 checks, returns `SmokeReport` with timing + JUnit XML). `SmokeConfig` for custom thresholds. Supports Bearer token auth via `connect_with_token`. Published to crates.io as standalone crate.
 - **victauri-cli**: CLI binary (`victauri`) with 8 commands: `init` (scaffold test directory + CLAUDE.md with agent instructions), `check` (server diagnostics), `test` (built-in smoke suite — 11 checks with pass/fail + JUnit XML), `record` (capture interactions → test file), `doctor` (full setup diagnosis), `watch` (file watcher → re-run tests), `invoke` (call any Tauri IPC command from terminal), `coverage` (IPC command coverage report). `victauri test` auto-discovers the running app, runs all smoke checks, prints a summary, exits 0/1 for CI. Configurable `--max-load-ms` and `--max-heap-mb` thresholds. `victauri init` creates/appends CLAUDE.md with instructions that make AI agents prefer Victauri over CDP/Playwright.
 - **victauri-watchdog**: Configurable via env vars (`VICTAURI_PORT`, `VICTAURI_INTERVAL`, `VICTAURI_MAX_FAILURES`, `VICTAURI_ON_FAILURE`). Proper `tracing-subscriber` log output. Executes configurable recovery commands on failure. Fires recovery action once per failure cycle, resets on recovery.
-- **demo-app**: Multi-window Tauri 2 app in `examples/demo-app/` with Victauri wired up. 21 commands (greet, counter CRUD, todo CRUD, settings, contact form with validation, notifications with cross-window events, window management, app state dump, plus a fire-and-forget `run_pipeline` + `pipeline_status` mirroring a real async backend job) all decorated with `#[inspectable]`. Registers a `pipeline` `app_state` probe and emits a `pipeline-complete` event for the async-completion demo. Tab-based navigation with ARIA attributes, `data-testid` on all interactive elements. Notification panel window with event sync. 20 integration tests in `tests/integration.rs` demonstrating every Victauri testing pattern (direct client API, Locator API, IPC verification, cross-boundary state, a11y audit, perf monitoring, time-travel recording, verify builder). Includes `.mcp.json` for immediate Claude Code connection.
+- **demo-app**: Multi-window Tauri 2 app in `examples/demo-app/` with Victauri wired up. 23 commands (incl. `saturate_async_runtime` / `async_runtime_ping` for the runtime-isolation test) (greet, counter CRUD, todo CRUD, settings, contact form with validation, notifications with cross-window events, window management, app state dump, plus a fire-and-forget `run_pipeline` + `pipeline_status` mirroring a real async backend job) all decorated with `#[inspectable]`. Registers a `pipeline` `app_state` probe and emits a `pipeline-complete` event for the async-completion demo. Tab-based navigation with ARIA attributes, `data-testid` on all interactive elements. Notification panel window with event sync. 20 integration tests in `tests/integration.rs` demonstrating every Victauri testing pattern (direct client API, Locator API, IPC verification, cross-boundary state, a11y audit, perf monitoring, time-travel recording, verify builder). Includes `.mcp.json` for immediate Claude Code connection.
 - **CI/CD**: GitHub Actions `ci.yml` (clippy + tests + docs on Linux/Windows/macOS, format check, live-app E2E on all 3 OS, cross-engine gauntlet, `CI Success` aggregate gate) + `release.yml` (test gate → cross-platform CLI/watchdog binary builds → sequential crates.io publish → GitHub Release with the binaries) + `release-vscode.yml` (VS Code extension, own `vscode-v*` tag; build job holds no secrets, publish job is environment-gated) + `surface-audit.yml` (weekly registry-drift check, fails on drift OR an unknown/failed query) + `docs.yml` (mdbook → Pages) + `e2e.yml` (manual: victauri-test client e2e suites). (The Chrome-extension jobs went with browser mode, removed 2026-06-09.) All crate code passes `cargo fmt --check`.
 - **docs/**: mdbook documentation site — 10 pages: introduction, getting started, compatibility, architecture, tools reference, testing, testing Tauri apps (approach comparison), configuration, security, FAQ.
 

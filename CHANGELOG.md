@@ -15,8 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382, certificate verification may accept
   distrusted emSign intermediates), `webpki-roots` 1.0.7 → 1.0.10 (RUSTSEC-2026-0381, the bundled
   roots allowed trust in those intermediates), `tokio` 1.52.1 → 1.53.3 (RUSTSEC-2026-0386, unsound
-  `AsyncFd` constructors, which Victauri does not call; 1.53.3 rather than 1.54.x stays clear of
-  1.54.0's RUSTSEC-2026-0384). They reach `cargo install victauri-cli --locked` through the
+  `AsyncFd` constructors, which Victauri does not call; 1.53.3 rather than 1.54.0, which has
+  RUSTSEC-2026-0384 — 1.54.1 fixes that but was still inside a 3-day release hold). They reach
+  `cargo install victauri-cli --locked` through the
   published lockfile, which is what 0.10.1 fixes. Victauri's own HTTP traffic is plain
   localhost; no Victauri code path verifies a remote certificate.
 
@@ -27,11 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synchronous call inside an `async` command, a CPU-bound task, a scheduled job — froze
   `/health`, the REST and MCP endpoints and every Rust-side tool with it, exactly when an agent
   needs to look inside (measured live in 4DA: everything frozen for ~90 s). The server now runs
-  on its own 2-thread runtime (falling back to Tauri's if one cannot be built); only tools that
-  genuinely need the app's main thread or webview wait on those. The demo app's new
+  on its own Tokio runtime (two async workers plus its own blocking pool, on a dedicated
+  thread; it falls back to Tauri's runtime if that cannot be built or started). Eval results
+  are delivered there too, so webview tools keep answering as well — they wait only on the
+  app's main thread and webview, which they genuinely need. CPU-heavy work that used to run on
+  an async worker (animation filmstrip composition, database discovery) moved to the blocking
+  pool so it cannot stall `/health` on the two workers. The demo app's new
   `saturate_async_runtime` command and the E2E test
-  `server_stays_responsive_while_the_app_blocks_its_async_runtime` prove it (shared runtime:
-  3.7 s stalls; own runtime: answers throughout).
+  `server_stays_responsive_while_the_app_blocks_its_async_runtime` prove it: while every worker
+  of the app's runtime is pinned (checked by an async command that cannot answer), `/health`, a
+  Rust-side tool, an `app_state` probe and `eval_js` all keep answering (on the shared runtime
+  the slowest round took 3.7 s).
 - **An eval's timeout covers the whole call** (#83). The liveness probe, the injection and the
   parse check are main-thread round trips, and the wait for the result started its own full
   timeout only after them — on a busy UI thread a "30 s" `eval_js` (and every tool built on it)
@@ -39,12 +46,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits to *start* only as long as the call has left (a closure not picked up in time is
   abandoned and never runs, so the call reports that the code did NOT run), and a call out of
   time before its code was sent says exactly that. A closure that already started is still
-  waited for, so "did my code run" stays truthful. Two floors keep short timeouts from turning
-  load into false failures: sending gets at least 2.5 s (the liveness probe always keeps its
-  full 2 s — a shorter one cannot tell a dead page from a busy one), and code that reached the
-  page gets at least min(timeout, 1 s) to answer. A call now ends within about
-  max(timeout, 2.5 s) + min(timeout, 1 s), plus the grace of a main-thread step that had
-  already started.
+  waited for, so "did my code run" stays truthful (a delivery that started and then outlived
+  its grace now reports that the code *may* have run, not that it did not). Two floors keep
+  short timeouts from turning load into false failures: sending gets at least 2.5 s (the
+  liveness probe always keeps its full 2 s — a shorter one cannot tell a dead page from a busy
+  one; a page whose bridge never signals ready is still probed, so it gets the "bridge not
+  responding — missing capability / page not loaded" diagnosis), and code that reached the page
+  gets at least min(timeout, 1 s) to answer, counted after the parse check; a result that has
+  arrived is never reported as a timeout. A call now ends within max(timeout, 2.5 s) + 2 s (a
+  probe dispatched just before the send deadline keeps its 2 s), plus the grace of a main-thread
+  step that had already started. `wait_for`'s page-side conditions get 12 s of extra eval time
+  (was 5 s) so sending on a busy UI thread cannot cut off the condition's own answer.
+
+### Release process
+
+- **crates.io publishing uses Trusted Publishing (OIDC)** — the release workflow no longer
+  reads a stored `CARGO_REGISTRY_TOKEN`; it exchanges the run's GitHub OIDC token for a
+  short-lived crates.io token that is revoked when the job ends (see RELEASING.md for the
+  one-time per-crate setup).
 
 ## [0.10.0] - 2026-10-18
 

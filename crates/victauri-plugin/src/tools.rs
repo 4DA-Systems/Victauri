@@ -223,7 +223,8 @@ fn accept_eval_result(
 
 /// Hand an eval result to the caller waiting on `id` without blocking the calling (main)
 /// thread: in place when the pending map is free, else from a tokio task holding only owned
-/// data.
+/// data — on Victauri's own server runtime when it has one, so a result never waits for an app
+/// that is blocking its own async runtime (the server keeps answering then, and so must this).
 fn deliver_eval_result(state: Arc<VictauriState>, id: String, result: String) {
     if let Ok(mut pending) = state.pending_evals.try_lock() {
         if let Some(tx) = pending.remove(&id) {
@@ -231,11 +232,16 @@ fn deliver_eval_result(state: Arc<VictauriState>, id: String, result: String) {
         }
         return;
     }
-    tauri::async_runtime::spawn(async move {
+    let server_runtime = state.server_runtime.get().cloned();
+    let deliver = async move {
         if let Some(tx) = state.pending_evals.lock().await.remove(&id) {
             let _ = tx.send(result);
         }
-    });
+    };
+    match server_runtime {
+        Some(rt) => drop(rt.spawn(deliver)),
+        None => drop(tauri::async_runtime::spawn(deliver)),
+    }
 }
 
 #[tauri::command]

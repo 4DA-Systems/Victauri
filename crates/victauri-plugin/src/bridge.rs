@@ -463,7 +463,14 @@ where
     // prevents needs several cross-thread round trips in flight, which an inline call is not.
     if is_main_thread() {
         return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(app)))
-            .map_err(|_| format!("{what} panicked on the main thread"));
+            .map_err(|_| format!("{what} {PANICKED_ON_MAIN}"));
+    }
+    // The agent call this round trip serves is already out of time: dispatch nothing.
+    if timeout.is_zero() {
+        return Err(format!(
+            "{what} was not sent to the main thread: the call's deadline had passed (it will not \
+             run)"
+        ));
     }
 
     let round_trip = move || -> Result<T, String> {
@@ -526,8 +533,8 @@ where
     let deadline = std::time::Instant::now() + timeout;
     let lock_timeout = || {
         format!(
-            "{what} did not complete on the main thread: timed out waiting for the main-thread \
-             dispatch lock"
+            "{what} did not complete on the main thread: ran out of time waiting for the \
+             main-thread dispatch lock (it will not run)"
         )
     };
     let _serialize = loop {
@@ -594,9 +601,10 @@ std::thread_local! {
 /// closure to start: by the time left until `deadline` (never more than
 /// [`MAIN_THREAD_TIMEOUT`]). An eval holds one around each synchronous bridge call so a busy UI
 /// thread cannot push the agent's call far past its own timeout — the closure that was not
-/// picked up in time is abandoned and never runs, so "not sent" stays true. Not `Send` and
-/// restores the previous budget on drop, so it can neither leak into another task nor be held
-/// across an `.await`.
+/// picked up in time is abandoned and never runs, so "not sent" stays true. Restores the
+/// previous budget on drop (nested budgets unwind in order). Hold it only around synchronous
+/// bridge calls: it is not `Send`, so a future holding one across an `.await` cannot be spawned
+/// onto a multi-threaded runtime, where it could resume on another thread.
 pub(crate) struct CallBudget {
     previous: Option<std::time::Instant>,
     _same_thread: std::marker::PhantomData<*const ()>,
@@ -620,7 +628,7 @@ impl Drop for CallBudget {
 }
 
 /// How long a round trip started now on this thread may wait for its closure to start.
-fn start_timeout() -> std::time::Duration {
+pub(crate) fn start_timeout() -> std::time::Duration {
     CALL_DEADLINE
         .with(std::cell::Cell::get)
         .map_or(MAIN_THREAD_TIMEOUT, |deadline| {
@@ -698,15 +706,24 @@ where
                 ));
             }
             // It started before we gave up: its effects will happen, so report its outcome.
-            rx.recv_timeout(grace).map_err(|_| {
-                format!(
-                    "{what} started on the main thread but did not finish in time; its outcome \
-                     is unknown"
-                )
-            })?
+            rx.recv_timeout(grace)
+                .map_err(|_| format!("{what} {STARTED_OUTCOME_UNKNOWN}"))?
         }
     };
-    outcome.map_err(|_panic| format!("{what} panicked on the main thread"))
+    outcome.map_err(|_panic| format!("{what} {PANICKED_ON_MAIN}"))
+}
+
+/// Error text of a main-thread closure that started but outlived its grace.
+const STARTED_OUTCOME_UNKNOWN: &str =
+    "started on the main thread but did not finish in time; its outcome is unknown";
+/// Error text of a main-thread closure that panicked.
+const PANICKED_ON_MAIN: &str = "panicked on the main thread";
+
+/// Whether a bridge error means the closure STARTED on the main thread, so its effects may
+/// have happened (it outlived its grace, or panicked part-way) — as opposed to a dispatch that
+/// never ran. An eval must not report "the code did NOT run" for these.
+pub(crate) fn closure_may_have_run(error: &str) -> bool {
+    error.contains(STARTED_OUTCOME_UNKNOWN) || error.contains(PANICKED_ON_MAIN)
 }
 
 impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
@@ -1420,8 +1437,8 @@ mod tests {
         use std::time::Instant;
         assert_eq!(start_timeout(), MAIN_THREAD_TIMEOUT);
         {
-            let _outer = CallBudget::until(Instant::now() + Duration::from_millis(300));
-            assert!(start_timeout() <= Duration::from_millis(300));
+            let _outer = CallBudget::until(Instant::now() + Duration::from_secs(5));
+            assert!(start_timeout() <= Duration::from_secs(5));
             {
                 let _inner = CallBudget::until(Instant::now() - Duration::from_millis(1));
                 assert_eq!(
@@ -1432,7 +1449,7 @@ mod tests {
             }
             let back = start_timeout();
             assert!(
-                back > Duration::ZERO && back <= Duration::from_millis(300),
+                back > Duration::ZERO && back <= Duration::from_secs(5),
                 "the inner budget restored the outer one: {back:?}"
             );
             let _long = CallBudget::until(Instant::now() + Duration::from_secs(3600));
@@ -1451,6 +1468,36 @@ mod tests {
         let _here = CallBudget::until(Instant::now());
         let elsewhere = std::thread::spawn(start_timeout).join().unwrap();
         assert_eq!(elsewhere, MAIN_THREAD_TIMEOUT);
+    }
+
+    /// The budget reaches a round trip through `start_timeout` — what `on_main` passes — so a
+    /// closure the main thread never picks up is abandoned at the call's deadline, not at 10 s.
+    #[test]
+    fn a_round_trip_under_a_call_budget_gives_up_at_the_calls_deadline() {
+        use super::{CallBudget, serialized_round_trip, start_timeout};
+        use std::time::Instant;
+        let gate = leaked_gate();
+        let _budget = CallBudget::until(Instant::now() + Duration::from_millis(80));
+        let begun = Instant::now();
+        let parked: Arc<std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Arc::default();
+        let park = Arc::clone(&parked);
+        let refused = serialized_round_trip(
+            gate,
+            "budgeted",
+            start_timeout(),
+            Duration::from_secs(5),
+            move |job| {
+                park.lock().unwrap().push(job);
+                Ok(())
+            },
+            || (),
+        );
+        assert!(refused.unwrap_err().contains("it will not run"));
+        assert!(
+            begun.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            begun.elapsed()
+        );
     }
 
     /// With a short start budget a closure that is never picked up is abandoned at the budget
