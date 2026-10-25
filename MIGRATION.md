@@ -1,5 +1,22 @@
 # Migration Guide
 
+## v0.10.0 → v0.10.1
+
+No API change; consumers on `"0.10"` pick it up with `cargo update`. Two behaviours change:
+
+**`eval_js` (and every tool built on it) honours its timeout for the whole call.** It used to
+time only the wait for the result, after the liveness probe, injection and parse check had each
+taken their own main-thread wait, so on a busy UI thread a call could run far past its timeout.
+A call now ends within about max(timeout, 2.5 s) + min(timeout, 1 s). On a slow UI thread you
+may see `eval timed out … before the code was sent … The code did NOT run` where 0.10.0 would
+have waited longer and succeeded; raise the timeout if the work legitimately needs it.
+
+**The MCP/REST server runs on its own Tokio runtime**, not the app's. Server-side code — your
+`VictauriBuilder::probe` closures included — now runs on Victauri's 2-thread runtime, so it
+keeps answering while the app's runtime is blocked. A probe that spawns Tokio tasks
+(`tokio::spawn`, `Handle::current()`) now spawns them on Victauri's runtime rather than the
+app's; spawn through `tauri::async_runtime` if a task must live on the app's runtime.
+
 ## v0.9.0 → v0.10.0
 
 Bump `victauri-plugin` / `victauri-test` (and `victauri-core` if you depend on it) from `"0.9"`
