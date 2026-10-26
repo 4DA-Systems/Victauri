@@ -147,11 +147,18 @@ object, `--args-file <path>` (`-` = stdin) a JSON object from a file; later sour
 earlier ones. In Windows PowerShell, which strips the quotes inside JSON arguments to native
 programs, use pairs or `--args-file -`.
 
-Output is the tool's result as JSON on stdout (`--raw` for one line). Exit codes: `0` success,
-`1` the tool reported an error (`{"error": …}` on stdout, the message on stderr), `2` a local
-problem — bad arguments, no app reachable, or an `--out` file that could not be written (the
-tool did run). Piping into a reader that stops early (`| head`) is a clean exit. With no app
-running, `victauri tools` still lists the built-in tool names and descriptions.
+Output is the tool's result as JSON on stdout (`--raw` for one line). Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | success |
+| `1` | the tool reported an error, or the app rejected the call (unknown tool, invalid arguments) — `{"error": …}` on stdout, the message on stderr |
+| `2` | a local problem — bad arguments, no app reachable (nothing was sent), or an `--out` file / stdout that could not be written (the tool did run) |
+| `3` | the call was sent but did not complete (timeout, lost connection) — the tool may have run; check its effect before retrying |
+
+`--out` overwrites an existing file; with several images it writes `<stem>-1.<ext>`,
+`<stem>-2.<ext>`, … Piping into a reader that stops early (`| head`) is a clean exit. With no
+app running, `victauri tools` still lists the built-in tool names and descriptions.
 
 ### `victauri coverage`
 

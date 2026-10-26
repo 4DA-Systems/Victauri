@@ -12,9 +12,12 @@ use serde_json::{Map, Value};
 
 /// Exit code: the tool ran and reported an error (`isError`), or the server rejected the call.
 pub const EXIT_TOOL_ERROR: i32 = 1;
-/// Exit code: a local problem — bad arguments, no app reachable, or a result `--out` could not
-/// save (the tool did run).
+/// Exit code: a local problem — bad arguments, no app reachable, or a result `--out` (or
+/// stdout) could not take (the tool did run).
 pub const EXIT_USAGE: i32 = 2;
+/// Exit code: the request was sent but no usable answer came back (timeout, lost connection,
+/// HTTP error) — the tool may or may not have run, so a caller must not blindly retry.
+pub const EXIT_OUTCOME_UNKNOWN: i32 = 3;
 
 const POWERSHELL_HINT: &str = "\n  (no double quotes survived — a shell such as Windows \
      PowerShell strips them from native-program arguments; use key=value pairs, or pipe the \
@@ -44,7 +47,10 @@ pub fn build_arguments(file_json: Option<&str>, args: &[String]) -> Result<Value
     for arg in rest {
         let (key, value) = parse_pair(arg)?;
         if seen_pairs.contains(&key) {
-            return Err(format!("argument '{key}' is given twice"));
+            return Err(format!(
+                "argument '{}' is given twice",
+                victauri_test::terminal::single_line(&key)
+            ));
         }
         seen_pairs.push(key.clone());
         obj.insert(key, value);
@@ -89,6 +95,7 @@ fn parse_pair(arg: &str) -> Result<(String, Value), String> {
     }
     let value = if is_json {
         serde_json::from_str(raw_value).map_err(|e| {
+            let key = victauri_test::terminal::single_line(key);
             let mut msg = format!(
                 "value of '{key}' (given with :=) is not valid JSON: {e} — use {key}=… for a \
                  plain string"
@@ -519,6 +526,12 @@ mod tests {
     #[test]
     fn a_hostile_argument_is_echoed_on_one_line() {
         let err = build_arguments(None, &args(&["bad\n::error ::forged"])).unwrap_err();
+        assert!(!err.contains('\n'), "{err}");
+        // Every error that echoes a key: a repeated key, and a bad `:=` value.
+        let err =
+            build_arguments(None, &args(&["a\n::error::x=1", "a\n::error::x=2"])).unwrap_err();
+        assert!(!err.contains('\n'), "{err}");
+        let err = build_arguments(None, &args(&["a\n::error::forged:=nope"])).unwrap_err();
         assert!(!err.contains('\n'), "{err}");
     }
 

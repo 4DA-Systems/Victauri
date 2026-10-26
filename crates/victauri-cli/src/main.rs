@@ -178,6 +178,8 @@ Arguments (combine freely; later sources override earlier ones):
   key:=json          any JSON value      limit:=5   deep:='{\"a\":[1,2]}'
   '{...}'            a JSON object, as the first argument
   --args-file PATH   a JSON object from a file; `-` reads stdin
+(The quoting shown is for sh-like shells. In cmd.exe or Windows PowerShell, pass JSON
+with --args-file - or use key=value pairs.)
 
 Examples:
   victauri call dom_snapshot
@@ -188,9 +190,14 @@ Examples:
   echo '{\"action\":\"list\"}' | victauri call window --args-file -
 
 Output: the tool's result as JSON on stdout. Image results are saved with --out (never
-printed as base64). Exit codes: 0 success, 1 the tool reported an error ({\"error\": …} on
-stdout), 2 a local problem: bad arguments, no app reachable, or an --out file
-that could not be written (the tool did run).")]
+printed as base64). Exit codes:
+  0  success
+  1  the tool reported an error, or the app rejected the call (unknown tool, invalid
+     arguments) — {\"error\": …} on stdout
+  2  a local problem: bad arguments, no app reachable (nothing was sent), or an --out
+     file / stdout that could not be written (the tool did run)
+  3  the call was sent but did not complete (timeout, lost connection) — the tool may
+     have run; check its effect before retrying")]
     Call {
         /// Tool name (`victauri tools` lists them)
         tool: String,
@@ -258,6 +265,17 @@ async fn connect(target: &AppTarget) -> Result<victauri_test::VictauriClient> {
 /// Whether a discovery error is "several apps are running and nothing selects one".
 fn is_ambiguous_app(err: &str) -> bool {
     err.contains("Multiple Victauri apps are running")
+}
+
+/// Whether a discovery failure means "no usable Victauri app" (nothing reachable — with no
+/// discovery entry the legacy default port is tried, and whatever answers there may refuse
+/// us), as opposed to a refusal to pick one of the running apps.
+fn no_app_running(e: &victauri_test::TestError) -> bool {
+    match e {
+        victauri_test::TestError::Connection { .. } | victauri_test::TestError::Request(_) => true,
+        victauri_test::TestError::Other(message) => message.contains("No Victauri app is running."),
+        _ => false,
+    }
 }
 
 /// [`victauri_test::VictauriClient::discover_app`] for `target`. When several Victauri apps
@@ -367,7 +385,9 @@ async fn main() -> Result<()> {
             cmd_invoke(&command, args.as_deref(), raw, &target).await?;
         }
         Commands::Tools { name, json, target } => {
-            let code = cmd_tools(name.as_deref(), json, &target).await?;
+            let code = cmd_tools(name.as_deref(), json, &target)
+                .await
+                .unwrap_or_else(local_failure);
             if code != 0 {
                 std::process::exit(code);
             }
@@ -388,7 +408,8 @@ async fn main() -> Result<()> {
                 raw,
                 &target,
             )
-            .await?;
+            .await
+            .unwrap_or_else(local_failure);
             if code != 0 {
                 std::process::exit(code);
             }
@@ -1475,6 +1496,18 @@ fn emit(text: &str) -> Result<()> {
     }
 }
 
+/// An error that escaped `call` / `tools` (in practice: stdout could not be written, e.g. a
+/// full disk) is a local problem — exit 2, never anyhow's 1, which means "the tool reported an
+/// error".
+#[allow(clippy::needless_pass_by_value)] // the shape `unwrap_or_else` hands it
+fn local_failure(e: anyhow::Error) -> i32 {
+    eprintln!(
+        "error: {}",
+        victauri_test::terminal::untrusted_multi_line(&format!("{e:#}"))
+    );
+    call::EXIT_USAGE
+}
+
 /// Print `value` as JSON on stdout: pretty, or one line with `raw`.
 fn print_json(value: &serde_json::Value, raw: bool) -> Result<()> {
     if raw {
@@ -1507,12 +1540,12 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
 
     // The live list carries each tool's real input schema and honors the app's disabled
     // tools; with no app reachable, the baked manifest still answers "what exists".
-    let (tools, app) = match discover_target(target).await {
+    let (tools, live, app) = match discover_target(target).await {
         Ok(mut client) => {
             warn_on_plugin_skew(&mut client).await;
             let app = client.app_identifier().map(str::to_string);
             match client.list_tools().await {
-                Ok(tools) => (tools, app),
+                Ok(tools) => (tools, true, app),
                 Err(e) => {
                     eprintln!(
                         "error: the app did not list its tools: {}",
@@ -1522,7 +1555,10 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
                 }
             }
         }
-        Err(e) => {
+        // Only "nothing is running" falls back to the built-in list. A refusal to pick an
+        // app (several running, an --app that matches none of the running ones, an identity
+        // mismatch, an unclaimed token) is the user's to fix, not to paper over.
+        Err(e) if no_app_running(&e) => {
             let reason = e.to_string();
             let first_line = reason.lines().next().unwrap_or_default();
             eprintln!(
@@ -1530,10 +1566,14 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
                  schemas come from the running app.",
                 single_line(first_line)
             );
-            (bridge::fallback_tools(), None)
+            (bridge::fallback_tools(), false, None)
+        }
+        Err(e) => {
+            eprintln!("{}", connect_failure_message(&e.to_string()));
+            return Ok(call::EXIT_USAGE);
         }
     };
-    let source = if app.is_some() { "live" } else { "builtin" };
+    let source = if live { "live" } else { "builtin" };
 
     let Some(name) = name else {
         if json_out {
@@ -1542,9 +1582,10 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
                 false,
             )?;
         } else {
-            let mut text = match &app {
-                Some(id) => format!("{} tools on {}:\n", tools.len(), single_line(id)),
-                None => format!("{} built-in tools (no app reachable):\n", tools.len()),
+            let mut text = match (&app, live) {
+                (Some(id), true) => format!("{} tools on {}:\n", tools.len(), single_line(id)),
+                (None, true) => format!("{} tools on the running app:\n", tools.len()),
+                (_, false) => format!("{} built-in tools (no app reachable):\n", tools.len()),
             };
             for line in tools.iter().filter_map(call::summary_line) {
                 text.push_str(&format!("  {}\n", single_line(&line)));
@@ -1563,7 +1604,7 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
         eprintln!("error: no tool named '{}'", single_line(name));
         let near = call::suggestions(name, &known);
         if !near.is_empty() {
-            eprintln!("  did you mean: {}", near.join(", "));
+            eprintln!("  did you mean: {}", single_line(&near.join(", ")));
         }
         eprintln!("  `victauri tools` lists them");
         return Ok(call::EXIT_USAGE);
@@ -1578,7 +1619,7 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
         untrusted_multi_line(tool["description"].as_str().unwrap_or("(no description)"))
     );
     let lines = call::schema_lines(&tool["inputSchema"]);
-    if app.is_none() {
+    if !live {
         text.push_str("Arguments: start the app to see them (schemas come from the running app).");
     } else if lines.is_empty() {
         text.push_str("Arguments: none");
@@ -1636,6 +1677,17 @@ async fn cmd_call(
             return Ok(call::EXIT_USAGE);
         }
     };
+    // Checked before the call, so the tool does not run only for its result to be lost.
+    if let Some(out) = out
+        && out.is_dir()
+    {
+        eprintln!(
+            "error: --out {} is a directory; give a file path such as {}",
+            single_line(&out.display().to_string()),
+            single_line(&out.join("shot.png").display().to_string())
+        );
+        return Ok(call::EXIT_USAGE);
+    }
 
     let mut client = match discover_target(target).await {
         Ok(client) => client,
@@ -1656,7 +1708,7 @@ async fn cmd_call(
                 let known: Vec<&str> = names.iter().map(String::as_str).collect();
                 let near = call::suggestions(tool, &known);
                 if !near.is_empty() {
-                    eprintln!("  did you mean: {}", near.join(", "));
+                    eprintln!("  did you mean: {}", single_line(&near.join(", ")));
                 }
                 eprintln!(
                     "  '{}' is not a Victauri tool (`victauri tools` lists them). To run one of \
@@ -1668,16 +1720,27 @@ async fn cmd_call(
             warn_on_plugin_skew(&mut client).await;
             return Ok(call::EXIT_TOOL_ERROR);
         }
-        Err(e) => {
-            let detail = e.to_string();
-            eprintln!("error: {}", untrusted_multi_line(&detail));
-            if matches!(&e, victauri_test::TestError::Request(r) if r.is_timeout()) {
-                eprintln!(
-                    "  the app did not answer in time — the tool may still have run; check its \
-                     effect before calling again"
-                );
-            }
+        // The connection was refused, so the request never left: nothing ran.
+        Err(victauri_test::TestError::Request(e)) if e.is_connect() => {
+            eprintln!(
+                "{}",
+                connect_failure_message(&victauri_test::TestError::Request(e).to_string())
+            );
             return Ok(call::EXIT_USAGE);
+        }
+        // Sent, but no usable answer (timeout, lost connection, an HTTP error): the tool may
+        // or may not have run. A distinct exit code, so a wrapper never retries it blindly.
+        Err(e) => {
+            eprintln!("error: {}", untrusted_multi_line(&e.to_string()));
+            let why = if matches!(&e, victauri_test::TestError::Request(r) if r.is_timeout()) {
+                "the app did not answer in time"
+            } else {
+                "the call did not complete"
+            };
+            eprintln!(
+                "  {why} — the tool may still have run; check its effect before calling again"
+            );
+            return Ok(call::EXIT_OUTCOME_UNKNOWN);
         }
     };
 

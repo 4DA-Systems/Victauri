@@ -141,6 +141,10 @@ async fn mcp(State(mock): State<Mock>, headers: HeaderMap, body: String) -> Resp
                 // Far more than any pipe buffer, so a reader that quits early (`| head`)
                 // closes the pipe while the CLI is still writing.
                 "big" => text(&json!({"blob": "x".repeat(4 * 1024 * 1024)})),
+                // The handler ran (or may have), then the server failed the response.
+                "crash" => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "handler panicked").into_response();
+                }
                 "badimage" => json!({"content": [
                     {"type": "image", "data": "%%% not base64", "mimeType": "image/png"}
                 ]}),
@@ -495,6 +499,54 @@ async fn local_failures_exit_2_not_the_tool_error_code() {
             .contains("base64"),
         "{}",
         stdout(&out)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_call_that_may_have_run_exits_3_not_the_nothing_ran_code() {
+    let iso = IsolatedTemp::new();
+    iso.write_entry(
+        start_mock("com.test.unknown_outcome", env!("CARGO_PKG_VERSION")).await,
+        "com.test.unknown_outcome",
+    );
+
+    // Sent, then the response failed: the tool may have run, so a wrapper must not read this
+    // as "nothing happened, retry" (exit 2).
+    let out = run(iso.victauri(&["call", "crash"])).await;
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("may still have run"),
+        "{}",
+        stderr(&out)
+    );
+    assert_no_token(&out);
+
+    // An --out that names a directory is refused BEFORE the call (2, not 3): the tool never
+    // runs only for its result to be lost.
+    let dir = iso.path("shots");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = run(iso.victauri(&["call", "crash", "--out", dir.to_str().unwrap()])).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("is a directory"), "{}", stderr(&out));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tools_refuses_an_unselectable_app_instead_of_falling_back() {
+    let iso = IsolatedTemp::new();
+    iso.write_entry(
+        start_mock("com.test.running", env!("CARGO_PKG_VERSION")).await,
+        "com.test.running",
+    );
+
+    // An app IS running; a wrong --app is the user's to fix, not "no app — here's the
+    // built-in list" with exit 0.
+    let out = run(iso.victauri(&["tools", "--json", "--app", "com.test.other"])).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stdout(&out).is_empty(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("com.test.running"),
+        "names the running app:\n{}",
+        stderr(&out)
     );
 }
 
