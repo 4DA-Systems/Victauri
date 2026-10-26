@@ -12,8 +12,13 @@ use serde_json::{Map, Value};
 
 /// Exit code: the tool ran and reported an error (`isError`), or the server rejected the call.
 pub const EXIT_TOOL_ERROR: i32 = 1;
-/// Exit code: bad arguments, or no app could be reached.
+/// Exit code: a local problem — bad arguments, no app reachable, or a result `--out` could not
+/// save (the tool did run).
 pub const EXIT_USAGE: i32 = 2;
+
+const POWERSHELL_HINT: &str = "\n  (no double quotes survived — a shell such as Windows \
+     PowerShell strips them from native-program arguments; use key=value pairs, or pipe the \
+     JSON in with --args-file -)";
 
 /// Build a tool's arguments from, in order: `--args-file` (a JSON object, `-` = stdin), an
 /// inline JSON object as the first positional argument, then `key=value` (string) /
@@ -56,11 +61,7 @@ fn parse_object(text: &str, source: &str) -> Result<Map<String, Value>, String> 
             // Windows PowerShell 5.1 strips the double quotes inside an argument passed to a
             // native program, so '{"a":1}' arrives as '{a:1}'. Name the workaround.
             if !text.contains('"') && text.contains(':') {
-                msg.push_str(
-                    "\n  (no double quotes survived — a shell such as Windows PowerShell strips \
-                     them from native-program arguments; use key=value / key:=json pairs, or \
-                     pipe the JSON in with --args-file -)",
-                );
+                msg.push_str(POWERSHELL_HINT);
             }
             Err(msg)
         }
@@ -88,10 +89,16 @@ fn parse_pair(arg: &str) -> Result<(String, Value), String> {
     }
     let value = if is_json {
         serde_json::from_str(raw_value).map_err(|e| {
-            format!(
+            let mut msg = format!(
                 "value of '{key}' (given with :=) is not valid JSON: {e} — use {key}=… for a \
                  plain string"
-            )
+            );
+            // `deep:='{"a":1}'` reaches us as `deep:={a:1}` from Windows PowerShell 5.1.
+            let looks_structured = raw_value.trim_start().starts_with(['{', '[']);
+            if looks_structured && !raw_value.contains('"') {
+                msg.push_str(POWERSHELL_HINT);
+            }
+            msg
         })?
     } else {
         Value::String(raw_value.to_string())
@@ -495,6 +502,18 @@ mod tests {
         // What Windows PowerShell 5.1 delivers for '{"action":"list"}'.
         let err = build_arguments(None, &args(&["{action:list}"])).unwrap_err();
         assert!(err.contains("--args-file -"), "{err}");
+    }
+
+    #[test]
+    fn quote_stripped_json_in_a_pair_names_the_powershell_workaround() {
+        // `deep:='{"a":1}'` as Windows PowerShell 5.1 delivers it.
+        for stripped in ["deep:={a:1}", "list:=[a,b]"] {
+            let err = build_arguments(None, &args(&[stripped])).unwrap_err();
+            assert!(err.contains("--args-file -"), "{stripped}: {err}");
+        }
+        // A plain invalid value gets no misleading PowerShell advice.
+        let err = build_arguments(None, &args(&["n:=nope"])).unwrap_err();
+        assert!(!err.contains("PowerShell"), "{err}");
     }
 
     #[test]

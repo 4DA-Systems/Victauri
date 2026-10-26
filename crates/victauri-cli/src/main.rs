@@ -189,7 +189,8 @@ Examples:
 
 Output: the tool's result as JSON on stdout. Image results are saved with --out (never
 printed as base64). Exit codes: 0 success, 1 the tool reported an error ({\"error\": …} on
-stdout), 2 bad arguments or no app reachable.")]
+stdout), 2 a local problem: bad arguments, no app reachable, or an --out file
+that could not be written (the tool did run).")]
     Call {
         /// Tool name (`victauri tools` lists them)
         tool: String,
@@ -1452,28 +1453,35 @@ async fn cmd_invoke(
         .await
         .with_context(|| format!("failed to invoke command '{command}'"))?;
 
-    if raw {
-        println!("{}", serde_json::to_string(&result)?);
-    } else {
+    if !raw {
         eprintln!("  Command: {command}");
         if let Some(a) = args_json {
             eprintln!("  Args:    {a}");
         }
         eprintln!();
-        println!("{}", serde_json::to_string_pretty(&result)?);
     }
+    print_json(&result, raw)
+}
 
-    Ok(())
+/// Write `text` and a newline to stdout. A reader that closed the pipe early
+/// (`victauri call dom_snapshot | head -5`) already has what it wanted, so that is not an
+/// error — `println!` would panic there ("failed printing to stdout", exit 101).
+fn emit(text: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    match writeln!(out, "{text}").and_then(|()| out.flush()) {
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => Ok(other?),
+    }
 }
 
 /// Print `value` as JSON on stdout: pretty, or one line with `raw`.
 fn print_json(value: &serde_json::Value, raw: bool) -> Result<()> {
     if raw {
-        println!("{}", serde_json::to_string(value)?);
+        emit(&serde_json::to_string(value)?)
     } else {
-        println!("{}", serde_json::to_string_pretty(value)?);
+        emit(&serde_json::to_string_pretty(value)?)
     }
-    Ok(())
 }
 
 /// Warn on a CLI↔plugin `major.minor` skew. One extra Rust-side call, so `call` only does it
@@ -1534,18 +1542,18 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
                 false,
             )?;
         } else {
-            match &app {
-                Some(id) => println!("{} tools on {}:", tools.len(), single_line(id)),
-                None => println!("{} built-in tools (no app reachable):", tools.len()),
-            }
+            let mut text = match &app {
+                Some(id) => format!("{} tools on {}:\n", tools.len(), single_line(id)),
+                None => format!("{} built-in tools (no app reachable):\n", tools.len()),
+            };
             for line in tools.iter().filter_map(call::summary_line) {
-                println!("  {}", single_line(&line));
+                text.push_str(&format!("  {}\n", single_line(&line)));
             }
-            println!();
-            println!(
-                "`victauri tools <name>` shows a tool's arguments; \
-                 `victauri call <name> key=value …` runs it."
+            text.push_str(
+                "\n`victauri tools <name>` shows a tool's arguments; \
+                 `victauri call <name> key=value …` runs it.",
             );
+            emit(&text)?;
         }
         return Ok(0);
     };
@@ -1565,26 +1573,26 @@ async fn cmd_tools(name: Option<&str>, json_out: bool, target: &AppTarget) -> Re
         print_json(tool, false)?;
         return Ok(0);
     }
-    println!("{name}");
-    println!();
-    println!(
-        "{}",
+    let mut text = format!(
+        "{name}\n\n{}\n\n",
         untrusted_multi_line(tool["description"].as_str().unwrap_or("(no description)"))
     );
-    println!();
     let lines = call::schema_lines(&tool["inputSchema"]);
     if app.is_none() {
-        println!("Arguments: start the app to see them (schemas come from the running app).");
+        text.push_str("Arguments: start the app to see them (schemas come from the running app).");
     } else if lines.is_empty() {
-        println!("Arguments: none");
+        text.push_str("Arguments: none");
     } else {
-        println!("Arguments:");
+        text.push_str("Arguments:\n");
         for line in &lines {
-            println!("{}", single_line(line));
+            text.push_str(&single_line(line));
+            text.push('\n');
         }
-        println!();
-        println!("Full input schema: victauri tools {name} --json");
+        text.push_str(&format!(
+            "\nFull input schema: victauri tools {name} --json"
+        ));
     }
+    emit(&text)?;
     Ok(0)
 }
 
@@ -1598,17 +1606,27 @@ async fn cmd_call(
 ) -> Result<i32> {
     use victauri_test::terminal::{single_line, untrusted_multi_line};
 
+    // Every failure before the call is a usage error (exit 2) — exit 1 means the tool ran
+    // and reported an error, so a local problem must never surface as anyhow's exit 1.
     let file_json = match args_file {
         Some("-") => {
             let mut text = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
-                .context("failed to read the arguments from stdin")?;
+            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
+                eprintln!("error: failed to read --args-file - (stdin): {e}");
+                return Ok(call::EXIT_USAGE);
+            }
             Some(text)
         }
-        Some(path) => Some(
-            std::fs::read_to_string(path)
-                .with_context(|| format!("failed to read --args-file {path}"))?,
-        ),
+        Some(path) => match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                eprintln!(
+                    "error: failed to read --args-file {}: {e}",
+                    single_line(path)
+                );
+                return Ok(call::EXIT_USAGE);
+            }
+        },
         None => None,
     };
     let arguments = match call::build_arguments(file_json.as_deref(), args) {
@@ -1663,9 +1681,12 @@ async fn cmd_call(
         }
     };
 
+    // A result the CLI cannot decode is reported like a tool error: exit 1 with the JSON
+    // `{"error": …}` the contract promises on stdout.
     let rendered = match call::render(&result) {
         Ok(rendered) => rendered,
         Err(e) => {
+            print_json(&serde_json::json!({ "error": e }), raw)?;
             eprintln!("error: {e}");
             return Ok(call::EXIT_TOOL_ERROR);
         }
@@ -1679,7 +1700,7 @@ async fn cmd_call(
         return Ok(call::EXIT_TOOL_ERROR);
     }
 
-    let mut saved = Vec::new();
+    let mut saved: Vec<PathBuf> = Vec::new();
     if let Some(out) = out {
         let count = rendered.images.len();
         if count == 0 {
@@ -1687,8 +1708,21 @@ async fn cmd_call(
         }
         for (i, image) in rendered.images.iter().enumerate() {
             let path = call::image_path(out, i, count, &image.mime_type);
-            std::fs::write(&path, &image.bytes)
-                .with_context(|| format!("failed to write {}", path.display()))?;
+            if let Err(e) = std::fs::write(&path, &image.bytes) {
+                // The tool already ran (its side effects happened); only saving failed.
+                eprintln!(
+                    "error: the tool ran, but its result was not saved — writing {} failed: {e}",
+                    single_line(&path.display().to_string())
+                );
+                if !saved.is_empty() {
+                    let done: Vec<String> = saved.iter().map(|p| p.display().to_string()).collect();
+                    eprintln!(
+                        "  saved before the failure: {}",
+                        single_line(&done.join(", "))
+                    );
+                }
+                return Ok(call::EXIT_USAGE);
+            }
             saved.push(path);
         }
     } else if !rendered.images.is_empty() {

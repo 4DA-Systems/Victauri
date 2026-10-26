@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   form in Windows PowerShell, which strips quotes inside JSON arguments). Image results
   (`screenshot`, `animation scrub`, `trace frames`) are decoded and saved with `--out`, never
   printed as base64. Exit codes: 0 success, 1 the tool reported an error (`{"error": …}` on
-  stdout), 2 bad arguments or no app reachable. `victauri tools [name]` lists the tools, or one
+  stdout), 2 a local problem (bad arguments, no app reachable, or an `--out` file that could
+  not be written — the tool did run). Output to a closed pipe (`| head`) is a clean exit. `victauri tools [name]` lists the tools, or one
   tool's arguments, from the live input schemas; with no app running it lists the built-in
   names and descriptions. Both use the same discovery, trust checks, `--app` pinning and token
   as `invoke`, take no port/URL/token flag, never print the token, and pass server-supplied

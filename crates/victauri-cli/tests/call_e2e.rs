@@ -125,6 +125,7 @@ async fn mcp(State(mock): State<Mock>, headers: HeaderMap, body: String) -> Resp
                     "app": {"identifier": mock.identifier},
                 })),
                 "echo" => text(&json!({"received": arguments})),
+                "invoke_command" => text(&json!({"app": mock.identifier})),
                 "screenshot" => json!({"content": [{
                     "type": "image",
                     "data": base64::engine::general_purpose::STANDARD.encode(PNG),
@@ -136,6 +137,12 @@ async fn mcp(State(mock): State<Mock>, headers: HeaderMap, body: String) -> Resp
                      "mimeType": "image/png"},
                     {"type": "image", "data": base64::engine::general_purpose::STANDARD.encode(PNG),
                      "mimeType": "image/png"}
+                ]}),
+                // Far more than any pipe buffer, so a reader that quits early (`| head`)
+                // closes the pipe while the CLI is still writing.
+                "big" => text(&json!({"blob": "x".repeat(4 * 1024 * 1024)})),
+                "badimage" => json!({"content": [
+                    {"type": "image", "data": "%%% not base64", "mimeType": "image/png"}
                 ]}),
                 // A page-controlled error text that tries to forge a CI annotation and drive
                 // the terminal.
@@ -454,4 +461,83 @@ async fn tools_lists_live_schemas_and_describes_one() {
         stderr(&out)
     );
     assert_no_token(&out);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn local_failures_exit_2_not_the_tool_error_code() {
+    let iso = IsolatedTemp::new();
+    iso.write_entry(
+        start_mock("com.test.local", env!("CARGO_PKG_VERSION")).await,
+        "com.test.local",
+    );
+
+    // An unreadable --args-file is a usage error, never "the tool reported an error".
+    let missing = iso.path("no-such-args.json");
+    let out = run(iso.victauri(&["call", "echo", "--args-file", missing.to_str().unwrap()])).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("--args-file"), "{}", stderr(&out));
+
+    // The tool RAN but its image could not be saved: exit 2, and the message says it ran.
+    let unwritable = iso.path("no-such-dir").join("shot.png");
+    let out =
+        run(iso.victauri(&["call", "screenshot", "--out", unwritable.to_str().unwrap()])).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("ran") && err.contains("not saved"), "{err}");
+
+    // A result the CLI cannot decode is a reported error: exit 1 WITH {"error"} on stdout.
+    let out = run(iso.victauri(&["call", "badimage"])).await;
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        json_stdout(&out)["error"]
+            .as_str()
+            .unwrap()
+            .contains("base64"),
+        "{}",
+        stdout(&out)
+    );
+}
+
+/// Spawn the CLI with stdout piped and close the read end at once, as `| head -1` does after
+/// its first line; returns (exit code, stderr).
+async fn run_with_closed_stdout(cmd: Command) -> (Option<i32>, String) {
+    let mut cmd = cmd;
+    tokio::task::spawn_blocking(move || {
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().expect("run victauri");
+        drop(child.stdout.take());
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reader_closing_the_pipe_is_a_clean_exit() {
+    let iso = IsolatedTemp::new();
+    iso.write_entry(
+        start_mock("com.test.pipe", env!("CARGO_PKG_VERSION")).await,
+        "com.test.pipe",
+    );
+
+    for args in [
+        &["call", "big"][..],
+        &["call", "big", "--raw"][..],
+        &["tools"][..],
+        &["tools", "--json"][..],
+        &["invoke", "whoami"][..],
+    ] {
+        let (code, err) = run_with_closed_stdout(iso.victauri(args)).await;
+        assert!(
+            !err.contains("panicked") && !err.contains("failed printing"),
+            "{args:?} panicked on a closed pipe:\n{err}"
+        );
+        assert_eq!(code, Some(0), "{args:?}: {err}");
+    }
 }

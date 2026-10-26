@@ -148,9 +148,10 @@ earlier ones. In Windows PowerShell, which strips the quotes inside JSON argumen
 programs, use pairs or `--args-file -`.
 
 Output is the tool's result as JSON on stdout (`--raw` for one line). Exit codes: `0` success,
-`1` the tool reported an error (`{"error": …}` on stdout, the message on stderr), `2` bad
-arguments or no app reachable. With no app running, `victauri tools` still lists the built-in
-tool names and descriptions.
+`1` the tool reported an error (`{"error": …}` on stdout, the message on stderr), `2` a local
+problem — bad arguments, no app reachable, or an `--out` file that could not be written (the
+tool did run). Piping into a reader that stops early (`| head`) is a clean exit. With no app
+running, `victauri tools` still lists the built-in tool names and descriptions.
 
 ### `victauri coverage`
 

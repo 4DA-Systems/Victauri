@@ -1183,8 +1183,8 @@ Every tool is also a shell command, for agents and scripts that work through a t
 `victauri call <tool> key=value key:=<json>` runs it and prints the result as JSON on stdout
 (`key=value` is a string, `key:=…` any JSON value; `--args-file -` reads a JSON object from
 stdin — the reliable form in Windows PowerShell, which strips quotes inside JSON arguments).
-Exit code 0 = success, 1 = the tool reported an error (`{"error": …}` on stdout), 2 = bad
-arguments or no app reachable. `victauri call screenshot --out shot.png` saves images instead
+Exit code 0 = success, 1 = the tool reported an error (`{"error": …}` on stdout), 2 = a local
+problem (bad arguments, no app reachable, or an `--out` file not written — the tool did run). `victauri call screenshot --out shot.png` saves images instead
 of printing base64. Add `--app <bundle-identifier>` when several apps run. Examples:
 `victauri call query_db query="SELECT count(*) FROM items"`,
 `victauri call invoke_command command=get_settings`, `victauri call interact action=click ref_id=e12`.
