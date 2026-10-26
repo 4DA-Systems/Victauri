@@ -383,6 +383,45 @@ fn list_notifications(state: tauri::State<'_, AppState>) -> Vec<Notification> {
     state.notifications.lock().unwrap().clone()
 }
 
+// ── The classic "blocking call in async code" bug (runtime-isolation demo) ──
+
+#[tauri::command]
+#[inspectable(
+    description = "Pin every async-runtime worker with blocking work for `seconds` (demo of the classic 'blocking call in async code' bug)",
+    intent = "saturate the async runtime",
+    category = "debug",
+    example = "hang the async runtime"
+)]
+fn saturate_async_runtime(seconds: u64) -> u64 {
+    // Twice as many tasks as cores (Tokio's default worker count), each doing a blocking sleep
+    // on an async worker: every worker of Tauri's runtime is stuck — what a scheduled job
+    // blocking the runtime did to a real app (and, before Victauri ran its server on its own
+    // runtime, to Victauri inside it). Every task sleeps until ONE shared deadline, so the tasks
+    // queued behind the first wave end then too and the runtime is pinned for `seconds`, not a
+    // multiple of it.
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(seconds.min(60));
+    let workers = std::thread::available_parallelism().map_or(8, std::num::NonZero::get) as u64 * 2;
+    for _ in 0..workers {
+        tauri::async_runtime::spawn(async move {
+            std::thread::sleep(until.saturating_duration_since(std::time::Instant::now()));
+        });
+    }
+    workers
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "An async command that answers at once — but only when the app's async runtime has a free worker",
+    intent = "check the async runtime responds",
+    category = "debug",
+    example = "ping the async runtime"
+)]
+async fn async_runtime_ping() -> u64 {
+    // Async Tauri commands run on Tauri's async runtime, so this answers only when that runtime
+    // can poll it: the runtime-isolation test's proof that the runtime really was pinned.
+    0
+}
+
 // ── Fire-and-forget pipeline (async-completion demo) ───────────────────────
 
 #[tauri::command]
@@ -553,6 +592,8 @@ fn main() {
                     get_app_state__schema(),
                     run_pipeline__schema(),
                     pipeline_status__schema(),
+                    saturate_async_runtime__schema(),
+                    async_runtime_ping__schema(),
                 ])
                 .listen_events(&["notification-added", "pipeline-complete"])
                 .probe("pipeline", move || probe_pipeline.snapshot())
@@ -583,6 +624,8 @@ fn main() {
             get_app_state,
             run_pipeline,
             pipeline_status,
+            saturate_async_runtime,
+            async_runtime_ping,
         ])
         .setup(|app| {
             // Main thread: take the one handle background work may borrow.

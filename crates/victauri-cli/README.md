@@ -91,7 +91,7 @@ victauri check --junit report.xml   # JUnit XML output for CI
 victauri check --app com.example.app  # pick one of several running apps
 ```
 
-**Several Victauri apps running?** `check`, `test`, `invoke`, `coverage`, `doctor` and `record`
+**Several Victauri apps running?** `check`, `test`, `invoke`, `call`, `tools`, `coverage`, `doctor` and `record`
 refuse to guess: they list each running app as `identifier (port N, pid P)` and ask you to
 select one with `--app <bundle-identifier>` (exact identifier or product name — never a
 prefix) or the `VICTAURI_APP` env var, or to pin the port with `VICTAURI_PORT`. A
@@ -122,6 +122,43 @@ victauri record --test-name login_flow      # Custom test function name
 ```
 
 With `--locator`, generated code uses `Locator::test_id("btn").click(&mut client)` instead of `client.click_by_id("btn")`. With `--assert-ipc`, each IPC command seen during recording gets an `assert_ipc_called()` assertion at the end.
+
+### `victauri tools` / `victauri call`
+
+Every Victauri tool from a plain shell — for agents and scripts that work through a terminal
+rather than an MCP client (Codex without MCP, Pi, OpenClaw, CI). Same discovery, trust checks,
+app pinning and auth as every other command; no port, URL or token to handle.
+
+```bash
+victauri tools                          # every tool, one line each (live from the running app)
+victauri tools query_db                 # a tool's description and arguments
+victauri tools --json                   # MCP tool objects with their input schemas
+
+victauri call dom_snapshot
+victauri call query_db query="SELECT count(*) FROM items" max_rows:=10
+victauri call invoke_command command=get_settings
+victauri call interact action=click ref_id=e12
+victauri call screenshot --out shot.png # images are saved, never printed as base64
+echo '{"action":"list"}' | victauri call window --args-file -
+```
+
+Arguments: `key=value` is a string, `key:=json` any JSON value, a leading `'{...}'` a JSON
+object, `--args-file <path>` (`-` = stdin) a JSON object from a file; later sources override
+earlier ones. In Windows PowerShell, which strips the quotes inside JSON arguments to native
+programs, use pairs or `--args-file -`.
+
+Output is the tool's result as JSON on stdout (`--raw` for one line). Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | success |
+| `1` | the tool reported an error, or the app rejected the call (unknown tool, invalid arguments) — `{"error": …}` on stdout, the message on stderr |
+| `2` | a local problem — bad arguments, no app reachable (nothing was sent), or an `--out` file / stdout that could not be written (the tool did run) |
+| `3` | the call was sent but did not complete (timeout, lost connection) — the tool may have run; check its effect before retrying |
+
+`--out` overwrites an existing file; with several images it writes `<stem>-1.<ext>`,
+`<stem>-2.<ext>`, … Piping into a reader that stops early (`| head`) is a clean exit. With no
+app running, `victauri tools` still lists the built-in tool names and descriptions.
 
 ### `victauri coverage`
 

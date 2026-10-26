@@ -439,13 +439,21 @@ fn is_main_thread() -> bool {
 /// (`block_in_place` panics there), so the whole runtime — every task on it — stalls for that
 /// long while the UI is wedged. Victauri's own server runs on a multi-threaded runtime; do not
 /// call bridge methods from a current-thread runtime you care about.
+///
+/// Within a [`CallBudget`] the wait for the closure to START is also capped by the time that
+/// agent call has left, so a busy UI thread cannot push a call far past its own deadline; a
+/// closure that already started is still waited for (its effects happen, so its real outcome is
+/// what the caller must report).
 fn on_main<R, T, F>(app: &tauri::AppHandle<R>, what: &str, f: F) -> Result<T, String>
 where
     R: Runtime,
     T: Send + 'static,
     F: FnOnce(&tauri::AppHandle<R>) -> T + Send + 'static,
 {
-    let timeout = std::time::Duration::from_secs(10);
+    let grace = MAIN_THREAD_TIMEOUT;
+    // Read on the CALLING thread (the budget is thread-local and `block_in_place` below keeps
+    // this call on it).
+    let timeout = start_timeout();
 
     // Already ON the main thread (a sync Tauri command, a menu handler, or an `on_main` closure
     // that calls back into the bridge): run inline, WITHOUT the dispatch lock. Taking the lock
@@ -455,7 +463,14 @@ where
     // prevents needs several cross-thread round trips in flight, which an inline call is not.
     if is_main_thread() {
         return std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(app)))
-            .map_err(|_| format!("{what} panicked on the main thread"));
+            .map_err(|_| format!("{what} {PANICKED_ON_MAIN}"));
+    }
+    // The agent call this round trip serves is already out of time: dispatch nothing.
+    if timeout.is_zero() {
+        return Err(format!(
+            "{what} was not sent to the main thread: the call's deadline had passed (it will not \
+             run)"
+        ));
     }
 
     let round_trip = move || -> Result<T, String> {
@@ -466,6 +481,7 @@ where
             &MAIN_DISPATCH_LOCK,
             what,
             timeout,
+            grace,
             |job| {
                 app.run_on_main_thread(job)
                     .map_err(|e| format!("failed to dispatch {what} to the main thread: {e}"))
@@ -498,15 +514,15 @@ where
 /// lock, for an earlier abandoned closure still running, and for this closure to be picked up —
 /// so serializing cannot stack N callers into N * timeout when the UI wedges: a closure that has
 /// not started by the deadline is abandoned (it never runs) and the call returns at `timeout`.
-/// A closure that DID start before the deadline is waited for up to a further `timeout` (the
-/// `grace` passed to [`dispatch_and_wait`]) so its real outcome is reported rather than
-/// "timed out" for work that happened. So a call returns within `timeout` if its closure never
-/// started, and within about 2 × `timeout` in the worst case (it started just before the
-/// deadline and then ran long).
+/// A closure that DID start before the deadline is waited for up to a further `grace` (passed
+/// to [`dispatch_and_wait`]) so its real outcome is reported rather than "timed out" for work
+/// that happened. So a call returns within `timeout` if its closure never started, and within
+/// `timeout + grace` in the worst case (it started just before the deadline and then ran long).
 fn serialized_round_trip<T, F>(
     gate: &'static DispatchGate,
     what: &str,
     timeout: std::time::Duration,
+    grace: std::time::Duration,
     post: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
     f: F,
 ) -> Result<T, String>
@@ -517,8 +533,8 @@ where
     let deadline = std::time::Instant::now() + timeout;
     let lock_timeout = || {
         format!(
-            "{what} did not complete on the main thread: timed out waiting for the main-thread \
-             dispatch lock"
+            "{what} did not complete on the main thread: ran out of time waiting for the \
+             main-thread dispatch lock (it will not run)"
         )
     };
     let _serialize = loop {
@@ -568,7 +584,58 @@ where
     };
     // Returns with the lock still held until the closure has either run or been abandoned,
     // so no second round trip is ever in flight beside a closure that may still start.
-    dispatch_and_wait(what, remaining, timeout, counted_post, f)
+    dispatch_and_wait(what, remaining, grace, counted_post, f)
+}
+
+/// The longest a main-thread round trip waits for its closure to start, and the grace it then
+/// gives a closure that started (see [`serialized_round_trip`]).
+const MAIN_THREAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+std::thread_local! {
+    /// The deadline of the agent call this thread is currently serving (see [`CallBudget`]).
+    static CALL_DEADLINE: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// While alive, caps how long a main-thread round trip made ON THIS THREAD may wait for its
+/// closure to start: by the time left until `deadline` (never more than
+/// [`MAIN_THREAD_TIMEOUT`]). An eval holds one around each synchronous bridge call so a busy UI
+/// thread cannot push the agent's call far past its own timeout — the closure that was not
+/// picked up in time is abandoned and never runs, so "not sent" stays true. Restores the
+/// previous budget on drop (nested budgets unwind in order). Hold it only around synchronous
+/// bridge calls: it is not `Send`, so a future holding one across an `.await` cannot be spawned
+/// onto a multi-threaded runtime, where it could resume on another thread.
+pub(crate) struct CallBudget {
+    previous: Option<std::time::Instant>,
+    _same_thread: std::marker::PhantomData<*const ()>,
+}
+
+impl CallBudget {
+    /// Budget the round trips made on this thread until the guard drops.
+    pub(crate) fn until(deadline: std::time::Instant) -> Self {
+        let previous = CALL_DEADLINE.with(|d| d.replace(Some(deadline)));
+        Self {
+            previous,
+            _same_thread: std::marker::PhantomData,
+        }
+    }
+}
+
+impl Drop for CallBudget {
+    fn drop(&mut self) {
+        CALL_DEADLINE.with(|d| d.set(self.previous));
+    }
+}
+
+/// How long a round trip started now on this thread may wait for its closure to start.
+pub(crate) fn start_timeout() -> std::time::Duration {
+    CALL_DEADLINE
+        .with(std::cell::Cell::get)
+        .map_or(MAIN_THREAD_TIMEOUT, |deadline| {
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(MAIN_THREAD_TIMEOUT)
+        })
 }
 
 /// A dispatched closure that has not started yet.
@@ -639,15 +706,24 @@ where
                 ));
             }
             // It started before we gave up: its effects will happen, so report its outcome.
-            rx.recv_timeout(grace).map_err(|_| {
-                format!(
-                    "{what} started on the main thread but did not finish in time; its outcome \
-                     is unknown"
-                )
-            })?
+            rx.recv_timeout(grace)
+                .map_err(|_| format!("{what} {STARTED_OUTCOME_UNKNOWN}"))?
         }
     };
-    outcome.map_err(|_panic| format!("{what} panicked on the main thread"))
+    outcome.map_err(|_panic| format!("{what} {PANICKED_ON_MAIN}"))
+}
+
+/// Error text of a main-thread closure that started but outlived its grace.
+const STARTED_OUTCOME_UNKNOWN: &str =
+    "started on the main thread but did not finish in time; its outcome is unknown";
+/// Error text of a main-thread closure that panicked.
+const PANICKED_ON_MAIN: &str = "panicked on the main thread";
+
+/// Whether a bridge error means the closure STARTED on the main thread, so its effects may
+/// have happened (it outlived its grace, or panicked part-way) — as opposed to a dispatch that
+/// never ran. An eval must not report "the code did NOT run" for these.
+pub(crate) fn closure_may_have_run(error: &str) -> bool {
+    error.contains(STARTED_OUTCOME_UNKNOWN) || error.contains(PANICKED_ON_MAIN)
 }
 
 impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
@@ -1352,6 +1428,131 @@ mod tests {
         Box::leak(Box::new(super::DispatchGate::new()))
     }
 
+    /// A call budget caps how long a round trip on this thread waits for its closure to START:
+    /// never past the agent call's deadline, never above the 10 s default, zero once it has
+    /// passed; nested budgets restore the outer one, and no budget means the default.
+    #[test]
+    fn a_call_budget_caps_the_start_wait_and_restores_on_drop() {
+        use super::{CallBudget, MAIN_THREAD_TIMEOUT, start_timeout};
+        use std::time::Instant;
+        assert_eq!(start_timeout(), MAIN_THREAD_TIMEOUT);
+        {
+            let _outer = CallBudget::until(Instant::now() + Duration::from_secs(5));
+            assert!(start_timeout() <= Duration::from_secs(5));
+            {
+                let _inner = CallBudget::until(Instant::now() - Duration::from_millis(1));
+                assert_eq!(
+                    start_timeout(),
+                    Duration::ZERO,
+                    "an expired budget waits for nothing"
+                );
+            }
+            let back = start_timeout();
+            assert!(
+                back > Duration::ZERO && back <= Duration::from_secs(5),
+                "the inner budget restored the outer one: {back:?}"
+            );
+            let _long = CallBudget::until(Instant::now() + Duration::from_secs(3600));
+            assert_eq!(
+                start_timeout(),
+                MAIN_THREAD_TIMEOUT,
+                "never above the default"
+            );
+        }
+        assert_eq!(
+            start_timeout(),
+            MAIN_THREAD_TIMEOUT,
+            "dropped: back to no budget"
+        );
+        // Thread-local: another thread never sees this thread's budget.
+        let _here = CallBudget::until(Instant::now());
+        let elsewhere = std::thread::spawn(start_timeout).join().unwrap();
+        assert_eq!(elsewhere, MAIN_THREAD_TIMEOUT);
+    }
+
+    /// The budget reaches a round trip through `start_timeout` — what `on_main` passes — so a
+    /// closure the main thread never picks up is abandoned at the call's deadline, not at 10 s.
+    #[test]
+    fn a_round_trip_under_a_call_budget_gives_up_at_the_calls_deadline() {
+        use super::{CallBudget, serialized_round_trip, start_timeout};
+        use std::time::Instant;
+        let gate = leaked_gate();
+        let _budget = CallBudget::until(Instant::now() + Duration::from_millis(80));
+        let begun = Instant::now();
+        let parked: Arc<std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Arc::default();
+        let park = Arc::clone(&parked);
+        let refused = serialized_round_trip(
+            gate,
+            "budgeted",
+            start_timeout(),
+            Duration::from_secs(5),
+            move |job| {
+                park.lock().unwrap().push(job);
+                Ok(())
+            },
+            || (),
+        );
+        assert!(refused.unwrap_err().contains("it will not run"));
+        assert!(
+            begun.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            begun.elapsed()
+        );
+    }
+
+    /// With a short start budget a closure that is never picked up is abandoned at the budget
+    /// (it never runs), not after the full 10 s; one that started is still waited for (grace).
+    #[test]
+    fn a_short_start_budget_abandons_an_unstarted_job_but_waits_for_a_started_one() {
+        use super::serialized_round_trip;
+        use std::time::Instant;
+        let gate = leaked_gate();
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let r = Arc::clone(&ran);
+        let begun = Instant::now();
+        // `post` that never runs the job: the main thread is "busy".
+        let parked: Arc<std::sync::Mutex<Vec<Box<dyn FnOnce() + Send>>>> = Arc::default();
+        let park = Arc::clone(&parked);
+        let refused = serialized_round_trip(
+            gate,
+            "never-started",
+            Duration::from_millis(80),
+            Duration::from_secs(5),
+            move |job| {
+                park.lock().unwrap().push(job);
+                Ok(())
+            },
+            move || r.store(true, std::sync::atomic::Ordering::SeqCst),
+        );
+        assert!(refused.unwrap_err().contains("it will not run"));
+        assert!(
+            begun.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            begun.elapsed()
+        );
+        // The main thread gets to it later: the abandoned job must not run.
+        for job in parked.lock().unwrap().drain(..) {
+            job();
+        }
+        assert!(!ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        // A job that starts in time but runs past the start budget: its real outcome comes back.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let slow = serialized_round_trip(
+            gate,
+            "started",
+            Duration::from_millis(80),
+            Duration::from_secs(5),
+            post_started(started_rx),
+            move || {
+                let _ = started_tx.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                "done"
+            },
+        );
+        assert_eq!(slow.unwrap(), "done");
+    }
+
     /// R4-LOCK1: a round trip whose closure STARTED but outlived timeout + grace returned
     /// "outcome unknown" and released the dispatch lock while the closure was still running on
     /// the main thread — so the next caller put a second round trip in flight beside it, the
@@ -1370,6 +1571,7 @@ mod tests {
         let first = serialized_round_trip(
             gate,
             "first",
+            Duration::from_millis(50),
             Duration::from_millis(50),
             post_started(started_rx),
             move || {
@@ -1394,6 +1596,7 @@ mod tests {
         let second_start = serialized_round_trip(
             gate,
             "second",
+            Duration::from_secs(5),
             Duration::from_secs(5),
             post_after(Duration::ZERO),
             Instant::now,
@@ -1422,6 +1625,7 @@ mod tests {
             gate,
             "first",
             Duration::from_millis(30),
+            Duration::from_millis(30),
             post_started(started_rx),
             move || {
                 let _ = started_tx.send(());
@@ -1435,6 +1639,7 @@ mod tests {
         let second = serialized_round_trip(
             gate,
             "second",
+            Duration::from_millis(200),
             Duration::from_millis(200),
             post_after(Duration::ZERO),
             move || r.fetch_add(1, Ordering::SeqCst),

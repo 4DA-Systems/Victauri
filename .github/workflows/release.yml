@@ -230,7 +230,7 @@ jobs:
   # dependency's build script and proc-macro. When this ran in the publish job, a malicious
   # build script could write `$GITHUB_ENV` / `$GITHUB_PATH` / `~/.cargo/config.toml` (e.g.
   # swap the `cargo` the next step runs, or add a credential provider) and so execute in
-  # the later step that holds CARGO_REGISTRY_TOKEN (round-4 audit R4-REL1). A separate job
+  # the later step that holds the crates.io token (round-4 audit R4-REL1). A separate job
   # gets a fresh runner: nothing it writes reaches the publish job.
   # ─────────────────────────────────────────────────────────────────────
   verify-packages:
@@ -269,9 +269,13 @@ jobs:
     # packages to verify (in their own secret-free job) and CI to be green before making
     # the version irreversible.
     needs: [test, build, verify-packages, require-ci-green]
-    # Least privilege for the job that holds the crates.io token (audit #8).
+    # Least privilege for the job that holds the crates.io token (audit #8). `id-token: write`
+    # is for crates.io Trusted Publishing: the job exchanges a GitHub OIDC token (bound to this
+    # repo, this workflow file and the `release` environment) for a ~30-minute crates.io token,
+    # which the auth action revokes when the job ends. No long-lived publish token is stored.
     permissions:
       contents: read
+      id-token: write
     # Gate behind a protected Environment. Add required reviewers in
     # repo Settings → Environments → release to require approval before publish.
     environment: release
@@ -309,9 +313,43 @@ jobs:
 
       # No rust-cache in this job: a restored target/ is code the job would then run.
 
+      # Crates already published at this version (a local publish, or a re-run after a partial
+      # one) need no token: when ALL are on crates.io the auth and publish steps are skipped, so
+      # the GitHub Release still gets cut even if Trusted Publishing is not (yet) configured.
+      - name: Check which crates are already on crates.io
+        id: published
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_REF#refs/tags/v}"
+          missing=0
+          for c in victauri-core victauri-macros victauri-plugin victauri-test victauri-cli victauri-watchdog; do
+            # Sparse-index path for names of 4+ chars: first two / next two / name.
+            if curl -fsSL -A "victauri-release (github.com/4DA-Systems/Victauri)" \
+                "https://index.crates.io/${c:0:2}/${c:2:2}/$c" \
+                | grep -q "\"vers\":\"$VER\""; then
+              echo "$c $VER is already on crates.io"
+            else
+              echo "$c $VER is not on crates.io yet"
+              missing=1
+            fi
+          done
+          echo "all=$([ "$missing" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      # Trusted Publishing. Each crate must list this publisher on crates.io (crate Settings →
+      # Trusted Publishing → GitHub: owner `4DA-Systems`, repository `Victauri`, workflow
+      # `release.yml`, environment `release`). With NO crate configured this step fails and
+      # nothing is published. The token covers only the crates whose config matches, so a crate
+      # left unconfigured fails at ITS turn below, after the earlier ones are live (a partial
+      # release: fix its config and re-run — published crates are skipped).
+      - name: Authenticate to crates.io (Trusted Publishing)
+        if: steps.published.outputs.all != 'true'
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
       - name: Publish crates in dependency order
+        if: steps.published.outputs.all != 'true'
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
         run: |
           publish() {
             echo "Publishing $1..."

@@ -3,7 +3,7 @@
   "name": "io.github.4DA-Systems/victauri",
   "title": "Victauri",
   "description": "In-process MCP server for Tauri apps: DOM, IPC with bodies, Rust state, SQLite. Debug builds only.",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "repository": {
     "url": "https://github.com/4DA-Systems/victauri",
     "source": "github"
@@ -13,7 +13,7 @@
     {
       "registryType": "cargo",
       "identifier": "victauri-cli",
-      "version": "0.10.0",
+      "version": "0.10.1",
       "runtimeHint": "victauri",
       "transport": { "type": "stdio" },
       "packageArguments": [

@@ -126,6 +126,7 @@ Or use the CLI for instant validation:
 ```bash
 victauri test                                    # 11 built-in smoke checks
 victauri check                                   # server health + IPC diagnostics
+victauri call dom_snapshot                       # any tool from the shell → JSON on stdout
 ```
 
 ### Use with your agent
@@ -348,7 +349,9 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | `get_plugin_info` | Plugin config: port, tools, privacy, version |
 | `get_diagnostics` | Shadow DOM, service workers, iframes, large DOM detection |
 
-All tools are also available via REST at `POST /api/tools/{name}` — no MCP client needed. See the [Tools Reference](docs/src/tools-reference.md).
+No MCP client needed: every tool is also a shell command — `victauri call query_db query="SELECT 1"`
+prints the result as JSON (`victauri tools <name>` shows a tool's arguments) — and a REST endpoint,
+`POST /api/tools/{name}`. See the [Tools Reference](docs/src/tools-reference.md).
 
 ---
 
@@ -446,7 +449,7 @@ Use the built-in composite action to run Victauri smoke tests in CI:
     xvfb-run -a ./target/debug/my-app &
     sleep 3
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.0
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.1
   with:
     max-load-ms: 10000
     max-heap-mb: 512

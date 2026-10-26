@@ -752,3 +752,92 @@ e2e_test!(
         assert!(reloads > 0, "reloader should have run at least once");
     }
 );
+
+// ────────────────────────────────────────────────────────────────────────────
+// Runtime isolation — the server keeps answering while the app blocks its own runtime
+// ────────────────────────────────────────────────────────────────────────────
+
+e2e_test!(
+    server_stays_responsive_while_the_app_blocks_its_async_runtime,
+    |client| async move {
+        // #83 (seen live in 4DA): a scheduled job blocked every worker of Tauri's async runtime
+        // for ~90 s, and because Victauri's server shared that runtime, /health and every
+        // Rust-side tool froze with it — exactly when an agent needs to look inside. The server
+        // now runs on its own runtime, so these must keep answering while the app is pinned.
+        use std::time::{Duration, Instant};
+
+        const PINNED_SECS: u64 = 4;
+        let pinned = client
+            .invoke_command(
+                "saturate_async_runtime",
+                Some(json!({ "seconds": PINNED_SECS })),
+            )
+            .await
+            .expect("the (synchronous) saturating command returns at once");
+        assert!(pinned.as_u64().unwrap_or(0) > 0, "{pinned:?}");
+        let pinned_at = Instant::now();
+        tokio::time::sleep(Duration::from_millis(300)).await; // let the tasks occupy the workers
+
+        // Positive control: the app's runtime really is pinned — an async command (which runs on
+        // it) cannot answer until it is free. Without this the test could pass vacuously.
+        let ping = client
+            .invoke_command_with_timeout("async_runtime_ping", None, 800)
+            .await;
+        assert!(
+            ping.as_ref()
+                .is_err_and(|e| e.to_string().contains("timed out")),
+            "the app's async runtime was not saturated, so this test proves nothing: {ping:?}"
+        );
+
+        let http = reqwest::Client::new();
+        let health_url = format!("{}/health", client.base_url());
+        let mut slowest = Duration::ZERO;
+        // Stop probing well before the pin ends, so the ping below can show the runtime was
+        // still pinned when the probing finished.
+        while pinned_at.elapsed() < Duration::from_secs(PINNED_SECS - 2) {
+            let t = Instant::now();
+            let health = http
+                .get(&health_url)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+                .expect("/health answers while the app's runtime is pinned");
+            assert!(health.status().is_success(), "{}", health.status());
+            client
+                .get_memory_stats()
+                .await
+                .expect("a Rust-side tool answers while the app's runtime is pinned");
+            client
+                .app_state(Some("pipeline"))
+                .await
+                .expect("an app_state probe answers while the app's runtime is pinned");
+            // A webview round trip too: the eval goes through the main thread and its result
+            // comes back through a sync command — neither may wait on the app's runtime.
+            let two = client
+                .eval_js("1 + 1")
+                .await
+                .expect("eval_js answers while the app's runtime is pinned");
+            assert_eq!(two, json!(2), "{two:?}");
+            slowest = slowest.max(t.elapsed());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            slowest < Duration::from_millis(1500),
+            "the server starved behind the app's blocked runtime: slowest round {slowest:?} \
+             (before the isolated runtime, /health alone took seconds here)"
+        );
+
+        // Leave no pinned runtime to the next test: the runtime is free again once the async
+        // command answers (every pinning task ends at the same deadline).
+        client
+            .invoke_command_with_timeout("async_runtime_ping", None, 30_000)
+            .await
+            .expect("the app's async runtime is free again after the pin");
+        let freed_after = pinned_at.elapsed();
+        assert!(
+            freed_after >= Duration::from_millis(PINNED_SECS * 1000 - 700),
+            "the runtime was free after {freed_after:?}, before the {PINNED_SECS} s pin ended — \
+             it was not pinned for the whole probing window, so the rounds above prove nothing"
+        );
+    }
+);

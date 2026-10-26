@@ -1164,8 +1164,10 @@ then fails with `422`/`404`. The bridge avoids that by design.
   automatically when it can read your identifier.
 - **If a tool call fails after an app rebuild/restart:** the bridge re-resolves the backend
   automatically — just retry (the transport is stateless by default, so there is usually no
-  session to lose). If the MCP path is genuinely wedged, the **sessionless
-  REST API is the fallback, NOT CDP**: `POST http://127.0.0.1:<port>/api/tools/<tool>` with
+  session to lose). If the MCP path is genuinely wedged, **the shell is the fallback, NOT
+  CDP**: `victauri call <tool> key=value …` (see "From a shell" below — it finds the app and
+  its token itself). Last resort, the sessionless REST API:
+  `POST http://127.0.0.1:<port>/api/tools/<tool>` with
   the app's Bearer token (same capabilities, no session). Run `victauri check` (add
   `--app <bundle-identifier>` if several apps run) to see the endpoint; the token is the
   `token` file in the app's `<pid>` directory under the **per-user** discovery root —
@@ -1173,6 +1175,21 @@ then fails with `422`/`404`. The bridge avoids that by design.
   `$XDG_STATE_HOME/victauri/` (`~/.local/state/victauri/`) on Linux/macOS,
   `%TEMP%\victauri\` on Windows. Never take a token from a shared, world-writable directory
   such as a bare `/tmp/victauri/`: another local user can plant entries there.
+
+### From a shell (no MCP client needed)
+
+Every tool is also a shell command, for agents and scripts that work through a terminal:
+`victauri tools` lists them, `victauri tools <tool>` shows a tool's arguments, and
+`victauri call <tool> key=value key:=<json>` runs it and prints the result as JSON on stdout
+(`key=value` is a string, `key:=…` any JSON value; `--args-file -` reads a JSON object from
+stdin — the reliable form in Windows PowerShell, which strips quotes inside JSON arguments).
+Exit code 0 = success, 1 = the tool reported an error or the app rejected the call
+(`{"error": …}` on stdout), 2 = a local problem (bad arguments, no app reachable, or an
+`--out` file not written — the tool did run), 3 = sent but did not complete (timeout) — the
+tool may have run, so check its effect before retrying. `victauri call screenshot --out
+shot.png` saves images instead of printing base64. Add `--app <bundle-identifier>` when several apps run. Examples:
+`victauri call query_db query="SELECT count(*) FROM items"`,
+`victauri call invoke_command command=get_settings`, `victauri call interact action=click ref_id=e12`.
 
 ### Awaiting async backend work (don't guess with sleeps)
 

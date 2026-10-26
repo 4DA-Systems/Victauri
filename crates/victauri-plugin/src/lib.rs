@@ -193,6 +193,9 @@ pub type PendingCallbacks = Arc<Mutex<HashMap<String, oneshot::Sender<String>>>>
 pub(crate) struct PendingSlot {
     map: PendingCallbacks,
     id: String,
+    /// Reserved by a page command, so it may be dropped on the APP's runtime (see
+    /// [`lock_pending_unqueued`]).
+    on_app_runtime: bool,
 }
 
 impl PendingSlot {
@@ -208,7 +211,15 @@ impl PendingSlot {
         Self {
             map: Arc::clone(map),
             id,
+            on_app_runtime: false,
         }
+    }
+
+    /// Mark a slot reserved by a page command (on the app's runtime): a removal it leaves for
+    /// later must never queue on the lock there.
+    pub(crate) fn reserved_on_app_runtime(mut self) -> Self {
+        self.on_app_runtime = true;
+        self
     }
 
     /// The reserved eval id.
@@ -265,6 +276,26 @@ pub(crate) fn eval_result_accepted(
     }
 }
 
+/// Take the [`PendingCallbacks`] lock WITHOUT joining its wait queue — for code that may run on
+/// the APP's async runtime (the page commands, a slot dropped there).
+///
+/// tokio's `Mutex` is fair: on release the lock is handed straight to the first QUEUED waiter,
+/// even if that task cannot be polled yet. A waiter queued on the app's runtime while the app
+/// pins it (a blocking call in async code) would then hold the lock until the app lets go, and
+/// every agent eval — on Victauri's own runtime — would hang in `reserve_pending` with it. A
+/// task that only ever `try_lock`s is never handed the lock while it is not running. Every map
+/// operation is a few non-awaiting lines, so the retry loop spins at most briefly.
+pub(crate) async fn lock_pending_unqueued(
+    map: &PendingCallbacks,
+) -> tokio::sync::MutexGuard<'_, HashMap<String, oneshot::Sender<String>>> {
+    loop {
+        if let Ok(guard) = map.try_lock() {
+            return guard;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
 impl Drop for PendingSlot {
     fn drop(&mut self) {
         eval_targets().remove(&self.id);
@@ -277,6 +308,12 @@ impl Drop for PendingSlot {
         let map = Arc::clone(&self.map);
         let id = std::mem::take(&mut self.id);
         match tokio::runtime::Handle::try_current() {
+            // A page command's slot is dropped on the app's runtime: never queue there.
+            Ok(rt) if self.on_app_runtime => {
+                rt.spawn(async move {
+                    lock_pending_unqueued(&map).await.remove(&id);
+                });
+            }
             Ok(rt) => {
                 rt.spawn(async move {
                     map.lock().await.remove(&id);
@@ -352,6 +389,10 @@ pub struct VictauriState {
     pub(crate) drain_watermarks: introspection::DrainWatermarks,
     /// Per-window page-load generations (bumped by each bridge ready signal).
     pub(crate) page_loads: introspection::PageLoads,
+    /// The runtime Victauri's server runs on (set when it starts on its own runtime): work the
+    /// server's calls depend on is spawned here, never on the app's runtime, which an app can
+    /// block (see `spawn_server_isolated`).
+    pub(crate) server_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 impl VictauriState {
@@ -393,6 +434,7 @@ impl VictauriState {
             probes: introspection::AppStateProbes::default(),
             drain_watermarks: introspection::DrainWatermarks::default(),
             page_loads: introspection::PageLoads::default(),
+            server_runtime: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1037,6 +1079,7 @@ impl VictauriBuilder {
                         probes: introspection::AppStateProbes::default(),
                         drain_watermarks: introspection::DrainWatermarks::default(),
                         page_loads: introspection::PageLoads::default(),
+                        server_runtime: std::sync::OnceLock::new(),
                     });
                     state.startup_timeline.mark("state_created");
 
@@ -1094,7 +1137,7 @@ impl VictauriBuilder {
                     let ready_state = state.clone();
                     let server_finished = state.task_tracker.track_guarded("mcp_server");
                     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
-                    tauri::async_runtime::spawn(async move {
+                    spawn_server_isolated(&ready_state.server_runtime, async move {
                         let _finished = server_finished;
                         match mcp::start_server_reporting_port(
                             app_handle,
@@ -1201,6 +1244,80 @@ impl VictauriBuilder {
                     tools::victauri_check_ipc_integrity,
                 ])
                 .build())
+        }
+    }
+}
+
+/// Run the MCP server on its **own** Tokio runtime (dedicated OS threads) instead of Tauri's
+/// shared async runtime.
+///
+/// An app that blocks its async workers — a synchronous call inside an `async` command, a
+/// CPU-bound loop on a Tokio task — used to take Victauri down with it: `/health`, the REST and
+/// MCP endpoints and every Rust-side tool stopped answering until the app let go (measured live
+/// in 4DA: everything frozen for ~90 s while a scheduled job pinned the runtime). That is
+/// exactly when an agent needs to look inside. On its own runtime the server keeps answering;
+/// only the tools that genuinely need the app's main thread or webview wait on those.
+/// Multi-threaded, because the bridge relies on `block_in_place`. Its handle is published in
+/// `runtime_slot` so work the server's calls depend on is spawned there too. Falls back to
+/// Tauri's runtime if a dedicated runtime cannot be built or its thread cannot start.
+#[cfg(debug_assertions)]
+fn spawn_server_isolated<F>(runtime_slot: &std::sync::OnceLock<tokio::runtime::Handle>, server: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("victauri-mcp")
+        .enable_all()
+        .build();
+    let rt = match runtime {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!(
+                "Victauri: dedicated runtime unavailable ({e}); sharing the app's async runtime"
+            );
+            tauri::async_runtime::spawn(server);
+            return;
+        }
+    };
+    let handle = rt.handle().clone();
+    // The runtime and the server travel to the thread together; if the thread cannot start,
+    // both come back here so the server can still run on the app's runtime.
+    let parcel = Arc::new(std::sync::Mutex::new(Some((rt, server))));
+    let for_thread = Arc::clone(&parcel);
+    // (Linux shows at most 15 bytes of a thread name.)
+    let spawned = std::thread::Builder::new()
+        .name("victauri-mcp-rt".into())
+        .spawn(move || {
+            let taken = for_thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((rt, server)) = taken {
+                rt.block_on(server);
+                // Blocking work still running at exit (a hung probe, a slow disk) must not pin
+                // this thread forever: dropping a runtime waits for it without limit.
+                rt.shutdown_timeout(std::time::Duration::from_secs(1));
+            }
+        });
+    match spawned {
+        Ok(_) => {
+            let _ = runtime_slot.set(handle);
+        }
+        Err(e) => {
+            tracing::error!(
+                "Victauri: MCP server thread could not start ({e}); sharing the app's async \
+                 runtime"
+            );
+            let taken = parcel
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            if let Some((rt, server)) = taken {
+                // Not a plain drop: dropping a runtime inside another runtime's context panics.
+                rt.shutdown_background();
+                tauri::async_runtime::spawn(server);
+            }
         }
     }
 }

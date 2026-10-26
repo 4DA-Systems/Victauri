@@ -524,7 +524,7 @@ fn local_initialize_response(client_msg: &Value) -> Value {
 /// The full baked tool list as MCP `Tool` objects. Each carries the real name + description
 /// and a permissive object input schema — enough for an agent to see what exists while the
 /// app is down; the live `tools/list` (with exact per-tool schemas) supersedes it on connect.
-fn fallback_tools() -> Vec<Value> {
+pub fn fallback_tools() -> Vec<Value> {
     let parsed: Vec<Value> = serde_json::from_str(TOOLS_FALLBACK_JSON).unwrap_or_default();
     parsed
         .into_iter()

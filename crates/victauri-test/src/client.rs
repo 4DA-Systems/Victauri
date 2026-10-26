@@ -724,20 +724,135 @@ impl VictauriClient {
     /// unrecoverable stale session). Returns [`TestError::Request`] on HTTP transport
     /// errors. Returns [`TestError::Mcp`] if the server returns a JSON-RPC error.
     pub async fn call_tool(&mut self, name: &str, arguments: Value) -> Result<Value, TestError> {
+        let timeout = request_timeout_for(&arguments);
+        let body = self
+            .rpc(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+                timeout,
+            )
+            .await?;
+
+        let result = &body["result"];
+        let content = &result["content"];
+
+        // Honor MCP tool-level errors: a tool that sets `isError: true` returns its
+        // failure message in the content text. Without this check the SDK would
+        // report a failed eval / invalid selector / tool_error as a successful
+        // `Ok(...)`, hiding real failures from callers (red-team P1).
+        let is_tool_error = result.get("isError").and_then(Value::as_bool) == Some(true);
+
+        if let Some(arr) = content.as_array()
+            && let Some(first) = arr.first()
+        {
+            if let Some(text) = first["text"].as_str() {
+                if is_tool_error {
+                    return Err(TestError::ToolError(text.to_string()));
+                }
+                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
+                    return Ok(parsed);
+                }
+                return Ok(Value::String(text.to_string()));
+            }
+            if first.get("type").and_then(Value::as_str) == Some("image") {
+                return Ok(first.clone());
+            }
+        }
+
+        if is_tool_error {
+            return Err(TestError::ToolError(format!(
+                "tool '{name}' returned an error result: {result}"
+            )));
+        }
+
+        Ok(body)
+    }
+
+    /// Call an MCP tool and return its complete MCP `result` object — every `content`
+    /// block (text AND image), plus `isError` — instead of [`Self::call_tool`]'s
+    /// first-block convenience value.
+    ///
+    /// A tool that ran and reported failure (`isError: true`) is returned as `Ok` with
+    /// that flag set, so the caller decides how to surface it. Same transport behavior as
+    /// [`Self::call_tool`]: rate-limit backoff, one re-handshake on a stale session, and
+    /// rediscovery of the same app after a restart; a request that may have been delivered
+    /// is never re-sent.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::call_tool`], except that a tool-level error is not an `Err`.
+    pub async fn call_tool_raw(
+        &mut self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, TestError> {
+        let timeout = request_timeout_for(&arguments);
+        let mut body = self
+            .rpc(
+                "tools/call",
+                json!({ "name": name, "arguments": arguments }),
+                timeout,
+            )
+            .await?;
+        Ok(body
+            .get_mut("result")
+            .map_or(Value::Null, serde_json::Value::take))
+    }
+
+    /// List the server's tools with their live input schemas (MCP `tools/list`, following
+    /// `nextCursor` pages). Each entry is an MCP `Tool` object: `name`, `description`,
+    /// `inputSchema`, and annotations when the server sends them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Connection`] / [`TestError::Request`] on transport failures and
+    /// [`TestError::Mcp`] if the server answers with a JSON-RPC error.
+    pub async fn list_tools(&mut self) -> Result<Vec<Value>, TestError> {
+        let mut tools = Vec::new();
+        let mut cursor: Option<String> = None;
+        // Bounded: a server that keeps returning a cursor cannot loop the client forever.
+        for _ in 0..64 {
+            let params = cursor
+                .as_ref()
+                .map_or_else(|| json!({}), |c| json!({ "cursor": c }));
+            let body = self
+                .rpc("tools/list", params, DEFAULT_REQUEST_TIMEOUT)
+                .await?;
+            let result = &body["result"];
+            if let Some(page) = result["tools"].as_array() {
+                tools.extend(page.iter().cloned());
+            }
+            match result.get("nextCursor").and_then(Value::as_str) {
+                Some(next) if !next.is_empty() => cursor = Some(next.to_string()),
+                _ => break,
+            }
+        }
+        Ok(tools)
+    }
+
+    /// Send one JSON-RPC request to `/mcp` and return the response body.
+    ///
+    /// Retries up to 3 times with exponential backoff on 429 (rate limited); on a 422
+    /// "expected initialized request" (stale session), a 401 or a refused connection of a
+    /// discovered client it re-handshakes once (re-resolving the same app) and retries —
+    /// none of those requests reached a handler. Anything else, including a timeout, is
+    /// returned as-is: a request that may have been delivered is never re-sent.
+    async fn rpc(
+        &mut self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<Value, TestError> {
         let id = self.next_id;
         self.next_id += 1;
 
         let call_body = json!({
             "jsonrpc": "2.0",
             "id": id,
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments
-            }
+            "method": method,
+            "params": params,
         });
 
-        let timeout = request_timeout_for(&arguments);
         let mut resp = None;
         let mut reinitialized = false;
         let mut reauthed = false;
@@ -810,6 +925,10 @@ impl VictauriClient {
         // Still stale after a re-handshake: surface a clear, actionable error pointing at
         // the sessionless REST endpoint, which never hits this failure class.
         if resp.status() == 422 {
+            let rest_route = match params.get("name").and_then(Value::as_str) {
+                Some(name) if method == "tools/call" => format!("POST /api/tools/{name}"),
+                _ => "GET /api/tools".to_string(),
+            };
             return Err(TestError::Connection {
                 host: self.host.clone(),
                 port: self.port,
@@ -817,7 +936,7 @@ impl VictauriClient {
                     "MCP session is stale (HTTP 422 'expected initialized request') and \
                      re-initialization did not recover — the server likely restarted \
                      mid-session. Use the sessionless REST API instead: \
-                     POST http://{}:{}/api/tools/{name} (same Bearer auth, no session \
+                     {rest_route} on http://{}:{} (same Bearer auth, no session \
                      handshake).",
                     self.host, self.port
                 ),
@@ -838,38 +957,6 @@ impl VictauriClient {
                     String::from,
                 ),
             });
-        }
-
-        let result = &body["result"];
-        let content = &result["content"];
-
-        // Honor MCP tool-level errors: a tool that sets `isError: true` returns its
-        // failure message in the content text. Without this check the SDK would
-        // report a failed eval / invalid selector / tool_error as a successful
-        // `Ok(...)`, hiding real failures from callers (red-team P1).
-        let is_tool_error = result.get("isError").and_then(Value::as_bool) == Some(true);
-
-        if let Some(arr) = content.as_array()
-            && let Some(first) = arr.first()
-        {
-            if let Some(text) = first["text"].as_str() {
-                if is_tool_error {
-                    return Err(TestError::ToolError(text.to_string()));
-                }
-                if let Ok(parsed) = serde_json::from_str::<Value>(text) {
-                    return Ok(parsed);
-                }
-                return Ok(Value::String(text.to_string()));
-            }
-            if first.get("type").and_then(Value::as_str) == Some("image") {
-                return Ok(first.clone());
-            }
-        }
-
-        if is_tool_error {
-            return Err(TestError::ToolError(format!(
-                "tool '{name}' returned an error result: {result}"
-            )));
         }
 
         Ok(body)

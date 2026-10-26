@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-27
+
+### Added
+
+- **`victauri tools` and `victauri call` — every tool from a plain shell.** Until now the
+  shell reached only app commands (`victauri invoke`); the other 34 tools needed an MCP client,
+  or `curl` plus the discovered port and token. Shell-first agents (Codex without MCP, Pi,
+  OpenClaw) and CI scripts now run any tool as a command: `victauri call query_db
+  query="SELECT 1"` prints the result as JSON on stdout. Arguments are `key=value` (string),
+  `key:=json` (any JSON value), a leading JSON object, or `--args-file <path|->` (the reliable
+  form in Windows PowerShell, which strips quotes inside JSON arguments). Image results
+  (`screenshot`, `animation scrub`, `trace frames`) are decoded and saved with `--out`, never
+  printed as base64. Exit codes: 0 success; 1 the tool reported an error or the app rejected
+  the call (`{"error": …}` on stdout); 2 a local problem (bad arguments, no app reachable —
+  nothing was sent — or an `--out` file / stdout that could not be written — the tool did run);
+  3 the call was sent but did not complete (timeout, lost connection), so the tool may have
+  run and a wrapper must not retry blindly. Output to a closed pipe (`| head`) is a clean exit.
+  `victauri tools [name]` lists the tools, or one tool's arguments, from the live input
+  schemas; with no app running it lists the built-in names and descriptions (a running app it
+  cannot select — several apps, a wrong `--app` — is an error, not a fallback). Both use the same discovery, trust checks, `--app` pinning and token
+  as `invoke`, take no port/URL/token flag, never print the token, and pass server-supplied
+  text through the terminal sanitizer. A failed call checks for CLI↔plugin version skew. The
+  agent guidance `victauri setup` writes now names `victauri call` as the fallback before raw
+  REST. `victauri-test` gains `VictauriClient::call_tool_raw` (the complete MCP result: every
+  content block and `isError`) and `VictauriClient::list_tools` (live tool schemas); `call_tool`
+  is unchanged.
+
+### Security
+
+- **Dependency advisories published after 0.10.0** (#86; lockfile only, semver-compatible):
+  `rustls-webpki` 0.103.15 → 0.103.16 (RUSTSEC-2026-0382, certificate verification may accept
+  distrusted emSign intermediates), `webpki-roots` 1.0.7 → 1.0.10 (RUSTSEC-2026-0381, the bundled
+  roots allowed trust in those intermediates), `tokio` 1.52.1 → 1.53.3 (RUSTSEC-2026-0386, unsound
+  `AsyncFd` constructors, which Victauri does not call; 1.53.3 rather than 1.54.0, which has
+  RUSTSEC-2026-0384 — 1.54.1 fixes that but was still inside a 3-day release hold). They reach
+  `cargo install victauri-cli --locked` through the
+  published lockfile, which is what 0.10.1 fixes. Victauri's own HTTP traffic is plain
+  localhost; no Victauri code path verifies a remote certificate.
+
+### Fixed
+
+- **The server keeps answering while the app blocks its own async runtime** (#83). Victauri's
+  MCP/REST server ran on Tauri's shared Tokio runtime, so an app that blocked its workers — a
+  synchronous call inside an `async` command, a CPU-bound task, a scheduled job — froze
+  `/health`, the REST and MCP endpoints and every Rust-side tool with it, exactly when an agent
+  needs to look inside (measured live in 4DA: everything frozen for ~90 s). The server now runs
+  on its own Tokio runtime (two async workers plus its own blocking pool, on a dedicated
+  thread; it falls back to Tauri's runtime if that cannot be built or started). Eval results
+  are delivered there too, so webview tools keep answering as well — they wait only on the
+  app's main thread and webview, which they genuinely need. CPU-heavy work that used to run on
+  an async worker (animation filmstrip composition, database discovery) moved to the blocking
+  pool so it cannot stall `/health` on the two workers. The demo app's new
+  `saturate_async_runtime` command and the E2E test
+  `server_stays_responsive_while_the_app_blocks_its_async_runtime` prove it: while every worker
+  of the app's runtime is pinned (checked by an async command that cannot answer), `/health`, a
+  Rust-side tool, an `app_state` probe and `eval_js` all keep answering (on the shared runtime
+  the slowest round took 3.7 s).
+- **An eval's timeout covers the whole call** (#83). The liveness probe, the injection and the
+  parse check are main-thread round trips, and the wait for the result started its own full
+  timeout only after them — on a busy UI thread a "30 s" `eval_js` (and every tool built on it)
+  could run for about two minutes. All steps now share one deadline: a main-thread round trip
+  waits to *start* only as long as the call has left (a closure not picked up in time is
+  abandoned and never runs, so the call reports that the code did NOT run), and a call out of
+  time before its code was sent says exactly that. A closure that already started is still
+  waited for, so "did my code run" stays truthful (a delivery that started and then outlived
+  its grace now reports that the code *may* have run, not that it did not). Two floors keep
+  short timeouts from turning load into false failures: sending gets at least 2.5 s (the
+  liveness probe always keeps its full 2 s — a shorter one cannot tell a dead page from a busy
+  one; a page whose bridge never signals ready is still probed, so it gets the "bridge not
+  responding — missing capability / page not loaded" diagnosis), and code that reached the page
+  gets at least min(timeout, 1 s) to answer, counted after the parse check; a result that has
+  arrived is never reported as a timeout. A call now ends within max(timeout, 2.5 s) + 2 s (a
+  probe dispatched just before the send deadline keeps its 2 s), plus the grace of a main-thread
+  step that had already started. A call that runs out of send time at any step (before the
+  probe, during it, or at the injection) gets the same "ran out of time before the code was
+  sent — the app's UI thread is busy" diagnosis. `wait_for`'s page-side conditions get 24 s of
+  extra eval time (was 5 s) — room for both main-thread start waits (up to 10 s each) and the
+  probe's 2 s — so sending on a busy UI thread cannot cut off the condition's own answer.
+- **A page-originated eval can no longer stall every agent eval while the app blocks its
+  runtime.** The page commands (`victauri_eval_js` / `victauri_dom_snapshot`) run on the app's
+  runtime and queued on the pending-eval lock; tokio's mutex hands a released lock to the first
+  queued waiter, so a waiter whose runtime the app had just pinned held it until the app let go,
+  and every agent eval waited behind it (a 1 s `eval_js` took ~6 s and blamed a busy UI thread).
+  Code that may run on the app's runtime now never queues on that lock.
+
+### Release process
+
+- **crates.io publishing uses Trusted Publishing (OIDC)** — the release workflow no longer
+  reads a stored `CARGO_REGISTRY_TOKEN`; it exchanges the run's GitHub OIDC token for a
+  short-lived crates.io token that is revoked when the job ends (see RELEASING.md for the
+  one-time per-crate setup — configure **all six** crates before tagging: the token covers only
+  configured crates, so a missing one stops the publish after the earlier crates are live).
+  When every crate is already on crates.io at the tag's version (a local publish, or a re-run),
+  the workflow skips authentication and publishing and still cuts the GitHub Release.
+
 ## [0.10.0] - 2026-10-18
 
 Built from an adversarial adoption audit (2026-10-16) of what stands between Victauri and being
@@ -2383,7 +2478,9 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/4DA-Systems/victauri/compare/v0.10.0...v0.10.1
+[0.10.0]: https://github.com/4DA-Systems/victauri/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/4DA-Systems/victauri/compare/v0.8.8...v0.9.0
 [0.8.8]: https://github.com/4DA-Systems/victauri/compare/v0.8.7...v0.8.8
 [0.8.7]: https://github.com/4DA-Systems/victauri/compare/v0.8.6...v0.8.7
