@@ -16,11 +16,35 @@ runs:
     - name: Install Tauri system dependencies
       shell: bash
       run: |
-        set -euo pipefail
-        sudo apt-get update
+        set -uo pipefail
         pkgs="libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libgtk-3-dev"
         if [ "${{ inputs.xvfb }}" = "true" ]; then
           pkgs="$pkgs xvfb"
         fi
-        # shellcheck disable=SC2086
-        sudo apt-get install -y $pkgs
+        # The runner's Azure Ubuntu mirror sometimes crawls (2026-10-26: one package every few
+        # seconds), and an unbounded apt-get then ran into every Linux job's timeout, which
+        # cancelled whole CI runs. Bound each attempt, retry dropped downloads, and move later
+        # attempts to the main Ubuntu archive (a slow mirror tends to stay slow). The package
+        # set is unchanged: the live-app jobs run the real WebKitGTK app, so no
+        # --no-install-recommends.
+        opts=(-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+        use_archive() {
+          echo "::warning::falling back from the runner's apt mirror to archive.ubuntu.com"
+          for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] && sudo sed -i 's#http://azure\.archive\.ubuntu\.com/ubuntu#http://archive.ubuntu.com/ubuntu#g' "$f"
+          done
+        }
+        for attempt in 1 2 3; do
+          [ "$attempt" = 2 ] && use_archive
+          # shellcheck disable=SC2086
+          if sudo timeout 120 apt-get "${opts[@]}" update \
+            && sudo timeout 300 apt-get "${opts[@]}" install -y $pkgs; then
+            exit 0
+          fi
+          echo "::warning::apt attempt $attempt failed or timed out"
+          # A timeout can land mid-dpkg; finish any half-configured packages before retrying.
+          sudo dpkg --configure -a || true
+          sleep $((attempt * 10))
+        done
+        echo "::error::could not install the Tauri system dependencies after 3 attempts"
+        exit 1
