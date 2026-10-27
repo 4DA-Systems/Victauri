@@ -184,9 +184,28 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-10-25)
+## Current State (2026-10-27)
 
-### v0.10.1 — release candidate (`release/0.10.1-prep`), self-red-teamed, NOT published
+### v0.10.1 — PUBLISHED 2026-10-27
+
+PR #87 squash-merged as `e892ce1` (crate code byte-identical to the CI-green head `929b900`, 26/26;
+the only tree delta is #88's VS Code dev-dependency lockfile). All six crates published LOCALLY
+with an operator token (env-only) after a token-less `cargo publish --workspace --dry-run --locked`
+in a clean worktree at the merge commit; `cargo install victauri-cli --locked` from crates.io
+verified live (35 tools + a live call on 4DA). Tag `v0.10.1` → release.yml: GitHub Release with
+8 binaries + `SHA256SUMS` (Windows CLI checksum + `--version` verified); its publish step skips
+the already-live crates but still needs the `release` environment approved
+(`gh api -X POST .../runs/<id>/pending_deployments -F "environment_ids[]=<id>" -f state=approved`).
+Its "Require CI green" step fails if main CI is not green yet — rerun the release run's failed
+jobs once it is. MCP Registry 0.10.1 active via `mcp-registry.yml`. Listed on CLI-Hub via HKUDS/CLI-Anything PR #622 (`public_registry.json`,
+`install_strategy: "command"`, `cargo install victauri-cli --locked`). GitHub runner trouble
+(Azure's Ubuntu mirror served ~1 package per few seconds, so "Install system dependencies" ran past
+the 20-min timeout; macOS jobs never got a runner) cancelled CI jobs on the PR head and on main
+(main needed 4 attempts); reruns passed — read the cancelled step's log before suspecting code. A
+local pre-push gate run failed once under load (a concurrent `cargo install`); the full
+workspace suite passed on rerun.
+
+#### Candidate history
 
 Issue #83 (PR #85's code, superseded by the release PR) on top of main's #86 lockfile
 (tokio 1.53.3 — not 1.54.x: 1.54.0 has RUSTSEC-2026-0384 and 1.54.1 was inside a 3-day release
@@ -225,9 +244,14 @@ quotes inside JSON args to native programs — verified live), prints JSON, save
 `--out`, exits 0/1/2. Same discovery/trust/`--app`/token path as `invoke`; no port/URL/token
 flag. `victauri-test` gained `call_tool_raw` + `list_tools` (transport loop moved unchanged into
 a private `rpc()`). Pure logic in `crates/victauri-cli/src/call.rs`; e2e in
-`tests/call_e2e.rs` (token-enforcing mock). Live: demo app + read-only 4DA; ~20 ms/call. A
-CLI-Hub `public_registry.json` entry is drafted in `.claude/plans/cli-hub-listing.md`
-(gitignored) — submit only after 0.10.1 is on crates.io and with the operator's OK.
+`tests/call_e2e.rs` (token-enforcing mock). Live: demo app + read-only 4DA; ~20 ms/call.
+Two review rounds fixed with fail-first tests: `40aaae6` (lead review — local failures exited
+1, a closed pipe panicked, no PowerShell hint for `:=` pairs, an undecodable result printed no
+JSON) and `929b900` (independent review — a call that was SENT but did not complete exited 2,
+"nothing ran", so a wrapper could re-run a side-effecting command: it now exits **3**; `tools`
+no longer falls back to the built-in list when a running app cannot be selected; `--out` naming
+a directory is refused before the call). Exit codes: 0 ok, 1 tool error / app rejected the call,
+2 local problem (nothing sent, or the result could not be written), 3 outcome unknown.
 
 ## Current State (2026-10-19)
 
