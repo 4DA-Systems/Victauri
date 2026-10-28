@@ -224,8 +224,21 @@ impl VictauriMcpHandler {
         let start = std::time::Instant::now();
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let sources = backend_logs::active_sources();
+        let reads_stdout = !sources.any_structured() && sources.stdout_capture;
 
-        if !sources.any_structured() && sources.stdout_capture {
+        // The matched line is returned, so a log wait reads the log: it needs the same
+        // capability as reading it directly. Without this, a disabled `logs.backend` could be
+        // read line by line through repeated waits with an advancing `since_seq`.
+        let capability = if reads_stdout {
+            "logs.stdout"
+        } else {
+            "logs.backend"
+        };
+        if !self.state.privacy.is_tool_enabled(capability) {
+            return super::tool_disabled(capability);
+        }
+
+        if reads_stdout {
             return Self::wait_for_stdout_line(&needle, min_level, since_ms, timeout, poll_ms)
                 .await;
         }
@@ -243,7 +256,7 @@ impl VictauriMcpHandler {
                 .backend_logs
                 .seq_at_or_after(now_ms().saturating_sub(since_ms))
         };
-        let hit = self
+        let (hit, missed) = self
             .state
             .backend_logs
             .wait_for(from, timeout, |e| {
@@ -266,6 +279,16 @@ impl VictauriMcpHandler {
             "elapsed_ms": elapsed_ms,
             "sources": sources_json(),
         });
+        if missed > 0 {
+            // The line may have been logged and evicted before it could be checked (a burst
+            // larger than the buffer): say so rather than reporting a plain timeout.
+            out["missed_entries"] = missed.into();
+            out["note"] = format!(
+                "{missed} entries were evicted before this wait could check them — the line may \
+                 have been logged; raise VICTAURI_LOG_CAPACITY or filter at the source"
+            )
+            .into();
+        }
         if !sources.any_structured() {
             out["hint"] = ENABLE_HINT.into();
         }
@@ -330,29 +353,40 @@ impl VictauriMcpHandler {
     /// Wrap a successful `invoke_command` result with the backend entries
     /// captured since `from`.
     pub(super) fn attach_backend_logs(&self, raw_result: &str, from: u64) -> CallToolResult {
+        let result: serde_json::Value = serde_json::from_str(raw_result)
+            .unwrap_or_else(|_| serde_json::Value::String(raw_result.to_string()));
+        let mut out = serde_json::json!({ "result": result });
+        self.add_backend_logs(&mut out, from);
+        json_result(&out)
+    }
+
+    /// A failed `invoke_command {with_logs:true}`: the error plus the backend entries captured
+    /// since `from` — a failing command is exactly when its Rust-side lines matter.
+    pub(super) fn backend_logs_error(&self, message: &str, from: u64) -> CallToolResult {
+        let mut out = serde_json::json!({ "error": message });
+        self.add_backend_logs(&mut out, from);
+        let text = serde_json::to_string(&out).unwrap_or_else(|_| message.to_string());
+        CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])
+    }
+
+    fn add_backend_logs(&self, out: &mut serde_json::Value, from: u64) {
         let to = self.state.backend_logs.next_seq();
         let (entries, total) =
             self.state
                 .backend_logs
                 .range(from, to, LogLevel::Debug, MAX_ATTACHED_LOGS);
-        let result: serde_json::Value = serde_json::from_str(raw_result)
-            .unwrap_or_else(|_| serde_json::Value::String(raw_result.to_string()));
-        let mut out = serde_json::json!({
-            "result": result,
-            "backend_logs": entries,
-            // Sequence number at the moment the command started: pass it to
-            // `wait_for {condition:"log", since_seq}` to await THIS call's later lines
-            // (fire-and-forget work) without ever matching an earlier run's.
-            "backend_log_cursor": from,
-            "next_seq": to,
-        });
+        out["backend_logs"] = serde_json::to_value(&entries).unwrap_or_default();
+        // Sequence number at the moment the command started: pass it to
+        // `wait_for {condition:"log", since_seq}` to await THIS call's later lines
+        // (fire-and-forget work) without ever matching an earlier run's.
+        out["backend_log_cursor"] = from.into();
+        out["next_seq"] = to.into();
         if total > entries.len() {
             out["backend_logs_truncated"] = (total - entries.len()).into();
         }
         if !backend_logs::active_sources().any_structured() {
             out["backend_logs_hint"] = ENABLE_HINT.into();
         }
-        json_result(&out)
     }
 }
 
@@ -638,5 +672,35 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("dispatch failed"));
         assert_eq!(r.is_error, Some(true));
+    }
+
+    /// `wait_for log` and `invoke_command {with_logs}` return log lines, so an operator who
+    /// disables `logs.backend` (an app that logs secrets) must not have it read through them —
+    /// line by line with an advancing `since_seq`, or attached to command results.
+    #[tokio::test]
+    async fn a_disabled_logs_backend_also_blocks_log_waits_and_with_logs() {
+        let mut state = VictauriState::for_tests();
+        state
+            .privacy
+            .disabled_tools
+            .insert("logs.backend".to_string());
+        let h = VictauriMcpHandler::new(Arc::new(state), Arc::new(NoWebview));
+        for (tool, args) in [
+            (
+                "wait_for",
+                json!({"condition": "log", "value": "x", "timeout_ms": 50}),
+            ),
+            (
+                "invoke_command",
+                json!({"command": "anything", "with_logs": true}),
+            ),
+        ] {
+            let r = h
+                .execute_tool(tool, args)
+                .await
+                .unwrap_or_else(|_| panic!("dispatch failed for {tool}"));
+            assert_eq!(r.is_error, Some(true), "{tool}: {}", text(&r));
+            assert!(text(&r).contains("logs.backend"), "{tool}: {}", text(&r));
+        }
     }
 }

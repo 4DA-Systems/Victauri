@@ -11,7 +11,7 @@ agent reads it, filters it, waits on it, and follows it live.
 | `logs {action:"backend_digest"}` | **Start here.** Per-level counts, noisiest targets, repeated messages collapsed into templates (`Registered source` ×22), the most recent warnings/errors, and every captured panic. One cheap call instead of paging thousands of lines. |
 | `logs {action:"backend", level, target, filter, since_seq, limit}` | Structured entries: level, target, message, **typed fields** (`elapsed_ms: 41191`), **span context** (`pipeline_run{batch=50}`), thread, `file:line`. Page forward with `next_seq` → `since_seq`. |
 | `wait_for {condition:"log", value, level}` | Blocks until a matching line is logged — wakes within a fraction of a millisecond of the event (edge-triggered, no polling), with a `since_ms` look-back (default 2 s) so a line logged just before the call still counts. |
-| `invoke_command {command, args, with_logs:true}` | The command's result **plus** every backend line (debug and above) logged while it ran — what the Rust side said about the call, in the same round trip. |
+| `invoke_command {command, args, with_logs:true}` | The command's result **plus** every backend line (debug and above) logged while it ran — what the Rust side said about the call, in the same round trip. A failing call (an error from the command, a timeout) carries the lines too, in its error result. Needs the `logs.backend` capability. |
 | `logs {action:"stdout"}` | Raw stdout/stderr lines, when the app was launched with `victauri run` (below) — including the process's exit record. |
 
 From a terminal (and from any agent harness that turns command output lines into events):

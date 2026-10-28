@@ -656,10 +656,17 @@ impl VictauriMcpHandler {
         }
 
         // ── Normal execution with timing ──
-        let log_cursor = params
-            .with_logs
-            .unwrap_or(false)
-            .then(|| self.backend_log_cursor());
+        // `with_logs` returns backend log entries, so it needs `logs.backend` like reading them
+        // directly — checked before the command runs, so a refused read has no side effects.
+        let with_logs = params.with_logs.unwrap_or(false);
+        if with_logs && !self.state.privacy.is_tool_enabled("logs.backend") {
+            return tool_disabled("logs.backend");
+        }
+        let log_cursor = with_logs.then(|| self.backend_log_cursor());
+        let fail = |message: String| match log_cursor {
+            Some(cursor) => self.backend_logs_error(&message, cursor),
+            None => tool_error(message),
+        };
         let start = std::time::Instant::now();
         let args_json = params.args.unwrap_or(serde_json::json!({}));
         let args_str = serde_json::to_string(&args_json).unwrap_or_else(|_| "{}".to_string());
@@ -688,7 +695,7 @@ impl VictauriMcpHandler {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result)
                     && let Some(err) = parsed.get("__error").and_then(|e| e.as_str())
                 {
-                    return tool_error(format!(
+                    return fail(format!(
                         "command '{}' returned error: {err}",
                         params.command
                     ));
@@ -704,13 +711,13 @@ impl VictauriMcpHandler {
                 if f.kind == EvalFailureKind::Aborted
                     && f.message.starts_with("eval timed out") =>
             {
-                tool_error(format!(
+                fail(format!(
                     "invoke_command failed: {} If the command is legitimately slow, pass \
                      `timeout_ms` (up to {MAX_INVOKE_TIMEOUT_MS}).",
                     f.message
                 ))
             }
-            Err(f) => tool_error(format!("invoke_command failed: {}", f.message)),
+            Err(f) => fail(format!("invoke_command failed: {}", f.message)),
         }
     }
 

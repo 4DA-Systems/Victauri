@@ -305,11 +305,12 @@ async fn wait_for_wakes_on_a_matching_entry_pushed_later() {
         producer.push(entry(LogLevel::Info, "t", "pipeline complete"));
     });
     let start = std::time::Instant::now();
-    let hit = buf
+    let (hit, missed) = buf
         .wait_for(from, std::time::Duration::from_secs(5), |e| {
             e.message.contains("complete")
         })
         .await;
+    assert_eq!(missed, 0);
     handle.await.unwrap();
     assert_eq!(
         hit.map(|e| e.message),
@@ -323,7 +324,7 @@ async fn wait_for_ignores_entries_before_the_cursor_and_times_out() {
     let buf = LogBuffer::default();
     buf.push(entry(LogLevel::Info, "t", "pipeline complete"));
     let from = buf.next_seq();
-    let hit = buf
+    let (hit, _) = buf
         .wait_for(from, std::time::Duration::from_millis(100), |e| {
             e.message.contains("complete")
         })
@@ -332,6 +333,68 @@ async fn wait_for_ignores_entries_before_the_cursor_and_times_out() {
         hit.is_none(),
         "an entry before the cursor must not satisfy the wait"
     );
+}
+
+/// Entries evicted before a waiter could check them are reported, not silently skipped: the
+/// line being waited for may be among them.
+#[tokio::test]
+async fn wait_for_reports_entries_evicted_before_it_could_check_them() {
+    let buf = LogBuffer::new(2, DEFAULT_MAX_BYTES);
+    for i in 0..5 {
+        buf.push(entry(LogLevel::Info, "t", &format!("line {i}")));
+    }
+    let (hit, missed) = buf
+        .wait_for(0, std::time::Duration::from_millis(50), |e| {
+            e.message == "line 0"
+        })
+        .await;
+    assert!(hit.is_none());
+    assert_eq!(missed, 3, "seqs 0..3 were evicted before the scan");
+}
+
+/// The panic hook must record a panic even while another thread holds the buffer (an agent's
+/// digest, another thread's log line) — and must not deadlock when the panicking thread holds
+/// it itself.
+#[test]
+fn panic_push_waits_for_another_holder_but_never_self_deadlocks() {
+    let buf = Arc::new(LogBuffer::default());
+    let holder = Arc::clone(&buf);
+    let (held_tx, held_rx) = std::sync::mpsc::channel();
+    let t = std::thread::spawn(move || {
+        let guard = holder.lock();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(guard);
+    });
+    held_rx.recv().unwrap();
+    assert!(
+        buf.try_push(entry(LogLevel::Error, "panic", "from another thread")),
+        "a panic while ANOTHER thread holds the lock is recorded"
+    );
+    t.join().unwrap();
+    assert_eq!(buf.next_seq(), 1);
+
+    let guard = buf.lock();
+    assert!(
+        !buf.try_push(entry(LogLevel::Error, "panic", "same thread")),
+        "a panic on the thread holding the lock is dropped, not deadlocked"
+    );
+    drop(guard);
+    assert!(buf.try_push(entry(LogLevel::Error, "panic", "after release")));
+}
+
+/// A huge `Debug` value costs at most the field budget, not its whole size.
+#[test]
+fn debug_values_are_bounded_while_formatting() {
+    let big = vec![0_u8; 1_000_000];
+    let text = super::debug_bounded(&big, MAX_FIELD_BYTES);
+    assert!(
+        text.len() <= MAX_FIELD_BYTES + "…[truncated]".len(),
+        "{}",
+        text.len()
+    );
+    assert!(text.ends_with("…[truncated]"));
+    assert_eq!(super::debug_bounded(&"short", MAX_FIELD_BYTES), "\"short\"");
 }
 
 #[test]

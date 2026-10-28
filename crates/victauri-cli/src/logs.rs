@@ -15,6 +15,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+/// Most bytes of a console capture read at once (a capture rotates at 64 MB).
+const MAX_READ: u64 = 32 * 1024 * 1024;
+
 /// Options for `victauri logs`.
 #[allow(clippy::struct_excessive_bools)]
 pub struct LogsOptions {
@@ -222,11 +225,29 @@ fn render_console(l: &Value) -> String {
 
 fn emit(line: &str, json: bool, raw: &Value) {
     if json {
-        // JSON escapes every control character itself.
-        out(&raw.to_string());
+        out(&json_terminal_safe(&raw.to_string()));
     } else {
         out(line);
     }
+}
+
+/// `serde_json` escapes C0 controls but writes C1 controls (U+0080–U+009F, which some
+/// terminals act on) and bidi controls raw. They can only occur inside JSON strings, so a
+/// `\uXXXX` escape keeps the JSON valid and equal while making it inert in a terminal.
+fn json_terminal_safe(json: &str) -> String {
+    let mut out = String::with_capacity(json.len());
+    for c in json.chars() {
+        let bidi = matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        );
+        if bidi || ('\u{80}'..='\u{9f}').contains(&c) {
+            out.push_str(&format!("\\u{:04x}", u32::from(c)));
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Entry point for `victauri logs`.
@@ -248,7 +269,15 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         }
         Err(why) => {
             // App down: the console capture (if the app ran under `victauri run`) still
-            // holds its output — including how it died.
+            // holds its output — including how it died. A capture does not record which app it
+            // belongs to, so with `--app` the newest one could be another app's: say so instead.
+            if opts.app.is_some() && crate::run::latest_capture().is_some() {
+                bail!(
+                    "{} — `victauri logs --stdout` shows the newest `victauri run` capture (of \
+                     whichever app ran last), or pass `--capture <file>`",
+                    clean(&why)
+                );
+            }
             if crate::run::latest_capture().is_some() {
                 eprintln!(
                     "victauri logs: {} — showing the latest `victauri run` capture instead",
@@ -270,7 +299,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             .logs(json!({"action": "backend_digest", "limit": 10}))
             .await?;
         if opts.json {
-            out(&serde_json::to_string_pretty(&d)?);
+            out(&json_terminal_safe(&serde_json::to_string_pretty(&d)?));
         } else {
             print_digest(&d);
         }
@@ -295,8 +324,13 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         eprintln!("victauri logs: {}", clean(hint));
     }
     // Where this app's raw output is captured (when run under `victauri run`): after a
-    // crash that file still holds its last words and exit status.
-    let capture_path = sources["stdout_capture_path"].as_str().map(PathBuf::from);
+    // crash that file still holds its last words and exit status. The path comes from the
+    // server, so it is only followed when it is one of OUR captures — never an arbitrary file
+    // shown as the app's output.
+    let capture_path = sources["stdout_capture_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| crate::run::is_own_capture(p));
     // `-n 0` = no history, only what arrives from now on.
     if opts.limit > 0 {
         print_page(&first, &opts);
@@ -457,7 +491,10 @@ async fn follow_capture(
             "no `victauri run` console capture found — launch the app as `victauri run -- <dev command>`",
         )?,
     };
-    eprintln!("victauri logs: console capture {}", path.display());
+    eprintln!(
+        "victauri logs: console capture {}",
+        clean(&path.display().to_string())
+    );
     let (lines, mut cursor) = read_capture(&path, None)?;
     let recent: Vec<&Value> = if let Some(ts) = since_ts_ms {
         lines
@@ -509,16 +546,27 @@ fn read_capture(path: &Path, from: Option<u64>) -> Result<(Vec<Value>, u64)> {
     let mut f =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let len = f.metadata()?.len();
-    let mut start = from.unwrap_or(0);
+    // Without a cursor, read the newest `MAX_READ` bytes: a capture grows to 64 MB before it
+    // rotates, and reading from the start showed lines from the middle of a long session —
+    // never its last words or exit record.
+    let tail_start = from.is_none() && len > MAX_READ;
+    let mut start = from.unwrap_or_else(|| len.saturating_sub(MAX_READ));
     if start > len {
         start = 0;
     }
     f.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
-    f.take(32 * 1024 * 1024).read_to_end(&mut buf)?;
+    f.take(MAX_READ).read_to_end(&mut buf)?;
     let mut out = Vec::new();
     let mut consumed = 0usize;
-    for chunk in buf.split_inclusive(|b| *b == b'\n') {
+    // A tail read starts mid-record: skip to the first complete line.
+    if tail_start {
+        match buf.iter().position(|b| *b == b'\n') {
+            Some(i) => consumed = i + 1,
+            None => return Ok((out, start + buf.len() as u64)),
+        }
+    }
+    for chunk in buf[consumed..].split_inclusive(|b| *b == b'\n') {
         if !chunk.ends_with(b"\n") {
             break;
         }

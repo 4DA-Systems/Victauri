@@ -46,7 +46,7 @@
 
 /// Backend (Rust-side) log capture: the `tracing` layer, the `log` adapter,
 /// the panic hook, and the buffer the `logs backend*` / `wait_for log` tools read.
-pub mod backend_logs;
+mod backend_logs;
 /// Runtime-erased webview bridge trait and its Tauri implementation.
 pub mod bridge;
 /// Backend database access (`SQLite` read-only queries).
@@ -110,7 +110,7 @@ const _: () = assert!(
     "victauri-plugin: the app links Tauri 3 — enable victauri-plugin's `tauri-v3` feature"
 );
 
-pub use backend_logs::{log_layer, log_logger, wrap_logger};
+pub use backend_logs::{BackendLogLayer, log_layer, log_logger, wrap_logger};
 pub use error::BuilderError;
 pub use privacy::PrivacyProfile;
 

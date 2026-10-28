@@ -42,6 +42,22 @@ pub fn capture_dir() -> Option<PathBuf> {
     crate::bridge::private_subdir("console")
 }
 
+/// Whether `path` is a capture file in our private capture directory (a regular `.jsonl`
+/// file directly inside it).
+#[must_use]
+pub fn is_own_capture(path: &Path) -> bool {
+    let Some(dir) = capture_dir().and_then(|d| d.canonicalize().ok()) else {
+        return false;
+    };
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
+        && path.extension().is_some_and(|x| x == "jsonl")
+        && path
+            .canonicalize()
+            .ok()
+            .and_then(|p| p.parent().map(Path::to_path_buf))
+            .is_some_and(|parent| parent == dir)
+}
+
 /// The most recently modified capture file (a regular file, not a symlink), if any.
 #[must_use]
 pub fn latest_capture() -> Option<PathBuf> {
@@ -206,7 +222,10 @@ fn pump<R: Read, W: Write>(
     let mut buf = Vec::with_capacity(4096);
     loop {
         buf.clear();
-        match reader.read_until(b'\n', &mut buf) {
+        // At most one stored line's worth per read: a child that writes megabytes without a
+        // newline must neither grow this buffer without bound nor hold its output back from the
+        // terminal until the newline finally arrives.
+        match std::io::Read::take(&mut reader, MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(_) => {
                 let _ = dst.write_all(&buf);
@@ -358,9 +377,22 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     let t_err = std::thread::spawn(move || pump(err, std::io::stderr(), "err", &c2));
 
     let status = child.wait().context("waiting for the app")?;
-    // Drain whatever the child wrote before it died — this is where crash output lives.
-    let _ = t_out.join();
-    let _ = t_err.join();
+    // Drain whatever the child wrote before it died — this is where crash output lives. A
+    // process the app started can inherit its stdout/stderr and keep them open after the app
+    // exits; waiting for EOF then never ends and the exit record is never written. Give the
+    // pumps a short grace period, then record the exit regardless.
+    let drain_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    while !(t_out.is_finished() && t_err.is_finished())
+        && std::time::Instant::now() < drain_deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if t_out.is_finished() {
+        let _ = t_out.join();
+    }
+    if t_err.is_finished() {
+        let _ = t_err.join();
+    }
 
     let summary = describe_exit(status);
     if let Ok(mut c) = capture.lock() {

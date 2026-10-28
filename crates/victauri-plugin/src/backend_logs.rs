@@ -230,6 +230,71 @@ struct Ring {
     totals: [u64; 5],
 }
 
+thread_local! {
+    /// Whether this thread currently holds a [`LogBuffer`] lock (see [`LogBuffer::try_push`]).
+    static HOLDS_RING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A held ring lock; clears [`HOLDS_RING`] when released.
+struct RingGuard<'a>(std::sync::MutexGuard<'a, Ring>);
+
+impl Drop for RingGuard<'_> {
+    fn drop(&mut self) {
+        HOLDS_RING.with(|h| h.set(false));
+    }
+}
+
+impl std::ops::Deref for RingGuard<'_> {
+    type Target = Ring;
+    fn deref(&self) -> &Ring {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RingGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Ring {
+        &mut self.0
+    }
+}
+
+/// `format!("{value:?}")`, except formatting stops once `max` bytes are written: a huge
+/// `Debug` value (a multi-megabyte buffer recorded as a field or by `#[instrument]`) then costs
+/// at most `max` bytes instead of its whole size, on every event that carries it.
+fn debug_bounded(value: &dyn std::fmt::Debug, max: usize) -> String {
+    struct Bounded {
+        out: String,
+        max: usize,
+        cut: bool,
+    }
+    impl std::fmt::Write for Bounded {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            let room = self.max.saturating_sub(self.out.len());
+            if s.len() <= room {
+                self.out.push_str(s);
+                return Ok(());
+            }
+            let mut end = room;
+            while end > 0 && !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            self.out.push_str(&s[..end]);
+            self.cut = true;
+            // Stop the formatter: the rest would be discarded anyway.
+            Err(std::fmt::Error)
+        }
+    }
+    let mut b = Bounded {
+        out: String::new(),
+        max,
+        cut: false,
+    };
+    let _ = write!(b, "{value:?}");
+    if b.cut {
+        b.out.push_str("…[truncated]");
+    }
+    b.out
+}
+
 /// Bounded ring buffer of captured backend log entries.
 ///
 /// A process-global instance ([`global`]) is fed by the capture sources and read
@@ -269,10 +334,13 @@ impl LogBuffer {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Ring> {
-        self.ring
+    fn lock(&self) -> RingGuard<'_> {
+        let guard = self
+            .ring
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        HOLDS_RING.with(|h| h.set(true));
+        RingGuard(guard)
     }
 
     /// Append an entry (its `seq` is assigned here) and wake waiters.
@@ -283,15 +351,16 @@ impl LogBuffer {
         self.notify.notify_waiters();
     }
 
-    /// Non-blocking push used from the panic hook: if the lock is held (e.g. the
-    /// panic happened while this buffer was being written) the entry is dropped
-    /// rather than deadlocking the panicking thread.
+    /// Push used from the panic hook. A panic on a thread that is itself holding this lock
+    /// (mid-push or mid-query) must not deadlock, so that one entry is dropped. Any other
+    /// thread waits: holders only do bounded in-memory work and never log under the lock, and
+    /// a `try_lock` dropped real panics whenever an agent query or another thread's log write
+    /// happened to hold the lock at that moment.
     fn try_push(&self, entry: BackendLogEntry) -> bool {
-        let mut ring = match self.ring.try_lock() {
-            Ok(g) => g,
-            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return false,
-        };
+        if HOLDS_RING.with(std::cell::Cell::get) {
+            return false;
+        }
+        let mut ring = self.lock();
         Self::push_locked(&mut ring, entry, self.capacity, self.max_bytes);
         drop(ring);
         self.notify.notify_waiters();
@@ -473,12 +542,15 @@ impl LogBuffer {
         from_seq: u64,
         timeout: std::time::Duration,
         pred: F,
-    ) -> Option<BackendLogEntry>
+    ) -> (Option<BackendLogEntry>, u64)
     where
         F: Fn(&BackendLogEntry) -> bool,
     {
         let deadline = tokio::time::Instant::now() + timeout;
         let mut scanned_to = from_seq;
+        // Entries evicted before this waiter could check them (a burst larger than the buffer
+        // between two wake-ups): the wait cannot vouch for them, so the count is reported.
+        let mut missed = 0;
         loop {
             // Register interest BEFORE scanning so an entry pushed between the
             // scan and the await still wakes us (no lost wake-up).
@@ -487,16 +559,21 @@ impl LogBuffer {
             notified.as_mut().enable();
             {
                 let ring = self.lock();
+                if let Some(front) = ring.entries.front()
+                    && front.seq > scanned_to
+                {
+                    missed += front.seq - scanned_to;
+                }
                 for e in ring.entries.iter().filter(|e| e.seq >= scanned_to) {
                     if pred(e) {
-                        return Some(e.clone());
+                        return (Some(e.clone()), missed);
                     }
                 }
                 // Everything below next_seq has now been checked once.
                 scanned_to = scanned_to.max(ring.next_seq);
             }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                return None;
+                return (None, missed);
             }
         }
     }
@@ -1070,11 +1147,13 @@ impl EventVisitor {
 
 impl Visit for EventVisitor {
     fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-        let text = truncate_string(format!("{value:?}"), MAX_FIELD_BYTES);
         if field.name() == "message" {
-            self.message = format!("{value:?}");
+            self.message = debug_bounded(value, MAX_MESSAGE_BYTES);
         } else {
-            self.put(field, serde_json::Value::String(text));
+            self.put(
+                field,
+                serde_json::Value::String(debug_bounded(value, MAX_FIELD_BYTES)),
+            );
         }
     }
 
@@ -1135,10 +1214,14 @@ impl Visit for SpanVisitor {
         if !self.0.is_empty() {
             self.0.push(' ');
         }
+        // Each value is bounded like an event field: the span string is cloned into every
+        // event inside the span, so an unbounded `#[instrument]` argument (a 10 MB buffer)
+        // used to cost its whole Debug size per event and flush the ring.
+        let value = debug_bounded(value, MAX_FIELD_BYTES);
         if field.name() == "message" {
-            let _ = write!(self.0, "{value:?}");
+            self.0.push_str(&value);
         } else {
-            let _ = write!(self.0, "{}={value:?}", field.name());
+            let _ = write!(self.0, "{}={value}", field.name());
         }
     }
 }
