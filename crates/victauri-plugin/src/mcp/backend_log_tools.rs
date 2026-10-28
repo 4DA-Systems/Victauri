@@ -109,6 +109,29 @@ fn visible_text<'a>(
     }
 }
 
+/// Cut matched console lines to `limit` and return the cursor to hand back. A cursor read
+/// (`since_seq`) pages forward — the oldest lines are kept and the cursor is the first matching
+/// line not returned — so a follower that fell behind never skips the middle of a burst; a
+/// plain read keeps the newest lines.
+fn page_console_lines(
+    matched: &mut Vec<backend_logs::ConsoleLine>,
+    limit: usize,
+    since_seq: Option<u64>,
+    end: u64,
+) -> u64 {
+    if matched.len() <= limit {
+        return end;
+    }
+    if since_seq.is_some() {
+        let next = matched.get(limit).map_or(end, |l| l.offset);
+        matched.truncate(limit);
+        next
+    } else {
+        matched.drain(..matched.len() - limit);
+        end
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -193,9 +216,17 @@ impl VictauriMcpHandler {
             .collect();
         page.total_matched = matched.len();
         page.truncated = matched.len() > limit;
-        if matched.len() > limit {
-            matched.drain(..matched.len() - limit);
+        if page.truncated {
+            // The same contract as the unredacted query: a cursor read keeps the oldest
+            // matches (and continues after them), a plain read the newest.
+            if query.since_seq.is_some() {
+                matched.truncate(limit);
+            } else {
+                matched.drain(..matched.len() - limit);
+            }
         }
+        page.next_seq =
+            backend_logs::page_next_seq(query.since_seq, page.truncated, &matched, page.next_seq);
         page.entries = matched;
         page
     }
@@ -256,9 +287,7 @@ impl VictauriMcpHandler {
                     })
                     .collect();
                 let total = matched.len();
-                if total > limit {
-                    matched.drain(..total - limit);
-                }
+                let next = page_console_lines(&mut matched, limit, params.since_seq, next);
                 json_result(&serde_json::json!({
                     "lines": matched,
                     "total_matched": total,
@@ -492,7 +521,9 @@ mod tests {
     use victauri_core::WindowState;
 
     use super::super::VictauriMcpHandler;
+    use super::page_console_lines;
     use crate::VictauriState;
+    use crate::backend_logs;
     use crate::backend_logs::{BackendLogLayer, LogBuffer};
     use crate::bridge::WebviewBridge;
 
@@ -806,5 +837,72 @@ mod tests {
             assert!(text(&r).contains("logs.backend"), "{tool}: {}", text(&r));
             assert!(!text(&r).contains("hunter2xyz"), "{tool}: {}", text(&r));
         }
+    }
+
+    /// The same for the `victauri run` capture (`logs stdout`), whose cursor is a byte offset.
+    #[test]
+    fn a_stdout_cursor_read_pages_forward_through_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.jsonl");
+        let body: String = (0..10)
+            .map(|i| format!("{{\"l\":\"line {i}\",\"s\":\"out\",\"t\":{i}}}\n"))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        let (mut cursor, mut seen) = (0_u64, Vec::new());
+        for _ in 0..10 {
+            let (mut lines, end) =
+                backend_logs::read_console_capture(&path, Some(cursor), 1 << 20).unwrap();
+            let truncated = lines.len() > 3;
+            cursor = page_console_lines(&mut lines, 3, Some(cursor), end);
+            seen.extend(lines.into_iter().map(|l| l.text));
+            if !truncated {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..10).map(|i| format!("line {i}")).collect::<Vec<_>>()
+        );
+        // A plain read (no cursor) still shows the newest lines.
+        let (mut lines, end) = backend_logs::read_console_capture(&path, None, 1 << 20).unwrap();
+        assert_eq!(page_console_lines(&mut lines, 2, None, end), end);
+        assert_eq!(lines.last().unwrap().text, "line 9");
+    }
+
+    /// A follower that fell behind reads on from `next_seq` — on the redacting path too
+    /// (a text filter with redaction on), where the page is cut after the filter.
+    #[tokio::test]
+    async fn a_cursor_read_pages_forward_on_the_redacting_path() {
+        let mut state = VictauriState::for_tests();
+        state.privacy.redaction_enabled = true;
+        for i in 0..10 {
+            state
+                .backend_logs
+                .push(crate::backend_logs::BackendLogEntry::for_tests(
+                    "app",
+                    &format!("step {i}"),
+                ));
+        }
+        let h = VictauriMcpHandler::new(Arc::new(state), Arc::new(NoWebview));
+        let (mut cursor, mut seen) = (0_u64, Vec::new());
+        loop {
+            let page = call(
+                &h,
+                "logs",
+                json!({"action": "backend", "filter": "step", "since_seq": cursor, "limit": 3}),
+            )
+            .await;
+            for e in page["entries"].as_array().unwrap() {
+                seen.push(e["message"].as_str().unwrap().to_string());
+            }
+            cursor = page["next_seq"].as_u64().unwrap();
+            if page["truncated"] != true {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..10).map(|i| format!("step {i}")).collect::<Vec<_>>()
+        );
     }
 }

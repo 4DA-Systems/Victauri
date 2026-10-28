@@ -316,8 +316,13 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     let mut backend = backend;
     let mut label = label;
     let mut cursor = first["next_seq"].as_u64().unwrap_or(0);
+    // A cursor read returns the OLDEST entries after the cursor, `truncated` when more are
+    // waiting: read the rest at once instead of one page per poll interval.
+    let mut behind = false;
     loop {
-        tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        if !behind {
+            tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        }
         args["since_seq"] = cursor.into();
         args["limit"] = 2000.into();
         if let Ok(page) = backend.logs(args.clone()).await {
@@ -326,6 +331,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             }
             print_page(&page, &opts);
             cursor = page["next_seq"].as_u64().unwrap_or(cursor);
+            behind = page["truncated"] == true;
             continue;
         }
         // Taken at the FIRST failed poll: the crash's last words are just before this moment
@@ -362,6 +368,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         }
         print_page(&page, &opts);
         cursor = page["next_seq"].as_u64().unwrap_or(0);
+        behind = page["truncated"] == true;
         backend = b;
         label = l;
     }

@@ -679,9 +679,9 @@ Access all captured logs from the application.
 | `events` | `since` | Event stream |
 | `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
 | `clear` | — | Clear the IPC + network logs (per-test isolation) |
-| `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Page forward with the returned `next_seq` |
+| `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Without `since_seq` the newest `limit` entries; with it the oldest after the cursor, and `next_seq` continues after them (read on while `truncated`) |
 | `backend_digest` | `limit` (top N per list, default 10) | Start here: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic |
-| `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited |
+| `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited. `since_seq` pages forward like `backend` |
 | `filter` | string | no | `network`: URL substring filter; `backend`/`stdout`: case-insensitive text match |
 | `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |
 

@@ -508,30 +508,40 @@ impl LogBuffer {
         let ring = self.lock();
         let oldest_seq = ring.entries.front().map_or(ring.next_seq, |e| e.seq);
         let matcher = q.matcher();
-        // Newest-first scan so `limit` keeps the most recent matches, then flip.
         let mut matched: Vec<BackendLogEntry> = Vec::new();
         let mut total_matched = 0usize;
-        for e in ring.entries.iter().rev() {
-            if let Some(since) = q.since_seq
-                && e.seq < since
-            {
-                break;
+        if let Some(since) = q.since_seq {
+            // A cursor read pages FORWARD: the oldest matches after the cursor, so a reader
+            // that fell behind by more than `limit` continues from `next_seq` instead of
+            // silently skipping the middle of a burst.
+            for e in ring.entries.range(ring.index_of(since)..) {
+                if matcher.matches(e) {
+                    total_matched += 1;
+                    if matched.len() < q.limit {
+                        matched.push(e.clone());
+                    }
+                }
             }
-            if !matcher.matches(e) {
-                continue;
+        } else {
+            // Newest-first scan so `limit` keeps the most recent matches, then flip.
+            for e in ring.entries.iter().rev() {
+                if !matcher.matches(e) {
+                    continue;
+                }
+                total_matched += 1;
+                if matched.len() < q.limit {
+                    matched.push(e.clone());
+                }
             }
-            total_matched += 1;
-            if matched.len() < q.limit {
-                matched.push(e.clone());
-            }
+            matched.reverse();
         }
-        matched.reverse();
+        let truncated = total_matched > matched.len();
         let gap = q.since_seq.is_some_and(|s| ring.evicted_since(s) > 0);
         LogPage {
-            truncated: total_matched > matched.len(),
+            next_seq: page_next_seq(q.since_seq, truncated, &matched, ring.next_seq),
+            truncated,
             total_matched,
             entries: matched,
-            next_seq: ring.next_seq,
             oldest_seq,
             evicted: ring.evicted,
             gap,
@@ -882,6 +892,21 @@ pub fn entry_contains(e: &BackendLogEntry, needle: &str) -> bool {
     })
 }
 
+/// The cursor a [`LogPage`] hands back: the end of the buffer, unless a cursor read was cut by
+/// its limit — then just past the last entry returned, so the next read continues there.
+#[must_use]
+pub fn page_next_seq(
+    since_seq: Option<u64>,
+    truncated: bool,
+    entries: &[BackendLogEntry],
+    buffer_next_seq: u64,
+) -> u64 {
+    match entries.last() {
+        Some(last) if since_seq.is_some() && truncated => last.seq + 1,
+        _ => buffer_next_seq,
+    }
+}
+
 /// Result page of a [`LogBuffer::query`].
 #[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
@@ -890,9 +915,10 @@ pub struct LogPage {
     pub entries: Vec<BackendLogEntry>,
     /// How many buffered entries matched in total (may exceed `entries.len()`).
     pub total_matched: usize,
-    /// `true` when `limit` cut the result (the newest matches were kept).
+    /// `true` when `limit` cut the result. Without `since_seq` the newest matches were kept;
+    /// with it the OLDEST were, and `next_seq` points just past them (read on to get the rest).
     pub truncated: bool,
-    /// Pass back as `since_seq` to get only newer entries next time.
+    /// Pass back as `since_seq` to continue: never skips an entry, even when `truncated`.
     pub next_seq: u64,
     /// Oldest sequence number still buffered.
     pub oldest_seq: u64,

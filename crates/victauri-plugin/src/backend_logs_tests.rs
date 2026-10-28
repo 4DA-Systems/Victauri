@@ -97,6 +97,35 @@ fn query_filters_by_level_target_text_and_cursor() {
 }
 
 #[test]
+fn a_cursor_read_pages_forward_without_skipping_a_burst() {
+    let buf = LogBuffer::default();
+    for i in 0..10 {
+        buf.push(entry(LogLevel::Info, "t", &format!("n{i}")));
+    }
+    // A follower 10 entries behind, reading 3 at a time, must see every entry exactly once.
+    let mut cursor = 0;
+    let mut seen = Vec::new();
+    loop {
+        let page = buf.query(&LogQuery {
+            since_seq: Some(cursor),
+            limit: 3,
+            ..LogQuery::default()
+        });
+        seen.extend(page.entries.iter().map(|e| e.message.clone()));
+        assert!(
+            page.next_seq > cursor || page.entries.is_empty(),
+            "cursor must advance"
+        );
+        cursor = page.next_seq;
+        if !page.truncated {
+            break;
+        }
+    }
+    assert_eq!(seen, (0..10).map(|i| format!("n{i}")).collect::<Vec<_>>());
+    assert_eq!(cursor, 10, "the last page hands back the end of the buffer");
+}
+
+#[test]
 fn limit_keeps_newest_matches_and_reports_truncation() {
     let buf = LogBuffer::default();
     for i in 0..10 {

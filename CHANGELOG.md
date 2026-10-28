@@ -90,7 +90,11 @@ developer watches in the debug console — were invisible to an agent. Now:
   app may run from another directory); leaves no empty capture when the command cannot start;
   rotates at 64 MB (falling back to a timestamped name, and stopping line capture rather than
   growing without bound if the file cannot be rotated); decodes a shell's 128+N exit codes.
-- **Cursors:** a `logs clear` is no longer reported as an eviction gap; `wait_for` and the
+- **Cursors:** a read with `since_seq` pages FORWARD — the oldest entries after the cursor,
+  and `next_seq` continues right after them — so a follower that fell more than `limit` behind
+  no longer skips the middle of a burst (it used to get the newest `limit` and a cursor at the
+  end; found by a live soak against 4DA). `victauri logs --follow` reads a backlog without
+  waiting a poll interval per page. A `logs clear` is no longer reported as an eviction gap; `wait_for` and the
   attached-log window jump to the cursor by index instead of rescanning the buffer under its lock.
 - `victauri logs` rejects flag combinations it used to ignore silently (`--digest --follow`,
   `--target` / `--app` with `--stdout`).
