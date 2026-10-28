@@ -448,6 +448,48 @@ fn panic_push_waits_for_another_holder_but_never_self_deadlocks() {
     assert!(buf.try_push(entry(LogLevel::Error, "panic", "after release")));
 }
 
+/// tokio-console setups (`--cfg tokio_unstable` + Tokio's `tracing` feature) trace every waker
+/// clone while Tokio holds a `Notify`'s waiter lock. Capturing that event and waking waiters
+/// from it re-entered the lock and froze every logging thread of the app. In a normal build
+/// Tokio emits nothing and this passes trivially; build it with
+/// `RUSTFLAGS="--cfg tokio_unstable"` to exercise the real interleaving.
+#[test]
+fn waking_a_log_waiter_survives_tokio_tracing_its_own_wakers() {
+    let buf = Arc::new(LogBuffer::default());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let b = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        with_capture(&b, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let woken = rt.block_on(async {
+                let waiter = {
+                    let b = Arc::clone(&b);
+                    tokio::spawn(async move {
+                        b.wait_for(0, std::time::Duration::from_secs(5), |e| {
+                            e.message == "done"
+                        })
+                        .await
+                    })
+                };
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                b.push(entry(LogLevel::Info, "t", "done"));
+                waiter.await.unwrap().0.is_some()
+            });
+            let _ = done_tx.send(woken);
+        });
+    });
+    assert_eq!(
+        done_rx.recv_timeout(std::time::Duration::from_secs(20)),
+        Ok(true),
+        "the waiter must be woken — a hang here is the re-entrant notify deadlock"
+    );
+}
+
 /// A panic's backtrace is captured on the panicking thread but symbolised only when read: the
 /// placeholder is replaced by the resolved text and the id removed, wherever the entry sits.
 #[test]
