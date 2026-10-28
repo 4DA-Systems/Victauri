@@ -5,6 +5,8 @@ mod agents;
 mod bridge;
 mod call;
 mod jsonc;
+mod logs;
+mod run;
 
 use std::path::{Path, PathBuf};
 
@@ -243,6 +245,54 @@ printed as base64). Exit codes:
         #[command(flatten)]
         target: AppTarget,
     },
+    /// Launch an app (or its dev command) with stdout/stderr captured for agents — zero app
+    /// changes, survives crashes. e.g. `victauri run -- npm run tauri dev`
+    Run {
+        /// Write the capture here instead of `console/<pid>-<ms>.jsonl` under the private
+        /// per-user Victauri directory
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        /// The command to run, after `--`
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        command: Vec<String>,
+    },
+    /// Show (or follow) the running app's Rust backend logs; falls back to the latest
+    /// `victauri run` capture when the app is down
+    Logs {
+        /// Which app, when several are running (bundle identifier or product name)
+        #[arg(long)]
+        app: Option<String>,
+        /// Minimum level: trace, debug, info, warn, error
+        #[arg(short, long)]
+        level: Option<String>,
+        /// Target prefix(es), comma-separated (e.g. `app::db`)
+        #[arg(short, long)]
+        target: Option<String>,
+        /// Only lines containing this text (case-insensitive)
+        #[arg(short, long)]
+        grep: Option<String>,
+        /// How many recent lines to show first
+        #[arg(short = 'n', long, default_value_t = 100)]
+        limit: usize,
+        /// Keep printing new lines as they arrive (one line per event — monitor-friendly)
+        #[arg(short, long)]
+        follow: bool,
+        /// Print the digest: counts, repeated messages, recent problems, panics
+        #[arg(long)]
+        digest: bool,
+        /// Read raw stdout/stderr from the `victauri run` capture instead
+        #[arg(long)]
+        stdout: bool,
+        /// Read a specific capture file (implies --stdout)
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        /// Print raw JSON records instead of formatted lines
+        #[arg(long)]
+        json: bool,
+        /// Poll interval for --follow, in milliseconds
+        #[arg(long, default_value_t = 500)]
+        interval_ms: u64,
+    },
 }
 
 /// Which running app a command talks to when several Victauri apps are up.
@@ -421,6 +471,40 @@ async fn main() -> Result<()> {
             target,
         } => {
             cmd_coverage(threshold, junit.as_deref(), allow_empty_registry, &target).await?;
+        }
+        Commands::Run { capture, command } => {
+            let code = tokio::task::spawn_blocking(move || run::run(&command, capture))
+                .await
+                .context("launcher task failed")??;
+            std::process::exit(code);
+        }
+        Commands::Logs {
+            app,
+            level,
+            target,
+            grep,
+            limit,
+            follow,
+            digest,
+            stdout,
+            capture,
+            json,
+            interval_ms,
+        } => {
+            logs::cmd_logs(logs::LogsOptions {
+                app,
+                level,
+                target,
+                grep,
+                limit,
+                follow,
+                digest,
+                stdout,
+                json,
+                capture,
+                interval_ms: interval_ms.max(50),
+            })
+            .await?;
         }
     }
 

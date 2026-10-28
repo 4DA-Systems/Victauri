@@ -439,9 +439,21 @@ fn run_pipeline(pipeline: tauri::State<'_, Arc<PipelineState>>) {
     // (see its doc comment for why).
     let pipeline = Arc::clone(&pipeline);
     pipeline.running.store(true, Ordering::SeqCst);
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(400));
+    tracing::info!(target: "demo::pipeline", batch = 50_u64, "pipeline started");
+    std::thread::Builder::new()
+        .name("pipeline-worker".into())
+        .spawn(move || {
+        let _span = tracing::info_span!("pipeline_run", batch = 50_u64).entered();
+        for step in 1..=4_u64 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            tracing::debug!(target: "demo::pipeline", step, "processed chunk");
+        }
         let processed = pipeline.processed.fetch_add(50, Ordering::SeqCst) + 50;
+        if processed.is_multiple_of(100) {
+            // A realistic "not an error, but look at this" line for agents to find.
+            tracing::warn!(target: "demo::pipeline", processed, "backlog crossed a multiple of 100 items");
+        }
+        tracing::info!(target: "demo::pipeline", processed, elapsed_ms = 400_u64, "pipeline complete");
         pipeline.running.store(false, Ordering::SeqCst);
         if let Some(app) = APP.get() {
             let _ = app.emit(
@@ -449,7 +461,40 @@ fn run_pipeline(pipeline: tauri::State<'_, Arc<PipelineState>>) {
                 serde_json::json!({ "processed": processed }),
             );
         }
-    });
+    })
+        .expect("spawn pipeline worker");
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "Crash a background worker thread (demo of zero-config panic capture — the app keeps running)",
+    intent = "crash background worker",
+    category = "debug",
+    example = "panic in a background thread"
+)]
+fn panic_in_background() {
+    std::thread::Builder::new()
+        .name("flaky-worker".into())
+        .spawn(|| {
+            let items: Vec<u32> = Vec::new();
+            // Deliberate: the kind of bug that silently kills a background task in a real app.
+            let _ = items[3];
+        })
+        .expect("spawn flaky worker");
+}
+
+#[tauri::command]
+#[inspectable(
+    description = "Abort the whole process after printing last words (demo of crash capture under `victauri run`)",
+    intent = "crash the app",
+    category = "debug",
+    example = "hard crash"
+)]
+fn crash_process() {
+    // Like a native abort / heap-corruption detector: the message goes to stderr and the
+    // process dies immediately — no unwinding, no in-process logger gets to flush.
+    eprintln!("demo: fatal invariant violated — aborting (these are the last words)");
+    std::process::abort();
 }
 
 #[tauri::command]
@@ -555,6 +600,20 @@ fn seed_db(path: &std::path::Path) -> rusqlite::Result<()> {
 }
 
 fn main() {
+    // The app's logging, as real apps set it up — plus the ONE line that gives
+    // Victauri the backend log (logs backend, wait_for log, invoke_command with_logs).
+    {
+        use tracing_subscriber::prelude::*;
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,demo=debug")),
+            )
+            .with(tracing_subscriber::fmt::layer())
+            .with(victauri_plugin::log_layer())
+            .init();
+    }
+
     // Shared pipeline state: one Arc cloned into both the `app_state` probe and
     // Tauri's managed state (the idiomatic VictauriBuilder::probe pattern).
     let pipeline = Arc::new(PipelineState::default());
@@ -594,6 +653,8 @@ fn main() {
                     pipeline_status__schema(),
                     saturate_async_runtime__schema(),
                     async_runtime_ping__schema(),
+                    panic_in_background__schema(),
+                    crash_process__schema(),
                 ])
                 .listen_events(&["notification-added", "pipeline-complete"])
                 .probe("pipeline", move || probe_pipeline.snapshot())
@@ -626,6 +687,8 @@ fn main() {
             pipeline_status,
             saturate_async_runtime,
             async_runtime_ping,
+            panic_in_background,
+            crash_process,
         ])
         .setup(|app| {
             // Main thread: take the one handle background work may borrow.

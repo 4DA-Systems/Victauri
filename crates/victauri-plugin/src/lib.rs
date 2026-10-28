@@ -44,6 +44,9 @@
 //!     .unwrap();
 //! ```
 
+/// Backend (Rust-side) log capture: the `tracing` layer, the `log` adapter,
+/// the panic hook, and the buffer the `logs backend*` / `wait_for log` tools read.
+mod backend_logs;
 /// Runtime-erased webview bridge trait and its Tauri implementation.
 pub mod bridge;
 /// Backend database access (`SQLite` read-only queries).
@@ -107,6 +110,7 @@ const _: () = assert!(
     "victauri-plugin: the app links Tauri 3 — enable victauri-plugin's `tauri-v3` feature"
 );
 
+pub use backend_logs::{BackendLogLayer, log_layer, log_logger, wrap_logger};
 pub use error::BuilderError;
 pub use privacy::PrivacyProfile;
 
@@ -393,6 +397,9 @@ pub struct VictauriState {
     /// server's calls depend on is spawned here, never on the app's runtime, which an app can
     /// block (see `spawn_server_isolated`).
     pub(crate) server_runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+    /// Captured backend (Rust-side) log entries — fed by [`log_layer`],
+    /// [`log_logger`]/[`wrap_logger`] and the panic hook; read by `logs backend*`.
+    pub(crate) backend_logs: Arc<backend_logs::LogBuffer>,
 }
 
 impl VictauriState {
@@ -435,6 +442,9 @@ impl VictauriState {
             drain_watermarks: introspection::DrainWatermarks::default(),
             page_loads: introspection::PageLoads::default(),
             server_runtime: std::sync::OnceLock::new(),
+            // A private buffer, not the process-global one, so parallel tests
+            // never see each other's entries.
+            backend_logs: Arc::new(backend_logs::LogBuffer::default()),
         }
     }
 }
@@ -475,6 +485,7 @@ pub struct VictauriBuilder {
     listen_events: Vec<String>,
     db_search_paths: Vec<std::path::PathBuf>,
     probes: Vec<(String, std::sync::Arc<introspection::ProbeFn>)>,
+    capture_panics: bool,
 }
 
 impl Default for VictauriBuilder {
@@ -502,6 +513,7 @@ impl Default for VictauriBuilder {
             listen_events: Vec::new(),
             db_search_paths: Vec::new(),
             probes: Vec::new(),
+            capture_panics: true,
         }
     }
 }
@@ -867,6 +879,18 @@ impl VictauriBuilder {
         self
     }
 
+    /// Capture Rust panics into the backend log (`logs backend_digest` lists them).
+    ///
+    /// On by default in debug builds: the plugin installs a panic hook that
+    /// records the message, location, thread and backtrace, then calls the hook
+    /// that was installed before it — so the app's own hook and the default
+    /// stderr message still run. Pass `false` to leave the panic hook alone.
+    #[must_use]
+    pub const fn capture_panics(mut self, enabled: bool) -> Self {
+        self.capture_panics = enabled;
+        self
+    }
+
     /// Register a callback invoked once the MCP server is listening.
     /// The callback receives the port number.
     ///
@@ -1007,6 +1031,12 @@ impl VictauriBuilder {
 
             self.validate()?;
 
+            // Zero-config backend visibility: panics (including ones on background
+            // threads that would otherwise only reach stderr) land in the backend log.
+            if self.capture_panics {
+                backend_logs::install_panic_hook();
+            }
+
             let port = self.resolve_port();
             let event_capacity = self.event_capacity;
             let recorder_capacity = self.recorder_capacity;
@@ -1080,6 +1110,7 @@ impl VictauriBuilder {
                         drain_watermarks: introspection::DrainWatermarks::default(),
                         page_loads: introspection::PageLoads::default(),
                         server_runtime: std::sync::OnceLock::new(),
+                        backend_logs: backend_logs::global(),
                     });
                     state.startup_timeline.mark("state_created");
 

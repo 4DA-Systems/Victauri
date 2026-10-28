@@ -19,6 +19,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 # Seeds demo.db so query_db / introspect db_health have a real application database.
 rusqlite = { workspace = true, features = ["bundled"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 victauri-test = { workspace = true }

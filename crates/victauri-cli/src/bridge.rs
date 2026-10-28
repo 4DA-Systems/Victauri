@@ -1280,6 +1280,34 @@ enum Selection {
     Refused(String),
 }
 
+/// One trusted-discovery scan for other CLI commands (`victauri logs`): the live backend
+/// matching `app` (or the only one) as `(port, token, label)`.
+///
+/// # Errors
+/// Returns a message naming the running apps when the choice is ambiguous, or saying none
+/// is reachable.
+pub async fn resolve_backend(
+    app: Option<&str>,
+) -> std::result::Result<(u16, Option<String>, String), String> {
+    let app = app.map(str::to_string).or_else(|| {
+        std::env::var("VICTAURI_APP")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    });
+    match scan_once(app.as_deref()).await {
+        Selection::One(s) => Ok((s.port, s.token.clone(), s.label())),
+        Selection::None => Err(match app {
+            Some(a) => format!("no running Victauri app matches '{a}'"),
+            None => "no running Victauri app found".to_string(),
+        }),
+        Selection::Ambiguous(labels) => Err(format!(
+            "several Victauri apps are running — pick one with --app <identifier>:\n  {}",
+            labels.join("\n  ")
+        )),
+        Selection::Refused(why) => Err(why),
+    }
+}
+
 /// Pick the server matching `app` exactly, or the sole running server. Several matches —
 /// no selector with several apps up, or two apps sharing an identifier — are ambiguous,
 /// never "the first one".
@@ -1332,6 +1360,40 @@ fn discovery_roots() -> Vec<std::path::PathBuf> {
             .path()
             .to_path_buf(),
     ]
+}
+
+/// A private per-user directory `name` under the first usable discovery root (e.g. `console`
+/// for `victauri run` captures). Both the root and the directory are created owner-only and
+/// must pass [`dir_is_trusted`] — a real directory, owned by us, not group/other-writable — so
+/// another local user can neither pre-create it, plant files in it, nor redirect our writes
+/// through a symlink (a shared `/tmp/victauri` allowed all three). `None` when no root is usable.
+pub fn private_subdir(name: &str) -> Option<std::path::PathBuf> {
+    discovery_roots().into_iter().find_map(|root| {
+        let dir = root.join(name);
+        (create_private_dir(&root)
+            && dir_is_trusted(&root)
+            && create_private_dir(&dir)
+            && dir_is_trusted(&dir))
+        .then_some(dir)
+    })
+}
+
+/// `create_dir_all`, owner-only (0700) on Unix. An existing directory is left as it is (its
+/// trust is checked separately).
+fn create_private_dir(dir: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir).is_ok()
+    }
 }
 
 #[cfg_attr(all(test, not(unix)), allow(dead_code))]
@@ -1694,6 +1756,27 @@ fn dir_is_trusted(_path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `victauri run` captures (the app's whole output, secrets included) live here, and
+    /// `victauri logs` shows them as the app's own output: a directory another user could
+    /// pre-create or write to must be refused, not used.
+    #[test]
+    fn private_subdir_is_owner_only_and_refuses_a_shared_directory() {
+        let dir = private_subdir("console-test").expect("a private dir under the isolated root");
+        assert!(dir.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&dir).unwrap().permissions().mode() & 0o077,
+                0
+            );
+            let shared = discovery_roots()[0].join("shared-test");
+            std::fs::create_dir_all(&shared).unwrap();
+            std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+            assert!(private_subdir("shared-test").is_none());
+        }
+    }
 
     /// Audit N6: the per-user root is scanned first; the legacy shared root is last.
     #[cfg(unix)]

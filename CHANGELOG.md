@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — backend (Rust) log capture: the app's debug console, for agents
+
+Victauri's log tools saw only the webview; the Rust backend's own diagnostics — what a
+developer watches in the debug console — were invisible to an agent. Now:
+
+- **`logs {action:"backend"}`** — structured Rust log entries (typed fields, span context,
+  thread, file:line) with level / target-prefix / text filters and a `since_seq` cursor.
+- **`logs {action:"backend_digest"}`** — counts per level, noisiest targets, repeated messages
+  collapsed into templates, recent warnings/errors and every panic, in one call.
+- **`wait_for {condition:"log"}`** — block until a matching backend line is logged (edge-triggered:
+  wakes within a fraction of a millisecond; `since_ms` look-back). A timeout says how many entries
+  were evicted before the wait could check them (`missed_entries`), instead of a bare timeout.
+- **`invoke_command {with_logs:true}`** — the result plus the backend lines logged during the call;
+  a failing call (an error from the command, a timeout) carries them too, in its error result.
+- **`logs {action:"stdout"}`** + **`victauri run -- <cmd>`** — an out-of-process launcher that
+  captures raw stdout/stderr (zero app changes; any logger, `println!`, C libraries, `tauri dev`
+  build errors) and records how the process exited (code / signal / NTSTATUS, decoded, with its last
+  stderr lines). A crash's last words survive the crash — measured 20/20, vs 0/20 for an in-process
+  capture after `abort()`.
+- **`victauri logs`** CLI — digest, filters, `--follow` (one line per event; monitor-friendly;
+  re-probes a busy app instead of declaring it gone; hands off to the crash capture if it dies).
+- **Capture sources:** a zero-config panic hook (debug builds; chains to the previous hook;
+  `VictauriBuilder::capture_panics(false)` to opt out), `victauri_plugin::log_layer()` for
+  `tracing` apps, `log_logger()` / `wrap_logger()` for `log` apps (incl. `tauri-plugin-log` via
+  `TargetKind::Dispatch`). All no-ops in release builds. Victauri's own and the embedded
+  `rmcp` SDK's lines are excluded (`VICTAURI_LOG_INTERNAL=1` keeps them).
+- `victauri-test`: `backend_logs`, `backend_digest`, `wait_for_log`.
+- **Same safety rules as the rest of Victauri.** The new actions go through the same
+  authorization (`logs.backend`, `logs.backend_digest`, `logs.stdout` — readable in the Observe
+  profile, like the other logs) and output redaction as every tool; `wait_for log` and
+  `invoke_command {with_logs}` require the capability of the log they return, so disabling
+  `logs.backend` cannot be bypassed through them. `victauri run` writes its
+  capture owner-only into a `console` directory under the private per-user Victauri directory,
+  which must pass the same trust check as discovery: never a shared temp directory, where another
+  local user could redirect it through a symlink or plant a forged capture. `victauri logs`
+  prints one entry per line with control and bidi characters escaped (app colours stripped; in
+  `--json`, C1 and bidi characters are `\u` escapes), and a reader that closes the pipe is a clean
+  exit. A panic is recorded even while another thread holds the log buffer; field, span and
+  message values are bounded while they are formatted, so a multi-megabyte `#[instrument]`
+  argument costs a few kilobytes per event. `victauri run` reads child output in bounded chunks
+  and records the exit even if a process the app started keeps its stdout open.
+- Public API: `victauri_plugin::{log_layer, log_logger, wrap_logger, BackendLogLayer}`; the
+  buffer and its helpers stay internal.
+
 ## [0.10.1] - 2026-10-27
 
 ### Added
