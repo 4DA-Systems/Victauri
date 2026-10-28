@@ -10,7 +10,7 @@ use super::VictauriMcpHandler;
 use super::compound_params::LogsParams;
 use super::helpers::{json_result, missing_param, tool_error};
 use super::other_params::WaitForParams;
-use crate::backend_logs::{self, LogLevel, LogQuery};
+use crate::backend_logs::{self, BackendLogEntry, LogLevel, LogQuery};
 
 /// Default page size for `logs backend` / `logs stdout`.
 const DEFAULT_BACKEND_LIMIT: usize = 100;
@@ -75,6 +75,40 @@ fn since_ms_from(since: Option<f64>) -> Option<u64> {
         .map(|v| v as u64)
 }
 
+/// The entry as the caller would see it under a redacting profile, or `None` when redaction is
+/// off. Filters must match this view, not the raw entry (see [`VictauriMcpHandler::query_visible`]).
+fn visible_entry(
+    privacy: &crate::privacy::PrivacyConfig,
+    e: &BackendLogEntry,
+) -> Option<BackendLogEntry> {
+    if !privacy.redaction_enabled {
+        return None;
+    }
+    let mut seen = e.clone();
+    seen.message = privacy.redact_output(&e.message);
+    seen.target = privacy.redact_output(&e.target);
+    seen.spans = e.spans.iter().map(|s| privacy.redact_output(s)).collect();
+    let fields = serde_json::Value::Object(e.fields.clone()).to_string();
+    if let Ok(serde_json::Value::Object(redacted)) =
+        serde_json::from_str(&privacy.redact_output(&fields))
+    {
+        seen.fields = redacted;
+    }
+    Some(seen)
+}
+
+/// A captured stdout line as the caller would see it (redacted when the profile redacts).
+fn visible_text<'a>(
+    privacy: &crate::privacy::PrivacyConfig,
+    text: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if privacy.redaction_enabled {
+        std::borrow::Cow::Owned(privacy.redact_output(text))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -106,7 +140,13 @@ impl VictauriMcpHandler {
             fields: field_pairs(params.fields.as_ref()),
             limit: clamp_limit(params.limit),
         };
-        let page = self.state.backend_logs.query(&query);
+        let page = if self.state.privacy.redaction_enabled
+            && (query.contains.is_some() || !query.fields.is_empty())
+        {
+            self.query_visible(query)
+        } else {
+            self.state.backend_logs.query(&query)
+        };
         let sources = backend_logs::active_sources();
         let mut out = serde_json::to_value(&page).unwrap_or_default();
         if let Some(obj) = out.as_object_mut() {
@@ -124,7 +164,40 @@ impl VictauriMcpHandler {
                 obj.insert("hint".into(), hint.into());
             }
         }
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
+    }
+
+    /// [`LogBuffer::query`] for a redacting profile: the text and field filters are matched
+    /// against the REDACTED entry — what the caller sees — not the raw one, which would answer
+    /// "does the hidden value contain X?" and recover it a character at a time. The candidates
+    /// are copied out under the lock and filtered after it is released, so the redaction work
+    /// never holds up the app's logging threads.
+    fn query_visible(&self, mut query: LogQuery) -> backend_logs::LogPage {
+        let needle = query.contains.take().map(|s| s.to_lowercase());
+        let fields = std::mem::take(&mut query.fields);
+        let limit = query.limit;
+        query.limit = usize::MAX;
+        let mut page = self.state.backend_logs.query(&query);
+        let privacy = &self.state.privacy;
+        let mut matched: Vec<BackendLogEntry> = page
+            .entries
+            .drain(..)
+            .filter(|e| {
+                let seen = visible_entry(privacy, e).unwrap_or_else(|| e.clone());
+                needle
+                    .as_deref()
+                    .is_none_or(|n| backend_logs::entry_contains(&seen, n))
+                    && backend_logs::entry_fields_match(&seen, &fields)
+            })
+            .collect();
+        page.total_matched = matched.len();
+        page.truncated = matched.len() > limit;
+        if matched.len() > limit {
+            matched.drain(..matched.len() - limit);
+        }
+        page.entries = matched;
+        page
     }
 
     pub(super) fn logs_backend_digest(&self, params: &LogsParams) -> CallToolResult {
@@ -147,10 +220,11 @@ impl VictauriMcpHandler {
                 );
             }
         }
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
     }
 
-    pub(super) fn logs_stdout(params: &LogsParams) -> CallToolResult {
+    pub(super) fn logs_stdout(&self, params: &LogsParams) -> CallToolResult {
         let Some(path) = backend_logs::console_capture_path() else {
             return tool_error(
                 "This app was not launched with `victauri run`, so its raw stdout/stderr is \
@@ -174,9 +248,11 @@ impl VictauriMcpHandler {
                     .into_iter()
                     .filter(|l| {
                         min_level.is_none_or(|min| l.level.is_some_and(|lv| lv >= min))
-                            && needle
-                                .as_deref()
-                                .is_none_or(|n| l.text.to_lowercase().contains(n))
+                            && needle.as_deref().is_none_or(|n| {
+                                visible_text(&self.state.privacy, &l.text)
+                                    .to_lowercase()
+                                    .contains(n)
+                            })
                     })
                     .collect();
                 let total = matched.len();
@@ -234,12 +310,15 @@ impl VictauriMcpHandler {
         } else {
             "logs.backend"
         };
-        if !self.state.privacy.is_tool_enabled(capability) {
+        // `is_call_allowed`, not `is_tool_enabled`: disabling the whole `logs` tool must cover
+        // this too, not only its `logs.backend` / `logs.stdout` actions.
+        if !self.state.privacy.is_call_allowed("logs", capability) {
             return super::tool_disabled(capability);
         }
 
         if reads_stdout {
-            return Self::wait_for_stdout_line(&needle, min_level, since_ms, timeout, poll_ms)
+            return self
+                .wait_for_stdout_line(&needle, min_level, since_ms, timeout, poll_ms)
                 .await;
         }
 
@@ -263,15 +342,23 @@ impl VictauriMcpHandler {
                 e.level >= min_level
                     && backend_logs::entry_contains(e, &needle)
                     && backend_logs::entry_fields_match(e, &wanted_fields)
+                    // A raw match is re-checked on the redacted view (only for these
+                    // candidates), so a wait never confirms a value the caller cannot see.
+                    && visible_entry(&self.state.privacy, e).is_none_or(|seen| {
+                        backend_logs::entry_contains(&seen, &needle)
+                            && backend_logs::entry_fields_match(&seen, &wanted_fields)
+                    })
             })
             .await;
         let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(entry) = hit {
-            return json_result(&serde_json::json!({
+            let mut out = serde_json::json!({
                 "ok": true,
                 "entry": entry,
                 "elapsed_ms": elapsed_ms,
-            }));
+            });
+            backend_logs::resolve_backtraces(&mut out);
+            return json_result(&out);
         }
         let mut out = serde_json::json!({
             "ok": false,
@@ -292,10 +379,12 @@ impl VictauriMcpHandler {
         if !sources.any_structured() {
             out["hint"] = ENABLE_HINT.into();
         }
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
     }
 
     async fn wait_for_stdout_line(
+        &self,
         needle: &str,
         min_level: LogLevel,
         since_ms: u64,
@@ -316,7 +405,9 @@ impl VictauriMcpHandler {
                         l.ts_ms >= cutoff
                             && (min_level == LogLevel::Trace
                                 || l.level.is_some_and(|lv| lv >= min_level))
-                            && l.text.to_lowercase().contains(needle)
+                            && visible_text(&self.state.privacy, &l.text)
+                                .to_lowercase()
+                                .contains(needle)
                     }) {
                         return json_result(&serde_json::json!({
                             "ok": true,
@@ -357,6 +448,7 @@ impl VictauriMcpHandler {
             .unwrap_or_else(|_| serde_json::Value::String(raw_result.to_string()));
         let mut out = serde_json::json!({ "result": result });
         self.add_backend_logs(&mut out, from);
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
     }
 
@@ -365,6 +457,7 @@ impl VictauriMcpHandler {
     pub(super) fn backend_logs_error(&self, message: &str, from: u64) -> CallToolResult {
         let mut out = serde_json::json!({ "error": message });
         self.add_backend_logs(&mut out, from);
+        backend_logs::resolve_backtraces(&mut out);
         let text = serde_json::to_string(&out).unwrap_or_else(|_| message.to_string());
         CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])
     }
@@ -679,12 +772,22 @@ mod tests {
     /// line by line with an advancing `since_seq`, or attached to command results.
     #[tokio::test]
     async fn a_disabled_logs_backend_also_blocks_log_waits_and_with_logs() {
-        let mut state = VictauriState::for_tests();
-        state
-            .privacy
-            .disabled_tools
-            .insert("logs.backend".to_string());
-        let h = VictauriMcpHandler::new(Arc::new(state), Arc::new(NoWebview));
+        // The action, and the whole `logs` tool (an operator writing just `logs`).
+        for disabled in ["logs.backend", "logs"] {
+            let mut state = VictauriState::for_tests();
+            state.privacy.disabled_tools.insert(disabled.to_string());
+            state
+                .backend_logs
+                .push(crate::backend_logs::BackendLogEntry::for_tests(
+                    "auth",
+                    "password=hunter2xyz",
+                ));
+            let h = VictauriMcpHandler::new(Arc::new(state), Arc::new(NoWebview));
+            assert_log_reads_refused(&h, disabled).await;
+        }
+    }
+
+    async fn assert_log_reads_refused(h: &VictauriMcpHandler, disabled: &str) {
         for (tool, args) in [
             (
                 "wait_for",
@@ -699,8 +802,9 @@ mod tests {
                 .execute_tool(tool, args)
                 .await
                 .unwrap_or_else(|_| panic!("dispatch failed for {tool}"));
-            assert_eq!(r.is_error, Some(true), "{tool}: {}", text(&r));
+            assert_eq!(r.is_error, Some(true), "{disabled} / {tool}: {}", text(&r));
             assert!(text(&r).contains("logs.backend"), "{tool}: {}", text(&r));
+            assert!(!text(&r).contains("hunter2xyz"), "{tool}: {}", text(&r));
         }
     }
 }

@@ -7,49 +7,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-28
+
 ### Added — backend (Rust) log capture: the app's debug console, for agents
 
 Victauri's log tools saw only the webview; the Rust backend's own diagnostics — what a
 developer watches in the debug console — were invisible to an agent. Now:
 
 - **`logs {action:"backend"}`** — structured Rust log entries (typed fields, span context,
-  thread, file:line) with level / target-prefix / text filters and a `since_seq` cursor.
+  thread, file:line) with level / target-prefix / text / field filters and a `since_seq` cursor.
 - **`logs {action:"backend_digest"}`** — counts per level, noisiest targets, repeated messages
   collapsed into templates, recent warnings/errors and every panic, in one call.
 - **`wait_for {condition:"log"}`** — block until a matching backend line is logged (edge-triggered:
-  wakes within a fraction of a millisecond; `since_ms` look-back). A timeout says how many entries
-  were evicted before the wait could check them (`missed_entries`), instead of a bare timeout.
+  woken the moment the line is captured; `since_ms` look-back or an exact `since_seq` cursor). A
+  timeout says how many entries were evicted before the wait could check them (`missed_entries`).
 - **`invoke_command {with_logs:true}`** — the result plus the backend lines logged during the call;
   a failing call (an error from the command, a timeout) carries them too, in its error result.
 - **`logs {action:"stdout"}`** + **`victauri run -- <cmd>`** — an out-of-process launcher that
   captures raw stdout/stderr (zero app changes; any logger, `println!`, C libraries, `tauri dev`
-  build errors) and records how the process exited (code / signal / NTSTATUS, decoded, with its last
-  stderr lines). A crash's last words survive the crash — measured 20/20, vs 0/20 for an in-process
-  capture after `abort()`.
-- **`victauri logs`** CLI — digest, filters, `--follow` (one line per event; monitor-friendly;
-  re-probes a busy app instead of declaring it gone; hands off to the crash capture if it dies).
-- **Capture sources:** a zero-config panic hook (debug builds; chains to the previous hook;
-  `VictauriBuilder::capture_panics(false)` to opt out), `victauri_plugin::log_layer()` for
-  `tracing` apps, `log_logger()` / `wrap_logger()` for `log` apps (incl. `tauri-plugin-log` via
-  `TargetKind::Dispatch`). All no-ops in release builds. Victauri's own and the embedded
-  `rmcp` SDK's lines are excluded (`VICTAURI_LOG_INTERNAL=1` keeps them).
+  build errors) and records how the process exited (code / signal / NTSTATUS, decoded, with its
+  last stderr lines) — so a crash's last words survive the crash, which no in-process capture can
+  promise.
+- **`victauri logs`** CLI — digest, filters, `--follow` (one line per event; monitor-friendly). A
+  follow survives a busy app and a restart (it re-resolves the app through discovery, so a
+  `tauri dev` rebuild with a new token and port is followed), and hands off to the crash capture
+  when the app is gone for good.
+- **Capture sources:** a zero-config panic hook (debug builds; `VictauriBuilder::capture_panics(false)`
+  to opt out), `victauri_plugin::log_layer()` for `tracing` apps, `log_logger()` /
+  `wrap_logger()` for `log` apps (incl. `tauri-plugin-log` via `TargetKind::Dispatch`). Victauri's
+  own and the embedded `rmcp` SDK's lines are excluded (`VICTAURI_LOG_INTERNAL=1` keeps them);
+  Tokio's runtime instrumentation is always excluded. `VICTAURI_LOG_LEVEL` (default `debug`) and
+  `VICTAURI_LOG_CAPACITY` (default 5,000, max 100,000 entries) tune the capture.
 - `victauri-test`: `backend_logs`, `backend_digest`, `wait_for_log`.
-- **Same safety rules as the rest of Victauri.** The new actions go through the same
-  authorization (`logs.backend`, `logs.backend_digest`, `logs.stdout` — readable in the Observe
-  profile, like the other logs) and output redaction as every tool; `wait_for log` and
-  `invoke_command {with_logs}` require the capability of the log they return, so disabling
-  `logs.backend` cannot be bypassed through them. `victauri run` writes its
-  capture owner-only into a `console` directory under the private per-user Victauri directory,
-  which must pass the same trust check as discovery: never a shared temp directory, where another
-  local user could redirect it through a symlink or plant a forged capture. `victauri logs`
-  prints one entry per line with control and bidi characters escaped (app colours stripped; in
-  `--json`, C1 and bidi characters are `\u` escapes), and a reader that closes the pipe is a clean
-  exit. A panic is recorded even while another thread holds the log buffer; field, span and
-  message values are bounded while they are formatted, so a multi-megabyte `#[instrument]`
-  argument costs a few kilobytes per event. `victauri run` reads child output in bounded chunks
-  and records the exit even if a process the app started keeps its stdout open.
 - Public API: `victauri_plugin::{log_layer, log_logger, wrap_logger, BackendLogLayer}`; the
-  buffer and its helpers stay internal.
+  buffer and its helpers stay internal. `BackendLogLayer` implements `tracing_subscriber::Layer`,
+  so `tracing-subscriber` 0.3 (≥ 0.3.18) is now a dependency of the plugin.
+
+### Changed — for apps that change nothing
+
+- **Debug builds install a panic hook.** It chains the hook installed before it, and that hook
+  runs **first** (an app's own crash hook — zeroising secrets, writing a crash log — is never
+  delayed). The first 20 panics keep a backtrace: frames are captured on the panicking thread,
+  symbolised only when an agent reads the entry. `capture_panics(false)` turns it off. Release
+  builds are unchanged.
+- **Release builds stay free of Victauri code** with the documented `log_layer()` line: the
+  layer type is empty in release builds (the app monomorphises a layer's methods whatever its
+  value, so an always-`None` layer used to ship ~50 KB of capture code).
+- New dependencies for apps that did not have them: `tracing-subscriber` (with `sharded-slab`,
+  `thread_local`); `log` is already in every Tauri app's graph.
+
+### Security and robustness (adversarial review of the new surface, before release)
+
+- **Authorization:** the new actions are gated like every other (`logs.backend`,
+  `logs.backend_digest`, `logs.stdout` — readable in the Observe profile, like the other logs).
+  `wait_for log` and `invoke_command {with_logs}` need the capability of the log they return, and
+  disabling the whole `logs` tool covers them too (they used to return log lines regardless).
+- **Redaction:** output passes through the usual redaction (on in Observe/Test and with
+  `strict_privacy_mode()`), now also of `key=value` pairs in free text — span context such as
+  `login{password="…"}` (`#[instrument]` records every argument) and lines like `token=abc123`.
+  With redaction on, `filter` / `fields` / `wait_for` match the REDACTED text, so a match can no
+  longer confirm a hidden value one character at a time.
+- **No deadlock with tokio-console setups:** with `tokio_unstable` + Tokio's `tracing` feature,
+  Tokio traces waker clones while holding a `Notify` lock; capturing that event and waking
+  waiters re-entered the same lock and froze every logging thread. Tokio's instrumentation is
+  excluded, and a push from inside the notify machinery no longer wakes waiters.
+- **Panics are not lost** while another thread holds the log buffer (an agent's query, another
+  thread's log line); a panic on the thread that holds it is dropped rather than deadlocked.
+- **Bounded memory:** field, span and message values are bounded while they are formatted (a
+  multi-megabyte `#[instrument]` argument costs a few kilobytes per event, not its size per
+  event); `victauri run` reads child output in bounded chunks.
+- **Captures are private:** `victauri run` writes owner-only into a `console` directory under the
+  private per-user Victauri directory (trust-checked like discovery, and with an owner-only ACL on
+  Windows) — never a shared temp directory, where another local user could redirect it through a
+  symlink or plant a forged capture. `victauri logs` only follows a capture path the app reports
+  when it is one of the user's own captures; with `--app` and the app down it no longer shows
+  another app's capture as this one's.
+- **Terminal safety:** `victauri logs` prints one entry per line with control and bidi characters
+  escaped (app colours stripped; in `--json`, C1 and bidi characters are `\u` escapes), status
+  lines go to stderr, and a reader that closes the pipe is a clean exit.
+- **`victauri run`:** records the exit even if a process the app started keeps its stdout open;
+  passes non-UTF-8 output through to a Windows console; makes a relative `--capture` absolute (the
+  app may run from another directory); leaves no empty capture when the command cannot start;
+  rotates at 64 MB (falling back to a timestamped name, and stopping line capture rather than
+  growing without bound if the file cannot be rotated); decodes a shell's 128+N exit codes.
+- **Cursors:** a `logs clear` is no longer reported as an eviction gap; `wait_for` and the
+  attached-log window jump to the cursor by index instead of rescanning the buffer under its lock.
+- `victauri logs` rejects flag combinations it used to ignore silently (`--digest --follow`,
+  `--target` / `--app` with `--stdout`).
+
+### Repository and CI
+
+- CI: Linux jobs cache the WebKitGTK `.deb` files and survive a crawling apt mirror (a bounded
+  first attempt, then `archive.ubuntu.com`); a weekly RustSec check of main's lockfile;
+  `actions/checkout` v5 (Node 24). The local pre-push gate gives `clippy` / `test` explicit
+  timeouts (a cold worktree's `test` was killed at the 600 s default).
+- The bump script fails on a failing `cargo` step and verifies `examples/tauri3/Cargo.lock` with
+  `--locked` (it went stale when the plugin gained a dependency, which turned the non-required
+  Tauri 3 canary red).
 
 ## [0.10.1] - 2026-10-27
 
@@ -2522,7 +2576,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/4DA-Systems/victauri/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/4DA-Systems/victauri/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/4DA-Systems/victauri/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/4DA-Systems/victauri/compare/v0.8.8...v0.9.0

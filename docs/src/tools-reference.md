@@ -680,7 +680,7 @@ Access all captured logs from the application.
 | `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
 | `clear` | — | Clear the IPC + network logs (per-test isolation) |
 | `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Page forward with the returned `next_seq` |
-| `backend_digest` | — | Start here: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic |
+| `backend_digest` | `limit` (top N per list, default 10) | Start here: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic |
 | `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited |
 | `filter` | string | no | `network`: URL substring filter; `backend`/`stdout`: case-insensitive text match |
 | `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |

@@ -324,7 +324,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | `dom_snapshot` | Full accessibility tree with ref handles |
 | `find_elements` | Search by text, role, test ID, CSS, label, placeholder, alt, title |
 | `screenshot` | Platform-native window capture (no Chromium) |
-| `wait_for` | Poll for conditions: text, selector, IPC settle, JS `expression`, or Tauri `event` — await async backend work without sleeps |
+| `wait_for` | Poll for conditions: text, selector, IPC settle, JS `expression`, Tauri `event`, or a backend `log` line — await async backend work without sleeps |
 | `assert_semantic` | Evaluate JS + assert against expected value |
 
 ### Compound tools (multiple actions per tool)
@@ -342,7 +342,7 @@ See the [Testing Guide](docs/src/testing.md) for IPC checkpoints, visual regress
 | **`route`** | `add` (block / fulfill / delay fetch+XHR), `list`, `clear`, `clear_all`, `matches` |
 | **`trace`** | `start`, `stop`, `status`, `frames` (background screencast ring buffer) |
 | **`animation`** | `list`, `scrub`, `sample` (Web Animations API — no CDP) |
-| **`logs`** | `console`, `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc`, `clear` |
+| **`logs`** | `console`, `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc`, `clear`; the Rust backend: `backend`, `backend_digest`, `stdout` ([Backend Logs](docs/src/backend-logs.md)) |
 | **`introspect`** | `command_timings`, `coverage`, `command_catalog`, `contract_record`, `contract_check`, `contract_list`, `contract_clear`, `startup_timing`, `capabilities`, `db_health`, `plugin_state`, `processes`, `plugin_tasks`, `event_bus`, `event_bus_clear` |
 | **`fault`** | `inject` (delay/error/drop/corrupt), `list`, `clear`, `clear_all` |
 | **`explain`** | `summary`, `last_action`, `diff` |
@@ -449,7 +449,7 @@ Use the built-in composite action to run Victauri smoke tests in CI:
     xvfb-run -a ./target/debug/my-app &
     sleep 3
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.1
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.2
   with:
     max-load-ms: 10000
     max-heap-mb: 512

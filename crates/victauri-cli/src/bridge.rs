@@ -1373,7 +1373,8 @@ pub fn private_subdir(name: &str) -> Option<std::path::PathBuf> {
         (create_private_dir(&root)
             && dir_is_trusted(&root)
             && create_private_dir(&dir)
-            && dir_is_trusted(&dir))
+            && dir_is_trusted(&dir)
+            && restrict_private_dir(&dir))
         .then_some(dir)
     })
 }
@@ -1393,6 +1394,23 @@ fn create_private_dir(dir: &std::path::Path) -> bool {
     #[cfg(not(unix))]
     {
         std::fs::create_dir_all(dir).is_ok()
+    }
+}
+
+/// Windows: give the (already trust-checked, so ours) subdirectory a PROTECTED owner-only DACL,
+/// created or not — under a `TEMP` that is shared (a redirected `C:\Temp`, an MSYS2 tmp) its
+/// inherited ACL could let other users read the captures or plant a forged one. Only the
+/// subdirectory: re-protecting the discovery root would push the ACL into every app's entry.
+/// Elsewhere the 0700 creation (Unix) already does this.
+fn restrict_private_dir(dir: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        victauri_test::process::restrict_dir_to_current_user(dir)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dir;
+        true
     }
 }
 

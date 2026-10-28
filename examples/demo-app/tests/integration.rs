@@ -920,6 +920,15 @@ e2e_test!(
         assert_eq!(hit["ok"], true, "panic not captured: {hit}");
         assert_eq!(hit["entry"]["source"], "panic");
         assert_eq!(hit["entry"]["thread"], "flaky-worker");
+        // The backtrace is symbolised when read (not on the panicking thread) — and it must
+        // arrive resolved, naming the code that panicked, with no placeholder id left behind.
+        let fields = &hit["entry"]["fields"];
+        assert!(fields.get("backtrace_id").is_none(), "{hit}");
+        let backtrace = fields["backtrace"].as_str().unwrap_or_default();
+        assert!(
+            backtrace.contains("panic_in_background"),
+            "symbolised backtrace: {backtrace}"
+        );
         let digest = client.backend_digest().await.unwrap();
         assert!(
             digest["panics"].as_array().is_some_and(|p| !p.is_empty()),

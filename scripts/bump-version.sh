@@ -140,6 +140,9 @@ if ! $DRY_RUN; then
     # it with --locked, so its path-dependency versions must follow the bump too.
     echo "Updating examples/tauri3/Cargo.lock..."
     (cd "$ROOT/examples/tauri3" && cargo update -p victauri-plugin -p victauri-core -p victauri-macros --offline 2>&1 | tail -1)
+    # pipefail (set above) already fails the bump on a cargo error; also prove the lockfile is
+    # complete — a new plugin dependency once left it stale, and CI builds it with --locked.
+    (cd "$ROOT/examples/tauri3" && cargo metadata --locked --format-version 1 --no-deps >/dev/null)
 fi
 
 echo ""

@@ -1,5 +1,28 @@
 # Migration Guide
 
+## v0.10.1 → v0.10.2
+
+No API change (additions only; `cargo semver-checks` reports no semver update needed); consumers
+on `"0.10"` pick it up with `cargo update`. What changes without opting in:
+
+**Debug builds install a panic hook** (backend log capture). It chains the hook installed before
+it — which runs first, so an app's own crash hook is not delayed — and records the panic for
+agents (`logs backend_digest`). An app that installs its own hook *after* the plugin builds and
+does not chain (`take_hook`) replaces Victauri's, which only loses the capture. Opt out with
+`VictauriBuilder::capture_panics(false)`. Release builds are unchanged.
+
+**New dependencies:** `tracing-subscriber` 0.3 (≥ 0.3.18; with `sharded-slab`, `thread_local`)
+for apps that do not have it yet.
+
+**`invoke_command` with `with_logs: true`** (new) returns `{result, backend_logs, …}` — and a
+failed call returns an error result whose text is JSON (`{"error": …, "backend_logs": …}`)
+instead of plain text. Calls without `with_logs` are unchanged.
+
+To capture structured `tracing` / `log` output (optional), add one line where the app sets up
+logging — `.with(victauri_plugin::log_layer())`, or `log_logger()` / `wrap_logger()` for `log` —
+or run the app under `victauri run -- <dev command>`. See `docs/src/backend-logs.md`. If
+Victauri is behind a Cargo feature (`victauri init --optional`), gate that line on the feature.
+
 ## v0.10.0 → v0.10.1
 
 No API change; consumers on `"0.10"` pick it up with `cargo update`. Three behaviours change:

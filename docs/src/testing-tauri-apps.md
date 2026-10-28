@@ -436,7 +436,7 @@ Coverage gate ──────────────── victauri coverage
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.1
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.2
   with:
     max-load-ms: 5000
     coverage: true

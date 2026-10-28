@@ -108,6 +108,16 @@ impl LogLevel {
         }
     }
 
+    const fn to_level_filter(self) -> tracing::level_filters::LevelFilter {
+        match self {
+            Self::Trace => tracing::level_filters::LevelFilter::TRACE,
+            Self::Debug => tracing::level_filters::LevelFilter::DEBUG,
+            Self::Info => tracing::level_filters::LevelFilter::INFO,
+            Self::Warn => tracing::level_filters::LevelFilter::WARN,
+            Self::Error => tracing::level_filters::LevelFilter::ERROR,
+        }
+    }
+
     const fn from_log(level: log::Level) -> Self {
         match level {
             log::Level::Trace => Self::Trace,
@@ -174,6 +184,23 @@ pub struct BackendLogEntry {
 }
 
 impl BackendLogEntry {
+    /// An info-level `tracing` entry (tests).
+    #[cfg(test)]
+    pub(crate) fn for_tests(target: &str, message: &str) -> Self {
+        Self {
+            seq: 0,
+            ts_ms: now_ms(),
+            level: LogLevel::Info,
+            target: target.to_string(),
+            message: message.to_string(),
+            fields: serde_json::Map::new(),
+            spans: Vec::new(),
+            thread: None,
+            location: None,
+            source: LogSource::Tracing,
+        }
+    }
+
     fn approx_bytes(&self) -> usize {
         let fields: usize = self
             .fields
@@ -226,8 +253,29 @@ struct Ring {
     bytes: usize,
     /// Entries evicted to respect capacity (lifetime).
     evicted: u64,
+    /// Every entry below this sequence number was removed by [`LogBuffer::clear`] — deliberately,
+    /// so a cursor older than it is not an eviction gap.
+    cleared_before: u64,
     /// Lifetime totals per level (index = `LogLevel::index`).
     totals: [u64; 5],
+}
+
+impl Ring {
+    /// Index in `entries` of the first entry with `seq >= seq` (sequence numbers in the ring
+    /// are contiguous, so this is arithmetic, not a scan).
+    fn index_of(&self, seq: u64) -> usize {
+        self.entries.front().map_or(0, |front| {
+            usize::try_from(seq.saturating_sub(front.seq))
+                .unwrap_or(usize::MAX)
+                .min(self.entries.len())
+        })
+    }
+
+    /// Entries with `seq >= from` that were evicted (not cleared) before they could be read.
+    fn evicted_since(&self, from: u64) -> u64 {
+        let oldest = self.entries.front().map_or(self.next_seq, |e| e.seq);
+        oldest.saturating_sub(from.max(self.cleared_before))
+    }
 }
 
 thread_local! {
@@ -295,6 +343,47 @@ fn debug_bounded(value: &dyn std::fmt::Debug, max: usize) -> String {
     b.out
 }
 
+thread_local! {
+    /// Whether this thread is inside this module's own `Notify` machinery (waking waiters, or
+    /// registering/polling a waiter). Tokio can emit `tracing` events from in there — with
+    /// `tokio_unstable` + its `tracing` feature it traces every waker clone while holding the
+    /// `Notify`'s waiter lock — and such an event reaches [`BackendLogLayer`], whose push would
+    /// call `notify_waiters` again on the same lock: a self-deadlock that froze every logging
+    /// thread of the app. A push made from in there still records its entry but skips the wake
+    /// (the waiters being woken rescan anyway).
+    static IN_NOTIFY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Sets [`IN_NOTIFY`] for its lifetime (restoring the previous value, also on unwind).
+struct NotifyScope(bool);
+
+impl NotifyScope {
+    fn enter() -> Self {
+        Self(IN_NOTIFY.with(|f| f.replace(true)))
+    }
+}
+
+impl Drop for NotifyScope {
+    fn drop(&mut self) {
+        let previous = self.0;
+        IN_NOTIFY.with(|f| f.set(previous));
+    }
+}
+
+/// A future whose every poll runs inside a [`NotifyScope`] (for a `Notified` being awaited).
+struct PollInNotifyScope<F>(F);
+
+impl<F: std::future::Future + Unpin> std::future::Future for PollInNotifyScope<F> {
+    type Output = F::Output;
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let _scope = NotifyScope::enter();
+        std::pin::Pin::new(&mut self.0).poll(cx)
+    }
+}
+
 /// Bounded ring buffer of captured backend log entries.
 ///
 /// A process-global instance ([`global`]) is fed by the capture sources and read
@@ -343,12 +432,17 @@ impl LogBuffer {
         RingGuard(guard)
     }
 
-    /// Append an entry (its `seq` is assigned here) and wake waiters.
+    /// Append an entry (its `seq` is assigned here) and wake waiters. Dropped if this thread
+    /// already holds the lock — only possible when a panic under the lock runs a hook that
+    /// logs (the app's own panic hook, chained by Victauri's), which would otherwise deadlock.
     pub fn push(&self, entry: BackendLogEntry) {
+        if HOLDS_RING.with(std::cell::Cell::get) {
+            return;
+        }
         let mut ring = self.lock();
         Self::push_locked(&mut ring, entry, self.capacity, self.max_bytes);
         drop(ring);
-        self.notify.notify_waiters();
+        self.wake_waiters();
     }
 
     /// Push used from the panic hook. A panic on a thread that is itself holding this lock
@@ -363,7 +457,7 @@ impl LogBuffer {
         let mut ring = self.lock();
         Self::push_locked(&mut ring, entry, self.capacity, self.max_bytes);
         drop(ring);
-        self.notify.notify_waiters();
+        self.wake_waiters();
         true
     }
 
@@ -379,6 +473,16 @@ impl LogBuffer {
                 ring.evicted += 1;
             }
         }
+    }
+
+    /// Wake `wait_for` waiters — unless this thread is already inside the `Notify` machinery
+    /// (see [`IN_NOTIFY`]), where waking again would deadlock.
+    fn wake_waiters(&self) {
+        if IN_NOTIFY.with(std::cell::Cell::get) {
+            return;
+        }
+        let _scope = NotifyScope::enter();
+        self.notify.notify_waiters();
     }
 
     /// The sequence number the next entry will get (a cursor for "from now on").
@@ -422,7 +526,7 @@ impl LogBuffer {
             }
         }
         matched.reverse();
-        let gap = q.since_seq.is_some_and(|s| s < oldest_seq);
+        let gap = q.since_seq.is_some_and(|s| ring.evicted_since(s) > 0);
         LogPage {
             truncated: total_matched > matched.len(),
             total_matched,
@@ -447,8 +551,9 @@ impl LogBuffer {
         let ring = self.lock();
         let all: Vec<&BackendLogEntry> = ring
             .entries
-            .iter()
-            .filter(|e| e.seq >= from && e.seq < to && e.level >= min_level)
+            .range(ring.index_of(from)..)
+            .take_while(|e| e.seq < to)
+            .filter(|e| e.level >= min_level)
             .collect();
         let total = all.len();
         let start = total.saturating_sub(limit);
@@ -556,15 +661,16 @@ impl LogBuffer {
             // scan and the await still wakes us (no lost wake-up).
             let notified = self.notify.notified();
             tokio::pin!(notified);
-            notified.as_mut().enable();
+            {
+                let _scope = NotifyScope::enter();
+                notified.as_mut().enable();
+            }
             {
                 let ring = self.lock();
-                if let Some(front) = ring.entries.front()
-                    && front.seq > scanned_to
-                {
-                    missed += front.seq - scanned_to;
-                }
-                for e in ring.entries.iter().filter(|e| e.seq >= scanned_to) {
+                missed += ring.evicted_since(scanned_to);
+                // Only the entries not checked yet: an index jump, not a rescan of the whole
+                // ring under the lock the app's loggers need on every wake-up.
+                for e in ring.entries.range(ring.index_of(scanned_to)..) {
                     if pred(e) {
                         return (Some(e.clone()), missed);
                     }
@@ -572,7 +678,10 @@ impl LogBuffer {
                 // Everything below next_seq has now been checked once.
                 scanned_to = scanned_to.max(ring.next_seq);
             }
-            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+            if tokio::time::timeout_at(deadline, PollInNotifyScope(notified.as_mut()))
+                .await
+                .is_err()
+            {
                 return (None, missed);
             }
         }
@@ -583,6 +692,7 @@ impl LogBuffer {
         let mut ring = self.lock();
         ring.entries.clear();
         ring.bytes = 0;
+        ring.cleared_before = ring.next_seq;
     }
 }
 
@@ -869,7 +979,7 @@ pub fn global() -> Arc<LogBuffer> {
             let capacity = std::env::var("VICTAURI_LOG_CAPACITY")
                 .ok()
                 .and_then(|v| v.trim().parse::<usize>().ok())
-                .filter(|n| (1..=1_000_000).contains(n))
+                .filter(|n| (1..=100_000).contains(n))
                 .unwrap_or(DEFAULT_CAPACITY);
             Arc::new(LogBuffer::new(
                 capacity,
@@ -955,6 +1065,32 @@ pub fn is_internal_target(target: &str) -> bool {
         || target.starts_with("rmcp::")
 }
 
+/// Tokio's own runtime instrumentation (`tokio_unstable` + its `tracing` feature: waker and
+/// task events for tokio-console). Always excluded, whatever `VICTAURI_LOG_INTERNAL` says: some
+/// of it is emitted while tokio holds internal locks, so capturing it is never safe, and it is
+/// runtime plumbing, not the app's log.
+#[must_use]
+pub fn is_runtime_internal_target(target: &str) -> bool {
+    target == "tokio"
+        || target.starts_with("tokio::")
+        || target.starts_with("runtime::")
+        || target.starts_with("runtime.")
+}
+
+/// The least severe level captured: `VICTAURI_LOG_LEVEL` (trace/debug/info/warn/error), default
+/// `debug` — trace-level output from every dependency would mostly be noise that evicts the
+/// app's own lines.
+#[must_use]
+pub fn capture_level() -> LogLevel {
+    static LEVEL: OnceLock<LogLevel> = OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("VICTAURI_LOG_LEVEL")
+            .ok()
+            .and_then(|v| LogLevel::parse(&v))
+            .unwrap_or(LogLevel::Debug)
+    })
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -983,16 +1119,19 @@ fn current_thread_name() -> Option<String> {
 /// `tracing_subscriber` layer that copies every event into Victauri's backend
 /// log buffer. Obtain it with [`log_layer`].
 #[derive(Clone)]
+#[cfg(debug_assertions)]
 pub struct BackendLogLayer {
     buffer: Arc<LogBuffer>,
 }
 
+#[cfg(debug_assertions)]
 impl std::fmt::Debug for BackendLogLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendLogLayer").finish_non_exhaustive()
     }
 }
 
+#[cfg(debug_assertions)]
 impl BackendLogLayer {
     /// A layer writing into a specific buffer (tests); apps use [`log_layer`].
     #[must_use]
@@ -1000,6 +1139,28 @@ impl BackendLogLayer {
         Self { buffer }
     }
 }
+
+/// Release builds: a zero-sized layer with an empty [`Layer`] impl. [`log_layer`] returns
+/// `None` in release anyway, but the app monomorphises the layer type's methods into its own
+/// binary whatever the value — so the type itself must be empty for the documented one-line
+/// recipe to leave no Victauri code in a release build.
+#[cfg(not(debug_assertions))]
+#[derive(Debug, Clone, Copy)]
+pub struct BackendLogLayer {
+    _private: (),
+}
+
+#[cfg(not(debug_assertions))]
+impl BackendLogLayer {
+    /// A layer writing into a specific buffer (tests); apps use [`log_layer`].
+    #[must_use]
+    pub fn with_buffer(_buffer: Arc<LogBuffer>) -> Self {
+        Self { _private: () }
+    }
+}
+
+#[cfg(not(debug_assertions))]
+impl<S: Subscriber> Layer<S> for BackendLogLayer {}
 
 /// The `tracing` layer that feeds Victauri's backend log capture.
 ///
@@ -1018,8 +1179,11 @@ impl BackendLogLayer {
 ///
 /// It sees what passes the subscriber's *global* filter (an `EnvFilter` added
 /// with `.with(...)` filters every layer). Returns `None` — a no-op layer — in
-/// release builds and when `VICTAURI_DISABLE` is set, so the line can stay in
-/// the app unconditionally. A later `set_global_default` cannot add a layer to a
+/// release builds and when `VICTAURI_DISABLE` is set, and in release builds the
+/// layer type itself is empty, so the line adds no Victauri code to a release
+/// binary and can stay in the app unconditionally — unless Victauri is behind a
+/// Cargo feature (`victauri init --optional`): then gate the line on that feature
+/// too, since it names this crate. A later `set_global_default` cannot add a layer to a
 /// subscriber the app already installed, which is why this is an explicit line
 /// rather than something `init()` could do on its own.
 #[must_use]
@@ -1031,12 +1195,22 @@ pub fn log_layer() -> Option<BackendLogLayer> {
 }
 
 /// Span fields recorded once per span and reused for every event inside it.
+#[cfg(debug_assertions)]
 struct SpanFields(String);
 
+#[cfg(debug_assertions)]
 impl<S> Layer<S> for BackendLogLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
+    // An upper bound, not a filter: this layer never disables anything for other layers (a
+    // `Layer::enabled` returning false would). Without a hint, an app whose own layers all use
+    // per-layer filters ends up with a global max level of TRACE, so every trace-level callsite
+    // in every dependency would be built for this layer alone.
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(capture_level().to_level_filter())
+    }
+
     fn on_new_span(
         &self,
         attrs: &tracing::span::Attributes<'_>,
@@ -1075,7 +1249,10 @@ where
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         mark_source(SRC_TRACING);
         let meta = event.metadata();
-        if is_internal_target(meta.target()) {
+        if is_internal_target(meta.target())
+            || is_runtime_internal_target(meta.target())
+            || LogLevel::from_tracing(*meta.level()) < capture_level()
+        {
             return;
         }
         let mut v = EventVisitor::default();
@@ -1253,15 +1430,21 @@ impl VictauriLogger {
 
 impl log::Log for VictauriLogger {
     fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
-        // Capture everything the global `log::max_level` lets through; the inner
-        // logger still applies its own filter to what it prints.
-        self.inner.as_ref().is_none_or(|i| i.enabled(metadata))
-            || metadata.level() <= log::max_level()
+        // `enabled` only answers `log_enabled!` (the `log!` macros call `log` directly, which
+        // captures regardless): with a wrapped logger, answer exactly as it does, so app code
+        // guarded by `log_enabled!` keeps doing what it did before Victauri was added.
+        match &self.inner {
+            Some(inner) => inner.enabled(metadata),
+            None => metadata.level() <= log::max_level(),
+        }
     }
 
     fn log(&self, record: &log::Record<'_>) {
         mark_source(SRC_LOG);
-        if is_internal_target(record.target()) {
+        if is_internal_target(record.target())
+            || is_runtime_internal_target(record.target())
+            || LogLevel::from_log(record.level()) < capture_level()
+        {
             if let Some(inner) = &self.inner
                 && inner.enabled(record.metadata())
             {
@@ -1359,17 +1542,68 @@ pub fn install_panic_hook() {
         let buffer = global();
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            capture_panic(&buffer, info);
+            // The app's own hook first: it may be a security hook (4DA's crash guard zeroises
+            // secrets and writes its crash log) that must not wait on this one.
             previous(info);
+            capture_panic(&buffer, info);
         }));
         mark_source(SRC_PANIC);
     });
 }
 
+/// A panic's backtrace, captured on the panicking thread but symbolised only when an agent
+/// reads the entry: symbol resolution is the expensive part (the first one on Windows loads
+/// debug info — measured over 10 s in a large app), and it must not run on the panicking
+/// thread, which may be the UI thread or a panic the app catches on purpose.
+struct PendingBacktrace {
+    backtrace: std::backtrace::Backtrace,
+    resolved: OnceLock<String>,
+}
+
+fn pending_backtraces() -> &'static Mutex<HashMap<u32, Arc<PendingBacktrace>>> {
+    static PENDING: OnceLock<Mutex<HashMap<u32, Arc<PendingBacktrace>>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Replace every `backtrace_id` placeholder in `value` (an entry, or any JSON holding entries)
+/// with the symbolised, trimmed backtrace. Runs on the reading side — the server's runtime —
+/// and resolves each backtrace once.
+pub fn resolve_backtraces(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(id) = map
+                .get("backtrace_id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+            {
+                let slot = pending_backtraces()
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&id)
+                    .cloned();
+                if let Some(slot) = slot {
+                    let text = slot.resolved.get_or_init(|| {
+                        truncate_string(
+                            trim_backtrace(&slot.backtrace.to_string()),
+                            MAX_BACKTRACE_BYTES,
+                        )
+                    });
+                    map.insert("backtrace".into(), text.clone().into());
+                }
+                map.remove("backtrace_id");
+            }
+            for v in map.values_mut() {
+                resolve_backtraces(v);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(resolve_backtraces),
+        _ => {}
+    }
+}
+
 fn capture_panic(buffer: &LogBuffer, info: &std::panic::PanicHookInfo<'_>) {
-    // Symbol resolution is the expensive part of a backtrace (the first one on
-    // Windows loads debug info: hundreds of ms). A panic storm must not turn the
-    // hook into a stall, so only the first few panics carry one.
+    // Capturing the frames is cheap; symbolising them is not (see `PendingBacktrace`), so that
+    // is deferred to the reader. Only the first few panics keep a backtrace at all.
     static BACKTRACES_TAKEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let payload = info.payload();
     let message = payload
@@ -1381,12 +1615,19 @@ fn capture_panic(buffer: &LogBuffer, info: &std::panic::PanicHookInfo<'_>) {
         .location()
         .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
     let mut fields = serde_json::Map::new();
-    if BACKTRACES_TAKEN.fetch_add(1, Ordering::Relaxed) < MAX_PANIC_BACKTRACES {
-        let raw = std::backtrace::Backtrace::force_capture().to_string();
-        fields.insert(
-            "backtrace".into(),
-            truncate_string(trim_backtrace(&raw), MAX_BACKTRACE_BYTES).into(),
-        );
+    let n = BACKTRACES_TAKEN.fetch_add(1, Ordering::Relaxed);
+    if n < MAX_PANIC_BACKTRACES {
+        let slot = Arc::new(PendingBacktrace {
+            backtrace: std::backtrace::Backtrace::force_capture(),
+            resolved: OnceLock::new(),
+        });
+        // try_lock: a panic while this thread holds the map (it never does any real work
+        // under it) must not deadlock the hook.
+        if let Ok(mut pending) = pending_backtraces().try_lock() {
+            pending.insert(n, slot);
+            fields.insert("backtrace_id".into(), n.into());
+            fields.insert("backtrace".into(), "(symbolised when read)".into());
+        }
     } else {
         fields.insert(
             "backtrace".into(),
