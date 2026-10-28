@@ -271,10 +271,13 @@ of guessing with a fixed sleep.
 **Parameters:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle`, `expression`, `event` |
-| `value` | string | no | Selector/text/URL to match; the JS expression (`expression`); or the Tauri event name (`event`). Not needed for `ipc_idle`/`network_idle` |
+| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle`, `expression`, `event`, `log` |
+| `value` | string | no | Selector/text/URL to match; the JS expression (`expression`); the Tauri event name (`event`); or the text a backend log line must contain (`log`). Not needed for `ipc_idle`/`network_idle` |
 | `expected` | any | no | For `expression`: the JSON value the expression must equal. Omit to wait for the expression to become truthy |
-| `since_ms` | number | no | For `event`: how far back (ms) to accept an already-fired event when the wait begins (default: 2000) |
+| `since_ms` | number | no | For `event` and `log`: how far back (ms) to accept an already-fired event or line when the wait begins (default: 2000) |
+| `level` | string | no | For `log`: minimum level (`trace`/`debug`/`info`/`warn`/`error`) |
+| `fields` | object | no | For `log`: the line's structured fields must also equal these (text compare, case-insensitive) |
+| `since_seq` | number | no | For `log`: only lines with sequence number ≥ this (overrides `since_ms`) — take it from `invoke_command {with_logs:true}`'s `backend_log_cursor` before the work starts |
 | `timeout_ms` | number | no | Max wait time in ms (default: 10000) |
 | `poll_ms` | number | no | Poll interval in ms (default: 200) |
 
@@ -285,6 +288,10 @@ of guessing with a fixed sleep.
 - **`event`** — blocks until a named Tauri event fires (evaluated against the captured
   event bus, with a `since_ms` look-back). The app must emit the event and Victauri must
   capture it via `VictauriBuilder::listen_events`. Returns `{ ok, event, elapsed_ms }`.
+- **`log`** — blocks until the Rust backend logs a line containing `value` (case-insensitive,
+  over message, target, fields and spans), at or above `level`. Edge-triggered: the waiter
+  wakes the moment the line is captured. Needs backend log capture — see
+  [Backend Logs](./backend-logs.md).
 
 **Example:**
 ```json
@@ -292,9 +299,10 @@ of guessing with a fixed sleep.
 {"condition": "url", "value": "/dashboard"}
 {"condition": "expression", "value": "(await window.__TAURI_INTERNALS__.invoke('get_status')).running === false", "timeout_ms": 30000}
 {"condition": "event", "value": "analysis-complete", "timeout_ms": 30000}
+{"condition": "log", "value": "pipeline complete", "level": "info", "timeout_ms": 30000}
 ```
 
-The robust async pattern is `invoke_command(...)` then `wait_for(expression|event, ...)`.
+The robust async pattern is `invoke_command(...)` then `wait_for(expression|event|log, ...)`.
 
 ---
 
@@ -671,7 +679,10 @@ Access all captured logs from the application.
 | `events` | `since` | Event stream |
 | `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
 | `clear` | — | Clear the IPC + network logs (per-test isolation) |
-| `filter` | string | no | `network`: URL substring filter |
+| `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Page forward with the returned `next_seq` |
+| `backend_digest` | — | Start here: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic |
+| `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited |
+| `filter` | string | no | `network`: URL substring filter; `backend`/`stdout`: case-insensitive text match |
 | `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |
 
 **Example:**
@@ -679,7 +690,11 @@ Access all captured logs from the application.
 {"action": "console", "level": "error"}
 {"action": "network"}
 {"action": "slow_ipc", "threshold_ms": 100}
+{"action": "backend_digest"}
+{"action": "backend", "level": "warn", "target": "my_app::db", "filter": "timeout"}
 ```
+
+The `backend*` and `stdout` actions need a capture source — see [Backend Logs](./backend-logs.md).
 
 > `ipc`/`network`/`slow_ipc` return at most 100 entries by default and truncate
 > large per-entry bodies (4 KB) — pass an explicit `limit` for more.

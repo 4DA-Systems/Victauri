@@ -160,6 +160,38 @@ Output is the tool's result as JSON on stdout (`--raw` for one line). Exit codes
 `<stem>-2.<ext>`, … Piping into a reader that stops early (`| head`) is a clean exit. With no
 app running, `victauri tools` still lists the built-in tool names and descriptions.
 
+### `victauri logs` / `victauri run`
+
+The Rust backend's own log — what you would watch in the app's debug console — from the
+terminal. `victauri logs` reads the running app's captured backend log (structured entries from
+`tracing` / `log`, plus panics, which are captured with zero setup):
+
+```bash
+victauri logs --digest                 # counts, repeated messages, recent problems, panics
+victauri logs --level warn -n 50       # the last 50 warnings and errors
+victauri logs --target app::db --grep timeout
+victauri logs --follow --level warn    # one line per new warning — monitor-friendly
+victauri logs --json                   # raw records
+```
+
+`victauri run -- <command>` launches the app (or its dev command) with stdout/stderr captured —
+no app changes, any logger, `println!`, native libraries, build errors — and records how the
+process exited (code, signal or Windows NTSTATUS, decoded, with its last stderr lines). The
+capture survives a crash, so `victauri logs --stdout` shows the last words of an app that is
+gone:
+
+```bash
+victauri run -- npm run tauri dev
+victauri logs --stdout --follow
+```
+
+Structured capture needs one line in the app's logging setup — `.with(victauri_plugin::log_layer())`
+on a `tracing_subscriber` registry, or `victauri_plugin::log_logger()` for `log` / `tauri-plugin-log`.
+See the [Backend Logs guide](../../docs/src/backend-logs.md). Captures are written owner-only to
+a `console` directory under the private per-user Victauri directory (never a shared temp dir);
+log text is printed one entry per line with control and bidi characters escaped, so app output
+cannot drive your terminal or forge CI annotations.
+
 ### `victauri coverage`
 
 Report IPC command coverage — which registered commands your tests exercise.

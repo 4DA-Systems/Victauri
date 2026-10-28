@@ -1206,8 +1206,35 @@ immediately (often `null`) while the real work runs. Don't poll by hand or sprin
   fires, with a `since_ms` look-back so an event emitted in the gap after your `invoke_command`
   is still caught: `wait_for { condition: "event", value: "analysis-complete" }`. (Custom events
   must be registered via `VictauriBuilder::listen_events(&["…"])`.)
+- **Completion log line:** `wait_for` with `condition: "log"` blocks until the Rust backend
+  logs a line containing `value` (optional minimum `level`) — it wakes the instant the line is
+  logged: `wait_for { condition: "log", value: "sync complete" }`. Works for any app whose
+  backend log Victauri captures (see below).
 
-The robust pattern is `invoke_command(...)` then `wait_for(expression|event, ...)` — never a bare sleep.
+The robust pattern is `invoke_command(...)` then `wait_for(expression|event|log, ...)` — never a bare sleep.
+
+### The Rust backend's log (what the app prints to its console)
+
+The `logs` tool reads the **Rust side** too — the debug console a human would watch:
+- `logs { action: "backend_digest" }` — **start here** when something is off: per-level counts,
+  repeated messages collapsed into templates, recent warnings/errors, and every captured panic
+  (including panics on background threads that otherwise only reach stderr).
+- `logs { action: "backend", level: "warn", target: "my_app::db", filter: "timeout" }` —
+  structured entries (typed fields, span context, thread, file:line). Page forward with the
+  returned `next_seq` → `since_seq`.
+- `invoke_command { command, args, with_logs: true }` — the command's result **plus** the backend
+  log lines emitted while it ran, in one call.
+- `logs { action: "stdout" }` — raw stdout/stderr when the app was started with
+  `victauri run -- <dev command>`; after a crash, `victauri logs --stdout` (terminal) shows the
+  last words and the decoded exit status even though the app is gone.
+- Live monitoring from a terminal: `victauri logs --follow --level warn` prints one line per new
+  warning/error — hand it to a line-streaming monitor to be notified as they happen.
+
+Panics are captured automatically. Structured capture needs one line in the app's logging setup
+(`.with(victauri_plugin::log_layer())` on a `tracing_subscriber` registry, or
+`victauri_plugin::log_logger()` chained into `tauri-plugin-log`/fern); without it, launch the app
+via `victauri run` to capture its raw console with zero code changes. If `backend*` returns a
+`hint` saying no source is active, relay that one-line fix rather than grepping log files.
 
 ### Reading app-specific backend state
 
