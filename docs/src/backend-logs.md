@@ -145,7 +145,8 @@ registry.init();
   writing a crash log) is never delayed by Victauri's. An app that installs a hook *later*
   without chaining replaces Victauri's; `sources.panic_hook` then still says it was installed.
   The first 20 panics carry a backtrace: its frames are captured on the panicking thread, but
-  symbolised (the slow part) only when an agent reads the entry.
+  symbolised (the slow part) only when an agent reads the entry. On Windows that needs the
+  binary's `.pdb` beside it (as for any Rust backtrace): a copied `.exe` shows `<unknown>` frames.
 - **Secrets.** Backend logs can contain whatever the app logs. Output passes through the same
   redaction as every other tool — on in the `Observe` and `Test` privacy profiles and with
   `strict_privacy_mode()`, off in the default `FullControl` profile — including `key=value`

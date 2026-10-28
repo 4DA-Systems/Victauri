@@ -296,14 +296,8 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     });
     let first = backend.logs(args.clone()).await?;
     let sources = &first["sources"];
-    // Where this app's raw output is captured (when run under `victauri run`): after a
-    // crash that file still holds its last words and exit status. The path comes from the
-    // server, so it is only followed when it is one of OUR captures — never an arbitrary file
-    // shown as the app's output.
-    let capture_path = sources["stdout_capture_path"]
-        .as_str()
-        .map(PathBuf::from)
-        .filter(|p| crate::run::is_own_capture(p));
+    // After a crash, the `victauri run` capture still holds the app's last words and exit status.
+    let mut capture_path = own_capture_path(&first);
     let structured = sources["tracing"] == true || sources["log"] == true;
     if !structured && sources["stdout_capture"] == true {
         eprintln!("victauri logs: no structured source in this app — reading its captured stdout");
@@ -357,6 +351,9 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
                 "victauri logs: app restarted — following the new process {}",
                 clean(&l)
             );
+            // The new process writes its own capture: a later crash must be read from THAT
+            // file, not the previous process's.
+            capture_path = own_capture_path(&page);
         } else {
             eprintln!(
                 "victauri logs: app was unresponsive for {:.1}s — resumed",
@@ -368,6 +365,16 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         backend = b;
         label = l;
     }
+}
+
+/// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
+/// response's `sources`. The path comes from the server, so it is only used when it is one
+/// of OUR captures — never an arbitrary file shown as the app's output.
+fn own_capture_path(page: &Value) -> Option<PathBuf> {
+    page["sources"]["stdout_capture_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| crate::run::is_own_capture(p))
 }
 
 struct Reattached {
@@ -691,6 +698,25 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capture_path_is_used_only_when_it_is_our_own_capture() {
+        let Some(dir) = crate::run::capture_dir() else {
+            return;
+        };
+        let ours = dir.join(format!("test-{}.jsonl", std::process::id()));
+        std::fs::write(&ours, "").unwrap();
+        let page = |p: &std::path::Path| json!({"sources": {"stdout_capture_path": p}});
+        assert_eq!(own_capture_path(&page(&ours)), Some(ours.clone()));
+        // A file outside the private capture directory (the server could name anything).
+        let elsewhere =
+            std::env::temp_dir().join(format!("victauri-not-ours-{}.jsonl", std::process::id()));
+        std::fs::write(&elsewhere, "").unwrap();
+        assert_eq!(own_capture_path(&page(&elsewhere)), None);
+        assert_eq!(own_capture_path(&json!({"sources": {}})), None);
+        let _ = std::fs::remove_file(&ours);
+        let _ = std::fs::remove_file(&elsewhere);
+    }
 
     #[test]
     fn render_entry_is_one_readable_line() {
