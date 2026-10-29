@@ -757,8 +757,13 @@ jobs:
         working-directory: crates/victauri-plugin/tests/bridge_tests
         run: npm ci --no-audit --no-fund
 
+      # The E2E tests are built HERE, before the app starts: building them relinks the demo binary
+      # (dev-dependency features), and a binary (or, on Windows, the PDB of the copy that runs)
+      # replaced under the running app leaves its panic backtraces unreadable (`<unknown>` frames).
       - name: Build demo app
-        run: cargo build -p demo-app
+        run: |
+          cargo build -p demo-app
+          cargo test -p demo-app --test integration --no-run
 
       # The app's stderr is CAPTURED, not discarded. When the host dies mid-suite, the test only
       # reports "connection refused" — the actual cause (e.g. glibc's `malloc(): unaligned tcache
