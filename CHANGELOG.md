@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.2] - 2026-10-28
+## [0.10.2] - 2026-10-30
 
 ### Added — backend (Rust) log capture: the app's debug console, for agents
 
