@@ -787,9 +787,13 @@ jobs:
         run: |
           # Run a COPY so the later `cargo test` is free to relink
           # target\debug\demo-app.exe — Windows can't remove a running .exe, which
-          # otherwise fails the E2E step with "Access is denied".
-          Copy-Item .\target\debug\demo-app.exe .\target\debug\demo-app-run.exe -Force
-          $proc = Start-Process -FilePath .\target\debug\demo-app-run.exe -PassThru
+          # otherwise fails the E2E step with "Access is denied". The copy runs from its OWN
+          # directory with its own copy of the PDB: rustc embeds only the PDB's file name, so a
+          # copy beside target\debug reads the PDB of whatever a later build links there, and its
+          # panic backtraces come out as `<unknown>`.
+          New-Item -ItemType Directory -Force .\target\demo-run | Out-Null
+          Copy-Item .\target\debug\demo-app.exe, .\target\debug\demo_app.pdb .\target\demo-run\ -Force
+          $proc = Start-Process -FilePath .\target\demo-run\demo-app.exe -PassThru
           "APP_PID=$($proc.Id)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
       - name: Victauri smoke tests
