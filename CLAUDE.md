@@ -211,6 +211,28 @@ job's `continue-on-error`) — fixed by the bump, and the bump script now fails 
 step and checks that lockfile with `--locked`. LESSON: a CI watcher must read every job, not the
 run conclusion, or a non-required red job hides.
 
+**Live verification of the candidate (2026-10-29) found two more real bugs, both fixed:**
+(1) cursor reads (`logs backend` / `stdout` with `since_seq`) returned the NEWEST `limit` matches
+and a `next_seq` at the buffer end, so a follower more than one page behind silently lost the
+middle of a burst — they now page forward (oldest first, `next_seq` just past the page);
+fail-first: a reader 10 behind paging by 3 got 3 of 10. Found by a 3-min, 34.5k-call soak against
+4DA: one `wait_for log` timed out — counting the logged trigger lines (1,471 = every call made)
+plus a 24 s stretch with no trigger line showed a 4DA-side stall, NOT a lost wake-up, and reading
+that window by cursor exposed the paging bug. (2) `victauri logs --follow` re-attached after a
+restart but kept the FIRST process's capture path, so the second process's crash printed nothing
+→ re-read from the new process's `sources`. Evidence, all live on Windows: demo E2E 31/31 (incl.
+the symbolised-backtrace assertion — a COPIED `.exe` shows `<unknown>` frames because rustc embeds
+only the PDB file name; docs note it); release `demo-app` with the `log_layer()` line is 29,696 B
+SMALLER than without and contains none of the capture strings (probe validated on the debug
+build, which has them); tokio-console deadlock test hangs at the 20 s bound on pre-fix `e39a738`
+under `--cfg tokio_unstable` and passes on the fix; `victauri run` capture in the private
+`console` dir, relative `--capture` made absolute; 4DA second GUI (identifier
+`com.4da.app.vic0102`, port 4448, scratch DB snapshot, `fourda://` key backed up + restored
+byte-identical, operator's 4DA untouched): digest/filters/typed fields/`with_logs` (success +
+error)/`wait_for log`/CLI digest+filters on real 4DA tracing, 381 entries paged by 7 identical to
+one full read. Gate on `296e996`: fmt, clippy ×3, rustdoc, 2,186 workspace tests / 0 failed,
+preflight.
+
 ### v0.10.1 — PUBLISHED 2026-10-27
 
 PR #87 squash-merged as `e892ce1` (crate code byte-identical to the CI-green head `929b900`, 26/26;
