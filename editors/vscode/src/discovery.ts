@@ -80,11 +80,14 @@ export async function discoveryRoots(): Promise<string[]> {
 //   Administrators and the user access to a profile, so no other non-admin user can plant
 //   anything there — the check would cost a PowerShell start for nothing;
 // - anywhere else, the owner is read with PowerShell's `Get-Acl` (one call for a batch of
-//   directories, 10 s timeout) and must be the current user, the token's default owner, or
-//   `BUILTIN\Administrators` when this token is a member — the plugin writer's own rule. The
-//   verdict is cached per directory identity (inode + birth time), so a recreated directory is
-//   checked again. It fails CLOSED: if PowerShell cannot run, such a directory is not trusted
-//   (set `victauri.port` + `victauri.authToken` explicitly in that environment).
+//   directories, 30 s timeout — a cold Windows PowerShell start has been measured above 10 s on
+//   a CI runner) and must be the current user, the token's default owner, or
+//   `BUILTIN\Administrators` when this token is a member — the plugin writer's own rule. A
+//   definite verdict is cached per directory identity (inode + birth time), so a recreated
+//   directory is checked again. It fails CLOSED: if PowerShell cannot run, times out or answers
+//   garbage, such a directory is not trusted for that scan — and that failure is NOT cached, so
+//   the next scan asks again instead of distrusting the app's directory for as long as it lives
+//   (set `victauri.port` + `victauri.authToken` explicitly where PowerShell cannot run).
 
 export interface OwnerCheckOptions {
   /** The profile directory treated as private (default `os.homedir()`); tests override it. */
@@ -130,8 +133,12 @@ export function ownerCheckEnv(
   return env;
 }
 
-/** Ask PowerShell whether each of `dirs` is owned by the current user; all-false on failure. */
-function queryOwners(dirs: string[]): Promise<boolean[]> {
+/**
+ * Ask PowerShell whether each of `dirs` is owned by the current user. `null` when there is no
+ * definite answer — PowerShell failed to run or timed out, or its output did not parse or did not
+ * answer every directory: the caller then trusts none of them for now and does not cache it.
+ */
+function queryOwners(dirs: string[]): Promise<boolean[] | null> {
   const systemRoot = process.env.SystemRoot || "C:\\Windows";
   const ps = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   return new Promise((resolve) => {
@@ -140,17 +147,20 @@ function queryOwners(dirs: string[]): Promise<boolean[]> {
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", OWNER_SCRIPT],
       {
         env: ownerCheckEnv(process.env, dirs),
-        timeout: 10_000,
+        timeout: 30_000,
         windowsHide: true,
       },
       (err, stdout) => {
-        if (err) return resolve(dirs.map(() => false));
+        if (err) return resolve(null);
         try {
           const parsed: unknown = JSON.parse(String(stdout).trim());
           const arr = Array.isArray(parsed) ? parsed : [parsed];
-          resolve(dirs.map((_, i) => arr[i] === true));
+          if (arr.length !== dirs.length || arr.some((v) => typeof v !== "boolean")) {
+            return resolve(null);
+          }
+          resolve(arr as boolean[]);
         } catch {
-          resolve(dirs.map(() => false));
+          resolve(null);
         }
       }
     );
@@ -186,10 +196,14 @@ async function windowsOwnedDirs(
   }
   if (pending.length > 0) {
     const verdicts = await queryOwners(pending.map((p) => p.dir));
-    pending.forEach(({ dir, id }, i) => {
-      ownerVerdicts.set(dir, { id, trusted: verdicts[i] });
-      if (verdicts[i]) trusted.add(dir);
-    });
+    // No definite answer: trust none of them now (fail closed), but cache nothing — one slow
+    // or failed PowerShell start must not distrust the app's directory for as long as it lives.
+    if (verdicts !== null) {
+      pending.forEach(({ dir, id }, i) => {
+        ownerVerdicts.set(dir, { id, trusted: verdicts[i] });
+        if (verdicts[i]) trusted.add(dir);
+      });
+    }
   }
   return trusted;
 }

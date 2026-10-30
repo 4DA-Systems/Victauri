@@ -14,6 +14,11 @@ only tools and the discovery format that are unchanged since 0.9.0).
   failed closed. Every such directory was untrusted, so the app was never found (the default
   `%LOCALAPPDATA%\Temp`, inside your profile, needs no check and was not affected). The check now
   runs Windows PowerShell without the inherited `PSModulePath`.
+- **Windows: one slow or failed ownership check no longer distrusts the app for good.** A cold
+  Windows PowerShell start can take more than the old 10 s limit (measured on a CI runner), and
+  that failure was cached for the life of the app's discovery directory, so the extension never
+  connected until the app restarted. Failures are now not cached: they fail closed for that scan
+  and the next scan asks again. The limit is now 30 s.
 - **Dependencies:** the extension's development-only dependencies were updated to clear OSV
   advisories (#88). Nothing in the packaged extension changes because of this: it bundles only
   its own code (`dist/extension.js`).

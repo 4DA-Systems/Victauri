@@ -205,6 +205,35 @@ test("windows: the owner check works with PowerShell 7's module path inherited",
   }
 });
 
+// 0.10.2 (found by CI's first Windows run): a cold Windows PowerShell start passed the old 10 s
+// timeout, and the failure was cached — the app's directory stayed untrusted for its lifetime.
+test("windows: a failed owner check fails closed but is retried, not cached", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("windows only");
+    return;
+  }
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "victauri-vsc-retry-"));
+  const opts = { profileDir: "Z:\\victauri-no-such-profile" };
+  try {
+    const mine = path.join(root, "401");
+    fs.mkdirSync(mine);
+    const savedRoot = process.env.SystemRoot;
+    process.env.SystemRoot = "Z:\\victauri-no-such-windows"; // PowerShell cannot start
+    try {
+      assert.equal(await dirIsTrusted(mine, opts), false, "no answer: not trusted");
+    } finally {
+      process.env.SystemRoot = savedRoot;
+    }
+    assert.equal(
+      await dirIsTrusted(mine, opts),
+      true,
+      "the failed check must not be cached: the next scan asks again"
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // R5B-LINDISC1: the plugin falls back to a per-user root under the home directory when the
 // predictable `<temp>/victauri-<uid>` was taken over by another user; the extension must scan it.
 test("homeStateRoot: $XDG_STATE_HOME/victauri, else ~/.local/state/victauri", () => {
