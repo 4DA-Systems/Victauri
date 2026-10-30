@@ -1032,8 +1032,9 @@ pub struct ActiveSources {
     pub panic_hook: bool,
     /// The app runs under `victauri run` (raw stdout/stderr captured out-of-process).
     pub stdout_capture: bool,
-    /// [`log_layer`], [`log_logger`] or [`wrap_logger`] was called in this process — a
-    /// structured source exists even when the app's own filter has let nothing reach it yet.
+    /// [`log_layer`], [`log_logger`] or [`wrap_logger`] was called in this process: the app
+    /// built a structured source, which may still deliver nothing (its own filter drops every
+    /// record, or the install failed because another logger/subscriber was already set).
     pub structured_installed: bool,
 }
 
@@ -1790,6 +1791,22 @@ pub fn read_console_capture(
     from: Option<u64>,
     tail_bytes: u64,
 ) -> std::io::Result<(Vec<ConsoleLine>, u64)> {
+    read_console_capture_window(path, from, tail_bytes, CONSOLE_READ_WINDOW)
+        .map(|(lines, next, _)| (lines, next))
+}
+
+/// Most bytes of a console capture one read takes (a capture rotates at 64 MB).
+pub const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
+
+/// [`read_console_capture`] that also says whether the read stopped at its `window` with more
+/// of the file left: a cursor reader must then read on from the returned offset even when no
+/// line limit was hit. A record still being written at the end of the file does not count.
+pub fn read_console_capture_window(
+    path: &std::path::Path,
+    from: Option<u64>,
+    tail_bytes: u64,
+    window: u64,
+) -> std::io::Result<(Vec<ConsoleLine>, u64, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
@@ -1800,7 +1817,8 @@ pub fn read_console_capture(
     }
     file.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
-    file.take(16 * 1024 * 1024).read_to_end(&mut buf)?;
+    file.take(window).read_to_end(&mut buf)?;
+    let more = start + (buf.len() as u64) < len;
     let mut lines = Vec::new();
     let mut offset = start;
     let mut consumed = 0usize;
@@ -1825,7 +1843,10 @@ pub fn read_console_capture(
             lines.push(line);
         }
     }
-    Ok((lines, start + consumed as u64))
+    // A window without one complete record (not a `victauri run` capture, whose records are
+    // capped far below it) must not ask for an immediate re-read of the same offset.
+    let more = more && consumed > 0;
+    Ok((lines, start + consumed as u64, more))
 }
 
 /// Best-effort level detection for a plain console line (`tracing`'s

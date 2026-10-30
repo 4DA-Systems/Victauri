@@ -480,8 +480,11 @@ fn panic_push_waits_for_another_holder_but_never_self_deadlocks() {
 /// tokio-console setups (`--cfg tokio_unstable` + Tokio's `tracing` feature) trace every waker
 /// clone while Tokio holds a `Notify`'s waiter lock. Capturing that event and waking waiters
 /// from it re-entered the lock and froze every logging thread of the app. In a normal build
-/// Tokio emits nothing and this passes trivially; build it with
-/// `RUSTFLAGS="--cfg tokio_unstable"` to exercise the real interleaving.
+/// Tokio emits nothing and this passes trivially. To exercise the real interleaving, build with
+/// `RUSTFLAGS="--cfg tokio_unstable"` AND run with `VICTAURI_LOG_LEVEL=trace` (the waker events
+/// are TRACE, below the default capture level) — and run this test alone, since the capture
+/// level is read once per process. CI's "tokio-console configuration" step does exactly that;
+/// with both defences removed it hangs at the 20 s bound there.
 #[test]
 fn waking_a_log_waiter_survives_tokio_tracing_its_own_wakers() {
     let buf = Arc::new(LogBuffer::default());
@@ -655,6 +658,62 @@ fn console_capture_reader_resumes_from_offsets_and_skips_partial_records() {
     assert_eq!(more.len(), 1);
     assert_eq!(more[0].text, "partial");
     assert_eq!(more[0].offset, next);
+}
+
+/// Release review: a cursor read stops at its byte window (16 MiB), and `logs stdout` reported
+/// `truncated: false` whenever the LINE limit was not hit — on a 40 MB capture an agent read
+/// the first window, saw nothing truncated, and never reached the panic further on. The reader
+/// now says when it stopped at the window with more of the file after it.
+#[test]
+fn a_cursor_read_cut_by_its_window_says_there_is_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("console.jsonl");
+    let record = |i: usize| format!("{{\"t\":{i},\"s\":\"out\",\"l\":\"line {i:03}\"}}\n");
+    let body: String = (0..10).map(record).collect();
+    std::fs::write(&path, &body).unwrap();
+    // A window of about three records: page through the file by the returned cursor.
+    let window = (record(0).len() * 3 + 5) as u64;
+    let (mut cursor, mut seen, mut reads) = (0_u64, Vec::new(), 0);
+    loop {
+        let (lines, next, more) =
+            read_console_capture_window(&path, Some(cursor), 0, window).unwrap();
+        reads += 1;
+        assert!(
+            next > cursor || !more,
+            "a read that says `more` must advance"
+        );
+        seen.extend(lines.into_iter().map(|l| l.text));
+        cursor = next;
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        (0..10).map(|i| format!("line {i:03}")).collect::<Vec<_>>()
+    );
+    assert!(
+        reads >= 4,
+        "the window cut the file into pages ({reads} reads)"
+    );
+
+    // The end of the file is not "more", even with a record still being written there.
+    std::fs::write(
+        &path,
+        format!("{body}{{\"t\":99,\"s\":\"out\",\"l\":\"partial"),
+    )
+    .unwrap();
+    let (_, next, more) =
+        read_console_capture_window(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(!more, "an unterminated last record is not more to read");
+    assert_eq!(next, body.len() as u64);
+
+    // A window smaller than one record consumes nothing: it must not ask for a re-read of
+    // the same offset (a follower would spin on it).
+    let (lines, next, more) = read_console_capture_window(&path, Some(0), 0, 4).unwrap();
+    assert!(lines.is_empty());
+    assert_eq!(next, 0);
+    assert!(!more);
 }
 
 #[test]

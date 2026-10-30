@@ -190,8 +190,9 @@ victauri logs --stdout --follow
 Structured capture needs one line in the app's logging setup — `.with(victauri_plugin::log_layer())`
 on a `tracing_subscriber` registry, or `victauri_plugin::log_logger()` for `log` / `tauri-plugin-log`.
 See the [Backend Logs guide](https://github.com/4DA-Systems/victauri/blob/main/docs/src/backend-logs.md).
-`--follow` re-attaches when the app restarts (a `tauri dev` rebuild) and, when it is gone for
-good, prints its last words and exit status from the capture. Captures are written owner-only
+`--follow` re-attaches when the app restarts (a `tauri dev` rebuild) — first printing how the
+previous process ended when it had its own `victauri run` capture — and, when the app is gone
+for good, prints its last words and exit status from its capture. Captures are written owner-only
 to a `console` directory under the private per-user Victauri directory (never a shared temp
 dir); log text is printed one entry per line with control and bidi characters escaped, so app
 output cannot drive your terminal or forge CI annotations.

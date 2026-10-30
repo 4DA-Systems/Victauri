@@ -139,9 +139,11 @@ pub struct WaitForParams {
     /// match YOUR run's completion line, not a concurrent run of the same code path.
     pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     /// For the `log` condition: only entries with sequence number >= this count
-    /// (overrides `since_ms`). Take it from `invoke_command {with_logs:true}`'s
-    /// `backend_log_cursor` (or any `logs backend` call's `next_seq`) BEFORE the work
-    /// starts, so a previous run's identical line can never satisfy the wait.
+    /// (overrides `since_ms`). Take it BEFORE the work starts, so a previous run's
+    /// identical line can never satisfy the wait: `invoke_command {with_logs:true}`'s
+    /// `backend_log_cursor`, or the `next_seq` of a `logs backend` read made WITHOUT
+    /// `since_seq` (the end of the buffer). Not the `next_seq` of a cursor read whose
+    /// `truncated` is true: that one continues a page and points at older entries.
     pub since_seq: Option<u64>,
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]

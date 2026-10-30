@@ -25,8 +25,11 @@ victauri logs --stdout                 # the `victauri run` capture — works af
 
 `--follow` survives a busy app and a restart: when a read fails it re-resolves the app through
 discovery for up to 20 s (a `tauri dev` rebuild comes back with a new token and port) and then
-follows the new process. If the app is gone for good, it switches to that app's `victauri run`
-capture to print its last words and exit status.
+follows the new process — first printing how the previous one ended (its exit record and last
+stderr lines, and any warning or error) when that process had its own `victauri run` capture.
+If the app is gone for good, it switches to that app's `victauri run` capture to print its last
+words and exit status; an app not launched with `victauri run` has no capture, and the follower
+says so rather than showing another app's.
 
 ## Capture sources
 

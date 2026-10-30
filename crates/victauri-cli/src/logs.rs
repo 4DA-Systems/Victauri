@@ -315,9 +315,13 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     let sources = &first["sources"];
     // After a crash, the `victauri run` capture still holds the app's last words and exit status.
     let mut capture_path = own_capture_path(&first);
-    let structured = sources["tracing"] == true || sources["log"] == true;
-    if !structured && sources["stdout_capture"] == true {
+    if !follows_structured(sources) && sources["stdout_capture"] == true {
         eprintln!("victauri logs: no structured source in this app — reading its captured stdout");
+        if opts.target.is_some() {
+            eprintln!(
+                "victauri logs: --target is ignored for raw stdout lines (they carry no target)"
+            );
+        }
         return follow_stdout_via_app(&backend, &opts, capture_path).await;
     }
     if let Some(hint) = first["hint"].as_str() {
@@ -336,19 +340,30 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     // A cursor read returns the OLDEST entries after the cursor, `truncated` when more are
     // waiting: read the rest at once instead of one page per poll interval.
     let mut behind = false;
+    // When the app last answered: what a dying process printed after this is its final moments.
+    let mut last_ok_ms = now_ms();
+    // Which process answered the last page (absent from plugins that do not report it).
+    let mut pid = page_pid(&first);
     loop {
         if !behind {
             tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
         }
         args["since_seq"] = cursor.into();
         args["limit"] = 2000.into();
-        if let Ok(page) = backend.logs(args.clone()).await {
-            if page["gap"] == true {
-                eprintln!("victauri logs: [some entries were evicted before they could be read]");
-            }
+        // A page from a NEW process behind the same port and token (a fixed token, or auth off)
+        // is handled below as a restart, not printed as more of the old one — the new process's
+        // entries below the old cursor would otherwise be skipped silently.
+        // Taken before the request: the server reads the buffer after this moment, so nothing
+        // printed after it can have been in the page.
+        let asked_ms = now_ms();
+        if let Ok(page) = backend.logs(args.clone()).await
+            && !is_new_process(&page, cursor, pid)
+        {
+            warn_gap(&page);
             print_page(&page, &opts);
             cursor = page["next_seq"].as_u64().unwrap_or(cursor);
             behind = page["truncated"] == true;
+            last_ok_ms = asked_ms;
             continue;
         }
         // Taken at the FIRST failed poll: the crash's last words are just before this moment
@@ -364,30 +379,108 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             label: l,
             page,
             restarted,
-        }) = reattach(&opts, &args, cursor, &label, Duration::from_secs(20)).await
+        }) = reattach(&opts, &args, cursor, &label, pid, Duration::from_secs(20)).await
         else {
             eprintln!("victauri logs: app went away (crashed, closed or rebuilding)");
             return hand_off_to_capture(&opts, capture_path.clone(), went_away_ms).await;
         };
         if restarted {
+            // The new process writes its own capture: a later crash must be read from THAT
+            // file, not the previous process's — and the previous one's capture is the only
+            // record of how it ended (its fatal panic rarely reaches a poll before it dies).
+            let new_capture = own_capture_path(&page);
+            if let Some(old) = capture_path.as_deref()
+                && new_capture.as_deref() != Some(old)
+            {
+                show_final_moments(&opts, old, last_ok_ms);
+            }
             eprintln!(
                 "victauri logs: app restarted — following the new process {}",
                 clean(&l)
             );
-            // The new process writes its own capture: a later crash must be read from THAT
-            // file, not the previous process's.
-            capture_path = own_capture_path(&page);
+            capture_path = new_capture;
         } else {
             eprintln!(
                 "victauri logs: app was unresponsive for {:.1}s — resumed",
                 stalled.elapsed().as_secs_f64()
             );
         }
+        warn_gap(&page);
         print_page(&page, &opts);
         cursor = page["next_seq"].as_u64().unwrap_or(0);
         behind = page["truncated"] == true;
+        last_ok_ms = now_ms();
+        pid = page_pid(&page);
         backend = b;
         label = l;
+    }
+}
+
+fn page_pid(page: &Value) -> Option<u64> {
+    page["sources"]["pid"].as_u64()
+}
+
+/// Whether a page came from a different process than the one followed so far: it reports
+/// another pid, or (from a plugin that reports none) its cursor went backwards — sequence
+/// numbers only go up within one process.
+fn is_new_process(page: &Value, cursor: u64, known_pid: Option<u64>) -> bool {
+    match (page_pid(page), known_pid) {
+        (Some(now), Some(before)) if now != before => true,
+        _ => went_backwards(page, cursor),
+    }
+}
+
+/// `--follow` reads the structured log when the app built a structured source — even one that
+/// has delivered nothing yet (an app that has not logged by the time `--follow` starts would
+/// otherwise be switched to raw stdout for good).
+fn follows_structured(sources: &Value) -> bool {
+    sources["tracing"] == true || sources["log"] == true || sources["structured_installed"] == true
+}
+
+/// Sequence numbers only go up within one process, so a `next_seq` below the cursor means the
+/// page came from a new process.
+fn went_backwards(page: &Value, cursor: u64) -> bool {
+    page["next_seq"].as_u64().is_some_and(|next| next < cursor)
+}
+
+fn warn_gap(page: &Value) {
+    if page["gap"] == true {
+        eprintln!("victauri logs: [some entries were evicted before they could be read]");
+    }
+}
+
+/// The records of a previous process's capture worth showing when the follower moves on to a
+/// restarted process: how it ended (its exit record, which carries its last stderr lines,
+/// always) and any warning or error it printed from `since_ts_ms` on — its last successful
+/// poll, so what the follower already printed is not repeated — that also passes the
+/// follower's own `--level` / `--grep`. Not its routine output.
+fn final_moments<'a>(lines: &'a [Value], since_ts_ms: u64, opts: &LogsOptions) -> Vec<&'a Value> {
+    let picked: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["t"].as_u64().unwrap_or(0) >= since_ts_ms)
+        .filter(|l| {
+            l["s"] == "exit"
+                || (l["level"]
+                    .as_str()
+                    .is_some_and(|lv| level_rank(lv) >= level_rank("warn"))
+                    && console_line_passes(l, opts))
+        })
+        .collect();
+    let keep = picked.len().saturating_sub(50);
+    picked[keep..].to_vec()
+}
+
+fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
+    let Ok((lines, _)) = read_capture(path, None) else {
+        return;
+    };
+    let picked = final_moments(&lines, since_ts_ms, opts);
+    if picked.is_empty() {
+        return;
+    }
+    eprintln!("victauri logs: how the previous process ended (from its `victauri run` capture):");
+    for l in picked {
+        emit(&render_console(l), opts.json, l);
     }
 }
 
@@ -409,13 +502,16 @@ struct Reattached {
 }
 
 /// Re-resolve the app through discovery until `max` passes, and read the log from `cursor`.
-/// A different process (the label carries the pid) or a sequence counter that went backwards
-/// means the app restarted: then the NEW process's log is read from its start.
+/// A different process means the app restarted — told by the label (which carries the pid
+/// when discovery knows it), the pid the page reports (the label has none when `VICTAURI_PORT`
+/// names a port without a discovery entry), or a sequence counter that went backwards: then the
+/// NEW process's log is read from its start.
 async fn reattach(
     opts: &LogsOptions,
     args: &Value,
     cursor: u64,
     old_label: &str,
+    known_pid: Option<u64>,
     max: Duration,
 ) -> Option<Reattached> {
     let deadline = std::time::Instant::now() + max;
@@ -427,8 +523,7 @@ async fn reattach(
         let Ok(page) = backend.logs(args.clone()).await else {
             continue;
         };
-        let counter_reset = page["next_seq"].as_u64().is_some_and(|next| next < cursor);
-        let restarted = label != old_label || counter_reset;
+        let restarted = label != old_label || is_new_process(&page, cursor, known_pid);
         let page = if restarted {
             let mut from_start = args.clone();
             from_start["since_seq"] = 0.into();
@@ -456,13 +551,21 @@ async fn hand_off_to_capture(
     capture_path: Option<PathBuf>,
     went_away_ms: u64,
 ) -> Result<()> {
-    let path = capture_path.or_else(crate::run::latest_capture);
-    if path.is_none() {
+    // Only the app's OWN capture. An app that reported none was not launched with `victauri
+    // run`, so the newest capture on disk belongs to some other app (or an older run) — showing
+    // it as this app's last words, or tailing a live one, would be wrong.
+    let Some(path) = capture_path else {
+        eprintln!(
+            "victauri logs: no capture of this app's last output to show — it was not launched \
+             with `victauri run` (`victauri run -- <dev command>` keeps one), or its capture was \
+             written outside Victauri's private directory with `--capture` (read that file with \
+             `victauri logs --capture <file>`)"
+        );
         return Ok(());
-    }
+    };
     follow_capture(
         opts,
-        path,
+        Some(path),
         Some(went_away_ms.saturating_sub(opts.interval_ms + 2000)),
         Some(Duration::from_secs(30)),
     )
@@ -580,7 +683,12 @@ async fn follow_stdout_via_app(
             args["limit"] = 2000.into();
             first = false;
         }
-        tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        // A cursor read pages forward: while `truncated`, more is already waiting — read it
+        // now, or a burst faster than one page per interval leaves the follower ever further
+        // behind (and a capture that rotates meanwhile loses the unread rest).
+        if page["truncated"] != true {
+            tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        }
     }
 }
 
@@ -739,6 +847,129 @@ mod tests {
         }
         let other = "no backend log source is active";
         assert_eq!(explain_logs_error(other), other);
+    }
+
+    /// Release review: an app that built `log_layer()` but had not logged yet when `--follow`
+    /// started was switched to raw stdout for good (its `tracing`/`log` bits were still unset).
+    #[test]
+    fn a_built_but_silent_source_keeps_the_structured_follow() {
+        let s = |tracing: bool, installed: bool| {
+            json!({"tracing": tracing, "log": false, "structured_installed": installed,
+                   "stdout_capture": true})
+        };
+        assert!(follows_structured(&s(true, true)));
+        assert!(
+            follows_structured(&s(false, true)),
+            "built, nothing delivered yet"
+        );
+        assert!(!follows_structured(&s(false, false)));
+        // A plugin from before the field existed: the old rule.
+        assert!(!follows_structured(
+            &json!({"tracing": false, "log": false})
+        ));
+    }
+
+    /// Release review: with a fixed token (or auth off), a restart on the same port between two
+    /// polls answered the old cursor with the new process's page, and the follower jumped its
+    /// cursor back without noticing — skipping the new process's first entries.
+    #[test]
+    fn a_cursor_that_went_backwards_is_a_new_process() {
+        assert!(went_backwards(&json!({"next_seq": 3}), 120));
+        assert!(!went_backwards(&json!({"next_seq": 120}), 120), "caught up");
+        assert!(!went_backwards(&json!({"next_seq": 121}), 120));
+        assert!(
+            !went_backwards(&json!({"error": "x"}), 120),
+            "no next_seq: not a restart"
+        );
+    }
+
+    /// Release review: a crash followed by a restart within the re-attach window showed only
+    /// "app restarted" — the crash itself was never shown. The previous process's capture is
+    /// read for how it ended: the exit record (with its last stderr lines) and any warning or
+    /// error from its final moments, not its routine output.
+    #[test]
+    fn final_moments_are_how_the_process_ended() {
+        let lines = vec![
+            json!({"t": 100, "s": "err", "l": "old warning", "level": "warn"}),
+            json!({"t": 1_000, "s": "out", "l": "routine", "level": "info"}),
+            json!({"t": 1_001, "s": "out", "l": "no level at all"}),
+            json!({"t": 1_002, "s": "err", "l": "thread 'main' panicked at src/x.rs", "level": "error"}),
+            json!({"t": 1_003, "s": "exit", "l": "exited with code 101", "tail": ["boom"]}),
+        ];
+        let all = opts_with(None, None);
+        let picked: Vec<&str> = final_moments(&lines, 900, &all)
+            .into_iter()
+            .map(|l| l["l"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            picked,
+            vec!["thread 'main' panicked at src/x.rs", "exited with code 101"],
+            "before the window, and routine lines, are left out"
+        );
+        let many: Vec<Value> = (0..80)
+            .map(|i| json!({"t": 2_000 + i, "s": "err", "l": format!("e{i}"), "level": "error"}))
+            .collect();
+        let tail = final_moments(&many, 0, &all);
+        assert_eq!(tail.len(), 50);
+        assert_eq!(tail[49]["l"], "e79", "the newest are kept");
+
+        // The follower's own --grep / --level apply too; the exit record always shows.
+        let warn_and_exit = vec![
+            json!({"t": 5, "s": "err", "l": "disk nearly full", "level": "warn"}),
+            json!({"t": 6, "s": "exit", "l": "exited with code 1"}),
+        ];
+        let errors_only = opts_with(Some("error"), None);
+        let picked: Vec<&str> = final_moments(&warn_and_exit, 0, &errors_only)
+            .into_iter()
+            .map(|l| l["l"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            picked,
+            vec!["exited with code 1"],
+            "--level error drops the warning"
+        );
+        let grep_other = opts_with(None, Some("database"));
+        assert_eq!(final_moments(&warn_and_exit, 0, &grep_other).len(), 1);
+    }
+
+    fn opts_with(level: Option<&str>, grep: Option<&str>) -> LogsOptions {
+        LogsOptions {
+            app: None,
+            level: level.map(str::to_string),
+            target: None,
+            grep: grep.map(str::to_string),
+            limit: 100,
+            follow: true,
+            digest: false,
+            stdout: false,
+            json: false,
+            capture: None,
+            interval_ms: 500,
+        }
+    }
+
+    /// Release review (second pass): a restart behind the same port and token was detected only
+    /// when the new process's cursor fell below the old one — a new process that logged past it
+    /// before the next poll was read as more of the old one. The plugin now reports its pid.
+    #[test]
+    fn a_page_from_another_pid_is_a_new_process() {
+        let page = |pid: u64, next: u64| json!({"next_seq": next, "sources": {"pid": pid}});
+        assert!(
+            is_new_process(&page(2, 500), 100, Some(1)),
+            "past the cursor, other pid"
+        );
+        assert!(
+            !is_new_process(&page(1, 500), 100, Some(1)),
+            "same process, more entries"
+        );
+        assert!(
+            is_new_process(&page(1, 3), 100, Some(1)),
+            "cursor went backwards"
+        );
+        // A plugin that reports no pid: the cursor rule alone.
+        let old = |next: u64| json!({"next_seq": next, "sources": {}});
+        assert!(!is_new_process(&old(500), 100, None));
+        assert!(is_new_process(&old(3), 100, None));
     }
 
     #[test]

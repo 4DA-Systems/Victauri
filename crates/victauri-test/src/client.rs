@@ -1751,8 +1751,10 @@ impl VictauriClient {
 
     /// Like [`Self::wait_for_log`], but only entries with sequence number >= `since_seq`
     /// count — take the cursor BEFORE starting the work (`backend_log_cursor` from
-    /// `invoke_command {with_logs:true}`, or `next_seq` from [`Self::backend_logs`]) so a
-    /// previous run's identical line can never satisfy the wait.
+    /// `invoke_command {with_logs:true}`, or the `next_seq` of a [`Self::backend_logs`]
+    /// read made without `since_seq`, which is the end of the buffer) so a previous run's
+    /// identical line can never satisfy the wait. A cursor read's `next_seq` is NOT safe
+    /// here when that read was `truncated`: it continues a page and points at older entries.
     ///
     /// # Errors
     ///
