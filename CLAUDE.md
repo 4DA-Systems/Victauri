@@ -184,9 +184,55 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-10-28)
+## Current State (2026-10-31)
 
-### v0.10.2 — release candidate (`release/0.10.2-prep`), five-lens audit, NOT published
+### v0.10.2 — PUBLISHED 2026-10-31
+
+PR #93 (`ef61ed1`) + PR #94 (`cfdd6b0`, tree == the CI-green, re-reviewed head `93fcdc4`). All six
+crates published LOCALLY from a clean worktree at `cfdd6b0` with an operator token (env-only,
+`cargo publish --workspace --no-verify --locked` after a token-less `--dry-run --locked` there),
+verified on crates.io + the sparse index; `cargo install victauri-cli --version 0.10.2 --locked`
+from crates.io verified live (35 tools + a read-only call on 4DA). Tag `v0.10.2` → release.yml run
+41130623324: publish step skipped the six live crates (`release` env approved), GitHub Release
+with 8 binaries + `SHA256SUMS` (Windows CLI checksum + `--version` verified). MCP Registry
+`io.github.4DA-Systems/victauri` 0.10.2 active + latest (`mcp-registry.yml`). Main CI on both
+merge commits 26/26. 4DA lock bump HELD until 4da-ea's src-tauri Cargo.lock chain lands (#1048
+rusqlite 0.40.2 — inside our `<0.41` range — #947, #949 still open on 10-31).
+
+**Final verification (2026-10-30/31), after a host restart, on the exact shipping tree, found
+real defects the five-lens audit had not** — all fixed with tests and proven live before/after:
+- *Fresh consumer from the packaged `.crate` files* (no lockfile → newest deps: tauri 2.12.5,
+  tokio 1.54.1, rusqlite 0.40.2; every documented logging recipe compiled verbatim and run live):
+  an installed-but-silent source (env_logger / `EnvFilter` from env with `RUST_LOG` unset =
+  error-only) was told to add the line it had → `sources.structured_installed` + a hint naming the
+  filter or a failed install.
+- *New CLI vs 4DA's 0.10.1 plugin (read-only)*: `victauri logs` printed a raw ``unknown variant
+  `backend` `` → names the older plugin.
+- *Three independent review passes over every post-audit change* (`ca32d01..`): `wait_for
+  since_seq` docs named an unsafe cursor (a truncated cursor read's `next_seq` points at OLDER
+  entries → false success); `logs stdout` reported `truncated:false` when cut by its 16 MiB window;
+  `--follow` lost a crash followed by a fast restart (now prints how the previous process ended),
+  missed a restart behind the same port + token (now by the `pid` every `sources` reports),
+  dropped re-attach gaps, slept between backlog pages in raw-stdout mode, abandoned structured mode
+  for a not-yet-logging app, and handed off to ANOTHER app's capture when the dead app had none.
+- The tokio-console deadlock CI guard was VACUOUS twice: it needs `--cfg tokio_unstable` AND
+  `VICTAURI_LOG_LEVEL=trace` (waker events are TRACE, below the default capture level). Measured:
+  with both defences removed it passed without the env, hung to the 20 s bound with it.
+- Live before/after (fresh consumer under `victauri run`, demo app as the "other app"): crash +
+  fast restart, same-port/token restart (cursor below and past the old one), no-capture hand-off,
+  20,000-line stdout burst (14.4 s → ~5 s, none lost), built-but-silent source, 20 MB capture
+  paged past 16 MiB. Release footprint re-measured on the final packages: debug 6/6 capture
+  strings, release 0/6. Gate on `93fcdc4`: clippy ×5 configs, rustdoc, 4,935 tests / 0 failed.
+
+Known, not fixed (pre-existing, fails safe): discovery liveness is PID-only — a stale entry from a
+hard-killed app whose PID Windows reused, naming the port the current app holds, passes `/health`,
+so `--app` selection refuses with "several apps" (seen only in a harness that hard-killed dozens of
+apps on one port). Hardening idea: confirm the PID through `/info`. Also: the
+`code_that_reached_the_page_gets_its_full_result_window` timing test (300 ms margin) and the
+pre-push gate can fail on a saturated machine (e.g. a concurrent `cargo install`) and pass on rerun;
+the Windows E2E smoke "DOM complete < 10000 ms" budget can miss on a cold runner (11.1 s seen).
+
+#### Candidate history
 
 Ships the backend (Rust) log capture merged as #92 (re-cut of draft #73) — `logs backend /
 backend_digest / stdout`, `wait_for log`, `invoke_command {with_logs}`, `victauri run`,
