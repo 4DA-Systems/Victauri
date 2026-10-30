@@ -111,6 +111,25 @@ const OWNER_SCRIPT = [
   "ConvertTo-Json -Compress -InputObject $out",
 ].join("; ");
 
+/**
+ * The environment for the Windows PowerShell 5.1 owner check. `PSModulePath` is dropped: a
+ * VS Code started from a PowerShell 7 terminal (`code .`) passes on pwsh's module path, and
+ * Windows PowerShell then loads PowerShell 7's incompatible `Microsoft.PowerShell.Security` —
+ * `Get-Acl` fails, and every directory outside the profile read as not owned (fail-closed, so
+ * the app was never found). Without the variable, 5.1 uses its own default module path.
+ */
+export function ownerCheckEnv(
+  base: NodeJS.ProcessEnv,
+  dirs: string[]
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (k.toLowerCase() !== "psmodulepath") env[k] = v;
+  }
+  env.VICTAURI_OWNER_PATHS = JSON.stringify(dirs);
+  return env;
+}
+
 /** Ask PowerShell whether each of `dirs` is owned by the current user; all-false on failure. */
 function queryOwners(dirs: string[]): Promise<boolean[]> {
   const systemRoot = process.env.SystemRoot || "C:\\Windows";
@@ -120,7 +139,7 @@ function queryOwners(dirs: string[]): Promise<boolean[]> {
       ps,
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", OWNER_SCRIPT],
       {
-        env: { ...process.env, VICTAURI_OWNER_PATHS: JSON.stringify(dirs) },
+        env: ownerCheckEnv(process.env, dirs),
         timeout: 10_000,
         windowsHide: true,
       },

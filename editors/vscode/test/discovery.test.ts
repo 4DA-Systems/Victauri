@@ -9,8 +9,10 @@ import * as path from "node:path";
 import { authProbeVerdict, healthStatusMeansAlive } from "../src/client";
 import {
   DiscoveredServer,
+  dirIsTrusted,
   discoveryRoots,
   homeStateRoot,
+  ownerCheckEnv,
   pidLiveness,
   resolveConnection,
   scanServers,
@@ -161,6 +163,44 @@ test("windows: a discovery directory owned by another account is not trusted", a
       "a planted entry's token must never be read"
     );
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// 0.10.2: Windows PowerShell 5.1 launched with PowerShell 7's PSModulePath (VS Code started
+// from a pwsh terminal) cannot load `Get-Acl`'s module, so every directory read as not owned.
+test("ownerCheckEnv drops PSModulePath, whatever its casing, and passes the paths", () => {
+  const env = ownerCheckEnv({ PSModulePath: "C:\\pwsh7\\Modules", psmodulepath: "x", PATH: "p" }, ["C:\\a"]);
+  assert.equal(Object.keys(env).some((k) => k.toLowerCase() === "psmodulepath"), false);
+  assert.equal(env.PATH, "p");
+  assert.equal(env.VICTAURI_OWNER_PATHS, JSON.stringify(["C:\\a"]));
+});
+
+test("windows: the owner check works with PowerShell 7's module path inherited", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("windows only");
+    return;
+  }
+  const ps7 = path.join(process.env.ProgramFiles || "C:\\Program Files", "PowerShell", "7", "Modules");
+  if (!fs.existsSync(ps7)) {
+    t.skip("PowerShell 7 is not installed");
+    return;
+  }
+  const saved = process.env.PSModulePath;
+  process.env.PSModulePath = [ps7, saved].filter(Boolean).join(";");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "victauri-vsc-ps7-"));
+  try {
+    const mine = path.join(root, "301");
+    fs.mkdirSync(mine);
+    // Outside the (overridden) profile, so the real owner check runs.
+    assert.equal(
+      await dirIsTrusted(mine, { profileDir: "Z:\\victauri-no-such-profile" }),
+      true,
+      "a directory this user created must be trusted"
+    );
+  } finally {
+    if (saved === undefined) delete process.env.PSModulePath;
+    else process.env.PSModulePath = saved;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

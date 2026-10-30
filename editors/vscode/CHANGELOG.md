@@ -2,6 +2,22 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.10.2
+
+Version-synced with the Victauri 0.10.2 release; works with plugins 0.9.x and 0.10.x (it uses
+only tools and the discovery format that are unchanged since 0.9.0).
+
+- **Windows: discovery works when VS Code was started from a PowerShell 7 terminal.** The
+  ownership check for a discovery directory outside your profile runs Windows PowerShell 5.1's
+  `Get-Acl`. Started from `pwsh` (`code .`), VS Code passes on PowerShell 7's `PSModulePath`,
+  5.1 then loads PowerShell 7's incompatible security module, `Get-Acl` fails, and the check
+  failed closed. Every such directory was untrusted, so the app was never found (the default
+  `%LOCALAPPDATA%\Temp`, inside your profile, needs no check and was not affected). The check now
+  runs Windows PowerShell without the inherited `PSModulePath`.
+- **Dependencies:** the extension's development-only dependencies were updated to clear OSV
+  advisories (#88). Nothing in the packaged extension changes because of this: it bundles only
+  its own code (`dist/extension.js`).
+
 ## 0.9.0
 
 Version-synced with the Victauri 0.9.0 release. Extension changes:
