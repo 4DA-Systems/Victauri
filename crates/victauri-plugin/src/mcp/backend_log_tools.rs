@@ -30,13 +30,17 @@ to the app's tracing_subscriber registry, or chain `victauri_plugin::log_logger(
 setup (tauri-plugin-log / fern) / wrap its logger with `victauri_plugin::wrap_logger(...)`. \
 Panics are captured automatically.";
 
-/// Guidance when a structured source IS installed but has received nothing: the app's own
-/// filter is dropping the records before Victauri sees them.
-pub(super) const FILTERED_HINT: &str = "A structured backend log source is installed \
-(`log_layer()` / `log_logger()` / `wrap_logger()`), but no record has reached it yet. The app's \
-own filter decides what it sees: an `EnvFilter` or `env_logger` built from the environment is \
-error-only while `RUST_LOG` is unset. Set `RUST_LOG` (e.g. `RUST_LOG=info`) or the filter string \
-in the app's logging setup, restart the app, and retry. Panics are captured either way.";
+/// Guidance when a structured source WAS BUILT but has received nothing. Victauri only knows
+/// the app called the constructor; the two causes it cannot tell apart are named both.
+pub(super) const FILTERED_HINT: &str = "The app built a structured backend log source \
+(`log_layer()` / `log_logger()` / `wrap_logger()`), but no record has reached it yet. Either \
+(1) the app's own filter drops everything it logs — an `EnvFilter` or `env_logger` built from \
+the environment is error-only while `RUST_LOG` is unset: set `RUST_LOG` (e.g. `RUST_LOG=info`) \
+or the filter string, restart the app, and retry; or (2) the source was never installed — \
+`log::set_boxed_logger(...)` / a subscriber's `try_init()` fails, and `.ok()` hides it, when a \
+logger or subscriber is already set (e.g. the `LogTracer` that `tracing_subscriber`'s `init()` \
+installs): add Victauri's line to the logger or subscriber the app actually installs. Panics \
+are captured either way.";
 
 /// The hint for "no structured source has delivered anything": add one, or fix the filter of
 /// the one that is already installed.
@@ -296,8 +300,13 @@ impl VictauriMcpHandler {
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_lowercase);
-        match backend_logs::read_console_capture(&path, params.since_seq, STDOUT_TAIL_BYTES) {
-            Ok((lines, next)) => {
+        match backend_logs::read_console_capture_window(
+            &path,
+            params.since_seq,
+            STDOUT_TAIL_BYTES,
+            backend_logs::CONSOLE_READ_WINDOW,
+        ) {
+            Ok((lines, next, more_in_file)) => {
                 let mut matched: Vec<_> = lines
                     .into_iter()
                     .filter(|l| {
@@ -314,7 +323,9 @@ impl VictauriMcpHandler {
                 json_result(&serde_json::json!({
                     "lines": matched,
                     "total_matched": total,
-                    "truncated": total > limit,
+                    // Cut by the line limit, or by the read window with more of the capture
+                    // after it: either way, read on from `next_seq`.
+                    "truncated": total > limit || (params.since_seq.is_some() && more_in_file),
                     "next_seq": next,
                     "path": path.to_string_lossy(),
                 }))

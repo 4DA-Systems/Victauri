@@ -657,6 +657,62 @@ fn console_capture_reader_resumes_from_offsets_and_skips_partial_records() {
     assert_eq!(more[0].offset, next);
 }
 
+/// Release review: a cursor read stops at its byte window (16 MiB), and `logs stdout` reported
+/// `truncated: false` whenever the LINE limit was not hit — on a 40 MB capture an agent read
+/// the first window, saw nothing truncated, and never reached the panic further on. The reader
+/// now says when it stopped at the window with more of the file after it.
+#[test]
+fn a_cursor_read_cut_by_its_window_says_there_is_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("console.jsonl");
+    let record = |i: usize| format!("{{\"t\":{i},\"s\":\"out\",\"l\":\"line {i:03}\"}}\n");
+    let body: String = (0..10).map(record).collect();
+    std::fs::write(&path, &body).unwrap();
+    // A window of about three records: page through the file by the returned cursor.
+    let window = (record(0).len() * 3 + 5) as u64;
+    let (mut cursor, mut seen, mut reads) = (0_u64, Vec::new(), 0);
+    loop {
+        let (lines, next, more) =
+            read_console_capture_window(&path, Some(cursor), 0, window).unwrap();
+        reads += 1;
+        assert!(
+            next > cursor || !more,
+            "a read that says `more` must advance"
+        );
+        seen.extend(lines.into_iter().map(|l| l.text));
+        cursor = next;
+        if !more {
+            break;
+        }
+    }
+    assert_eq!(
+        seen,
+        (0..10).map(|i| format!("line {i:03}")).collect::<Vec<_>>()
+    );
+    assert!(
+        reads >= 4,
+        "the window cut the file into pages ({reads} reads)"
+    );
+
+    // The end of the file is not "more", even with a record still being written there.
+    std::fs::write(
+        &path,
+        format!("{body}{{\"t\":99,\"s\":\"out\",\"l\":\"partial"),
+    )
+    .unwrap();
+    let (_, next, more) =
+        read_console_capture_window(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(!more, "an unterminated last record is not more to read");
+    assert_eq!(next, body.len() as u64);
+
+    // A window smaller than one record consumes nothing: it must not ask for a re-read of
+    // the same offset (a follower would spin on it).
+    let (lines, next, more) = read_console_capture_window(&path, Some(0), 0, 4).unwrap();
+    assert!(lines.is_empty());
+    assert_eq!(next, 0);
+    assert!(!more);
+}
+
 #[test]
 fn level_parse_accepts_common_spellings() {
     assert_eq!(LogLevel::parse("WARNING"), Some(LogLevel::Warn));

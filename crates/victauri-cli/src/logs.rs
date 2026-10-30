@@ -315,9 +315,13 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     let sources = &first["sources"];
     // After a crash, the `victauri run` capture still holds the app's last words and exit status.
     let mut capture_path = own_capture_path(&first);
-    let structured = sources["tracing"] == true || sources["log"] == true;
-    if !structured && sources["stdout_capture"] == true {
+    if !follows_structured(sources) && sources["stdout_capture"] == true {
         eprintln!("victauri logs: no structured source in this app — reading its captured stdout");
+        if opts.target.is_some() {
+            eprintln!(
+                "victauri logs: --target is ignored for raw stdout lines (they carry no target)"
+            );
+        }
         return follow_stdout_via_app(&backend, &opts, capture_path).await;
     }
     if let Some(hint) = first["hint"].as_str() {
@@ -336,19 +340,25 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     // A cursor read returns the OLDEST entries after the cursor, `truncated` when more are
     // waiting: read the rest at once instead of one page per poll interval.
     let mut behind = false;
+    // When the app last answered: what a dying process printed after this is its final moments.
+    let mut last_ok_ms = now_ms();
     loop {
         if !behind {
             tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
         }
         args["since_seq"] = cursor.into();
         args["limit"] = 2000.into();
-        if let Ok(page) = backend.logs(args.clone()).await {
-            if page["gap"] == true {
-                eprintln!("victauri logs: [some entries were evicted before they could be read]");
-            }
+        // A page whose cursor went BACKWARDS is a new process behind the same port and token
+        // (a fixed token, or auth off): handled below as a restart, not printed as more of the
+        // old one — its entries below the old cursor would otherwise be skipped silently.
+        if let Ok(page) = backend.logs(args.clone()).await
+            && !went_backwards(&page, cursor)
+        {
+            warn_gap(&page);
             print_page(&page, &opts);
             cursor = page["next_seq"].as_u64().unwrap_or(cursor);
             behind = page["truncated"] == true;
+            last_ok_ms = now_ms();
             continue;
         }
         // Taken at the FIRST failed poll: the crash's last words are just before this moment
@@ -370,24 +380,84 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             return hand_off_to_capture(&opts, capture_path.clone(), went_away_ms).await;
         };
         if restarted {
+            // The new process writes its own capture: a later crash must be read from THAT
+            // file, not the previous process's — and the previous one's capture is the only
+            // record of how it ended (its fatal panic rarely reaches a poll before it dies).
+            let new_capture = own_capture_path(&page);
+            if let Some(old) = capture_path.as_deref()
+                && new_capture.as_deref() != Some(old)
+            {
+                show_final_moments(&opts, old, last_ok_ms.saturating_sub(2000));
+            }
             eprintln!(
                 "victauri logs: app restarted — following the new process {}",
                 clean(&l)
             );
-            // The new process writes its own capture: a later crash must be read from THAT
-            // file, not the previous process's.
-            capture_path = own_capture_path(&page);
+            capture_path = new_capture;
         } else {
             eprintln!(
                 "victauri logs: app was unresponsive for {:.1}s — resumed",
                 stalled.elapsed().as_secs_f64()
             );
         }
+        warn_gap(&page);
         print_page(&page, &opts);
         cursor = page["next_seq"].as_u64().unwrap_or(0);
         behind = page["truncated"] == true;
+        last_ok_ms = now_ms();
         backend = b;
         label = l;
+    }
+}
+
+/// `--follow` reads the structured log when the app built a structured source — even one that
+/// has delivered nothing yet (an app that has not logged by the time `--follow` starts would
+/// otherwise be switched to raw stdout for good).
+fn follows_structured(sources: &Value) -> bool {
+    sources["tracing"] == true || sources["log"] == true || sources["structured_installed"] == true
+}
+
+/// Sequence numbers only go up within one process, so a `next_seq` below the cursor means the
+/// page came from a new process.
+fn went_backwards(page: &Value, cursor: u64) -> bool {
+    page["next_seq"].as_u64().is_some_and(|next| next < cursor)
+}
+
+fn warn_gap(page: &Value) {
+    if page["gap"] == true {
+        eprintln!("victauri logs: [some entries were evicted before they could be read]");
+    }
+}
+
+/// The records of a previous process's capture worth showing when the follower moves on to a
+/// restarted process: how it ended (its exit record, which carries its last stderr lines) and
+/// any warning or error it printed from `since_ts_ms` on — not its routine output.
+fn final_moments(lines: &[Value], since_ts_ms: u64) -> Vec<&Value> {
+    let picked: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["t"].as_u64().unwrap_or(0) >= since_ts_ms)
+        .filter(|l| {
+            l["s"] == "exit"
+                || l["level"]
+                    .as_str()
+                    .is_some_and(|lv| level_rank(lv) >= level_rank("warn"))
+        })
+        .collect();
+    let keep = picked.len().saturating_sub(50);
+    picked[keep..].to_vec()
+}
+
+fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
+    let Ok((lines, _)) = read_capture(path, None) else {
+        return;
+    };
+    let picked = final_moments(&lines, since_ts_ms);
+    if picked.is_empty() {
+        return;
+    }
+    eprintln!("victauri logs: how the previous process ended (from its `victauri run` capture):");
+    for l in picked {
+        emit(&render_console(l), opts.json, l);
     }
 }
 
@@ -456,13 +526,19 @@ async fn hand_off_to_capture(
     capture_path: Option<PathBuf>,
     went_away_ms: u64,
 ) -> Result<()> {
-    let path = capture_path.or_else(crate::run::latest_capture);
-    if path.is_none() {
+    // Only the app's OWN capture. An app that reported none was not launched with `victauri
+    // run`, so the newest capture on disk belongs to some other app (or an older run) — showing
+    // it as this app's last words, or tailing a live one, would be wrong.
+    let Some(path) = capture_path else {
+        eprintln!(
+            "victauri logs: this app was not launched with `victauri run`, so no capture of its \
+             last output exists (`victauri run -- <dev command>` keeps one)"
+        );
         return Ok(());
-    }
+    };
     follow_capture(
         opts,
-        path,
+        Some(path),
         Some(went_away_ms.saturating_sub(opts.interval_ms + 2000)),
         Some(Duration::from_secs(30)),
     )
@@ -580,7 +656,12 @@ async fn follow_stdout_via_app(
             args["limit"] = 2000.into();
             first = false;
         }
-        tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        // A cursor read pages forward: while `truncated`, more is already waiting — read it
+        // now, or a burst faster than one page per interval leaves the follower ever further
+        // behind (and a capture that rotates meanwhile loses the unread rest).
+        if page["truncated"] != true {
+            tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        }
     }
 }
 
@@ -739,6 +820,70 @@ mod tests {
         }
         let other = "no backend log source is active";
         assert_eq!(explain_logs_error(other), other);
+    }
+
+    /// Release review: an app that built `log_layer()` but had not logged yet when `--follow`
+    /// started was switched to raw stdout for good (its `tracing`/`log` bits were still unset).
+    #[test]
+    fn a_built_but_silent_source_keeps_the_structured_follow() {
+        let s = |tracing: bool, installed: bool| {
+            json!({"tracing": tracing, "log": false, "structured_installed": installed,
+                   "stdout_capture": true})
+        };
+        assert!(follows_structured(&s(true, true)));
+        assert!(
+            follows_structured(&s(false, true)),
+            "built, nothing delivered yet"
+        );
+        assert!(!follows_structured(&s(false, false)));
+        // A plugin from before the field existed: the old rule.
+        assert!(!follows_structured(
+            &json!({"tracing": false, "log": false})
+        ));
+    }
+
+    /// Release review: with a fixed token (or auth off), a restart on the same port between two
+    /// polls answered the old cursor with the new process's page, and the follower jumped its
+    /// cursor back without noticing — skipping the new process's first entries.
+    #[test]
+    fn a_cursor_that_went_backwards_is_a_new_process() {
+        assert!(went_backwards(&json!({"next_seq": 3}), 120));
+        assert!(!went_backwards(&json!({"next_seq": 120}), 120), "caught up");
+        assert!(!went_backwards(&json!({"next_seq": 121}), 120));
+        assert!(
+            !went_backwards(&json!({"error": "x"}), 120),
+            "no next_seq: not a restart"
+        );
+    }
+
+    /// Release review: a crash followed by a restart within the re-attach window showed only
+    /// "app restarted" — the crash itself was never shown. The previous process's capture is
+    /// read for how it ended: the exit record (with its last stderr lines) and any warning or
+    /// error from its final moments, not its routine output.
+    #[test]
+    fn final_moments_are_how_the_process_ended() {
+        let lines = vec![
+            json!({"t": 100, "s": "err", "l": "old warning", "level": "warn"}),
+            json!({"t": 1_000, "s": "out", "l": "routine", "level": "info"}),
+            json!({"t": 1_001, "s": "out", "l": "no level at all"}),
+            json!({"t": 1_002, "s": "err", "l": "thread 'main' panicked at src/x.rs", "level": "error"}),
+            json!({"t": 1_003, "s": "exit", "l": "exited with code 101", "tail": ["boom"]}),
+        ];
+        let picked: Vec<&str> = final_moments(&lines, 900)
+            .into_iter()
+            .map(|l| l["l"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            picked,
+            vec!["thread 'main' panicked at src/x.rs", "exited with code 101"],
+            "before the window, and routine lines, are left out"
+        );
+        let many: Vec<Value> = (0..80)
+            .map(|i| json!({"t": 2_000 + i, "s": "err", "l": format!("e{i}"), "level": "error"}))
+            .collect();
+        let tail = final_moments(&many, 0);
+        assert_eq!(tail.len(), 50);
+        assert_eq!(tail[49]["l"], "e79", "the newest are kept");
     }
 
     #[test]

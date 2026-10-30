@@ -108,6 +108,27 @@ developer watches in the debug console — were invisible to an agent. Now:
   log capture and must be bumped to 0.10.2, instead of printing the plugin's ``unknown variant
   `backend` `` deserializer error — the likely first contact when the CLI is upgraded before the
   app (found by running the 0.10.2 CLI against 4DA on 0.10.1).
+- **A final independent review of the post-audit changes** found these, all fixed with tests:
+  - `wait_for {condition:"log", since_seq}`'s docs said "any `logs backend` call's `next_seq`" is
+    a safe pre-work cursor; since cursor reads page forward, a truncated cursor read's `next_seq`
+    points at OLDER entries, so a previous run's line could satisfy the wait. The docs now name
+    the safe sources (`backend_log_cursor`, or a read without `since_seq`).
+  - `logs stdout` cursor reads take at most 16 MiB of the capture but reported `truncated: false`
+    when the line limit was not hit, so an agent paging a large capture stopped early. A read cut
+    by that window now reports `truncated: true`.
+  - `victauri logs --follow`: a crash followed by a restart within the re-attach window now
+    prints how the previous process ended (its exit record and last stderr lines, plus warnings
+    and errors), instead of only "app restarted"; a restart behind the same port and token (a
+    fixed token, or auth off) is detected instead of skipping the new process's first entries;
+    entries evicted before a re-attach are reported; the raw-stdout follower reads a backlog
+    without waiting an interval per page; an app that built `log_layer()` but has not logged yet
+    is followed structurally, not switched to raw stdout; `--target` with raw stdout says it is
+    ignored; and when an app that was not launched with `victauri run` dies, the follower no
+    longer shows the newest capture on disk, which belongs to some other app.
+  - The hint for a built-but-silent source also names a failed install (`set_boxed_logger(..)` /
+    `try_init()` returning an error that `.ok()` hides) as a cause, not only the app's filter.
+  - CI now runs the tokio-console deadlock test with `--cfg tokio_unstable`; without it the test
+    passes trivially.
 
 ### Repository and CI
 

@@ -124,6 +124,17 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+      # The tokio-console deadlock test (`wait_for log` froze the app's logging threads when Tokio
+      # traces its own wakers) only reaches the real interleaving when Tokio emits that tracing:
+      # `--cfg tokio_unstable`. In the normal build above it passes trivially. Own target dir, so
+      # the different RUSTFLAGS do not invalidate the cached build.
+      - name: tokio-console configuration (Linux)
+        if: runner.os == 'Linux'
+        env:
+          RUSTFLAGS: "-Dwarnings --cfg tokio_unstable"
+          CARGO_TARGET_DIR: target/tokio-unstable
+        run: cargo test -p victauri-plugin --lib waking_a_log_waiter_survives_tokio_tracing_its_own_wakers
+
   # The canonical "below the glass" proof, run live on every desktop platform.
   # On macOS no external tool can even attach to the WKWebView (Tauri docs:
   # tauri-driver is "only Windows and Linux ... due to macOS not having a
