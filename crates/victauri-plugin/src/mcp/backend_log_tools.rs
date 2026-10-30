@@ -30,6 +30,24 @@ to the app's tracing_subscriber registry, or chain `victauri_plugin::log_logger(
 setup (tauri-plugin-log / fern) / wrap its logger with `victauri_plugin::wrap_logger(...)`. \
 Panics are captured automatically.";
 
+/// Guidance when a structured source IS installed but has received nothing: the app's own
+/// filter is dropping the records before Victauri sees them.
+pub(super) const FILTERED_HINT: &str = "A structured backend log source is installed \
+(`log_layer()` / `log_logger()` / `wrap_logger()`), but no record has reached it yet. The app's \
+own filter decides what it sees: an `EnvFilter` or `env_logger` built from the environment is \
+error-only while `RUST_LOG` is unset. Set `RUST_LOG` (e.g. `RUST_LOG=info`) or the filter string \
+in the app's logging setup, restart the app, and retry. Panics are captured either way.";
+
+/// The hint for "no structured source has delivered anything": add one, or fix the filter of
+/// the one that is already installed.
+fn no_structured_hint(sources: backend_logs::ActiveSources) -> &'static str {
+    if sources.structured_installed {
+        FILTERED_HINT
+    } else {
+        ENABLE_HINT
+    }
+}
+
 fn parse_level(raw: Option<&str>) -> Result<Option<LogLevel>, CallToolResult> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
         None => Ok(None),
@@ -62,6 +80,7 @@ fn sources_json() -> serde_json::Value {
         "log": s.log,
         "panic_hook": s.panic_hook,
         "stdout_capture": s.stdout_capture,
+        "structured_installed": s.structured_installed,
         // Where `victauri run` writes the raw output — lets a follower keep reading it
         // after the app dies (the crash's last words and exit status land there).
         "stdout_capture_path": backend_logs::console_capture_path().map(|p| p.to_string_lossy().into_owned()),
@@ -177,6 +196,8 @@ impl VictauriMcpHandler {
             if page.entries.is_empty() && page.next_seq == 0 {
                 let hint = if sources.any_structured() {
                     "Backend capture is active but nothing has been logged yet.".to_string()
+                } else if sources.structured_installed {
+                    FILTERED_HINT.to_string()
                 } else if sources.stdout_capture {
                     "No structured backend source is installed, but the app runs under \
                      `victauri run` — read its raw output with `logs {action:\"stdout\"}`."
@@ -241,7 +262,9 @@ impl VictauriMcpHandler {
             if !sources.any_structured() {
                 obj.insert(
                     "hint".into(),
-                    if sources.stdout_capture {
+                    if sources.structured_installed {
+                        FILTERED_HINT
+                    } else if sources.stdout_capture {
                         "Only panics are captured structurally; the app's raw output is under \
                          `logs {action:\"stdout\"}`."
                     } else {
@@ -406,7 +429,7 @@ impl VictauriMcpHandler {
             .into();
         }
         if !sources.any_structured() {
-            out["hint"] = ENABLE_HINT.into();
+            out["hint"] = no_structured_hint(sources).into();
         }
         backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
@@ -506,8 +529,9 @@ impl VictauriMcpHandler {
         if total > entries.len() {
             out["backend_logs_truncated"] = (total - entries.len()).into();
         }
-        if !backend_logs::active_sources().any_structured() {
-            out["backend_logs_hint"] = ENABLE_HINT.into();
+        let sources = backend_logs::active_sources();
+        if !sources.any_structured() {
+            out["backend_logs_hint"] = no_structured_hint(sources).into();
         }
     }
 }
@@ -904,5 +928,49 @@ mod tests {
             seen,
             (0..10).map(|i| format!("step {i}")).collect::<Vec<_>>()
         );
+    }
+
+    /// An inner logger whose filter passes nothing, like `env_logger` with `RUST_LOG` unset
+    /// below `error`: the wrapper is installed but never sees a record.
+    struct DropsEverything;
+
+    impl log::Log for DropsEverything {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            false
+        }
+        fn log(&self, _: &log::Record<'_>) {}
+        fn flush(&self) {}
+    }
+
+    /// Release verification (fresh consumer, `env_logger` recipe without `RUST_LOG`): the app had
+    /// added `wrap_logger`, its filter let nothing through, and every hint told it to add
+    /// `wrap_logger`. Building a source now marks it installed, so the hint names the filter.
+    #[test]
+    fn an_installed_source_that_saw_nothing_is_reported_as_filtered() {
+        let _logger = backend_logs::wrap_logger(Box::new(DropsEverything));
+        let sources = backend_logs::active_sources();
+        assert!(
+            sources.structured_installed,
+            "wrap_logger() did not mark a structured source as installed"
+        );
+        assert_eq!(super::no_structured_hint(sources), super::FILTERED_HINT);
+        assert!(super::FILTERED_HINT.contains("RUST_LOG"));
+    }
+
+    #[test]
+    fn no_installed_source_gets_the_add_a_source_hint() {
+        let none = backend_logs::ActiveSources {
+            tracing: false,
+            log: false,
+            panic_hook: true,
+            stdout_capture: false,
+            structured_installed: false,
+        };
+        assert_eq!(super::no_structured_hint(none), super::ENABLE_HINT);
+        let installed = backend_logs::ActiveSources {
+            structured_installed: true,
+            ..none
+        };
+        assert_eq!(super::no_structured_hint(installed), super::FILTERED_HINT);
     }
 }

@@ -128,7 +128,11 @@ registry.init();
   subscriber's *global* filter (an `EnvFilter` added with `.with(...)` filters every layer). If
   the app runs at `info`, debug lines are not captured. On top of that the capture keeps
   `debug` and above by default (`VICTAURI_LOG_LEVEL=trace|debug|info|warn|error` to change it);
-  the layer never filters anything for the app's own layers.
+  the layer never filters anything for the app's own layers. A filter read from the
+  environment (`EnvFilter::from_default_env()`, `env_logger::Builder::from_default_env()`) is
+  error-only while `RUST_LOG` is unset, so such an app captures nothing below `error` until
+  `RUST_LOG` is set; the tools then report the source as installed
+  (`sources.structured_installed`) and say so, instead of asking for a line the app already has.
 - **One process.** The plugin sees its own process. Sidecars and helper binaries (e.g. a
   separate engine process) need their own capture — `victauri run` them too.
 - **In-memory and bounded.** The buffer keeps 5,000 entries / ~8 MB by default

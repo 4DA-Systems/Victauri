@@ -995,6 +995,10 @@ static SOURCES: AtomicU8 = AtomicU8::new(0);
 const SRC_TRACING: u8 = 1;
 const SRC_LOG: u8 = 1 << 1;
 const SRC_PANIC: u8 = 1 << 2;
+// Set when the app builds a structured source, not when it first delivers: an app whose own
+// filter passes nothing (an `EnvFilter` / `env_logger` with `RUST_LOG` unset is error-only) has
+// a source that never sees a record, and must not be told to add the line it already has.
+const SRC_STRUCTURED_INSTALLED: u8 = 1 << 3;
 
 /// The process-wide capture buffer. Capacity comes from `VICTAURI_LOG_CAPACITY`
 /// (entries) when set, else [`DEFAULT_CAPACITY`].
@@ -1028,6 +1032,9 @@ pub struct ActiveSources {
     pub panic_hook: bool,
     /// The app runs under `victauri run` (raw stdout/stderr captured out-of-process).
     pub stdout_capture: bool,
+    /// [`log_layer`], [`log_logger`] or [`wrap_logger`] was called in this process — a
+    /// structured source exists even when the app's own filter has let nothing reach it yet.
+    pub structured_installed: bool,
 }
 
 impl ActiveSources {
@@ -1047,6 +1054,7 @@ pub fn active_sources() -> ActiveSources {
         log: bits & SRC_LOG != 0,
         panic_hook: bits & SRC_PANIC != 0,
         stdout_capture: console_capture_path().is_some(),
+        structured_installed: bits & SRC_STRUCTURED_INSTALLED != 0,
     }
 }
 
@@ -1217,6 +1225,7 @@ pub fn log_layer() -> Option<BackendLogLayer> {
     if capture_disabled() {
         return None;
     }
+    mark_source(SRC_STRUCTURED_INSTALLED);
     Some(BackendLogLayer::with_buffer(global()))
 }
 
@@ -1521,6 +1530,7 @@ pub fn log_logger() -> Box<dyn log::Log> {
     if capture_disabled() {
         return Box::new(NullLogger);
     }
+    mark_source(SRC_STRUCTURED_INSTALLED);
     Box::new(VictauriLogger::with_buffer(global(), None))
 }
 
@@ -1541,6 +1551,7 @@ pub fn wrap_logger(inner: Box<dyn log::Log>) -> Box<dyn log::Log> {
     if capture_disabled() {
         return inner;
     }
+    mark_source(SRC_STRUCTURED_INSTALLED);
     Box::new(VictauriLogger::with_buffer(global(), Some(inner)))
 }
 

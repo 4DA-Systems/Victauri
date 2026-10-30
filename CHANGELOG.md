@@ -98,6 +98,12 @@ developer watches in the debug console — were invisible to an agent. Now:
   attached-log window jump to the cursor by index instead of rescanning the buffer under its lock.
 - `victauri logs` rejects flag combinations it used to ignore silently (`--digest --follow`,
   `--target` / `--app` with `--stdout`).
+- **Hints name the app's filter when a source is installed:** an app with `log_layer()` /
+  `log_logger()` / `wrap_logger()` whose own filter passes nothing (an `EnvFilter` or
+  `env_logger` built from the environment is error-only while `RUST_LOG` is unset) used to be
+  told "no backend log source is active — add `log_layer()`…", the line it already had. Building
+  a source now marks it installed (`sources.structured_installed`), and the hint says to set
+  `RUST_LOG` / the filter instead (found by building a fresh consumer from the packaged crates).
 
 ### Repository and CI
 
