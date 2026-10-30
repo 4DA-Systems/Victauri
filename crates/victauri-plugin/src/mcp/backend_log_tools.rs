@@ -85,6 +85,10 @@ fn sources_json() -> serde_json::Value {
         "panic_hook": s.panic_hook,
         "stdout_capture": s.stdout_capture,
         "structured_installed": s.structured_installed,
+        // Which process answered: a follower holding a cursor tells a restart behind the same
+        // port and token (a fixed token, or auth off) from more of the same process by this,
+        // since the new process's sequence numbers may well have passed the old cursor.
+        "pid": std::process::id(),
         // Where `victauri run` writes the raw output — lets a follower keep reading it
         // after the app dies (the crash's last words and exit status land there).
         "stdout_capture_path": backend_logs::console_capture_path().map(|p| p.to_string_lossy().into_owned()),

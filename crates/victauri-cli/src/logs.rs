@@ -342,17 +342,19 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     let mut behind = false;
     // When the app last answered: what a dying process printed after this is its final moments.
     let mut last_ok_ms = now_ms();
+    // Which process answered the last page (absent from plugins that do not report it).
+    let mut pid = page_pid(&first);
     loop {
         if !behind {
             tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
         }
         args["since_seq"] = cursor.into();
         args["limit"] = 2000.into();
-        // A page whose cursor went BACKWARDS is a new process behind the same port and token
-        // (a fixed token, or auth off): handled below as a restart, not printed as more of the
-        // old one — its entries below the old cursor would otherwise be skipped silently.
+        // A page from a NEW process behind the same port and token (a fixed token, or auth off)
+        // is handled below as a restart, not printed as more of the old one — the new process's
+        // entries below the old cursor would otherwise be skipped silently.
         if let Ok(page) = backend.logs(args.clone()).await
-            && !went_backwards(&page, cursor)
+            && !is_new_process(&page, cursor, pid)
         {
             warn_gap(&page);
             print_page(&page, &opts);
@@ -387,7 +389,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             if let Some(old) = capture_path.as_deref()
                 && new_capture.as_deref() != Some(old)
             {
-                show_final_moments(&opts, old, last_ok_ms.saturating_sub(2000));
+                show_final_moments(&opts, old, last_ok_ms);
             }
             eprintln!(
                 "victauri logs: app restarted — following the new process {}",
@@ -405,8 +407,23 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         cursor = page["next_seq"].as_u64().unwrap_or(0);
         behind = page["truncated"] == true;
         last_ok_ms = now_ms();
+        pid = page_pid(&page);
         backend = b;
         label = l;
+    }
+}
+
+fn page_pid(page: &Value) -> Option<u64> {
+    page["sources"]["pid"].as_u64()
+}
+
+/// Whether a page came from a different process than the one followed so far: it reports
+/// another pid, or (from a plugin that reports none) its cursor went backwards — sequence
+/// numbers only go up within one process.
+fn is_new_process(page: &Value, cursor: u64, known_pid: Option<u64>) -> bool {
+    match (page_pid(page), known_pid) {
+        (Some(now), Some(before)) if now != before => true,
+        _ => went_backwards(page, cursor),
     }
 }
 
@@ -430,17 +447,20 @@ fn warn_gap(page: &Value) {
 }
 
 /// The records of a previous process's capture worth showing when the follower moves on to a
-/// restarted process: how it ended (its exit record, which carries its last stderr lines) and
-/// any warning or error it printed from `since_ts_ms` on — not its routine output.
-fn final_moments(lines: &[Value], since_ts_ms: u64) -> Vec<&Value> {
+/// restarted process: how it ended (its exit record, which carries its last stderr lines,
+/// always) and any warning or error it printed from `since_ts_ms` on — its last successful
+/// poll, so what the follower already printed is not repeated — that also passes the
+/// follower's own `--level` / `--grep`. Not its routine output.
+fn final_moments<'a>(lines: &'a [Value], since_ts_ms: u64, opts: &LogsOptions) -> Vec<&'a Value> {
     let picked: Vec<&Value> = lines
         .iter()
         .filter(|l| l["t"].as_u64().unwrap_or(0) >= since_ts_ms)
         .filter(|l| {
             l["s"] == "exit"
-                || l["level"]
+                || (l["level"]
                     .as_str()
                     .is_some_and(|lv| level_rank(lv) >= level_rank("warn"))
+                    && console_line_passes(l, opts))
         })
         .collect();
     let keep = picked.len().saturating_sub(50);
@@ -451,7 +471,7 @@ fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
     let Ok((lines, _)) = read_capture(path, None) else {
         return;
     };
-    let picked = final_moments(&lines, since_ts_ms);
+    let picked = final_moments(&lines, since_ts_ms, opts);
     if picked.is_empty() {
         return;
     }
@@ -531,8 +551,10 @@ async fn hand_off_to_capture(
     // it as this app's last words, or tailing a live one, would be wrong.
     let Some(path) = capture_path else {
         eprintln!(
-            "victauri logs: this app was not launched with `victauri run`, so no capture of its \
-             last output exists (`victauri run -- <dev command>` keeps one)"
+            "victauri logs: no capture of this app's last output to show — it was not launched \
+             with `victauri run` (`victauri run -- <dev command>` keeps one), or its capture was \
+             written outside Victauri's private directory with `--capture` (read that file with \
+             `victauri logs --capture <file>`)"
         );
         return Ok(());
     };
@@ -869,7 +891,8 @@ mod tests {
             json!({"t": 1_002, "s": "err", "l": "thread 'main' panicked at src/x.rs", "level": "error"}),
             json!({"t": 1_003, "s": "exit", "l": "exited with code 101", "tail": ["boom"]}),
         ];
-        let picked: Vec<&str> = final_moments(&lines, 900)
+        let all = opts_with(None, None);
+        let picked: Vec<&str> = final_moments(&lines, 900, &all)
             .into_iter()
             .map(|l| l["l"].as_str().unwrap())
             .collect();
@@ -881,9 +904,67 @@ mod tests {
         let many: Vec<Value> = (0..80)
             .map(|i| json!({"t": 2_000 + i, "s": "err", "l": format!("e{i}"), "level": "error"}))
             .collect();
-        let tail = final_moments(&many, 0);
+        let tail = final_moments(&many, 0, &all);
         assert_eq!(tail.len(), 50);
         assert_eq!(tail[49]["l"], "e79", "the newest are kept");
+
+        // The follower's own --grep / --level apply too; the exit record always shows.
+        let warn_and_exit = vec![
+            json!({"t": 5, "s": "err", "l": "disk nearly full", "level": "warn"}),
+            json!({"t": 6, "s": "exit", "l": "exited with code 1"}),
+        ];
+        let errors_only = opts_with(Some("error"), None);
+        let picked: Vec<&str> = final_moments(&warn_and_exit, 0, &errors_only)
+            .into_iter()
+            .map(|l| l["l"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            picked,
+            vec!["exited with code 1"],
+            "--level error drops the warning"
+        );
+        let grep_other = opts_with(None, Some("database"));
+        assert_eq!(final_moments(&warn_and_exit, 0, &grep_other).len(), 1);
+    }
+
+    fn opts_with(level: Option<&str>, grep: Option<&str>) -> LogsOptions {
+        LogsOptions {
+            app: None,
+            level: level.map(str::to_string),
+            target: None,
+            grep: grep.map(str::to_string),
+            limit: 100,
+            follow: true,
+            digest: false,
+            stdout: false,
+            json: false,
+            capture: None,
+            interval_ms: 500,
+        }
+    }
+
+    /// Release review (second pass): a restart behind the same port and token was detected only
+    /// when the new process's cursor fell below the old one — a new process that logged past it
+    /// before the next poll was read as more of the old one. The plugin now reports its pid.
+    #[test]
+    fn a_page_from_another_pid_is_a_new_process() {
+        let page = |pid: u64, next: u64| json!({"next_seq": next, "sources": {"pid": pid}});
+        assert!(
+            is_new_process(&page(2, 500), 100, Some(1)),
+            "past the cursor, other pid"
+        );
+        assert!(
+            !is_new_process(&page(1, 500), 100, Some(1)),
+            "same process, more entries"
+        );
+        assert!(
+            is_new_process(&page(1, 3), 100, Some(1)),
+            "cursor went backwards"
+        );
+        // A plugin that reports no pid: the cursor rule alone.
+        let old = |next: u64| json!({"next_seq": next, "sources": {}});
+        assert!(!is_new_process(&old(500), 100, None));
+        assert!(is_new_process(&old(3), 100, None));
     }
 
     #[test]

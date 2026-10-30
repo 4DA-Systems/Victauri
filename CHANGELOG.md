@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.2] - 2026-10-30
+## [0.10.2] - 2026-10-31
 
 ### Added — backend (Rust) log capture: the app's debug console, for agents
 
@@ -118,8 +118,10 @@ developer watches in the debug console — were invisible to an agent. Now:
     by that window now reports `truncated: true`.
   - `victauri logs --follow`: a crash followed by a restart within the re-attach window now
     prints how the previous process ended (its exit record and last stderr lines, plus warnings
-    and errors), instead of only "app restarted"; a restart behind the same port and token (a
-    fixed token, or auth off) is detected instead of skipping the new process's first entries;
+    and errors that pass its `--level` / `--grep`), instead of only "app restarted"; a restart
+    behind the same port and token (a fixed token, or auth off) is detected — by the `pid` every
+    `sources` object now reports, else by a cursor that went backwards — instead of skipping the
+    new process's first entries;
     entries evicted before a re-attach are reported; the raw-stdout follower reads a backlog
     without waiting an interval per page; an app that built `log_layer()` but has not logged yet
     is followed structurally, not switched to raw stdout; `--target` with raw stdout says it is
@@ -127,8 +129,10 @@ developer watches in the debug console — were invisible to an agent. Now:
     longer shows the newest capture on disk, which belongs to some other app.
   - The hint for a built-but-silent source also names a failed install (`set_boxed_logger(..)` /
     `try_init()` returning an error that `.ok()` hides) as a cause, not only the app's filter.
-  - CI now runs the tokio-console deadlock test with `--cfg tokio_unstable`; without it the test
-    passes trivially.
+  - CI now runs the tokio-console deadlock test with `--cfg tokio_unstable` and
+    `VICTAURI_LOG_LEVEL=trace` (Tokio's waker events are TRACE, below the default capture level).
+    Without both it passed even with the deadlock's two defences removed; with them it hangs
+    there and passes on the real code (measured).
 
 ### Repository and CI
 

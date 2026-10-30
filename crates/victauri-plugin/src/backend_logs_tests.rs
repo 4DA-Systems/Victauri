@@ -480,8 +480,11 @@ fn panic_push_waits_for_another_holder_but_never_self_deadlocks() {
 /// tokio-console setups (`--cfg tokio_unstable` + Tokio's `tracing` feature) trace every waker
 /// clone while Tokio holds a `Notify`'s waiter lock. Capturing that event and waking waiters
 /// from it re-entered the lock and froze every logging thread of the app. In a normal build
-/// Tokio emits nothing and this passes trivially; build it with
-/// `RUSTFLAGS="--cfg tokio_unstable"` to exercise the real interleaving.
+/// Tokio emits nothing and this passes trivially. To exercise the real interleaving, build with
+/// `RUSTFLAGS="--cfg tokio_unstable"` AND run with `VICTAURI_LOG_LEVEL=trace` (the waker events
+/// are TRACE, below the default capture level) — and run this test alone, since the capture
+/// level is read once per process. CI's "tokio-console configuration" step does exactly that;
+/// with both defences removed it hangs at the 20 s bound there.
 #[test]
 fn waking_a_log_waiter_survives_tokio_tracing_its_own_wakers() {
     let buf = Arc::new(LogBuffer::default());
