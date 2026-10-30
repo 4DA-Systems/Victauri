@@ -169,18 +169,25 @@ Update-File "docs\src\compatibility.md" "`"bridge_version`": `"$OldVersion`"" "`
 # 13. Update Cargo.lock via cargo check
 if (-not $DryRun) {
     Write-Host "`nUpdating Cargo.lock..." -ForegroundColor Cyan
+    # The output is trimmed to its last line, so the exit code must be checked explicitly: a
+    # failing step used to print one line and let the bump report success.
     Push-Location $root
     try {
         cargo check --workspace 2>&1 | Select-Object -Last 1
+        if ($LASTEXITCODE -ne 0) { throw "cargo check --workspace failed (exit $LASTEXITCODE)" }
     } finally {
         Pop-Location
     }
     # examples/tauri3 is its own workspace (Tauri 3 cannot share the root lockfile) and CI builds
-    # it with --locked, so its path-dependency versions must follow the bump too.
+    # it with --locked, so its path-dependency versions — and any new dependency of the plugin —
+    # must follow the bump too. Verified with a --locked metadata read afterwards.
     Write-Host "Updating examples\tauri3\Cargo.lock..." -ForegroundColor Cyan
     Push-Location (Join-Path $root "examples\tauri3")
     try {
         cargo update -p victauri-plugin -p victauri-core -p victauri-macros --offline 2>&1 | Select-Object -Last 1
+        if ($LASTEXITCODE -ne 0) { throw "cargo update in examples\tauri3 failed (exit $LASTEXITCODE)" }
+        cargo metadata --locked --format-version 1 --no-deps 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "examples\tauri3\Cargo.lock is still out of date (cargo metadata --locked failed)" }
     } finally {
         Pop-Location
     }

@@ -126,6 +126,9 @@ struct Capture {
     file: std::fs::File,
     written: u64,
     recent_err: std::collections::VecDeque<String>,
+    /// Set when the file could not be rotated: line capture stops (the size bound holds) and
+    /// only the exit record is still written.
+    stopped: bool,
 }
 
 impl Capture {
@@ -135,15 +138,27 @@ impl Capture {
                 .with_context(|| format!("cannot create {}", parent.display()))?;
         }
         let file = open_private(path)?;
+        // A `--capture` file that already exists is appended to: count what it holds toward the
+        // rotation bound, and make it owner-only like a new one (best effort).
+        let written = file.metadata().map_or(0, |m| m.len());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
         Ok(Self {
             path: path.to_path_buf(),
             file,
-            written: 0,
+            written,
             recent_err: std::collections::VecDeque::with_capacity(EXIT_TAIL_LINES),
+            stopped: false,
         })
     }
 
     fn record(&mut self, stream: &str, line: &str) {
+        if self.stopped {
+            return;
+        }
         let mut text = strip_ansi(line);
         if text.len() > MAX_LINE_BYTES {
             let mut cut = MAX_LINE_BYTES;
@@ -177,8 +192,21 @@ impl Capture {
     fn write_record(&mut self, rec: &serde_json::Value) {
         let mut bytes = rec.to_string().into_bytes();
         bytes.push(b'\n');
-        if self.written + bytes.len() as u64 > MAX_CAPTURE_BYTES {
-            self.rotate();
+        if self.written + bytes.len() as u64 > MAX_CAPTURE_BYTES && !self.rotate() {
+            // Could not rotate (a reader holding the previous file open on Windows, say): stop
+            // capturing lines rather than grow past the bound, and say so in the capture. The
+            // exit record — the most valuable line — still goes in.
+            if rec["s"] != "exit" {
+                if !self.stopped {
+                    self.stopped = true;
+                    let note = serde_json::json!({
+                        "t": now_ms(), "s": "err",
+                        "l": "[victauri run: capture stopped — the file could not be rotated]",
+                    });
+                    let _ = self.file.write_all(format!("{note}\n").as_bytes());
+                }
+                return;
+            }
         }
         // Capture failures must never disturb the app: ignore write errors.
         if self.file.write_all(&bytes).is_ok() {
@@ -186,13 +214,27 @@ impl Capture {
         }
     }
 
-    fn rotate(&mut self) {
+    /// Move the full file aside (`.jsonl.1`, else a timestamped name) and start a new one.
+    /// Returns whether a new file was started.
+    fn rotate(&mut self) -> bool {
         let old = self.path.with_extension("jsonl.1");
         let _ = std::fs::remove_file(&old);
-        let _ = std::fs::rename(&self.path, &old);
-        if let Ok(f) = open_private(&self.path) {
-            self.file = f;
-            self.written = 0;
+        let moved = std::fs::rename(&self.path, &old).is_ok()
+            || std::fs::rename(
+                &self.path,
+                self.path.with_extension(format!("jsonl.{}", now_ms())),
+            )
+            .is_ok();
+        if !moved {
+            return false;
+        }
+        match open_private(&self.path) {
+            Ok(f) => {
+                self.file = f;
+                self.written = 0;
+                true
+            }
+            Err(_) => false,
         }
     }
 }
@@ -228,7 +270,14 @@ fn pump<R: Read, W: Write>(
         match std::io::Read::take(&mut reader, MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(_) => {
-                let _ = dst.write_all(&buf);
+                // A Windows console stdout rejects bytes that are not UTF-8 (`InvalidData`) —
+                // OEM-codepage output from cmd builtins or localised linker errors — and would
+                // drop the whole chunk: pass those through lossily instead.
+                if let Err(e) = dst.write_all(&buf)
+                    && e.kind() == std::io::ErrorKind::InvalidData
+                {
+                    let _ = dst.write_all(String::from_utf8_lossy(&buf).as_bytes());
+                }
                 let _ = dst.flush();
                 let line = String::from_utf8_lossy(&buf);
                 let line = line.trim_end_matches('\n');
@@ -320,6 +369,13 @@ pub fn describe_exit(status: ExitStatus) -> String {
                 None if code == 101 => {
                     "exited with code 101 (a Rust panic on the main thread)".to_string()
                 }
+                // A shell (`npm run …`, `sh -c`) reports a child it lost to signal N as 128+N:
+                // the app itself was usually killed, not the wrapper.
+                None if cfg!(unix) && (129..=192).contains(&code) => format!(
+                    "exited with code {code} — usually a child killed by signal {} (a shell \
+                     reports signal N as 128+N; 134 = SIGABRT, 139 = SIGSEGV)",
+                    code - 128
+                ),
                 None => format!("exited with code {code}"),
             }
         }
@@ -339,7 +395,10 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
         );
     };
     let path = match capture_file {
-        Some(path) => path,
+        // Absolute: the path is handed to the app, which may run from another directory
+        // (`tauri dev` starts it in src-tauri), and a relative one would then name another file.
+        Some(path) => std::path::absolute(&path)
+            .with_context(|| format!("invalid --capture path {}", path.display()))?,
         None => capture_dir()
             .context(
                 "no private per-user directory for the capture (the Victauri discovery root is \
@@ -360,14 +419,25 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     let _ = ctrlc::set_handler(|| {});
 
     let resolved = resolve_program(program);
-    let mut child = Command::new(&resolved)
+    let child = Command::new(&resolved)
         .args(args)
         .env(CONSOLE_CAPTURE_ENV, &path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("cannot start {}", resolved.display()))?;
+        .spawn();
+    let mut child = match child {
+        Ok(child) => child,
+        Err(e) => {
+            // Nothing ran: an empty capture would become the newest one and hide an earlier
+            // crash's capture from `victauri logs --stdout`.
+            drop(capture);
+            if std::fs::metadata(&path).is_ok_and(|m| m.len() == 0) {
+                let _ = std::fs::remove_file(&path);
+            }
+            return Err(e).with_context(|| format!("cannot start {}", resolved.display()));
+        }
+    };
 
     let out = child.stdout.take().context("child stdout")?;
     let err = child.stderr.take().context("child stderr")?;

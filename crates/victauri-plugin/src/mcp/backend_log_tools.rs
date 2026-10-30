@@ -10,7 +10,7 @@ use super::VictauriMcpHandler;
 use super::compound_params::LogsParams;
 use super::helpers::{json_result, missing_param, tool_error};
 use super::other_params::WaitForParams;
-use crate::backend_logs::{self, LogLevel, LogQuery};
+use crate::backend_logs::{self, BackendLogEntry, LogLevel, LogQuery};
 
 /// Default page size for `logs backend` / `logs stdout`.
 const DEFAULT_BACKEND_LIMIT: usize = 100;
@@ -29,6 +29,24 @@ including crash output; (2) one line for structured logs — add `.with(victauri
 to the app's tracing_subscriber registry, or chain `victauri_plugin::log_logger()` into its `log` \
 setup (tauri-plugin-log / fern) / wrap its logger with `victauri_plugin::wrap_logger(...)`. \
 Panics are captured automatically.";
+
+/// Guidance when a structured source IS installed but has received nothing: the app's own
+/// filter is dropping the records before Victauri sees them.
+pub(super) const FILTERED_HINT: &str = "A structured backend log source is installed \
+(`log_layer()` / `log_logger()` / `wrap_logger()`), but no record has reached it yet. The app's \
+own filter decides what it sees: an `EnvFilter` or `env_logger` built from the environment is \
+error-only while `RUST_LOG` is unset. Set `RUST_LOG` (e.g. `RUST_LOG=info`) or the filter string \
+in the app's logging setup, restart the app, and retry. Panics are captured either way.";
+
+/// The hint for "no structured source has delivered anything": add one, or fix the filter of
+/// the one that is already installed.
+fn no_structured_hint(sources: backend_logs::ActiveSources) -> &'static str {
+    if sources.structured_installed {
+        FILTERED_HINT
+    } else {
+        ENABLE_HINT
+    }
+}
 
 fn parse_level(raw: Option<&str>) -> Result<Option<LogLevel>, CallToolResult> {
     match raw.map(str::trim).filter(|s| !s.is_empty()) {
@@ -62,6 +80,7 @@ fn sources_json() -> serde_json::Value {
         "log": s.log,
         "panic_hook": s.panic_hook,
         "stdout_capture": s.stdout_capture,
+        "structured_installed": s.structured_installed,
         // Where `victauri run` writes the raw output — lets a follower keep reading it
         // after the app dies (the crash's last words and exit status land there).
         "stdout_capture_path": backend_logs::console_capture_path().map(|p| p.to_string_lossy().into_owned()),
@@ -73,6 +92,63 @@ fn since_ms_from(since: Option<f64>) -> Option<u64> {
     since
         .filter(|v| v.is_finite() && *v > 0.0)
         .map(|v| v as u64)
+}
+
+/// The entry as the caller would see it under a redacting profile, or `None` when redaction is
+/// off. Filters must match this view, not the raw entry (see [`VictauriMcpHandler::query_visible`]).
+fn visible_entry(
+    privacy: &crate::privacy::PrivacyConfig,
+    e: &BackendLogEntry,
+) -> Option<BackendLogEntry> {
+    if !privacy.redaction_enabled {
+        return None;
+    }
+    let mut seen = e.clone();
+    seen.message = privacy.redact_output(&e.message);
+    seen.target = privacy.redact_output(&e.target);
+    seen.spans = e.spans.iter().map(|s| privacy.redact_output(s)).collect();
+    let fields = serde_json::Value::Object(e.fields.clone()).to_string();
+    if let Ok(serde_json::Value::Object(redacted)) =
+        serde_json::from_str(&privacy.redact_output(&fields))
+    {
+        seen.fields = redacted;
+    }
+    Some(seen)
+}
+
+/// A captured stdout line as the caller would see it (redacted when the profile redacts).
+fn visible_text<'a>(
+    privacy: &crate::privacy::PrivacyConfig,
+    text: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    if privacy.redaction_enabled {
+        std::borrow::Cow::Owned(privacy.redact_output(text))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+/// Cut matched console lines to `limit` and return the cursor to hand back. A cursor read
+/// (`since_seq`) pages forward — the oldest lines are kept and the cursor is the first matching
+/// line not returned — so a follower that fell behind never skips the middle of a burst; a
+/// plain read keeps the newest lines.
+fn page_console_lines(
+    matched: &mut Vec<backend_logs::ConsoleLine>,
+    limit: usize,
+    since_seq: Option<u64>,
+    end: u64,
+) -> u64 {
+    if matched.len() <= limit {
+        return end;
+    }
+    if since_seq.is_some() {
+        let next = matched.get(limit).map_or(end, |l| l.offset);
+        matched.truncate(limit);
+        next
+    } else {
+        matched.drain(..matched.len() - limit);
+        end
+    }
 }
 
 fn now_ms() -> u64 {
@@ -106,7 +182,13 @@ impl VictauriMcpHandler {
             fields: field_pairs(params.fields.as_ref()),
             limit: clamp_limit(params.limit),
         };
-        let page = self.state.backend_logs.query(&query);
+        let page = if self.state.privacy.redaction_enabled
+            && (query.contains.is_some() || !query.fields.is_empty())
+        {
+            self.query_visible(query)
+        } else {
+            self.state.backend_logs.query(&query)
+        };
         let sources = backend_logs::active_sources();
         let mut out = serde_json::to_value(&page).unwrap_or_default();
         if let Some(obj) = out.as_object_mut() {
@@ -114,6 +196,8 @@ impl VictauriMcpHandler {
             if page.entries.is_empty() && page.next_seq == 0 {
                 let hint = if sources.any_structured() {
                     "Backend capture is active but nothing has been logged yet.".to_string()
+                } else if sources.structured_installed {
+                    FILTERED_HINT.to_string()
                 } else if sources.stdout_capture {
                     "No structured backend source is installed, but the app runs under \
                      `victauri run` — read its raw output with `logs {action:\"stdout\"}`."
@@ -124,7 +208,48 @@ impl VictauriMcpHandler {
                 obj.insert("hint".into(), hint.into());
             }
         }
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
+    }
+
+    /// [`LogBuffer::query`] for a redacting profile: the text and field filters are matched
+    /// against the REDACTED entry — what the caller sees — not the raw one, which would answer
+    /// "does the hidden value contain X?" and recover it a character at a time. The candidates
+    /// are copied out under the lock and filtered after it is released, so the redaction work
+    /// never holds up the app's logging threads.
+    fn query_visible(&self, mut query: LogQuery) -> backend_logs::LogPage {
+        let needle = query.contains.take().map(|s| s.to_lowercase());
+        let fields = std::mem::take(&mut query.fields);
+        let limit = query.limit;
+        query.limit = usize::MAX;
+        let mut page = self.state.backend_logs.query(&query);
+        let privacy = &self.state.privacy;
+        let mut matched: Vec<BackendLogEntry> = page
+            .entries
+            .drain(..)
+            .filter(|e| {
+                let seen = visible_entry(privacy, e).unwrap_or_else(|| e.clone());
+                needle
+                    .as_deref()
+                    .is_none_or(|n| backend_logs::entry_contains(&seen, n))
+                    && backend_logs::entry_fields_match(&seen, &fields)
+            })
+            .collect();
+        page.total_matched = matched.len();
+        page.truncated = matched.len() > limit;
+        if page.truncated {
+            // The same contract as the unredacted query: a cursor read keeps the oldest
+            // matches (and continues after them), a plain read the newest.
+            if query.since_seq.is_some() {
+                matched.truncate(limit);
+            } else {
+                matched.drain(..matched.len() - limit);
+            }
+        }
+        page.next_seq =
+            backend_logs::page_next_seq(query.since_seq, page.truncated, &matched, page.next_seq);
+        page.entries = matched;
+        page
     }
 
     pub(super) fn logs_backend_digest(&self, params: &LogsParams) -> CallToolResult {
@@ -137,7 +262,9 @@ impl VictauriMcpHandler {
             if !sources.any_structured() {
                 obj.insert(
                     "hint".into(),
-                    if sources.stdout_capture {
+                    if sources.structured_installed {
+                        FILTERED_HINT
+                    } else if sources.stdout_capture {
                         "Only panics are captured structurally; the app's raw output is under \
                          `logs {action:\"stdout\"}`."
                     } else {
@@ -147,10 +274,11 @@ impl VictauriMcpHandler {
                 );
             }
         }
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
     }
 
-    pub(super) fn logs_stdout(params: &LogsParams) -> CallToolResult {
+    pub(super) fn logs_stdout(&self, params: &LogsParams) -> CallToolResult {
         let Some(path) = backend_logs::console_capture_path() else {
             return tool_error(
                 "This app was not launched with `victauri run`, so its raw stdout/stderr is \
@@ -174,15 +302,15 @@ impl VictauriMcpHandler {
                     .into_iter()
                     .filter(|l| {
                         min_level.is_none_or(|min| l.level.is_some_and(|lv| lv >= min))
-                            && needle
-                                .as_deref()
-                                .is_none_or(|n| l.text.to_lowercase().contains(n))
+                            && needle.as_deref().is_none_or(|n| {
+                                visible_text(&self.state.privacy, &l.text)
+                                    .to_lowercase()
+                                    .contains(n)
+                            })
                     })
                     .collect();
                 let total = matched.len();
-                if total > limit {
-                    matched.drain(..total - limit);
-                }
+                let next = page_console_lines(&mut matched, limit, params.since_seq, next);
                 json_result(&serde_json::json!({
                     "lines": matched,
                     "total_matched": total,
@@ -234,12 +362,15 @@ impl VictauriMcpHandler {
         } else {
             "logs.backend"
         };
-        if !self.state.privacy.is_tool_enabled(capability) {
+        // `is_call_allowed`, not `is_tool_enabled`: disabling the whole `logs` tool must cover
+        // this too, not only its `logs.backend` / `logs.stdout` actions.
+        if !self.state.privacy.is_call_allowed("logs", capability) {
             return super::tool_disabled(capability);
         }
 
         if reads_stdout {
-            return Self::wait_for_stdout_line(&needle, min_level, since_ms, timeout, poll_ms)
+            return self
+                .wait_for_stdout_line(&needle, min_level, since_ms, timeout, poll_ms)
                 .await;
         }
 
@@ -263,15 +394,23 @@ impl VictauriMcpHandler {
                 e.level >= min_level
                     && backend_logs::entry_contains(e, &needle)
                     && backend_logs::entry_fields_match(e, &wanted_fields)
+                    // A raw match is re-checked on the redacted view (only for these
+                    // candidates), so a wait never confirms a value the caller cannot see.
+                    && visible_entry(&self.state.privacy, e).is_none_or(|seen| {
+                        backend_logs::entry_contains(&seen, &needle)
+                            && backend_logs::entry_fields_match(&seen, &wanted_fields)
+                    })
             })
             .await;
         let elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Some(entry) = hit {
-            return json_result(&serde_json::json!({
+            let mut out = serde_json::json!({
                 "ok": true,
                 "entry": entry,
                 "elapsed_ms": elapsed_ms,
-            }));
+            });
+            backend_logs::resolve_backtraces(&mut out);
+            return json_result(&out);
         }
         let mut out = serde_json::json!({
             "ok": false,
@@ -290,12 +429,14 @@ impl VictauriMcpHandler {
             .into();
         }
         if !sources.any_structured() {
-            out["hint"] = ENABLE_HINT.into();
+            out["hint"] = no_structured_hint(sources).into();
         }
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
     }
 
     async fn wait_for_stdout_line(
+        &self,
         needle: &str,
         min_level: LogLevel,
         since_ms: u64,
@@ -316,7 +457,9 @@ impl VictauriMcpHandler {
                         l.ts_ms >= cutoff
                             && (min_level == LogLevel::Trace
                                 || l.level.is_some_and(|lv| lv >= min_level))
-                            && l.text.to_lowercase().contains(needle)
+                            && visible_text(&self.state.privacy, &l.text)
+                                .to_lowercase()
+                                .contains(needle)
                     }) {
                         return json_result(&serde_json::json!({
                             "ok": true,
@@ -357,6 +500,7 @@ impl VictauriMcpHandler {
             .unwrap_or_else(|_| serde_json::Value::String(raw_result.to_string()));
         let mut out = serde_json::json!({ "result": result });
         self.add_backend_logs(&mut out, from);
+        backend_logs::resolve_backtraces(&mut out);
         json_result(&out)
     }
 
@@ -365,6 +509,7 @@ impl VictauriMcpHandler {
     pub(super) fn backend_logs_error(&self, message: &str, from: u64) -> CallToolResult {
         let mut out = serde_json::json!({ "error": message });
         self.add_backend_logs(&mut out, from);
+        backend_logs::resolve_backtraces(&mut out);
         let text = serde_json::to_string(&out).unwrap_or_else(|_| message.to_string());
         CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])
     }
@@ -384,8 +529,9 @@ impl VictauriMcpHandler {
         if total > entries.len() {
             out["backend_logs_truncated"] = (total - entries.len()).into();
         }
-        if !backend_logs::active_sources().any_structured() {
-            out["backend_logs_hint"] = ENABLE_HINT.into();
+        let sources = backend_logs::active_sources();
+        if !sources.any_structured() {
+            out["backend_logs_hint"] = no_structured_hint(sources).into();
         }
     }
 }
@@ -399,7 +545,9 @@ mod tests {
     use victauri_core::WindowState;
 
     use super::super::VictauriMcpHandler;
+    use super::page_console_lines;
     use crate::VictauriState;
+    use crate::backend_logs;
     use crate::backend_logs::{BackendLogLayer, LogBuffer};
     use crate::bridge::WebviewBridge;
 
@@ -679,12 +827,22 @@ mod tests {
     /// line by line with an advancing `since_seq`, or attached to command results.
     #[tokio::test]
     async fn a_disabled_logs_backend_also_blocks_log_waits_and_with_logs() {
-        let mut state = VictauriState::for_tests();
-        state
-            .privacy
-            .disabled_tools
-            .insert("logs.backend".to_string());
-        let h = VictauriMcpHandler::new(Arc::new(state), Arc::new(NoWebview));
+        // The action, and the whole `logs` tool (an operator writing just `logs`).
+        for disabled in ["logs.backend", "logs"] {
+            let mut state = VictauriState::for_tests();
+            state.privacy.disabled_tools.insert(disabled.to_string());
+            state
+                .backend_logs
+                .push(crate::backend_logs::BackendLogEntry::for_tests(
+                    "auth",
+                    "password=hunter2xyz",
+                ));
+            let h = VictauriMcpHandler::new(Arc::new(state), Arc::new(NoWebview));
+            assert_log_reads_refused(&h, disabled).await;
+        }
+    }
+
+    async fn assert_log_reads_refused(h: &VictauriMcpHandler, disabled: &str) {
         for (tool, args) in [
             (
                 "wait_for",
@@ -699,8 +857,120 @@ mod tests {
                 .execute_tool(tool, args)
                 .await
                 .unwrap_or_else(|_| panic!("dispatch failed for {tool}"));
-            assert_eq!(r.is_error, Some(true), "{tool}: {}", text(&r));
+            assert_eq!(r.is_error, Some(true), "{disabled} / {tool}: {}", text(&r));
             assert!(text(&r).contains("logs.backend"), "{tool}: {}", text(&r));
+            assert!(!text(&r).contains("hunter2xyz"), "{tool}: {}", text(&r));
         }
+    }
+
+    /// The same for the `victauri run` capture (`logs stdout`), whose cursor is a byte offset.
+    #[test]
+    fn a_stdout_cursor_read_pages_forward_through_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cap.jsonl");
+        let body: String = (0..10)
+            .map(|i| format!("{{\"l\":\"line {i}\",\"s\":\"out\",\"t\":{i}}}\n"))
+            .collect();
+        std::fs::write(&path, body).unwrap();
+        let (mut cursor, mut seen) = (0_u64, Vec::new());
+        for _ in 0..10 {
+            let (mut lines, end) =
+                backend_logs::read_console_capture(&path, Some(cursor), 1 << 20).unwrap();
+            let truncated = lines.len() > 3;
+            cursor = page_console_lines(&mut lines, 3, Some(cursor), end);
+            seen.extend(lines.into_iter().map(|l| l.text));
+            if !truncated {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..10).map(|i| format!("line {i}")).collect::<Vec<_>>()
+        );
+        // A plain read (no cursor) still shows the newest lines.
+        let (mut lines, end) = backend_logs::read_console_capture(&path, None, 1 << 20).unwrap();
+        assert_eq!(page_console_lines(&mut lines, 2, None, end), end);
+        assert_eq!(lines.last().unwrap().text, "line 9");
+    }
+
+    /// A follower that fell behind reads on from `next_seq` — on the redacting path too
+    /// (a text filter with redaction on), where the page is cut after the filter.
+    #[tokio::test]
+    async fn a_cursor_read_pages_forward_on_the_redacting_path() {
+        let mut state = VictauriState::for_tests();
+        state.privacy.redaction_enabled = true;
+        for i in 0..10 {
+            state
+                .backend_logs
+                .push(crate::backend_logs::BackendLogEntry::for_tests(
+                    "app",
+                    &format!("step {i}"),
+                ));
+        }
+        let h = VictauriMcpHandler::new(Arc::new(state), Arc::new(NoWebview));
+        let (mut cursor, mut seen) = (0_u64, Vec::new());
+        loop {
+            let page = call(
+                &h,
+                "logs",
+                json!({"action": "backend", "filter": "step", "since_seq": cursor, "limit": 3}),
+            )
+            .await;
+            for e in page["entries"].as_array().unwrap() {
+                seen.push(e["message"].as_str().unwrap().to_string());
+            }
+            cursor = page["next_seq"].as_u64().unwrap();
+            if page["truncated"] != true {
+                break;
+            }
+        }
+        assert_eq!(
+            seen,
+            (0..10).map(|i| format!("step {i}")).collect::<Vec<_>>()
+        );
+    }
+
+    /// An inner logger whose filter passes nothing, like `env_logger` with `RUST_LOG` unset
+    /// below `error`: the wrapper is installed but never sees a record.
+    struct DropsEverything;
+
+    impl log::Log for DropsEverything {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            false
+        }
+        fn log(&self, _: &log::Record<'_>) {}
+        fn flush(&self) {}
+    }
+
+    /// Release verification (fresh consumer, `env_logger` recipe without `RUST_LOG`): the app had
+    /// added `wrap_logger`, its filter let nothing through, and every hint told it to add
+    /// `wrap_logger`. Building a source now marks it installed, so the hint names the filter.
+    #[test]
+    fn an_installed_source_that_saw_nothing_is_reported_as_filtered() {
+        let _logger = backend_logs::wrap_logger(Box::new(DropsEverything));
+        let sources = backend_logs::active_sources();
+        assert!(
+            sources.structured_installed,
+            "wrap_logger() did not mark a structured source as installed"
+        );
+        assert_eq!(super::no_structured_hint(sources), super::FILTERED_HINT);
+        assert!(super::FILTERED_HINT.contains("RUST_LOG"));
+    }
+
+    #[test]
+    fn no_installed_source_gets_the_add_a_source_hint() {
+        let none = backend_logs::ActiveSources {
+            tracing: false,
+            log: false,
+            panic_hook: true,
+            stdout_capture: false,
+            structured_installed: false,
+        };
+        assert_eq!(super::no_structured_hint(none), super::ENABLE_HINT);
+        let installed = backend_logs::ActiveSources {
+            structured_installed: true,
+            ..none
+        };
+        assert_eq!(super::no_structured_hint(installed), super::FILTERED_HINT);
     }
 }

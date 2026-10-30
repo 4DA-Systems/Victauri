@@ -106,6 +106,25 @@ static TEXT_KEY_VALUE_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync:
     },
 );
 
+/// `<name ending in a sensitive word>=<value>` in free text — the shape of `tracing` span fields
+/// (`login{password="…" api_key=…}`, which `#[instrument]` records for every argument), log lines
+/// like `token=abc123`, and `key=value` config dumps. The name is the sensitive word, optionally
+/// after `prefix_` / `prefix-` / `prefix.` components (`db_password`, `x-api_key`) — a word that
+/// merely starts the name (`tokens_used`, `token_count`) is not a credential. The value is a
+/// quoted string (to its closing quote, or the end of a truncated text) or a bare word.
+static TEXT_KEY_EQ_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::LazyLock::new(|| {
+    let mut words: Vec<String> = SENSITIVE_JSON_KEYS
+        .iter()
+        .map(|k| regex::escape(&k.to_lowercase()))
+        .collect();
+    words.sort();
+    words.dedup();
+    compile_builtin(&format!(
+        r#"(?i)(\b(?:[a-z0-9]{{1,32}}[_.-]){{0,4}}(?:{})\s*=\s*)("(?:[^"\\]|\\.)*(?:"|\z)|'[^'\n]*(?:'|\z)|[^\s,;&}})\]"'\[][^\s,;&}})\]"']*)"#,
+        words.join("|")
+    ))
+});
+
 /// Compile one of the built-in patterns; a failure is a bug, logged instead of panicking.
 fn compile_builtin(pattern: &str) -> Option<regex::Regex> {
     regex::Regex::new(pattern)
@@ -113,11 +132,17 @@ fn compile_builtin(pattern: &str) -> Option<regex::Regex> {
         .ok()
 }
 
-/// Replace the value of every sensitive `"key": value` pair found in free text.
+/// Replace the value of every sensitive `"key": value` and `key=value` pair found in free text.
 fn redact_text_key_values(text: &str) -> std::borrow::Cow<'_, str> {
-    match TEXT_KEY_VALUE_RE.as_ref() {
+    let colon = match TEXT_KEY_VALUE_RE.as_ref() {
         Some(re) => re.replace_all(text, r#"${1}"[REDACTED]""#),
         None => std::borrow::Cow::Borrowed(text),
+    };
+    match TEXT_KEY_EQ_RE.as_ref() {
+        Some(re) if re.is_match(&colon) => {
+            std::borrow::Cow::Owned(re.replace_all(&colon, "${1}[REDACTED]").into_owned())
+        }
+        _ => colon,
     }
 }
 
@@ -482,6 +507,50 @@ mod tests {
             "{out}"
         );
         assert_eq!(v["command"], "get_settings");
+    }
+
+    /// Backend log span context is `name{key=value …}` text (`#[instrument]` records every
+    /// argument) — the same secret that is redacted as an event field must be redacted there.
+    #[test]
+    fn redacts_key_equals_value_pairs_in_text() {
+        let r = Redactor::default();
+        let input = serde_json::json!({
+            "spans": ["login{user=\"ann\" password=\"hunter2xyz\" api_key=plainsecret}"],
+            "message": "retrying with token=abc123secret after 3s",
+            "fields": {"tokens_used": 5, "elapsed_ms": 40}
+        })
+        .to_string();
+        let out = r.redact(&input);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("still valid JSON");
+        let span = v["spans"][0].as_str().unwrap();
+        assert!(
+            !span.contains("hunter2xyz") && !span.contains("plainsecret"),
+            "{out}"
+        );
+        assert!(
+            span.contains("user=\"ann\""),
+            "non-sensitive fields survive: {out}"
+        );
+        assert!(!out.contains("abc123secret"), "{out}");
+        assert!(v["message"].as_str().unwrap().contains("after 3s"), "{out}");
+        assert_eq!(v["fields"]["elapsed_ms"], 40);
+        // Plain (non-JSON) text too, including a value cut off by truncation.
+        let plain = r.redact("connect secret='s3cr3t' then password=\"unterminated");
+        assert!(
+            !plain.contains("s3cr3t") && !plain.contains("unterminated"),
+            "{plain}"
+        );
+        let prefixed = r.redact("db_password=pw1 x-api_key=k2 tokens_used=5 token_count=9");
+        assert!(
+            !prefixed.contains("pw1") && !prefixed.contains("k2"),
+            "{prefixed}"
+        );
+        assert!(
+            prefixed.contains("tokens_used=5") && prefixed.contains("token_count=9"),
+            "{prefixed}"
+        );
+        // Already-redacted values are left alone (no doubled markers).
+        assert_eq!(r.redact("token=[REDACTED] x"), "token=[REDACTED] x");
     }
 
     #[test]

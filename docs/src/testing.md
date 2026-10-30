@@ -854,7 +854,7 @@ Victauri tests run in CI without special infrastructure. Pick the approach that 
 - name: Start app
   run: xvfb-run --auto-servernum cargo run -p my-app &
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.1
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.2
   with:
     max-load-ms: 5000
     max-heap-mb: 256

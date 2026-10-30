@@ -184,7 +184,54 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-10-27)
+## Current State (2026-10-28)
+
+### v0.10.2 — release candidate (`release/0.10.2-prep`), five-lens audit, NOT published
+
+Ships the backend (Rust) log capture merged as #92 (re-cut of draft #73) — `logs backend /
+backend_digest / stdout`, `wait_for log`, `invoke_command {with_logs}`, `victauri run`,
+`victauri logs` — plus the fixes from a five-lens pre-release audit (in-process safety,
+security/privacy, CLI cross-platform, claims/release/supply chain, consumer upgrade/footprint).
+Semver: additions only (`cargo semver-checks` vs 0.10.1: no update required) → a PATCH release
+(project convention: compatible features ship in 0.x patch releases so `"0.10"` consumers get
+them). Notable fixes, each with a test: a tokio-console (`tokio_unstable` + tokio `tracing`)
+self-deadlock in `wait_for log` (Tokio traces waker clones under its `Notify` lock; capturing
+that event re-entered the lock) → Tokio instrumentation excluded + an `IN_NOTIFY` re-entrancy
+guard; disabling the bare `logs` tool did not cover `wait_for log` / `with_logs`
+(`is_call_allowed`, not `is_tool_enabled`); span `key=value` text was never redacted and
+`filter` matched raw text (a redaction oracle); the `log_layer()` line shipped ~50 KB of capture
+code into RELEASE builds (the app monomorphises the layer type whatever its value) → the type is
+an empty ZST in release; the panic hook resolved a backtrace (seconds on Windows) before the app's
+own crash hook → previous hook first, backtrace symbolised when read (`resolve_backtraces`);
+`victauri logs --follow` printed nothing from a crash and never re-attached after a restart
+(health probe is unauthenticated) → re-resolve through discovery; Windows capture dir now gets an
+owner-only DACL (`victauri_test::process::restrict_dir_to_current_user`). Also: the Tauri 3
+canary had been RED since #92 (`examples/tauri3/Cargo.lock` missing the new deps; hidden by the
+job's `continue-on-error`) — fixed by the bump, and the bump script now fails on a failing cargo
+step and checks that lockfile with `--locked`. LESSON: a CI watcher must read every job, not the
+run conclusion, or a non-required red job hides.
+
+**Live verification of the candidate (2026-10-29) found two more real bugs, both fixed:**
+(1) cursor reads (`logs backend` / `stdout` with `since_seq`) returned the NEWEST `limit` matches
+and a `next_seq` at the buffer end, so a follower more than one page behind silently lost the
+middle of a burst — they now page forward (oldest first, `next_seq` just past the page);
+fail-first: a reader 10 behind paging by 3 got 3 of 10. Found by a 3-min, 34.5k-call soak against
+4DA: one `wait_for log` timed out — counting the logged trigger lines (1,471 = every call made)
+plus a 24 s stretch with no trigger line showed a 4DA-side stall, NOT a lost wake-up, and reading
+that window by cursor exposed the paging bug. (2) `victauri logs --follow` re-attached after a
+restart but kept the FIRST process's capture path, so the second process's crash printed nothing
+→ re-read from the new process's `sources`. Evidence, all live on Windows: demo E2E 31/31 (incl.
+the symbolised-backtrace assertion — a COPIED `.exe` shows `<unknown>` frames because rustc embeds
+only the PDB file name; docs note it); release `demo-app` with the `log_layer()` line is 29,696 B
+SMALLER than without and contains none of the capture strings (probe validated on the debug
+build, which has them); tokio-console deadlock test hangs at the 20 s bound on pre-fix `e39a738`
+under `--cfg tokio_unstable` and passes on the fix; `victauri run` capture in the private
+`console` dir, relative `--capture` made absolute; 4DA second GUI (identifier
+`com.4da.app.vic0102`, port 4448, scratch DB snapshot, `fourda://` key backed up + restored
+byte-identical, operator's 4DA untouched): digest/filters/typed fields/`with_logs` (success +
+error)/`wait_for log`/CLI digest+filters on real 4DA tracing, 381 entries paged by 7 identical to
+one full read. Gate on `296e996`: fmt, clippy ×3, rustdoc, 2,186 workspace tests / 0 failed,
+preflight.
 
 ### v0.10.1 — PUBLISHED 2026-10-27
 
@@ -1226,8 +1273,8 @@ Tested against 4 third-party open-source Tauri 2 apps with fully built frontends
 - **victauri-core**: `EventLog` (ring buffer), `CommandRegistry` (BTreeMap with search + NL resolve), `DomSnapshot`, `WindowState`, `VerificationResult`/`Divergence`, `GhostCommandReport`, `IpcIntegrityReport`, `SemanticAssertion`/`AssertionResult`, `ScoredCommand`, `EventRecorder` (time-travel recording with checkpoints), `RecordedSession`, `RecordedEvent`, `StateCheckpoint`. 157 tests (32 codegen unit + 121 core + 4 compile tests). 16 Criterion benchmarks across 5 groups. All mutex/rwlock calls use poisoning recovery.
 - **victauri-macros**: `#[inspectable]` proc macro with `description`, `intent`, `category`, `example` attributes. Uses proper `syn::meta` parsing (not string matching). Generates `<fn>__schema()` returning `CommandInfo` with full intent metadata. 4 integration tests.
 - **victauri-plugin**: Full MCP server with **35 tools** + 3 resources. Tools organized by category:
-  - **Standalone (20)**: eval_js, dom_snapshot, find_elements, invoke_command, screenshot, verify_state, detect_ghost_commands, check_ipc_integrity, wait_for (text/selector/url/ipc_idle/network_idle + **expression**/**event** for awaiting async backend work), assert_semantic, resolve_command, get_registry, **app_state** (app-defined backend-state probes), get_memory_stats, get_plugin_info, get_diagnostics, app_info, list_app_dir, read_app_file, query_db
-  - **Compound (15)**: interact (click/double_click/hover/focus/scroll_into_view/select_option), input (fill/type_text/press_key), window (get_state/list/manage/resize/move_to/set_title/introspectability), storage (get/set/delete/get_cookies), navigate (go_to/go_back/get_history/set_dialog_response/get_dialog_log), recording (start/stop/checkpoint/list_checkpoints/get_events/events_between/get_replay/export/import/replay/flush), inspect (get_styles/get_bounding_boxes/highlight/clear_highlights/audit_accessibility/get_performance), css (inject/remove), route (add/list/clear/clear_all/matches — fetch/XHR interception; on the fetch transport also mocks/delays real Tauri IPC — see the fault-injection note), trace (start/stop/status/frames — screencast ring buffer), animation (list/scrub/sample), logs (console/network/ipc/navigation/dialogs/events/slow_ipc/clear), **introspect** (command_timings/coverage/command_catalog/contract_record/contract_check/contract_list/contract_clear/startup_timing/capabilities/db_health/plugin_state/processes/plugin_tasks/event_bus/event_bus_clear), **fault** (inject/list/clear/clear_all), **explain** (summary/last_action/diff)
+  - **Standalone (20)**: eval_js, dom_snapshot, find_elements, invoke_command, screenshot, verify_state, detect_ghost_commands, check_ipc_integrity, wait_for (text/selector/url/ipc_idle/network_idle + **expression**/**event**/**log** for awaiting async backend work), assert_semantic, resolve_command, get_registry, **app_state** (app-defined backend-state probes), get_memory_stats, get_plugin_info, get_diagnostics, app_info, list_app_dir, read_app_file, query_db
+  - **Compound (15)**: interact (click/double_click/hover/focus/scroll_into_view/select_option), input (fill/type_text/press_key), window (get_state/list/manage/resize/move_to/set_title/introspectability), storage (get/set/delete/get_cookies), navigate (go_to/go_back/get_history/set_dialog_response/get_dialog_log), recording (start/stop/checkpoint/list_checkpoints/get_events/events_between/get_replay/export/import/replay/flush), inspect (get_styles/get_bounding_boxes/highlight/clear_highlights/audit_accessibility/get_performance), css (inject/remove), route (add/list/clear/clear_all/matches — fetch/XHR interception; on the fetch transport also mocks/delays real Tauri IPC — see the fault-injection note), trace (start/stop/status/frames — screencast ring buffer), animation (list/scrub/sample), logs (console/network/ipc/navigation/dialogs/events/slow_ipc/clear + backend/backend_digest/stdout — the Rust side, see docs/src/backend-logs.md), **introspect** (command_timings/coverage/command_catalog/contract_record/contract_check/contract_list/contract_clear/startup_timing/capabilities/db_health/plugin_state/processes/plugin_tasks/event_bus/event_bus_clear), **fault** (inject/list/clear/clear_all), **explain** (summary/last_action/diff)
   Resources: victauri://ipc-log, victauri://windows, victauri://state (read on demand; `resources.subscribe` is NOT advertised — legacy subscribe/unsubscribe calls are accepted but nothing pushes updates). JS bridge (version = the crate version, injected at build time) with IPC interception, network monitoring, storage access, navigation tracking, dialog capture, extended interactions, and waitFor. `EventRecorder` with 50,000 event capacity. **Release-safe**: `init()` returns a no-op plugin in release builds via `#[cfg(debug_assertions)]` gate. `VictauriBuilder` for port/capacity/auth configuration + `VICTAURI_PORT`/`VICTAURI_AUTH_TOKEN` env vars. Bearer token auth middleware (**enabled by default** with auto-generated UUID v4 token, case-insensitive per RFC 7235). `auth_disabled()` to opt out, or `auth_token("...")` for a fixed token. Token-bucket rate limiter (AtomicU64, 1000 req/sec default). Privacy layer with command allowlists/blocklists, tool disabling, regex-based output redaction, strict mode. Tool enable/disable via builder. 203 unit tests + 128 integration tests + 38 adversarial tests + 85 tool contract tests + 30 bridge tests + 22 stress tests + 19 platform tests.
 - **victauri-test**: Typed MCP HTTP client (`VictauriClient`) with auto-session management (initialize + notifications/initialized). 23 convenience methods for tool calls (eval_js, dom_snapshot, click, fill, etc). 6 standalone assertion helpers: `assert_json_eq`, `assert_json_truthy`, `assert_no_a11y_violations`, `assert_performance_budget`, `assert_ipc_healthy`, `assert_state_matches`. 11 client assertion methods: `assert_eval_works`, `assert_dom_snapshot_valid`, `assert_screenshot_ok`, `assert_windows_exist`, `assert_ipc_integrity_ok`, `assert_accessible`, `assert_dom_complete_under`, `assert_heap_under_mb`, `assert_no_uncaught_errors`, `assert_recording_lifecycle`, `assert_health_hardened`. Built-in `smoke_test()` suite (11 checks, returns `SmokeReport` with timing + JUnit XML). `SmokeConfig` for custom thresholds. Supports Bearer token auth via `connect_with_token`. Published to crates.io as standalone crate.
 - **victauri-cli**: CLI binary (`victauri`) with 8 commands: `init` (scaffold test directory + CLAUDE.md with agent instructions), `check` (server diagnostics), `test` (built-in smoke suite — 11 checks with pass/fail + JUnit XML), `record` (capture interactions → test file), `doctor` (full setup diagnosis), `watch` (file watcher → re-run tests), `invoke` (call any Tauri IPC command from terminal), `coverage` (IPC command coverage report). `victauri test` auto-discovers the running app, runs all smoke checks, prints a summary, exits 0/1 for CI. Configurable `--max-load-ms` and `--max-heap-mb` thresholds. `victauri init` creates/appends CLAUDE.md with instructions that make AI agents prefer Victauri over CDP/Playwright.

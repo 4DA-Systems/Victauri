@@ -200,7 +200,7 @@ if [ "$OS" = Windows_NT ]; then ROOTS="${TMPDIR:-/tmp}/victauri"   # Git Bash: /
 else ROOTS="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/victauri} ${TMPDIR:-/tmp}/victauri-$(id -u) $HOME/.local/state/victauri"; fi
 TOKEN=$(cat "$(for r in $ROOTS; do ls -t "$r"/*/token 2>/dev/null; done | head -n1)")
 curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/info
-# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.10.1",...}
+# Returns: {"name":"victauri","port":7373,"protocol":"mcp","version":"0.10.2",...}
 ```
 
 Or use the Victauri CLI:

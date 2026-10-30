@@ -57,25 +57,6 @@ impl Backend {
         ))
     }
 
-    /// Poll `/health` for up to `max` — a busy app answers slowly, a dead one never.
-    async fn recovers_within(&self, max: Duration) -> bool {
-        let deadline = std::time::Instant::now() + max;
-        while std::time::Instant::now() < deadline {
-            let ok = self
-                .http
-                .get(format!("{}/health", self.base))
-                .timeout(Duration::from_secs(2))
-                .send()
-                .await
-                .is_ok_and(|r| r.status().is_success());
-            if ok {
-                return true;
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-        false
-    }
-
     async fn logs(&self, args: Value) -> Result<Value> {
         let mut req = self
             .http
@@ -92,14 +73,31 @@ impl Backend {
             .await
             .context("unexpected response")?;
         if let Some(err) = resp.get("error") {
+            let err = err.as_str().map_or_else(|| err.to_string(), str::to_string);
             bail!(
                 "{}",
-                victauri_test::terminal::untrusted_multi_line(
-                    &err.as_str().map_or_else(|| err.to_string(), str::to_string)
-                )
+                victauri_test::terminal::untrusted_multi_line(&explain_logs_error(&err))
             );
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }
+}
+
+/// A plugin older than 0.10.2 has no backend-log actions, and rejects them as an unknown
+/// `logs` variant — the usual first contact after `cargo install victauri-cli` while the app
+/// still embeds the older plugin. Say that, and how to fix it, instead of a deserializer error.
+fn explain_logs_error(err: &str) -> String {
+    let predates = ["backend", "backend_digest", "stdout"]
+        .iter()
+        .any(|action| err.contains(&format!("unknown variant `{action}`")));
+    if predates {
+        format!(
+            "this app's Victauri plugin predates backend log capture (added in victauri-plugin \
+             0.10.2) — bump the app's `victauri-plugin` dependency to 0.10.2 or newer and \
+             rebuild it. (The plugin said: {err})"
+        )
+    } else {
+        err.to_string()
     }
 }
 
@@ -315,22 +313,16 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     });
     let first = backend.logs(args.clone()).await?;
     let sources = &first["sources"];
+    // After a crash, the `victauri run` capture still holds the app's last words and exit status.
+    let mut capture_path = own_capture_path(&first);
     let structured = sources["tracing"] == true || sources["log"] == true;
     if !structured && sources["stdout_capture"] == true {
         eprintln!("victauri logs: no structured source in this app — reading its captured stdout");
-        return follow_stdout_via_app(&backend, &opts).await;
+        return follow_stdout_via_app(&backend, &opts, capture_path).await;
     }
     if let Some(hint) = first["hint"].as_str() {
         eprintln!("victauri logs: {}", clean(hint));
     }
-    // Where this app's raw output is captured (when run under `victauri run`): after a
-    // crash that file still holds its last words and exit status. The path comes from the
-    // server, so it is only followed when it is one of OUR captures — never an arbitrary file
-    // shown as the app's output.
-    let capture_path = sources["stdout_capture_path"]
-        .as_str()
-        .map(PathBuf::from)
-        .filter(|p| crate::run::is_own_capture(p));
     // `-n 0` = no history, only what arrives from now on.
     if opts.limit > 0 {
         print_page(&first, &opts);
@@ -338,9 +330,16 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
     if !opts.follow {
         return Ok(());
     }
+    let mut backend = backend;
+    let mut label = label;
     let mut cursor = first["next_seq"].as_u64().unwrap_or(0);
+    // A cursor read returns the OLDEST entries after the cursor, `truncated` when more are
+    // waiting: read the rest at once instead of one page per poll interval.
+    let mut behind = false;
     loop {
-        tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        if !behind {
+            tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
+        }
         args["since_seq"] = cursor.into();
         args["limit"] = 2000.into();
         if let Ok(page) = backend.logs(args.clone()).await {
@@ -349,33 +348,125 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             }
             print_page(&page, &opts);
             cursor = page["next_seq"].as_u64().unwrap_or(cursor);
-        } else {
-            // A slow answer is not a dead app: a busy host (or a stalled UI) can miss one
-            // request. Only declare it gone when /health stays silent too.
-            let stalled = std::time::Instant::now();
-            if backend.recovers_within(Duration::from_secs(20)).await {
-                eprintln!(
-                    "victauri logs: app was unresponsive for {:.1}s — resumed",
-                    stalled.elapsed().as_secs_f64()
-                );
-                continue;
-            }
-            out("victauri logs: app went away (crashed, closed or rebuilding)");
-            let went_away_ms = now_ms();
-            let path = capture_path.clone().or_else(crate::run::latest_capture);
-            if path.is_some() {
-                // Show what the app printed in its final moments, then how it exited.
-                return follow_capture(
-                    &opts,
-                    path,
-                    Some(went_away_ms.saturating_sub(opts.interval_ms + 2000)),
-                    Some(Duration::from_secs(30)),
-                )
-                .await;
-            }
-            return Ok(());
+            behind = page["truncated"] == true;
+            continue;
         }
+        // Taken at the FIRST failed poll: the crash's last words are just before this moment
+        // (taking it after the re-attach wait filtered every one of them out).
+        let went_away_ms = now_ms();
+        let stalled = std::time::Instant::now();
+        // A slow answer is not a dead app, and a restarted app (a `tauri dev` rebuild) has a
+        // new token and maybe a new port: re-resolve it through discovery for up to 20 s
+        // rather than probing the unauthenticated /health, which a restarted app answers
+        // while every authenticated read fails.
+        let Some(Reattached {
+            backend: b,
+            label: l,
+            page,
+            restarted,
+        }) = reattach(&opts, &args, cursor, &label, Duration::from_secs(20)).await
+        else {
+            eprintln!("victauri logs: app went away (crashed, closed or rebuilding)");
+            return hand_off_to_capture(&opts, capture_path.clone(), went_away_ms).await;
+        };
+        if restarted {
+            eprintln!(
+                "victauri logs: app restarted — following the new process {}",
+                clean(&l)
+            );
+            // The new process writes its own capture: a later crash must be read from THAT
+            // file, not the previous process's.
+            capture_path = own_capture_path(&page);
+        } else {
+            eprintln!(
+                "victauri logs: app was unresponsive for {:.1}s — resumed",
+                stalled.elapsed().as_secs_f64()
+            );
+        }
+        print_page(&page, &opts);
+        cursor = page["next_seq"].as_u64().unwrap_or(0);
+        behind = page["truncated"] == true;
+        backend = b;
+        label = l;
     }
+}
+
+/// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
+/// response's `sources`. The path comes from the server, so it is only used when it is one
+/// of OUR captures — never an arbitrary file shown as the app's output.
+fn own_capture_path(page: &Value) -> Option<PathBuf> {
+    page["sources"]["stdout_capture_path"]
+        .as_str()
+        .map(PathBuf::from)
+        .filter(|p| crate::run::is_own_capture(p))
+}
+
+struct Reattached {
+    backend: Backend,
+    label: String,
+    page: Value,
+    restarted: bool,
+}
+
+/// Re-resolve the app through discovery until `max` passes, and read the log from `cursor`.
+/// A different process (the label carries the pid) or a sequence counter that went backwards
+/// means the app restarted: then the NEW process's log is read from its start.
+async fn reattach(
+    opts: &LogsOptions,
+    args: &Value,
+    cursor: u64,
+    old_label: &str,
+    max: Duration,
+) -> Option<Reattached> {
+    let deadline = std::time::Instant::now() + max;
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let Ok((backend, label)) = Backend::connect(opts.app.as_deref()).await else {
+            continue;
+        };
+        let Ok(page) = backend.logs(args.clone()).await else {
+            continue;
+        };
+        let counter_reset = page["next_seq"].as_u64().is_some_and(|next| next < cursor);
+        let restarted = label != old_label || counter_reset;
+        let page = if restarted {
+            let mut from_start = args.clone();
+            from_start["since_seq"] = 0.into();
+            match backend.logs(from_start).await {
+                Ok(p) => p,
+                Err(_) => continue,
+            }
+        } else {
+            page
+        };
+        return Some(Reattached {
+            backend,
+            label,
+            page,
+            restarted,
+        });
+    }
+    None
+}
+
+/// The app is gone: show what it printed in its final moments, then how it exited, from its
+/// `victauri run` capture (if it ran under one).
+async fn hand_off_to_capture(
+    opts: &LogsOptions,
+    capture_path: Option<PathBuf>,
+    went_away_ms: u64,
+) -> Result<()> {
+    let path = capture_path.or_else(crate::run::latest_capture);
+    if path.is_none() {
+        return Ok(());
+    }
+    follow_capture(
+        opts,
+        path,
+        Some(went_away_ms.saturating_sub(opts.interval_ms + 2000)),
+        Some(Duration::from_secs(30)),
+    )
+    .await
 }
 
 fn print_page(page: &Value, opts: &LogsOptions) {
@@ -453,12 +544,29 @@ fn console_line_passes(l: &Value, opts: &LogsOptions) -> bool {
     true
 }
 
-async fn follow_stdout_via_app(backend: &Backend, opts: &LogsOptions) -> Result<()> {
+async fn follow_stdout_via_app(
+    backend: &Backend,
+    opts: &LogsOptions,
+    capture_path: Option<PathBuf>,
+) -> Result<()> {
     let mut args =
         json!({"action": "stdout", "limit": opts.limit, "level": opts.level, "filter": opts.grep});
     let mut first = true;
     loop {
-        let page = backend.logs(args.clone()).await?;
+        let page = match backend.logs(args.clone()).await {
+            Ok(page) => page,
+            // This mode is the one where the capture is everything: when the app dies while
+            // being followed, read its last words and exit from the capture file directly.
+            Err(e) if opts.follow && !first => {
+                let went_away_ms = now_ms();
+                eprintln!(
+                    "victauri logs: app went away ({}) — reading its capture",
+                    clean(&e.to_string())
+                );
+                return hand_off_to_capture(opts, capture_path, went_away_ms).await;
+            }
+            Err(e) => return Err(e),
+        };
         if let Some(lines) = page["lines"].as_array() {
             for l in lines {
                 emit(&render_console(l), opts.json, l);
@@ -614,6 +722,43 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Release verification: the 0.10.2 CLI against 4DA's 0.10.1 plugin printed only the
+    /// plugin's deserializer error for `victauri logs`.
+    #[test]
+    fn an_older_plugin_is_named_as_the_cause() {
+        let old = "invalid parameters: unknown variant `backend`, expected one of `console`, \
+                   `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc`, `clear`";
+        let msg = explain_logs_error(old);
+        assert!(msg.contains("predates backend log capture"), "{msg}");
+        assert!(msg.contains("0.10.2"), "{msg}");
+        assert!(msg.contains(old), "the plugin's own words are kept: {msg}");
+        for action in ["backend_digest", "stdout"] {
+            let e = format!("invalid parameters: unknown variant `{action}`, expected one of …");
+            assert!(explain_logs_error(&e).contains("predates"), "{action}");
+        }
+        let other = "no backend log source is active";
+        assert_eq!(explain_logs_error(other), other);
+    }
+
+    #[test]
+    fn a_capture_path_is_used_only_when_it_is_our_own_capture() {
+        let Some(dir) = crate::run::capture_dir() else {
+            return;
+        };
+        let ours = dir.join(format!("test-{}.jsonl", std::process::id()));
+        std::fs::write(&ours, "").unwrap();
+        let page = |p: &std::path::Path| json!({"sources": {"stdout_capture_path": p}});
+        assert_eq!(own_capture_path(&page(&ours)), Some(ours.clone()));
+        // A file outside the private capture directory (the server could name anything).
+        let elsewhere =
+            std::env::temp_dir().join(format!("victauri-not-ours-{}.jsonl", std::process::id()));
+        std::fs::write(&elsewhere, "").unwrap();
+        assert_eq!(own_capture_path(&page(&elsewhere)), None);
+        assert_eq!(own_capture_path(&json!({"sources": {}})), None);
+        let _ = std::fs::remove_file(&ours);
+        let _ = std::fs::remove_file(&elsewhere);
+    }
 
     #[test]
     fn render_entry_is_one_readable_line() {

@@ -157,7 +157,9 @@ Output is the tool's result as JSON on stdout (`--raw` for one line). Exit codes
 | `3` | the call was sent but did not complete (timeout, lost connection) — the tool may have run; check its effect before retrying |
 
 `--out` overwrites an existing file; with several images it writes `<stem>-1.<ext>`,
-`<stem>-2.<ext>`, … Piping into a reader that stops early (`| head`) is a clean exit. With no
+`<stem>-2.<ext>`, … (the JSON `saved` paths are UTF-8: a path that is not valid UTF-8 is shown
+with replacement characters, though the file is written to the real path). Piping into a reader
+that stops early (`| head`) is a clean exit. With no
 app running, `victauri tools` still lists the built-in tool names and descriptions.
 
 ### `victauri logs` / `victauri run`
@@ -187,10 +189,12 @@ victauri logs --stdout --follow
 
 Structured capture needs one line in the app's logging setup — `.with(victauri_plugin::log_layer())`
 on a `tracing_subscriber` registry, or `victauri_plugin::log_logger()` for `log` / `tauri-plugin-log`.
-See the [Backend Logs guide](../../docs/src/backend-logs.md). Captures are written owner-only to
-a `console` directory under the private per-user Victauri directory (never a shared temp dir);
-log text is printed one entry per line with control and bidi characters escaped, so app output
-cannot drive your terminal or forge CI annotations.
+See the [Backend Logs guide](https://github.com/4DA-Systems/victauri/blob/main/docs/src/backend-logs.md).
+`--follow` re-attaches when the app restarts (a `tauri dev` rebuild) and, when it is gone for
+good, prints its last words and exit status from the capture. Captures are written owner-only
+to a `console` directory under the private per-user Victauri directory (never a shared temp
+dir); log text is printed one entry per line with control and bidi characters escaped, so app
+output cannot drive your terminal or forge CI annotations.
 
 ### `victauri coverage`
 

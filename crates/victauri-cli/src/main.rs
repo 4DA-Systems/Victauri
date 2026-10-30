@@ -260,13 +260,13 @@ printed as base64). Exit codes:
     /// `victauri run` capture when the app is down
     Logs {
         /// Which app, when several are running (bundle identifier or product name)
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["stdout", "capture"])]
         app: Option<String>,
         /// Minimum level: trace, debug, info, warn, error
         #[arg(short, long)]
         level: Option<String>,
-        /// Target prefix(es), comma-separated (e.g. `app::db`)
-        #[arg(short, long)]
+        /// Target prefix(es), comma-separated (e.g. `app::db`); structured logs only
+        #[arg(short, long, conflicts_with_all = ["stdout", "capture", "digest"])]
         target: Option<String>,
         /// Only lines containing this text (case-insensitive)
         #[arg(short, long)]
@@ -278,7 +278,7 @@ printed as base64). Exit codes:
         #[arg(short, long)]
         follow: bool,
         /// Print the digest: counts, repeated messages, recent problems, panics
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["follow", "stdout", "capture", "grep", "level"])]
         digest: bool,
         /// Read raw stdout/stderr from the `victauri run` capture instead
         #[arg(long)]

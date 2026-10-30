@@ -43,8 +43,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Backend log capture: the `log_layer()` tracing layer (registry only — no fmt/env-filter)
-# and the `log` crate adapter. Both are already in every Tauri app's dependency graph.
-tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+# and the `log` crate adapter. `log` is in every Tauri app's graph; `tracing-subscriber` (with
+# sharded-slab / thread_local) is new to apps that do not use it already. `BackendLogLayer`
+# implements its `Layer`, so tracing-subscriber 0.3 is part of this crate's public API.
+# 0.3.18+: older 0.3.x mishandle an `Option::None` layer (what `log_layer()` returns in release
+# builds) — 0.3.14 disabled every event globally, 0.3.15 made the max level OFF.
+tracing-subscriber = { version = "0.3.18", default-features = false, features = ["registry", "std"] }
 log = { version = "0.4", features = ["std"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -95,6 +99,9 @@ proptest = "1"
 fern = "0.7"
 # Proves the documented tracing recipes (registry + EnvFilter + fmt, and fmt().finish().with(..)).
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+# Tokio's own instrumentation (inert unless built with `--cfg tokio_unstable`): lets
+# `waking_a_log_waiter_survives_tokio_tracing_its_own_wakers` reproduce a tokio-console setup.
+tokio = { workspace = true, features = ["tracing"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 x11rb = { version = "0.13", features = ["composite"] }

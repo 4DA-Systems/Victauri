@@ -71,6 +71,17 @@ pub fn dir_owned_by_current_user(path: &std::path::Path) -> bool {
     imp::dir_owned_by_current_user(path)
 }
 
+/// Windows: give the directory at `path` a PROTECTED owner-only DACL (the current user: full
+/// control, inherited by its files). A directory created in a `TEMP` that is shared — or simply
+/// inherits a permissive ACL — would otherwise let other users read or plant files in it.
+/// Returns whether the DACL was applied.
+#[cfg(windows)]
+#[doc(hidden)]
+#[must_use]
+pub fn restrict_dir_to_current_user(path: &std::path::Path) -> bool {
+    imp::restrict_dir_to_current_user(path)
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod imp {
@@ -214,6 +225,61 @@ mod imp {
                 .iter()
                 .any(|g| EqualSid(g.Sid, admins.as_mut_ptr().cast::<c_void>()) != 0)
         }
+    }
+
+    /// Replace `path`'s DACL with a PROTECTED, owner-only one: the current token user gets full
+    /// control (inherited by children); no inherited or pre-existing ACE survives. Mirrors the
+    /// plugin's `apply_owner_only_dacl` (`mcp/server.rs`).
+    pub(super) fn restrict_dir_to_current_user(path: &std::path::Path) -> bool {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::GENERIC_ALL;
+        use windows_sys::Win32::Security::Authorization::{
+            EXPLICIT_ACCESS_W, NO_MULTIPLE_TRUSTEE, SET_ACCESS, SetEntriesInAclW,
+            SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+        };
+        use windows_sys::Win32::Security::{
+            ACL, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+        };
+
+        let Some(me) = own_token_info(TokenUser) else {
+            return false;
+        };
+        let explicit = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: GENERIC_ALL,
+            grfAccessMode: SET_ACCESS,
+            grfInheritance: SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_USER,
+                ptstrName: sid(&me).cast::<u16>(),
+            },
+        };
+        let mut new_acl: *mut ACL = std::ptr::null_mut();
+        // SAFETY: one explicit entry whose SID lives in `me` (alive for this call), no prior
+        // ACL; on success `new_acl` is a LocalAlloc'd ACL, freed by `Local` below.
+        let rc = unsafe { SetEntriesInAclW(1, &explicit, std::ptr::null(), &mut new_acl) };
+        if rc != ERROR_SUCCESS || new_acl.is_null() {
+            return false;
+        }
+        let _acl = Local(new_acl.cast::<c_void>());
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `wide` is NUL-terminated; `new_acl` is a valid ACL. PROTECTED strips
+        // inheritance and every other explicit ACE, leaving exactly the owner-only DACL.
+        let set = unsafe {
+            SetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                new_acl,
+                std::ptr::null(),
+            )
+        };
+        set == ERROR_SUCCESS
     }
 
     /// Frees a `LocalAlloc`'d block on drop.
@@ -482,6 +548,32 @@ mod tests {
             return;
         }
         assert!(!dir_owned_by_current_user(dir.path()));
+    }
+
+    /// The owner-only DACL replaces whatever the directory had (here: an explicit grant to
+    /// `Everyone`, standing in for a permissive inherited ACL) and keeps it usable by us.
+    #[cfg(windows)]
+    #[test]
+    fn an_owner_only_dacl_replaces_every_other_ace() {
+        let dir = tempfile::tempdir().unwrap();
+        let granted = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .args(["/grant", "*S-1-1-0:(OI)(CI)F", "/q"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(granted, "test setup: grant Everyone");
+        assert!(restrict_dir_to_current_user(dir.path()));
+        let acl = std::process::Command::new("icacls")
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        let acl = String::from_utf8_lossy(&acl.stdout);
+        assert!(
+            !acl.contains("Everyone") && !acl.contains("S-1-1-0"),
+            "{acl}"
+        );
+        assert!(dir_owned_by_current_user(dir.path()));
+        std::fs::write(dir.path().join("probe"), b"ok").unwrap();
     }
 
     /// R4-DISC1: with no `kill` binary at all (NixOS/Guix/minimal containers), a live PID

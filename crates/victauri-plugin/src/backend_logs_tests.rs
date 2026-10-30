@@ -97,6 +97,35 @@ fn query_filters_by_level_target_text_and_cursor() {
 }
 
 #[test]
+fn a_cursor_read_pages_forward_without_skipping_a_burst() {
+    let buf = LogBuffer::default();
+    for i in 0..10 {
+        buf.push(entry(LogLevel::Info, "t", &format!("n{i}")));
+    }
+    // A follower 10 entries behind, reading 3 at a time, must see every entry exactly once.
+    let mut cursor = 0;
+    let mut seen = Vec::new();
+    loop {
+        let page = buf.query(&LogQuery {
+            since_seq: Some(cursor),
+            limit: 3,
+            ..LogQuery::default()
+        });
+        seen.extend(page.entries.iter().map(|e| e.message.clone()));
+        assert!(
+            page.next_seq > cursor || page.entries.is_empty(),
+            "cursor must advance"
+        );
+        cursor = page.next_seq;
+        if !page.truncated {
+            break;
+        }
+    }
+    assert_eq!(seen, (0..10).map(|i| format!("n{i}")).collect::<Vec<_>>());
+    assert_eq!(cursor, 10, "the last page hands back the end of the buffer");
+}
+
+#[test]
 fn limit_keeps_newest_matches_and_reports_truncation() {
     let buf = LogBuffer::default();
     for i in 0..10 {
@@ -128,6 +157,71 @@ fn stale_cursor_reports_gap() {
         ..LogQuery::default()
     });
     assert!(page.gap, "entries 1..4 were evicted unseen");
+}
+
+/// `clear()` removes entries on purpose: a cursor from before the clear has missed nothing
+/// to eviction, so neither a query nor a waiter may report one — but an eviction AFTER the
+/// clear still is a gap.
+#[tokio::test]
+async fn a_clear_is_not_reported_as_an_eviction_gap() {
+    let buf = LogBuffer::new(3, usize::MAX);
+    for _ in 0..2 {
+        buf.push(entry(LogLevel::Info, "t", "before"));
+    }
+    buf.clear();
+    buf.push(entry(LogLevel::Info, "t", "after"));
+    let page = buf.query(&LogQuery {
+        since_seq: Some(0),
+        ..LogQuery::default()
+    });
+    assert!(!page.gap, "cleared entries are not an eviction gap");
+    assert_eq!(page.entries.len(), 1);
+    let (hit, missed) = buf
+        .wait_for(0, std::time::Duration::from_millis(20), |e| {
+            e.message == "nope"
+        })
+        .await;
+    assert!(hit.is_none());
+    assert_eq!(missed, 0);
+
+    // Overflow after the clear (capacity 3): seq 2 and 3 are evicted unseen.
+    for _ in 0..4 {
+        buf.push(entry(LogLevel::Info, "t", "later"));
+    }
+    let page = buf.query(&LogQuery {
+        since_seq: Some(0),
+        ..LogQuery::default()
+    });
+    assert!(page.gap);
+    let (_, missed) = buf
+        .wait_for(0, std::time::Duration::from_millis(20), |_| false)
+        .await;
+    assert_eq!(missed, 2);
+}
+
+/// `range` (what `invoke_command {with_logs}` attaches) and `wait_for` jump to the cursor by
+/// index; both must still return exactly the entries in `[from, to)`.
+#[tokio::test]
+async fn cursor_lookups_return_exactly_the_requested_window() {
+    let buf = LogBuffer::new(5, usize::MAX);
+    for i in 0..8 {
+        buf.push(entry(LogLevel::Info, "t", &format!("m{i}")));
+    }
+    // Entries 3..8 remain.
+    let (got, total) = buf.range(4, 7, LogLevel::Trace, 100);
+    let msgs: Vec<&str> = got.iter().map(|e| e.message.as_str()).collect();
+    assert_eq!(msgs, ["m4", "m5", "m6"]);
+    assert_eq!(total, 3);
+    let (got, _) = buf.range(0, 4, LogLevel::Trace, 100);
+    assert_eq!(got.len(), 1, "only m3 is still buffered below 4");
+    let (got, _) = buf.range(100, 200, LogLevel::Trace, 100);
+    assert!(got.is_empty());
+    let (hit, _) = buf
+        .wait_for(6, std::time::Duration::from_millis(20), |e| {
+            e.message.starts_with('m')
+        })
+        .await;
+    assert_eq!(hit.map(|e| e.message), Some("m6".to_string()));
 }
 
 #[test]
@@ -381,6 +475,76 @@ fn panic_push_waits_for_another_holder_but_never_self_deadlocks() {
     );
     drop(guard);
     assert!(buf.try_push(entry(LogLevel::Error, "panic", "after release")));
+}
+
+/// tokio-console setups (`--cfg tokio_unstable` + Tokio's `tracing` feature) trace every waker
+/// clone while Tokio holds a `Notify`'s waiter lock. Capturing that event and waking waiters
+/// from it re-entered the lock and froze every logging thread of the app. In a normal build
+/// Tokio emits nothing and this passes trivially; build it with
+/// `RUSTFLAGS="--cfg tokio_unstable"` to exercise the real interleaving.
+#[test]
+fn waking_a_log_waiter_survives_tokio_tracing_its_own_wakers() {
+    let buf = Arc::new(LogBuffer::default());
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let b = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        with_capture(&b, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let woken = rt.block_on(async {
+                let waiter = {
+                    let b = Arc::clone(&b);
+                    tokio::spawn(async move {
+                        b.wait_for(0, std::time::Duration::from_secs(5), |e| {
+                            e.message == "done"
+                        })
+                        .await
+                    })
+                };
+                for _ in 0..3 {
+                    tokio::task::yield_now().await;
+                }
+                b.push(entry(LogLevel::Info, "t", "done"));
+                waiter.await.unwrap().0.is_some()
+            });
+            let _ = done_tx.send(woken);
+        });
+    });
+    assert_eq!(
+        done_rx.recv_timeout(std::time::Duration::from_secs(20)),
+        Ok(true),
+        "the waiter must be woken — a hang here is the re-entrant notify deadlock"
+    );
+}
+
+/// A panic's backtrace is captured on the panicking thread but symbolised only when read: the
+/// placeholder is replaced by the resolved text and the id removed, wherever the entry sits.
+#[test]
+fn backtraces_are_symbolised_when_read_not_when_panicking() {
+    let id = 4_000_000_u32; // far from the hook's real ids
+    // A disabled backtrace: symbolising a real one loads this test binary's debug info under
+    // std's global backtrace lock (seconds on Windows) and stalls every test that panics
+    // meanwhile. The plumbing under test is the same.
+    super::pending_backtraces().lock().unwrap().insert(
+        id,
+        Arc::new(super::PendingBacktrace {
+            backtrace: std::backtrace::Backtrace::disabled(),
+            resolved: OnceLock::new(),
+        }),
+    );
+    let mut out = serde_json::json!({
+        "entries": [{"message": "boom", "fields": {"backtrace_id": id, "backtrace": "(symbolised when read)"}}],
+        "other": {"backtrace_id": 999_999_999_u64}
+    });
+    super::resolve_backtraces(&mut out);
+    let fields = &out["entries"][0]["fields"];
+    assert!(fields.get("backtrace_id").is_none(), "{out}");
+    let bt = fields["backtrace"].as_str().unwrap();
+    assert!(!bt.is_empty() && bt != "(symbolised when read)", "{bt}");
+    // An unknown id is dropped, not left dangling.
+    assert!(out["other"].get("backtrace_id").is_none(), "{out}");
 }
 
 /// A huge `Debug` value costs at most the field budget, not its whole size.

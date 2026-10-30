@@ -659,7 +659,7 @@ impl VictauriMcpHandler {
         // `with_logs` returns backend log entries, so it needs `logs.backend` like reading them
         // directly — checked before the command runs, so a refused read has no side effects.
         let with_logs = params.with_logs.unwrap_or(false);
-        if with_logs && !self.state.privacy.is_tool_enabled("logs.backend") {
+        if with_logs && !self.state.privacy.is_call_allowed("logs", "logs.backend") {
             return tool_disabled("logs.backend");
         }
         let log_cursor = with_logs.then(|| self.backend_log_cursor());
@@ -3409,7 +3409,7 @@ impl VictauriMcpHandler {
             }
             LogsAction::Backend => self.logs_backend(&params),
             LogsAction::BackendDigest => self.logs_backend_digest(&params),
-            LogsAction::Stdout => Self::logs_stdout(&params),
+            LogsAction::Stdout => self.logs_stdout(&params),
             LogsAction::Clear => {
                 // Clearing the IPC/network logs erases captured evidence — a
                 // mutation of observable state — so it is gated separately and

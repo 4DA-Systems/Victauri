@@ -687,6 +687,7 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install system dependencies
         uses: ./.github/actions/linux-deps
@@ -756,8 +757,13 @@ jobs:
         working-directory: crates/victauri-plugin/tests/bridge_tests
         run: npm ci --no-audit --no-fund
 
+      # The E2E tests are built HERE, before the app starts: building them relinks the demo binary
+      # (dev-dependency features), and a binary (or, on Windows, the PDB of the copy that runs)
+      # replaced under the running app leaves its panic backtraces unreadable (`<unknown>` frames).
       - name: Build demo app
-        run: cargo build -p demo-app
+        run: |
+          cargo build -p demo-app
+          cargo test -p demo-app --test integration --no-run
 
       # The app's stderr is CAPTURED, not discarded. When the host dies mid-suite, the test only
       # reports "connection refused" — the actual cause (e.g. glibc's `malloc(): unaligned tcache
@@ -781,9 +787,13 @@ jobs:
         run: |
           # Run a COPY so the later `cargo test` is free to relink
           # target\debug\demo-app.exe — Windows can't remove a running .exe, which
-          # otherwise fails the E2E step with "Access is denied".
-          Copy-Item .\target\debug\demo-app.exe .\target\debug\demo-app-run.exe -Force
-          $proc = Start-Process -FilePath .\target\debug\demo-app-run.exe -PassThru
+          # otherwise fails the E2E step with "Access is denied". The copy runs from its OWN
+          # directory with its own copy of the PDB: rustc embeds only the PDB's file name, so a
+          # copy beside target\debug reads the PDB of whatever a later build links there, and its
+          # panic backtraces come out as `<unknown>`.
+          New-Item -ItemType Directory -Force .\target\demo-run | Out-Null
+          Copy-Item .\target\debug\demo-app.exe, .\target\debug\demo_app.pdb .\target\demo-run\ -Force
+          $proc = Start-Process -FilePath .\target\demo-run\demo-app.exe -PassThru
           "APP_PID=$($proc.Id)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
       - name: Victauri smoke tests

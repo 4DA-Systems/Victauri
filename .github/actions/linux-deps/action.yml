@@ -70,6 +70,9 @@ runs:
           # shellcheck disable=SC2086
           if sudo timeout 180 apt-get "${opts[@]}" update \
             && sudo timeout "$limit" apt-get "${opts[@]}" install -y $PKGS; then
+            # Drop package versions the archive no longer serves, so the cache (restored by
+            # prefix across runner-image updates) does not grow week after week.
+            sudo apt-get "${opts[@]}" autoclean -y >/dev/null 2>&1 || true
             sudo chown -R "$(id -u):$(id -g)" "$DEBS"
             echo "installed; $(find "$DEBS" -maxdepth 1 -name '*.deb' | wc -l) .deb files cached"
             exit 0
