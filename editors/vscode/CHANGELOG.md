@@ -2,6 +2,17 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.10.3
+
+An extension-only patch on top of 0.10.2 (the Victauri crates stay at 0.10.2); works with plugins
+0.9.x and 0.10.x.
+
+- **Windows: one slow or failed ownership check no longer distrusts the app for good.** A cold
+  Windows PowerShell start can take more than the old 10 s limit (measured on a CI runner), and
+  that failure was cached for the life of the app's discovery directory, so the extension never
+  connected until the app restarted. Present since 0.9.0. Failures are now not cached: they fail
+  closed for that scan and the next scan asks again. The limit is now 30 s.
+
 ## 0.10.2
 
 Version-synced with the Victauri 0.10.2 release; works with plugins 0.9.x and 0.10.x (it uses
@@ -14,11 +25,6 @@ only tools and the discovery format that are unchanged since 0.9.0).
   failed closed. Every such directory was untrusted, so the app was never found (the default
   `%LOCALAPPDATA%\Temp`, inside your profile, needs no check and was not affected). The check now
   runs Windows PowerShell without the inherited `PSModulePath`.
-- **Windows: one slow or failed ownership check no longer distrusts the app for good.** A cold
-  Windows PowerShell start can take more than the old 10 s limit (measured on a CI runner), and
-  that failure was cached for the life of the app's discovery directory, so the extension never
-  connected until the app restarted. Failures are now not cached: they fail closed for that scan
-  and the next scan asks again. The limit is now 30 s.
 - **Dependencies:** the extension's development-only dependencies were updated to clear OSV
   advisories (#88). Nothing in the packaged extension changes because of this: it bundles only
   its own code (`dist/extension.js`).

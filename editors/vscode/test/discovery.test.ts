@@ -205,7 +205,7 @@ test("windows: the owner check works with PowerShell 7's module path inherited",
   }
 });
 
-// 0.10.2 (found by CI's first Windows run): a cold Windows PowerShell start passed the old 10 s
+// 0.10.3 (found by CI's first Windows run): a cold Windows PowerShell start passed the old 10 s
 // timeout, and the failure was cached — the app's directory stayed untrusted for its lifetime.
 test("windows: a failed owner check fails closed but is retried, not cached", async (t) => {
   if (process.platform !== "win32") {
