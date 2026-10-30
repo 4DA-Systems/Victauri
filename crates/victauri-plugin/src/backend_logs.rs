@@ -1796,12 +1796,12 @@ pub fn read_console_capture(
 }
 
 /// Most bytes of a console capture one read takes (a capture rotates at 64 MB).
-pub(crate) const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
+pub const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
 
 /// [`read_console_capture`] that also says whether the read stopped at its `window` with more
 /// of the file left: a cursor reader must then read on from the returned offset even when no
 /// line limit was hit. A record still being written at the end of the file does not count.
-pub(crate) fn read_console_capture_window(
+pub fn read_console_capture_window(
     path: &std::path::Path,
     from: Option<u64>,
     tail_bytes: u64,
