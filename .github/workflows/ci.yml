@@ -365,10 +365,18 @@ jobs:
           if-no-files-found: ignore
 
   # The VS Code extension: typecheck, bundle, and its unit tests (code generation escaping,
-  # discovery/connection resolution, health semantics) under plain Node.
+  # discovery/connection resolution, health semantics) under plain Node. Also on Windows: the
+  # discovery owner check there (Windows PowerShell's Get-Acl) is Windows-only code, and its tests
+  # skip elsewhere. The runner's default shell is pwsh and it runs elevated, so both the
+  # PowerShell-7-module-path test and the planted-owner test execute — the module-path bug went
+  # unseen from 0.9.0 to 0.10.2 because this job only ever ran on Linux.
   vscode:
-    name: VS Code extension
-    runs-on: ubuntu-latest
+    name: VS Code extension (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     timeout-minutes: 15
     permissions:
       contents: read
