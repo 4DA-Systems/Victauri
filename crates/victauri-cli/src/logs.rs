@@ -353,6 +353,9 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         // A page from a NEW process behind the same port and token (a fixed token, or auth off)
         // is handled below as a restart, not printed as more of the old one — the new process's
         // entries below the old cursor would otherwise be skipped silently.
+        // Taken before the request: the server reads the buffer after this moment, so nothing
+        // printed after it can have been in the page.
+        let asked_ms = now_ms();
         if let Ok(page) = backend.logs(args.clone()).await
             && !is_new_process(&page, cursor, pid)
         {
@@ -360,7 +363,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             print_page(&page, &opts);
             cursor = page["next_seq"].as_u64().unwrap_or(cursor);
             behind = page["truncated"] == true;
-            last_ok_ms = now_ms();
+            last_ok_ms = asked_ms;
             continue;
         }
         // Taken at the FIRST failed poll: the crash's last words are just before this moment
@@ -376,7 +379,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             label: l,
             page,
             restarted,
-        }) = reattach(&opts, &args, cursor, &label, Duration::from_secs(20)).await
+        }) = reattach(&opts, &args, cursor, &label, pid, Duration::from_secs(20)).await
         else {
             eprintln!("victauri logs: app went away (crashed, closed or rebuilding)");
             return hand_off_to_capture(&opts, capture_path.clone(), went_away_ms).await;
@@ -499,13 +502,16 @@ struct Reattached {
 }
 
 /// Re-resolve the app through discovery until `max` passes, and read the log from `cursor`.
-/// A different process (the label carries the pid) or a sequence counter that went backwards
-/// means the app restarted: then the NEW process's log is read from its start.
+/// A different process means the app restarted — told by the label (which carries the pid
+/// when discovery knows it), the pid the page reports (the label has none when `VICTAURI_PORT`
+/// names a port without a discovery entry), or a sequence counter that went backwards: then the
+/// NEW process's log is read from its start.
 async fn reattach(
     opts: &LogsOptions,
     args: &Value,
     cursor: u64,
     old_label: &str,
+    known_pid: Option<u64>,
     max: Duration,
 ) -> Option<Reattached> {
     let deadline = std::time::Instant::now() + max;
@@ -517,8 +523,7 @@ async fn reattach(
         let Ok(page) = backend.logs(args.clone()).await else {
             continue;
         };
-        let counter_reset = page["next_seq"].as_u64().is_some_and(|next| next < cursor);
-        let restarted = label != old_label || counter_reset;
+        let restarted = label != old_label || is_new_process(&page, cursor, known_pid);
         let page = if restarted {
             let mut from_start = args.clone();
             from_start["since_seq"] = 0.into();
