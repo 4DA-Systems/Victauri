@@ -73,14 +73,31 @@ impl Backend {
             .await
             .context("unexpected response")?;
         if let Some(err) = resp.get("error") {
+            let err = err.as_str().map_or_else(|| err.to_string(), str::to_string);
             bail!(
                 "{}",
-                victauri_test::terminal::untrusted_multi_line(
-                    &err.as_str().map_or_else(|| err.to_string(), str::to_string)
-                )
+                victauri_test::terminal::untrusted_multi_line(&explain_logs_error(&err))
             );
         }
         Ok(resp.get("result").cloned().unwrap_or(Value::Null))
+    }
+}
+
+/// A plugin older than 0.10.2 has no backend-log actions, and rejects them as an unknown
+/// `logs` variant — the usual first contact after `cargo install victauri-cli` while the app
+/// still embeds the older plugin. Say that, and how to fix it, instead of a deserializer error.
+fn explain_logs_error(err: &str) -> String {
+    let predates = ["backend", "backend_digest", "stdout"]
+        .iter()
+        .any(|action| err.contains(&format!("unknown variant `{action}`")));
+    if predates {
+        format!(
+            "this app's Victauri plugin predates backend log capture (added in victauri-plugin \
+             0.10.2) — bump the app's `victauri-plugin` dependency to 0.10.2 or newer and \
+             rebuild it. (The plugin said: {err})"
+        )
+    } else {
+        err.to_string()
     }
 }
 
@@ -705,6 +722,24 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Release verification: the 0.10.2 CLI against 4DA's 0.10.1 plugin printed only the
+    /// plugin's deserializer error for `victauri logs`.
+    #[test]
+    fn an_older_plugin_is_named_as_the_cause() {
+        let old = "invalid parameters: unknown variant `backend`, expected one of `console`, \
+                   `network`, `ipc`, `navigation`, `dialogs`, `events`, `slow_ipc`, `clear`";
+        let msg = explain_logs_error(old);
+        assert!(msg.contains("predates backend log capture"), "{msg}");
+        assert!(msg.contains("0.10.2"), "{msg}");
+        assert!(msg.contains(old), "the plugin's own words are kept: {msg}");
+        for action in ["backend_digest", "stdout"] {
+            let e = format!("invalid parameters: unknown variant `{action}`, expected one of …");
+            assert!(explain_logs_error(&e).contains("predates"), "{action}");
+        }
+        let other = "no backend log source is active";
+        assert_eq!(explain_logs_error(other), other);
+    }
 
     #[test]
     fn a_capture_path_is_used_only_when_it_is_our_own_capture() {

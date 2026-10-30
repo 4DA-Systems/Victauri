@@ -104,6 +104,10 @@ developer watches in the debug console — were invisible to an agent. Now:
   told "no backend log source is active — add `log_layer()`…", the line it already had. Building
   a source now marks it installed (`sources.structured_installed`), and the hint says to set
   `RUST_LOG` / the filter instead (found by building a fresh consumer from the packaged crates).
+- **`victauri logs` against an older plugin** says the app's `victauri-plugin` predates backend
+  log capture and must be bumped to 0.10.2, instead of printing the plugin's ``unknown variant
+  `backend` `` deserializer error — the likely first contact when the CLI is upgraded before the
+  app (found by running the 0.10.2 CLI against 4DA on 0.10.1).
 
 ### Repository and CI
 
