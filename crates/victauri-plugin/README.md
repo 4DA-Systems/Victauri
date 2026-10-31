@@ -54,7 +54,7 @@ victauri_plugin::VictauriBuilder::new()
 | `sqlite` | on | `query_db` and `introspect db_health` (via rusqlite). Without it both tools return a clear "not compiled in" error. |
 | `bundled-sqlite` | on | Compiles SQLite into the binary (rusqlite's `bundled`). Implies `sqlite`. |
 
-The plugin accepts rusqlite `>=0.32, <0.41`, so cargo unifies it with your app's own rusqlite —
+The plugin accepts rusqlite `>=0.32, <0.42`, so cargo unifies it with your app's own rusqlite —
 which means `bundled-sqlite` **also switches your app's rusqlite to the bundled SQLite**. If your
 app links a system SQLite or SQLCipher, keep yours by turning the default features off and
 enabling only `sqlite`:

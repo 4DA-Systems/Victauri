@@ -81,7 +81,7 @@ pub(crate) enum Bounded<T> {
     Failed(String),
 }
 
-/// Victauri accepts a RANGE of rusqlite versions (`>=0.32, <0.41`) so it unifies with the app's
+/// Victauri accepts a RANGE of rusqlite versions (`>=0.32, <0.42`) so it unifies with the app's
 /// own rusqlite instead of forcing a second `libsqlite3-sys` (`links = "sqlite3"` allows only
 /// one per build). Across that range several connection setters changed return type — `()` or
 /// `i32` on older versions, `rusqlite::Result` on newer ones (`set_limit` from 0.33,
@@ -123,7 +123,8 @@ impl<T> SetupOutcome for rusqlite::Result<T> {
 // point (see `SetupOutcome`), so one source compiles fail-closed across the supported range.
 #[allow(clippy::unit_arg)]
 pub(crate) fn run_bounded<T>(
-    conn: &rusqlite::Connection,
+    // `&mut`: `progress_handler` takes `&mut self` from rusqlite 0.41 (`&self` before).
+    conn: &mut rusqlite::Connection,
     budget: Duration,
     f: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
 ) -> Bounded<T> {
@@ -149,7 +150,7 @@ pub(crate) fn run_bounded<T>(
     }
     let result = {
         let _interrupt = InterruptGuard::arm(conn, budget);
-        f(conn)
+        f(&*conn)
     };
     // Removing it can only fail harmlessly (the next phase installs its own deadline).
     let _ = conn
@@ -202,7 +203,7 @@ pub(crate) fn db_health_report(
     count_budget: Duration,
     check_budget: Duration,
 ) -> Result<serde_json::Value, String> {
-    let conn = open_untrusted_read_only(path)?;
+    let mut conn = open_untrusted_read_only(path)?;
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
         MAX_DB_HEALTH_CELL_BYTES,
@@ -218,7 +219,7 @@ pub(crate) fn db_health_report(
     .map_err(|e| format!("failed to harden database connection: {e}"))?;
 
     // Phase 0: metadata + the (bounded) table listing.
-    let meta = run_bounded(&conn, DB_HEALTH_META_BUDGET, |c| {
+    let meta = run_bounded(&mut conn, DB_HEALTH_META_BUDGET, |c| {
         let text = |name: &str| c.pragma_query_value(None, name, |r| r.get::<_, String>(0));
         let int = |name: &str| c.pragma_query_value(None, name, |r| r.get::<_, i64>(0));
         let journal_mode = text("journal_mode")?;
@@ -317,7 +318,7 @@ pub(crate) fn db_health_report(
                 all_counted = false;
             } else {
                 let sql = format!("SELECT count(*) FROM {}", quote_sqlite_identifier(&name));
-                match run_bounded(&conn, remaining, |c| {
+                match run_bounded(&mut conn, remaining, |c| {
                     c.query_row(&sql, [], |r| r.get::<_, i64>(0))
                 }) {
                     Bounded::Done(n) => entry["row_count"] = serde_json::json!(n),
@@ -359,7 +360,7 @@ pub(crate) fn db_health_report(
     };
     let (integrity, integrity_kind, integrity_note) = match per_table_reason {
         None => {
-            let integrity = match run_bounded(&conn, check_budget, |c| {
+            let integrity = match run_bounded(&mut conn, check_budget, |c| {
                 c.pragma_query_value(None, "quick_check", |r| r.get::<_, String>(0))
             }) {
                 Bounded::Done(s) => s,
@@ -374,7 +375,7 @@ pub(crate) fn db_health_report(
             (integrity, "quick_check", None)
         }
         Some(reason) => {
-            let integrity = match run_bounded(&conn, check_budget, |c| {
+            let integrity = match run_bounded(&mut conn, check_budget, |c| {
                 quick_check_tables(c, &ordinary_tables)
             }) {
                 Bounded::Done(problems) if problems.is_empty() => "ok".to_string(),
@@ -1532,7 +1533,9 @@ fn query_with_limits(
 
     let max_rows = max_rows.unwrap_or(MAX_ROWS_DEFAULT).min(MAX_ROWS_LIMIT);
 
-    let conn = rusqlite::Connection::open_with_flags(
+    // `mut` only matters from rusqlite 0.41, where `progress_handler` takes `&mut self`.
+    #[allow(unused_mut)]
+    let mut conn = rusqlite::Connection::open_with_flags(
         db_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
@@ -1618,7 +1621,12 @@ fn query_with_limits(
             None => sqlite_query_error("failed to prepare query", e, query_timeout),
         })?;
 
-    let column_names = unique_column_keys(&stmt.column_names());
+    // By index, not `column_names()`: that returns a `Vec` before rusqlite 0.41, an iterator after.
+    let names = (0..stmt.column_count())
+        .map(|i| stmt.column_name(i).map(str::to_owned))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("query error: {e}"))?;
+    let column_names = unique_column_keys(&names.iter().map(String::as_str).collect::<Vec<_>>());
     // `"key":` per column, sized once.
     let key_bytes: Vec<usize> = column_names.iter().map(|k| json_len(k) + 1).collect();
     // A row object's fixed cost: its braces and the commas between its fields.

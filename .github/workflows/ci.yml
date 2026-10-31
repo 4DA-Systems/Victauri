@@ -456,7 +456,7 @@ jobs:
       - name: Check MSRV
         run: cargo check --workspace --locked
 
-  # victauri-plugin accepts rusqlite `>=0.32, <0.41` so cargo unifies onto the app's own
+  # victauri-plugin accepts rusqlite `>=0.32, <0.42` so cargo unifies onto the app's own
   # rusqlite (`links = "sqlite3"` allows one libsqlite3-sys per build). The lockfile pins the
   # OLD end; this job proves the NEW end: the security setters changed return type across the
   # range (`SetupOutcome` in database.rs keeps them fail-closed on every version).
@@ -478,10 +478,10 @@ jobs:
 
       - name: Move rusqlite to the newest version the range allows
         # Fails if the update did not reach the newest minor the workspace range allows
-        # (`>=0.32, <0.41` in Cargo.toml) — otherwise this job would silently keep testing 0.32.
+        # (`>=0.32, <0.42` in Cargo.toml) — otherwise this job would silently keep testing 0.32.
         # Widen NEWEST together with the range.
         env:
-          NEWEST: "0.40."
+          NEWEST: "0.41."
         run: |
           cargo update -p rusqlite
           resolved=$(grep -A1 '^name = "rusqlite"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')

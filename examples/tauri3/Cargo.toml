@@ -30,7 +30,7 @@ tauri = "=3.0.0-alpha.5"
 tauri-runtime-wry = "=3.0.0-alpha.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = ">=0.32, <0.41", features = ["bundled"] }
+rusqlite = { version = ">=0.32, <0.42", features = ["bundled"] }
 # The demo's logging setup (and its `victauri_plugin::log_layer()` line).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
