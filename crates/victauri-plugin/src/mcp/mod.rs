@@ -509,6 +509,16 @@ pub struct VictauriMcpHandler {
     last_app_urls: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
+/// A captured window as a tool result: the image, then which window it is, since `screenshot {}`
+/// chooses one for the caller. A plain text block, because clients show text and drop `_meta`. The
+/// image stays first: `VictauriClient::call_tool` and the older CLIs read the first block.
+pub(crate) fn screenshot_result(png_base64: String, window: &str) -> CallToolResult {
+    CallToolResult::success(vec![
+        ContentBlock::image(png_base64, "image/png"),
+        ContentBlock::text(format!("note: captured window {window:?}")),
+    ])
+}
+
 #[tool_router]
 impl VictauriMcpHandler {
     // ── Standalone Tools ────────────────────────────────────────────────────
@@ -856,7 +866,7 @@ impl VictauriMcpHandler {
                 Ok(png_bytes) => {
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-                    CallToolResult::success(vec![ContentBlock::image(b64, "image/png")])
+                    screenshot_result(b64, &target_label)
                 }
                 Err(e) => tool_error(format!("screenshot capture failed: {e}")),
             },

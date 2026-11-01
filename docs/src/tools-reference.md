@@ -207,7 +207,9 @@ Capture a PNG screenshot of the application window.
 |------|------|----------|-------------|
 | `window_label` | string | no | Target window (defaults to main) |
 
-**Returns:** Base64-encoded PNG image data.
+**Returns:** Base64-encoded PNG image data, and a text block naming the window captured
+(`note: captured window "main"`; over REST, a `note` beside the image), since with no label
+`screenshot` picks the window itself.
 
 > **Linux:** capture requires X11 or XWayland (the common case, including CI under `xvfb`). A
 > pure-Wayland session exposes no safe per-window capture path, so `screenshot` returns a clear
