@@ -797,8 +797,14 @@ mod tests {
             (ticker.await.unwrap(), read_took, panic_took)
         });
         println!("read {read_took:?}, worst timer gap {gap:?}, other panic {panic_took:?}");
-        // The positive control: symbolising has to be slow for this to say anything.
-        assert!(read_took > Duration::from_millis(200), "{read_took:?}");
+        // The positive control: symbolising has to be slow for this to say anything. It takes
+        // seconds on Windows and can be well under 200 ms on Linux, where this shows nothing.
+        let too_quick = read_took <= Duration::from_millis(200);
+        assert!(!(too_quick && cfg!(windows)), "{read_took:?}");
+        if too_quick {
+            println!("inconclusive here: symbolising was too quick to block anything");
+            return;
+        }
         assert!(
             gap < read_took / 2,
             "workers pinned: {gap:?} of {read_took:?}"

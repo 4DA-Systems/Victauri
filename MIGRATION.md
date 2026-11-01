@@ -151,7 +151,9 @@ parsed `e<digits>` must stop.
 
 ### Dependencies
 
-`rusqlite` now accepts `>=0.32, <0.42`. New Windows feature `Win32_System_JobObjects` on
+`rusqlite` now accepts `>=0.32, <0.42`. The minimum Rust stays 1.88 for the crates, with Cargo's
+MSRV-aware resolver (`resolver = "3"`) picking compatible dependencies; `cargo install victauri-cli
+--locked` follows the committed lockfile and needs Rust 1.89. New Windows feature `Win32_System_JobObjects` on
 `victauri-test`; `ctrlc` gains its `termination` feature.
 
 ## v0.10.1 → v0.10.2

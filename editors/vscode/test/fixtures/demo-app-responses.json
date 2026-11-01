@@ -18,12 +18,12 @@
   "port": 17650,
   "privacy_mode": false,
   "protocol": "mcp",
-  "version": "0.10.2"
+  "version": "0.10.3"
  },
  "click_unknown_ref": {
   "status": 200,
   "body": {
-   "error": "ref not found: e999999 (this ref is from a previous page load or another window; this page's refs start with ipu2e — take a new dom_snapshot or find_elements)\n\n[hint: CHECK_INPUT]"
+   "error": "ref not found: e999999 (this ref is from a previous page load or another window; this page's refs start with tldge — take a new dom_snapshot or find_elements)\n\n[hint: CHECK_INPUT]"
   }
  },
  "tools": {
@@ -46,8 +46,8 @@
       "maximized": false,
       "minimized": false,
       "position": [
-       286,
-       286
+       130,
+       130
       ],
       "size": [
        900,
@@ -67,27 +67,27 @@
      {
       "args": {},
       "command": "get_counter",
-      "duration_ms": 29,
+      "duration_ms": 32,
       "error": null,
       "id": 2,
       "result": 0,
       "status": "ok",
-      "timestamp": 1793534869769
+      "timestamp": 1793546006284
      },
      {
       "args": {},
       "command": "list_todos",
-      "duration_ms": 28,
+      "duration_ms": 33,
       "error": null,
       "id": 3,
       "result": [],
       "status": "ok",
-      "timestamp": 1793534869770
+      "timestamp": 1793546006285
      },
      {
       "args": {},
       "command": "get_settings",
-      "duration_ms": 28,
+      "duration_ms": 33,
       "error": null,
       "id": 4,
       "result": {
@@ -96,17 +96,17 @@
        "theme": "dark"
       },
       "status": "ok",
-      "timestamp": 1793534869770
+      "timestamp": 1793546006285
      },
      {
       "args": {},
       "command": "list_notifications",
-      "duration_ms": 27,
+      "duration_ms": 32,
       "error": null,
       "id": 5,
       "result": [],
       "status": "ok",
-      "timestamp": 1793534869771
+      "timestamp": 1793546006286
      },
      {
       "args": {
@@ -118,7 +118,7 @@
       "id": 7,
       "result": "Hello, fixture! This response came from Rust.",
       "status": "ok",
-      "timestamp": 1793534875359
+      "timestamp": 1793546010864
      },
      {
       "args": {},
@@ -128,7 +128,7 @@
       "id": 12,
       "result": "Command no_such_command_fixture not found",
       "status": "error",
-      "timestamp": 1793534875368
+      "timestamp": 1793546010874
      }
     ]
    }
@@ -137,11 +137,11 @@
    "status": 200,
    "body": {
     "result": {
-     "page_fault_count": 12374,
-     "page_file_bytes": 11063296,
-     "peak_page_file_bytes": 11726848,
-     "peak_working_set_bytes": 40292352,
-     "working_set_bytes": 40288256
+     "page_fault_count": 15089,
+     "page_file_bytes": 11214848,
+     "peak_page_file_bytes": 11280384,
+     "peak_working_set_bytes": 51625984,
+     "working_set_bytes": 51621888
     }
    }
   },
@@ -153,7 +153,7 @@
       "identifier": "com.example.victauri-demo",
       "product_name": "victauri-demo"
      },
-     "bridge_version": "0.10.2",
+     "bridge_version": "0.10.3",
      "capacities": {
       "eval_timeout_secs": 30,
       "event_log": 10000
@@ -212,7 +212,7 @@
       "total": 35
      },
      "uptime_secs": 6,
-     "version": "0.10.2"
+     "version": "0.10.3"
     }
    }
   },
@@ -221,7 +221,7 @@
    "body": {
     "result": {
      "info": {
-      "bridge_version": "0.10.2",
+      "bridge_version": "0.10.3",
       "dom_elements": 97,
       "event_listeners": 34,
       "ipc_capture": {
@@ -262,7 +262,7 @@
      "js_heap": {
       "limit_mb": 4192,
       "total_mb": 3.95,
-      "used_mb": 2.51
+      "used_mb": 2.53
      },
      "long_tasks": {
       "count": 0,
@@ -273,29 +273,29 @@
       "connect_ms": 0,
       "decoded_body_size": 23621,
       "dns_ms": 0,
-      "dom_complete_ms": 99,
-      "dom_interactive_ms": 74,
+      "dom_complete_ms": 1119,
+      "dom_interactive_ms": 1117,
       "encoded_body_size": 23621,
-      "load_event_ms": 99,
+      "load_event_ms": 1119,
       "response_ms": 0,
       "transfer_size": 23921,
-      "ttfb_ms": 54
+      "ttfb_ms": 1070
      },
      "paint": {
-      "first-contentful-paint": 180,
-      "first-paint": 180
+      "first-contentful-paint": 1128,
+      "first-paint": 1128
      },
      "resources": {
       "by_type": {
        "fetch": {
         "count": 19,
         "total_bytes": 0,
-        "total_ms": 31.999999940395355
+        "total_ms": 30.19999998807907
        },
        "other": {
         "count": 1,
         "total_bytes": 23921,
-        "total_ms": 1.2000000178813934
+        "total_ms": 1.9000000059604645
        }
       },
       "slowest": [
@@ -307,25 +307,25 @@
        },
        {
         "duration_ms": 3,
-        "name": "list_todos",
-        "size": 0,
-        "type": "fetch"
-       },
-       {
-        "duration_ms": 2,
         "name": "get_settings",
         "size": 0,
         "type": "fetch"
        },
        {
         "duration_ms": 2,
-        "name": "get_counter",
+        "name": "list_notifications",
         "size": 0,
         "type": "fetch"
        },
        {
         "duration_ms": 2,
-        "name": "list_notifications",
+        "name": "favicon.ico",
+        "size": 23921,
+        "type": "other"
+       },
+       {
+        "duration_ms": 2,
+        "name": "get_counter",
         "size": 0,
         "type": "fetch"
        }
@@ -357,7 +357,7 @@
    "body": {
     "result": {
      "ok": true,
-     "ref_id": "ipu2e5"
+     "ref_id": "tldge5"
     }
    }
   },
@@ -374,7 +374,7 @@
    "status": 200,
    "body": {
     "result": {
-     "ref_id": "ipu2e5",
+     "ref_id": "tldge5",
      "styles": {
       "border-radius": "8px",
       "color": "rgb(139, 92, 246)",
@@ -436,7 +436,7 @@
           "enabled": true,
           "focusable": false,
           "name": "Victauri Demo",
-          "ref_id": "ipu2e2",
+          "ref_id": "tldge2",
           "role": "heading",
           "tag": "h1",
           "text": "Victauri Demo",
@@ -455,7 +455,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "ipu2e3",
+          "ref_id": "tldge3",
           "role": null,
           "tag": "p",
           "text": "25 instrumented commands — connect an MCP client to introspect everything",
@@ -483,7 +483,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Home",
-            "ref_id": "ipu2e5",
+            "ref_id": "tldge5",
             "role": "tab",
             "tag": "button",
             "text": "Home",
@@ -502,7 +502,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Todos",
-            "ref_id": "ipu2e6",
+            "ref_id": "tldge6",
             "role": "tab",
             "tag": "button",
             "text": "Todos",
@@ -521,7 +521,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Contact",
-            "ref_id": "ipu2e7",
+            "ref_id": "tldge7",
             "role": "tab",
             "tag": "button",
             "text": "Contact",
@@ -540,7 +540,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Settings",
-            "ref_id": "ipu2e8",
+            "ref_id": "tldge8",
             "role": "tab",
             "tag": "button",
             "text": "Settings",
@@ -559,7 +559,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Notifications 0",
-            "ref_id": "ipu2e9",
+            "ref_id": "tldge9",
             "role": "tab",
             "tag": "button",
             "text": "Notifications",
@@ -570,7 +570,7 @@
           "enabled": true,
           "focusable": false,
           "name": "Main navigation",
-          "ref_id": "ipu2e4",
+          "ref_id": "tldge4",
           "role": "tablist",
           "tag": "nav",
           "text": null,
@@ -609,7 +609,7 @@
               "enabled": true,
               "focusable": false,
               "name": "Greet",
-              "ref_id": "ipu2e12",
+              "ref_id": "tldge12",
               "role": "heading",
               "tag": "h2",
               "text": "Greet",
@@ -628,7 +628,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "ipu2e13",
+              "ref_id": "tldge13",
               "role": null,
               "tag": "label",
               "text": "Your name",
@@ -651,7 +651,7 @@
               "enabled": true,
               "focusable": true,
               "name": "Your name",
-              "ref_id": "ipu2e14",
+              "ref_id": "tldge14",
               "role": "textbox",
               "tag": "input",
               "text": null,
@@ -673,7 +673,7 @@
               "enabled": true,
               "focusable": true,
               "name": "Greet",
-              "ref_id": "ipu2e15",
+              "ref_id": "tldge15",
               "role": "button",
               "tag": "button",
               "text": "Greet",
@@ -695,7 +695,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "ipu2e16",
+              "ref_id": "tldge16",
               "role": null,
               "tag": "div",
               "text": null,
@@ -706,7 +706,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "ipu2e11",
+            "ref_id": "tldge11",
             "role": null,
             "tag": "div",
             "text": null,
@@ -734,7 +734,7 @@
               "enabled": true,
               "focusable": false,
               "name": "Counter",
-              "ref_id": "ipu2e18",
+              "ref_id": "tldge18",
               "role": "heading",
               "tag": "h2",
               "text": "Counter",
@@ -756,7 +756,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "ipu2e19",
+              "ref_id": "tldge19",
               "role": "status",
               "tag": "div",
               "text": "0",
@@ -787,7 +787,7 @@
                 "enabled": true,
                 "focusable": true,
                 "name": "Decrement counter",
-                "ref_id": "ipu2e21",
+                "ref_id": "tldge21",
                 "role": "button",
                 "tag": "button",
                 "text": "−",
@@ -809,7 +809,7 @@
                 "enabled": true,
                 "focusable": true,
                 "name": "Increment counter",
-                "ref_id": "ipu2e22",
+                "ref_id": "tldge22",
                 "role": "button",
                 "tag": "button",
                 "text": "+",
@@ -831,7 +831,7 @@
                 "enabled": true,
                 "focusable": true,
                 "name": "Reset counter",
-                "ref_id": "ipu2e23",
+                "ref_id": "tldge23",
                 "role": "button",
                 "tag": "button",
                 "text": "Reset",
@@ -842,7 +842,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "ipu2e20",
+              "ref_id": "tldge20",
               "role": null,
               "tag": "div",
               "text": null,
@@ -853,7 +853,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "ipu2e17",
+            "ref_id": "tldge17",
             "role": null,
             "tag": "div",
             "text": null,
@@ -864,7 +864,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "ipu2e10",
+          "ref_id": "tldge10",
           "role": "tabpanel",
           "tag": "div",
           "text": null,
@@ -892,7 +892,7 @@
             "enabled": true,
             "focusable": false,
             "name": "Sweep Animation",
-            "ref_id": "ipu2e25",
+            "ref_id": "tldge25",
             "role": "heading",
             "tag": "h2",
             "text": "Sweep Animation",
@@ -920,7 +920,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "ipu2e27",
+              "ref_id": "tldge27",
               "role": null,
               "tag": "code",
               "text": "animation",
@@ -931,7 +931,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "ipu2e26",
+            "ref_id": "tldge26",
             "role": null,
             "tag": "p",
             "text": "A miscalibrated slide-in. Use the\n         tool to measure and fix it.",
@@ -962,7 +962,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "ipu2e29",
+              "ref_id": "tldge29",
               "role": null,
               "tag": "div",
               "text": "Notification",
@@ -973,7 +973,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "ipu2e28",
+            "ref_id": "tldge28",
             "role": null,
             "tag": "div",
             "text": null,
@@ -995,7 +995,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Play sweep",
-            "ref_id": "ipu2e30",
+            "ref_id": "tldge30",
             "role": "button",
             "tag": "button",
             "text": "Play sweep",
@@ -1006,7 +1006,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "ipu2e24",
+          "ref_id": "tldge24",
           "role": null,
           "tag": "div",
           "text": null,
@@ -1034,7 +1034,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "ipu2e32",
+            "ref_id": "tldge32",
             "role": null,
             "tag": "span",
             "text": null,
@@ -1053,7 +1053,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "ipu2e33",
+            "ref_id": "tldge33",
             "role": null,
             "tag": "strong",
             "text": "127.0.0.1:7373",
@@ -1072,7 +1072,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "ipu2e34",
+            "ref_id": "tldge34",
             "role": null,
             "tag": "br",
             "text": null,
@@ -1094,7 +1094,7 @@
             "enabled": true,
             "focusable": true,
             "name": "get_app_state()",
-            "ref_id": "ipu2e35",
+            "ref_id": "tldge35",
             "role": "button",
             "tag": "button",
             "text": "get_app_state()",
@@ -1105,7 +1105,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "ipu2e31",
+          "ref_id": "tldge31",
           "role": null,
           "tag": "div",
           "text": "Victauri MCP server running on",
@@ -1116,7 +1116,7 @@
         "enabled": true,
         "focusable": false,
         "name": null,
-        "ref_id": "ipu2e1",
+        "ref_id": "tldge1",
         "role": null,
         "tag": "div",
         "text": null,
@@ -1127,7 +1127,7 @@
       "enabled": true,
       "focusable": false,
       "name": null,
-      "ref_id": "ipu2e0",
+      "ref_id": "tldge0",
       "role": null,
       "tag": "body",
       "text": null,

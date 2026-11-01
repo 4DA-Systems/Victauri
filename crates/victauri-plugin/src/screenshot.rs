@@ -1344,7 +1344,7 @@ mod tests {
         assert_eq!(at(0), [255, 0, 0, 255], "left edge");
         assert_eq!(at(w - 1), [0, 0, 255, 255], "right edge");
         assert!(
-            rgba.chunks_exact(4).all(|p| p[3] == 255),
+            rgba.iter().skip(3).step_by(4).all(|&alpha| alpha == 255),
             "transparent pixels"
         );
     }

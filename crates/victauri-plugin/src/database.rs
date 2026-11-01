@@ -789,9 +789,16 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
     let load_error = |e: rusqlite::Error| {
         sqlite_query_error("failed to load database schema", e, SCHEMA_CHECK_BUDGET)
     };
+    // The retry is for a schema entry that cannot be parsed. A lock has had its wait already, and
+    // waiting again would break the one short lock wait a query promises.
     let mut stmt = conn
         .prepare(READ_SCHEMA)
-        .or_else(|_| conn.prepare(READ_SCHEMA))
+        .or_else(|e| match e.sqlite_error_code() {
+            Some(
+                rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked,
+            ) => Err(e),
+            _ => conn.prepare(READ_SCHEMA),
+        })
         .map_err(load_error)?;
     let mut rows = stmt.query([]).map_err(load_error)?;
     let mut views: Vec<(String, usize)> = Vec::new();
@@ -3515,16 +3522,23 @@ mod tests {
         assert!(QUERY_BUSY_TIMEOUT <= Duration::from_secs(1));
         let locker = rusqlite::Connection::open(&path).unwrap();
         locker.execute_batch("BEGIN EXCLUSIVE").unwrap();
-        let started = Instant::now();
-        let err = query(&path, "SELECT * FROM users", &[], None).unwrap_err();
-        assert!(err.contains("locked"), "{err}");
-        // Loose wall bound (the pre-fix wait was 5 s + the 5 s CPU deadline); the exact
-        // configured timeout is asserted above.
-        assert!(
-            started.elapsed() < Duration::from_secs(4),
-            "lock wait took {:?}",
-            started.elapsed()
-        );
+        // One wait, not one per connection or statement. Load only adds time, so the quickest of
+        // three is what counts. Without usleep a build's busy handler sleeps in whole seconds.
+        let bound = if cfg!(target_os = "macos") {
+            Duration::from_secs(4)
+        } else {
+            Duration::from_millis(1900)
+        };
+        let quickest = (0..3)
+            .map(|_| {
+                let started = Instant::now();
+                let err = query(&path, "SELECT * FROM users", &[], None).unwrap_err();
+                assert!(err.contains("locked"), "{err}");
+                started.elapsed()
+            })
+            .min()
+            .unwrap();
+        assert!(quickest < bound, "lock wait took {quickest:?}");
         locker.execute_batch("ROLLBACK").unwrap();
     }
 

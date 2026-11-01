@@ -493,11 +493,15 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
-      # --locked: check the committed lockfile's versions (the ones CI and a fresh
-      # `cargo install --locked` resolve), and fail if Cargo.lock is out of date instead of
-      # silently re-resolving.
+      # The committed lockfile holds what newest-toolchain consumers resolve (tauri 2.12 needs
+      # Rust 1.90), so it cannot build here. An MSRV consumer's resolver picks older compatible
+      # versions: prove the crates compile on those, the promise rust-version makes.
       - name: Check MSRV
-        run: cargo check --workspace --locked
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+        run: |
+          cargo update
+          cargo check --workspace --locked
 
   # victauri-plugin accepts rusqlite `>=0.32, <0.42` so cargo unifies onto the app's own
   # rusqlite (`links = "sqlite3"` allows one libsqlite3-sys per build). The lockfile pins the
