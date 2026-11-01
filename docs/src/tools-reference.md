@@ -767,9 +767,10 @@ page-scoped (cleared on reload).
 {"action": "matches"}
 ```
 
-> **Scope:** fetch supports all behaviors; XHR supports `block`/`delay`
-> (`fulfill` is fetch-only). Top-level navigation, sub-resources (img/css), and
-> WebSocket frames are not intercepted.
+> **Scope:** fetch and XHR support all behaviors: a fulfilled XHR never reaches
+> the network, and reports the rule's status, headers and body through its
+> `responseType`, with its usual events. Top-level navigation, sub-resources
+> (img/css), and WebSocket frames are not intercepted.
 >
 > **Rules on Tauri IPC change what the app's real `invoke` gets.** On the fetch
 > transport (`http://ipc.localhost/<cmd>` on Windows — `https://ipc.localhost/<cmd>` with `useHttpsScheme` — `ipc://localhost/<cmd>` on

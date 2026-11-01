@@ -896,14 +896,6 @@ fn route_rules_are_agent_only_and_validated() {
              var t0 = Date.now(); try { await fetch(big); } catch (e) {} T(Date.now() - t0 < 500, 'regex ran');",
         ),
         (
-            "xhr_fulfill_is_tagged_not_applied",
-            "<div></div>",
-            "var r = AGENT.addRoute({pattern:'/never', action:'fulfill', body:'{}'}); T(r.xhr_note, J(r)); \
-             var x = new XMLHttpRequest(); x.open('GET', 'http://127.0.0.1:9/never'); x.send(); x.abort(); \
-             var e = B.getNetworkLog().filter(function(n){return n.method === 'GET'})[0]; T(e.fulfill_not_applied === true, J(e)); \
-             var m = B.getRouteMatches(); T(m[0].applied === false, J(m));",
-        ),
-        (
             "xhr_delay_abort_cancels",
             "<div></div>",
             "AGENT.addRoute({pattern:'/slow', action:'delay', delay_ms: 80}); \

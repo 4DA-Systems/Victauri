@@ -819,15 +819,22 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (typeof status !== 'number' || status !== Math.floor(status) || status < 200 || status > 599) {
             throw new RangeError('victauri: route #' + route.id + ' fulfill status must be an integer in 200-599, got ' + status);
         }
-        // The Response constructor throws if a null-body status carries a body.
-        var nullBody = status === 204 || status === 205 || status === 304;
-        var bodyStr = nullBody ? null
-            : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
-        var hdrs = { 'content-type': route.content_type };
+        var bodyStr = mockBody(route);
+        var Ctor = RESPONSE_CTOR || Response;
+        return { resp: new Ctor(bodyStr, { status: status, statusText: route.status_text, headers: mockHeaders(route) }), body: bodyStr };
+    }
+    // A mock's body text, null for a null-body status (the Response constructor throws if one
+    // carries a body).
+    function mockBody(route) {
+        var nullBody = route.status === 204 || route.status === 205 || route.status === 304;
+        return nullBody ? null : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
+    }
+    function mockHeaders(route) {
+        var hdrs = OBJ_CREATE(null);
+        hdrs['content-type'] = route.content_type;
         // Lower-cased: `Content-Type` next to the default `content-type` became a joined, doubled header.
         for (var k in route.headers) { if (hasOwn(route.headers, k)) hdrs[REFLECT_APPLY(STR_TO_LOWER, k, [])] = route.headers[k]; }
-        var Ctor = RESPONSE_CTOR || Response;
-        return { resp: new Ctor(bodyStr, { status: status, statusText: route.status_text, headers: hdrs }), body: bodyStr };
+        return hdrs;
     }
     // The part of a response's Content-Type that Tauri's ipc-protocol.js switches on: the
     // header as `Headers` gives it (trimmed, repeated names joined with ", "), up to the first comma.
@@ -873,14 +880,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             + ' duration includes the delay (`route_delay_ms`), so command_timings leaves them out.' + scope;
     }
 
-    function recordRouteMatch(rule, url, method, notApplied) {
+    function recordRouteMatch(rule, url, method) {
         rule.triggered = (rule.triggered || 0) + 1;
         var m = {
             rule_id: rule.id, action: rule.action, url: loggedUrl(url),
             method: (method || 'GET').toUpperCase(), timestamp: Date.now(),
             trigger_count: rule.triggered,
         };
-        if (notApplied) m.applied = false;
         appendCapped(routeMatchLog, m, CAP_ROUTE_MATCHES);
     }
 
@@ -1153,6 +1159,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     var STR_INDEXOF = String.prototype.indexOf;
     var STR_SUBSTRING = String.prototype.substring;
     var STR_TO_LOWER = String.prototype.toLowerCase;
+    var ARRAY_BUFFER_SLICE = ArrayBuffer.prototype.slice;
     // Native `Request` getters. They brand-check (throw for anything but a genuine Request), so
     // they tell a real Request apart from a look-alike object and read what fetch really uses —
     // an own `url` property planted on a Request instance cannot shadow them.
@@ -3073,9 +3080,6 @@ const INIT_SCRIPT_BODY: &str = r#"
         routeRules[routeRules.length] = r; // not .push (see appendCapped)
         // A copy: the stored rule was validated, and page script must not edit it afterwards.
         var out = { ok: true, id: r.id, rule: cloneJson(r) };
-        if (r.action === 'fulfill') {
-            out.xhr_note = 'fulfill applies to fetch only: an XMLHttpRequest matching this rule still goes to the network (its log entry is tagged fulfill_not_applied).';
-        }
         if (hitsIpc) out.ipc_note = routeIpcNote(r);
         // A command-specific pattern that does not name the IPC host (`greet`, `*/greet`)
         // can still match a Tauri IPC URL. Such a call never gets this mock (Tauri would run
@@ -4368,13 +4372,14 @@ const INIT_SCRIPT_BODY: &str = r#"
         function xhrState(xhr) {
             var st = XHR_NET_GET(xhrNet, xhr);
             if (!st) {
-                st = { net: null, entry: null, hooked: false };
+                st = { net: null, entry: null, hooked: false, mock: null, mime: null };
                 XHR_NET_SET(xhrNet, xhr, st);
             }
             return st;
         }
-        function xhrEvent(type) {
-            return typeof ProgressEvent === 'function' ? new ProgressEvent(type) : new Event(type);
+        function xhrEvent(type, loaded, total) {
+            if (typeof ProgressEvent !== 'function') return new Event(type);
+            return new ProgressEvent(type, { lengthComputable: total > 0, loaded: loaded || 0, total: total || 0 });
         }
         function xhrFinish(entry, status) {
             entry.status = status;
@@ -4423,6 +4428,248 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (e && e.status === 'pending') xhrFinish(e, 'error');
             });
         }
+
+        // ── `fulfill` ──
+        //
+        // A mocked request never reaches the native XHR, which stays OPENED. Everything the page
+        // reads about the response comes from the mock instead: the prototype's accessors and
+        // header methods ask this per-XHR state first, so nothing shows on the instance, and an XHR
+        // with no mock (or a `this` that is not an XHR) still gets the native behaviour and errors.
+        var XHR_PROTO = XMLHttpRequest.prototype;
+        var TEXT_ENCODER = null;
+        try { TEXT_ENCODER = new window.TextEncoder(); } catch (e) { TEXT_ENCODER = null; }
+        var TEXT_ENCODE = TEXT_ENCODER ? window.TextEncoder.prototype.encode : null;
+        var BLOB_CTOR = typeof window.Blob === 'function' ? window.Blob : null;
+        var DOM_PARSER = typeof window.DOMParser === 'function' ? window.DOMParser : null;
+        var DOM_PARSE = DOM_PARSER ? window.DOMParser.prototype.parseFromString : null;
+        function xhrMockOf(xhr) {
+            var st = XHR_NET_GET(xhrNet, xhr);
+            return st ? st.mock : null;
+        }
+        function mockBytes(m) {
+            if (m.bytes === undefined) {
+                m.bytes = TEXT_ENCODER ? REFLECT_APPLY(TEXT_ENCODE, TEXT_ENCODER, [m.body]) : null;
+            }
+            return m.bytes;
+        }
+        function mockByteLength(m) {
+            var bytes = mockBytes(m);
+            return bytes ? bytes.length : m.body.length;
+        }
+        // Parsed as a real response is: HTML only when the page asked for a document, a document
+        // that is not well-formed or of another type is null.
+        function mockDocument(m, xhr, htmlAllowed) {
+            if (m.document !== undefined) return m.document;
+            var st = XHR_NET_GET(xhrNet, xhr);
+            var mime = st.mime || m.headers['content-type'] || '';
+            var semi = REFLECT_APPLY(STR_INDEXOF, mime, [';']);
+            mime = REFLECT_APPLY(STR_TO_LOWER, semi < 0 ? mime : REFLECT_APPLY(STR_SUBSTRING, mime, [0, semi]), []).trim();
+            var isHtml = mime === 'text/html';
+            var isXml = mime === 'text/xml' || mime === 'application/xml'
+                || (mime.length > 4 && REFLECT_APPLY(STR_SUBSTRING, mime, [mime.length - 4]) === '+xml');
+            var doc = null;
+            if (DOM_PARSER && ((isHtml && htmlAllowed) || isXml)) {
+                try {
+                    doc = REFLECT_APPLY(DOM_PARSE, new DOM_PARSER(), [m.body, isHtml ? 'text/html' : 'application/xml']);
+                    if (isXml && doc.getElementsByTagName('parsererror').length) doc = null;
+                } catch (e) { doc = null; }
+            }
+            if (isHtml && !htmlAllowed) return null; // not cached: `responseType` can still change
+            m.document = doc;
+            return doc;
+        }
+        function mockResponse(m, xhr, type) {
+            if (m.state !== 4 || m.failed) return null;
+            if (m.value !== undefined) return m.value;
+            var value = null;
+            if (type === 'json') {
+                try { value = PRISTINE_PARSE(m.body); } catch (e) { value = null; }
+            } else if (type === 'arraybuffer') {
+                var bytes = mockBytes(m);
+                value = bytes ? REFLECT_APPLY(ARRAY_BUFFER_SLICE, bytes.buffer, [bytes.byteOffset, bytes.byteOffset + bytes.length]) : null;
+            } else if (type === 'blob') {
+                value = BLOB_CTOR ? new BLOB_CTOR(mockBytes(m) ? [mockBytes(m)] : [m.body], { type: m.headers['content-type'] || '' }) : null;
+            } else if (type === 'document') {
+                return mockDocument(m, xhr, true);
+            }
+            m.value = value;
+            return value;
+        }
+        function hasHeaders(m) { return m.state >= 2 && !m.failed; }
+        function xhrAccessor(name, read) {
+            var d = Object.getOwnPropertyDescriptor(XHR_PROTO, name);
+            if (!d || !d.get) return;
+            var native = d.get;
+            Object.defineProperty(XHR_PROTO, name, {
+                configurable: d.configurable, enumerable: d.enumerable, set: d.set,
+                get: function() {
+                    var m = xhrMockOf(this);
+                    return m ? read(m, this, native) : REFLECT_APPLY(native, this, []);
+                },
+            });
+        }
+        var XHR_TYPE_GET = (Object.getOwnPropertyDescriptor(XHR_PROTO, 'responseType') || {}).get;
+        function xhrType(xhr) { return XHR_TYPE_GET ? REFLECT_APPLY(XHR_TYPE_GET, xhr, []) : ''; }
+        xhrAccessor('readyState', function(m) { return m.state; });
+        xhrAccessor('status', function(m) { return hasHeaders(m) ? m.status : 0; });
+        xhrAccessor('statusText', function(m) { return hasHeaders(m) ? m.status_text : ''; });
+        xhrAccessor('responseURL', function(m) { return hasHeaders(m) ? m.url : ''; });
+        xhrAccessor('responseText', function(m, xhr, native) {
+            var type = xhrType(xhr);
+            // The native getter throws this engine's own InvalidStateError for another type.
+            if (type !== '' && type !== 'text') return REFLECT_APPLY(native, xhr, []);
+            return (m.state >= 3 && !m.failed) ? m.body : '';
+        });
+        xhrAccessor('response', function(m, xhr) {
+            var type = xhrType(xhr);
+            if (type === '' || type === 'text') return (m.state >= 3 && !m.failed) ? m.body : '';
+            return mockResponse(m, xhr, type);
+        });
+        xhrAccessor('responseXML', function(m, xhr, native) {
+            var type = xhrType(xhr);
+            if (type !== '' && type !== 'document') return REFLECT_APPLY(native, xhr, []);
+            if (m.state !== 4 || m.failed) return null;
+            return mockDocument(m, xhr, type === 'document');
+        });
+        var origGetAll = XHR_PROTO.getAllResponseHeaders;
+        var origOverrideMime = XHR_PROTO.overrideMimeType;
+        XHR_PROTO.getResponseHeader = function(name) {
+            var m = xhrMockOf(this);
+            if (!m || arguments.length < 1) return REFLECT_APPLY(XHR_GET_HEADER, this, arguments);
+            if (!hasHeaders(m)) return null;
+            var key = REFLECT_APPLY(STR_TO_LOWER, toStringExact(name), []);
+            // Never readable from a response, as for a real one.
+            if (key === 'set-cookie' || key === 'set-cookie2') return null;
+            return m.headers[key] === undefined ? null : '' + m.headers[key];
+        };
+        XHR_PROTO.getAllResponseHeaders = function() {
+            var m = xhrMockOf(this);
+            if (!m) return REFLECT_APPLY(origGetAll, this, arguments);
+            if (!hasHeaders(m)) return '';
+            var names = [];
+            for (var k in m.headers) { if (k !== 'set-cookie' && k !== 'set-cookie2') names[names.length] = k; }
+            names.sort();
+            var out = '';
+            for (var i = 0; i < names.length; i++) out += names[i] + ': ' + m.headers[names[i]] + '\r\n';
+            return out;
+        };
+        XHR_PROTO.overrideMimeType = function(mime) {
+            var ret = REFLECT_APPLY(origOverrideMime, this, arguments);
+            var st = xhrState(this);
+            st.mime = toStringExact(mime);
+            return ret;
+        };
+        function xhrFire(xhr, event) {
+            try { REFLECT_APPLY(DISPATCH_EVENT, xhr, [event]); } catch (e) {}
+        }
+        // The native object's url, as `responseURL` gives it: absolute, no fragment.
+        function xhrResponseUrl(url) {
+            var abs = url;
+            try {
+                var base = BASE_URI_GET ? REFLECT_APPLY(BASE_URI_GET, document, []) : window.location.href;
+                abs = REFLECT_APPLY(URL_HREF_GET, new URL_CTOR(url, base), []);
+            } catch (e) {}
+            var hash = REFLECT_APPLY(STR_INDEXOF, abs, ['#']);
+            return hash < 0 ? abs : REFLECT_APPLY(STR_SUBSTRING, abs, [0, hash]);
+        }
+        function xhrMockEnd(entry, m, url) {
+            entry.status_text = m.status_text;
+            if (isIpcUrl(url)) entry.ipc_response = m.headers['tauri-response'] === 'ok' ? 'ok' : 'error';
+            xhrFinish(entry, m.status);
+        }
+        // Answer a matching request with the rule's mock: `send` does not reach the network. The
+        // transitions come in one later task, stopping as soon as a handler moved the XHR on.
+        function xhrFulfill(xhr, st, entry, route, net, body) {
+            var m = {
+                state: 1, failed: false, timer: null,
+                status: route.status, status_text: route.status_text,
+                headers: mockHeaders(route),
+                body: mockBody(route) || '',
+                url: xhrResponseUrl(net.url),
+            };
+            st.mock = m;
+            st.entry = entry;
+            entry.mocked = true;
+            if (route.delay_ms > 0) entry.route_delay_ms = route.delay_ms;
+            xhrLog(entry);
+            var size = mockByteLength(m);
+            if (!net.async) {
+                // Nothing can wait inside a synchronous send().
+                xhrMockEnd(entry, m, net.url);
+                m.state = 4;
+                xhrFire(xhr, new Event('readystatechange'));
+                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('load', size, size));
+                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('loadend', size, size));
+                return;
+            }
+            var hasBody = body !== null && body !== undefined && net.method !== 'GET' && net.method !== 'HEAD';
+            var sent = typeof body === 'string' ? body.length : 0;
+            xhrFire(xhr, xhrEvent('loadstart', 0, 0));
+            if (hasBody) xhrFire(xhr.upload, xhrEvent('loadstart', 0, sent));
+            if (st.mock !== m || m.state !== 1) return;
+            function moved(state) { return st.mock !== m || m.state !== state; }
+            function answer() {
+                m.timer = null;
+                if (moved(1)) return;
+                if (hasBody) {
+                    xhrFire(xhr.upload, xhrEvent('progress', sent, sent));
+                    xhrFire(xhr.upload, xhrEvent('load', sent, sent));
+                    xhrFire(xhr.upload, xhrEvent('loadend', sent, sent));
+                    if (moved(1)) return;
+                }
+                m.state = 2;
+                xhrFire(xhr, new Event('readystatechange'));
+                if (moved(2)) return;
+                // With no body there is no LOADING state and no progress.
+                if (size > 0) {
+                    m.state = 3;
+                    xhrFire(xhr, new Event('readystatechange'));
+                    if (moved(3)) return;
+                    xhrFire(xhr, xhrEvent('progress', size, size));
+                    if (moved(3)) return;
+                }
+                xhrMockEnd(entry, m, net.url);
+                m.state = 4;
+                xhrFire(xhr, new Event('readystatechange'));
+                if (moved(4)) return;
+                xhrFire(xhr, xhrEvent('load', size, size));
+                if (moved(4)) return;
+                xhrFire(xhr, xhrEvent('loadend', size, size));
+            }
+            // A `timeout` the mock's delay runs past ends it as it would end a slow request.
+            var limit = xhr.timeout;
+            if (limit > 0 && route.delay_ms >= limit) {
+                m.timer = SET_TIMEOUT(function() {
+                    m.timer = null;
+                    if (moved(1)) return;
+                    m.failed = true;
+                    m.state = 4;
+                    xhrFinish(entry, 'timeout');
+                    xhrFire(xhr, new Event('readystatechange'));
+                    if (moved(4)) return;
+                    xhrFire(xhr, xhrEvent('timeout', 0, 0));
+                    if (moved(4)) return;
+                    xhrFire(xhr, xhrEvent('loadend', 0, 0));
+                }, limit);
+            } else {
+                m.timer = SET_TIMEOUT(answer, route.delay_ms);
+            }
+        }
+        // As on a real request: in flight it ends with `readystatechange`, `abort`, `loadend`; once
+        // it has ended there are no events. Either way it reads as UNSENT afterwards.
+        function xhrMockAbort(xhr, st, m) {
+            if (m.timer !== null) { CLEAR_TIMEOUT(m.timer); m.timer = null; }
+            if (m.state < 4 && m.state > 0) {
+                m.failed = true;
+                m.state = 4;
+                if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+                xhrFire(xhr, new Event('readystatechange'));
+                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('abort', 0, 0));
+                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('loadend', 0, 0));
+            }
+            if (st.mock === m) { m.failed = true; m.state = 0; }
+        }
+
         XMLHttpRequest.prototype.open = function(method, url) {
             // No early delete: an open() that throws leaves the previous request intact (spec),
             // and a successful one replaces this entry below.
@@ -4437,6 +4684,14 @@ const INIT_SCRIPT_BODY: &str = r#"
             for (var i = 2; i < arguments.length; i++) args[i] = arguments[i];
             var ret = REFLECT_APPLY(origOpen, this, args);
             var st = xhrState(this);
+            // A new request: nothing of a mocked one is left. The native object never left OPENED,
+            // so it did not announce the state change a page sees.
+            var announce = false;
+            if (st.mock) {
+                if (st.mock.timer !== null) CLEAR_TIMEOUT(st.mock.timer);
+                announce = st.mock.state !== 1;
+                st.mock = null;
+            }
             // open() on a request in flight terminates it without firing any event: close its
             // entry here, or it would stay 'pending' forever.
             if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
@@ -4446,13 +4701,16 @@ const INIT_SCRIPT_BODY: &str = r#"
                 st.delay_timer = null;
             }
             st.entry = null;
-            st.net = { method: m, url: u };
+            // An explicit third argument is converted even when undefined (false), as open() does.
+            st.net = { method: m, url: u, async: arguments.length < 3 || !!arguments[2] };
+            if (announce) xhrFire(this, new Event('readystatechange'));
             return ret;
         };
         // abort() during a route delay: the real send has not happened, so the native abort is a
         // no-op and the request would still go out after the delay.
         XMLHttpRequest.prototype.abort = function() {
             var st = XHR_NET_GET(xhrNet, this);
+            if (st && st.mock) return xhrMockAbort(this, st, st.mock);
             if (st && st.delay_timer !== null && st.delay_timer !== undefined) {
                 CLEAR_TIMEOUT(st.delay_timer);
                 st.delay_timer = null;
@@ -4467,6 +4725,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         };
         XMLHttpRequest.prototype.send = function() {
             var st = XHR_NET_GET(xhrNet, this);
+            // The native object is still OPENED and would really send: this one has been sent.
+            if (st && st.mock) throw new DOMException('The object\'s state must be OPENED.', 'InvalidStateError');
             var net = st && st.net;
             if (!net || isVictauriInternalUrl(net.url)) {
                 return REFLECT_APPLY(origSend, this, arguments);
@@ -4483,14 +4743,15 @@ const INIT_SCRIPT_BODY: &str = r#"
             xhrHook(this, st);
             var self = this;
 
-            // Phase 1 routing for XHR: block + delay are supported here.
-            // `fulfill` (synthetic response) is fetch-only — faking the full
-            // XHR response surface is unreliable. Such a request really goes out, and the log says so.
+            // Phase 1 routing for XHR: block, delay, and fulfill (see `xhrFulfill`).
             var xroute = matchRoute(net.url, net.method);
             if (xroute) {
-                recordRouteMatch(xroute, net.url, net.method, xroute.action === 'fulfill');
+                recordRouteMatch(xroute, net.url, net.method);
                 entry.route_rule = xroute.id;
-                if (xroute.action === 'fulfill') entry.fulfill_not_applied = true;
+                if (xroute.action === 'fulfill') {
+                    xhrFulfill(this, st, entry, xroute, net, arguments[0]);
+                    return undefined;
+                }
                 if (xroute.action === 'block') {
                     st.entry = entry;
                     entry.blocked = true;
@@ -4509,7 +4770,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     }, 0);
                     return; // do not send
                 }
-                if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
+                if (xroute.action === 'delay' && xroute.delay_ms > 0) {
                     st.entry = entry;
                     xhrLog(entry);
                     var dArgs = arguments;

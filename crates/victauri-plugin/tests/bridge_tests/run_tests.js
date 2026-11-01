@@ -340,6 +340,7 @@ async function run() {
       window.Request = Request;
       window.Response = Response;
       window.Headers = Headers;
+      window.TextEncoder = TextEncoder;
     }
 
     // Optional script run BEFORE the bridge — as Tauri's own init scripts (core.js,

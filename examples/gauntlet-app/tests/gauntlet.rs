@@ -694,6 +694,69 @@ gauntlet!(go_back_recovers_a_stopped_page, base, {
     );
 });
 
+// ── 21. XHR `fulfill`: the engine's own XMLHttpRequest reports the mock ───────
+
+gauntlet!(xhr_route_fulfill_reports_the_mock, base, {
+    // The page CSP's `connect-src` would refuse this URL: a request that reached the network errors.
+    let add = call(
+        &base,
+        "route",
+        json!({ "action": "add", "pattern": "gauntlet-xhr-mock", "behavior": "fulfill", "status": 201,
+                "status_text": "Made", "headers": { "X-One": "1" }, "body": "{\"a\":[1]}" }),
+    )
+    .await;
+    assert!(result(&add).get("xhr_note").is_none(), "{}", result(&add));
+    let code = r"
+        function one(type) { return new Promise(function(done) {
+            var x = new XMLHttpRequest(), seen = [];
+            ['readystatechange','progress','load','error','abort','loadend'].forEach(function(t) {
+                x.addEventListener(t, function() { seen.push(t === 'readystatechange' ? 'rs' + x.readyState : t); });
+            });
+            x.onloadend = function() {
+                var r = x.response;
+                done({ type: type, seen: seen.join(), rs: x.readyState, status: x.status, text: x.statusText,
+                    header: x.getResponseHeader('x-one'), all: x.getAllResponseHeaders(),
+                    url: x.responseURL.indexOf('gauntlet-xhr-mock') !== -1,
+                    value: type === 'json' ? r.a[0]
+                        : type === 'arraybuffer' ? new Uint8Array(r).length
+                        : type === 'blob' ? r.size + ' ' + r.type
+                        : type === 'document' ? r
+                        : r });
+            };
+            x.open('GET', 'https://example.invalid/gauntlet-xhr-mock'); x.responseType = type; x.send();
+        }); }
+        var out = [];
+        for (var t of ['', 'text', 'json', 'arraybuffer', 'blob', 'document']) out.push(await one(t));
+        return out;";
+    let r = call(&base, "eval_js", json!({ "code": code })).await;
+    let _ = call(&base, "route", json!({ "action": "clear_all" })).await;
+    let rows = result(&r).as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 6, "{r}");
+    for row in &rows {
+        assert_eq!(
+            row["seen"],
+            json!("rs2,rs3,progress,rs4,load,loadend"),
+            "{row}"
+        );
+        assert_eq!(row["rs"], json!(4), "{row}");
+        assert_eq!(row["status"], json!(201), "{row}");
+        assert_eq!(row["text"], json!("Made"), "{row}");
+        assert_eq!(row["header"], json!("1"), "{row}");
+        assert_eq!(
+            row["all"],
+            json!("content-type: application/json\r\nx-one: 1\r\n"),
+            "{row}"
+        );
+        assert_eq!(row["url"], json!(true), "{row}");
+    }
+    assert_eq!(rows[0]["value"], json!("{\"a\":[1]}"), "{}", rows[0]);
+    assert_eq!(rows[1]["value"], json!("{\"a\":[1]}"), "{}", rows[1]);
+    assert_eq!(rows[2]["value"], json!(1), "{}", rows[2]);
+    assert_eq!(rows[3]["value"], json!(9), "{}", rows[3]);
+    assert_eq!(rows[4]["value"], json!("9 application/json"), "{}", rows[4]);
+    assert_eq!(rows[5]["value"], Value::Null, "{}", rows[5]);
+});
+
 // ── 23-25. DISPLAY-GATED: screenshot + filmstrip + trusted input ─────────────
 // These need a real window server (Screen Recording on macOS); they run on the
 // macOS validation box and local Windows (VICTAURI_GAUNTLET_DISPLAY=1) and skip
