@@ -2757,9 +2757,10 @@ fn snapshot_element_count(snap: &serde_json::Value) -> u64 {
                                 .bytes()
                                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
                     });
-                    let Some(rest) = rest
-                        .strip_prefix('e')
-                        .or_else(|| tagged.and_then(|head| rest.strip_prefix(head)))
+                    // Tagged first: a tag can start with `e` too (`[eabce12]`).
+                    let Some(rest) = tagged
+                        .and_then(|head| rest.strip_prefix(head))
+                        .or_else(|| rest.strip_prefix('e'))
                     else {
                         return false;
                     };
@@ -4480,6 +4481,12 @@ mod tests {
             "format": "compact"
         });
         assert_eq!(snapshot_element_count(&tagged), 2);
+        // A page tag may itself start with `e` (1 in 26), and may end in digits.
+        let e_tag = serde_json::json!({
+            "tree": "[eabce12] body\n  [e123e4] a\n  [e12] legacy\n  [e123e] not a ref\n",
+            "format": "compact"
+        });
+        assert_eq!(snapshot_element_count(&e_tag), 3);
         let json_tree = serde_json::json!({
             "tree": {"ref_id": "e1", "children": [
                 {"ref_id": "e2", "children": []},

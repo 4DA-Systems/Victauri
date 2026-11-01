@@ -203,6 +203,72 @@ fn a_closed_stderr_does_not_change_the_exit_code() {
     );
 }
 
+/// A child that ignores SIGTERM held `victauri run` forever: the signal was forwarded once and
+/// nothing followed it. `signals` stop signals are sent 200 ms apart; the launcher must then end
+/// within `within`, having recorded the kill.
+#[cfg(not(windows))]
+fn stubborn_child_is_killed(signals: usize, within: Duration) {
+    let t = Temp::new();
+    let cap = t.path("c.jsonl");
+    let pid_file = t.path("pid");
+    let argv = t.script(
+        "app",
+        "",
+        &format!(
+            "trap '' TERM INT\necho $$ > '{}'\nwhile :; do sleep 1; done\n",
+            pid_file.display()
+        ),
+    );
+    let mut args = vec!["run", "--capture", cap.to_str().unwrap(), "--"];
+    args.extend(argv.iter().map(String::as_str));
+    let mut launcher = KillOnDrop(
+        t.victauri(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let app_pid = wait_for_pid(&pid_file);
+    let start = Instant::now();
+    for i in 0..signals {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Command::new("kill")
+            .args(["-TERM", &launcher.0.id().to_string()])
+            .status()
+            .unwrap();
+    }
+    let ended = loop {
+        if launcher.0.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if start.elapsed() > within {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    if !ended {
+        kill_pid(app_pid);
+    }
+    assert!(ended, "still running after {within:?}");
+    let capture = std::fs::read_to_string(&cap).unwrap();
+    assert!(capture.contains("SIGKILL"), "{capture}");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_child_ignoring_sigterm_is_killed_in_the_end() {
+    stubborn_child_is_killed(1, Duration::from_secs(20));
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_second_stop_signal_kills_at_once() {
+    stubborn_child_is_killed(2, Duration::from_secs(6));
+}
+
 /// An agent harness or `timeout` that stops the launcher left the app holding its port and its
 /// single-instance lock. On Windows the launcher is killed outright (no handler can run) and the
 /// job object takes the whole tree; on Unix SIGTERM is forwarded and the exit is recorded.

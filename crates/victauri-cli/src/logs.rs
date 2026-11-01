@@ -791,10 +791,15 @@ fn capture_head(path: &Path) -> Option<Vec<u8>> {
     Some(head)
 }
 
-/// One file can have grown since the head was read, so only the common length is compared.
-fn same_capture(a: &[u8], b: &[u8]) -> bool {
-    let n = a.len().min(b.len());
-    a[..n] == b[..n]
+/// Whether `now` is still the file whose head was `seen`. One file can have grown since, so only
+/// the common length is compared. Nothing seen yet fits any file; but a file does not shrink, so
+/// an empty one after a non-empty head is a new file, whose first record is still to come.
+fn same_capture(seen: &[u8], now: &[u8]) -> bool {
+    if seen.is_empty() {
+        return true;
+    }
+    let n = seen.len().min(now.len());
+    n > 0 && seen[..n] == now[..n]
 }
 
 /// The next records of a followed capture, across a rotation. The launcher renames a full file
@@ -910,6 +915,60 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(n: u64) -> String {
+        format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"line {n}\"}}\n")
+    }
+
+    fn texts(lines: &[Value]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l["l"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Review: a poll that landed between the launcher's new (still empty) file and its first
+    /// record took an empty head for "the same capture" and reset the offset. The next poll then
+    /// saw a rotation with the offset at 0 and printed the whole rotated capture again.
+    #[test]
+    fn a_rotation_seen_while_the_new_file_is_empty_reprints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        std::fs::write(&path, format!("{}{}", record(1), record(2))).unwrap();
+        let head = capture_head(&path).unwrap();
+        let (seen, offset) = read_capture(&path, None).unwrap();
+        assert_eq!(seen.len(), 2);
+        let mut cursor = CaptureCursor { offset, head };
+
+        // One unread line, then the rotation, then nothing yet in the new file.
+        let mut old = std::fs::read_to_string(&path).unwrap();
+        old.push_str(&record(3));
+        std::fs::write(&path, &old).unwrap();
+        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+        std::fs::write(&path, "").unwrap();
+
+        let mut got = texts(&read_followed(&path, &mut cursor).unwrap());
+        std::fs::write(&path, record(4)).unwrap();
+        got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
+        got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
+        assert_eq!(got, ["line 3", "line 4"]);
+    }
+
+    /// A capture that was empty when the follower attached is the ordinary start of a run.
+    #[test]
+    fn a_capture_empty_at_attach_is_read_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut cursor = CaptureCursor {
+            offset: 0,
+            head: capture_head(&path).unwrap(),
+        };
+        assert!(read_followed(&path, &mut cursor).unwrap().is_empty());
+        std::fs::write(&path, record(1)).unwrap();
+        let got = texts(&read_followed(&path, &mut cursor).unwrap());
+        assert_eq!(got, ["line 1"]);
+    }
 
     /// Release verification: the 0.10.2 CLI against 4DA's 0.10.1 plugin printed only the
     /// plugin's deserializer error for `victauri logs`.
