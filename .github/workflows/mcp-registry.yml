@@ -24,6 +24,15 @@ jobs:
       id-token: write # GitHub OIDC login to the MCP Registry
       contents: read
     steps:
+      # This job can publish under the org's namespace with no secret, so what it reads must be
+      # main's server.json, not one from whatever branch the dispatch named.
+      - name: Refuse anything but main
+        run: |
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::Run this workflow from main (got $GITHUB_REF)."
+            exit 1
+          fi
+
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false

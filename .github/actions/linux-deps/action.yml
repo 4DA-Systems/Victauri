@@ -9,6 +9,13 @@ inputs:
     description: Also install xvfb (for launching the app headless)
     required: false
     default: "false"
+  cache:
+    description: >-
+      Restore and save the .deb cache. Release jobs set this to "false": a tag run reads
+      main's cache scope, which a job running third-party code can write, and actions/cache
+      extracts a tar with absolute paths, so apt verifying the packages would not cover it.
+    required: false
+    default: "true"
 
 runs:
   using: composite
@@ -33,6 +40,7 @@ runs:
         echo "image_version=${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
 
     - name: Restore cached packages
+      if: inputs.cache == 'true'
       id: restore
       uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
@@ -85,7 +93,7 @@ runs:
         exit 1
 
     - name: Save package cache
-      if: steps.restore.outputs.cache-hit != 'true'
+      if: inputs.cache == 'true' && steps.restore.outputs.cache-hit != 'true'
       continue-on-error: true # several jobs race to save the same key; one wins
       uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
       with:
