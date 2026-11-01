@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use victauri_plugin::VictauriState;
 use victauri_plugin::bridge::WebviewBridge;
-use victauri_plugin::mcp::build_app_stateful;
+use victauri_plugin::mcp::{build_app, build_app_stateful};
 use victauri_plugin::privacy::PrivacyConfig;
 
 use common::SimpleMockBridge;
@@ -163,6 +163,80 @@ async fn start_test_server(state: Arc<VictauriState>, labels: &[&str]) -> String
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
+}
+
+/// A `tools/call` whose `arguments` are not an object used to come back as `-32601` with the
+/// message `tools/call`, which says the method does not exist.
+#[tokio::test]
+async fn mcp_arguments_that_are_not_an_object_are_named_as_the_problem() {
+    let stateless = {
+        let bridge: Arc<dyn WebviewBridge> = Arc::new(SimpleMockBridge::new(&["main"]));
+        let app = build_app(test_state(), bridge);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    };
+    let stateful = start_test_server(test_state(), &["main"]).await;
+    for base in [stateless, stateful] {
+        let (client, sid) = mcp_session(&base).await;
+        for arguments in [
+            serde_json::json!("button"),
+            serde_json::json!(["button"]),
+            serde_json::json!(3),
+            serde_json::json!(true),
+        ] {
+            let body = call_tool(&client, &base, &sid, "find_elements", arguments.clone()).await;
+            let reply: serde_json::Value = serde_json::from_str(&body).expect(&body);
+            assert_eq!(reply["id"], 99, "{body}");
+            assert_eq!(reply["error"]["code"], -32602, "{arguments}: {body}");
+            let message = reply["error"]["message"].as_str().unwrap();
+            assert!(message.contains("must be an object"), "{body}");
+        }
+        // An object, and no arguments at all, still reach the tool.
+        let body = call_tool(
+            &client,
+            &base,
+            &sid,
+            "get_memory_stats",
+            serde_json::json!({}),
+        )
+        .await;
+        assert!(!body.contains("must be an object"), "{body}");
+        assert!(body.contains("result"), "{body}");
+        let body = call_tool(
+            &client,
+            &base,
+            &sid,
+            "get_memory_stats",
+            serde_json::Value::Null,
+        )
+        .await;
+        assert!(!body.contains("must be an object"), "{body}");
+    }
+}
+
+/// The same mistake on the REST route.
+#[tokio::test]
+async fn rest_arguments_that_are_not_an_object_are_named_as_the_problem() {
+    let base = start_test_server(test_state(), &["main"]).await;
+    let client = reqwest::Client::new();
+    let post = |body: &'static str| {
+        client
+            .post(format!("{base}/api/tools/find_elements"))
+            .header("Content-Type", "application/json")
+            .body(body)
+            .send()
+    };
+    for body in ["\"button\"", "[1]", "3", "true"] {
+        let resp = post(body).await.unwrap();
+        assert_eq!(resp.status(), 400, "{body}");
+        let reply: serde_json::Value = resp.json().await.unwrap();
+        let error = reply["error"].as_str().unwrap();
+        assert!(error.contains("must be a JSON object"), "{body}: {error}");
+    }
 }
 
 async fn start_privacy_server(config: PrivacyConfig, labels: &[&str]) -> String {

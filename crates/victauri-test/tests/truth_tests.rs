@@ -1273,6 +1273,24 @@ async fn a_budget_that_was_exceeded_still_fails() {
     );
 }
 
+/// `find_elements` takes a `Value`, so `"button".into()` compiles. It went out as the tool's
+/// arguments and came back as `Mcp { code: -32601, message: "tools/call" }`.
+#[tokio::test]
+async fn find_elements_takes_a_string_as_a_css_selector() {
+    let (mut c, calls) = client(answers_empty()).await;
+    c.find_elements("button".into()).await.unwrap();
+    c.find_elements(json!({"role": "button"})).await.unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls[0],
+        ("find_elements".to_string(), json!({"css": "button"}))
+    );
+    assert_eq!(
+        calls[1],
+        ("find_elements".to_string(), json!({"role": "button"}))
+    );
+}
+
 #[tokio::test]
 async fn typed_plugin_info_reports_the_tool_count() {
     // The shape of `get_plugin_info` (`mcp/mod.rs`).
