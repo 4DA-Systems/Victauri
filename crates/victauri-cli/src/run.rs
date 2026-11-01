@@ -1,7 +1,8 @@
 //! `victauri run -- <command>` — launch an app (or its dev command) with its
 //! stdout/stderr captured **out of process**.
 //!
-//! The launcher passes every byte through to this terminal unchanged, and also
+//! The launcher passes every byte through to this terminal unchanged, as it arrives (a
+//! prompt has no newline to wait for), and also
 //! appends each line to a JSONL capture file whose path it hands the app in
 //! `VICTAURI_CONSOLE_LOG`. The embedded plugin serves that file as
 //! `logs {action:"stdout"}`, and `victauri logs --stdout` reads it — even after
@@ -15,8 +16,13 @@
 //! `tauri-plugin-log`'s Stdout target, C libraries) with zero code changes, and
 //! wraps whole dev commands (`npm run tauri dev`), so `cargo` build errors are
 //! captured too.
+//!
+//! Stopping the launcher stops the app: otherwise an agent harness or `timeout` leaves it holding
+//! its port and single-instance lock. On Windows a job object takes the whole tree when the
+//! launcher dies, however it dies. On Unix SIGTERM/SIGHUP are forwarded and the exit is recorded;
+//! SIGKILL cannot be seen, so it still orphans the app.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -32,6 +38,14 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// stderr lines carried on the final `exit` record, so a crash's last words stay
 /// attached to the crash even under a level filter.
 const EXIT_TAIL_LINES: usize = 12;
+/// Captures hold whatever the app printed, secrets included, up to 128 MB per run. Dead apps'
+/// captures past this age go, and at most this many are kept however recent they are. Long
+/// enough for a crash's output to be read; `--capture <file>` paths are never touched.
+const CAPTURE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+const CAPTURE_KEEP: usize = 20;
+/// On Unix: how long a stop signal waits before being forwarded (see [`forward_stop`]).
+#[cfg(unix)]
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Directory holding console captures: `console` under the per-user discovery root, created
 /// owner-only and trust-checked (see [`crate::bridge::private_subdir`]). Captures hold whatever
@@ -69,6 +83,69 @@ pub fn latest_capture() -> Option<PathBuf> {
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .max_by_key(|(t, _)| *t)
         .map(|(_, p)| p)
+}
+
+/// The pid and the run in a capture's own name: `<pid>-<ms>.jsonl`, rotated as `.jsonl.<n>`.
+/// `None` for anything else in the directory, which is not ours to delete.
+fn capture_group(file_name: &str) -> Option<(u32, &str)> {
+    let (base, rotated) = match file_name.split_once(".jsonl") {
+        Some((base, "")) => (base, None),
+        Some((base, rest)) => (base, Some(rest.strip_prefix('.')?)),
+        None => return None,
+    };
+    if rotated.is_some_and(|r| r.is_empty() || !r.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let (pid, ms) = base.split_once('-')?;
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((pid.parse().ok()?, base))
+}
+
+/// Delete old captures of apps that are gone: those past [`CAPTURE_MAX_AGE`], then all but the
+/// newest [`CAPTURE_KEEP`]. A capture whose launcher might still be alive is never deleted (only
+/// a definitely-dead pid counts; a reused pid just keeps a capture longer). Best effort: a file
+/// a reader holds open simply stays until the next run.
+fn prune_captures(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut groups: std::collections::BTreeMap<String, (u32, std::time::SystemTime, Vec<PathBuf>)> =
+        std::collections::BTreeMap::new();
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some((pid, base)) = name.to_str().and_then(capture_group) else {
+            continue;
+        };
+        let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        let group = groups
+            .entry(base.to_string())
+            .or_insert((pid, modified, Vec::new()));
+        group.1 = group.1.max(modified);
+        group.2.push(entry.path());
+    }
+    let mut dead: Vec<_> = groups
+        .into_values()
+        .filter(|(pid, ..)| victauri_test::process::liveness(*pid).is_dead())
+        .collect();
+    dead.sort_by_key(|(_, modified, _)| std::cmp::Reverse(*modified));
+    let now = std::time::SystemTime::now();
+    for (i, (_, modified, files)) in dead.iter().enumerate() {
+        let too_old = now
+            .duration_since(*modified)
+            .is_ok_and(|age| age > CAPTURE_MAX_AGE);
+        if too_old || i >= CAPTURE_KEEP {
+            for file in files {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
 }
 
 /// Remove ANSI escape sequences (CSI `ESC[...X`, OSC `ESC]...BEL`) and a trailing `\r`.
@@ -126,6 +203,8 @@ struct Capture {
     file: std::fs::File,
     written: u64,
     recent_err: std::collections::VecDeque<String>,
+    /// Bytes of the line each stream (out, err) is still in the middle of.
+    pending: [Vec<u8>; 2],
     /// Set when the file could not be rotated: line capture stops (the size bound holds) and
     /// only the exit record is still written.
     stopped: bool,
@@ -151,8 +230,41 @@ impl Capture {
             file,
             written,
             recent_err: std::collections::VecDeque::with_capacity(EXIT_TAIL_LINES),
+            pending: [Vec::new(), Vec::new()],
             stopped: false,
         })
+    }
+
+    /// Take raw bytes as they arrived and record each line they complete. A line longer than
+    /// one stored record is split into several, so a child that writes megabytes without a
+    /// newline neither grows this buffer without bound nor loses anything.
+    fn feed(&mut self, stream: &'static str, mut bytes: &[u8]) {
+        let slot = usize::from(stream == "err");
+        while let Some(newline) = bytes.iter().position(|b| *b == b'\n') {
+            let mut line = std::mem::take(&mut self.pending[slot]);
+            line.extend_from_slice(&bytes[..newline]);
+            bytes = &bytes[newline + 1..];
+            while line.len() > MAX_LINE_BYTES {
+                let rest = line.split_off(MAX_LINE_BYTES);
+                self.record(stream, &String::from_utf8_lossy(&line));
+                line = rest;
+            }
+            self.record(stream, &String::from_utf8_lossy(&line));
+        }
+        self.pending[slot].extend_from_slice(bytes);
+        while self.pending[slot].len() >= MAX_LINE_BYTES {
+            let rest = self.pending[slot].split_off(MAX_LINE_BYTES);
+            let line = std::mem::replace(&mut self.pending[slot], rest);
+            self.record(stream, &String::from_utf8_lossy(&line));
+        }
+    }
+
+    /// Record a line the stream never finished (EOF, or the exit record is about to be written).
+    fn flush_partial(&mut self, stream: &'static str) {
+        let line = std::mem::take(&mut self.pending[usize::from(stream == "err")]);
+        if !line.is_empty() {
+            self.record(stream, &String::from_utf8_lossy(&line));
+        }
     }
 
     fn record(&mut self, stream: &str, line: &str) {
@@ -180,6 +292,9 @@ impl Capture {
 
     /// The final record: how the app ended, plus its last stderr lines.
     fn record_exit(&mut self, summary: &str) {
+        // A process the app started may hold the pipes open, so a pump can still be mid-line.
+        self.flush_partial("out");
+        self.flush_partial("err");
         let rec = serde_json::json!({
             "t": now_ms(),
             "s": "exit",
@@ -253,39 +368,70 @@ fn open_private(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("cannot open capture file {}", path.display()))
 }
 
-/// Copy `src` to `dst` byte-for-byte while recording each complete line.
+/// Copy `src` to `dst` byte-for-byte as it arrives, and hand it to the capture, which assembles
+/// lines. The terminal never waits for a line: a prompt (`Terminate batch job (Y/N)? `, a
+/// password request) or a `\r` progress bar has no newline to wait for.
 fn pump<R: Read, W: Write>(
-    src: R,
+    mut src: R,
     mut dst: W,
     stream: &'static str,
     capture: &Arc<Mutex<Capture>>,
 ) {
-    let mut reader = BufReader::with_capacity(64 * 1024, src);
-    let mut buf = Vec::with_capacity(4096);
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
-        buf.clear();
-        // At most one stored line's worth per read: a child that writes megabytes without a
-        // newline must neither grow this buffer without bound nor hold its output back from the
-        // terminal until the newline finally arrives.
-        match std::io::Read::take(&mut reader, MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                // A Windows console stdout rejects bytes that are not UTF-8 (`InvalidData`) —
-                // OEM-codepage output from cmd builtins or localised linker errors — and would
-                // drop the whole chunk: pass those through lossily instead.
-                if let Err(e) = dst.write_all(&buf)
-                    && e.kind() == std::io::ErrorKind::InvalidData
-                {
-                    let _ = dst.write_all(String::from_utf8_lossy(&buf).as_bytes());
-                }
-                let _ = dst.flush();
-                let line = String::from_utf8_lossy(&buf);
-                let line = line.trim_end_matches('\n');
-                if let Ok(mut c) = capture.lock() {
-                    c.record(stream, line);
-                }
-            }
+        let n = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        pass_through(&mut dst, &buf[..n]);
+        let _ = dst.flush();
+        if let Ok(mut c) = capture.lock() {
+            c.feed(stream, &buf[..n]);
         }
+    }
+    if let Ok(mut c) = capture.lock() {
+        c.flush_partial(stream);
+    }
+}
+
+/// Write `bytes` to the terminal, ignoring a reader that went away. A Windows console stdout
+/// writes the valid UTF-8 prefix, then rejects the rest (`InvalidData`) — OEM-codepage output from
+/// cmd builtins or localised linker errors: pass what is left through lossily, not all of it
+/// again.
+fn pass_through<W: Write>(dst: &mut W, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        match dst.write(bytes) {
+            Ok(0) => return,
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let _ = dst.write_all(String::from_utf8_lossy(bytes).as_bytes());
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// The stop-signal handler. `ctrlc` does not say which signal arrived, and Ctrl+C already reached
+/// the child through the terminal's process group: forwarding at once would hit a child that is
+/// shutting down gracefully on SIGINT with a SIGTERM too. So it waits a moment, and forwards
+/// only to a child still running. Only the direct child: its own group would need `setpgid`,
+/// which takes it out of the terminal's foreground group and so breaks Ctrl+C.
+#[cfg(unix)]
+fn forward_stop(child_pid: &std::sync::atomic::AtomicU32) {
+    std::thread::sleep(STOP_GRACE);
+    let pid = child_pid.load(std::sync::atomic::Ordering::Acquire);
+    if pid != 0 {
+        // The shell builtin: `kill` is not a binary everywhere (NixOS, Guix, minimal containers).
+        let _ = Command::new("sh")
+            .args(["-c", "kill -TERM \"$1\"", "victauri-run", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -403,11 +549,15 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
             .context(
                 "no private per-user directory for the capture (the Victauri discovery root is \
                  missing, shared or not owned by you) — pass --capture <file>",
-            )?
+            )
+            .inspect(|dir| prune_captures(dir))?
             .join(format!("{}-{}.jsonl", std::process::id(), now_ms())),
     };
     let capture = Arc::new(Mutex::new(Capture::create(&path)?));
-    eprintln!(
+    // Not `eprintln!`: it panics on a closed stderr (`… 2>&1 | head`), and the panic would
+    // replace the child's exit code.
+    let _ = writeln!(
+        std::io::stderr(),
         "victauri run: capturing stdout/stderr -> {}\n\
          victauri run: agents read it with `logs {{action:\"stdout\"}}` (app up) or \
          `victauri logs --stdout` (any time, even after a crash)",
@@ -416,6 +566,14 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
 
     // Ctrl+C reaches the child directly (same console / process group); the
     // launcher must survive it so it can record how the child ended.
+    #[cfg(unix)]
+    let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    #[cfg(unix)]
+    let _ = {
+        let child_pid = Arc::clone(&child_pid);
+        ctrlc::set_handler(move || forward_stop(&child_pid))
+    };
+    #[cfg(not(unix))]
     let _ = ctrlc::set_handler(|| {});
 
     let resolved = resolve_program(program);
@@ -439,6 +597,12 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
         }
     };
 
+    #[cfg(unix)]
+    child_pid.store(child.id(), std::sync::atomic::Ordering::Release);
+    // Dies with this process, however it dies. Best effort: without a job the app still runs.
+    #[cfg(windows)]
+    let job = victauri_test::process::KillOnCloseJob::assign(&child);
+
     let out = child.stdout.take().context("child stdout")?;
     let err = child.stderr.take().context("child stderr")?;
     let c1 = Arc::clone(&capture);
@@ -446,7 +610,16 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     let t_out = std::thread::spawn(move || pump(out, std::io::stdout(), "out", &c1));
     let t_err = std::thread::spawn(move || pump(err, std::io::stderr(), "err", &c2));
 
-    let status = child.wait().context("waiting for the app")?;
+    let status = child.wait();
+    // The app is done. Before anything else: what it deliberately left running (a dev server, a
+    // daemon) is not ours to kill, and a pid that has been reaped must never be signalled.
+    #[cfg(unix)]
+    child_pid.store(0, std::sync::atomic::Ordering::Release);
+    #[cfg(windows)]
+    if let Some(job) = job {
+        job.disarm();
+    }
+    let status = status.context("waiting for the app")?;
     // Drain whatever the child wrote before it died — this is where crash output lives. A
     // process the app started can inherit its stdout/stderr and keep them open after the app
     // exits; waiting for EOF then never ends and the exit record is never written. Give the
@@ -468,7 +641,7 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     if let Ok(mut c) = capture.lock() {
         c.record_exit(&summary);
     }
-    eprintln!("victauri run: app {summary}");
+    let _ = writeln!(std::io::stderr(), "victauri run: app {summary}");
     Ok(status.code().unwrap_or(1))
 }
 
@@ -527,6 +700,92 @@ mod tests {
             use std::os::unix::process::ExitStatusExt;
             let s = ExitStatus::from_raw(6); // raw wait status: killed by signal 6
             assert!(describe_exit(s).contains("SIGABRT"));
+        }
+    }
+
+    /// What a Windows console does with bytes that are not UTF-8: writes the valid prefix, then
+    /// fails on the rest. The prefix used to be written twice.
+    #[test]
+    fn pass_through_writes_a_console_rejected_chunk_once() {
+        struct Console(Vec<u8>);
+        impl Write for Console {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                match std::str::from_utf8(bytes) {
+                    Ok(_) => {
+                        self.0.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    Err(e) if e.valid_up_to() > 0 => {
+                        self.0.extend_from_slice(&bytes[..e.valid_up_to()]);
+                        Ok(e.valid_up_to())
+                    }
+                    Err(_) => Err(std::io::ErrorKind::InvalidData.into()),
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut console = Console(Vec::new());
+        pass_through(&mut console, b"ok \xff end");
+        assert_eq!(String::from_utf8(console.0).unwrap(), "ok \u{fffd} end");
+    }
+
+    /// A line longer than one record is split, none of it lost, whichever way the chunks fall.
+    #[test]
+    fn feed_assembles_lines_across_chunks_and_splits_long_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        let mut c = Capture::create(&path).unwrap();
+        c.feed("out", b"hel");
+        c.feed("err", b"E1\n");
+        c.feed("out", b"lo\nwor");
+        c.flush_partial("out");
+        let long = vec![b'x'; MAX_LINE_BYTES * 2 + 5];
+        c.feed("out", &long);
+        c.feed("out", b"\n");
+        let recs: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let line = |i: usize| recs[i]["l"].as_str().unwrap();
+        assert_eq!(line(0), "E1");
+        assert_eq!(recs[0]["s"], "err");
+        assert_eq!(line(1), "hello");
+        assert_eq!(line(2), "wor");
+        assert_eq!(
+            recs[3..]
+                .iter()
+                .map(|r| r["l"].as_str().unwrap().len())
+                .sum::<usize>(),
+            long.len()
+        );
+        assert!(
+            recs[3..]
+                .iter()
+                .all(|r| !r["l"].as_str().unwrap().contains('…'))
+        );
+    }
+
+    #[test]
+    fn capture_names_parse_and_nothing_else_does() {
+        assert_eq!(capture_group("12-34.jsonl"), Some((12, "12-34")));
+        assert_eq!(capture_group("12-34.jsonl.1"), Some((12, "12-34")));
+        assert_eq!(
+            capture_group("12-34.jsonl.1730000000000"),
+            Some((12, "12-34"))
+        );
+        for other in [
+            "notes.jsonl",
+            "12.jsonl",
+            "a-34.jsonl",
+            "12-34.txt",
+            "12-34.jsonl.x",
+            "12-.jsonl",
+            "12-34.jsonl.",
+        ] {
+            assert_eq!(capture_group(other), None, "{other}");
         }
     }
 

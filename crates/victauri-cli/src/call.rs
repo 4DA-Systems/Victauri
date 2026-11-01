@@ -58,6 +58,20 @@ pub fn build_arguments(file_json: Option<&str>, args: &[String]) -> Result<Value
     Ok(Value::Object(obj))
 }
 
+/// The text of an `--args-file`. Windows PowerShell 5.1 is why this route exists, and it writes
+/// a BOM (`Out-File -Encoding utf8`) or UTF-16 (`>`): the first is fine, the second is named.
+pub fn decode_args_file(bytes: &[u8]) -> Result<String, String> {
+    if bytes.starts_with(&[0xff, 0xfe]) || bytes.starts_with(&[0xfe, 0xff]) {
+        return Err(
+            "is UTF-16 (what `>` writes in Windows PowerShell); save it as UTF-8, e.g. with \
+             `Out-File -Encoding utf8`"
+                .to_string(),
+        );
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    String::from_utf8(bytes.to_vec()).map_err(|e| format!("is not valid UTF-8: {e}"))
+}
+
 fn parse_object(text: &str, source: &str) -> Result<Map<String, Value>, String> {
     match serde_json::from_str::<Value>(text) {
         Ok(Value::Object(map)) => Ok(map),

@@ -232,7 +232,7 @@ fn emit(line: &str, json: bool, raw: &Value) {
 /// `serde_json` escapes C0 controls but writes C1 controls (U+0080–U+009F, which some
 /// terminals act on) and bidi controls raw. They can only occur inside JSON strings, so a
 /// `\uXXXX` escape keeps the JSON valid and equal while making it inert in a terminal.
-fn json_terminal_safe(json: &str) -> String {
+pub fn json_terminal_safe(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
     for c in json.chars() {
         let bidi = matches!(
@@ -246,6 +246,16 @@ fn json_terminal_safe(json: &str) -> String {
         }
     }
     out
+}
+
+/// Whether the user asked for one particular app: `--app`, `VICTAURI_APP` or `VICTAURI_PORT`,
+/// by the rules the backend resolver itself applies (blank selector and port 0 are unset).
+fn selects_an_app(app: Option<&str>, env: impl Fn(&str) -> Option<String>) -> bool {
+    app.is_some()
+        || env("VICTAURI_APP").is_some_and(|s| !s.trim().is_empty())
+        || env("VICTAURI_PORT")
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .is_some_and(|p| p != 0)
 }
 
 /// Entry point for `victauri logs`.
@@ -268,8 +278,11 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         Err(why) => {
             // App down: the console capture (if the app ran under `victauri run`) still
             // holds its output — including how it died. A capture does not record which app it
-            // belongs to, so with `--app` the newest one could be another app's: say so instead.
-            if opts.app.is_some() && crate::run::latest_capture().is_some() {
+            // belongs to, so with a selector or a pinned port, wherever it was set, the newest
+            // one could be another app's: say so instead.
+            if selects_an_app(opts.app.as_deref(), |var| std::env::var(var).ok())
+                && crate::run::latest_capture().is_some()
+            {
                 bail!(
                     "{} — `victauri logs --stdout` shows the newest `victauri run` capture (of \
                      whichever app ran last), or pass `--capture <file>`",
@@ -711,7 +724,9 @@ async fn follow_capture(
         "victauri logs: console capture {}",
         clean(&path.display().to_string())
     );
-    let (lines, mut cursor) = read_capture(&path, None)?;
+    let head = capture_head(&path).unwrap_or_default();
+    let (lines, offset) = read_capture(&path, None)?;
+    let mut cursor = CaptureCursor { offset, head };
     let recent: Vec<&Value> = if let Some(ts) = since_ts_ms {
         lines
             .iter()
@@ -734,7 +749,7 @@ async fn follow_capture(
     let mut idle = Duration::ZERO;
     loop {
         tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
-        let (lines, next) = read_capture(&path, Some(cursor))?;
+        let lines = read_followed(&path, &mut cursor)?;
         if lines.is_empty() {
             idle += Duration::from_millis(opts.interval_ms);
             if stop_after_idle.is_some_and(|max| idle >= max) {
@@ -751,8 +766,73 @@ async fn follow_capture(
                 return Ok(());
             }
         }
-        cursor = next;
     }
+}
+
+/// How much of a capture's first bytes tells one file from the next.
+const CAPTURE_HEAD_BYTES: u64 = 256;
+
+/// Where a follower is in a capture: the offset, and the start of the file it applies to.
+struct CaptureCursor {
+    offset: u64,
+    head: Vec<u8>,
+}
+
+/// The first bytes of a capture; `None` when it cannot be read (between the launcher's rename
+/// and its new file, for one).
+fn capture_head(path: &Path) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(CAPTURE_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    Some(head)
+}
+
+/// One file can have grown since the head was read, so only the common length is compared.
+fn same_capture(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().min(b.len());
+    a[..n] == b[..n]
+}
+
+/// The next records of a followed capture, across a rotation. The launcher renames a full file
+/// to `.jsonl.1` and starts a new one, so the unread tail is in the rotated file. A length check
+/// cannot see a rotation whose new file has already grown past the cursor; the first record has
+/// a timestamp and differs. If the rotated file is not the one being read either (a second
+/// rotation between two polls), those lines are gone, and that is said.
+fn read_followed(path: &Path, cursor: &mut CaptureCursor) -> Result<Vec<Value>> {
+    let Some(head) = capture_head(path) else {
+        return Ok(Vec::new());
+    };
+    if !same_capture(&cursor.head, &head) {
+        let rotated = path.with_extension("jsonl.1");
+        if capture_head(&rotated).is_some_and(|h| same_capture(&cursor.head, &h)) {
+            let (lines, next) = read_capture(&rotated, Some(cursor.offset))?;
+            let advanced = next != cursor.offset;
+            cursor.offset = next;
+            // Larger than one read: stay on it until it is drained.
+            if advanced {
+                return Ok(lines);
+            }
+        } else {
+            eprintln!(
+                "victauri logs: [the capture rotated more than once between two reads; some \
+                 lines were lost]"
+            );
+        }
+        *cursor = CaptureCursor {
+            offset: 0,
+            head: head.clone(),
+        };
+    }
+    if head.len() > cursor.head.len() {
+        cursor.head = head;
+    }
+    let (lines, next) = read_capture(path, Some(cursor.offset))?;
+    cursor.offset = next;
+    Ok(lines)
 }
 
 /// Read JSONL capture records from `from` (or the whole file). Tolerates a
