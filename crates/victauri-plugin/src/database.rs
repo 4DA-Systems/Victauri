@@ -553,10 +553,16 @@ const DB_STACK_BYTES: usize = 64 * 1024 * 1024;
 /// dev profile: well under 1 KiB of stack per level.
 #[cfg(feature = "sqlite")]
 const MAX_SQL_NESTING: usize = 256;
-/// Most nesting a database's views may add up to. Views stack when one selects from another, so
-/// the whole schema is charged: each view costs 1 plus its own nesting.
+/// Most SELECTs accepted in agent SQL or in one schema entry (a compound is capped at 500 by
+/// `SQLite` itself). CTEs chain with no parentheses to count, and preparing a chain is quadratic in
+/// a call no deadline can interrupt: measured 209 s for 30,974 CTEs (the 1 MB size cap).
 #[cfg(feature = "sqlite")]
-const MAX_SCHEMA_VIEW_NESTING: usize = 10_000;
+const MAX_SQL_SELECTS: usize = 2_000;
+/// Most nesting a database's views may add up to. Views stack when one selects from another, so
+/// the whole schema is charged: each view costs 1 plus its own nesting or SELECT count, whichever
+/// is larger. Preparing a chain is quadratic too: measured 195 s for 9,900 views, so about 8 s here.
+#[cfg(feature = "sqlite")]
+const MAX_SCHEMA_VIEW_NESTING: usize = 2_000;
 /// The longest schema entry the nesting check itself will parse (see [`check_schema_nesting`]).
 #[cfg(feature = "sqlite")]
 const SCHEMA_CHECK_PARSE_BYTES: i32 = 4_096;
@@ -585,11 +591,13 @@ fn on_db_stack<T: Send>(f: impl FnOnce() -> Result<T, String> + Send) -> Result<
     })
 }
 
-/// Deepest parenthesis nesting in `sql`, ignoring strings, identifiers and comments.
+/// Deepest parenthesis nesting in `sql` and its number of SELECTs, ignoring strings, identifiers
+/// and comments.
 #[cfg(feature = "sqlite")]
-fn sql_nesting(sql: &str) -> usize {
+fn sql_nesting(sql: &str) -> (usize, usize) {
+    let masked = scan_sql(sql).masked.to_ascii_lowercase();
     let (mut depth, mut deepest) = (0usize, 0usize);
-    for b in scan_sql(sql).masked.bytes() {
+    for b in masked.bytes() {
         if b == b'(' {
             depth += 1;
             deepest = deepest.max(depth);
@@ -597,7 +605,7 @@ fn sql_nesting(sql: &str) -> usize {
             depth = depth.saturating_sub(1);
         }
     }
-    deepest
+    (deepest, masked.matches("select").count())
 }
 
 /// Refuse a database whose schema is nested deeply enough to threaten the stack. `SQLite` parses
@@ -669,7 +677,7 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
         }) else {
             continue;
         };
-        let nesting = sql_nesting(&text);
+        let (nesting, selects) = sql_nesting(&text);
         let name = || {
             row.get::<_, String>(1)
                 .unwrap_or_else(|_| "<unnamed>".to_string())
@@ -682,8 +690,15 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
                 name()
             ));
         }
+        if selects > MAX_SQL_SELECTS {
+            return Err(format!(
+                "refusing to open this database: schema entry `{}` nests {selects} SELECTs (the \
+                 limit is {MAX_SQL_SELECTS})",
+                name()
+            ));
+        }
         if matches!(row.get_ref(0), Ok(rusqlite::types::ValueRef::Text(b"view"))) {
-            view_nesting = view_nesting.saturating_add(nesting + 1);
+            view_nesting = view_nesting.saturating_add(nesting.max(selects) + 1);
             if view_nesting > MAX_SCHEMA_VIEW_NESTING {
                 return Err(format!(
                     "refusing to open this database: its views nest up to {view_nesting} levels \
@@ -1695,10 +1710,15 @@ pub fn validate_query(sql: &str) -> Result<(), String> {
         );
     }
 
-    let nesting = sql_nesting(sql);
+    let (nesting, selects) = sql_nesting(sql);
     if nesting > MAX_SQL_NESTING {
         return Err(format!(
             "query nests {nesting} levels deep (the limit is {MAX_SQL_NESTING})"
+        ));
+    }
+    if selects > MAX_SQL_SELECTS {
+        return Err(format!(
+            "query nests {selects} SELECTs (the limit is {MAX_SQL_SELECTS})"
         ));
     }
 
@@ -2211,25 +2231,22 @@ mod tests {
             return;
         };
         let count = "SELECT count(*) FROM users";
-        if case == "cte_chain_at_the_size_cap" {
-            // Depth without parentheses, so no nesting check sees it: only the size cap and the
-            // stack bound it. Whatever SQLite answers, the process must live.
-            let (_f, path) = create_test_db();
-            let mut sql = String::from("WITH a0 AS (SELECT 1)");
-            let mut i = 1;
-            while sql.len() < MAX_QUERY_SQL_BYTES - 100 {
-                sql.push_str(&format!(",a{i} AS (SELECT * FROM a{})", i - 1));
-                i += 1;
-            }
-            sql.push_str(&format!(" SELECT * FROM a{}", i - 1));
-            println!("{i} CTEs: {:?}", query(&path, &sql, &[], None).map(|_| ()));
-            return;
-        }
         let (_f, path);
         let err = match case.as_str() {
             "deep_sql" => {
                 (_f, path) = create_test_db();
                 query(&path, &nested_select(6400), &[], None).unwrap_err()
+            }
+            "cte_chain_at_the_size_cap" => {
+                (_f, path) = create_test_db();
+                let mut sql = String::from("WITH a0 AS (SELECT 1)");
+                let mut i = 1;
+                while sql.len() < MAX_QUERY_SQL_BYTES - 100 {
+                    sql.push_str(&format!(",a{i} AS (SELECT * FROM a{})", i - 1));
+                    i += 1;
+                }
+                sql.push_str(&format!(" SELECT * FROM a{}", i - 1));
+                query(&path, &sql, &[], None).unwrap_err()
             }
             "deep_sql_at_the_size_cap" => {
                 (_f, path) = create_test_db();
@@ -2269,6 +2286,12 @@ mod tests {
         let (_f, path) = create_test_db();
         let r = query(&path, &nested_select(100), &[], None).unwrap();
         assert_eq!(r["row_count"], 3);
+        // A compound at SQLite's own limit is a lot of SELECTs and perfectly ordinary.
+        let compound = vec!["SELECT 1"; 500].join(" UNION ALL ");
+        assert_eq!(
+            query(&path, &compound, &[], Some(1000)).unwrap()["row_count"],
+            500
+        );
         // Parentheses in a string are not nesting, in a query or in a schema.
         let parens = "(".repeat(5000);
         assert!(query(&path, &format!("SELECT '{parens}'"), &[], None).is_ok());

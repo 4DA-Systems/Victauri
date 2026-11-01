@@ -1130,15 +1130,11 @@ impl VictauriBuilder {
                         let bus = state.event_bus.clone();
                         let name = event_name.clone();
                         app.listen_any(event_name.clone(), move |event| {
-                            let payload =
-                                serde_json::from_str::<serde_json::Value>(event.payload())
-                                    .map_or_else(
-                                        |_| event.payload().to_string(),
-                                        |v| v.to_string(),
-                                    );
+                            // Already JSON text from Tauri: this can run on the emitter's main
+                            // thread, so no parse and re-encode of a payload of any size here.
                             bus.push(introspection::CapturedTauriEvent {
                                 name: name.clone(),
-                                payload,
+                                payload: event.payload().to_string(),
                                 timestamp: chrono::Utc::now()
                                     .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             });

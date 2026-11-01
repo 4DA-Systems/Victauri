@@ -791,11 +791,21 @@ impl CapturedTauriEvent {
 }
 
 const DEFAULT_EVENT_BUS_CAPACITY: usize = 1000;
+/// Longest payload kept per captured event; longer ones are cut, with a marker.
+const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Most payload bytes retained in all; the oldest events go first.
+const MAX_EVENT_BUS_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct EventBusBuffer {
+    events: VecDeque<CapturedTauriEvent>,
+    payload_bytes: usize,
+}
 
 /// Thread-safe ring buffer for captured Tauri events.
 #[derive(Clone)]
 pub struct EventBusMonitor {
-    inner: std::sync::Arc<RwLock<VecDeque<CapturedTauriEvent>>>,
+    inner: std::sync::Arc<RwLock<EventBusBuffer>>,
     capacity: usize,
 }
 
@@ -804,21 +814,38 @@ impl EventBusMonitor {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: std::sync::Arc::new(RwLock::new(VecDeque::with_capacity(capacity))),
+            inner: std::sync::Arc::new(RwLock::new(EventBusBuffer::default())),
             capacity,
         }
     }
 
     /// Record a captured event.
-    pub fn push(&self, event: CapturedTauriEvent) {
+    pub fn push(&self, mut event: CapturedTauriEvent) {
+        // Before the lock: the emitter may be the main thread.
+        if event.payload.len() > MAX_EVENT_PAYLOAD_BYTES {
+            let mut cut = MAX_EVENT_PAYLOAD_BYTES;
+            while !event.payload.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let dropped = event.payload.len() - cut;
+            event.payload.truncate(cut);
+            event.payload.shrink_to_fit();
+            event
+                .payload
+                .push_str(&format!("…[truncated {dropped} bytes]"));
+        }
         let mut buf = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if buf.len() >= self.capacity {
-            buf.pop_front();
+        buf.payload_bytes += event.payload.len();
+        buf.events.push_back(event);
+        while buf.events.len() > self.capacity || buf.payload_bytes > MAX_EVENT_BUS_BYTES {
+            let Some(old) = buf.events.pop_front() else {
+                break;
+            };
+            buf.payload_bytes = buf.payload_bytes.saturating_sub(old.payload.len());
         }
-        buf.push_back(event);
     }
 
     /// Get all captured events.
@@ -827,6 +854,7 @@ impl EventBusMonitor {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
             .iter()
             .cloned()
             .collect()
@@ -838,6 +866,7 @@ impl EventBusMonitor {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
             .len()
     }
 
@@ -853,8 +882,9 @@ impl EventBusMonitor {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = buf.len();
-        buf.clear();
+        let count = buf.events.len();
+        buf.events.clear();
+        buf.payload_bytes = 0;
         count
     }
 }
@@ -1161,8 +1191,8 @@ fn get_process_memory_windows(pid: u32) -> Option<u64> {
     };
 
     // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`
-    // opens a limited handle for reading memory stats. The process handle is closed
-    // automatically when dropped (windows crate handles this).
+    // opens a limited handle for reading memory stats. It has no `Drop`: it is closed below,
+    // or it would also keep an exited child's process object alive.
     unsafe {
         let process = OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
@@ -1174,11 +1204,9 @@ fn get_process_memory_windows(pid: u32) -> Option<u64> {
         let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
         counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
 
-        if GetProcessMemoryInfo(process, &mut counters, counters.cb).is_ok() {
-            Some(counters.WorkingSetSize as u64)
-        } else {
-            None
-        }
+        let read = GetProcessMemoryInfo(process, &mut counters, counters.cb).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        read.then_some(counters.WorkingSetSize as u64)
     }
 }
 
@@ -1526,6 +1554,67 @@ impl DrainWatermarks {
 }
 #[cfg(test)]
 mod tests {
+    /// `OpenProcess` returns a plain handle with no `Drop`, so each query must close it.
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn reading_a_process_memory_does_not_leak_its_handle() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let count = || {
+            let mut n = 0;
+            // SAFETY: the current-process pseudo handle and a valid out pointer.
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }.unwrap();
+            i64::from(n)
+        };
+        let before = count();
+        for _ in 0..2000 {
+            assert!(super::get_process_memory_windows(std::process::id()).is_some());
+        }
+        // Margin for tests running alongside; the leak was one handle per call.
+        let grew = count() - before;
+        assert!(grew < 1000, "{grew} handles after 2000 calls");
+    }
+
+    /// An event carrying megabytes, emitted repeatedly, must not pile up in the host: 1000 entries
+    /// was the only cap, whatever their size.
+    #[test]
+    fn the_event_bus_bounds_what_it_retains() {
+        let bus = super::EventBusMonitor::new(1000);
+        let huge = "x".repeat(1024 * 1024);
+        for _ in 0..200 {
+            bus.push(super::CapturedTauriEvent::new("big", huge.as_str(), "t"));
+        }
+        let retained: usize = bus.events().iter().map(|e| e.payload.len()).sum();
+        assert!(retained <= 16 * 1024 * 1024, "{retained} bytes retained");
+        let newest = bus.events().pop().unwrap();
+        assert!(newest.payload.len() < 100 * 1024);
+        assert!(newest.payload.contains("[truncated"), "marks the cut");
+
+        // A small payload is stored as it came, and many of them still reach the entry cap.
+        let bus = super::EventBusMonitor::new(3);
+        for i in 0..5 {
+            bus.push(super::CapturedTauriEvent::new(
+                "e",
+                format!("{{\"n\":{i}}}"),
+                "t",
+            ));
+        }
+        assert_eq!(bus.len(), 3);
+        assert_eq!(bus.events()[2].payload, "{\"n\":4}");
+
+        // Many mid-sized ones: the byte budget drops the oldest.
+        let bus = super::EventBusMonitor::new(100_000);
+        let mid = "y".repeat(60 * 1024);
+        for _ in 0..1000 {
+            bus.push(super::CapturedTauriEvent::new("e", mid.as_str(), "t"));
+        }
+        let retained: usize = bus.events().iter().map(|e| e.payload.len()).sum();
+        assert!(retained <= 16 * 1024 * 1024, "{retained} bytes retained");
+        assert_eq!(bus.clear(), retained / mid.len());
+        bus.push(super::CapturedTauriEvent::new("e", mid.as_str(), "t"));
+        assert_eq!(bus.len(), 1);
+    }
+
     use super::*;
 
     /// G-10: expired fault rules were never evicted, and nothing bounded the number of rules.
