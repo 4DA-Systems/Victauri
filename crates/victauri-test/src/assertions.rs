@@ -60,8 +60,12 @@ pub struct CheckResult {
     pub description: String,
     /// Whether the check passed.
     pub passed: bool,
-    /// Failure detail (empty if passed).
+    /// Failure detail. Conventionally empty if passed, but a passing check may carry a note (for
+    /// example a skip reason, or candidates that were deliberately not treated as failures).
     pub detail: String,
+    /// The check did not run because its precondition was not met. A skipped check counts as
+    /// passed; a `JUnit` report writes it as `<skipped>`.
+    pub skipped: bool,
 }
 
 impl CheckResult {
@@ -72,6 +76,7 @@ impl CheckResult {
             description: description.into(),
             passed,
             detail: detail.into(),
+            skipped: false,
         }
     }
 }
@@ -156,14 +161,16 @@ impl<'a> VerifyBuilder<'a> {
         }
     }
 
-    /// Assert that the page currently contains the given text.
+    /// Assert that the page currently contains the given text: the text a user can read, as
+    /// [`VictauriClient::expect_text`] sees it, joined across elements and including shadow roots
+    /// and same-origin frames.
     #[must_use]
     pub fn has_text(mut self, text: &str) -> Self {
         self.checks.push(Check::HasText(text.to_string()));
         self
     }
 
-    /// Assert that the page does NOT contain the given text.
+    /// Assert that the page does NOT contain the given text (see [`Self::has_text`]).
     #[must_use]
     pub fn has_no_text(mut self, text: &str) -> Self {
         self.checks.push(Check::HasNoText(text.to_string()));
@@ -186,6 +193,11 @@ impl<'a> VerifyBuilder<'a> {
     }
 
     /// Assert that an IPC command was never called.
+    ///
+    /// The bridge keeps the newest 1000 network entries, IPC included. Once that log is full an
+    /// older call may have rolled off, so this check then fails as inconclusive rather than pass on
+    /// what it cannot see. To assert on a busy app, use [`VictauriClient::create_ipc_checkpoint`]
+    /// and [`VictauriClient::get_ipc_calls_since`].
     #[must_use]
     pub fn ipc_was_not_called(mut self, command: &str) -> Self {
         self.checks
@@ -203,7 +215,8 @@ impl<'a> VerifyBuilder<'a> {
         self
     }
 
-    /// Assert NO network request was made matching the given URL substring.
+    /// Assert NO network request was made matching the given URL substring. Inconclusive, and so
+    /// failed, once the 1000-entry log is full (see [`Self::ipc_was_not_called`]).
     #[must_use]
     pub fn no_network_request(mut self, url_contains: &str) -> Self {
         self.checks.push(Check::NoNetworkRequest {
@@ -229,14 +242,19 @@ impl<'a> VerifyBuilder<'a> {
         self
     }
 
-    /// Assert that IPC integrity is healthy (no stale/errored calls).
+    /// Assert that IPC integrity is healthy: no call was left without a response. A command that
+    /// returned an error is a sound round trip, so errored calls do not make this fail; use
+    /// [`Self::no_console_errors`] or the `error_count` of `check_ipc_integrity` for those. Also
+    /// fails when Victauri reports it cannot observe the page's IPC at all.
     #[must_use]
     pub fn ipc_healthy(mut self) -> Self {
         self.checks.push(Check::IpcHealthy);
         self
     }
 
-    /// Assert that there are no ghost commands.
+    /// Assert that there are no confirmed ghost commands: commands the frontend invoked that only
+    /// ever failed with "command not found". Weaker candidates (`frontend_only`, which may be real
+    /// commands that merely returned an error) are named in the detail but do not fail the check.
     #[must_use]
     pub fn no_ghost_commands(mut self) -> Self {
         self.checks.push(Check::NoGhostCommands);
@@ -276,35 +294,33 @@ impl<'a> VerifyBuilder<'a> {
 async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckResult, TestError> {
     match check {
         Check::HasText(text) => {
-            let snap = client.dom_snapshot().await?;
-            let snap_str = serde_json::to_string(&snap).unwrap_or_default();
-            let found = snap_str.contains(text.as_str());
+            let found = page_text(client).await?.contains(text.as_str());
             Ok(CheckResult {
                 description: format!("page contains \"{text}\""),
                 passed: found,
                 detail: if found {
                     String::new()
                 } else {
-                    format!("text \"{text}\" not found in DOM")
+                    format!("text \"{text}\" not found on the page")
                 },
+                skipped: false,
             })
         }
         Check::HasNoText(text) => {
-            let snap = client.dom_snapshot().await?;
-            let snap_str = serde_json::to_string(&snap).unwrap_or_default();
-            let found = snap_str.contains(text.as_str());
+            let found = page_text(client).await?.contains(text.as_str());
             Ok(CheckResult {
                 description: format!("page does NOT contain \"{text}\""),
                 passed: !found,
                 detail: if found {
-                    format!("text \"{text}\" was found in DOM but shouldn't be")
+                    format!("text \"{text}\" was found on the page but shouldn't be")
                 } else {
                     String::new()
                 },
+                skipped: false,
             })
         }
         Check::IpcWasCalled(command) => {
-            let log = client.get_ipc_log(None).await?;
+            let log = client.get_ipc_log(Some(LOG_WINDOW)).await?;
             let found = ipc_log_contains_command(&log, command);
             Ok(CheckResult {
                 description: format!("IPC command \"{command}\" was called"),
@@ -314,10 +330,11 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                 } else {
                     format!("command \"{command}\" not found in IPC log")
                 },
+                skipped: false,
             })
         }
         Check::IpcWasCalledWith(command, expected_args) => {
-            let log = client.get_ipc_log(None).await?;
+            let log = client.get_ipc_log(Some(LOG_WINDOW)).await?;
             let (found, actual_args) = ipc_log_find_with_args(&log, command, expected_args);
             Ok(CheckResult {
                 description: format!("IPC \"{command}\" called with {expected_args}"),
@@ -329,26 +346,31 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                 } else {
                     format!("command \"{command}\" not found in IPC log")
                 },
+                skipped: false,
             })
         }
         Check::IpcWasNotCalled(command) => {
-            let log = client.get_ipc_log(None).await?;
+            let log = client.get_ipc_log(Some(LOG_WINDOW)).await?;
             let found = ipc_log_contains_command(&log, command);
+            let inconclusive = !found && network_log_is_full(client, &log).await;
             Ok(CheckResult {
                 description: format!("IPC command \"{command}\" was NOT called"),
-                passed: !found,
+                passed: !found && !inconclusive,
                 detail: if found {
                     format!("command \"{command}\" WAS called but shouldn't have been")
+                } else if inconclusive {
+                    log_full_detail("IPC")
                 } else {
                     String::new()
                 },
+                skipped: false,
             })
         }
         Check::NetworkRequest {
             method,
             url_contains,
         } => {
-            let log = client.logs("network", None).await?;
+            let log = client.logs("network", Some(LOG_WINDOW)).await?;
             let found = network_log_matches(&log, method.as_deref(), url_contains);
             let desc = match method {
                 Some(m) => format!("network {m} request to \"*{url_contains}*\""),
@@ -362,23 +384,28 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                 } else {
                     "no matching network request found".to_string()
                 },
+                skipped: false,
             })
         }
         Check::NoNetworkRequest { url_contains } => {
-            let log = client.logs("network", None).await?;
+            let log = client.logs("network", Some(LOG_WINDOW)).await?;
             let found = network_log_matches(&log, None, url_contains);
+            let inconclusive = !found && log_entry_count(&log) >= LOG_WINDOW;
             Ok(CheckResult {
                 description: format!("NO network request to \"*{url_contains}*\""),
-                passed: !found,
+                passed: !found && !inconclusive,
                 detail: if found {
                     format!("found network request matching \"{url_contains}\" but shouldn't have")
+                } else if inconclusive {
+                    log_full_detail("network")
                 } else {
                     String::new()
                 },
+                skipped: false,
             })
         }
         Check::NoConsoleErrors => {
-            let log = client.logs("console", None).await?;
+            let log = client.logs("console", Some(LOG_WINDOW)).await?;
             let errors = console_log_errors(&log);
             Ok(CheckResult {
                 description: "no console errors".to_string(),
@@ -388,6 +415,7 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                 } else {
                     format!("{} error(s): {}", errors.len(), errors.join("; "))
                 },
+                skipped: false,
             })
         }
         Check::StateMatches {
@@ -410,14 +438,12 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                     let divs = result.get("divergences").cloned().unwrap_or(Value::Null);
                     format!("divergences: {divs}")
                 },
+                skipped: false,
             })
         }
         Check::IpcHealthy => {
             let result = client.check_ipc_integrity().await?;
-            let healthy = result
-                .get("healthy")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let healthy = crate::client::ipc_integrity_is_healthy(&result);
             Ok(CheckResult {
                 description: "IPC integrity healthy".to_string(),
                 passed: healthy,
@@ -426,37 +452,46 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                 } else {
                     serde_json::to_string(&result).unwrap_or_default()
                 },
+                skipped: false,
             })
         }
         Check::NoGhostCommands => {
             let result = client.detect_ghost_commands().await?;
-            let ghosts = result
-                .get("frontend_only")
-                .or_else(|| result.get("ghost_commands"))
-                .and_then(Value::as_array)
-                .map_or(0, Vec::len);
-            // `frontend_only` is only a real bug list when the registry mirrors the
-            // app's full command set. Without that (reliability none/low), the entries
-            // are real-but-uninstrumented commands — failing here would punish every app
-            // that doesn't use #[inspectable]. Only treat as ghosts when reliability is high.
-            let reliability = result
-                .get("reliability")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let counts_as_ghosts = ghosts > 0 && reliability == "high";
+            // `confirmed_ghosts` is the bug list: invoked, never succeeded, "command not found".
+            // A plugin too old to report it fails closed rather than pass unseen.
+            let Some(confirmed) = result.get("confirmed_ghosts").and_then(Value::as_array) else {
+                return Ok(CheckResult {
+                    description: "no ghost commands".to_string(),
+                    passed: false,
+                    detail: "the plugin's report has no `confirmed_ghosts`; \
+                             upgrade victauri-plugin to run this check"
+                        .to_string(),
+                    skipped: false,
+                });
+            };
+            // `frontend_only` is a candidate list by the tool's own description ("confirm before
+            // filing"): a real command that only returned a domain error lands there even when
+            // `reliability` is high, which only means the registry is not empty.
+            let candidates = command_names(result.get("frontend_only"));
             Ok(CheckResult {
                 description: "no ghost commands".to_string(),
-                passed: !counts_as_ghosts,
-                detail: if counts_as_ghosts {
-                    format!("{ghosts} ghost command(s) found (reliability: high)")
-                } else if ghosts > 0 {
+                passed: confirmed.is_empty(),
+                detail: if !confirmed.is_empty() {
                     format!(
-                        "{ghosts} frontend-only command(s) found but registry is \
-                         incomplete (reliability: {reliability}) — not treated as ghosts"
+                        "{} confirmed ghost command(s): {}",
+                        confirmed.len(),
+                        command_names(Some(&Value::Array(confirmed.clone()))).join(", ")
+                    )
+                } else if !candidates.is_empty() {
+                    format!(
+                        "{} unconfirmed candidate(s), not treated as ghosts: {}",
+                        candidates.len(),
+                        candidates.join(", ")
                     )
                 } else {
                     String::new()
                 },
+                skipped: false,
             })
         }
         Check::CoverageAbove(threshold) => {
@@ -476,9 +511,79 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                         report.coverage_percentage
                     )
                 },
+                skipped: false,
             })
         }
     }
+}
+
+/// The most entries the bridge's network log (which IPC calls live in) and console log hold, and
+/// so the most a log read can return. The log tools default to the newest 100 when not told.
+pub const LOG_WINDOW: usize = 1000;
+
+/// The text a user can read on the page, from the same read `expect_text` polls, plus same-origin
+/// frames. A `null` means there is no page to read, which must not pass as "text not found".
+async fn page_text(client: &mut VictauriClient) -> Result<String, TestError> {
+    match client.eval_js(PAGE_TEXT_JS).await? {
+        Value::String(text) => Ok(text),
+        other => Err(TestError::Other(format!(
+            "could not read the page's text (is the page loaded?): {}",
+            crate::terminal::single_line(&other.to_string())
+        ))),
+    }
+}
+
+const PAGE_TEXT_JS: &str = "(function() { \
+         function read(root) { \
+           var text = (typeof root.innerText === 'string' ? root.innerText : root.textContent) || ''; \
+           var els = root.querySelectorAll('*'); \
+           for (var i = 0; i < els.length; i++) { \
+             if (els[i].shadowRoot) text += ' ' + read(els[i].shadowRoot); \
+             if (els[i].tagName === 'IFRAME' || els[i].tagName === 'FRAME') { \
+               try { var doc = els[i].contentDocument; \
+                     if (doc && doc.body) text += ' ' + read(doc.body); } catch (e) {} \
+             } \
+           } \
+           return text; \
+         } \
+         return document.body ? read(document.body) : null; })()";
+
+fn log_entry_count(log: &Value) -> usize {
+    log.as_array()
+        .or_else(|| log.get("entries").and_then(Value::as_array))
+        .map_or(0, Vec::len)
+}
+
+/// Whether older entries may have rolled off the log `ipc_log` was read from. IPC calls share the
+/// bridge's network log with other requests, so the IPC list alone can look short of a full log.
+/// A failed count (eval disabled by the app's privacy profile) falls back to that list.
+async fn network_log_is_full(client: &mut VictauriClient, ipc_log: &Value) -> bool {
+    const COUNT_JS: &str =
+        "(window.__VICTAURI__?.getNetworkLog(null, 0, { bodies: false }) || []).length";
+    let network = client
+        .eval_js(COUNT_JS)
+        .await
+        .ok()
+        .and_then(|count| count.as_u64());
+    log_entry_count(ipc_log) >= LOG_WINDOW
+        || network.is_some_and(|count| count >= LOG_WINDOW as u64)
+}
+
+fn log_full_detail(which: &str) -> String {
+    format!(
+        "inconclusive: the {which} log holds its maximum of {LOG_WINDOW} entries, so an older \
+         match may have rolled off"
+    )
+}
+
+/// The `name`s in a list of ghost report entries, safe to print (they come from the page).
+fn command_names(list: Option<&Value>) -> Vec<String> {
+    list.and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("name").and_then(Value::as_str))
+        .map(crate::terminal::single_line)
+        .collect()
 }
 
 fn ipc_log_contains_command(log: &Value, command: &str) -> bool {
@@ -653,6 +758,9 @@ pub fn assert_ipc_called_with(log: &Value, command: &str, expected_args: &Value)
 
 /// Assert that a specific IPC command was NOT called.
 ///
+/// This judges only the `log` it is given, so read it with an explicit limit:
+/// `client.get_ipc_log(Some(1000))`. With `None` the tool returns only the newest 100 calls.
+///
 /// # Panics
 ///
 /// Panics if the command was found in the IPC log.
@@ -677,6 +785,44 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// `PAGE_TEXT_JS` run for real in Node, against a fake document: joined shadow-root and frame
+    /// text, and `null` when there is no body.
+    #[test]
+    fn page_text_script_runs() {
+        let program = format!(
+            r#"
+var shadow = {{ textContent: "in shadow", querySelectorAll: function() {{ return []; }} }};
+var frameBody = {{ innerText: "in frame", querySelectorAll: function() {{ return []; }} }};
+var document = {{ body: {{ innerText: "top", querySelectorAll: function() {{ return [
+  {{ shadowRoot: shadow, tagName: "DIV" }},
+  {{ tagName: "IFRAME", contentDocument: {{ body: frameBody }} }},
+  {{ tagName: "IFRAME", get contentDocument() {{ throw new Error("cross-origin"); }} }}
+]; }} }} }};
+console.log(JSON.stringify({PAGE_TEXT_JS}));
+document = {{ body: null }};
+console.log(JSON.stringify({PAGE_TEXT_JS}));
+"#
+        );
+        let out = match std::process::Command::new("node")
+            .args(["-e", &program])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("skipping: node is not available ({e})");
+                return;
+            }
+        };
+        assert!(
+            out.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines, ["\"top in shadow in frame\"", "null"]);
+    }
 
     #[test]
     fn ipc_contains_finds_command_in_array() {
@@ -804,6 +950,7 @@ mod tests {
                 description: "desc\u{1b}[31m".into(),
                 passed: false,
                 detail: "page said\n::warning::forged\r\u{7}".into(),
+                skipped: false,
             }],
         };
         let payload = std::panic::catch_unwind(|| report.assert_all_passed()).unwrap_err();
@@ -875,11 +1022,13 @@ mod tests {
                     description: "check1".into(),
                     passed: true,
                     detail: String::new(),
+                    skipped: false,
                 },
                 CheckResult {
                     description: "check2".into(),
                     passed: true,
                     detail: String::new(),
+                    skipped: false,
                 },
             ],
         };
@@ -895,11 +1044,13 @@ mod tests {
                     description: "pass".into(),
                     passed: true,
                     detail: String::new(),
+                    skipped: false,
                 },
                 CheckResult {
                     description: "fail".into(),
                     passed: false,
                     detail: "something wrong".into(),
+                    skipped: false,
                 },
             ],
         };
@@ -916,6 +1067,7 @@ mod tests {
                 description: "bad".into(),
                 passed: false,
                 detail: "it broke".into(),
+                skipped: false,
             }],
         };
         report.assert_all_passed();

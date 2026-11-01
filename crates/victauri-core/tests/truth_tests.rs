@@ -165,9 +165,11 @@ fn generated(test_name: &str, selector: &str, style: CodegenStyle) -> String {
         )],
         vec![],
     );
-    let mut options = CodegenOptions::default();
-    options.test_name = test_name.to_string();
-    options.style = style;
+    let options = CodegenOptions {
+        test_name: test_name.to_string(),
+        style,
+        ..CodegenOptions::default()
+    };
     generate_test(&session, &options)
 }
 

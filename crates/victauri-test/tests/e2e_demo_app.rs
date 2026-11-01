@@ -753,7 +753,8 @@ e2e_test!(accessibility_audit_returns_results, {
     let mut client = VictauriClient::discover().await.unwrap();
     let result = client.audit_accessibility().await.unwrap();
     let text = serde_json::to_string(&result).unwrap();
-    assert!(text.contains("summary") || text.contains("violations") || text.contains("passes"));
+    assert!(result["violations"].is_array(), "{text}");
+    assert!(result["summary"]["critical"].is_u64(), "{text}");
 });
 
 e2e_test!(accessibility_audit_has_structure, {
