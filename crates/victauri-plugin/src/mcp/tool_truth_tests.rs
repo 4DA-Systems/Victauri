@@ -582,6 +582,61 @@ async fn explain_on_a_page_it_cannot_read_is_an_error_not_no_errors() {
     }
 }
 
+/// Eval reaches a page whose bridge is missing, so `?.` answers `undefined`: nothing happened, and
+/// no tool may report that as done. A method that really returns nothing stays a success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_without_the_bridge_is_an_error_for_every_bridge_call() {
+    let calls = [
+        ("interact", json!({"action": "click", "ref_id": "k3f9e1"})),
+        (
+            "input",
+            json!({"action": "fill", "ref_id": "k3f9e1", "value": "x"}),
+        ),
+        ("input", json!({"action": "press_key", "key": "Enter"})),
+        ("inspect", json!({"action": "audit_accessibility"})),
+        (
+            "storage",
+            json!({"action": "get", "storage_type": "local", "key": "k"}),
+        ),
+        (
+            "wait_for",
+            json!({"condition": "text", "value": "x", "timeout_ms": 50}),
+        ),
+        ("find_elements", json!({"text": "x"})),
+        ("dom_snapshot", json!({})),
+    ];
+    for (tool, args) in calls {
+        let st = state();
+        let bridge = AppBridge::new(
+            &st,
+            Arc::new(|script: &str| {
+                Some(if script.contains("!!window.__VICTAURI__") {
+                    "false".to_string()
+                } else {
+                    "undefined".to_string()
+                })
+            }),
+        );
+        let h = handler(&st, &bridge);
+        let msg = err_text(&call(&h, tool, args.clone()).await);
+        assert!(msg.contains("no Victauri bridge"), "{tool} {args}: {msg}");
+    }
+    let st = state();
+    let bridge = AppBridge::new(
+        &st,
+        Arc::new(|script: &str| {
+            Some(if script.contains("!!window.__VICTAURI__") {
+                "true".to_string()
+            } else {
+                "undefined".to_string()
+            })
+        }),
+    );
+    let h = handler(&st, &bridge);
+    let r = call(&h, "inspect", json!({"action": "clear_highlights"})).await;
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+}
+
 /// `window.__VICTAURI__?.…` on a page without the bridge answers `undefined`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn explain_on_a_page_without_the_bridge_is_an_error() {

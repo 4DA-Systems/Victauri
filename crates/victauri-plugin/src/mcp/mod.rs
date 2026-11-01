@@ -643,6 +643,12 @@ impl VictauriMcpHandler {
             .await
         {
             Ok(result) => {
+                if let Some(refused) = self
+                    .missing_bridge_error(&result, params.webview_label.as_deref())
+                    .await
+                {
+                    return refused;
+                }
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&result)
                     && let Some(err) = parsed.get("error").and_then(|e| e.as_str())
                 {
@@ -1056,6 +1062,12 @@ impl VictauriMcpHandler {
             // A timeout is an answer (`ok:false`). A hint means the wait could never have ended
             // well: a mistake in the call.
             Ok(result) => {
+                if let Some(refused) = self
+                    .missing_bridge_error(&result, params.webview_label.as_deref())
+                    .await
+                {
+                    return refused;
+                }
                 let refused = page_json::parse_page_json::<serde_json::Value>(&result)
                     .is_ok_and(|v| v.get("hint").is_some());
                 match page_action_error(&result).filter(|_| refused) {
@@ -5650,9 +5662,35 @@ impl VictauriMcpHandler {
 
     async fn eval_bridge(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
         match self.eval_with_return(code, webview_label).await {
-            Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
+            Ok(result) => match self.missing_bridge_error(&result, webview_label).await {
+                Some(refused) => refused,
+                None => CallToolResult::success(vec![ContentBlock::text(result)]),
+            },
             Err(e) => tool_error(e),
         }
+    }
+
+    /// `window.__VICTAURI__?.click(…)` on a page without the bridge answers `undefined`, which
+    /// must not read as done. Asked only after an `undefined`, because a bridge method may
+    /// legitimately return nothing.
+    async fn missing_bridge_error(
+        &self,
+        result: &str,
+        webview_label: Option<&str>,
+    ) -> Option<CallToolResult> {
+        if result != "undefined" {
+            return None;
+        }
+        let present = self
+            .eval_with_return("return !!window.__VICTAURI__", webview_label)
+            .await;
+        (present.as_deref() == Ok("false")).then(|| {
+            tool_error(
+                "the page has no Victauri bridge, so nothing was done: it may be a page the app \
+                 navigated to outside its own origin, or an error page. Navigate back, or take a \
+                 screenshot to see what is showing.",
+            )
+        })
     }
 
     /// Run a page ACTION (`interact`, `input`, `inspect`, `route add`) and report a failure the
@@ -5662,10 +5700,15 @@ impl VictauriMcpHandler {
     /// the body (R5B-ISERR1).
     async fn eval_page_action(&self, code: &str, webview_label: Option<&str>) -> CallToolResult {
         match self.eval_with_return(code, webview_label).await {
-            Ok(result) => match page_action_error(&result) {
-                Some(message) => tool_error(message),
-                None => CallToolResult::success(vec![ContentBlock::text(result)]),
-            },
+            Ok(result) => {
+                if let Some(refused) = self.missing_bridge_error(&result, webview_label).await {
+                    return refused;
+                }
+                match page_action_error(&result) {
+                    Some(message) => tool_error(message),
+                    None => CallToolResult::success(vec![ContentBlock::text(result)]),
+                }
+            }
             Err(e) => tool_error(e),
         }
     }
