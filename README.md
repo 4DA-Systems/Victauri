@@ -450,7 +450,7 @@ Use the built-in composite action to run Victauri smoke tests in CI:
     xvfb-run -a ./target/debug/my-app &
     sleep 3
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.2
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.3
   with:
     max-load-ms: 10000
     max-heap-mb: 512

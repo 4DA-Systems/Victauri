@@ -233,7 +233,7 @@ Returns:
     }
   ],
   "info": {
-    "bridge_version": "0.10.2",
+    "bridge_version": "0.10.3",
     "dom_elements": 847,
     "open_shadow_roots": 12,
     "event_listeners": 234,

@@ -29,6 +29,12 @@ it said. The changes most likely to reach you come first.
 - **`ipc_was_not_called` and `no_network_request`** fail as inconclusive once the log holds its 1000
   entries, because a match may have rolled off. On a busy app take a checkpoint first
   (`create_ipc_checkpoint`, `get_ipc_calls_since`).
+- **`verify().run()`** returns `Err` only for connection and transport failures; any other error is a
+  failed check with the reason. `ipc_was_not_called` and `no_ghost_commands` fail under `capture:"none"`.
+  `no_console_errors` and `assert_no_uncaught_errors` fail as inconclusive on a full 1000-entry console log
+  with no errors; the smoke suite skips instead, as it does for a heap or DOM budget it cannot measure.
+- **`to_have_value` and the checked matchers** return `Assertion` on an element with no such state, even
+  negated. **`is_visible`** now agrees with `to_be_visible`.
 - **`has_text` / `has_no_text`** read rendered text through `eval_js`, so they error under a profile
   that disables it, and `has_no_text` errors when there is no body.
 - **`no_ghost_commands`** fails on `confirmed_ghosts`, no longer on `frontend_only`.
@@ -64,7 +70,8 @@ parsed `e<digits>` must stop.
   keys, escapes such as `é`) stays a string; other JSON text still decodes. Infinities are
   `{"__real":"Infinity"}`. Invalid UTF-8 is `{"__invalid_utf8":true,"text":…,"base64":…}`. SQL past
   256 parenthesis levels or 2,000 SELECTs is refused. A database is refused if one schema entry
-  exceeds 1 MB, 256 levels or 2,000 SELECTs, or its views add up past 2,000 (`db_health` too).
+  exceeds 1 MB, 256 levels or 2,000 SELECTs, if a chain of views runs past 2,000 levels, or if view
+  text totals over 16 MiB (`db_health` too). Unrelated views do not add up.
 - **Database discovery:** auto-selection and the `app_info` listing skip files without a SQLite
   header, so a SQLCipher database is no longer auto-selected (an explicit `path` still works). `.db3`
   and any-case extensions are found. `history`, `cookies` and `favicons` are app candidates.
@@ -75,15 +82,18 @@ parsed `e<digits>` must stop.
 - **`input` and `interact`:** `fill`/`type_text` return errors for readonly, checkbox, radio, file and
   button inputs and for values a number/date/time/range/color field rejects; the old value is kept.
   `type_text` over 20,000 characters errors. `select_option` errors for unknown or disabled values and
-  fires `input` before `change`. `opacity:0` elements are actionable; a click lands on the hit
-  descendant; an ancestor on top counts as covering (except a label operating that control). Keyboard
-  events carry `code`, `keyCode` and `which`.
+  fires `input` before `change`; `values:[]` clears a multi-select. `opacity:0` elements are actionable;
+  a click lands on the hit descendant; an ancestor on top counts as covering only if the element has
+  left that ancestor's box, or a label operating that control. A child painted behind its own ancestor
+  (negative z-index) is therefore clicked rather than reported covered. Keyboard events carry `code`,
+  `keyCode` and `which`.
 - **Snapshots** list `opacity:0` elements (`[transparent]`) and visible children of `visibility:hidden`
   parents.
 - **`logs`:** `console`, `navigation`, `dialogs` and `events` default to the newest 100 with trimmed
   fields. `limit:0` on `backend` and `stdout` returns nothing and keeps the cursor.
 - **`window`:** `webview_label`, `window` and `window_label` now target that window (they were ignored).
-  `resize` and `move_to` report what the OS applied, plus `requested`.
+  `resize` and `move_to` report what the OS applied, plus `requested`; they wait up to about 500 ms for
+  the change to land and add `settled:false` if it never does.
 - **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
   `/health` first, costing about 2 s and that history entry. `go_back` on a stopped page returns
   `{ok, recovered, url, note}`.
@@ -95,10 +105,17 @@ parsed `e<digits>` must stop.
   over REST; `/mcp` stays at 2 MiB.
 - **`wait_for`:** text, selector and url conditions without a value fail at once. Explicit
   `expected: null` compares with null. `event` omits `payload` where `introspect.event_bus` is not
-  allowed. A bad selector resolves `ok:false`.
+  allowed. An invalid selector is a tool error. `text`, `text_gone` and `selector_gone` are not met
+  while the page has no body. `ipc_idle` under blind capture returns `ok:false` with `ipc_capture`.
+- **A page with no Victauri bridge** is a tool error for bridge calls and log reads; they used to
+  answer `undefined` or an empty list as a success.
+- **`logs ipc` and `logs network`** gain `bodies:false`. IPC entries carry `args_truncated:true` when
+  `args` is not what was sent.
 - **`route add`** rejects invalid regex, non-object headers and unknown actions. XHR `fulfill` is tagged
   and warned, not implemented. **`window.__VICTAURI__.addRoute`** is gone from the page-visible API.
-- **Also:** `list_app_dir pattern` has real `*`/`?`, refuses `[`/`]`. Paths over 4096 bytes are refused.
+- **`logs stdout` and `wait_for log`:** a cursor landing after a rotation drains the rotated file and
+  reports `truncated:true`.
+- **Also:** `list_app_dir pattern` has real `*`/`?`; `[`/`]` match literally. Paths over 4096 bytes are refused.
   `trace start` on an unknown window errors. `storage set` needs a `value`. `animation` failures are tool
   errors. `contract_record` refuses non-object args. A fault delay counts against `timeout_ms`. MCP
   `serverInfo` is `victauri`, and the REST tool list adds `input_schema`.
@@ -122,7 +139,8 @@ parsed `e<digits>` must stop.
   app. `VICTAURI_PORT=0` means unset. `victauri logs` with `VICTAURI_APP` or `VICTAURI_PORT` set and the
   app down refuses, rather than showing the newest capture.
 - `victauri run` passes output through as it arrives. Killing it kills the app and its tree on Windows;
-  SIGTERM and SIGHUP are forwarded on Unix. Default-location captures of dead apps are deleted at the
+  SIGTERM and SIGHUP are forwarded on Unix, followed by SIGKILL after 10 s or at once on a second signal.
+  Default-location captures of dead apps are deleted at the
   next run once past 7 days or beyond the newest 20.
 - `--out` and `--capture` refuse symlinks. `record` checks `--output` before connecting. `--args-file`
   accepts a UTF-8 BOM and names UTF-16. `call`, `invoke` and `tools --json` stdout escapes C1 and bidi

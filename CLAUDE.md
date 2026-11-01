@@ -184,6 +184,34 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
+## Current State (2026-11-02)
+
+### v0.10.3 — candidate on `release/0.10.3-prep`, NOT published
+
+A nine-lens adversarial audit (network, JS bridge, data/native, in-process, CLI, VS Code, library
+truth, release claims, live sweep), fixed in seven isolated lanes, merged, reviewed by three
+independent readers, then fixed again in three lanes. **Main finding: assertions and tools that
+reported success without checking** (a11y assertions read a key the audit never produced; negative
+matchers passed on a missing element; a bridge call on a page with no bridge returned `undefined` as
+success). They now tell the truth, so consumers' green suites can go red: see MIGRATION.md. Semver:
+compatible, patch.
+
+Decisions to keep: eval runs in the page's realm with page-controlled prototypes, so results and logs
+are evidence against a buggy page, not a hostile one (no private channel; it would move the line
+without making results trustworthy). Refs carry a per-page-load tag and are opaque. Direct-dependency
+major bumps stay out of a patch (`reqwest::Error` is public).
+
+Lessons: the first live run of the merged lanes found what every lane's own suite missed (two name
+computations, an invented `summary.total` shape), because each lane tested against its own tree. A
+harness must refuse a taken port: the app silently falls back a port, and other local daemons can hold ports
+around 7610. `adversarial`'s `trusted_input_platform_behaviour` sends real OS keystrokes: skip it
+locally on a shared desktop. Copy the PDB with a copied `.exe`, or backtraces show `<unknown>`.
+
+Known, not fixed: a catastrophic route regex on an ordinary URL can hang the page; XHR `fulfill` is
+tagged and warned, not implemented; a killed `victauri run` writes no exit record on Windows and
+orphans the app on Unix SIGKILL; a rotated log cursor landing exactly on a record boundary stays
+silent; a child painted behind its own ancestor (negative z-index) clicks rather than reports covered.
+
 ## Current State (2026-10-31)
 
 ### v0.10.2 — PUBLISHED 2026-10-31
@@ -1325,7 +1353,7 @@ Tested against 4 third-party open-source Tauri 2 apps with fully built frontends
 - **victauri-test**: Typed MCP HTTP client (`VictauriClient`) with auto-session management (initialize + notifications/initialized). 23 convenience methods for tool calls (eval_js, dom_snapshot, click, fill, etc). 6 standalone assertion helpers: `assert_json_eq`, `assert_json_truthy`, `assert_no_a11y_violations`, `assert_performance_budget`, `assert_ipc_healthy`, `assert_state_matches`. 11 client assertion methods: `assert_eval_works`, `assert_dom_snapshot_valid`, `assert_screenshot_ok`, `assert_windows_exist`, `assert_ipc_integrity_ok`, `assert_accessible`, `assert_dom_complete_under`, `assert_heap_under_mb`, `assert_no_uncaught_errors`, `assert_recording_lifecycle`, `assert_health_hardened`. Built-in `smoke_test()` suite (11 checks, returns `SmokeReport` with timing + JUnit XML). `SmokeConfig` for custom thresholds. Supports Bearer token auth via `connect_with_token`. Published to crates.io as standalone crate.
 - **victauri-cli**: CLI binary (`victauri`) with 8 commands: `init` (scaffold test directory + CLAUDE.md with agent instructions), `check` (server diagnostics), `test` (built-in smoke suite — 11 checks with pass/fail + JUnit XML), `record` (capture interactions → test file), `doctor` (full setup diagnosis), `watch` (file watcher → re-run tests), `invoke` (call any Tauri IPC command from terminal), `coverage` (IPC command coverage report). `victauri test` auto-discovers the running app, runs all smoke checks, prints a summary, exits 0/1 for CI. Configurable `--max-load-ms` and `--max-heap-mb` thresholds. `victauri init` creates/appends CLAUDE.md with instructions that make AI agents prefer Victauri over CDP/Playwright.
 - **victauri-watchdog**: Configurable via env vars (`VICTAURI_PORT`, `VICTAURI_INTERVAL`, `VICTAURI_MAX_FAILURES`, `VICTAURI_ON_FAILURE`). Proper `tracing-subscriber` log output. Executes configurable recovery commands on failure. Fires recovery action once per failure cycle, resets on recovery.
-- **demo-app**: Multi-window Tauri 2 app in `examples/demo-app/` with Victauri wired up. 23 commands (incl. `saturate_async_runtime` / `async_runtime_ping` for the runtime-isolation test) (greet, counter CRUD, todo CRUD, settings, contact form with validation, notifications with cross-window events, window management, app state dump, plus a fire-and-forget `run_pipeline` + `pipeline_status` mirroring a real async backend job) all decorated with `#[inspectable]`. Registers a `pipeline` `app_state` probe and emits a `pipeline-complete` event for the async-completion demo. Tab-based navigation with ARIA attributes, `data-testid` on all interactive elements. Notification panel window with event sync. 20 integration tests in `tests/integration.rs` demonstrating every Victauri testing pattern (direct client API, Locator API, IPC verification, cross-boundary state, a11y audit, perf monitoring, time-travel recording, verify builder). Includes `.mcp.json` for immediate Claude Code connection.
+- **demo-app**: Multi-window Tauri 2 app in `examples/demo-app/` with Victauri wired up. 25 commands (incl. `saturate_async_runtime` / `async_runtime_ping` for the runtime-isolation test) (greet, counter CRUD, todo CRUD, settings, contact form with validation, notifications with cross-window events, window management, app state dump, plus a fire-and-forget `run_pipeline` + `pipeline_status` mirroring a real async backend job) all decorated with `#[inspectable]`. Registers a `pipeline` `app_state` probe and emits a `pipeline-complete` event for the async-completion demo. Tab-based navigation with ARIA attributes, `data-testid` on all interactive elements. Notification panel window with event sync. 31 integration tests in `tests/integration.rs` demonstrating every Victauri testing pattern (direct client API, Locator API, IPC verification, cross-boundary state, a11y audit, perf monitoring, time-travel recording, verify builder). Includes `.mcp.json` for immediate Claude Code connection.
 - **CI/CD**: GitHub Actions `ci.yml` (clippy + tests + docs on Linux/Windows/macOS, format check, live-app E2E on all 3 OS, cross-engine gauntlet, `CI Success` aggregate gate) + `release.yml` (test gate → cross-platform CLI/watchdog binary builds → sequential crates.io publish → GitHub Release with the binaries) + `release-vscode.yml` (VS Code extension, own `vscode-v*` tag; build job holds no secrets, publish job is environment-gated) + `surface-audit.yml` (weekly registry-drift check, fails on drift OR an unknown/failed query) + `docs.yml` (mdbook → Pages) + `e2e.yml` (manual: victauri-test client e2e suites). (The Chrome-extension jobs went with browser mode, removed 2026-06-09.) All crate code passes `cargo fmt --check`.
 - **docs/**: mdbook documentation site — 10 pages: introduction, getting started, compatibility, architecture, tools reference, testing, testing Tauri apps (approach comparison), configuration, security, FAQ.
 
