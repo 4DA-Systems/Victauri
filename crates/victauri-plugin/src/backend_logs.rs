@@ -1937,7 +1937,50 @@ pub const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
 /// [`read_console_capture`] that also says whether the read stopped at its `window` with more
 /// of the file left: a cursor reader must then read on from the returned offset even when no
 /// line limit was hit. A record still being written at the end of the file does not count.
+///
+/// A cursor is a byte offset and carries nothing that says which file it is for, so a rotation
+/// (`victauri run` renames a full capture to `.jsonl.1`) shows only in where the offset lands: past
+/// the end, or not just after a line break. Then the unread tail is read from the rotated file, and
+/// the new file from its start. An offset that happens to land exactly on a record boundary of the
+/// new file cannot be told apart, and neither can a second rotation between two reads.
 pub fn read_console_capture_window(
+    path: &std::path::Path,
+    from: Option<u64>,
+    tail_bytes: u64,
+    window: u64,
+) -> std::io::Result<(Vec<ConsoleLine>, u64, bool)> {
+    let mut from = from;
+    if let Some(cursor) = from
+        && cursor > 0
+        && !at_record_boundary(path, cursor)
+    {
+        let rotated = path.with_extension("jsonl.1");
+        if at_record_boundary(&rotated, cursor) {
+            let (lines, next, _) = read_capture_window(&rotated, Some(cursor), 0, window)?;
+            // Read on from `next`: the new file is still to come. No progress: it is drained.
+            if next != cursor {
+                return Ok((lines, next, true));
+            }
+            from = Some(0);
+        }
+    }
+    read_capture_window(path, from, tail_bytes, window)
+}
+
+/// Whether `offset` is inside `path` and just after a line break.
+fn at_record_boundary(path: &std::path::Path, offset: u64) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut byte = [0u8; 1];
+    std::fs::File::open(path)
+        .and_then(|mut file| {
+            file.seek(SeekFrom::Start(offset - 1))?;
+            file.read_exact(&mut byte)
+        })
+        .is_ok()
+        && byte[0] == b'\n'
+}
+
+fn read_capture_window(
     path: &std::path::Path,
     from: Option<u64>,
     tail_bytes: u64,
