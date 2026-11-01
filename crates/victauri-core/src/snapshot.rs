@@ -44,7 +44,7 @@ pub struct DomSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct DomElement {
-    /// Unique ref handle for this element (e.g. "e3"), used to target interactions.
+    /// Unique ref handle for this element (e.g. "k3f9e3"; opaque, compare whole), used to target interactions.
     pub ref_id: String,
     /// HTML tag name (e.g. "div", "button").
     pub tag: String,
@@ -198,7 +198,7 @@ impl DomSnapshot {
     /// let snapshot: DomSnapshot = serde_json::from_value(serde_json::json!({
     ///     "webview_label": "main",
     ///     "elements": [{
-    ///         "ref_id": "e1", "tag": "button", "role": "button", "name": "Submit",
+    ///         "ref_id": "k3f9e1", "tag": "button", "role": "button", "name": "Submit",
     ///         "text": null, "value": null, "enabled": true, "visible": true,
     ///         "focusable": true, "bounds": null, "children": [], "attributes": {}
     ///     }],
@@ -208,7 +208,7 @@ impl DomSnapshot {
     /// let text = snapshot.to_accessible_text(0);
     /// assert!(text.contains("button"));
     /// assert!(text.contains("Submit"));
-    /// assert!(text.contains("[ref=e1]"));
+    /// assert!(text.contains("[ref=k3f9e1]"));
     /// ```
     #[must_use]
     pub fn to_accessible_text(&self, indent: usize) -> String {

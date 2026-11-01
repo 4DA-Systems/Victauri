@@ -116,6 +116,17 @@ enum Pick {
 /// All refinement methods return a new `Locator` (the type is `Clone`), so the
 /// original remains usable.
 ///
+/// # What a locator sees
+///
+/// - **Not strict.** Unlike Playwright's locators, several matches are not an error: the first is
+///   used unless [`nth`](Self::nth) or [`last`](Self::last) says otherwise.
+/// - **Actions and `to_be_visible`/`to_be_hidden`** pick among elements that are not hidden by
+///   `display` or `visibility`, so `.click()` skips a hidden duplicate.
+/// - **Reads, `count`, `all` and the other expectations** see everything in the DOM, hidden or not:
+///   a `display:none` element is still attached. So a position can differ between the two
+///   (`nth(1).click()` is the second *visible* match, `all()[1]` the second match).
+/// - **More than 1000 matches is an error**, never a truncated count.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -162,7 +173,11 @@ impl Locator {
         }
     }
 
-    /// Locate elements whose visible text contains `text` (case-insensitive substring).
+    /// Locate the deepest elements whose full text contains `text` (case-insensitive substring):
+    /// `<main><button>Save</button></main>` matches the button, not `<main>`.
+    ///
+    /// A heading and a button can both say "Save", and the first in the document wins: narrow it
+    /// with `Locator::role("button").and_text("Save")` when you mean the button.
     #[must_use]
     pub fn text(text: &str) -> Self {
         Self {
@@ -172,7 +187,7 @@ impl Locator {
         }
     }
 
-    /// Locate elements whose visible text exactly equals `text`.
+    /// Locate the deepest elements whose whitespace-normalised full text equals `text`.
     #[must_use]
     pub fn text_exact(text: &str) -> Self {
         Self {
@@ -279,7 +294,7 @@ impl Locator {
         self
     }
 
-    /// Further filter by the presence (and optionally value) of an HTML attribute.
+    /// Further filter by the presence (and, with `Some`, the exact value) of an HTML attribute.
     #[must_use]
     pub fn and_has_attribute(mut self, attr_name: &str, attr_value: Option<&str>) -> Self {
         self.filters.push(Filter::HasAttribute(
@@ -296,7 +311,8 @@ impl Locator {
         self
     }
 
-    /// Select the first match (default behavior, explicit for readability).
+    /// Select the first match (default behavior, explicit for readability). Locators are not
+    /// strict, so this is also what happens when several elements match and nothing says which.
     #[must_use]
     pub fn first(mut self) -> Self {
         self.pick = Pick::First;
@@ -356,17 +372,27 @@ impl Locator {
         client.type_text(&el.ref_id, text).await
     }
 
-    /// Press a keyboard key (e.g. `"Enter"`, `"Control+c"`).
+    /// Focus the resolved element, then press a keyboard key on it (e.g. `"Enter"`,
+    /// `"Control+c"`).
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::ElementNotFound`] if no element matches.
+    /// Returns [`TestError::ElementNotFound`] if no element matches, and
+    /// [`TestError::Assertion`] if the element could not be focused: the key would otherwise go to
+    /// whatever holds focus.
     pub async fn press_key(
         &self,
         client: &mut VictauriClient,
         key: &str,
     ) -> Result<Value, TestError> {
-        let _el = self.resolve_one(client).await?;
+        let el = self.resolve_one(client).await?;
+        let focused = client.focus(&el.ref_id).await?;
+        if focused.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(TestError::Assertion(format!(
+                "{self}: could not focus the element to press {key}: {}",
+                crate::terminal::single_line(&focused.to_string())
+            )));
+        }
         client.press_key(key).await
     }
 
@@ -456,7 +482,9 @@ impl Locator {
         client: &mut VictauriClient,
         want: bool,
     ) -> Result<Value, TestError> {
-        self.eval_on_element(client, &set_checked_js(want)).await
+        let el = self.resolve_one(client).await?;
+        let code = element_script(&el.ref_id, &set_checked_js(want));
+        element_result(client.eval_js(&code).await?, self)
     }
 
     // ── Query methods ───────────────────────────────────────────────────
@@ -503,7 +531,7 @@ impl Locator {
     ///
     /// Returns [`TestError::ElementNotFound`] if no element matches.
     pub async fn is_visible(&self, client: &mut VictauriClient) -> Result<bool, TestError> {
-        let el = self.resolve_one(client).await?;
+        let el = self.resolve_attached(client).await?;
         Ok(el.visible)
     }
 
@@ -513,7 +541,7 @@ impl Locator {
     ///
     /// Returns [`TestError::ElementNotFound`] if no element matches.
     pub async fn is_enabled(&self, client: &mut VictauriClient) -> Result<bool, TestError> {
-        let el = self.resolve_one(client).await?;
+        let el = self.resolve_attached(client).await?;
         Ok(el.enabled)
     }
 
@@ -559,7 +587,7 @@ impl Locator {
         &self,
         client: &mut VictauriClient,
     ) -> Result<Option<Bounds>, TestError> {
-        let el = self.resolve_one(client).await?;
+        let el = self.resolve_attached(client).await?;
         Ok(el.bounds)
     }
 
@@ -627,18 +655,47 @@ impl Locator {
 
     // ── Resolution internals ────────────────────────────────────────────
 
+    /// Every match in the DOM, hidden or not.
     async fn resolve_all(
         &self,
         client: &mut VictauriClient,
     ) -> Result<Vec<LocatorMatch>, TestError> {
-        let query = self.build_query();
-        let result = client.find_elements(query).await?;
-        let mut elements = Self::parse_elements(&result);
-        elements = self.apply_filters(elements);
-        Ok(elements)
+        self.find(client, true).await
     }
 
+    async fn find(
+        &self,
+        client: &mut VictauriClient,
+        include_hidden: bool,
+    ) -> Result<Vec<LocatorMatch>, TestError> {
+        let mut query = self.build_query();
+        if include_hidden {
+            query["include_hidden"] = json!(true);
+        }
+        let result = client.find_elements(query).await?;
+        let elements = self.parse_answer(&result)?;
+        // The query asked for one more than the cap, so this means "some were cut off": every
+        // count, position and filter below would be silently wrong.
+        if elements.len() > MAX_MATCHES {
+            return Err(TestError::Other(format!(
+                "{self}: more than {MAX_MATCHES} elements match; narrow the locator"
+            )));
+        }
+        let elements = self.apply_filters(elements);
+        self.apply_page_filters(client, elements).await
+    }
+
+    /// The element an action targets: chosen among the elements that are not hidden.
     async fn resolve_one(&self, client: &mut VictauriClient) -> Result<LocatorMatch, TestError> {
+        let visible = self.find(client, false).await?;
+        self.pick_one(visible)
+    }
+
+    /// The element a read or a state expectation targets: chosen among everything in the DOM.
+    async fn resolve_attached(
+        &self,
+        client: &mut VictauriClient,
+    ) -> Result<LocatorMatch, TestError> {
         let all = self.resolve_all(client).await?;
         self.pick_one(all)
     }
@@ -673,8 +730,7 @@ impl Locator {
                 query["text"] = json!(t);
             }
             Strategy::TextExact(t) => {
-                query["text"] = json!(t);
-                query["exact"] = json!(true);
+                query["text_exact"] = json!(t);
             }
             Strategy::TestId(id) => {
                 query["test_id"] = json!(id);
@@ -696,57 +752,37 @@ impl Locator {
             }
         }
 
-        // Promote filters that the bridge can handle natively into the query
+        // Each query key holds one condition, so the first filter for a key goes to the bridge
+        // (which applies it before its cap); a later one must narrow, never replace, what is
+        // already there, and is applied by `apply_filters` / `apply_page_filters`.
         for filter in &self.filters {
-            match filter {
-                Filter::Role(r) => {
-                    query["role"] = json!(r);
-                }
-                Filter::Name(n) => {
-                    query["name"] = json!(n);
-                }
-                Filter::Tag(t) => {
-                    query["tag"] = json!(t);
-                }
-                // Text, TextExact, and HasAttribute are applied client-side
-                Filter::Text(_) | Filter::TextExact(_) | Filter::HasAttribute(_, _) => {}
+            let (key, value) = match filter {
+                Filter::Role(r) => ("role", r),
+                Filter::Name(n) => ("name", n),
+                Filter::Tag(t) => ("tag", t),
+                Filter::Text(t) => ("text", t),
+                Filter::TextExact(t) => ("text_exact", t),
+                Filter::HasAttribute(a, _) => ("attribute", a),
+            };
+            if query.get(key).is_some() {
+                continue;
+            }
+            query[key] = json!(value);
+            if let Filter::HasAttribute(_, Some(v)) = filter {
+                query["attribute_value"] = json!(v);
             }
         }
 
-        query["max_results"] = json!(50);
+        query["max_results"] = json!(MAX_MATCHES + 1);
         query
     }
 
+    /// Filters whose whole answer is in the bridge's result fields.
     fn apply_filters(&self, elements: Vec<LocatorMatch>) -> Vec<LocatorMatch> {
         let mut result = elements;
 
-        // TextExact strategy requires exact client-side match (bridge `text` with
-        // `exact:true` may not be supported on all versions).
-        if let Strategy::TextExact(ref expected) = self.strategy {
-            result.retain(|el| {
-                el.text
-                    .as_deref()
-                    .is_some_and(|t| t.trim() == expected.as_str())
-            });
-        }
-
         for filter in &self.filters {
             match filter {
-                Filter::Text(expected) => {
-                    let lower = expected.to_lowercase();
-                    result.retain(|el| {
-                        el.text
-                            .as_deref()
-                            .is_some_and(|t| t.to_lowercase().contains(&lower))
-                    });
-                }
-                Filter::TextExact(expected) => {
-                    result.retain(|el| {
-                        el.text
-                            .as_deref()
-                            .is_some_and(|t| t.trim() == expected.as_str())
-                    });
-                }
                 Filter::Role(expected) => {
                     result.retain(|el| el.role.as_deref().is_some_and(|r| r == expected.as_str()));
                 }
@@ -759,14 +795,98 @@ impl Locator {
                     });
                 }
                 Filter::Tag(expected) => {
-                    result.retain(|el| el.tag == *expected);
+                    result.retain(|el| el.tag.eq_ignore_ascii_case(expected));
                 }
-                // HasAttribute cannot be checked without DOM access; keep all.
-                Filter::HasAttribute(_, _) => {}
+                // Not decidable here: the result's `text` is cut at 100 characters and attributes
+                // are not in it at all. See `page_conditions`.
+                Filter::Text(_) | Filter::TextExact(_) | Filter::HasAttribute(_, _) => {}
             }
         }
 
         result
+    }
+
+    /// JS conditions on `el` that must be checked in the page: a later text filter, which has no
+    /// query key left, plus every exact-text and attribute condition. Those two are re-checked even
+    /// though the query carries them, because a plugin older than these query keys ignores them and
+    /// would hand back every element, and the first of those would then be clicked.
+    fn page_conditions(&self) -> Vec<String> {
+        let js = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+        let contains = |text: &str| {
+            format!(
+                "norm(full(el)).toLowerCase().indexOf(norm({}).toLowerCase()) !== -1",
+                js(text)
+            )
+        };
+        let equals = |text: &str| format!("norm(full(el)) === norm({})", js(text));
+
+        let mut conditions = Vec::new();
+        let mut substring_in_query = false;
+        match &self.strategy {
+            Strategy::Text(_) => substring_in_query = true,
+            Strategy::TextExact(t) => conditions.push(equals(t)),
+            _ => {}
+        }
+        for filter in &self.filters {
+            match filter {
+                Filter::Text(t) => {
+                    if substring_in_query {
+                        conditions.push(contains(t));
+                    }
+                    substring_in_query = true;
+                }
+                Filter::TextExact(t) => conditions.push(equals(t)),
+                Filter::HasAttribute(name, None) => {
+                    conditions.push(format!("el.hasAttribute({})", js(name)));
+                }
+                Filter::HasAttribute(name, Some(value)) => {
+                    conditions.push(format!("el.getAttribute({}) === {}", js(name), js(value)));
+                }
+                Filter::Role(_) | Filter::Name(_) | Filter::Tag(_) => {}
+            }
+        }
+        conditions
+    }
+
+    /// Keeps the elements meeting [`Self::page_conditions`]; one eval for all of them.
+    async fn apply_page_filters(
+        &self,
+        client: &mut VictauriClient,
+        elements: Vec<LocatorMatch>,
+    ) -> Result<Vec<LocatorMatch>, TestError> {
+        let conditions = self.page_conditions();
+        if conditions.is_empty() || elements.is_empty() {
+            return Ok(elements);
+        }
+        let refs: Vec<&str> = elements.iter().map(|el| el.ref_id.as_str()).collect();
+        let answer = client.eval_js(&page_filter_js(&refs, &conditions)).await?;
+        let keep = answer
+            .as_array()
+            .filter(|keep| keep.len() == elements.len())
+            .ok_or_else(|| {
+                TestError::Other(format!(
+                    "{self}: could not check its filters in the page, got: {}",
+                    crate::terminal::single_line(&answer.to_string())
+                ))
+            })?;
+        Ok(elements
+            .into_iter()
+            .zip(keep)
+            .filter(|(_, keep)| keep.as_bool() == Some(true))
+            .map(|(el, _)| el)
+            .collect())
+    }
+
+    /// [`Self::parse_elements`], refusing an answer that is not an element list: read as an empty
+    /// list, it would satisfy `to_have_count(0)` on a page where the bridge is not even loaded.
+    fn parse_answer(&self, result: &Value) -> Result<Vec<LocatorMatch>, TestError> {
+        if result.is_array() || result.get("elements").is_some_and(Value::is_array) {
+            return Ok(Self::parse_elements(result));
+        }
+        Err(TestError::Other(format!(
+            "{self}: find_elements did not return an element list (is the page loaded?): {}",
+            crate::terminal::single_line(&result.to_string())
+        )))
     }
 
     fn parse_elements(result: &Value) -> Vec<LocatorMatch> {
@@ -818,10 +938,34 @@ impl Locator {
         client: &mut VictauriClient,
         js_body: &str,
     ) -> Result<Value, TestError> {
-        let el = self.resolve_one(client).await?;
+        let el = self.resolve_attached(client).await?;
         let code = element_script(&el.ref_id, js_body);
         element_result(client.eval_js(&code).await?, self)
     }
+}
+
+/// The most matches a locator will work with; asked for as this plus one, to detect more.
+const MAX_MATCHES: usize = 1000;
+
+/// JS answering, for each ref, whether its element meets all of `conditions`. Text is what the
+/// bridge's `text` / `text_exact` judge: `textContent` without script and style source, whitespace
+/// collapsed. A stricter reading here would drop elements the bridge rightly matched.
+fn page_filter_js(refs: &[&str], conditions: &[String]) -> String {
+    format!(
+        "(function() {{ var refs = {}; var out = []; \
+         var norm = function(s) {{ return (s || '').replace(/\\s+/g, ' ').trim(); }}; \
+         var full = function(n) {{ var t = ''; var kids = n.childNodes || []; \
+           for (var k = 0; k < kids.length; k++) {{ var c = kids[k]; \
+             if (c.nodeType === 3) t += c.nodeValue; \
+             else if (c.nodeType === 1 && !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(c.tagName)) t += full(c); }} \
+           return t; }}; \
+         for (var i = 0; i < refs.length; i++) {{ \
+           var el = window.__VICTAURI__?.getRef(refs[i]); \
+           out[i] = !!el && {}; }} \
+         return out; }})()",
+        serde_json::to_string(refs).unwrap_or_else(|_| "[]".to_string()),
+        conditions.join(" && ")
+    )
 }
 
 /// Marker an [`element_script`] returns when its ref no longer resolves.
@@ -832,7 +976,7 @@ const ERROR_KEY: &str = "__victauri_error";
 /// Wraps `js_body` (which sees the element as `el`) in a script that reports a ref
 /// that no longer resolves — instead of returning `null`, which callers would read
 /// as an empty text, an absent attribute or an unchecked box.
-fn element_script(ref_id: &str, js_body: &str) -> String {
+pub(crate) fn element_script(ref_id: &str, js_body: &str) -> String {
     let ref_str = serde_json::to_string(ref_id).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
@@ -901,6 +1045,13 @@ impl fmt::Display for Locator {
 ///
 /// Each assertion method polls the condition repeatedly until it passes or
 /// the timeout expires. Use [`.not()`](Self::not) to negate the next assertion.
+///
+/// An element that does not exist is "not yet": it is waited for, and if it never appears the
+/// assertion fails with [`TestError::ElementNotFound`], negated or not. `.not().to_have_text("x")`
+/// needs an element to say something about. Only [`to_be_hidden`](Self::to_be_hidden),
+/// `.not().to_be_visible()`, [`to_be_detached`](Self::to_be_detached), `.not().to_be_attached()`
+/// and `to_have_count(0)` are satisfied by absence. Any other failure (a dead app, an invalid
+/// selector, a tool error) is returned at once and never counts as the condition being met.
 pub struct LocatorExpect<'a> {
     locator: &'a Locator,
     client: &'a mut VictauriClient,
@@ -946,7 +1097,9 @@ impl<'a> LocatorExpect<'a> {
         } else {
             format!("{} to be visible", self.locator)
         };
-        self.poll_until_simple(|el| el.visible, &desc).await
+        // `.not()`: gone counts as not visible.
+        self.poll_until_simple(|el| el.visible, negated, negated, false, &desc)
+            .await
     }
 
     /// Wait until the element is hidden (not visible).
@@ -961,9 +1114,8 @@ impl<'a> LocatorExpect<'a> {
         } else {
             format!("{} to be hidden", self.locator)
         };
-        // "hidden" means visible==false, so invert the check
-        let effective_negated = !negated;
-        self.poll_until_simple_with_negated(|el| el.visible, effective_negated, &desc)
+        // "hidden" means visible==false, so invert the check; gone counts as hidden.
+        self.poll_until_simple(|el| el.visible, !negated, !negated, false, &desc)
             .await
     }
 
@@ -979,7 +1131,9 @@ impl<'a> LocatorExpect<'a> {
         } else {
             format!("{} to be enabled", self.locator)
         };
-        self.poll_until_simple(|el| el.enabled, &desc).await
+        // Being absent says nothing about being enabled.
+        self.poll_until_simple(|el| el.enabled, negated, false, true, &desc)
+            .await
     }
 
     /// Wait until the element is disabled.
@@ -994,8 +1148,7 @@ impl<'a> LocatorExpect<'a> {
         } else {
             format!("{} to be disabled", self.locator)
         };
-        let effective_negated = !negated;
-        self.poll_until_simple_with_negated(|el| el.enabled, effective_negated, &desc)
+        self.poll_until_simple(|el| el.enabled, !negated, false, true, &desc)
             .await
     }
 
@@ -1003,238 +1156,93 @@ impl<'a> LocatorExpect<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
+    /// [`TestError::ElementNotFound`] if the element never appears.
     pub async fn to_be_focused(self) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT be focused", self.locator)
-        } else {
-            format!("{} to be focused", self.locator)
-        };
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = check_focused(&locator, client).await;
-            let condition_met = match result {
-                Ok(met) => {
-                    if negated {
-                        !met
-                    } else {
-                        met
-                    }
-                }
-                Err(_) if negated => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    deadline
-                        .duration_since(Instant::now().checked_sub(poll).unwrap_or(Instant::now()))
-                        .as_millis()
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe("be focused");
+        self.poll_read("return document.activeElement === el;", is_true, &desc)
+            .await
     }
 
     /// Wait until the element's text content equals `expected`.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
+    /// [`TestError::ElementNotFound`] if the element never appears.
     pub async fn to_have_text(self, expected: &str) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT have text \"{expected}\"", self.locator)
-        } else {
-            format!("{} to have text \"{expected}\"", self.locator)
-        };
-        let expected_owned = expected.to_string();
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = check_text_content(&locator, client).await;
-            let condition_met = match result {
-                Ok(actual) => {
-                    let matches = actual.trim() == expected_owned.as_str();
-                    if negated { !matches } else { matches }
-                }
-                Err(_) if negated => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    self.timeout_ms
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe(&format!("have text \"{expected}\""));
+        self.poll_read(
+            TEXT_CONTENT_JS,
+            |val| value_to_string(val).trim() == expected,
+            &desc,
+        )
+        .await
     }
 
     /// Wait until the element's text content contains `expected` as a substring.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
+    /// [`TestError::ElementNotFound`] if the element never appears.
     pub async fn to_contain_text(self, expected: &str) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT contain text \"{expected}\"", self.locator)
-        } else {
-            format!("{} to contain text \"{expected}\"", self.locator)
-        };
-        let expected_owned = expected.to_string();
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = check_text_content(&locator, client).await;
-            let condition_met = match result {
-                Ok(actual) => {
-                    let matches = actual.contains(expected_owned.as_str());
-                    if negated { !matches } else { matches }
-                }
-                Err(_) if negated => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    self.timeout_ms
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe(&format!("contain text \"{expected}\""));
+        self.poll_read(
+            TEXT_CONTENT_JS,
+            |val| value_to_string(val).contains(expected),
+            &desc,
+        )
+        .await
     }
 
     /// Wait until the element's input value equals `expected`.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
+    /// [`TestError::ElementNotFound`] if the element never appears.
     pub async fn to_have_value(self, expected: &str) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT have value \"{expected}\"", self.locator)
-        } else {
-            format!("{} to have value \"{expected}\"", self.locator)
-        };
-        let expected_owned = expected.to_string();
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = check_input_value(&locator, client).await;
-            let condition_met = match result {
-                Ok(actual) => {
-                    let matches = actual == expected_owned;
-                    if negated { !matches } else { matches }
-                }
-                Err(_) if negated => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    self.timeout_ms
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe(&format!("have value \"{expected}\""));
+        self.poll_read(
+            "return el.value || \"\";",
+            |val| value_to_string(val) == expected,
+            &desc,
+        )
+        .await
     }
 
     /// Wait until the element has the given attribute with the given value.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
+    /// [`TestError::ElementNotFound`] if the element never appears.
     pub async fn to_have_attribute(self, attr_name: &str, value: &str) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!(
-                "{} to NOT have attribute {attr_name}=\"{value}\"",
-                self.locator
-            )
-        } else {
-            format!("{} to have attribute {attr_name}=\"{value}\"", self.locator)
-        };
-        let attr_owned = attr_name.to_string();
-        let value_owned = value.to_string();
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = check_attribute(&locator, client, &attr_owned).await;
-            let condition_met = match result {
-                Ok(actual) => {
-                    let matches = actual.as_deref() == Some(value_owned.as_str());
-                    if negated { !matches } else { matches }
-                }
-                Err(_) if negated => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    self.timeout_ms
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe(&format!("have attribute {attr_name}=\"{value}\""));
+        // A JSON string is a valid JS string literal for any input (newlines, U+2028…).
+        let name = serde_json::to_string(attr_name).unwrap_or_else(|_| "\"\"".to_string());
+        let body = format!("return el.getAttribute({name});");
+        self.poll_read(&body, |val| val.as_str() == Some(value), &desc)
+            .await
     }
 
-    /// Wait until the number of matching elements equals `expected`.
+    /// Wait until the number of matching elements (hidden ones included) equals `expected`.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time. An error from the query
+    /// itself (a dead app, an invalid selector) is returned as is: it says nothing about the count.
     pub async fn to_have_count(self, expected: usize) -> Result<(), TestError> {
         let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT have count {expected}", self.locator)
-        } else {
-            format!("{} to have count {expected}", self.locator)
-        };
+        let desc = self.describe(&format!("have count {expected}"));
         let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
         let poll = Duration::from_millis(self.poll_ms);
         let locator = self.locator.clone();
         let client = self.client;
         loop {
-            let result = locator.resolve_all(client).await;
-            let condition_met = match result {
-                Ok(all) => {
-                    let matches = all.len() == expected;
-                    if negated { !matches } else { matches }
-                }
-                Err(_) if negated && expected != 0 => true,
-                Err(_) if !negated && expected == 0 => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
+            let matches = locator.resolve_all(client).await?.len() == expected;
+            if matches != negated {
                 return Ok(());
             }
             if Instant::now() >= deadline {
@@ -1251,148 +1259,76 @@ impl<'a> LocatorExpect<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
+    /// [`TestError::ElementNotFound`] if the element never appears.
     pub async fn to_be_checked(self) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT be checked", self.locator)
-        } else {
-            format!("{} to be checked", self.locator)
-        };
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = check_checked(&locator, client).await;
-            let condition_met = match result {
-                Ok(checked) => {
-                    if negated {
-                        !checked
-                    } else {
-                        checked
-                    }
-                }
-                Err(_) if negated => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    self.timeout_ms
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe("be checked");
+        let body = format!("{CHECKED_STATE_JS} return isOn();");
+        self.poll_read(&body, is_true, &desc).await
     }
 
     /// Wait until the element is unchecked.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
+    /// [`TestError::ElementNotFound`] if the element never appears.
     pub async fn to_be_unchecked(self) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT be unchecked", self.locator)
-        } else {
-            format!("{} to be unchecked", self.locator)
-        };
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = check_checked(&locator, client).await;
-            let condition_met = match result {
-                Ok(checked) => {
-                    let unchecked = !checked;
-                    if negated { !unchecked } else { unchecked }
-                }
-                Err(_) if negated => true,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    self.timeout_ms
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe("be unchecked");
+        let body = format!("{CHECKED_STATE_JS} return isOn();");
+        self.poll_read(&body, |val| val.as_bool() == Some(false), &desc)
+            .await
     }
 
-    /// Wait until the element exists in the DOM.
+    /// Wait until the element exists in the DOM, visible or not.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::Timeout`] if the condition is not met in time.
     pub async fn to_be_attached(self) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT be attached", self.locator)
-        } else {
-            format!("{} to be attached", self.locator)
-        };
-        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
-        let poll = Duration::from_millis(self.poll_ms);
-        let locator = self.locator.clone();
-        let client = self.client;
-        loop {
-            let result = locator.resolve_one(client).await;
-            let condition_met = match result {
-                Ok(_) => !negated,
-                Err(TestError::ElementNotFound(_)) => negated,
-                Err(e) => return Err(e),
-            };
-            if condition_met {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
-                    self.timeout_ms
-                )));
-            }
-            tokio::time::sleep(poll).await;
-        }
+        let desc = self.describe("be attached");
+        let want_attached = !self.negated;
+        self.poll_attached(want_attached, &desc).await
     }
 
-    /// Wait until the element is removed from the DOM.
+    /// Wait until the element is removed from the DOM. A hidden element is still attached.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::Timeout`] if the condition is not met in time.
     pub async fn to_be_detached(self) -> Result<(), TestError> {
-        let negated = self.negated;
-        let desc = if negated {
-            format!("{} to NOT be detached", self.locator)
+        let desc = self.describe("be detached");
+        let want_attached = self.negated;
+        self.poll_attached(want_attached, &desc).await
+    }
+
+    // ── Internal polling helpers ─────────────────────────────────────────
+
+    fn describe(&self, what: &str) -> String {
+        if self.negated {
+            format!("{} to NOT {what}", self.locator)
         } else {
-            format!("{} to be detached", self.locator)
-        };
+            format!("{} to {what}", self.locator)
+        }
+    }
+
+    async fn poll_attached(self, want_attached: bool, description: &str) -> Result<(), TestError> {
         let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
         let poll = Duration::from_millis(self.poll_ms);
         let locator = self.locator.clone();
         let client = self.client;
         loop {
-            let result = locator.resolve_one(client).await;
-            let condition_met = match result {
-                Ok(_) => negated,
-                Err(TestError::ElementNotFound(_)) => !negated,
+            let attached = match locator.resolve_attached(client).await {
+                Ok(_) => true,
+                Err(TestError::ElementNotFound(_)) => false,
                 Err(e) => return Err(e),
             };
-            if condition_met {
+            if attached == want_attached {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 return Err(TestError::Timeout(format!(
-                    "expected {desc} within {}ms",
+                    "expected {description} within {}ms",
                     self.timeout_ms
                 )));
             }
@@ -1400,22 +1336,16 @@ impl<'a> LocatorExpect<'a> {
         }
     }
 
-    // ── Internal polling helpers ─────────────────────────────────────────
-
-    /// Poll a condition that only depends on the resolved `LocatorMatch` fields.
-    async fn poll_until_simple<F>(self, check: F, description: &str) -> Result<(), TestError>
-    where
-        F: Fn(&LocatorMatch) -> bool,
-    {
-        let negated = self.negated;
-        self.poll_until_simple_with_negated(check, negated, description)
-            .await
-    }
-
-    async fn poll_until_simple_with_negated<F>(
+    /// Poll a condition on the resolved `LocatorMatch` fields. `absent_passes` says whether no
+    /// element satisfies it, which is separate from `negated`: `to_be_disabled` negates "enabled",
+    /// yet a missing element is not disabled. `include_hidden` is the scope the element is chosen
+    /// from (see [`Locator`]).
+    async fn poll_until_simple<F>(
         self,
         check: F,
         negated: bool,
+        absent_passes: bool,
+        include_hidden: bool,
         description: &str,
     ) -> Result<(), TestError>
     where
@@ -1426,13 +1356,14 @@ impl<'a> LocatorExpect<'a> {
         let locator = self.locator.clone();
         let client = self.client;
         loop {
-            let result = locator.resolve_one(client).await;
-            let condition_met = match result {
-                Ok(el) => {
-                    let raw = check(&el);
-                    if negated { !raw } else { raw }
-                }
-                Err(TestError::ElementNotFound(_)) if negated => true,
+            let found = if include_hidden {
+                locator.resolve_attached(client).await
+            } else {
+                locator.resolve_one(client).await
+            };
+            let condition_met = match found {
+                Ok(el) => check(&el) != negated,
+                Err(TestError::ElementNotFound(_)) if absent_passes => true,
                 Err(e @ TestError::ElementNotFound(_)) => {
                     if Instant::now() >= deadline {
                         return Err(e);
@@ -1453,78 +1384,48 @@ impl<'a> LocatorExpect<'a> {
             tokio::time::sleep(poll).await;
         }
     }
-}
 
-// ── Free-standing check functions (avoid lifetime issues with closures) ─────
-
-async fn check_focused(locator: &Locator, client: &mut VictauriClient) -> Result<bool, TestError> {
-    let el = locator.resolve_one(client).await?;
-    let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
-    let code = format!(
-        "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-         if (!el) return false; return document.activeElement === el; }})()"
-    );
-    let val = client.eval_js(&code).await?;
-    Ok(val.as_bool().unwrap_or(false))
-}
-
-async fn check_text_content(
-    locator: &Locator,
-    client: &mut VictauriClient,
-) -> Result<String, TestError> {
-    let el = locator.resolve_one(client).await?;
-    let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
-    let code = format!(
-        "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-         if (!el) return \"\"; return el.textContent || \"\"; }})()"
-    );
-    let val = client.eval_js(&code).await?;
-    Ok(value_to_string(&val))
-}
-
-async fn check_input_value(
-    locator: &Locator,
-    client: &mut VictauriClient,
-) -> Result<String, TestError> {
-    let el = locator.resolve_one(client).await?;
-    let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
-    let code = format!(
-        "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-         if (!el) return \"\"; return el.value || \"\"; }})()"
-    );
-    let val = client.eval_js(&code).await?;
-    Ok(value_to_string(&val))
-}
-
-async fn check_attribute(
-    locator: &Locator,
-    client: &mut VictauriClient,
-    attr_name: &str,
-) -> Result<Option<String>, TestError> {
-    let el = locator.resolve_one(client).await?;
-    let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
-    let escaped = attr_name.replace('\\', "\\\\").replace('"', "\\\"");
-    let code = format!(
-        "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-         if (!el) return null; return el.getAttribute(\"{escaped}\"); }})()"
-    );
-    let val = client.eval_js(&code).await?;
-    if val.is_null() {
-        Ok(None)
-    } else {
-        Ok(Some(value_to_string(&val)))
+    /// Poll a condition on a value read from the element by `js_body` (which sees it as `el`),
+    /// honouring `.not()`. A missing element is "not yet", including a ref that went stale between
+    /// finding and reading; it never reads as an empty value, which would satisfy a negation.
+    async fn poll_read<F>(self, js_body: &str, check: F, description: &str) -> Result<(), TestError>
+    where
+        F: Fn(&Value) -> bool,
+    {
+        let negated = self.negated;
+        let deadline = Instant::now() + Duration::from_millis(self.timeout_ms);
+        let poll = Duration::from_millis(self.poll_ms);
+        let locator = self.locator.clone();
+        let client = self.client;
+        loop {
+            match locator.eval_on_element(client, js_body).await {
+                Ok(val) => {
+                    if check(&val) != negated {
+                        return Ok(());
+                    }
+                }
+                Err(e @ TestError::ElementNotFound(_)) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+            if Instant::now() >= deadline {
+                return Err(TestError::Timeout(format!(
+                    "expected {description} within {}ms",
+                    self.timeout_ms
+                )));
+            }
+            tokio::time::sleep(poll).await;
+        }
     }
 }
 
-async fn check_checked(locator: &Locator, client: &mut VictauriClient) -> Result<bool, TestError> {
-    let el = locator.resolve_one(client).await?;
-    let ref_str = serde_json::to_string(&el.ref_id).unwrap_or_else(|_| "\"\"".to_string());
-    let code = format!(
-        "(function() {{ var el = window.__VICTAURI__?.getRef({ref_str}); \
-         if (!el) return false; {CHECKED_STATE_JS} return isOn(); }})()"
-    );
-    let val = client.eval_js(&code).await?;
-    Ok(val.as_bool().unwrap_or(false))
+const TEXT_CONTENT_JS: &str = "return el.textContent || \"\";";
+
+fn is_true(val: &Value) -> bool {
+    val.as_bool() == Some(true)
 }
 
 /// JS (sees the element as `el`) defining `isOn()`: the checked state of a native
@@ -1587,7 +1488,7 @@ mod tests {
         let loc = Locator::role("button");
         let q = loc.build_query();
         assert_eq!(q["role"], json!("button"));
-        assert_eq!(q["max_results"], json!(50));
+        assert_eq!(q["max_results"], json!(1001));
     }
 
     #[test]
@@ -1681,6 +1582,19 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_that_is_not_a_list_is_refused() {
+        let loc = Locator::css("p");
+        assert!(loc.parse_answer(&json!([])).unwrap().is_empty());
+        assert!(
+            loc.parse_answer(&json!({"elements": []}))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(loc.parse_answer(&json!(null)).is_err());
+        assert!(loc.parse_answer(&json!("undefined")).is_err());
+    }
+
+    #[test]
     fn parse_elements_empty() {
         let data = json!([]);
         let elements = Locator::parse_elements(&data);
@@ -1696,16 +1610,30 @@ mod tests {
     }
 
     #[test]
-    fn apply_filters_exact_text() {
-        let loc = Locator::role("button").and_text_exact("Submit");
-        let elements = vec![
-            make_match("e1", "button", Some("Submit Form")),
-            make_match("e2", "button", Some("Submit")),
-            make_match("e3", "button", Some("Cancel")),
-        ];
-        let filtered = loc.apply_filters(elements);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].ref_id, "e2");
+    fn page_conditions_cover_what_the_result_fields_cannot_answer() {
+        assert!(Locator::css("li").page_conditions().is_empty());
+        // The one substring filter the query carries needs no second check.
+        assert!(
+            Locator::role("button")
+                .and_text("Save")
+                .page_conditions()
+                .is_empty()
+        );
+        let two_texts = Locator::text("a").and_text("b").page_conditions();
+        assert_eq!(two_texts.len(), 1);
+        assert!(two_texts[0].contains("\"b\""), "{two_texts:?}");
+        assert_eq!(Locator::text_exact("a").page_conditions().len(), 1);
+        let attr = Locator::css("x")
+            .and_has_attribute("data-a", Some("1"))
+            .and_has_attribute("data-b", None)
+            .page_conditions();
+        assert_eq!(
+            attr,
+            [
+                "el.getAttribute(\"data-a\") === \"1\"",
+                "el.hasAttribute(\"data-b\")"
+            ]
+        );
     }
 
     #[test]
@@ -1835,8 +1763,9 @@ mod tests {
     fn locator_text_exact_build_query() {
         let loc = Locator::text_exact("Submit");
         let q = loc.build_query();
-        assert_eq!(q["text"], json!("Submit"));
-        assert_eq!(q["exact"], json!(true));
+        assert_eq!(q["text_exact"], json!("Submit"));
+        assert!(q.get("text").is_none());
+        assert!(q.get("exact").is_none());
     }
 
     #[test]
@@ -1984,30 +1913,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_filters_text_case_insensitive() {
-        let loc = Locator::role("button").and_text("submit");
-        let elements = vec![
-            make_match("e1", "button", Some("Submit Form")),
-            make_match("e2", "button", Some("Cancel")),
-        ];
-        let filtered = loc.apply_filters(elements);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].ref_id, "e1");
-    }
-
-    #[test]
-    fn text_exact_strategy_filters_client_side() {
-        let loc = Locator::text_exact("OK");
-        let elements = vec![
-            make_match("e1", "span", Some("OK")),
-            make_match("e2", "span", Some("OK button")),
-        ];
-        let filtered = loc.apply_filters(elements);
-        assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].ref_id, "e1");
-    }
-
-    #[test]
     fn bounds_deserialize() {
         let json_str = r#"{"x":10.5,"y":20.0,"width":100.0,"height":50.5}"#;
         let bounds: Bounds = serde_json::from_str(json_str).unwrap();
@@ -2123,6 +2028,53 @@ async function run(name, el, want) {{
                 .map(|l| serde_json::from_str(l).expect("scenario JSON"))
                 .collect(),
         )
+    }
+
+    /// The filter script is JS built by string: run it, against fake elements.
+    #[test]
+    fn page_filter_script_runs_and_selects() {
+        let loc = Locator::text_exact("Save  now")
+            .and_has_attribute("data-a", Some("1"))
+            .and_has_attribute("data-b", None);
+        let code = page_filter_js(&["e1", "e2", "e3", "gone"], &loc.page_conditions());
+        let program = format!(
+            r#"
+function el(text, attrs) {{
+  return {{ childNodes: [
+              {{ nodeType: 3, nodeValue: text }},
+              {{ nodeType: 1, tagName: "STYLE", childNodes: [{{ nodeType: 3, nodeValue: "p {{}}" }}] }}
+            ],
+           getAttribute: function(k) {{ return k in attrs ? attrs[k] : null; }},
+           hasAttribute: function(k) {{ return k in attrs; }} }};
+}}
+var page = {{
+  e1: el(" Save \n now ", {{ "data-a": "1", "data-b": "" }}),
+  e2: el("Save now", {{ "data-a": "2", "data-b": "" }}),
+  e3: el("Save now and later", {{ "data-a": "1", "data-b": "" }})
+}};
+var window = {{ __VICTAURI__: {{ getRef: function(r) {{ return page[r]; }} }} }};
+console.log(JSON.stringify({code}));
+"#
+        );
+        let out = match std::process::Command::new("node")
+            .args(["-e", &program])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("skipping: node is not available ({e})");
+                return;
+            }
+        };
+        assert!(
+            out.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "[true,false,false,false]"
+        );
     }
 
     #[test]

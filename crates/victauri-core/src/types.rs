@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct RefHandle {
-    /// Unique ref identifier (e.g. "e3") assigned during DOM snapshot.
+    /// Unique ref identifier (e.g. "k3f9e3"; opaque, compare whole) assigned during DOM snapshot.
     pub id: String,
     /// CSS selector that can locate this element in the DOM.
     pub selector: String,

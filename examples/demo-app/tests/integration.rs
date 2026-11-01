@@ -67,7 +67,12 @@ e2e_test!(locator_greet_by_test_id, |client| async move {
         .await
         .unwrap();
 
-    Locator::text("Greet").click(&mut client).await.unwrap();
+    // The `<h2>Greet</h2>` above it also says "Greet" and comes first, hence the role.
+    Locator::role("button")
+        .and_text("Greet")
+        .click(&mut client)
+        .await
+        .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -76,9 +81,11 @@ e2e_test!(locator_greet_by_test_id, |client| async move {
         .await
         .unwrap();
     let text = result.as_str().unwrap_or("");
+    // The name filled in above: `greet_flow` runs first and leaves a greeting of its own, so
+    // "Hello" alone would pass with a click that hit nothing.
     assert!(
-        text.contains("Hello") && text.contains("Rust"),
-        "greet result should contain greeting from Rust: {text}"
+        text.contains("Hello") && text.contains("Charlie") && text.contains("Rust"),
+        "greet result should greet the name just filled in, from Rust: {text}"
     );
 });
 
@@ -260,7 +267,8 @@ e2e_test!(command_registry_populated, |client| async move {
 
 e2e_test!(accessibility_audit, |client| async move {
     let audit = client.audit_accessibility().await.unwrap();
-    let violations = audit["summary"]["violations"].as_u64().unwrap_or(0);
+    let violations = audit["violations"].as_array().unwrap().len();
+    assert_eq!(audit["summary"]["total"].as_u64(), Some(violations as u64));
 
     assert!(
         violations < 5,
@@ -276,14 +284,13 @@ e2e_test!(accessibility_audit, |client| async move {
 e2e_test!(performance_budget, |client| async move {
     let perf = client.get_performance_metrics().await.unwrap();
 
-    if let Some(dom_interactive) = perf["navigation"]["domInteractive"].as_f64() {
-        assert!(
-            dom_interactive < 5000.0,
-            "DOM interactive took {dom_interactive}ms — should be under 5s"
-        );
-    }
+    let dom_interactive = perf["navigation"]["dom_interactive_ms"].as_f64().unwrap();
+    assert!(
+        dom_interactive < 5000.0,
+        "DOM interactive took {dom_interactive}ms — should be under 5s"
+    );
 
-    if let Some(element_count) = perf["dom"]["elementCount"].as_u64() {
+    if let Some(element_count) = perf["dom"]["elements"].as_u64() {
         assert!(
             element_count < 1000,
             "DOM has {element_count} elements — should be under 1000"

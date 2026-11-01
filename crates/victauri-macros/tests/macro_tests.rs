@@ -5,7 +5,7 @@
 
 use victauri_core::registry::CommandInfo;
 
-mod fake_tauri_types {
+mod tauri {
     pub struct AppHandle;
     pub struct State<T>(std::marker::PhantomData<T>);
     pub struct Window;
@@ -202,9 +202,9 @@ fn original_name(user_id: u64) -> u64 {
 /// A path-qualified `State` whose generics contain `::` is still an injected arg.
 #[victauri_macros::inspectable]
 fn with_injected(
-    app: fake_tauri_types::AppHandle,
-    state: fake_tauri_types::State<std::sync::Mutex<u8>>,
-    window: &fake_tauri_types::Window,
+    app: tauri::AppHandle,
+    state: tauri::State<std::sync::Mutex<u8>>,
+    window: &tauri::Window,
     page_size: u32,
 ) -> u32 {
     let _ = (app, state, window);

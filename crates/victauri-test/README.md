@@ -63,8 +63,8 @@ Locator::css("#counter")
 | Method | Finds by |
 |---|---|
 | `Locator::role("button")` | ARIA role |
-| `Locator::text("Submit")` | Visible text (substring) |
-| `Locator::text_exact("OK")` | Visible text (exact) |
+| `Locator::text("Submit")` | Deepest elements containing the text (case-insensitive) |
+| `Locator::text_exact("OK")` | Deepest elements whose whitespace-normalised text equals it |
 | `Locator::test_id("save-btn")` | `data-testid` attribute |
 | `Locator::css("#my-id")` | CSS selector |
 | `Locator::label("Email")` | Associated `<label>` text |
@@ -74,15 +74,21 @@ Locator::css("#counter")
 
 ### Refinement
 
-Chain `.and_text()`, `.and_role()`, `.and_tag()`, `.nth()`, `.first()`, `.last()` to narrow results.
+Chain `.and_text()`, `.and_role()`, `.and_tag()`, `.and_has_attribute()`, `.name()`, `.nth()`, `.first()`, `.last()` to narrow results.
+
+Locators are not strict: several matches use the first. A heading and a button can both say "Save", so write `Locator::role("button").and_text("Save")` when you mean the button. Actions pick among elements that are not hidden; reads, `count()` and most expectations also see hidden ones.
 
 ### Expectations
 
 `locator.expect(&mut client)` returns an expectation builder with:
-`to_be_visible()`, `to_be_hidden()`, `to_be_enabled()`, `to_be_disabled()`,
+`to_be_visible()`, `to_be_hidden()`, `to_be_enabled()`, `to_be_disabled()`, `to_be_focused()`,
+`to_be_checked()`, `to_be_unchecked()`, `to_be_attached()`, `to_be_detached()`,
 `to_have_text("...")`, `to_contain_text("...")`, `to_have_value("...")`,
-`to_have_role("...")`, `to_have_attribute("name", "value")`,
-`to_have_count(n)`, `to_have_bounds_near(...)`, `not()` (negate any).
+`to_have_attribute("name", "value")`, `to_have_count(n)`, `not()` (negate any).
+
+A missing element is waited for and then fails, negated or not. Only `to_be_hidden()`,
+`not().to_be_visible()`, `to_be_detached()`, `not().to_be_attached()` and `to_have_count(0)` are
+satisfied by absence. Errors (a dead app, an invalid selector) are always returned.
 
 ## Fluent Verification
 
@@ -116,6 +122,8 @@ let diff = client.screenshot_visual("dashboard", &opts).await?;
 assert!(diff.is_match(opts.threshold_percent));
 ```
 
+With no baseline yet, the screenshot is saved and `diff.baseline_created` is set: nothing was compared. In CI (`CI` is set) that is a failure unless `update_baselines` is on, so commit a baseline for each OS.
+
 ## IPC Coverage
 
 ```rust
@@ -132,7 +140,7 @@ let report = client.smoke_test().await?;
 report.assert_all_passed();
 ```
 
-Runs 11 checks: `eval_js` works, DOM snapshot valid, screenshot captures an image, windows exist, IPC integrity healthy, no uncaught errors, accessibility audit, DOM complete under the load budget, JS heap under the memory budget, recording lifecycle, and health endpoint hardened.
+Runs 11 checks: `eval_js` works, DOM snapshot valid, screenshot captures an image, windows exist, IPC integrity healthy, no uncaught errors, accessibility audit, DOM complete under the load budget, JS heap under the memory budget, recording lifecycle, and health endpoint hardened. The accessibility check fails only on critical violations and reports the rest in its detail; `assert_accessible()` is the strict form.
 
 ## Documentation
 

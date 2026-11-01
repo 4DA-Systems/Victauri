@@ -285,6 +285,9 @@ fn tauri_conf_identifier(dir: &std::path::Path) -> Option<String> {
 }
 
 const AMBIGUOUS_PREFIX: &str = "Multiple Victauri apps are running";
+/// How the error for "no app was discovered" starts. The CLI recognises this wording (with its
+/// full stop) to fall back to its built-in tool list.
+pub const NOTHING_DISCOVERED: &str = "No Victauri app is running";
 
 /// Pure core of [`try_resolve_connection`].
 fn resolve_from(
@@ -347,12 +350,18 @@ fn resolve_from(
                 format!(" Running apps:\n  {}", labels.join("\n  "))
             };
             Err(format!(
-                "No running Victauri app matches the app selector '{app}' (VICTAURI_APP / \
-                 --app: an exact bundle identifier or product name).{running}"
+                "No running Victauri app matches the app selector '{}' (VICTAURI_APP / \
+                 --app: an exact bundle identifier or product name).{running}",
+                crate::terminal::single_line(app)
             ))
         }
-        // Nothing discovered: the legacy default endpoint, with no token.
-        ([], None) => Ok((DEFAULT_PORT, None)),
+        // Nothing discovered. Every plugin since 0.7.4 writes discovery, so whatever holds the
+        // default port is not known to be a Victauri app: sending the call there would present
+        // its answers as the app's. `VICTAURI_PORT` is how to say otherwise.
+        ([], None) => Err(format!(
+            "{NOTHING_DISCOVERED}. Start the app in a debug build, or set VICTAURI_PORT to name \
+             its endpoint explicitly."
+        )),
         (many, _) => Err(ambiguity_message(many.iter().copied())),
     }
 }
@@ -558,7 +567,13 @@ impl DiscoveredServer {
             .as_deref()
             .or(self.product_name.as_deref())
             .unwrap_or("<unknown app>");
-        format!("{name} (port {}, pid {})", self.port, self.pid)
+        // The identifier comes from a project's `tauri.conf.json`: it reaches a terminal here.
+        format!(
+            "{} (port {}, pid {})",
+            crate::terminal::single_line(name),
+            self.port,
+            self.pid
+        )
     }
 }
 
@@ -1130,7 +1145,24 @@ mod tests {
             resolve_from(None, None, None, &servers[..1]),
             Ok((7373, Some("a".to_string())))
         );
-        assert_eq!(resolve_from(None, None, None, &[]), Ok((7373, None)));
+        // A label reaches a terminal, and its identifier comes from a project's tauri.conf.json.
+        let hostile = DiscoveredServer {
+            pid: 1,
+            port: 7373,
+            token: None,
+            identifier: Some("com.x\u{1b}]0;PWNED\u{7}\n::error::forged".to_string()),
+            product_name: None,
+        };
+        let label = hostile.label();
+        assert!(!label.chars().any(char::is_control), "{label:?}");
+        assert!(!label.lines().any(|l| l.starts_with("::")), "{label:?}");
+
+        // Nothing discovered: no call goes to whatever holds the default port.
+        let err = resolve_from(None, None, None, &[]).unwrap_err();
+        assert!(err.starts_with(NOTHING_DISCOVERED), "{err}");
+        assert!(err.contains("VICTAURI_PORT"), "{err}");
+        // An explicit port still reaches it.
+        assert_eq!(resolve_from(Some(7373), None, None, &[]), Ok((7373, None)));
     }
 
     /// Hand `path` to `NT AUTHORITY\SYSTEM` — the stand-in for "another user" (needs an

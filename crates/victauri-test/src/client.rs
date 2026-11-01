@@ -234,16 +234,28 @@ impl<'a> WaitForBuilder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns errors from [`VictauriClient::call_tool`].
+    /// Returns [`TestError::Timeout`] if the condition was not met in time, and errors from
+    /// [`VictauriClient::call_tool`]. (The tool itself reports a timeout as a result with
+    /// `ok: false`, which is what [`VictauriClient::wait_for`] hands back.)
     pub async fn run(self) -> Result<Value, TestError> {
-        self.client
+        let result = self
+            .client
             .wait_for(
                 &self.condition,
                 self.value.as_deref(),
                 Some(self.timeout_ms),
                 Some(self.poll_ms),
             )
-            .await
+            .await?;
+        if result.get("ok").and_then(Value::as_bool) == Some(true) {
+            Ok(result)
+        } else {
+            Err(TestError::Timeout(format!(
+                "condition \"{}\" was not met: {}",
+                self.condition,
+                crate::terminal::single_line(&result.to_string())
+            )))
+        }
     }
 }
 
@@ -260,7 +272,7 @@ impl<'a> WaitForBuilder<'a> {
 ///
 /// let mut client = VictauriClient::connect(7373).await.unwrap();
 /// let title = client.eval_js("document.title").await.unwrap();
-/// client.click("e3").await.unwrap();
+/// client.click("k3f9e3").await.unwrap(); // a ref from a snapshot or find_elements
 /// let snapshot = client.dom_snapshot().await.unwrap();
 /// ```
 pub struct VictauriClient {
@@ -557,15 +569,17 @@ impl VictauriClient {
     /// 1. `VICTAURI_PORT` (+ optional `VICTAURI_AUTH_TOKEN`) — the explicit endpoint
     /// 2. Per-process discovery directories (`<root>/<pid>/{port,token,metadata.json}`),
     ///    narrowed by `VICTAURI_APP` (exact bundle identifier or product name) when set
-    /// 3. Default: port 7373, no auth — only when no Victauri app is discovered at all
+    ///
+    /// With nothing discovered and no `VICTAURI_PORT`, this fails rather than try the default port:
+    /// whatever holds it would be sent the calls and have its answers taken for the app's.
     ///
     /// A `VICTAURI_AUTH_TOKEN` without `VICTAURI_PORT` is only sent to the running app whose
     /// own discovery token equals it — never to whatever holds the default port.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Other`] when discovery cannot pick one app (several are running
-    /// and nothing selects one, the selected app is not running, or an explicit token
+    /// Returns [`TestError::Other`] when discovery cannot pick one app (none is running, several
+    /// are and nothing selects one, the selected app is not running, or an explicit token
     /// matches no running app) — the message names the running apps and how to select one.
     /// Returns [`TestError::Connection`] if the server is unreachable or returns a
     /// non-success status. Returns [`TestError::Request`] on HTTP transport failures.
@@ -585,8 +599,14 @@ impl VictauriClient {
         // entries of dead apps as a side effect, so the diagnosis must be captured first
         // to explain a subsequent failure.
         let diagnosis = crate::discovery::diagnose_discovery();
-        let (port, token) =
-            crate::discovery::try_resolve_connection(app).map_err(TestError::Other)?;
+        let (port, token) = crate::discovery::try_resolve_connection(app).map_err(|why| {
+            TestError::Other(match diagnosis.hint() {
+                Some(hint) if why.starts_with(crate::discovery::NOTHING_DISCOVERED) => {
+                    format!("{why}\n\n  Discovery diagnosis: {hint}")
+                }
+                _ => why,
+            })
+        })?;
         match Self::connect_with_token(port, token.as_deref()).await {
             Ok(mut client) => {
                 client.discovered = true;
@@ -1085,11 +1105,13 @@ impl VictauriClient {
     }
 
     /// Deterministically scrub the target's animation to `points` evenly-spaced
-    /// steps, returning the geometry curve (and a filmstrip when `capture`).
+    /// steps, returning the geometry curve. With `capture`, the filmstrip PNG is added under
+    /// `image` (`{type, data, mimeType}`) beside the curve and its `filmstrip` manifest.
     ///
     /// # Errors
     ///
-    /// Returns errors from [`VictauriClient::call_tool`].
+    /// Returns [`TestError::ToolError`] if the tool reports a failure, and transport errors from
+    /// [`VictauriClient::call_tool_raw`].
     pub async fn animation_scrub(
         &mut self,
         selector: Option<&str>,
@@ -1100,7 +1122,24 @@ impl VictauriClient {
         if let Some(s) = selector {
             args["selector"] = json!(s);
         }
-        self.call_tool("animation", args).await
+        // Not `call_tool`: it keeps the first content block, and with a capture that is the image,
+        // which loses the curve this method exists to return.
+        let result = self.call_tool_raw("animation", args).await?;
+        let blocks = result["content"].as_array().cloned().unwrap_or_default();
+        let text = blocks.iter().find_map(|block| block["text"].as_str());
+        if result.get("isError").and_then(Value::as_bool) == Some(true) {
+            return Err(TestError::ToolError(text.unwrap_or_default().to_string()));
+        }
+        let mut out = text
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .unwrap_or_else(|| json!({}));
+        if let (Some(fields), Some(image)) = (
+            out.as_object_mut(),
+            blocks.iter().find(|block| block["type"] == "image"),
+        ) {
+            fields.insert("image".to_string(), image.clone());
+        }
+        Ok(out)
     }
 
     /// Arm the real-time motion recorder. Trigger the animation, then call
@@ -1259,7 +1298,8 @@ impl VictauriClient {
         .await
     }
 
-    /// Get the IPC call log.
+    /// Get the IPC call log. `None` means the tool's default, the newest 100 calls: pass a limit
+    /// (the bridge keeps up to 1000) for anything that must not miss an older call.
     ///
     /// # Errors
     ///
@@ -1327,12 +1367,43 @@ impl VictauriClient {
         self.call_tool("check_ipc_integrity", json!({})).await
     }
 
-    /// Run a semantic assertion against a JS expression.
+    /// Assert a semantic condition on a JS expression: it fails when the condition does not hold.
+    /// [`Self::evaluate_semantic`] returns the verdict instead.
+    ///
+    /// `equals` and `not_equals` follow `victauri_core::verification::json_values_equal`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TestError::Assertion`] if the condition does not hold, and errors from
+    /// [`VictauriClient::call_tool`].
+    pub async fn assert_semantic(
+        &mut self,
+        expression: &str,
+        label: &str,
+        condition: &str,
+        expected: Value,
+    ) -> Result<Value, TestError> {
+        let result = self
+            .evaluate_semantic(expression, label, condition, expected)
+            .await?;
+        if result.get("passed").and_then(Value::as_bool) == Some(true) {
+            Ok(result)
+        } else {
+            Err(TestError::Assertion(format!(
+                "semantic assertion '{}' failed: {}",
+                crate::terminal::single_line(label),
+                crate::terminal::single_line(&result.to_string())
+            )))
+        }
+    }
+
+    /// Evaluate a semantic condition on a JS expression and return the verdict
+    /// (`{label, passed, actual, expected, message}`), whichever way it went.
     ///
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
-    pub async fn assert_semantic(
+    pub async fn evaluate_semantic(
         &mut self,
         expression: &str,
         label: &str,
@@ -1483,6 +1554,9 @@ impl VictauriClient {
     ///
     /// Conditions: `text`, `text_gone`, `selector`, `selector_gone`, `url`,
     /// `ipc_idle`, `network_idle`.
+    ///
+    /// A timeout is NOT an error here: the result is `{ ok: false, error, elapsed_ms }`, so check
+    /// `ok`. [`Self::wait`] and [`Self::expect_text`] return an error instead.
     ///
     /// # Errors
     ///
@@ -1846,7 +1920,9 @@ impl VictauriClient {
     /// Returns errors from [`VictauriClient::call_tool`].
     #[deprecated(since = "0.2.0", note = "renamed to get_ipc_calls_for")]
     pub async fn get_ipc_calls(&mut self, command: &str) -> Result<Vec<Value>, TestError> {
-        let log = self.get_ipc_log(None).await?;
+        let log = self
+            .get_ipc_log(Some(crate::assertions::LOG_WINDOW))
+            .await?;
         let entries = if let Some(arr) = log.as_array() {
             arr.clone()
         } else if let Some(entries) = log.get("entries").and_then(Value::as_array) {
@@ -2333,10 +2409,17 @@ impl VictauriClient {
     /// Returns [`TestError::ElementNotFound`] if no element has the given id.
     /// Returns other errors from [`VictauriClient::call_tool`].
     pub async fn text_by_id(&mut self, id: &str) -> Result<String, TestError> {
-        let snap = self.snapshot_json().await?;
-        let tree = &snap["tree"];
-        find_text_by_attr_id(tree, id)
-            .ok_or_else(|| TestError::ElementNotFound(format!("id=\"{id}\"")))
+        // Found through the snapshot, read through the ref: the snapshot's `text` is the element's
+        // direct text only, which is "" for `<p id=x><span>hello</span></p>`.
+        let ref_id = self.find_ref_by_id(id).await?;
+        let code = crate::locator::element_script(&ref_id, "return el.textContent || \"\";");
+        match self.eval_js(&code).await? {
+            Value::String(text) => Ok(text),
+            Value::Null => Ok(String::new()),
+            _ => Err(TestError::ElementNotFound(format!(
+                "id=\"{id}\" (the element went stale before it could be read)"
+            ))),
+        }
     }
 
     // ── Internal helpers for high-level API ─────────────────────────────────
@@ -2381,15 +2464,15 @@ impl VictauriClient {
 
     /// Create a [`Locator`](crate::Locator) matching elements by ARIA role.
     ///
-    /// Equivalent to Playwright's `page.getByRole()`.
+    /// Like Playwright's `page.getByRole()`, but not strict: see [`Locator`](crate::Locator).
     #[must_use]
     pub fn get_by_role(&self, role: &str) -> crate::locator::Locator {
         crate::locator::Locator::role(role)
     }
 
-    /// Create a [`Locator`](crate::Locator) matching elements by visible text content.
+    /// Create a [`Locator`](crate::Locator) matching the deepest elements containing a text.
     ///
-    /// Equivalent to Playwright's `page.getByText()`.
+    /// Like Playwright's `page.getByText()`, but not strict: see [`Locator`](crate::Locator).
     #[must_use]
     pub fn get_by_text(&self, text: &str) -> crate::locator::Locator {
         crate::locator::Locator::text(text)
@@ -2571,26 +2654,6 @@ fn find_in_tree_by_attr_id(node: &Value, id: &str) -> Option<String> {
     None
 }
 
-fn find_text_by_attr_id(node: &Value, id: &str) -> Option<String> {
-    if node
-        .get("attributes")
-        .and_then(|a| a.get("id"))
-        .and_then(Value::as_str)
-        == Some(id)
-    {
-        let text = node.get("text").and_then(Value::as_str).unwrap_or("");
-        return Some(text.to_string());
-    }
-    if let Some(children) = node.get("children").and_then(Value::as_array) {
-        for child in children {
-            if let Some(found) = find_text_by_attr_id(child, id) {
-                return Some(found);
-            }
-        }
-    }
-    None
-}
-
 // ── Assertion Helpers ────────────────────────────────────────────────────────
 
 /// Assert that a JSON value at the given pointer equals the expected value.
@@ -2650,28 +2713,33 @@ pub fn assert_json_truthy(value: &Value, pointer: &str) {
     );
 }
 
-/// Assert that an accessibility audit has zero violations.
+/// Assert that an accessibility audit has zero violations, of any severity.
 ///
 /// # Panics
 ///
-/// Panics if the audit contains any violations.
+/// Panics if the audit contains any violations, or has no `violations` list to count.
 ///
 /// # Examples
 ///
 /// ```
 /// use serde_json::json;
 ///
-/// let audit = json!({"summary": {"violations": 0, "passes": 12}});
+/// let audit = json!({
+///     "violations": [],
+///     "warnings": [],
+///     "summary": {"critical": 0, "serious": 0, "moderate": 0, "minor": 0, "total": 0}
+/// });
 /// victauri_test::assert_no_a11y_violations(&audit);
 /// ```
 pub fn assert_no_a11y_violations(audit: &Value) {
-    let violations = audit
-        .pointer("/summary/violations")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(u64::MAX);
-    assert_eq!(
-        violations, 0,
-        "expected 0 accessibility violations, got {violations}"
+    let Some(violations) = audit.get("violations").and_then(Value::as_array) else {
+        panic!("accessibility audit has no `violations` list: {audit}");
+    };
+    assert!(
+        violations.is_empty(),
+        "expected 0 accessibility violations, got {}: {}",
+        violations.len(),
+        serde_json::to_string_pretty(violations).unwrap_or_default()
     );
 }
 
@@ -2714,7 +2782,19 @@ pub fn assert_performance_budget(metrics: &Value, max_load_ms: f64, max_heap_mb:
     }
 }
 
-/// Assert that IPC integrity is healthy (no stale or errored calls).
+/// Whether a `check_ipc_integrity` result means anything good: the tool's verdict (no stale calls;
+/// an errored call is a sound round trip), and not the "healthy" of a page whose IPC Victauri
+/// reports it cannot see.
+pub fn ipc_integrity_is_healthy(integrity: &Value) -> bool {
+    integrity.get("healthy").and_then(Value::as_bool) == Some(true)
+        && integrity
+            .pointer("/ipc_capture/capture")
+            .and_then(Value::as_str)
+            != Some("none")
+}
+
+/// Assert that IPC integrity is healthy: no call was left without a response, and Victauri can
+/// observe the page's IPC. Errored calls are sound round trips and do not fail this.
 ///
 /// # Panics
 ///
@@ -2725,16 +2805,15 @@ pub fn assert_performance_budget(metrics: &Value, max_load_ms: f64, max_heap_mb:
 /// ```
 /// use serde_json::json;
 ///
-/// let integrity = json!({"healthy": true, "stale_calls": 0, "error_calls": 0});
+/// let integrity = json!({
+///     "healthy": true, "total_calls": 3, "pending_count": 0, "stale_count": 0,
+///     "error_count": 1, "stale_calls": [], "errored_calls": [{"command": "save"}]
+/// });
 /// victauri_test::assert_ipc_healthy(&integrity);
 /// ```
 pub fn assert_ipc_healthy(integrity: &Value) {
-    let healthy = integrity
-        .get("healthy")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
     assert!(
-        healthy,
+        ipc_integrity_is_healthy(integrity),
         "IPC integrity check failed: {}",
         serde_json::to_string_pretty(integrity).unwrap_or_default()
     );
