@@ -129,6 +129,8 @@ export class VictauriClient {
   private refreshing = false;
   /** Which `startPolling` is current: a poll left over from an earlier one is ignored. */
   private pollGeneration = 0;
+  /** Which `connect` is current: a `disconnect` or a newer connect leaves an older one stale. */
+  private connectGeneration = 0;
   private readonly onStateChange = new vscode.EventEmitter<ConnectionState>();
   private readonly onDataUpdate = new vscode.EventEmitter<void>();
 
@@ -160,6 +162,7 @@ export class VictauriClient {
   }
 
   async connect(port: number, authToken?: string, options: ConnectOptions = {}): Promise<void> {
+    const generation = ++this.connectGeneration;
     this.pointAt(port, authToken ?? "");
     this.identifier = options.identifier;
     this.discover = options.discover;
@@ -176,17 +179,21 @@ export class VictauriClient {
       // so a wrong/missing token fails here instead of every refresh 401-ing
       // silently afterwards.
       await this.probeAuthenticated();
+      if (generation !== this.connectGeneration) return;
       this.setState("connected");
       await this.refreshAll();
       // The user may have pressed Disconnect during that first load.
       if (this.state === "connected") this.startPolling();
     } catch (e) {
+      // What failed was a connect the user already walked away from.
+      if (generation !== this.connectGeneration) return;
       this.setState("disconnected");
       throw e;
     }
   }
 
   disconnect(): void {
+    this.connectGeneration++;
     this.stopPolling();
     // Nothing is sent from here until the next connect: an open screenshot panel still has a
     // Refresh button.
