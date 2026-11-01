@@ -49,7 +49,8 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   gains `attribute`, `attribute_value`, `text_exact` and `include_hidden`.
 - Actionability: SVG, `opacity:0` styled controls, MUI wrappers, labels, disabled fieldsets, shadow DOM events,
   contenteditable and same-origin iframes. An element whose hit is its ancestor counts as covered, including closed
-  accordions, `.sr-only` and `::after` overlays; only SVG and wrapped inline elements that are not clipped are exempt.
+  accordions, `.sr-only` and `::after` overlays, unless it is SVG or wrapped inline content still visible, the content
+  of a control such as a `.stretched-link`, or partly clipped with its visible part reachable.
 - A bridge call or log read on a page with no bridge is a tool error; it used to answer `undefined` or an empty list
   as a success.
 - `type_text` no longer corrupts number and date inputs. Log entries are bounded. Scrubbing restores the

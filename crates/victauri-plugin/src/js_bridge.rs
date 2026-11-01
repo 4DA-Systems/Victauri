@@ -921,19 +921,34 @@ const INIT_SCRIPT_BODY: &str = r#"
         var lines = typeof el.getClientRects === 'function' ? el.getClientRects() : null;
         return !!lines && lines.length > 1;
     }
-    // Whether the ancestors of `el`, up to and including `top`, clip its box to nothing.
-    function clippedAwayBelow(top, el, win) {
+    // What is left of `el` after the ancestors up to and including `top` clip it: its centre, or
+    // null when nothing a user could see remains. Clipping is to the padding box, so a border or
+    // padding on a closed accordion does not count as room.
+    function visibleCentreBelow(top, el, win) {
         var r = el.getBoundingClientRect();
         var left = r.left, right = r.right, y0 = r.top, y1 = r.bottom;
         for (var n = el; n && n !== top;) {
             n = n.assignedSlot || n.parentNode || n.host;
             if (!n || n.nodeType !== 1) continue;
             var cs = win.getComputedStyle(n);
+            if ((cs.clip && cs.clip !== 'auto') || (cs.clipPath && cs.clipPath !== 'none')) return null;
+            // `overflow` does not apply to an inline box, whose client size reads 0.
+            if (cs.display === 'inline') continue;
             var box = n.getBoundingClientRect();
-            if (cs.overflowX && cs.overflowX !== 'visible') { left = Math.max(left, box.left); right = Math.min(right, box.right); }
-            if (cs.overflowY && cs.overflowY !== 'visible') { y0 = Math.max(y0, box.top); y1 = Math.min(y1, box.bottom); }
+            var inX = box.left + (n.clientLeft || 0), inY = box.top + (n.clientTop || 0);
+            if (cs.overflowX && cs.overflowX !== 'visible') { left = Math.max(left, inX); right = Math.min(right, inX + n.clientWidth); }
+            if (cs.overflowY && cs.overflowY !== 'visible') { y0 = Math.max(y0, inY); y1 = Math.min(y1, inY + n.clientHeight); }
         }
-        return left >= right || y0 >= y1;
+        if (right - left <= 1 || y1 - y0 <= 1) return null;
+        return { x: (left + right) / 2, y: (y0 + y1) / 2 };
+    }
+    // A control that a click on its content operates, whatever paints on top inside it (a
+    // `.stretched-link` or ripple `::after` is hit as the control).
+    function isOperableControl(el) {
+        var tag = el.tagName;
+        if (tag === 'BUTTON' || tag === 'SUMMARY' || (tag === 'A' && elAttr(el, 'href') !== null)) return true;
+        var role = elAttr(el, 'role');
+        return role === 'button' || role === 'link';
     }
     function checkActionable(el) {
         if (!el || !el.isConnected) return { error: 'element is detached from DOM', hint: 'RETRY_LATER' };
@@ -986,11 +1001,17 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (!hitCovers(lineHit, el)) return null;
             }
         }
-        // What does not paint its own centre (a stroke-only circle, a `<g>` with an empty centre,
-        // a line gap) is hit as its ancestor, unless it was clipped away. Nothing else gets this
-        // pass: a button in a closed accordion, under its parent's `::after`, or behind its parent
-        // is hit as that ancestor too, and there the ancestor really is what a click would reach.
-        if (hitCovers(topEl, el) && composedContains(topEl, el) && paintsOffCentre(el) && !clippedAwayBelow(topEl, el, win)) return null;
+        // An ancestor at the point, with `el` still visible below it. What does not paint its own
+        // centre (a stroke-only circle, a `<g>` with an empty centre, a line gap) and the content of
+        // a control pass. Anything else passes only if its visible part is what a click would hit:
+        // a button under its parent's `::after`, or behind its parent, is not.
+        if (hitCovers(topEl, el) && composedContains(topEl, el)) {
+            var shown = visibleCentreBelow(topEl, el, win);
+            if (shown) {
+                if (paintsOffCentre(el) || isOperableControl(topEl)) return null;
+                if (!hitCovers(deepElementFromPoint(doc, shown.x, shown.y), el)) return null;
+            }
+        }
         if (hitCovers(topEl, el)) {
             var tag = topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
             var info = tag;

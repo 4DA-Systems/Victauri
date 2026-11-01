@@ -1120,7 +1120,8 @@ fn trusted_probe_matches_the_actionability_rules() {
 fn an_ancestor_hit_is_cover_except_for_what_paints_off_centre() {
     const RECTS: &str = r"
         function box(el, x, y, w, h) { el.getBoundingClientRect = function() {
-            return { left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, x: x, y: y }; }; }
+            return { left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, x: x, y: y }; };
+            Object.defineProperty(el, 'clientWidth', { value: w, configurable: true }); Object.defineProperty(el, 'clientHeight', { value: h, configurable: true }); }
     ";
     const LINES: &str = r"$('#l').getClientRects = function() { return [
         { left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16 },
@@ -1196,7 +1197,71 @@ fn an_ancestor_hit_is_cover_except_for_what_paints_off_centre() {
         var r = await B.click(refOf('#l'), 150);
         T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
     );
+    // The deepest text match inside a control whose `::after` covers it.
+    let content_of_a_control = format!(
+        r"{RECTS}
+        box($('#b'), 0, 0, 200, 40); box($('#s'), 50, 10, 40, 20);
+        var n = 0; $('#b').onclick = function() {{ n++; }};
+        document.elementFromPoint = function() {{ return $('#b'); }};
+        var r = await B.click(refOf('#s'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    );
+    let content_of_a_closed_control = format!(
+        r"{RECTS}
+        box($('#b'), 0, 0, 200, 0); box($('#s'), 50, 10, 40, 20);
+        document.elementFromPoint = function() {{ return $('#b'); }};
+        var r = await B.click(refOf('#s'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
+    );
+    // A border is not room: only the padding box shows anything.
+    let svg_in_a_bordered_closed_box = format!(
+        r"{RECTS}
+        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 2); box($('#s'), 50, 50, 20, 20);
+        Object.defineProperty($('#c'), 'clientHeight', {{ value: 0 }});
+        document.elementFromPoint = function() {{ return $('#a'); }};
+        var r = await B.click(refOf('#s'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
+    );
+    let svg_under_a_clip = format!(
+        r"{RECTS}
+        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 200); box($('#s'), 50, 50, 20, 20);
+        document.elementFromPoint = function() {{ return $('#a'); }};
+        var r = await B.click(refOf('#s'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
+    );
+    // Partly visible: the visible part is what a user clicks.
+    let partly_clipped_button = format!(
+        r"{RECTS}
+        box($('#c'), 0, 0, 40, 40); box($('#b'), 0, 0, 100, 40);
+        var n = 0; $('#b').onclick = function() {{ n++; }};
+        document.elementFromPoint = function(x) {{ return x < 40 ? $('#b') : $('#c'); }};
+        var r = await B.click(refOf('#b'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    );
     check(&[
+        (
+            "content_of_a_control_hit_as_the_control",
+            "<button id=b><span id=s>Save</span></button>",
+            &content_of_a_control,
+        ),
+        (
+            "content_of_a_control_in_a_closed_box",
+            "<button id=b style='overflow-y:hidden'><span id=s>Save</span></button>",
+            &content_of_a_closed_control,
+        ),
+        (
+            "svg_in_a_bordered_closed_box",
+            "<div id=a><div id=c style='overflow-y:hidden'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
+            &svg_in_a_bordered_closed_box,
+        ),
+        (
+            "svg_under_a_clip_path",
+            "<div id=a><div id=c style='clip-path:inset(50%)'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
+            &svg_under_a_clip,
+        ),
+        (
+            "partly_clipped_button",
+            "<div id=c style='overflow-x:clip'><button id=b>x</button></div>",
+            &partly_clipped_button,
+        ),
         (
             "plain_button_under_its_ancestor",
             "<div id=a><button id=b>x</button></div>",

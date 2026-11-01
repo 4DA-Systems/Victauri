@@ -5411,12 +5411,11 @@ impl VictauriMcpHandler {
             )
             .await
         {
-            Ok(result) => {
-                return match self.missing_bridge_error(&result, label).await {
-                    Some(refused) => refused,
-                    None => CallToolResult::success(vec![ContentBlock::text(result)]),
-                };
-            }
+            // A page with no bridge cannot run `history.back()`: that is what the recovery is for.
+            Ok(result) => match self.missing_bridge_error(&result, label).await {
+                Some(_) => "the page has no Victauri bridge".to_string(),
+                None => return CallToolResult::success(vec![ContentBlock::text(result)]),
+            },
             Err(f) if f.kind == EvalFailureKind::NotSent && f.message.contains(BRIDGE_DOWN) => {
                 f.message
             }
@@ -5459,8 +5458,8 @@ impl VictauriMcpHandler {
             "ok": true,
             "recovered": true,
             "url": target,
-            "note": "the page was not answering, so history.back() could not run; navigated \
-                     natively to the last known URL inside the app",
+            "note": "the page could not run history.back(), because it was not answering or has \
+                     no bridge; navigated natively to the last known URL inside the app",
         }))
     }
 

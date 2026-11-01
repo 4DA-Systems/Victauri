@@ -2724,7 +2724,9 @@ mod tests {
             "SELECT 1,/* c */$a(') ; SELECT 2 --'",
         ] {
             assert_eq!(statement_count(two), 2, "{two}");
-            let first = conn.prepare(two).expect(two);
+            // Only the first statement: from rusqlite 0.41 `prepare` refuses a trailing one.
+            let (head, _) = two.split_once(';').expect(two);
+            let first = conn.prepare(head).expect(two);
             assert_eq!(first.parameter_name(1), Some("$a(')"), "{two}");
         }
         // Straight after a string or a comment, too: neither is a word for `$` to continue.

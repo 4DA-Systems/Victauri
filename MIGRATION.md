@@ -84,7 +84,9 @@ parsed `e<digits>` must stop.
   `type_text` over 20,000 characters errors. `select_option` errors for unknown or disabled values and
   fires `input` before `change`; `values:[]` clears a multi-select. `opacity:0` elements are actionable;
   a click lands on the hit descendant; an ancestor on top counts as covering, after one scroll attempt,
-  except a label operating that control and an SVG or wrapped inline element still visibly inside it.
+  except a label operating that control, an SVG or wrapped inline element still visibly inside it, the
+  content of a control hit as that control, and an element whose visible part is what a click reaches.
+  A control with a hole at its centre (`clip-path`) is reported covered.
   Keyboard events carry `code`, `keyCode` and `which`.
 - **Snapshots** list `opacity:0` elements (`[transparent]`) and visible children of `visibility:hidden`
   parents.

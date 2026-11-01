@@ -593,7 +593,6 @@ async fn a_page_without_the_bridge_is_an_error_for_every_bridge_call() {
             json!({"action": "fill", "ref_id": "k3f9e1", "value": "x"}),
         ),
         ("input", json!({"action": "press_key", "key": "Enter"})),
-        ("navigate", json!({"action": "go_back"})),
         ("inspect", json!({"action": "audit_accessibility"})),
         (
             "storage",
@@ -636,6 +635,26 @@ async fn a_page_without_the_bridge_is_an_error_for_every_bridge_call() {
     let h = handler(&st, &bridge);
     let r = call(&h, "inspect", json!({"action": "clear_highlights"})).await;
     assert_ne!(r.is_error, Some(true), "{}", text(&r));
+}
+
+/// A page with no bridge cannot run `history.back()`, so `go_back` recovers natively rather than
+/// report that back ran.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn go_back_on_a_page_without_the_bridge_recovers() {
+    let st = state();
+    let bridge = AppBridge::new(
+        &st,
+        Arc::new(|script: &str| {
+            Some(if script.contains("!!window.__VICTAURI__") {
+                "false".to_string()
+            } else {
+                "undefined".to_string()
+            })
+        }),
+    );
+    let h = handler(&st, &bridge);
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert_eq!(out["recovered"], true, "{out}");
 }
 
 /// `window.__VICTAURI__?.…` on a page without the bridge answers `undefined`.
