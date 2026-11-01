@@ -109,7 +109,7 @@ pub async fn coverage_report(client: &mut VictauriClient) -> Result<CoverageRepo
     };
     let Some(coverage) = plugin else {
         let ipc_log = client
-            .get_ipc_log(Some(crate::assertions::LOG_WINDOW))
+            .logs_without_bodies("ipc", crate::assertions::LOG_WINDOW)
             .await?;
         let mut report = build_report(&registered, &extract_ipc_commands(&ipc_log))?;
         report.note = Some(

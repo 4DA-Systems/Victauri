@@ -1186,8 +1186,7 @@ async fn cmd_check(junit_path: Option<&Path>, target: &AppTarget) -> Result<()> 
         .context("memory stats failed")?;
     let rss = mem
         .get("working_set_bytes")
-        .or_else(|| mem.get("rss_bytes"))
-        .or_else(|| mem.get("rss"))
+        .or_else(|| mem.get("resident_bytes"))
         .and_then(serde_json::Value::as_u64);
     if let Some(bytes) = rss {
         let mb = bytes as f64 / 1_048_576.0;

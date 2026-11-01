@@ -139,8 +139,8 @@ pub struct PluginInfo {
     /// Tool details (nested object with `total`, `enabled`, etc.).
     #[serde(default)]
     pub tools: PluginToolInfo,
-    /// Number of tools — derived from `tools.total` if present, else top-level
-    /// `tool_count` for backwards compatibility.
+    /// Number of tools: `tools.total` when [`VictauriClient::plugin_info`] read one, else a
+    /// top-level `tool_count`, which a plugin old enough may send.
     #[serde(default)]
     pub tool_count: usize,
 }
@@ -159,6 +159,10 @@ pub struct PluginToolInfo {
 
 /// Structured process memory statistics returned by [`VictauriClient::memory_stats`].
 ///
+/// The field names are Windows'. On Linux and macOS the plugin reports `resident_bytes` and
+/// `peak_resident_bytes` / `resident_max_bytes`, which are read into the same fields; in the raw
+/// JSON of [`VictauriClient::get_memory_stats`] they keep those names.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -169,9 +173,11 @@ pub struct PluginToolInfo {
 #[derive(Debug, Clone, Deserialize)]
 #[non_exhaustive]
 pub struct MemoryStats {
-    /// Current working set size in bytes.
+    /// Current working set (resident) size in bytes.
+    #[serde(alias = "resident_bytes")]
     pub working_set_bytes: u64,
-    /// Peak working set size in bytes, if available.
+    /// Peak working set (resident) size in bytes, if available.
+    #[serde(alias = "peak_resident_bytes", alias = "resident_max_bytes")]
     pub peak_working_set_bytes: Option<u64>,
 }
 
@@ -1312,6 +1318,21 @@ impl VictauriClient {
         self.call_tool("logs", args).await
     }
 
+    /// Read `logs {action}` without request/response bodies and args, for reads that need only
+    /// names, urls, statuses and timestamps: 1000 entries with bodies can exceed the tool's result
+    /// cap on a busy app. A plugin too old to know `bodies` ignores it and sends them anyway.
+    pub(crate) async fn logs_without_bodies(
+        &mut self,
+        action: &str,
+        limit: usize,
+    ) -> Result<Value, TestError> {
+        self.call_tool(
+            "logs",
+            json!({"action": action, "limit": limit, "bodies": false}),
+        )
+        .await
+    }
+
     /// Verify frontend state against backend state.
     ///
     /// # Errors
@@ -2060,9 +2081,15 @@ impl VictauriClient {
         // length: the log tools serve a capped sliding window, so a length
         // snapshot breaks (always-empty `calls_since`) once the app has logged
         // more calls than the cap. Timestamps are window-position-independent.
-        let entries = self.ipc_log_entries().await?;
+        let log = self
+            .logs_without_bodies("ipc", crate::assertions::LOG_WINDOW)
+            .await?;
+        let entries = log
+            .as_array()
+            .or_else(|| log.get("entries").and_then(Value::as_array));
         let checkpoint_ms = entries
-            .iter()
+            .into_iter()
+            .flatten()
             .filter_map(|e| e.get("timestamp").and_then(Value::as_u64))
             .max()
             .unwrap_or(0);
@@ -2083,8 +2110,12 @@ impl VictauriClient {
     /// Returns other errors from [`VictauriClient::call_tool`].
     pub async fn plugin_info(&mut self) -> Result<PluginInfo, TestError> {
         let value = self.get_plugin_info().await?;
-        serde_json::from_value(value)
-            .map_err(|e| TestError::Other(format!("failed to deserialize PluginInfo: {e}")))
+        let mut info: PluginInfo = serde_json::from_value(value)
+            .map_err(|e| TestError::Other(format!("failed to deserialize PluginInfo: {e}")))?;
+        if info.tools.total > 0 {
+            info.tool_count = info.tools.total;
+        }
+        Ok(info)
     }
 
     /// Read process memory statistics as a typed [`MemoryStats`] struct.
@@ -2744,6 +2775,10 @@ pub fn assert_no_a11y_violations(audit: &Value) {
 }
 
 /// Assert that all performance metrics are within budget.
+///
+/// Judges only what `metrics` measured: a missing `js_heap.used_mb` (`performance.memory` does not
+/// exist on `WebKit`) or a `load_event_ms` of 0 (the page has not finished loading) is not checked.
+/// The smoke suite reports those as skipped.
 ///
 /// # Panics
 ///

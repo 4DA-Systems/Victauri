@@ -46,11 +46,7 @@ async fn soak_eval_and_snapshot() {
     let mut find_times = Vec::new();
     let mut memory_samples = Vec::new();
 
-    let initial_memory = client.get_memory_stats().await.unwrap();
-    let initial_ws = initial_memory
-        .get("working_set_bytes")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+    let initial_ws = client.memory_stats().await.unwrap().working_set_bytes;
     eprintln!(
         "soak test starting — duration: {}s, initial memory: {:.1} MB",
         duration.as_secs(),
@@ -94,12 +90,9 @@ async fn soak_eval_and_snapshot() {
         }
 
         if iteration.is_multiple_of(100)
-            && let Ok(stats) = client.get_memory_stats().await
+            && let Ok(stats) = client.memory_stats().await
         {
-            let ws = stats
-                .get("working_set_bytes")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
+            let ws = stats.working_set_bytes;
             memory_samples.push(ws);
             eprintln!(
                 "  [{:.0}s] iteration {iteration}, memory: {:.1} MB, eval p50: {:.1}ms",
@@ -112,11 +105,7 @@ async fn soak_eval_and_snapshot() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let final_memory = client.get_memory_stats().await.unwrap();
-    let final_ws = final_memory
-        .get("working_set_bytes")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
+    let final_ws = client.memory_stats().await.unwrap().working_set_bytes;
 
     eprintln!("\n=== SOAK TEST REPORT ===");
     eprintln!("Duration: {:.0}s", start.elapsed().as_secs_f64());

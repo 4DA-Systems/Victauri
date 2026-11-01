@@ -614,7 +614,12 @@ async fn has_text_reads_the_page_not_the_snapshot_json() {
 #[tokio::test]
 async fn has_no_text_fails_closed_without_a_page() {
     let (mut c, _) = client(Arc::new(|_, _| Ok("null".to_string()))).await;
-    assert!(c.verify().has_no_text("Error").run().await.is_err());
+    let report = c.verify().has_no_text("Error").run().await.unwrap();
+    assert!(!report.all_passed());
+    assert!(
+        report.results[0].detail.contains("could not read"),
+        "{report:?}"
+    );
 }
 
 // ── Waits and semantic assertions ───────────────────────────────────────────
@@ -884,4 +889,423 @@ async fn animation_scrub_with_capture_keeps_the_curve() {
     let r = c.animation_scrub(Some("#x"), 6, true).await.unwrap();
     assert_eq!(r["curve"][0]["tx"], 1, "{r}");
     assert_eq!(r["image"]["data"], "AAAA", "{r}");
+}
+
+// ── Checks that measured nothing, and checks that threw the report away ─────
+
+/// `check_ipc_integrity` as the tool returns it, with the bridge's `getIpcCaptureStatus`.
+fn integrity_with_capture(capture: &str) -> String {
+    json!({"healthy":true,"total_calls":0,"pending_count":0,"stale_count":0,"error_count":0,
+           "stale_calls":[],"errored_calls":[],"warning":null,
+           "ipc_capture":{"transport":"post_message_fallback","capture":capture,
+                          "note":"the IPC log is BLIND to calls made since the switch"}})
+    .to_string()
+}
+
+/// `detect_ghost_commands` with nothing found, as `build_ghost_report` + `ipc_capture` return it.
+fn ghost_report_with_capture(capture: &str) -> String {
+    json!({"confirmed_ghosts":[],"verified_handlers":0,"frontend_only":[],"post_message_only":[],
+           "excluded_builtins":[],"registry_only":[],"total_frontend_commands":0,
+           "total_registry_commands":0,"reliability":"none","note":"",
+           "ipc_capture":{"transport":"post_message_fallback","capture":capture,
+                          "note":"the IPC log is BLIND to calls made since the switch"}})
+    .to_string()
+}
+
+fn blind_page(capture: &'static str) -> Handler {
+    Arc::new(move |name, _| match name {
+        "logs" => Ok("[]".to_string()),
+        "check_ipc_integrity" => Ok(integrity_with_capture(capture)),
+        "detect_ghost_commands" => Ok(ghost_report_with_capture(capture)),
+        _ => Ok("0".to_string()),
+    })
+}
+
+#[tokio::test]
+async fn ipc_was_not_called_cannot_pass_on_a_page_whose_ipc_is_unobservable() {
+    let (mut c, _) = client(blind_page("none")).await;
+    let report = c.verify().ipc_was_not_called("x").run().await.unwrap();
+    assert!(!report.all_passed());
+    assert!(report.results[0].detail.contains("BLIND"), "{report:?}");
+
+    let (mut c, _) = client(blind_page("full")).await;
+    let report = c.verify().ipc_was_not_called("x").run().await.unwrap();
+    assert!(report.all_passed(), "{report:?}");
+}
+
+#[tokio::test]
+async fn no_ghost_commands_cannot_pass_on_a_page_whose_ipc_is_unobservable() {
+    let (mut c, _) = client(blind_page("none")).await;
+    let report = c.verify().no_ghost_commands().run().await.unwrap();
+    assert!(!report.all_passed());
+    assert!(report.results[0].detail.contains("BLIND"), "{report:?}");
+
+    // Requests are seen but not outcomes: passes, saying what it could not confirm.
+    let (mut c, _) = client(blind_page("requests_only")).await;
+    let report = c.verify().no_ghost_commands().run().await.unwrap();
+    assert!(report.all_passed(), "{report:?}");
+    assert!(
+        report.results[0].detail.contains("requests_only"),
+        "{report:?}"
+    );
+
+    let (mut c, _) = client(blind_page("full")).await;
+    let report = c.verify().no_ghost_commands().run().await.unwrap();
+    assert!(
+        report.all_passed() && report.results[0].detail.is_empty(),
+        "{report:?}"
+    );
+}
+
+#[tokio::test]
+async fn memory_stats_reads_every_platforms_keys() {
+    for stats in [
+        // memory.rs: Windows.
+        json!({"working_set_bytes":5,"peak_working_set_bytes":9,"page_file_bytes":1,
+               "peak_page_file_bytes":1,"page_fault_count":1}),
+        // Linux.
+        json!({"virtual_bytes":7,"resident_bytes":5,"peak_resident_bytes":9}),
+        // macOS.
+        json!({"virtual_bytes":7,"resident_bytes":5,"resident_max_bytes":9}),
+    ] {
+        let text = stats.to_string();
+        let (mut c, _) = client(Arc::new(move |_, _| Ok(text.clone()))).await;
+        let mem = c.memory_stats().await.unwrap();
+        assert_eq!(mem.working_set_bytes, 5, "{stats}");
+        assert_eq!(mem.peak_working_set_bytes, Some(9), "{stats}");
+    }
+}
+
+#[tokio::test]
+async fn name_only_reads_ask_for_no_bodies_and_the_args_check_keeps_them() {
+    let (mut c, calls) = client(Arc::new(|name, _| match name {
+        "logs" => Ok(json!([{"command":"greet","timestamp":5,"status":"ok"}]).to_string()),
+        "check_ipc_integrity" => Ok(integrity_with_capture("full")),
+        _ => Ok("0".to_string()),
+    }))
+    .await;
+    c.verify()
+        .ipc_was_called("greet")
+        .ipc_was_not_called("other")
+        .network_request(None, "x")
+        .no_network_request("y")
+        .run()
+        .await
+        .unwrap();
+    {
+        let calls = calls.lock().unwrap();
+        let logs: Vec<_> = calls.iter().filter(|(name, _)| name == "logs").collect();
+        assert_eq!(logs.len(), 4, "{logs:?}");
+        for (_, args) in logs {
+            assert_eq!(args["bodies"], false, "{args}");
+            assert_eq!(args["limit"], 1000, "{args}");
+        }
+    }
+    calls.lock().unwrap().clear();
+    c.verify()
+        .ipc_was_called_with("greet", json!({"a":1}))
+        .run()
+        .await
+        .unwrap();
+    assert!(calls.lock().unwrap()[0].1.get("bodies").is_none());
+
+    calls.lock().unwrap().clear();
+    c.create_ipc_checkpoint().await.unwrap();
+    assert_eq!(calls.lock().unwrap()[0].1["bodies"], false);
+}
+
+#[tokio::test]
+async fn a_check_that_errors_is_a_failed_check_not_a_lost_report() {
+    let (mut c, _) = client(Arc::new(|name, args| {
+        if name == "logs" && args["action"] == "network" {
+            // `eval_with_return` over its cap.
+            Err("eval result too large (6000000 bytes, limit 5000000)".to_string())
+        } else if name == "logs" {
+            Ok(json!([{"command":"greet"}]).to_string())
+        } else {
+            Ok("0".to_string())
+        }
+    }))
+    .await;
+    let report = c
+        .verify()
+        .ipc_was_called("greet")
+        .network_request(None, "x")
+        .ipc_was_called("greet")
+        .run()
+        .await
+        .expect("a tool error is not a transport error");
+    assert_eq!(report.results.len(), 3);
+    assert!(
+        report.results[0].passed && report.results[2].passed,
+        "{report:?}"
+    );
+    assert!(!report.results[1].passed);
+    assert!(report.results[1].detail.contains("too large"), "{report:?}");
+    assert!(report.results[1].description.contains('x'), "{report:?}");
+}
+
+#[tokio::test]
+async fn a_dead_app_is_still_an_error_for_the_whole_report() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let app = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(|body: String| async move {
+            let v: Value = serde_json::from_str(&body).unwrap_or_default();
+            axum::Json(json!({"jsonrpc":"2.0","id":v.get("id").cloned(),"result":{
+                "protocolVersion":"2025-06-18","capabilities":{},
+                "serverInfo":{"name":"m","version":"0"}}}))
+        }),
+    );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap();
+    });
+    let mut c = VictauriClient::connect_with_token(port, None)
+        .await
+        .unwrap();
+    tx.send(()).unwrap();
+    server.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(c.verify().ipc_was_called("x").run().await.is_err());
+}
+
+/// What `find_elements` answers on a document with no body yet (`js_bridge.rs`, via `tool_error`).
+const NOT_READY: &str = "page not ready: the document has no body yet (it may be loading or \
+                         reloading) — retry shortly";
+
+/// Not ready for the first `n` lookups, then `then`.
+fn not_ready_then(n: u32, then: Value) -> Handler {
+    let polls = Arc::new(Mutex::new(0u32));
+    Arc::new(move |name, _| {
+        if name == "find_elements" {
+            let mut seen = polls.lock().unwrap();
+            *seen += 1;
+            if *seen <= n {
+                return Err(NOT_READY.to_string());
+            }
+            return Ok(then.to_string());
+        }
+        Ok("\"Done\"".to_string())
+    })
+}
+
+#[tokio::test]
+async fn expectations_wait_out_a_navigation() {
+    let found = json!([el("k3f9e1", "div", "Done")]);
+    let l = Locator::test_id("x");
+    let (mut c, _) = client(not_ready_then(2, found.clone())).await;
+    l.expect(&mut c)
+        .poll_ms(10)
+        .to_have_text("Done")
+        .await
+        .unwrap();
+    let (mut c, _) = client(not_ready_then(2, found.clone())).await;
+    l.expect(&mut c).poll_ms(10).to_be_visible().await.unwrap();
+    let (mut c, _) = client(not_ready_then(2, found.clone())).await;
+    l.expect(&mut c).poll_ms(10).to_be_enabled().await.unwrap();
+    let (mut c, _) = client(not_ready_then(2, found.clone())).await;
+    l.expect(&mut c).poll_ms(10).to_be_attached().await.unwrap();
+    let (mut c, _) = client(not_ready_then(2, found)).await;
+    l.expect(&mut c).poll_ms(10).to_have_count(1).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_page_that_is_not_ready_has_no_elements_to_count() {
+    let l = Locator::test_id("x");
+    macro_rules! never_ready {
+        ($($matcher:tt)+) => {{
+            let (mut c, calls) = client(not_ready_then(u32::MAX, json!([]))).await;
+            let err = l
+                .expect(&mut c)
+                .timeout_ms(60)
+                .poll_ms(10)
+                .$($matcher)+
+                .await
+                .expect_err(stringify!($($matcher)+));
+            assert!(err.to_string().contains("page not ready"), "{err:?}");
+            assert!(calls.lock().unwrap().len() > 1, "it did not retry");
+        }};
+    }
+    never_ready!(to_have_count(0));
+    never_ready!(to_be_hidden());
+    never_ready!(to_be_detached());
+    never_ready!(not().to_be_visible());
+    never_ready!(not().to_be_attached());
+    never_ready!(not().to_have_count(5));
+    never_ready!(not().to_have_text("x"));
+    never_ready!(to_be_disabled());
+}
+
+/// `getPerformanceMetrics` on `WebKit`, on a page still loading.
+const METRICS_WEBKIT_LOADING: &str = r#"{"navigation":{"dom_interactive_ms":0,"dom_complete_ms":0,"load_event_ms":0},"js_heap":{"unavailable":true,"reason":"performance.memory is Chromium/WebView2-only; undefined on WebKit (WKWebView/WebKitGTK)"}}"#;
+const METRICS_MEASURED: &str =
+    r#"{"navigation":{"dom_complete_ms":120,"load_event_ms":130},"js_heap":{"used_mb":10.5}}"#;
+
+async fn smoke_with(
+    metrics: &'static str,
+    console: String,
+) -> Vec<victauri_test::SmokeCheckResult> {
+    let (mut c, _) = client(Arc::new(move |name, args| match name {
+        "inspect" if args["action"] == "get_performance" => Ok(metrics.to_string()),
+        "logs" => Ok(console.clone()),
+        "recording" => Err("recording session already active".to_string()),
+        _ => Ok("null".to_string()),
+    }))
+    .await;
+    c.smoke_test().await.unwrap().checks
+}
+
+fn named<'a>(
+    checks: &'a [victauri_test::SmokeCheckResult],
+    prefix: &str,
+) -> &'a victauri_test::SmokeCheckResult {
+    checks.iter().find(|c| c.name.starts_with(prefix)).unwrap()
+}
+
+#[tokio::test]
+async fn smoke_budgets_say_when_they_measured_nothing() {
+    let checks = smoke_with(METRICS_WEBKIT_LOADING, "[]".to_string()).await;
+    let heap = named(&checks, "heap");
+    assert!(heap.passed && heap.skipped, "{heap:?}");
+    assert!(heap.detail.contains("WebKit"), "{heap:?}");
+    let dom = named(&checks, "DOM complete");
+    assert!(dom.passed && dom.skipped, "{dom:?}");
+    assert!(!dom.detail.is_empty(), "{dom:?}");
+
+    let checks = smoke_with(METRICS_MEASURED, "[]".to_string()).await;
+    let heap = named(&checks, "heap");
+    assert!(heap.passed && !heap.skipped, "{heap:?}");
+    let dom = named(&checks, "DOM complete");
+    assert!(dom.passed && !dom.skipped, "{dom:?}");
+}
+
+#[tokio::test]
+async fn a_budget_that_was_exceeded_still_fails() {
+    let (mut c, _) = client(answers(METRICS_MEASURED)).await;
+    assert!(c.assert_heap_under_mb(1.0).await.is_err());
+    assert!(
+        c.assert_dom_complete_under(Duration::from_millis(1))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn typed_plugin_info_reports_the_tool_count() {
+    // The shape of `get_plugin_info` (`mcp/mod.rs`).
+    let info = json!({"version":"0.10.3","bridge_version":"0.10.3","port":7373,
+        "app":{"identifier":"com.x","product_name":"x"},
+        "tools":{"total":35,"enabled":34,"enabled_list":[],"disabled_list":[]},
+        "commands":{"allowlist":null,"blocklist":[]},
+        "privacy":{"profile":"full","redaction_enabled":false},
+        "capacities":{"event_log":10000,"eval_timeout_secs":30},
+        "registered_commands":3,"tool_invocations":2,"uptime_secs":100})
+    .to_string();
+    let (mut c, _) = client(Arc::new(move |_, _| Ok(info.clone()))).await;
+    let info = c.plugin_info().await.unwrap();
+    assert_eq!(info.tools.total, 35);
+    assert_eq!(info.tool_count, 35);
+}
+
+fn full_console_log() -> String {
+    let entries: Vec<Value> = (0..1000)
+        .map(|i| json!({"level":"log","message":"chatty","timestamp":i}))
+        .collect();
+    Value::Array(entries).to_string()
+}
+
+#[tokio::test]
+async fn console_negatives_are_inconclusive_on_a_full_log() {
+    let log = full_console_log();
+    let answer = log.clone();
+    let (mut c, _) = client(Arc::new(move |_, _| Ok(answer.clone()))).await;
+    let report = c.verify().no_console_errors().run().await.unwrap();
+    assert!(!report.all_passed());
+    assert!(
+        report.results[0].detail.contains("inconclusive"),
+        "{report:?}"
+    );
+
+    let err = c.assert_no_uncaught_errors().await.unwrap_err();
+    assert!(err.to_string().contains("inconclusive"), "{err}");
+
+    // In the smoke suite a chatty app has not failed anything: skipped, with the reason.
+    let checks = smoke_with(METRICS_MEASURED, log).await;
+    let uncaught = named(&checks, "no uncaught errors");
+    assert!(uncaught.passed && uncaught.skipped, "{uncaught:?}");
+    assert!(uncaught.detail.contains("inconclusive"), "{uncaught:?}");
+
+    // A log with room left means what it says.
+    let (mut c, _) = client(answers("[]")).await;
+    assert!(
+        c.verify()
+            .no_console_errors()
+            .run()
+            .await
+            .unwrap()
+            .all_passed()
+    );
+    c.assert_no_uncaught_errors().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_found_uncaught_error_in_a_full_log_is_a_failure_not_a_skip() {
+    let mut entries: Vec<Value> = (0..999)
+        .map(|i| json!({"level":"log","message":"chatty","timestamp":i}))
+        .collect();
+    entries.push(json!({"level":"error","message":"[uncaught] boom","timestamp":999}));
+    let checks = smoke_with(METRICS_MEASURED, Value::Array(entries).to_string()).await;
+    let uncaught = named(&checks, "no uncaught errors");
+    assert!(!uncaught.passed && !uncaught.skipped, "{uncaught:?}");
+}
+
+/// `findElements`: without `include_hidden` the bridge leaves hidden elements out.
+fn hidden_then_visible(any_visible: bool) -> Handler {
+    Arc::new(move |_, args| {
+        let mut hidden = el("k3f9e1", "div", "");
+        hidden["visible"] = json!(false);
+        let visible = el("k3f9e2", "div", "");
+        Ok(match (args["include_hidden"] == true, any_visible) {
+            (true, true) => json!([hidden, visible]),
+            (true, false) => json!([hidden]),
+            (false, true) => json!([visible]),
+            (false, false) => json!([]),
+        }
+        .to_string())
+    })
+}
+
+#[tokio::test]
+async fn is_visible_agrees_with_to_be_visible() {
+    let l = Locator::test_id("dup");
+    let (mut c, _) = client(hidden_then_visible(true)).await;
+    assert!(l.is_visible(&mut c).await.unwrap());
+    l.expect(&mut c)
+        .timeout_ms(30)
+        .to_be_visible()
+        .await
+        .unwrap();
+
+    let (mut c, _) = client(hidden_then_visible(false)).await;
+    assert!(!l.is_visible(&mut c).await.unwrap());
+    assert!(
+        l.expect(&mut c)
+            .timeout_ms(30)
+            .to_be_visible()
+            .await
+            .is_err()
+    );
+
+    let (mut c, _) = client(answers_empty()).await;
+    assert!(matches!(
+        l.is_visible(&mut c).await,
+        Err(TestError::ElementNotFound(_))
+    ));
 }

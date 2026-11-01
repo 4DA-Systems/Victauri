@@ -380,44 +380,67 @@ impl VictauriClient {
 
     /// Assert DOM complete time is under the given duration.
     ///
-    /// Passes silently if the browser does not expose navigation timing.
+    /// Passes silently if there is nothing to measure: the browser does not expose navigation
+    /// timing, or the page has not finished loading. [`Self::smoke_test`] reports that as skipped.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::Assertion`] if load time exceeds the budget.
     pub async fn assert_dom_complete_under(&mut self, max: Duration) -> Result<(), TestError> {
+        self.dom_complete_check(max).await.map(|_| ())
+    }
+
+    /// [`Self::assert_dom_complete_under`]; `Ok(Some(reason))` when it measured nothing.
+    async fn dom_complete_check(&mut self, max: Duration) -> Result<Option<String>, TestError> {
         let metrics = self.get_performance_metrics().await?;
-        if let Some(ms) = metrics
+        let ms = metrics
             .pointer("/navigation/dom_complete_ms")
-            .and_then(Value::as_f64)
-        {
-            let max_ms = max.as_millis() as f64;
-            if ms > max_ms {
-                return Err(TestError::Assertion(format!(
-                    "DOM complete took {ms:.0}ms, budget is {max_ms:.0}ms"
-                )));
-            }
+            .and_then(Value::as_f64);
+        // `domComplete` is 0 until the document completes, whatever the page's real load time.
+        let Some(ms) = ms.filter(|ms| *ms > 0.0) else {
+            return Ok(Some(
+                "skipped: no DOM complete time to judge (the page has not finished loading, or \
+                 this webview has no navigation timing)"
+                    .to_string(),
+            ));
+        };
+        let max_ms = max.as_millis() as f64;
+        if ms > max_ms {
+            return Err(TestError::Assertion(format!(
+                "DOM complete took {ms:.0}ms, budget is {max_ms:.0}ms"
+            )));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Assert JS heap usage is under the given megabyte limit.
     ///
-    /// Passes silently if the browser does not expose heap metrics.
+    /// Passes silently if the browser does not expose heap metrics (`WebKit` does not).
+    /// [`Self::smoke_test`] reports that as skipped.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::Assertion`] if heap exceeds the budget.
     pub async fn assert_heap_under_mb(&mut self, max_mb: f64) -> Result<(), TestError> {
+        self.heap_check(max_mb).await.map(|_| ())
+    }
+
+    /// [`Self::assert_heap_under_mb`]; `Ok(Some(reason))` when it measured nothing.
+    async fn heap_check(&mut self, max_mb: f64) -> Result<Option<String>, TestError> {
         let metrics = self.get_performance_metrics().await?;
-        if let Some(used) = metrics.pointer("/js_heap/used_mb").and_then(Value::as_f64)
-            && used > max_mb
-        {
+        let Some(used) = metrics.pointer("/js_heap/used_mb").and_then(Value::as_f64) else {
+            let why = metrics
+                .pointer("/js_heap/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("this webview reports no JS heap size");
+            return Ok(Some(format!("skipped: {why}")));
+        };
+        if used > max_mb {
             return Err(TestError::Assertion(format!(
                 "JS heap is {used:.1}MB, budget is {max_mb:.1}MB"
             )));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Assert there are no uncaught errors in the console log.
@@ -428,8 +451,18 @@ impl VictauriClient {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Assertion`] if uncaught errors are found.
+    /// Returns [`TestError::Assertion`] if uncaught errors are found, or if the console log is full
+    /// and shows none: an older one may have rolled off. [`Self::smoke_test`] reports that as skipped,
+    /// since a chatty app has not failed anything.
     pub async fn assert_no_uncaught_errors(&mut self) -> Result<(), TestError> {
+        match self.uncaught_errors_check().await? {
+            Some(reason) => Err(TestError::Assertion(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::assert_no_uncaught_errors`]; `Ok(Some(reason))` when the log cannot say.
+    async fn uncaught_errors_check(&mut self) -> Result<Option<String>, TestError> {
         let log = self
             .logs("console", Some(crate::assertions::LOG_WINDOW))
             .await?;
@@ -461,8 +494,11 @@ impl VictauriClient {
                         .join("; ")
                 )));
             }
+            if entries.len() >= crate::assertions::LOG_WINDOW {
+                return Ok(Some(crate::assertions::console_log_full_detail()));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Assert that the recording lifecycle works end-to-end.
@@ -664,16 +700,17 @@ impl VictauriClient {
             "IPC integrity healthy",
             self.assert_ipc_integrity_ok().await
         );
-        check!("no uncaught errors", self.assert_no_uncaught_errors().await);
+        // Skippable, like the two budgets below: a check that could not judge anything says so.
+        skippable_check!("no uncaught errors", self.uncaught_errors_check().await);
         noted_check!("accessibility audit", self.smoke_accessibility().await);
-        check!(
+        skippable_check!(
             format!("DOM complete < {}ms", config.max_dom_complete_ms),
-            self.assert_dom_complete_under(Duration::from_millis(config.max_dom_complete_ms))
+            self.dom_complete_check(Duration::from_millis(config.max_dom_complete_ms))
                 .await
         );
-        check!(
+        skippable_check!(
             format!("heap < {:.0}MB", config.max_heap_mb),
-            self.assert_heap_under_mb(config.max_heap_mb).await
+            self.heap_check(config.max_heap_mb).await
         );
         // Skippable: never ends a recording another client has in progress (R5B-SMOKE1).
         skippable_check!(
