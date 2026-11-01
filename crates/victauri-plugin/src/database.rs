@@ -203,6 +203,20 @@ pub(crate) fn db_health_report(
     count_budget: Duration,
     check_budget: Duration,
 ) -> Result<serde_json::Value, String> {
+    on_db_stack(|| {
+        check_schema_nesting(Path::new(path))
+            .map_err(|e| format!("cannot read database metadata: {e}"))?;
+        db_health_report_budgeted(path, DB_HEALTH_META_BUDGET, count_budget, check_budget)
+    })
+}
+
+#[cfg(feature = "sqlite")]
+fn db_health_report_budgeted(
+    path: &str,
+    meta_budget: Duration,
+    count_budget: Duration,
+    check_budget: Duration,
+) -> Result<serde_json::Value, String> {
     let mut conn = open_untrusted_read_only(path)?;
     conn.set_limit(
         rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
@@ -219,7 +233,7 @@ pub(crate) fn db_health_report(
     .map_err(|e| format!("failed to harden database connection: {e}"))?;
 
     // Phase 0: metadata + the (bounded) table listing.
-    let meta = run_bounded(&mut conn, DB_HEALTH_META_BUDGET, |c| {
+    let meta = run_bounded(&mut conn, meta_budget, |c| {
         let text = |name: &str| c.pragma_query_value(None, name, |r| r.get::<_, String>(0));
         let int = |name: &str| c.pragma_query_value(None, name, |r| r.get::<_, i64>(0));
         let journal_mode = text("journal_mode")?;
@@ -275,7 +289,7 @@ pub(crate) fn db_health_report(
         Bounded::TimedOut => {
             return Err(format!(
                 "database metadata did not load within {} ms",
-                DB_HEALTH_META_BUDGET.as_millis()
+                meta_budget.as_millis()
             ));
         }
         Bounded::Failed(e) => return Err(format!("cannot read database metadata: {e}")),
@@ -509,7 +523,7 @@ pub(crate) const DB_HEALTH_META_BUDGET: Duration = Duration::from_secs(3);
 
 /// A hook run on each connection Victauri opens (tests only).
 #[cfg(all(test, feature = "sqlite"))]
-type OpenHook = Box<dyn Fn(&rusqlite::Connection)>;
+type OpenHook = Arc<dyn Fn(&rusqlite::Connection) + Send + Sync>;
 
 #[cfg(all(test, feature = "sqlite"))]
 thread_local! {
@@ -528,6 +542,157 @@ fn run_open_hook(_conn: &rusqlite::Connection) {
             hook(_conn);
         }
     });
+}
+
+/// Stack for database work. `SQLite` recurses over nested SELECTs (parsing, copying and freeing
+/// them, and expanding views) with no limit of its own, and a stack overflow is not a panic: it
+/// ends the host process. Reserved, not committed: untouched pages cost address space only.
+#[cfg(feature = "sqlite")]
+const DB_STACK_BYTES: usize = 64 * 1024 * 1024;
+/// Deepest parenthesis nesting accepted in agent SQL or in one schema entry. Measured on the
+/// dev profile: well under 1 KiB of stack per level.
+#[cfg(feature = "sqlite")]
+const MAX_SQL_NESTING: usize = 256;
+/// Most nesting a database's views may add up to. Views stack when one selects from another, so
+/// the whole schema is charged: each view costs 1 plus its own nesting.
+#[cfg(feature = "sqlite")]
+const MAX_SCHEMA_VIEW_NESTING: usize = 10_000;
+/// The longest schema entry the nesting check itself will parse (see [`check_schema_nesting`]).
+#[cfg(feature = "sqlite")]
+const SCHEMA_CHECK_PARSE_BYTES: i32 = 4_096;
+/// Budget for [`check_schema_nesting`] once it has the file.
+#[cfg(feature = "sqlite")]
+const SCHEMA_CHECK_BUDGET: Duration = Duration::from_secs(3);
+
+/// Run `f` on a thread with [`DB_STACK_BYTES`] of stack and wait for it (a panic carries over).
+#[cfg(feature = "sqlite")]
+fn on_db_stack<T: Send>(f: impl FnOnce() -> Result<T, String> + Send) -> Result<T, String> {
+    #[cfg(test)]
+    let hook = ON_OPEN.with(|h| h.borrow().clone());
+    std::thread::scope(|scope| {
+        let thread = std::thread::Builder::new()
+            .name("victauri-db".to_string())
+            .stack_size(DB_STACK_BYTES)
+            .spawn_scoped(scope, move || {
+                #[cfg(test)]
+                ON_OPEN.with(|h| *h.borrow_mut() = hook);
+                f()
+            })
+            .map_err(|e| format!("cannot start the database thread: {e}"))?;
+        thread
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+    })
+}
+
+/// Deepest parenthesis nesting in `sql`, ignoring strings, identifiers and comments.
+#[cfg(feature = "sqlite")]
+fn sql_nesting(sql: &str) -> usize {
+    let (mut depth, mut deepest) = (0usize, 0usize);
+    for b in scan_sql(sql).masked.bytes() {
+        if b == b'(' {
+            depth += 1;
+            deepest = deepest.max(depth);
+        } else if b == b')' {
+            depth = depth.saturating_sub(1);
+        }
+    }
+    deepest
+}
+
+/// Refuse a database whose schema is nested deeply enough to threaten the stack. `SQLite` parses
+/// the whole schema on the first statement, so a crafted file can overflow the stack with no help
+/// from the query, and a larger stack alone cannot cover a schema entry of up to 1 GB.
+///
+/// So the text is read first, on a connection that does not parse it: with `writable_schema`,
+/// `SQLite` tolerates a schema entry it cannot parse (the first statement fails, the next one
+/// runs), and the SQL length limit makes every long entry unparseable. Entries within the limit
+/// are too short to nest dangerously.
+///
+/// The file can change between this check and the real open; the stack is the margin for that.
+#[cfg(feature = "sqlite")]
+// `unit_arg`: see `SetupOutcome`.
+#[allow(clippy::unit_arg)]
+fn check_schema_nesting(path: &Path) -> Result<(), String> {
+    const READ_SCHEMA: &str = "SELECT type, name, sql FROM sqlite_master";
+    let harden = |e: String| format!("failed to harden database connection: {e}");
+    let conn = rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|e| format!("failed to open database: {e}"))?;
+    conn.pragma_update(None, "trusted_schema", false)
+        .map_err(|e| harden(e.to_string()))?;
+    conn.pragma_update(None, "writable_schema", true)
+        .map_err(|e| harden(e.to_string()))?;
+    conn.busy_timeout(QUERY_BUSY_TIMEOUT)
+        .map_err(|e| harden(e.to_string()))?;
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_SQL_LENGTH,
+        SCHEMA_CHECK_PARSE_BYTES,
+    )
+    .into_setup()
+    .map_err(harden)?;
+    conn.set_limit(
+        rusqlite::limits::Limit::SQLITE_LIMIT_LENGTH,
+        MAX_QUERY_SQL_BYTES as i32,
+    )
+    .into_setup()
+    .map_err(harden)?;
+    let _interrupt = InterruptGuard::arm(&conn, SCHEMA_CHECK_BUDGET);
+    let load_error = |e: rusqlite::Error| {
+        sqlite_query_error("failed to load database schema", e, SCHEMA_CHECK_BUDGET)
+    };
+    let mut stmt = conn
+        .prepare(READ_SCHEMA)
+        .or_else(|_| conn.prepare(READ_SCHEMA))
+        .map_err(load_error)?;
+    let mut rows = stmt.query([]).map_err(load_error)?;
+    let mut view_nesting = 0usize;
+    loop {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => return Ok(()),
+            Err(e) if e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::TooBig) => {
+                return Err(format!(
+                    "refusing to open this database: a schema entry is too long (over \
+                     {MAX_QUERY_SQL_BYTES} bytes), which SQLite would have to parse in full"
+                ));
+            }
+            Err(e) => return Err(load_error(e)),
+        };
+        let Ok(text) = row.get_ref(2).map(|v| match v {
+            rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => {
+                String::from_utf8_lossy(t)
+            }
+            _ => std::borrow::Cow::Borrowed(""),
+        }) else {
+            continue;
+        };
+        let nesting = sql_nesting(&text);
+        let name = || {
+            row.get::<_, String>(1)
+                .unwrap_or_else(|_| "<unnamed>".to_string())
+        };
+        if nesting > MAX_SQL_NESTING {
+            return Err(format!(
+                "refusing to open this database: schema entry `{}` nests {nesting} levels deep \
+                 (the limit is {MAX_SQL_NESTING}); parsing it could overflow the stack and end \
+                 the app",
+                name()
+            ));
+        }
+        if matches!(row.get_ref(0), Ok(rusqlite::types::ValueRef::Text(b"view"))) {
+            view_nesting = view_nesting.saturating_add(nesting + 1);
+            if view_nesting > MAX_SCHEMA_VIEW_NESTING {
+                return Err(format!(
+                    "refusing to open this database: its views nest up to {view_nesting} levels \
+                     when chained (the limit is {MAX_SCHEMA_VIEW_NESTING}); expanding them could \
+                     overflow the stack and end the app"
+                ));
+            }
+        }
+    }
 }
 
 /// Open a database file Victauri did not create as read-only UNTRUSTED input: with
@@ -1252,7 +1417,9 @@ fn discover_recursive(
         }
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str())
-                && matches!(ext, "sqlite" | "sqlite3" | "db" | "sdb")
+                && ["sqlite", "sqlite3", "db", "db3", "sdb"]
+                    .iter()
+                    .any(|known| ext.eq_ignore_ascii_case(known))
             {
                 results.push(path);
             }
@@ -1266,14 +1433,13 @@ fn discover_recursive(
 /// that are browser-engine internal databases, never the application's own DB
 /// (Chromium/WebKit profile stores). Selecting one of these is the audit/red-team
 /// "wrong database" bug: an agent would confidently inspect `WebView` state instead of
-/// the app's data.
+/// the app's data. Names an app could plausibly use for its own file (`history`, `cookies`,
+/// `favicons`) are left out: Chromium's have no extension, so discovery never lists them, and
+/// anything under an engine directory is excluded by [`WEBVIEW_DIR_NAMES`] anyway.
 #[cfg(feature = "sqlite")]
 const WEBVIEW_DB_BASENAMES: &[&str] = &[
-    "cookies",
     "quotamanager",
     "web data",
-    "history",
-    "favicons",
     "top sites",
     "login data",
     "network action predictor",
@@ -1373,6 +1539,27 @@ pub struct DbCandidate {
     pub webview_internal: bool,
 }
 
+/// Whether `path` can be a `SQLite` database by its first bytes: an extension alone also matches
+/// Windows' `Thumbs.db` and other formats. An empty file is a new database to `SQLite`, and a file
+/// that cannot be read here is given the benefit of the doubt (opening it reports the real error).
+#[cfg(feature = "sqlite")]
+fn has_sqlite_header(path: &Path) -> bool {
+    use std::io::Read as _;
+    let mut header = [0u8; 16];
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    let mut read = 0;
+    let mut limited = file.take(header.len() as u64);
+    while let Ok(n) = limited.read(&mut header[read..]) {
+        if n == 0 {
+            break;
+        }
+        read += n;
+    }
+    read == 0 || header == *b"SQLite format 3\0"
+}
+
 /// Classify every database discovered under `dirs`, returning application candidates first
 /// (non-`WebView`, largest by size — the substantial app DB outranks incidental ones) and
 /// `WebView` internals last. De-duplicates paths discovered via overlapping roots.
@@ -1384,7 +1571,7 @@ pub fn classify_databases(dirs: &[PathBuf]) -> Vec<DbCandidate> {
     for dir in dirs {
         for path in discover_databases(dir) {
             let key = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !seen.insert(key) {
+            if !seen.insert(key) || !has_sqlite_header(&path) {
                 continue;
             }
             let size_bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
@@ -1452,14 +1639,16 @@ pub fn query(
     params: &[serde_json::Value],
     max_rows: Option<usize>,
 ) -> Result<serde_json::Value, String> {
-    query_with_limits(
-        db_path,
-        sql,
-        params,
-        max_rows,
-        QUERY_TIMEOUT,
-        MAX_QUERY_RESULT_BYTES,
-    )
+    on_db_stack(|| {
+        query_with_limits(
+            db_path,
+            sql,
+            params,
+            max_rows,
+            QUERY_TIMEOUT,
+            MAX_QUERY_RESULT_BYTES,
+        )
+    })
 }
 
 /// The checks a query must pass before any database is even opened: length, read-only
@@ -1506,6 +1695,13 @@ pub fn validate_query(sql: &str) -> Result<(), String> {
         );
     }
 
+    let nesting = sql_nesting(sql);
+    if nesting > MAX_SQL_NESTING {
+        return Err(format!(
+            "query nests {nesting} levels deep (the limit is {MAX_SQL_NESTING})"
+        ));
+    }
+
     // A UX guard, not the security boundary (that is the authorizer + READ_ONLY open): rusqlite's
     // `prepare` silently ignores a trailing statement, so a stacked query would otherwise run
     // only its first statement with no error. Quote-aware, so `SELECT 'a;b'` is one statement.
@@ -1532,6 +1728,8 @@ fn query_with_limits(
     validate_query(sql)?;
 
     let max_rows = max_rows.unwrap_or(MAX_ROWS_DEFAULT).min(MAX_ROWS_LIMIT);
+
+    check_schema_nesting(db_path)?;
 
     // `mut` only matters from rusqlite 0.41, where `progress_handler` takes `&mut self`.
     #[allow(unused_mut)]
@@ -1696,6 +1894,12 @@ fn sqlite_query_error(context: &str, error: rusqlite::Error, timeout: Duration) 
             "{context}: query timed out after {} ms",
             timeout.as_millis()
         )
+    } else if error.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::TooBig) {
+        format!(
+            "{context}: a value is larger than the {MAX_QUERY_CELL_BYTES} byte limit per cell \
+             (the whole query fails, including substr() of that value). Leave the column out, or \
+             select length(column) or typeof(column) to look at it"
+        )
     } else {
         format!("{context}: {error}")
     }
@@ -1783,6 +1987,13 @@ fn cell_to_json(
     let (value, bytes) = match row.get_ref(idx) {
         Ok(ValueRef::Null) | Err(_) => (serde_json::Value::Null, 4),
         Ok(ValueRef::Integer(i)) => (serde_json::json!(i), json_len(&i)),
+        // JSON has no infinity: `json!` would make it null, which reads as SQL NULL.
+        Ok(ValueRef::Real(f)) if f.is_infinite() => {
+            let name = if f > 0.0 { "Infinity" } else { "-Infinity" };
+            let v = serde_json::json!({ "__real": name });
+            let n = json_len(&v);
+            (v, n)
+        }
         Ok(ValueRef::Real(f)) => {
             let v = serde_json::json!(f);
             let n = json_len(&v);
@@ -1791,8 +2002,23 @@ fn cell_to_json(
         Ok(ValueRef::Text(t)) => {
             // Borrowed (no copy) for valid UTF-8; a cell is at most MAX_QUERY_CELL_BYTES.
             let s = String::from_utf8_lossy(t);
+            if matches!(s, std::borrow::Cow::Owned(_)) {
+                // Replacement characters would silently change the value: flag it, with the
+                // stored bytes alongside.
+                use base64::Engine;
+                let v = serde_json::json!({
+                    "__invalid_utf8": true,
+                    "text": s,
+                    "base64": base64::engine::general_purpose::STANDARD.encode(t),
+                });
+                let n = json_len(&v);
+                return (n <= budget).then_some((v, n));
+            }
+            // JSON text is decoded only if that loses nothing. Re-encoding changes big numbers,
+            // `1.10`, duplicate and unsorted keys and whitespace, so those stay the stored string.
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s)
                 && (parsed.is_object() || parsed.is_array())
+                && serde_json::to_string(&parsed).is_ok_and(|encoded| encoded == *s)
             {
                 let n = json_len(&parsed);
                 (parsed, n)
@@ -1872,8 +2098,15 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let r = db_health_report(path.to_str().unwrap(), Duration::ZERO, Duration::ZERO)
-            .expect("a timed-out phase must not fail the whole report");
+        // The metadata budget is the one thing not under test here, and 3 s of wall clock can
+        // run out on a loaded machine.
+        let r = db_health_report_budgeted(
+            path.to_str().unwrap(),
+            Duration::from_secs(120),
+            Duration::ZERO,
+            Duration::ZERO,
+        )
+        .expect("a timed-out phase must not fail the whole report");
         assert_eq!(r["row_counts_complete"], false);
         assert!(r["tables"][0]["row_count"].is_null());
         assert_eq!(r["tables"][0]["name"], "big");
@@ -1882,6 +2115,296 @@ mod tests {
         // The cheap metadata survives.
         assert!(r["page_count"].as_i64().unwrap() > 0);
         assert!(r["journal_mode"].is_string());
+    }
+
+    /// `n` nested FROM subqueries over `users`.
+    fn nested_select(n: usize) -> String {
+        format!(
+            "{}SELECT id FROM users{}",
+            "SELECT * FROM (".repeat(n),
+            ")".repeat(n)
+        )
+    }
+
+    /// A database with `users` plus schema rows written as a crafted file would hold them. Going
+    /// through `writable_schema` also means the writing connection never parses them.
+    fn db_with_schema_rows(rows: &[(String, String)]) -> (tempfile::NamedTempFile, PathBuf) {
+        let (file, path) = create_test_db();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("PRAGMA writable_schema=ON; BEGIN;")
+            .unwrap();
+        for (name, sql) in rows {
+            conn.execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql) \
+                 VALUES ('view', ?1, ?1, 0, ?2)",
+                [name, sql],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+        (file, path)
+    }
+
+    fn deep_view(n: usize) -> Vec<(String, String)> {
+        vec![(
+            "deep".to_string(),
+            format!("CREATE VIEW deep AS {}", nested_select(n)),
+        )]
+    }
+
+    fn view_chain(n: usize) -> Vec<(String, String)> {
+        (0..n)
+            .map(|i| {
+                let from = if i == 0 {
+                    "users".to_string()
+                } else {
+                    format!("v{}", i - 1)
+                };
+                (
+                    format!("v{i}"),
+                    format!("CREATE VIEW v{i} AS SELECT id FROM {from}"),
+                )
+            })
+            .collect()
+    }
+
+    /// Run one case in a child process: a stack overflow is not a panic, it ends the process.
+    fn in_child(test: &str, case: &str) -> std::process::Output {
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("database::tests::{test}"),
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("VICTAURI_TEST_DB_CASE", case)
+            .output()
+            .unwrap()
+    }
+
+    /// Deep SQL or a crafted schema used to overflow the blocking thread's 2 MiB stack and take
+    /// the host process with it. Each must be a clean error, on the plain default-stack thread
+    /// that `query` is called from. The schema cases are what an agent hits by doing nothing
+    /// unusual: `SELECT count(*) FROM users` merely loads the schema.
+    #[test]
+    fn deep_nesting_is_refused_without_harming_the_process() {
+        const TEST: &str = "deep_nesting_is_refused_without_harming_the_process";
+        let Ok(case) = std::env::var("VICTAURI_TEST_DB_CASE") else {
+            for case in [
+                "deep_sql",
+                "deep_sql_at_the_size_cap",
+                "deep_view_query",
+                "deep_view_health",
+                "huge_deep_view_query",
+                "huge_deep_view_health",
+                "view_chain",
+                "cte_chain_at_the_size_cap",
+            ] {
+                let out = in_child(TEST, case);
+                assert!(
+                    out.status.success(),
+                    "{case}: {}\n{}",
+                    out.status,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            return;
+        };
+        let count = "SELECT count(*) FROM users";
+        if case == "cte_chain_at_the_size_cap" {
+            // Depth without parentheses, so no nesting check sees it: only the size cap and the
+            // stack bound it. Whatever SQLite answers, the process must live.
+            let (_f, path) = create_test_db();
+            let mut sql = String::from("WITH a0 AS (SELECT 1)");
+            let mut i = 1;
+            while sql.len() < MAX_QUERY_SQL_BYTES - 100 {
+                sql.push_str(&format!(",a{i} AS (SELECT * FROM a{})", i - 1));
+                i += 1;
+            }
+            sql.push_str(&format!(" SELECT * FROM a{}", i - 1));
+            println!("{i} CTEs: {:?}", query(&path, &sql, &[], None).map(|_| ()));
+            return;
+        }
+        let (_f, path);
+        let err = match case.as_str() {
+            "deep_sql" => {
+                (_f, path) = create_test_db();
+                query(&path, &nested_select(6400), &[], None).unwrap_err()
+            }
+            "deep_sql_at_the_size_cap" => {
+                (_f, path) = create_test_db();
+                let n = (MAX_QUERY_SQL_BYTES - 100) / "SELECT * FROM ()".len();
+                query(&path, &nested_select(n), &[], None).unwrap_err()
+            }
+            "deep_view_query" => {
+                (_f, path) = db_with_schema_rows(&deep_view(20_000));
+                query(&path, count, &[], None).unwrap_err()
+            }
+            "deep_view_health" => {
+                (_f, path) = db_with_schema_rows(&deep_view(20_000));
+                let long = Duration::from_secs(30);
+                db_health_report(path.to_str().unwrap(), long, long).unwrap_err()
+            }
+            "huge_deep_view_query" => {
+                (_f, path) = db_with_schema_rows(&deep_view(400_000));
+                query(&path, count, &[], None).unwrap_err()
+            }
+            "huge_deep_view_health" => {
+                (_f, path) = db_with_schema_rows(&deep_view(400_000));
+                let long = Duration::from_secs(30);
+                db_health_report(path.to_str().unwrap(), long, long).unwrap_err()
+            }
+            "view_chain" => {
+                (_f, path) = db_with_schema_rows(&view_chain(30_000));
+                query(&path, "SELECT * FROM v29999", &[], None).unwrap_err()
+            }
+            other => panic!("unknown case {other}"),
+        };
+        assert!(err.contains("nest") || err.contains("too long"), "{err}");
+    }
+
+    /// The nesting checks must not touch ordinary databases and queries.
+    #[test]
+    fn ordinary_nesting_and_view_chains_still_work() {
+        let (_f, path) = create_test_db();
+        let r = query(&path, &nested_select(100), &[], None).unwrap();
+        assert_eq!(r["row_count"], 3);
+        // Parentheses in a string are not nesting, in a query or in a schema.
+        let parens = "(".repeat(5000);
+        assert!(query(&path, &format!("SELECT '{parens}'"), &[], None).is_ok());
+
+        let mut rows = view_chain(50);
+        rows.extend(deep_view(100));
+        rows.push((
+            "quoted".to_string(),
+            format!("CREATE VIEW quoted AS SELECT '{parens}' AS p"),
+        ));
+        let (_g, path) = db_with_schema_rows(&rows);
+        let r = query(&path, "SELECT * FROM v49", &[], None).unwrap();
+        assert_eq!(r["row_count"], 3);
+        let r = query(&path, "SELECT * FROM deep", &[], None).unwrap();
+        assert_eq!(r["row_count"], 3);
+        let r = query(&path, "SELECT length(p) AS n FROM quoted", &[], None).unwrap();
+        assert_eq!(r["rows"][0]["n"], 5000);
+        let long = Duration::from_secs(30);
+        let health = db_health_report(path.to_str().unwrap(), long, long).unwrap();
+        assert_eq!(health["integrity_check"], "ok");
+    }
+
+    /// A `.db` that is not SQLite (Windows' `Thumbs.db`) must not beat a real database by size.
+    #[test]
+    fn auto_selection_skips_files_that_are_not_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Thumbs.db"), vec![7u8; 100_000]).unwrap();
+        std::fs::write(dir.path().join("tiny.db"), b"short").unwrap();
+        let real = dir.path().join("real.sqlite");
+        write_sqlite(&real, 10);
+        let dirs = [dir.path().to_path_buf()];
+        assert_eq!(select_app_database(&dirs).unwrap(), real);
+        assert_eq!(classify_databases(&dirs).len(), 1);
+    }
+
+    /// An empty file is what SQLite itself treats as a new database.
+    #[test]
+    fn auto_selection_keeps_an_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("new.db");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            select_app_database(&[dir.path().to_path_buf()]).unwrap(),
+            empty
+        );
+    }
+
+    #[test]
+    fn discovery_matches_extensions_in_any_case_and_finds_db3() {
+        let dir = tempfile::tempdir().unwrap();
+        write_sqlite(&dir.path().join("MAIN.DB"), 10);
+        write_sqlite(&dir.path().join("data.db3"), 10);
+        assert_eq!(discover_databases(dir.path()).len(), 2);
+    }
+
+    /// Chromium's `History` has no extension and lives under the engine's directory; an app's
+    /// own `history.db` next to its data is the app's.
+    #[test]
+    fn an_apps_own_history_db_is_not_an_engine_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let history = dir.path().join("history.db");
+        write_sqlite(&history, 1);
+        rusqlite::Connection::open(&history)
+            .unwrap()
+            .execute_batch("INSERT INTO t (blob) VALUES (zeroblob(100000))")
+            .unwrap();
+        write_sqlite(&dir.path().join("analytics.db"), 1);
+        assert_eq!(
+            select_app_database(&[dir.path().to_path_buf()]).unwrap(),
+            history
+        );
+        assert!(is_webview_internal(Path::new(
+            "/app/EBWebView/Default/history.db"
+        )));
+    }
+
+    fn one_value(path: &Path, sql: &str) -> serde_json::Value {
+        let r = query(path, sql, &[], None).unwrap();
+        r["rows"][0]["v"].clone()
+    }
+
+    /// A value comes back as it is stored: JSON text is decoded only when that loses nothing.
+    #[test]
+    fn query_values_are_returned_faithfully() {
+        let (_f, path) = create_test_db();
+        for text in [
+            r#"{"id":123456789012345678901234567890}"#,
+            r#"{"id2":1.10}"#,
+            r#"{"z":1,"a":2}"#,
+            r#"{"a":2,"a":3}"#,
+            " [1] ",
+        ] {
+            assert_eq!(
+                one_value(&path, &format!("SELECT '{text}' AS v")),
+                serde_json::json!(text),
+                "{text}"
+            );
+        }
+        // JSON that survives the trip is still decoded.
+        assert_eq!(
+            one_value(&path, r#"SELECT '{"a":1,"b":[2,"x"]}' AS v"#),
+            serde_json::json!({"a": 1, "b": [2, "x"]})
+        );
+        // Infinities are not SQL NULL.
+        assert_eq!(
+            one_value(&path, "SELECT 9e999 AS v"),
+            serde_json::json!({"__real": "Infinity"})
+        );
+        assert_eq!(
+            one_value(&path, "SELECT -9e999 AS v"),
+            serde_json::json!({"__real": "-Infinity"})
+        );
+        assert_eq!(
+            one_value(&path, "SELECT NULL AS v"),
+            serde_json::Value::Null
+        );
+        // Bytes that are not UTF-8 are flagged and still recoverable.
+        assert_eq!(
+            one_value(&path, "SELECT CAST(x'ff41' AS TEXT) AS v"),
+            serde_json::json!({"__invalid_utf8": true, "text": "\u{fffd}A", "base64": "/0E="})
+        );
+    }
+
+    /// One oversized cell fails the row: the error must say what happened and the way forward.
+    #[test]
+    fn an_oversized_cell_error_names_the_cap_and_the_way_forward() {
+        let (_f, path) = create_test_db();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE docs (body BLOB); INSERT INTO docs VALUES (zeroblob(3000000));",
+        )
+        .unwrap();
+        drop(conn);
+        let err = query(&path, "SELECT * FROM docs", &[], None).unwrap_err();
+        assert!(err.contains("1048576"), "{err}");
+        assert!(err.contains("length("), "{err}");
     }
 
     /// Manual check against a REAL database (read-only):
@@ -1964,7 +2487,7 @@ mod tests {
 
     /// Run `f` with `hook` applied to every connection this thread opens.
     fn with_open_hook<T>(
-        hook: impl Fn(&rusqlite::Connection) + 'static,
+        hook: impl Fn(&rusqlite::Connection) + Send + Sync + 'static,
         f: impl FnOnce() -> T,
     ) -> T {
         struct Reset;
@@ -1973,7 +2496,7 @@ mod tests {
                 ON_OPEN.with(|h| *h.borrow_mut() = None);
             }
         }
-        ON_OPEN.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+        ON_OPEN.with(|h| *h.borrow_mut() = Some(Arc::new(hook)));
         let _reset = Reset;
         f()
     }
@@ -2517,7 +3040,7 @@ mod tests {
         let (_f, path) = create_test_db();
         let r = query(
             &path,
-            "SELECT id, name, score, NULL AS n, X'00FF10' AS b, '{\"k\": [1, 2]}' AS j, \
+            "SELECT id, name, score, NULL AS n, X'00FF10' AS b, '{\"k\":[1,2]}' AS j, \
              'q\"\\\n\u{1}é' AS s, 1.5e300 AS big FROM users",
             &[],
             None,
@@ -2807,7 +3330,7 @@ mod tests {
         let conn = rusqlite::Connection::open(&path).unwrap();
         conn.execute_batch(
             r#"CREATE TABLE config (key TEXT, value TEXT);
-               INSERT INTO config VALUES ('settings', '{"theme":"dark","lang":"en"}');"#,
+               INSERT INTO config VALUES ('settings', '{"lang":"en","theme":"dark"}');"#,
         )
         .unwrap();
         let result = query(&path, "SELECT * FROM config", &[], None).unwrap();
