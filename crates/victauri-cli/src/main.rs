@@ -186,7 +186,7 @@ with --args-file - or use key=value pairs.)
 Examples:
   victauri call dom_snapshot
   victauri call query_db query=\"SELECT count(*) FROM items\"
-  victauri call interact action=click ref_id=e12
+  victauri call interact action=click ref_id=k3f9e12
   victauri call invoke_command command=get_settings
   victauri call screenshot --out shot.png
   echo '{\"action\":\"list\"}' | victauri call window --args-file -

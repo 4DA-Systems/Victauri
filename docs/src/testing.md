@@ -48,8 +48,8 @@ async fn test_my_app() {
     let title = client.eval_js("document.title").await.unwrap();
     assert!(title.to_string().contains("My App"));
 
-    client.click("e3").await.unwrap();
-    client.fill("e5", "hello@example.com").await.unwrap();
+    client.click("k3f9e3").await.unwrap();
+    client.fill("k3f9e5", "hello@example.com").await.unwrap();
 }
 ```
 
@@ -89,7 +89,7 @@ High-level methods that find elements by text or ID — no ref handles or select
 | `expect_no_text("Error")` | Poll until text disappears (3s timeout) |
 | `text_by_id("counter")` | Get text content of element by id |
 | `double_click_by_id("item")` | Find element by id, double-click it |
-| `hover("e3")` | Hover over element by ref |
+| `hover("k3f9e3")` | Hover over element by ref |
 | `scroll_to_by_id("footer")` | Scroll element into viewport |
 
 ### Low-Level Client Methods

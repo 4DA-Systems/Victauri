@@ -140,7 +140,7 @@ victauri tools --json                   # MCP tool objects with their input sche
 victauri call dom_snapshot
 victauri call query_db query="SELECT count(*) FROM items" max_rows:=10
 victauri call invoke_command command=get_settings
-victauri call interact action=click ref_id=e12
+victauri call interact action=click ref_id=k3f9e12
 victauri call screenshot --out shot.png # images are saved, never printed as base64
 echo '{"action":"list"}' | victauri call window --args-file -
 ```

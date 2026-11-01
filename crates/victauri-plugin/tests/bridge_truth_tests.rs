@@ -733,6 +733,26 @@ fn find_attribute_hidden_cap_contract() {
     ]);
 }
 
+/// A locator is generated from a snapshot's name, so both tools must give the same one.
+#[test]
+fn snapshots_report_the_name_find_elements_matches() {
+    let html = "<label for=i>Your name</label><input id=i placeholder='Enter...'>\
+                <button id=b title=Hint>Save</button><button id=x aria-label=Close>x</button>";
+    check(&[(
+        "same_name",
+        html,
+        "function walk(n, out) { if (n.tag) out.push(n); (n.children || []).forEach(function(c){ walk(c, out); }); return out; } \
+         var nodes = walk(B.snapshot('json').tree, []); \
+         ['#i', '#b', '#x'].forEach(function(s) { \
+           var f = B.findElements({css: s})[0]; \
+           var n = nodes.filter(function(x){ return x.ref_id === f.ref_id; })[0]; \
+           T(n && f.name && n.name === f.name, s + ' ' + J(n) + ' vs ' + J(f)); \
+           T(B.findElements({role: f.role, name: n.name}).length >= 1, 'found by the snapshot name'); \
+         }); \
+         var t = B.snapshot().tree; T(t.indexOf('\"Your name\"') !== -1, t); T(t.indexOf('\"Enter...\"') === -1, t);",
+    )]);
+}
+
 #[test]
 fn accessible_name_is_one_computation() {
     check(&[

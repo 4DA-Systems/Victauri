@@ -3279,11 +3279,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         var rect = elRect(node);
         var tagName = elTag(node);
         var role = elAttr(node, 'role') || inferRole(node);
-        var name = elAttr(node, 'aria-label')
-            || elAttr(node, 'title')
-            || elAttr(node, 'placeholder')
-            || (tagName === 'BUTTON' ? truncText(node.textContent.trim(), 80) : null)
-            || (tagName === 'A' ? truncText(node.textContent.trim(), 80) : null);
+        var name = accessibleName(node);
 
         var element = {
             ref_id: ref_id,
@@ -3391,10 +3387,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         for (var d = 0; d < depth; d++) indent += '  ';
 
         var role = elAttr(node, 'role') || inferRole(node);
-        var name = elAttr(node, 'aria-label')
-            || elAttr(node, 'title')
-            || elAttr(node, 'placeholder')
-            || '';
+        var name = accessibleName(node) || '';
         var text = getDirectText(node) || '';
         var tag = elTag(node).toLowerCase();
 
@@ -3556,7 +3549,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         tooltip: 1 };
     // The accessible name: aria-label, aria-labelledby, an associated <label>, the text of a
     // button / link / summary-like element, then title and placeholder. One computation for the
-    // `name` result field and the `name` filter. Null when there is none.
+    // `name` result field, the `name` filter and both snapshots. Null when there is none.
     function accessibleName(el) {
         var aria = normText(elAttr(el, 'aria-label') || '');
         if (aria) return aria;

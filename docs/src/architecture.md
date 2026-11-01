@@ -114,9 +114,9 @@ __VICTAURI__.getStyles(ref)   // Computed CSS properties
 Following Playwright MCP's pattern, elements are identified by short-lived **ref handles** rather than CSS selectors:
 
 - Refs are derived from the accessible tree (ARIA roles and names)
-- They are short strings like `"e3"` or `"e47"`
-- They survive DOM restructuring within a single snapshot
-- A new `dom_snapshot` generates fresh refs
+- They are short opaque strings like `"k3f9e3"`: treat them as whole values, never parse them
+- The first four characters tag the page load, so a ref from before a reload or from another window fails at once and says why
+- An element keeps its ref while it stays in the page, through later snapshots and DOM restructuring
 
 This avoids brittle CSS selectors and gives agents a semantic view of the UI.
 

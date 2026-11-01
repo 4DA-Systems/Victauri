@@ -1,5 +1,141 @@
 # Migration Guide
 
+## v0.10.2 → v0.10.3
+
+A patch release with no public API removal: consumers on `"0.10"` pick it up with `cargo update`.
+But 0.10.3 comes from an adversarial audit whose main finding was that several assertions and tools
+reported success they had not checked. **They now tell the truth, so a test suite that was green
+can go red.** A new red is usually a real finding about your app, or a test that never checked what
+it said. The changes most likely to reach you come first.
+
+### Tests that may go red (`victauri-test`)
+
+- **Accessibility.** `assert_accessible` and `assert_no_a11y_violations` read a key the audit never
+  produced, so they could not fail. They now count `audit["violations"]` and fail if it is absent.
+  The smoke check fails only on `summary.critical > 0` and reports the other counts. Contrast and
+  heading findings are `warnings`, not `violations`; `summary.total` counts both.
+- **Locator negatives and matchers.** `.not().to_have_text/contain_text/value/attribute/checked/
+  unchecked/focused`, `.not().to_be_enabled()` and `to_be_disabled()` fail on a missing element after
+  waiting; they used to pass. All matchers wait for the element. A dead app or invalid selector is
+  an error, never read as the condition being met.
+- **Hidden elements.** `to_be_detached` fails for a hidden element still in the DOM. `count`, `all`,
+  `to_have_count`, `to_be_attached`, reads and state expectations include hidden elements. Actions,
+  `to_be_visible` and `to_be_hidden` stay visible-only, so `nth(1).click()` and `all()[1]` can differ.
+- **Text locators** resolve to the deepest match, so `Locator::text("Save")` on
+  `<button><span>Save</span></button>` is the span, and a heading can win over a button. Use
+  `role("button").and_text("Save")` for the control. A span in a disabled button reports disabled.
+- **`role(a).and_role(b)`** is an AND; `b` used to replace `a`. More than 1000 matches is an error.
+- **`Locator::press_key`** focuses the element first and errors if it cannot.
+- **`ipc_was_not_called` and `no_network_request`** fail as inconclusive once the log holds its 1000
+  entries, because a match may have rolled off. On a busy app take a checkpoint first
+  (`create_ipc_checkpoint`, `get_ipc_calls_since`).
+- **`has_text` / `has_no_text`** read rendered text through `eval_js`, so they error under a profile
+  that disables it, and `has_no_text` errors when there is no body.
+- **`no_ghost_commands`** fails on `confirmed_ghosts`, no longer on `frontend_only`.
+- **`assert_no_uncaught_errors`** includes unhandled rejections and reads 1000 entries.
+- **`client.wait(..).run()`** returns `Timeout` on `ok:false`. **`client.assert_semantic`** returns
+  `Assertion` on failure; new `evaluate_semantic` returns the verdict.
+- **`assert_dom_snapshot_valid`** refuses an empty tree. **`assert_screenshot_ok`** requires image
+  data and tolerates only the exact no-window messages. IPC integrity checks fail on `capture:"none"`.
+- **`compare_screenshot`** refuses non-PNG input and path-like names. In CI a missing baseline is
+  written and the check fails.
+- **`equals` / `not_equals`** coerce only a number against its canonical text: `null != "null"`,
+  `true != "true"`, `"1.10" != "1.1"`. `wait_for expected` uses the same rule. `verify_state` treats
+  `5` and `5.0` as equal.
+- **Discovery.** With nothing discovered and no `VICTAURI_PORT`, `discover`/`connect` return an error
+  instead of trying port 7373. A plugin older than 0.7.4 needs `VICTAURI_PORT`.
+- **`VICTAURI_E2E`** of `""`, `0`, `false` or `off` counts as off.
+- **Smaller changes:** `animation_scrub(capture=true)` returns the curve object with the image under
+  `image`. `text_by_id` returns full text content. `coverage_report` excludes mocked calls.
+  `write_junit_report` refuses a symlink, and `to_xml` adds `skipped="N"`. Duplicate checkpoint ids
+  are refused. `#[inspectable]`: `required` flags change where the old check was by spelling, an
+  app's own `api::State` now appears as an argument, and `__schema` copies the command's visibility.
+
+### Refs
+
+Ref ids changed from `e12` to a page-tagged form such as `k3f9e12`. Treat them as opaque. A ref from
+before a reload or from another window now fails at once with
+`ref not found: … previous page load …`, where it could resolve to a different element. Code that
+parsed `e<digits>` must stop.
+
+### Tools
+
+- **`query_db`:** JSON text whose re-encoding would change data (big numbers, `1.10`, `1e3`, duplicate
+  keys, escapes such as `é`) stays a string; other JSON text still decodes. Infinities are
+  `{"__real":"Infinity"}`. Invalid UTF-8 is `{"__invalid_utf8":true,"text":…,"base64":…}`. SQL past
+  256 parenthesis levels or 2,000 SELECTs is refused. A database is refused if one schema entry
+  exceeds 1 MB, 256 levels or 2,000 SELECTs, or its views add up past 2,000 (`db_health` too).
+- **Database discovery:** auto-selection and the `app_info` listing skip files without a SQLite
+  header, so a SQLCipher database is no longer auto-selected (an explicit `path` still works). `.db3`
+  and any-case extensions are found. `history`, `cookies` and `favicons` are app candidates.
+- **`find_elements`:** `text` returns deepest matches only and normalises whitespace; script and style
+  text no longer matches; `name` is the accessible name; `visible` and `enabled` are honest (`enabled`
+  includes a disabled fieldset, `aria-disabled` and a disabled ancestor control); `max_results` goes up
+  to 5000 and 0 returns none. New: `attribute`, `attribute_value`, `text_exact`, `include_hidden`.
+- **`input` and `interact`:** `fill`/`type_text` return errors for readonly, checkbox, radio, file and
+  button inputs and for values a number/date/time/range/color field rejects; the old value is kept.
+  `type_text` over 20,000 characters errors. `select_option` errors for unknown or disabled values and
+  fires `input` before `change`. `opacity:0` elements are actionable; a click lands on the hit
+  descendant; an ancestor on top counts as covering (except a label operating that control). Keyboard
+  events carry `code`, `keyCode` and `which`.
+- **Snapshots** list `opacity:0` elements (`[transparent]`) and visible children of `visibility:hidden`
+  parents.
+- **`logs`:** `console`, `navigation`, `dialogs` and `events` default to the newest 100 with trimmed
+  fields. `limit:0` on `backend` and `stdout` returns nothing and keeps the cursor.
+- **`window`:** `webview_label`, `window` and `window_label` now target that window (they were ignored).
+  `resize` and `move_to` report what the OS applied, plus `requested`.
+- **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
+  `/health` first, costing about 2 s and that history entry. `go_back` on a stopped page returns
+  `{ok, recovered, url, note}`.
+- **`explain` and `introspect coverage`** on an unreadable page are tool errors, where they reported a
+  clean result. `command_timings` adds `ipc_read_error`.
+- **`recording`:** `checkpoint` drains first (up to 3 s, reports `unreachable_windows`) and refuses empty
+  or duplicate ids. `events_between` stays a bare array when complete, and becomes
+  `{events, dropped, note}` when the ring buffer evicted part of the window. `import` accepts 48 MiB
+  over REST; `/mcp` stays at 2 MiB.
+- **`wait_for`:** text, selector and url conditions without a value fail at once. Explicit
+  `expected: null` compares with null. `event` omits `payload` where `introspect.event_bus` is not
+  allowed. A bad selector resolves `ok:false`.
+- **`route add`** rejects invalid regex, non-object headers and unknown actions. XHR `fulfill` is tagged
+  and warned, not implemented. **`window.__VICTAURI__.addRoute`** is gone from the page-visible API.
+- **Also:** `list_app_dir pattern` has real `*`/`?`, refuses `[`/`]`. Paths over 4096 bytes are refused.
+  `trace start` on an unknown window errors. `storage set` needs a `value`. `animation` failures are tool
+  errors. `contract_record` refuses non-object args. A fault delay counts against `timeout_ms`. MCP
+  `serverInfo` is `victauri`, and the REST tool list adds `input_schema`.
+
+### Privacy and configuration
+
+- `build()` fails on an invalid custom redaction pattern (`BuilderError::InvalidRedactionPattern`).
+- Redaction covers more keys (including `PWD`), `storage get` of a sensitive key, and numbers: a
+  matching number becomes a string.
+- The Test profile with a non-empty allowlist now lists and runs `invoke_command` for those commands.
+- `log_layer()` no longer lowers the global max level: apps with an unfiltered layer see TRACE again.
+- Event-bus payloads are cut at 64 KiB with a marker, 16 MiB in all, and keep their emitted key order.
+- Trusted clicks use the page's `devicePixelRatio`, so zoom counts. A page reporting a false ratio moves
+  the click, still clamped to the client area.
+
+### CLI and watchdog
+
+- `victauri setup` exits non-zero for a refused or unwritable config and for an entry pinned to another
+  app. User-level configs are written without `--app`.
+- `VICTAURI_PORT` set and unhealthy: the bridge and `victauri logs` no longer fall through to another
+  app. `VICTAURI_PORT=0` means unset. `victauri logs` with `VICTAURI_APP` or `VICTAURI_PORT` set and the
+  app down refuses, rather than showing the newest capture.
+- `victauri run` passes output through as it arrives. Killing it kills the app and its tree on Windows;
+  SIGTERM and SIGHUP are forwarded on Unix. Default-location captures of dead apps are deleted at the
+  next run once past 7 days or beyond the newest 20.
+- `--out` and `--capture` refuse symlinks. `record` checks `--output` before connecting. `--args-file`
+  accepts a UTF-8 BOM and names UTF-16. `call`, `invoke` and `tools --json` stdout escapes C1 and bidi
+  characters as `\uXXXX` (the JSON value is equal). Id-less `ping`/`initialize` get no reply.
+- Watchdog: a recovery command still running after 60 s is logged and left running. Windows recovery
+  runs as `cmd /d /s /c "<line>"`, so AutoRun is skipped and a line relying on the old escaping may parse
+  differently.
+
+### Dependencies
+
+`rusqlite` now accepts `>=0.32, <0.42`. New Windows feature `Win32_System_JobObjects` on
+`victauri-test`; `ctrlc` gains its `termination` feature.
+
 ## v0.10.1 → v0.10.2
 
 No API change (additions only; `cargo semver-checks` reports no semver update needed); consumers

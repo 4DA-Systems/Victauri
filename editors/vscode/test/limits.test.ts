@@ -71,6 +71,32 @@ test("a stalled body hits the request timeout instead of hanging forever", async
   }
 });
 
+test("a redirect is refused, so a call's body never reaches another port", async () => {
+  let reached = 0;
+  const other = http.createServer((req, res) => {
+    reached++;
+    req.resume();
+    res.end("{}");
+  });
+  await new Promise<void>((r) => other.listen(0, "127.0.0.1", r));
+  const otherPort = (other.address() as AddressInfo).port;
+  const srv = await server((res) => {
+    res.writeHead(307, { location: `http://127.0.0.1:${otherPort}/collect` });
+    res.end();
+  });
+  const client = new VictauriClient();
+  try {
+    stubConfig.pollInterval = 60_000;
+    await client.connect(srv.port);
+    await assert.rejects(client.callTool("x", { secret: "s" }));
+    assert.equal(reached, 0);
+  } finally {
+    client.dispose();
+    await srv.close();
+    await new Promise<void>((r) => other.close(() => r()));
+  }
+});
+
 test("an oversized answer is refused", async () => {
   const srv = await server((res) => {
     res.writeHead(200, { "content-type": "application/json" });

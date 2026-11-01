@@ -7,6 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-01
+
+From a nine-lens adversarial audit. **Assertions that reported success without checking now tell the
+truth, so a green test suite can go red.** See MIGRATION.md for every behaviour change.
+
+### Fixed: assertions and tools that lied
+
+- `assert_accessible` and `assert_no_a11y_violations` read a key the audit never produced and could not
+  fail. A failed lookup could read as a met condition in locator matchers; negative matchers passed on a
+  missing element; `no_ghost_commands` failed on the wrong list; `has_text` searched snapshot JSON;
+  `ipc_was_not_called` passed on a log window that could not see the call.
+- `wait_for expected` and `assert_semantic` disagreed on equality; both now share one rule, which no
+  longer calls `null` and `"null"` equal.
+- `explain` and `introspect coverage` turned an unreadable page into a clean "nothing happened".
+- `recording events_between` hid events the ring buffer had evicted, and `checkpoint` missed what the page
+  captured just before it.
+- `window` ignored its target and acted on the default window. `resize` and `move_to` reported the request,
+  not the outcome.
+- `query_db` silently changed big numbers, `1.10` and duplicate keys in JSON text, and returned infinities
+  as NULL. `select_option`, `fill` and `type_text` reported success for values that never applied.
+
+### Fixed: crashes and hangs in the host app
+
+- Deeply nested SQL or a crafted database schema could overflow the stack and kill the app. Both now return
+  a clean error (64 MiB reserved stack, nesting and view budgets).
+- Windows process-memory reads leaked a handle per call. The event bus could retain hundreds of MiB.
+- Logging: reading the log no longer stalls logging threads; a panic in a `Debug` impl, a value that logs
+  while being recorded and two capture layers in one subscriber no longer panic or deadlock; symbolising a
+  panic no longer blocks workers or another panic; `log_layer()` no longer lowers the global max level.
+- `navigate go_to` out of the app left a dead page with no way back; a page stopped by `while(true)` now
+  recovers through a detour on WebView2. The demo's sync window-building command deadlocked.
+
+### Fixed: JS bridge
+
+- Refs carry a per-page-load tag, so a ref from another page or window can never resolve to the wrong element.
+- A page could pollute prototypes or hook built-ins to forge or hide bridge results and logs, and could add
+  route rules: closed. Bridge comments that overclaimed are corrected. Results and logs are evidence against
+  a buggy page, not a hostile one (docs/src/security.md).
+- `find_elements` computes accessible names and honest `visible`/`enabled`, returns deepest text matches, and
+  gains `attribute`, `attribute_value`, `text_exact` and `include_hidden`.
+- Actionability: SVG, `opacity:0` styled controls, MUI wrappers, labels, disabled fieldsets, covering ancestors,
+  shadow DOM events, contenteditable and same-origin iframes.
+- `type_text` no longer corrupts number and date inputs. Log entries are bounded. Scrubbing restores the
+  animation's time and state.
+
+### Fixed: privacy
+
+- Invalid custom redaction patterns fail `build()`. Redaction covers numbers, name/value pairs, `storage get` and
+  short credential names. `wait_for event` omits the payload where the event bus is not allowed. Legacy
+  `disabled_tools` names block their actions. The Test profile's allowlist promise now works. Refused requests
+  cannot flood or write into the log.
+
+### Fixed: CLI and watchdog
+
+- `victauri run`: output reaches the terminal as it arrives, killing the launcher takes the app with it, and a closed
+  stderr no longer changes the exit code. Old captures are pruned.
+- Bridge: a `VICTAURI_PORT` pin that is down never reaches another app. Invalid UTF-8 no longer shuts it down.
+- `victauri logs --follow` loses nothing across rotation. `setup` no longer pins user-level configs to one project
+  and reports failures in its exit code. Output from a hostile plugin cannot drive the terminal.
+- Watchdog: quoted recovery paths with spaces work, and a slow recovery command is no longer killed.
+- With nothing discovered, tools no longer send requests to whatever holds port 7373.
+
+### Fixed: other
+
+- Screenshots of decorated windows keep their edges (Windows.Graphics.Capture crop). Trusted clicks respect page zoom.
+- Database discovery skips non-SQLite files and finds `.db3`.
+
+### Changed: release and CI
+
+- `rusqlite` range extended to `<0.42`; lockfile updates move CI onto rmcp 3.8, tauri 2.12, wry 0.57, tao 0.37 and
+  tokio 1.54.1, which consumers without a lockfile already resolve.
+- Release workflows use no caches (new guard `scripts/check-release-no-cache.sh`). The crate-exists check no longer
+  misreads a published crate. `release-vscode.yml` requires green CI, including the Windows job.
+  `mcp-registry.yml` refuses an unpublished version. `surface-audit.yml` covers the registry and GitHub Release.
+- A new CI leg runs the demo with auth on, and a new test opens a second window.
+
 ## [0.10.2] - 2026-10-31
 
 ### Added — backend (Rust) log capture: the app's debug console, for agents
@@ -2615,7 +2691,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.10.3...HEAD
+[0.10.3]: https://github.com/4DA-Systems/victauri/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/4DA-Systems/victauri/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/4DA-Systems/victauri/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/4DA-Systems/victauri/compare/v0.9.0...v0.10.0

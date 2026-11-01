@@ -481,9 +481,9 @@ default synthetic click. The window is brought to the foreground first.
 
 **Example:**
 ```json
-{"action": "click", "ref_id": "e3"}
-{"action": "click", "ref_id": "e3", "trusted": true}
-{"action": "select_option", "ref_id": "e9", "value": "us"}
+{"action": "click", "ref_id": "k3f9e3"}
+{"action": "click", "ref_id": "k3f9e3", "trusted": true}
+{"action": "select_option", "ref_id": "k3f9e9", "value": "us"}
 ```
 
 ---
@@ -511,9 +511,9 @@ input with a clear error.
 
 **Example:**
 ```json
-{"action": "fill", "ref_id": "e5", "value": "hello@example.com"}
-{"action": "type_text", "ref_id": "e5", "text": "Hello"}
-{"action": "type_text", "ref_id": "e5", "text": "Hello", "trusted": true}
+{"action": "fill", "ref_id": "k3f9e5", "value": "hello@example.com"}
+{"action": "type_text", "ref_id": "k3f9e5", "text": "Hello"}
+{"action": "type_text", "ref_id": "k3f9e5", "text": "Hello", "trusted": true}
 {"action": "press_key", "key": "Enter"}
 ```
 
@@ -651,8 +651,8 @@ CSS inspection, accessibility, and performance profiling.
 
 **Example:**
 ```json
-{"action": "get_styles", "ref_id": "e3", "properties": ["color", "font-size"]}
-{"action": "get_bounding_boxes", "ref_ids": ["e1", "e2", "e3"]}
+{"action": "get_styles", "ref_id": "k3f9e3", "properties": ["color", "font-size"]}
+{"action": "get_bounding_boxes", "ref_ids": ["k3f9e1", "k3f9e2", "k3f9e3"]}
 {"action": "audit_accessibility"}
 {"action": "get_performance"}
 ```

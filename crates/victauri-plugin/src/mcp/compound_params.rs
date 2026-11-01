@@ -118,7 +118,7 @@ impl fmt::Display for InteractAction {
 pub struct InteractParams {
     /// Action to perform: click, `double_click`, hover, focus, `scroll_into_view`, `select_option`.
     pub action: InteractAction,
-    /// Ref handle ID from a DOM snapshot (e.g. "e5"). Required for click, `double_click`, hover, focus, `select_option`.
+    /// Ref handle ID from a DOM snapshot (e.g. "k3f9e5"). Required for click, `double_click`, hover, focus, `select_option`.
     pub ref_id: Option<String>,
     /// Option values for `select_option` action.
     pub values: Option<Vec<String>>,

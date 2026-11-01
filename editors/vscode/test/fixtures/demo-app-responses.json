@@ -15,7 +15,7 @@
   "description": "Full-stack Tauri app inspection: webview + IPC + Rust backend + SQLite",
   "events_captured": 0,
   "name": "victauri",
-  "port": 7391,
+  "port": 17650,
   "privacy_mode": false,
   "protocol": "mcp",
   "version": "0.10.2"
@@ -23,7 +23,7 @@
  "click_unknown_ref": {
   "status": 200,
   "body": {
-   "error": "ref not found: e999999\n\n[hint: CHECK_INPUT]"
+   "error": "ref not found: e999999 (this ref is from a previous page load or another window; this page's refs start with jdo1e — take a new dom_snapshot or find_elements)\n\n[hint: CHECK_INPUT]"
   }
  },
  "tools": {
@@ -46,8 +46,8 @@
       "maximized": false,
       "minimized": false,
       "position": [
-       104,
-       104
+       338,
+       338
       ],
       "size": [
        900,
@@ -67,27 +67,27 @@
      {
       "args": {},
       "command": "get_counter",
-      "duration_ms": 47,
+      "duration_ms": 34,
       "error": null,
       "id": 2,
       "result": 0,
       "status": "ok",
-      "timestamp": 1793505616533
+      "timestamp": 1793533519709
      },
      {
       "args": {},
       "command": "list_todos",
-      "duration_ms": 46,
+      "duration_ms": 33,
       "error": null,
       "id": 3,
       "result": [],
       "status": "ok",
-      "timestamp": 1793505616534
+      "timestamp": 1793533519710
      },
      {
       "args": {},
       "command": "get_settings",
-      "duration_ms": 46,
+      "duration_ms": 32,
       "error": null,
       "id": 4,
       "result": {
@@ -96,39 +96,39 @@
        "theme": "dark"
       },
       "status": "ok",
-      "timestamp": 1793505616534
+      "timestamp": 1793533519711
      },
      {
       "args": {},
       "command": "list_notifications",
-      "duration_ms": 45,
+      "duration_ms": 32,
       "error": null,
       "id": 5,
       "result": [],
       "status": "ok",
-      "timestamp": 1793505616535
+      "timestamp": 1793533519711
      },
      {
       "args": {
        "name": "fixture"
       },
       "command": "greet",
-      "duration_ms": 3,
+      "duration_ms": 2,
       "error": null,
       "id": 7,
       "result": "Hello, fixture! This response came from Rust.",
       "status": "ok",
-      "timestamp": 1793505627929
+      "timestamp": 1793533525225
      },
      {
       "args": {},
       "command": "no_such_command_fixture",
-      "duration_ms": 3,
+      "duration_ms": 2,
       "error": "Command no_such_command_fixture not found",
       "id": 12,
       "result": "Command no_such_command_fixture not found",
       "status": "error",
-      "timestamp": 1793505627941
+      "timestamp": 1793533525236
      }
     ]
    }
@@ -137,11 +137,11 @@
    "status": 200,
    "body": {
     "result": {
-     "page_fault_count": 14593,
-     "page_file_bytes": 11145216,
-     "peak_page_file_bytes": 11583488,
-     "peak_working_set_bytes": 50393088,
-     "working_set_bytes": 50388992
+     "page_fault_count": 15159,
+     "page_file_bytes": 11321344,
+     "peak_page_file_bytes": 11423744,
+     "peak_working_set_bytes": 51703808,
+     "working_set_bytes": 51699712
     }
    }
   },
@@ -162,7 +162,7 @@
       "allowlist": null,
       "blocklist": []
      },
-     "port": 7391,
+     "port": 17650,
      "privacy": {
       "profile": "full_control",
       "redaction_enabled": false
@@ -211,7 +211,7 @@
       ],
       "total": 35
      },
-     "uptime_secs": 12,
+     "uptime_secs": 6,
      "version": "0.10.2"
     }
    }
@@ -261,8 +261,8 @@
      },
      "js_heap": {
       "limit_mb": 4192,
-      "total_mb": 3.13,
-      "used_mb": 2.34
+      "total_mb": 3.7,
+      "used_mb": 2.5
      },
      "long_tasks": {
       "count": 0,
@@ -273,13 +273,13 @@
       "connect_ms": 0,
       "decoded_body_size": 23621,
       "dns_ms": 0,
-      "dom_complete_ms": 107,
-      "dom_interactive_ms": 64,
+      "dom_complete_ms": 121,
+      "dom_interactive_ms": 92,
       "encoded_body_size": 23621,
-      "load_event_ms": 107,
+      "load_event_ms": 121,
       "response_ms": 0,
       "transfer_size": 23921,
-      "ttfb_ms": 37
+      "ttfb_ms": 66
      },
      "paint": {
       "first-contentful-paint": 236,
@@ -290,12 +290,12 @@
        "fetch": {
         "count": 19,
         "total_bytes": 0,
-        "total_ms": 38.29999998211861
+        "total_ms": 34.29999992251396
        },
        "other": {
         "count": 1,
         "total_bytes": 23921,
-        "total_ms": 1.4000000059604645
+        "total_ms": 2.5
        }
       },
       "slowest": [
@@ -318,14 +318,14 @@
         "type": "fetch"
        },
        {
-        "duration_ms": 2,
-        "name": "get_counter",
-        "size": 0,
-        "type": "fetch"
+        "duration_ms": 3,
+        "name": "favicon.ico",
+        "size": 23921,
+        "type": "other"
        },
        {
         "duration_ms": 2,
-        "name": "list_todos",
+        "name": "get_counter",
         "size": 0,
         "type": "fetch"
        }
@@ -344,23 +344,11 @@
       "critical": 0,
       "minor": 0,
       "moderate": 0,
-      "serious": 1,
-      "total": 1
+      "serious": 0,
+      "total": 0
      },
      "violations": [],
-     "warnings": [
-      {
-       "details": {
-        "bg": "rgb(139, 92, 246)",
-        "fg": "rgb(255, 255, 255)",
-        "ratio": "4.23"
-       },
-       "element": "<div id=\"sweep-toast\" class=\"sweep-toast\">",
-       "message": "Contrast ratio 4.23:1 (needs 4.5:1)",
-       "rule": "color-contrast",
-       "severity": "serious"
-      }
-     ]
+     "warnings": []
     }
    }
   },
@@ -369,7 +357,7 @@
    "body": {
     "result": {
      "ok": true,
-     "ref_id": "e5"
+     "ref_id": "jdo1e5"
     }
    }
   },
@@ -386,7 +374,7 @@
    "status": 200,
    "body": {
     "result": {
-     "ref_id": "e5",
+     "ref_id": "jdo1e5",
      "styles": {
       "border-radius": "8px",
       "color": "rgb(139, 92, 246)",
@@ -448,7 +436,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "e2",
+          "ref_id": "jdo1e2",
           "role": "heading",
           "tag": "h1",
           "text": "Victauri Demo",
@@ -467,10 +455,10 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "e3",
+          "ref_id": "jdo1e3",
           "role": null,
           "tag": "p",
-          "text": "19 instrumented commands — connect an MCP client to introspect everything",
+          "text": "25 instrumented commands — connect an MCP client to introspect everything",
           "value": null,
           "visible": true
          },
@@ -495,7 +483,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Home",
-            "ref_id": "e5",
+            "ref_id": "jdo1e5",
             "role": "tab",
             "tag": "button",
             "text": "Home",
@@ -514,7 +502,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Todos",
-            "ref_id": "e6",
+            "ref_id": "jdo1e6",
             "role": "tab",
             "tag": "button",
             "text": "Todos",
@@ -533,7 +521,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Contact",
-            "ref_id": "e7",
+            "ref_id": "jdo1e7",
             "role": "tab",
             "tag": "button",
             "text": "Contact",
@@ -552,7 +540,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Settings",
-            "ref_id": "e8",
+            "ref_id": "jdo1e8",
             "role": "tab",
             "tag": "button",
             "text": "Settings",
@@ -571,7 +559,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Notifications 0",
-            "ref_id": "e9",
+            "ref_id": "jdo1e9",
             "role": "tab",
             "tag": "button",
             "text": "Notifications",
@@ -582,7 +570,7 @@
           "enabled": true,
           "focusable": false,
           "name": "Main navigation",
-          "ref_id": "e4",
+          "ref_id": "jdo1e4",
           "role": "tablist",
           "tag": "nav",
           "text": null,
@@ -621,7 +609,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e12",
+              "ref_id": "jdo1e12",
               "role": "heading",
               "tag": "h2",
               "text": "Greet",
@@ -640,7 +628,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e13",
+              "ref_id": "jdo1e13",
               "role": null,
               "tag": "label",
               "text": "Your name",
@@ -663,7 +651,7 @@
               "enabled": true,
               "focusable": true,
               "name": "Enter your name...",
-              "ref_id": "e14",
+              "ref_id": "jdo1e14",
               "role": "textbox",
               "tag": "input",
               "text": null,
@@ -685,7 +673,7 @@
               "enabled": true,
               "focusable": true,
               "name": "Greet",
-              "ref_id": "e15",
+              "ref_id": "jdo1e15",
               "role": "button",
               "tag": "button",
               "text": "Greet",
@@ -707,7 +695,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e16",
+              "ref_id": "jdo1e16",
               "role": null,
               "tag": "div",
               "text": null,
@@ -718,7 +706,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e11",
+            "ref_id": "jdo1e11",
             "role": null,
             "tag": "div",
             "text": null,
@@ -746,7 +734,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e18",
+              "ref_id": "jdo1e18",
               "role": "heading",
               "tag": "h2",
               "text": "Counter",
@@ -768,7 +756,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e19",
+              "ref_id": "jdo1e19",
               "role": "status",
               "tag": "div",
               "text": "0",
@@ -799,7 +787,7 @@
                 "enabled": true,
                 "focusable": true,
                 "name": "Decrement counter",
-                "ref_id": "e21",
+                "ref_id": "jdo1e21",
                 "role": "button",
                 "tag": "button",
                 "text": "−",
@@ -821,7 +809,7 @@
                 "enabled": true,
                 "focusable": true,
                 "name": "Increment counter",
-                "ref_id": "e22",
+                "ref_id": "jdo1e22",
                 "role": "button",
                 "tag": "button",
                 "text": "+",
@@ -843,7 +831,7 @@
                 "enabled": true,
                 "focusable": true,
                 "name": "Reset counter",
-                "ref_id": "e23",
+                "ref_id": "jdo1e23",
                 "role": "button",
                 "tag": "button",
                 "text": "Reset",
@@ -854,7 +842,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e20",
+              "ref_id": "jdo1e20",
               "role": null,
               "tag": "div",
               "text": null,
@@ -865,7 +853,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e17",
+            "ref_id": "jdo1e17",
             "role": null,
             "tag": "div",
             "text": null,
@@ -876,7 +864,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "e10",
+          "ref_id": "jdo1e10",
           "role": "tabpanel",
           "tag": "div",
           "text": null,
@@ -904,7 +892,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e25",
+            "ref_id": "jdo1e25",
             "role": "heading",
             "tag": "h2",
             "text": "Sweep Animation",
@@ -932,7 +920,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e27",
+              "ref_id": "jdo1e27",
               "role": null,
               "tag": "code",
               "text": "animation",
@@ -943,7 +931,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e26",
+            "ref_id": "jdo1e26",
             "role": null,
             "tag": "p",
             "text": "A miscalibrated slide-in. Use the\n         tool to measure and fix it.",
@@ -974,7 +962,7 @@
               "enabled": true,
               "focusable": false,
               "name": null,
-              "ref_id": "e29",
+              "ref_id": "jdo1e29",
               "role": null,
               "tag": "div",
               "text": "Notification",
@@ -985,7 +973,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e28",
+            "ref_id": "jdo1e28",
             "role": null,
             "tag": "div",
             "text": null,
@@ -1007,7 +995,7 @@
             "enabled": true,
             "focusable": true,
             "name": "Play sweep",
-            "ref_id": "e30",
+            "ref_id": "jdo1e30",
             "role": "button",
             "tag": "button",
             "text": "Play sweep",
@@ -1018,7 +1006,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "e24",
+          "ref_id": "jdo1e24",
           "role": null,
           "tag": "div",
           "text": null,
@@ -1046,7 +1034,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e32",
+            "ref_id": "jdo1e32",
             "role": null,
             "tag": "span",
             "text": null,
@@ -1065,7 +1053,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e33",
+            "ref_id": "jdo1e33",
             "role": null,
             "tag": "strong",
             "text": "127.0.0.1:7373",
@@ -1084,7 +1072,7 @@
             "enabled": true,
             "focusable": false,
             "name": null,
-            "ref_id": "e34",
+            "ref_id": "jdo1e34",
             "role": null,
             "tag": "br",
             "text": null,
@@ -1106,7 +1094,7 @@
             "enabled": true,
             "focusable": true,
             "name": "get_app_state()",
-            "ref_id": "e35",
+            "ref_id": "jdo1e35",
             "role": "button",
             "tag": "button",
             "text": "get_app_state()",
@@ -1117,7 +1105,7 @@
           "enabled": true,
           "focusable": false,
           "name": null,
-          "ref_id": "e31",
+          "ref_id": "jdo1e31",
           "role": null,
           "tag": "div",
           "text": "Victauri MCP server running on",
@@ -1128,7 +1116,7 @@
         "enabled": true,
         "focusable": false,
         "name": null,
-        "ref_id": "e1",
+        "ref_id": "jdo1e1",
         "role": null,
         "tag": "div",
         "text": null,
@@ -1139,7 +1127,7 @@
       "enabled": true,
       "focusable": false,
       "name": null,
-      "ref_id": "e0",
+      "ref_id": "jdo1e0",
       "role": null,
       "tag": "body",
       "text": null,

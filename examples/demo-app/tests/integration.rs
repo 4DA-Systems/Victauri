@@ -268,7 +268,17 @@ e2e_test!(command_registry_populated, |client| async move {
 e2e_test!(accessibility_audit, |client| async move {
     let audit = client.audit_accessibility().await.unwrap();
     let violations = audit["violations"].as_array().unwrap().len();
-    assert_eq!(audit["summary"]["total"].as_u64(), Some(violations as u64));
+    let warnings = audit["warnings"].as_array().unwrap().len();
+    // The summary counts both lists; contrast findings are warnings.
+    assert_eq!(
+        audit["summary"]["total"].as_u64(),
+        Some((violations + warnings) as u64)
+    );
+    assert_eq!(
+        audit["summary"]["serious"].as_u64(),
+        Some(0),
+        "the demo page has a serious finding: {audit}"
+    );
 
     assert!(
         violations < 5,

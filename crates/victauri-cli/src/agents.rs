@@ -1230,7 +1230,7 @@ Exit code 0 = success, 1 = the tool reported an error or the app rejected the ca
 tool may have run, so check its effect before retrying. `victauri call screenshot --out
 shot.png` saves images instead of printing base64. Add `--app <bundle-identifier>` when several apps run. Examples:
 `victauri call query_db query="SELECT count(*) FROM items"`,
-`victauri call invoke_command command=get_settings`, `victauri call interact action=click ref_id=e12`.
+`victauri call invoke_command command=get_settings`, `victauri call interact action=click ref_id=k3f9e12`.
 
 ### Awaiting async backend work (don't guess with sleeps)
 

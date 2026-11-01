@@ -564,6 +564,8 @@ export class VictauriClient {
       const resp = await fetch(`${this.baseUrl}${path}`, {
         ...init,
         headers,
+        // A 307 would resend a tool call's body to wherever the answer points.
+        redirect: "error",
         signal: controller.signal,
       });
       return {
