@@ -247,6 +247,102 @@ mod trusted_probe_js {
         assert_eq!(results[4]["y"], 226.0, "{}", results[4]);
     }
 
+    /// The trusted coordinates are the point the bridge found, not the box's centre: a real OS
+    /// click at the centre of a stroke-only circle lands in empty space.
+    #[test]
+    fn click_probe_returns_the_point_that_was_found() {
+        let probe = trusted_click_probe_js("__VREF__");
+        // A circle of radius 40 around (100, 100), placed at (20, 10) by its screen CTM.
+        let stroke = "window.Element.prototype.scrollIntoView = function () {}; \
+             var c = document.getElementById('c'); \
+             c.getBoundingClientRect = function () { return {left: 80, top: 70, width: 80, height: 80, \
+               right: 160, bottom: 150, x: 80, y: 70}; }; \
+             c.getTotalLength = function () { return 2 * Math.PI * 40; }; \
+             c.getPointAtLength = function (s) { var t = s / 40; \
+               return {x: 100 + 40 * Math.cos(t), y: 100 + 40 * Math.sin(t)}; }; \
+             c.getScreenCTM = function () { return {a: 1, b: 0, c: 0, d: 1, e: 20, f: 10}; }; \
+             window.__onStroke = function (x, y) { return Math.abs(Math.hypot(x - 120, y - 110) - 40) < 1; }; \
+             document.elementFromPoint = function (x, y) { \
+               return window.__onStroke(x, y) ? c : document.body; };";
+        let stroke_html = r#"<html><body><svg width="200" height="200"><circle id="c" r="40"></circle></svg></body></html>"#;
+        let stroke_framed = "var f = document.createElement('iframe'); document.body.appendChild(f); \
+             var fw = f.contentWindow, fd = f.contentDocument; \
+             fd.body.innerHTML = '<svg width=\"200\" height=\"200\"><circle id=\"c\" r=\"40\"></circle></svg>'; \
+             fw.Element.prototype.scrollIntoView = function () {}; \
+             var c = fd.getElementById('c'); \
+             c.getBoundingClientRect = function () { return {left: 80, top: 70, width: 80, height: 80, \
+               right: 160, bottom: 150, x: 80, y: 70}; }; \
+             c.getTotalLength = function () { return 2 * Math.PI * 40; }; \
+             c.getPointAtLength = function (s) { var t = s / 40; \
+               return {x: 100 + 40 * Math.cos(t), y: 100 + 40 * Math.sin(t)}; }; \
+             c.getScreenCTM = function () { return {a: 1, b: 0, c: 0, d: 1, e: 20, f: 10}; }; \
+             fd.elementFromPoint = function (x, y) { \
+               return Math.abs(Math.hypot(x - 120, y - 110) - 40) < 1 ? c : fd.body; }; \
+             f.getBoundingClientRect = function () { return {left: 1000, top: 2000, width: 300, height: 300, \
+               right: 1300, bottom: 2300, x: 1000, y: 2000}; }; \
+             window.innerWidth = 5000; window.innerHeight = 5000; \
+             document.elementFromPoint = function () { return f; };";
+        let wrapped = "var l = document.getElementById('l'); \
+             l.getBoundingClientRect = function () { return {left: 0, top: 0, width: 100, height: 60, \
+               right: 100, bottom: 60, x: 0, y: 0}; }; \
+             l.getClientRects = function () { return [ \
+               {left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16}, \
+               {left: 0, top: 44, right: 30, bottom: 60, width: 30, height: 16}]; }; \
+             document.elementFromPoint = function (x, y) { \
+               return (x === 15 && y === 52) ? l : document.body; };";
+        let wrapped_html = r#"<html><body><a id="l" href="x">wrapped</a></body></html>"#;
+        let clipped_away = "window.Element.prototype.scrollIntoView = function () {}; \
+             document.getElementById('c').getBoundingClientRect = function () { \
+               return {left: 80, top: 70, width: 80, height: 80, right: 160, bottom: 150, x: 80, y: 70}; }; \
+             document.elementFromPoint = function () { return document.body; };";
+        let Some(results) = run(&[
+            (
+                "stroke-only circle",
+                stroke_html,
+                stroke,
+                "{css:'#c'}",
+                probe.clone(),
+            ),
+            (
+                "stroke-only circle in a frame",
+                "<html><body></body></html>",
+                stroke_framed,
+                "{css:'#c'}",
+                probe.clone(),
+            ),
+            (
+                "second line of a wrapped link",
+                wrapped_html,
+                wrapped,
+                "{css:'#l'}",
+                probe.clone(),
+            ),
+            (
+                "nothing of it can be hit",
+                stroke_html,
+                clipped_away,
+                "{css:'#c'}",
+                probe,
+            ),
+        ]) else {
+            return;
+        };
+        let on_stroke = |v: &serde_json::Value, ox: f64, oy: f64| {
+            let (x, y) = (v["x"].as_f64().unwrap(), v["y"].as_f64().unwrap());
+            ((x - ox - 120.0).hypot(y - oy - 110.0) - 40.0).abs() < 1.0
+        };
+        assert!(on_stroke(&results[0], 0.0, 0.0), "{}", results[0]);
+        assert!(on_stroke(&results[1], 1000.0, 2000.0), "{}", results[1]);
+        assert_eq!(results[2]["x"], 15.0, "{}", results[2]);
+        assert_eq!(results[2]["y"], 52.0, "{}", results[2]);
+        assert!(
+            results[3]["error"].as_str().unwrap().contains("covered")
+                && results[3].get("x").is_none(),
+            "{}",
+            results[3]
+        );
+    }
+
     /// A button inside an OPEN shadow root, hit-tested the way a browser does:
     /// `document.elementFromPoint` reports the shadow HOST (retargeting); only the shadow root's
     /// own `elementFromPoint` sees the button. `cover_inner` makes something else inside the

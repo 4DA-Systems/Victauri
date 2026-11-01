@@ -914,33 +914,13 @@ const INIT_SCRIPT_BODY: &str = r#"
     function hitCovers(hit, el) {
         return !!hit && hit !== el && !composedContains(el, hit) && !labelOperates(hit, el);
     }
-    // Shapes whose bounding box says nothing about what they paint at its centre: SVG, and an
-    // inline element wrapped over several lines.
-    function paintsOffCentre(el) {
+    // Shapes whose box says nothing about what they paint at its centre: SVG, an inline element
+    // wrapped over several lines, and a box with no area around content laid out outside it.
+    function paintsOffCentre(el, rect) {
         if (el.namespaceURI === 'http://www.w3.org/2000/svg') return true;
+        if (rect.width === 0 || rect.height === 0) return true;
         var lines = typeof el.getClientRects === 'function' ? el.getClientRects() : null;
         return !!lines && lines.length > 1;
-    }
-    // What is left of `el` after the ancestors up to and including `top` clip it: its centre, or
-    // null when nothing a user could see remains. Clipping is to the padding box, so a border or
-    // padding on a closed accordion does not count as room.
-    function visibleCentreBelow(top, el, win) {
-        var r = el.getBoundingClientRect();
-        var left = r.left, right = r.right, y0 = r.top, y1 = r.bottom;
-        for (var n = el; n && n !== top;) {
-            n = n.assignedSlot || n.parentNode || n.host;
-            if (!n || n.nodeType !== 1) continue;
-            var cs = win.getComputedStyle(n);
-            if ((cs.clip && cs.clip !== 'auto') || (cs.clipPath && cs.clipPath !== 'none')) return null;
-            // `overflow` does not apply to an inline box, whose client size reads 0.
-            if (cs.display === 'inline') continue;
-            var box = n.getBoundingClientRect();
-            var inX = box.left + (n.clientLeft || 0), inY = box.top + (n.clientTop || 0);
-            if (cs.overflowX && cs.overflowX !== 'visible') { left = Math.max(left, inX); right = Math.min(right, inX + n.clientWidth); }
-            if (cs.overflowY && cs.overflowY !== 'visible') { y0 = Math.max(y0, inY); y1 = Math.min(y1, inY + n.clientHeight); }
-        }
-        if (right - left <= 1 || y1 - y0 <= 1) return null;
-        return { x: (left + right) / 2, y: (y0 + y1) / 2 };
     }
     // A control that a click on its content operates, whatever paints on top inside it (a
     // `.stretched-link` or ripple `::after` is hit as the control).
@@ -950,7 +930,89 @@ const INIT_SCRIPT_BODY: &str = r#"
         var role = elAttr(el, 'role');
         return role === 'button' || role === 'link';
     }
-    function checkActionable(el) {
+    // `el` (or something inside it) is in the stack at the point, under whatever is on top. Hit
+    // testing honours clipping, so content clipped away below a control is not.
+    function stackHolds(el, x, y) {
+        var root = typeof el.getRootNode === 'function' ? el.getRootNode() : null;
+        if (!root || typeof root.elementsFromPoint !== 'function') return false;
+        var stack = root.elementsFromPoint(x, y);
+        for (var i = 0; i < stack.length; i++) {
+            if (composedContains(el, stack[i])) return true;
+        }
+        return false;
+    }
+    // Would a real click at the point reach `el`? Only the browser can say: `elementFromPoint`
+    // honours clipping, `clip-path`, pseudo-elements and z-order. `strict` is for an OS click,
+    // which lands on what is hit: it must be `el` or inside it.
+    function pointReaches(doc, el, x, y, strict) {
+        var hit = deepElementFromPoint(doc, x, y);
+        if (!hit) return false;
+        if (strict) return composedContains(el, hit);
+        if (!hitCovers(hit, el)) return true;
+        return composedContains(hit, el) && isOperableControl(hit) && stackHolds(el, x, y);
+    }
+    // Points along an SVG shape's outline in viewport coordinates (a stroke-only circle paints
+    // nothing else). `getScreenCTM` maps to the viewport of the element's own frame.
+    function outlinePoints(el, out) {
+        if (typeof el.getPointAtLength !== 'function' || typeof el.getScreenCTM !== 'function') return;
+        try {
+            var m = el.getScreenCTM(), len = el.getTotalLength();
+            if (!m || !(len > 0)) return;
+            for (var i = 0; i < 16; i++) {
+                var p = el.getPointAtLength(len * (i + 0.5) / 16);
+                out[out.length] = { x: m.a * p.x + m.c * p.y + m.e, y: m.b * p.x + m.d * p.y + m.f };
+            }
+        } catch (e) {}
+    }
+    function lineCentres(el, out) {
+        var lines = typeof el.getClientRects === 'function' ? el.getClientRects() : null;
+        if (!lines || lines.length < 2) return;
+        for (var i = 0; i < lines.length; i++) {
+            out[out.length] = { x: lines[i].left + lines[i].width / 2, y: lines[i].top + lines[i].height / 2 };
+        }
+    }
+    // Up to 32 descendants with a box, nearest first: what an empty inline box or a `<g>` paints.
+    function boxedDescendants(el) {
+        var found = [], queue = [el];
+        for (var q = 0; q < queue.length && found.length < 32 && queue.length < 512; q++) {
+            var kids = queue[q].children;
+            for (var k = 0; kids && k < kids.length; k++) {
+                var b = kids[k].getBoundingClientRect();
+                if (b.width > 0 || b.height > 0) found[found.length] = kids[k];
+                queue[queue.length] = kids[k];
+            }
+        }
+        return found;
+    }
+    // The first real point of `el` that a click would reach: along its outline, the centre of every
+    // line box, a 5x5 grid over its box, then what its descendants paint outside it.
+    function sampledPoint(doc, win, el, rect, strict) {
+        var vw = win.innerWidth || doc.documentElement.clientWidth;
+        var vh = win.innerHeight || doc.documentElement.clientHeight;
+        var at = [];
+        outlinePoints(el, at);
+        lineCentres(el, at);
+        for (var row = 0; row < 5; row++) {
+            for (var col = 0; col < 5; col++) {
+                at[at.length] = { x: rect.left + rect.width * (col + 0.5) / 5, y: rect.top + rect.height * (row + 0.5) / 5 };
+            }
+        }
+        var kids = boxedDescendants(el);
+        for (var k = 0; k < kids.length; k++) {
+            outlinePoints(kids[k], at);
+            lineCentres(kids[k], at);
+            var b = kids[k].getBoundingClientRect();
+            at[at.length] = { x: b.left + b.width / 2, y: b.top + b.height / 2 };
+        }
+        for (var i = 0; i < at.length; i++) {
+            var p = at[i];
+            if (p.x >= 0 && p.y >= 0 && p.x < vw && p.y < vh && pointReaches(doc, el, p.x, p.y, strict)) return p;
+        }
+        return null;
+    }
+    // Where a real click on `el` would reach it: `{x, y}` in its own frame's viewport (its centre
+    // when that works), or `{error, hint}`. `strict`: see `pointReaches`.
+    function hitPoint(el, strict) {
         if (!el || !el.isConnected) return { error: 'element is detached from DOM', hint: 'RETRY_LATER' };
         if (isDisabledControl(el)) return { error: 'element is disabled (disabled attribute)', hint: 'RETRY_LATER' };
         if (isAriaDisabled(el)) return { error: 'element is disabled (aria-disabled)', hint: 'RETRY_LATER' };
@@ -966,7 +1028,8 @@ const INIT_SCRIPT_BODY: &str = r#"
         // No opacity test: hit testing decides. An `opacity:0` input over a styled box is what a
         // user clicks (the MUI / Ant / Chakra checkbox pattern).
         var rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return { error: 'element has zero size', hint: 'RETRY_LATER' };
+        // An empty `<a>` around an absolute or floated child has no box of its own, and is clickable.
+        if (rect.width === 0 && rect.height === 0 && !boxedDescendants(el).length) return { error: 'element has zero size', hint: 'RETRY_LATER' };
         if (cs.pointerEvents === 'none') return { error: 'element has pointer-events: none', hint: 'RETRY_LATER' };
         var vw = win.innerWidth || doc.documentElement.clientWidth;
         var vh = win.innerHeight || doc.documentElement.clientHeight;
@@ -992,37 +1055,30 @@ const INIT_SCRIPT_BODY: &str = r#"
             cy = rect.top + rect.height / 2;
             topEl = deepElementFromPoint(doc, cx, cy);
         }
-        // A wrapped inline element's box centre can fall in a line gap, over a neighbour: what it
-        // paints is its line boxes.
-        if (hitCovers(topEl, el) && typeof el.getClientRects === 'function') {
-            var lines = el.getClientRects();
-            if (lines && lines.length > 1) {
-                var lineHit = deepElementFromPoint(doc, lines[0].left + lines[0].width / 2, lines[0].top + lines[0].height / 2);
-                if (!hitCovers(lineHit, el)) return null;
-            }
+        // Nothing at all at the centre: it is outside the viewport.
+        if (strict ? pointReaches(doc, el, cx, cy, true) : (!topEl || pointReaches(doc, el, cx, cy, false))) {
+            return { x: cx, y: cy };
         }
-        // An ancestor at the point, with `el` still visible below it. What does not paint its own
-        // centre (a stroke-only circle, a `<g>` with an empty centre, a line gap) and the content of
-        // a control pass. Anything else passes only if its visible part is what a click would hit:
-        // a button under its parent's `::after`, or behind its parent, is not.
-        if (hitCovers(topEl, el) && composedContains(topEl, el)) {
-            var shown = visibleCentreBelow(topEl, el, win);
-            if (shown) {
-                if (paintsOffCentre(el) || isOperableControl(topEl)) return null;
-                if (!hitCovers(deepElementFromPoint(doc, shown.x, shown.y), el)) return null;
-            }
+        // The centre is not on `el`. Ask the browser about points that are. An ancestor at the
+        // centre says nothing (`el` may have a hole there, or be clipped to a corner), and neither
+        // does anything at the centre of a shape that does not paint it. A sibling at the centre of
+        // anything else is cover.
+        if (!topEl || composedContains(topEl, el) || paintsOffCentre(el, rect)) {
+            var found = sampledPoint(doc, win, el, rect, strict);
+            if (found) return found;
         }
-        if (hitCovers(topEl, el)) {
-            var tag = topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
-            var info = tag;
-            if (topEl.id) info += '#' + topEl.id;
-            else if (topEl.className && typeof topEl.className === 'string') {
-                var cls = topEl.className.trim().split(/\s+/)[0];
-                if (cls) info += '.' + cls;
-            }
-            return { error: 'element is covered by ' + info + ' at (' + Math.round(cx) + ',' + Math.round(cy) + ')', hint: 'RETRY_LATER' };
+        var tag = topEl && topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
+        var info = tag;
+        if (topEl && topEl.id) info += '#' + topEl.id;
+        else if (topEl && topEl.className && typeof topEl.className === 'string') {
+            var cls = topEl.className.trim().split(/\s+/)[0];
+            if (cls) info += '.' + cls;
         }
-        return null;
+        return { error: 'element is covered by ' + info + ' at (' + Math.round(cx) + ',' + Math.round(cy) + ')', hint: 'RETRY_LATER' };
+    }
+    function checkActionable(el) {
+        var point = hitPoint(el, false);
+        return point.error ? point : null;
     }
 
     function withAutoWait(refId, timeoutMs, actionFn) {
@@ -2247,6 +2303,11 @@ const INIT_SCRIPT_BODY: &str = r#"
         navigateBack: function() {
             history.back();
             return { ok: true };
+        },
+
+        // Where a real click on this element would land (the trusted click probe's point).
+        hitPoint: function(el, strict) {
+            return hitPoint(el, strict === true);
         },
 
         // ── Dialogs ──────────────────────────────────────────────────────────

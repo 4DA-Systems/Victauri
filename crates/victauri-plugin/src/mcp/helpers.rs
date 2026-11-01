@@ -613,10 +613,12 @@ pub fn trusted_focus_probe_js(ref_id: &str) -> String {
 /// A real OS click lands on whatever is on screen at the point, so the point must be one
 /// where the element is actually hit: it runs the same checks as the bridge's
 /// actionability check for synthetic clicks (connected, enabled, visible, non-zero size,
-/// `pointer-events`, not covered at its center — the covering test is stricter: the hit
-/// element must be the element or inside it in the flat tree — slotted light-DOM content
-/// counts as inside the `<slot>` it renders in; the hit test descends into open shadow roots,
-/// whose content `elementFromPoint` otherwise reports as the shadow host) and then walks up
+/// `pointer-events`, not covered), and takes the point the bridge's `hitPoint` found: the
+/// element's center, or a real point of it when the center is not on it (a stroke-only circle,
+/// a control with a hole, a wrapped link). The covering test is stricter than a synthetic
+/// click's: the hit element must be the element or inside it in the flat tree (slotted light-DOM
+/// content counts as inside the `<slot>` it renders in; the hit test descends into open shadow
+/// roots, whose content `elementFromPoint` otherwise reports as the shadow host). It then walks up
 /// through same-origin frames,
 /// adding each frame's content offset and requiring the point to stay inside every
 /// viewport on the way and the frame itself to be the element hit there. Layout is page
@@ -631,8 +633,6 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
          function __hit(d,x,y){{var h=d.elementFromPoint(x,y),g=0; \
            while(h&&h.shadowRoot&&g++<32){{var i=h.shadowRoot.elementFromPoint(x,y); \
              if(!i||i===h)break; h=i;}} return h;}} \
-         function __within(a,b){{for(var n=b;n;n=n.assignedSlot||n.parentNode||n.host){{if(n===a)return true;}} \
-           return false;}} \
          if(!__e.isConnected) return __no('element is detached from the DOM'); \
          __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
          var __d=__e.ownerDocument||document, __w=__d.defaultView||window; \
@@ -643,13 +643,10 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
          if(__s.display==='none'||__s.visibility==='hidden') \
            return __no('element is not visible'); \
          if(__s.pointerEvents==='none') return __no('element has pointer-events: none'); \
-         var __b=__e.getBoundingClientRect(); \
-         if(!(__b.width>0&&__b.height>0)) return __no('element has zero size'); \
-         var __x=__b.left+__b.width/2, __y=__b.top+__b.height/2; \
+         var __pt=__v.hitPoint(__e,true); \
+         if(__pt.error) return __no(__pt.error); \
+         var __x=__pt.x, __y=__pt.y; \
          if(!__in(__w,__x,__y)) return __no('element center is outside the viewport'); \
-         var __t=__hit(__d,__x,__y); \
-         if(!__t||!__within(__e,__t)) \
-           return __no('element is covered at its center point'+(__t&&__t.tagName?' by <'+__t.tagName.toLowerCase()+'>':'')); \
          for(var __f=__w,__i=0;__f!==__f.top&&__i<32;__i++){{ \
            var __fe=null; try{{__fe=__f.frameElement;}}catch(__x2){{__fe=null;}} \
            if(!__fe) return __no('element is inside a cross-origin frame'); \
