@@ -14,7 +14,7 @@ inputs:
   max-load-ms:
     description: Maximum DOM complete time in milliseconds
     required: false
-    default: "10000"
+    default: "20000"
   max-heap-mb:
     description: Maximum JS heap usage in megabytes
     required: false

@@ -186,11 +186,13 @@ impl SmokeReport {
 ///
 /// ```
 /// let config = victauri_test::smoke::SmokeConfig::default();
-/// assert_eq!(config.max_dom_complete_ms, 10_000);
+/// assert_eq!(config.max_dom_complete_ms, 20_000);
 /// ```
 #[derive(Debug, Clone)]
 pub struct SmokeConfig {
-    /// Maximum acceptable DOM complete time in milliseconds (default: 10 000).
+    /// Maximum acceptable DOM complete time in milliseconds (default: 20 000). The default is a
+    /// sanity check, not a performance gate: the first launch of an app measures a cold webview
+    /// starting (12.5 s seen on a desktop, 11.1 s on a CI runner). Set your own to gate on it.
     pub max_dom_complete_ms: u64,
     /// Maximum acceptable JS heap usage in megabytes (default: 512).
     pub max_heap_mb: f64,
@@ -199,7 +201,7 @@ pub struct SmokeConfig {
 impl Default for SmokeConfig {
     fn default() -> Self {
         Self {
-            max_dom_complete_ms: 10_000,
+            max_dom_complete_ms: 20_000,
             max_heap_mb: 512.0,
         }
     }
@@ -390,15 +392,19 @@ impl VictauriClient {
         self.dom_complete_check(max).await.map(|_| ())
     }
 
-    /// [`Self::assert_dom_complete_under`]; `Ok(Some(reason))` when it measured nothing.
-    async fn dom_complete_check(&mut self, max: Duration) -> Result<Option<String>, TestError> {
+    /// [`Self::assert_dom_complete_under`]: `Ok(Ok(ms))` is what it measured, `Ok(Err(reason))`
+    /// why it measured nothing.
+    async fn dom_complete_check(
+        &mut self,
+        max: Duration,
+    ) -> Result<Result<f64, String>, TestError> {
         let metrics = self.get_performance_metrics().await?;
         let ms = metrics
             .pointer("/navigation/dom_complete_ms")
             .and_then(Value::as_f64);
         // `domComplete` is 0 until the document completes, whatever the page's real load time.
         let Some(ms) = ms.filter(|ms| *ms > 0.0) else {
-            return Ok(Some(
+            return Ok(Err(
                 "skipped: no DOM complete time to judge (the page has not finished loading, or \
                  this webview has no navigation timing)"
                     .to_string(),
@@ -410,7 +416,7 @@ impl VictauriClient {
                 "DOM complete took {ms:.0}ms, budget is {max_ms:.0}ms"
             )));
         }
-        Ok(None)
+        Ok(Ok(ms))
     }
 
     /// Assert JS heap usage is under the given megabyte limit.
@@ -703,11 +709,21 @@ impl VictauriClient {
         // Skippable, like the two budgets below: a check that could not judge anything says so.
         skippable_check!("no uncaught errors", self.uncaught_errors_check().await);
         noted_check!("accessibility audit", self.smoke_accessibility().await);
-        skippable_check!(
-            format!("DOM complete < {}ms", config.max_dom_complete_ms),
-            self.dom_complete_check(Duration::from_millis(config.max_dom_complete_ms))
-                .await
-        );
+        let start = Instant::now();
+        let outcome = self
+            .dom_complete_check(Duration::from_millis(config.max_dom_complete_ms))
+            .await;
+        checks.push(SmokeCheckResult {
+            name: format!("DOM complete < {}ms", config.max_dom_complete_ms),
+            passed: outcome.is_ok(),
+            skipped: matches!(outcome, Ok(Err(_))),
+            detail: match outcome {
+                Ok(Ok(ms)) => format!("took {ms:.0}ms"),
+                Ok(Err(reason)) => reason,
+                Err(e) => e.to_string(),
+            },
+            duration: start.elapsed(),
+        });
         skippable_check!(
             format!("heap < {:.0}MB", config.max_heap_mb),
             self.heap_check(config.max_heap_mb).await
@@ -827,7 +843,7 @@ mod tests {
     #[test]
     fn smoke_config_defaults() {
         let config = SmokeConfig::default();
-        assert_eq!(config.max_dom_complete_ms, 10_000);
+        assert_eq!(config.max_dom_complete_ms, 20_000);
         assert!((config.max_heap_mb - 512.0).abs() < f64::EPSILON);
     }
 

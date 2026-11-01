@@ -100,7 +100,7 @@ VICTAURI:BEGIN..END block, or .claude/skills/victauri/.")]
     /// Run the built-in smoke test suite against a running Tauri app
     Test {
         /// Maximum acceptable DOM complete time in milliseconds
-        #[arg(long, default_value_t = 10_000)]
+        #[arg(long, default_value_t = 20_000)]
         max_load_ms: u64,
         /// Maximum acceptable JS heap usage in megabytes
         #[arg(long, default_value_t = 512.0)]
