@@ -3725,7 +3725,8 @@ mod tests {
         let bound = if cfg!(target_os = "macos") {
             Duration::from_secs(4)
         } else {
-            Duration::from_millis(1900)
+            // A second wait measured 3.5 s; one wait reached 1.94 s under a loaded test run.
+            Duration::from_millis(2800)
         };
         let quickest = (0..3)
             .map(|_| {

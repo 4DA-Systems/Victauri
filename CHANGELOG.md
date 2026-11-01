@@ -31,7 +31,7 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
 ### Fixed: crashes and hangs in the host app
 
 - Deeply nested SQL or a crafted database schema could overflow the stack and kill the app. Both now return
-  a clean error (64 MiB reserved stack, nesting and view budgets).
+  a clean error (64 MiB reserved stack, nesting and view-chain budgets, which read SQL the way SQLite tokenizes it).
 - Windows process-memory reads leaked a handle per call. The event bus could retain hundreds of MiB.
 - Logging: reading the log no longer stalls logging threads; a panic in a `Debug` impl, a value that logs
   while being recorded and two capture layers in one subscriber no longer panic or deadlock; symbolising a
@@ -47,8 +47,11 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   a buggy page, not a hostile one (docs/src/security.md).
 - `find_elements` computes accessible names and honest `visible`/`enabled`, returns deepest text matches, and
   gains `attribute`, `attribute_value`, `text_exact` and `include_hidden`.
-- Actionability: SVG, `opacity:0` styled controls, MUI wrappers, labels, disabled fieldsets, covering ancestors,
-  shadow DOM events, contenteditable and same-origin iframes.
+- Actionability: SVG, `opacity:0` styled controls, MUI wrappers, labels, disabled fieldsets, shadow DOM events,
+  contenteditable and same-origin iframes. An element whose hit is its ancestor counts as covered, including closed
+  accordions, `.sr-only` and `::after` overlays; only SVG and wrapped inline elements that are not clipped are exempt.
+- A bridge call or log read on a page with no bridge is a tool error; it used to answer `undefined` or an empty list
+  as a success.
 - `type_text` no longer corrupts number and date inputs. Log entries are bounded. Scrubbing restores the
   animation's time and state.
 

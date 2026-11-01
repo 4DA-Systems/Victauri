@@ -138,7 +138,8 @@ parsed `e<digits>` must stop.
   app. `VICTAURI_PORT=0` means unset. `victauri logs` with `VICTAURI_APP` or `VICTAURI_PORT` set and the
   app down refuses, rather than showing the newest capture.
 - `victauri run` passes output through as it arrives. Killing it kills the app and its tree on Windows;
-  SIGTERM and SIGHUP are forwarded on Unix, followed by SIGKILL after 10 s or at once on a second signal.
+  SIGTERM and SIGHUP are forwarded on Unix, followed by SIGKILL after 10 s, or at once on a further signal more than 1 s after the first (a signal
+  within 1 s counts as the same stop, since wrappers such as `timeout` and `npm` can deliver it twice).
   Default-location captures of dead apps are deleted at the
   next run once past 7 days or beyond the newest 20.
 - `--out` and `--capture` refuse symlinks. `record` checks `--output` before connecting. `--args-file`
