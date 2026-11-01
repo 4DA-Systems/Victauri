@@ -279,7 +279,8 @@ impl fmt::Display for GhostCommandReport {
 /// use victauri_core::verification::IpcIntegrityReport;
 /// use serde_json::json;
 ///
-/// // Reports come from `check_ipc_integrity`; parsed from JSON here to show both states.
+/// // Reports come from `check_ipc_integrity` (this crate's function, not the MCP tool of the same
+/// // name; see the type's docs); parsed from JSON here to show both states.
 /// let healthy: IpcIntegrityReport = serde_json::from_value(json!({
 ///     "total_calls": 10, "completed": 10, "pending": 0, "errored": 0,
 ///     "stale_calls": [], "error_calls": [], "healthy": true
@@ -393,6 +394,12 @@ pub fn detect_ghost_commands(
 // ── IPC round-trip integrity ────────────────────────────────────────────────
 
 /// Summary of IPC round-trip health: completed, pending, errored, and stale calls.
+///
+/// This is the report of this crate's [`check_ipc_integrity`], over an [`EventLog`]. The MCP tool
+/// `check_ipc_integrity` answers in a different JSON shape (`pending_count`, `stale_count`,
+/// `error_count`, `errored_calls`, `warning`, `ipc_capture`) and a different verdict (its
+/// `healthy` ignores errored calls, which are sound round trips), so its result does not parse as
+/// this type: read it as JSON.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct IpcIntegrityReport {
@@ -524,7 +531,8 @@ pub enum AssertionCondition {
     Equals,
     /// Actual value must not equal the expected value.
     NotEquals,
-    /// String must contain substring, or array must contain element.
+    /// String must contain substring, or array must contain an element equal to the expected value
+    /// by [`json_values_equal`].
     Contains,
     /// Numeric actual must be greater than expected.
     GreaterThan,
@@ -686,7 +694,7 @@ fn canonical_number(s: &str) -> Option<serde_json::Number> {
 }
 
 /// The one definition of "equal" for checking a runtime value against an expected one, used by
-/// the `equals` / `not_equals` assertion conditions.
+/// the `equals` / `not_equals` assertion conditions and for the elements `contains` looks through.
 ///
 /// - Values are compared as JSON, by type: `null` is not `"null"`, `true` is not `"true"`, and an
 ///   object is not its serialized text. Different strings are never equal, whatever they parse to
@@ -736,7 +744,9 @@ pub fn evaluate_assertion(
         AssertionCondition::NotEquals => !json_values_equal(&actual, &assertion.expected),
         AssertionCondition::Contains => match (&actual, &assertion.expected) {
             (serde_json::Value::String(a), serde_json::Value::String(e)) => a.contains(e.as_str()),
-            (serde_json::Value::Array(arr), val) => arr.contains(val),
+            (serde_json::Value::Array(arr), val) => {
+                arr.iter().any(|item| json_values_equal(item, val))
+            }
             _ => false,
         },
         AssertionCondition::GreaterThan => {
