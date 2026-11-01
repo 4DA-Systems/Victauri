@@ -31,7 +31,7 @@ Browse files in app backend directories (data, config, log, local_data).
 |------|------|----------|-------------|
 | `directory` | string | no | One of: `data`, `config`, `log`, `local_data` (default: `data`) |
 | `path` | string | no | Subdirectory to list within the chosen directory |
-| `pattern` | string | no | Glob to filter entries (e.g. `*.db`) |
+| `pattern` | string | no | Glob to filter entries (e.g. `*.db`): `*` any run of characters, `?` one character, anything else (`[` and `]` included) itself |
 | `max_depth` | number | no | Recursion depth (default: 1) |
 
 **Returns:** `{base, path, exists, count, truncated, entries: [{name, path, is_dir, size, modified}]}`
@@ -275,7 +275,7 @@ of guessing with a fixed sleep.
 **Parameters:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle`, `expression`, `event`, `log` |
+| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle`, `expression`, `event`, `log`. `text`, `text_gone` and `selector_gone` are not met while the page has no body (mid navigation). An invalid selector is a tool error. `ipc_idle` returns `ok: false` at once, with `ipc_capture: "none"`, when the IPC log is blind to the page's traffic |
 | `value` | string | no | Selector/text/URL to match; the JS expression (`expression`); the Tauri event name (`event`); or the text a backend log line must contain (`log`). Not needed for `ipc_idle`/`network_idle` |
 | `expected` | any | no | For `expression`: the JSON value the expression must equal. Omit to wait for the expression to become truthy |
 | `since_ms` | number | no | For `event` and `log`: how far back (ms) to accept an already-fired event or line when the wait begins (default: 2000) |
@@ -463,7 +463,7 @@ may still settle) or `[hint: CHECK_INPUT]` (wrong target). The same applies to
 | `hover` | `ref_id` | Hover over an element |
 | `focus` | `ref_id` | Focus an element |
 | `scroll_into_view` | `ref_id` | Scroll element into viewport |
-| `select_option` | `ref_id`, `value` or `values` | Select option(s) in a `<select>` |
+| `select_option` | `ref_id`, `value` or `values` | Select option(s) in a `<select>`; `values: []` clears a `<select multiple>` |
 
 **Options:**
 | Name | Type | Required | Description |
@@ -530,8 +530,8 @@ Window management operations.
 | `get_state` | `label` | Get window state (position, size, visibility) |
 | `list` | — | List all window labels |
 | `manage` | `label`, `manage_action` | `minimize`, `unminimize`, `maximize`, `unmaximize`, `close`, `focus`, `show`, `hide`, `fullscreen`, `unfullscreen`, `always_on_top`, `not_always_on_top` |
-| `resize` | `label`, `width`, `height` | Resize a window |
-| `move_to` | `label`, `x`, `y` | Move a window |
+| `resize` | `label`, `width`, `height` | Resize a window. Reports the size read back (physical pixels) next to `requested`; `settled: false` if the window did not change within about 500 ms (Linux and macOS apply it asynchronously, and a window manager may ignore it) |
+| `move_to` | `label`, `x`, `y` | Move a window. Reports the position read back, with `settled: false` likewise |
 | `set_title` | `label`, `title` | Change window title |
 | `introspectability` | — | Probe every window's JS bridge and report which are introspectable vs. blind |
 
@@ -691,12 +691,12 @@ Access all captured logs from the application.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
-| `console` | `since`, `level` | Console log entries |
-| `network` | `since` | Network request log |
-| `ipc` | `since`, `limit` | IPC command log (calls captured on Tauri's postMessage fallback carry `transport: "post_message"`) |
-| `navigation` | — | Navigation history |
-| `dialogs` | — | Dialog interactions |
-| `events` | `since` | Event stream |
+| `console` | `since`, `limit` | Console log entries |
+| `network` | `filter`, `limit`, `bodies` | Network request log |
+| `ipc` | `limit`, `bodies`, `wait_for_capture` | IPC command log (calls captured on Tauri's postMessage fallback carry `transport: "post_message"`; `args_truncated: true` when `args` is not what was sent: cut, over the capture cap, or not captured) |
+| `navigation` | `limit` | Navigation history |
+| `dialogs` | `limit` | Dialog interactions |
+| `events` | `since`, `limit` | Event stream |
 | `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
 | `clear` | — | Clear the IPC + network logs (per-test isolation) |
 | `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Without `since_seq` the newest `limit` entries; with it the oldest after the cursor, and `next_seq` continues after them (read on while `truncated`) |
@@ -707,6 +707,8 @@ Access all captured logs from the application.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `filter` | string | no | `network`: URL substring filter; `backend`/`stdout`: case-insensitive text match |
+| `limit` | integer | no | Most entries to return, keeping the newest; 0 returns none. Default 100 (`slow_ipc`: 20) |
+| `bodies` | boolean | no | `ipc`/`network`: `false` leaves out args and request/response bodies, so reading up to 1000 entries stays small (default true) |
 | `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |
 
 **Example:**
@@ -720,8 +722,9 @@ Access all captured logs from the application.
 
 The `backend*` and `stdout` actions need a capture source — see [Backend Logs](./backend-logs.md).
 
-> `ipc`/`network`/`slow_ipc` return at most 100 entries by default and truncate
-> large per-entry bodies (4 KB) — pass an explicit `limit` for more.
+> `console`/`network`/`ipc`/`navigation`/`dialogs`/`events` return the newest 100 entries by
+> default (`slow_ipc`: 20) as a bare array, with nothing to say more exist; large per-entry fields
+> are cut at 4 KB. Pass an explicit `limit` for more.
 
 ---
 

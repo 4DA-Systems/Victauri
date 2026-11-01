@@ -956,6 +956,22 @@ const INIT_SCRIPT_BODY: &str = r#"
             cy = rect.top + rect.height / 2;
             topEl = deepElementFromPoint(doc, cx, cy);
         }
+        // A wrapped inline element's box centre can fall in a line gap, over a neighbour: what it
+        // paints is its line boxes.
+        if (hitCovers(topEl, el) && typeof el.getClientRects === 'function') {
+            var lines = el.getClientRects();
+            if (lines && lines.length > 1) {
+                var lineHit = deepElementFromPoint(doc, lines[0].left + lines[0].width / 2, lines[0].top + lines[0].height / 2);
+                if (!hitCovers(lineHit, el)) return null;
+            }
+        }
+        // What does not paint its own centre (a stroke-only circle, a `<g>` with an empty centre,
+        // a line gap) is hit as its ancestor. That is cover only once the element has left the
+        // ancestor's box: scrolled out, or clipped away.
+        if (hitCovers(topEl, el) && composedContains(topEl, el)) {
+            var anc = topEl.getBoundingClientRect();
+            if (rect.left < anc.right && rect.right > anc.left && rect.top < anc.bottom && rect.bottom > anc.top) return null;
+        }
         if (hitCovers(topEl, el)) {
             var tag = topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
             var info = tag;
@@ -1348,6 +1364,18 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         return null;
     }
+    // Whether a call's `args` are not what was sent: a marker in their place (over the capture
+    // cap, encrypted), or a call that carried arguments which were not captured at all (a binary
+    // body, capture off), which would otherwise read as a call with no arguments.
+    function ipcArgsIncomplete(n) {
+        var a = n.request_args;
+        if (typeof a === 'string') {
+            return REFLECT_APPLY(STR_INDEXOF, a, ['[body omitted:']) === 0
+                || REFLECT_APPLY(STR_INDEXOF, a, ['[encrypted:']) === 0;
+        }
+        return (a === undefined || a === null) && n.arg_size_bytes > 0;
+    }
+
     // The `getIpcLog` view of one IPC network entry: a fresh object whose nested values are
     // deep copies, so the page cannot rewrite a logged call through it. Without `bodies`, the
     // request args and result are left out and the error text is capped.
@@ -1406,6 +1434,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (typeof n.route_rule === 'number') e.route_rule = n.route_rule;
         if (bodies) {
             e.args = cloneJson(n.request_args) || {};
+            if (ipcArgsIncomplete(n)) e.args_truncated = true;
             // Nullish, not falsy: a command returning 0 / false / '' is a real result.
             e.result = (n.response_body === undefined || n.response_body === null) ? null : cloneJson(n.response_body);
         }
@@ -1619,7 +1648,9 @@ const INIT_SCRIPT_BODY: &str = r#"
             var includeHidden = q.include_hidden === true;
             // `exact` is the older spelling of text_exact.
             var legacyExact = !!q.text && q.exact === true;
-            var textNeedle = q.text && !legacyExact ? ('' + q.text).toLowerCase() : null;
+            // Normalised like the text it is compared with (a blank needle stays as given: it must
+            // not become '', which every element contains).
+            var textNeedle = q.text && !legacyExact ? (normText('' + q.text) || ('' + q.text)).toLowerCase() : null;
             var textExact = typeof q.text_exact === 'string' ? normText(q.text_exact)
                 : (legacyExact ? normText('' + q.text) : null);
             var byText = textNeedle !== null || textExact !== null;
@@ -1702,6 +1733,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (q.label) {
                 var labels = document.querySelectorAll('label');
                 var needle = ('' + q.label).toLowerCase();
+                var seen = [];
                 for (var li = 0; li < labels.length && results.length < maxResults; li++) {
                     var lbl = labels[li];
                     if ((lbl.textContent || '').toLowerCase().indexOf(needle) === -1) continue;
@@ -1713,9 +1745,15 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (!target) {
                         target = lbl.querySelector('input, textarea, select');
                     }
-                    if (target && matches(target)) {
-                        results[results.length] = buildResult(target, cssVisibleDeep(target));
-                    }
+                    if (!target || !matches(target)) continue;
+                    // Two labels can name one control, and a hidden control is no match unless
+                    // asked for, as in every other query.
+                    var dup = false;
+                    for (var si = 0; si < seen.length; si++) { if (seen[si] === target) dup = true; }
+                    if (dup) continue;
+                    seen[seen.length] = target;
+                    var labelledShown = cssVisibleDeep(target);
+                    if (labelledShown || includeHidden) results[results.length] = buildResult(target, labelledShown);
                 }
                 return results;
             }
@@ -1910,9 +1948,11 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (el.tagName !== 'SELECT') {
                     return { ok: false, error: 'element is not a <select>', hint: 'CHECK_INPUT' };
                 }
-                if (!values || !values.length) {
+                // No values is how a `<select multiple>` is cleared; a single select always has one.
+                if ((!values || !values.length) && !el.multiple) {
                     return { ok: false, error: 'select_option needs at least one value', hint: 'CHECK_INPUT' };
                 }
+                values = values || [];
                 // Checked before anything changes: assigning a value no option has resets the
                 // select to its first option, and a disabled option is not one a user can choose.
                 var wanted = OBJ_CREATE(null);
@@ -2232,19 +2272,35 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var poll = opts.poll_ms || 200;
                 var start = Date.now();
 
+                // A selector that can never match is a mistake in the call, not a wait to sit out.
+                if ((opts.condition === 'selector' || opts.condition === 'selector_gone') && opts.value) {
+                    try { document.createDocumentFragment().querySelector(opts.value); } catch (e) {
+                        resolve({ ok: false, error: 'invalid CSS selector: ' + opts.value + ' — ' + e.message, hint: 'CHECK_INPUT', elapsed_ms: 0 });
+                        return;
+                    }
+                }
+
                 function checkInner() {
                     var met = false;
+                    // A page with no body yet (mid navigation) has not lost the text or the
+                    // element: nothing can be said until it has one.
                     if (opts.condition === 'text' && opts.value) {
-                        met = pageText(document.body).indexOf(opts.value) !== -1;
+                        met = !!document.body && pageText(document.body).indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'text_gone' && opts.value) {
-                        met = pageText(document.body).indexOf(opts.value) === -1;
+                        met = !!document.body && pageText(document.body).indexOf(opts.value) === -1;
                     } else if (opts.condition === 'selector' && opts.value) {
                         met = !!document.querySelector(opts.value);
                     } else if (opts.condition === 'selector_gone' && opts.value) {
-                        met = !document.querySelector(opts.value);
+                        met = !!document.body && !document.querySelector(opts.value);
                     } else if (opts.condition === 'url' && opts.value) {
                         met = window.location.href.indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'ipc_idle') {
+                        // Blind to the traffic, "no call is pending" would be true of anything.
+                        var capture = ipcCaptureStatus();
+                        if (capture.capture === 'none') {
+                            resolve({ ok: false, error: 'ipc_idle cannot be judged: ' + capture.note, ipc_capture: 'none', elapsed_ms: Date.now() - start });
+                            return;
+                        }
                         met = true;
                         for (var wi = 0; wi < networkLog.length; wi++) {
                             if (isIpcEntry(networkLog[wi]) && networkLog[wi].status === 'pending') { met = false; break; }
@@ -3262,10 +3318,18 @@ const INIT_SCRIPT_BODY: &str = r#"
     }
     // Appends the element for `node` to `out`. A `visibility:hidden` element is skipped but its
     // children are not: CSS lets them be `visibility:visible`, and they are then what a user sees.
+    // How many `opacity:0` elements enclose the node being walked: opacity does not inherit, so a
+    // child's own computed style reads 1 while nothing of it is rendered.
+    var transparentDepth = 0;
     function walkDomInto(node, out, isRoot) {
         if (!node || nodeKind(node) !== 1) return;
-
         var style = window.getComputedStyle(node);
+        var zero = style.opacity === '0';
+        if (zero) transparentDepth++;
+        try { walkStyledInto(node, out, isRoot, style); }
+        finally { if (zero) transparentDepth--; }
+    }
+    function walkStyledInto(node, out, isRoot, style) {
         if (style.display === 'none') return;
         var hidden = style.visibility === 'hidden';
 
@@ -3296,7 +3360,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             attributes: {}
         };
         // Rendered fully transparent, but still what a click at that point hits.
-        if (style.opacity === '0') element.transparent = true;
+        if (transparentDepth > 0) element.transparent = true;
 
         var interestingAttrs = ['data-testid', 'id', 'type', 'href', 'src', 'checked', 'selected'];
         for (var a = 0; a < interestingAttrs.length; a++) {
@@ -3376,8 +3440,13 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     function walkDomCompact(node, depth, isRoot) {
         if (!node || nodeKind(node) !== 1) return '';
-
         var style = window.getComputedStyle(node);
+        var zero = style.opacity === '0';
+        if (zero) transparentDepth++;
+        try { return walkStyledCompact(node, depth, isRoot, style); }
+        finally { if (zero) transparentDepth--; }
+    }
+    function walkStyledCompact(node, depth, isRoot, style) {
         if (style.display === 'none') return '';
         // See walkDomInto: a hidden element is not listed, its visible children are.
         if (style.visibility === 'hidden' && isRoot !== true) return compactChildren(node, depth);
@@ -3420,7 +3489,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
 
         if (!isElEnabled(node)) line += ' [disabled]';
-        if (style.opacity === '0') line += ' [transparent]';
+        if (transparentDepth > 0) line += ' [transparent]';
         var value = safeValue(node);
         if (value !== null) {
             line += ' value=' + compactStr(isPasswordInput(node) ? '[REDACTED]' : truncText(value, 40));
@@ -4113,7 +4182,12 @@ const INIT_SCRIPT_BODY: &str = r#"
                             if (isIpc) flushIpcWaiters();
                             reject((signal && signal.reason) || new DOMException('The operation was aborted.', 'AbortError'));
                         }
-                        var timer = SET_TIMEOUT(resolve, ms);
+                        // Once the delay is over the signal is the real request's business: an abort
+                        // after a finished request must not rewrite its entry.
+                        var timer = SET_TIMEOUT(function() {
+                            if (signal) { try { REFLECT_APPLY(REMOVE_LISTENER, signal, ['abort', aborted]); } catch (e) {} }
+                            resolve();
+                        }, ms);
                         if (!signal) return;
                         if (signal.aborted) { aborted(); return; }
                         try { REFLECT_APPLY(ADD_LISTENER, signal, ['abort', aborted]); } catch (e) {}
@@ -4175,6 +4249,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         var origSend = XMLHttpRequest.prototype.send;
         var origAbort = XMLHttpRequest.prototype.abort;
         var ADD_LISTENER = EventTarget.prototype.addEventListener;
+        var REMOVE_LISTENER = EventTarget.prototype.removeEventListener;
         var DISPATCH_EVENT = EventTarget.prototype.dispatchEvent;
         // Per-XHR state in a closure WeakMap — not an expando on the XHR, which page script
         // could overwrite to forge the entry `send()` logs (R4-JS3): the {method, url} `open()`
@@ -4264,6 +4339,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             // open() on a request in flight terminates it without firing any event: close its
             // entry here, or it would stay 'pending' forever.
             if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+            // ... and a request still in its route delay is gone with it.
+            if (st.delay_timer !== null && st.delay_timer !== undefined) {
+                CLEAR_TIMEOUT(st.delay_timer);
+                st.delay_timer = null;
+            }
             st.entry = null;
             st.net = { method: m, url: u };
             return ret;
@@ -4332,13 +4412,14 @@ const INIT_SCRIPT_BODY: &str = r#"
                     st.entry = entry;
                     xhrLog(entry);
                     var dArgs = arguments;
-                    st.delay_timer = SET_TIMEOUT(function() {
-                        st.delay_timer = null;
+                    var delayTimer = SET_TIMEOUT(function() {
+                        if (st.delay_timer === delayTimer) st.delay_timer = null;
                         // Re-opened meanwhile: this request no longer exists.
                         if (st.entry !== entry || entry.status !== 'pending') return;
                         try { REFLECT_APPLY(origSend, self, dArgs); }
                         catch (e) { entry.error = String(e); xhrFinish(entry, 'error'); }
                     }, xroute.delay_ms);
+                    st.delay_timer = delayTimer;
                     return;
                 }
             }

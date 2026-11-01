@@ -360,7 +360,14 @@ impl Redactor {
                     changed |= new_val.is_some();
                     let new_key = self.redact_regex(key);
                     changed |= new_key != *key;
-                    new_map.insert(new_key, new_val.unwrap_or_else(|| val.clone()));
+                    // Keys that redact to the same text must not overwrite each other's values.
+                    let mut unique = new_key.clone();
+                    let mut n = 1;
+                    while new_map.contains_key(&unique) {
+                        n += 1;
+                        unique = format!("{new_key}#{n}");
+                    }
+                    new_map.insert(unique, new_val.unwrap_or_else(|| val.clone()));
                 }
                 changed.then_some(serde_json::Value::Object(new_map))
             }
@@ -729,6 +736,20 @@ mod tests {
             let out = r.redact(clean);
             assert!(out.contains("Ann"), "{clean} -> {out}");
         }
+    }
+
+    /// Two keys that redact to the same text used to collapse into one, losing a value.
+    #[test]
+    fn keys_redacted_to_the_same_text_keep_their_values() {
+        let r = Redactor::default();
+        let out = r.redact(r#"{"ann@example.com":1,"bob@example.com":2,"n":3}"#);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(!out.contains("example.com"), "{out}");
+        let map = v.as_object().unwrap();
+        assert_eq!(map.len(), 3, "{out}");
+        let mut values: Vec<i64> = map.values().map(|n| n.as_i64().unwrap()).collect();
+        values.sort_unstable();
+        assert_eq!(values, [1, 2, 3], "{out}");
     }
 
     /// `RegexSet::new` fails as a whole, so one bad pattern used to drop the good ones too.

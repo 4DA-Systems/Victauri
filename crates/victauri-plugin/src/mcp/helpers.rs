@@ -45,6 +45,11 @@ pub fn json_truthy(value: &serde_json::Value) -> bool {
     }
 }
 
+/// First statement of every log projection: `window.__VICTAURI__?.x() || []` alone reads a page
+/// with no bridge as "nothing happened", which a health check then reports as healthy.
+pub(super) const NO_BRIDGE_GUARD: &str =
+    "if (!window.__VICTAURI__) throw new Error('the page has no Victauri bridge');";
+
 /// Build the JS that projects the webview IPC log down to just command names for
 /// `detect_ghost_commands`.
 ///
@@ -64,7 +69,7 @@ pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter}\
+        "{NO_BRIDGE_GUARD} return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) || null; }})\
          .filter(function(x){{ return x; }})"
     )
@@ -88,7 +93,7 @@ pub fn ghost_ipc_outcomes_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (function() {{\
+        "{NO_BRIDGE_GUARD} return (function() {{\
          \n  var log = (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter};\
          \n  var byCmd = {{}};\
          \n  for (var i = 0; i < log.length; i++) {{\
@@ -306,7 +311,7 @@ pub fn ipc_timing_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, unrouted: true }}) || []){filter}\
+        "{NO_BRIDGE_GUARD} return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, unrouted: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) ? {{ command: c.command, \
          duration_ms: (typeof c.duration_ms === 'number' ? c.duration_ms : null) }} : null; }})\
          .filter(function(x){{ return x; }})"
@@ -394,7 +399,8 @@ pub fn ipc_timing_stats(entries: &[serde_json::Value]) -> Vec<serde_json::Value>
 #[must_use]
 pub fn ipc_catalog_projection_js() -> String {
     // NB: kept as one returned expression so `eval_with_return` wraps it correctly.
-    "return (function(){\
+    "if (!window.__VICTAURI__) throw new Error('the page has no Victauri bridge');\
+     return (function(){\
         var MAXD = 5, MAXK = 60;\
         function shape(v, d){\
             if (v === null) return 'null';\

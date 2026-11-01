@@ -26,6 +26,10 @@ struct AppBridge {
     states: Arc<StdMutex<Vec<WindowState>>>,
     /// The size the OS really gives a resized window (`None`: what was asked for).
     os_size_limit: Option<(u32, u32)>,
+    /// Linux and macOS apply a resize or move later: the change lands after this long.
+    os_apply_delay: Option<Duration>,
+    /// The window manager ignores a resize or move altogether.
+    os_ignores_geometry: bool,
     evals: Arc<StdMutex<Vec<(Option<String>, String)>>>,
     /// `(label, what)` of every native window call.
     native: Arc<StdMutex<Vec<(Option<String>, String)>>>,
@@ -42,6 +46,8 @@ impl AppBridge {
                 window_state("notifications", "http://tauri.localhost/notifications.html"),
             ])),
             os_size_limit: None,
+            os_apply_delay: None,
+            os_ignores_geometry: false,
             evals: Arc::default(),
             native: Arc::default(),
         }
@@ -72,6 +78,28 @@ impl AppBridge {
             .iter()
             .filter(|(_, s)| s.contains(needle))
             .count()
+    }
+
+    /// What the OS does with a resize or move, when it gets to it.
+    fn apply_geometry(&self, change: impl Fn(&mut WindowState) + Send + 'static) {
+        if self.os_ignores_geometry {
+            return;
+        }
+        let states = Arc::clone(&self.states);
+        let apply = move || {
+            for state in states.lock().unwrap().iter_mut() {
+                change(state);
+            }
+        };
+        match self.os_apply_delay {
+            Some(delay) => {
+                std::thread::spawn(move || {
+                    std::thread::sleep(delay);
+                    apply();
+                });
+            }
+            None => apply(),
+        }
     }
 
     fn set_window_url(&self, label: &str, url: &str) {
@@ -152,11 +180,12 @@ impl WebviewBridge for AppBridge {
             Some((mw, mh)) => (w.min(mw), h.min(mh)),
             None => (w, h),
         };
-        for state in self.states.lock().unwrap().iter_mut() {
-            if label.is_none_or(|l| state.label == l) {
+        let label = label.map(str::to_string);
+        self.apply_geometry(move |state| {
+            if label.as_deref().is_none_or(|l| state.label == l) {
                 *state = state.clone().with_size(w, h);
             }
-        }
+        });
         Ok(())
     }
     fn move_window(&self, label: Option<&str>, x: i32, y: i32) -> Result<(), String> {
@@ -164,6 +193,12 @@ impl WebviewBridge for AppBridge {
             .lock()
             .unwrap()
             .push((label.map(str::to_string), format!("move {x},{y}")));
+        let label = label.map(str::to_string);
+        self.apply_geometry(move |state| {
+            if label.as_deref().is_none_or(|l| state.label == l) {
+                *state = state.clone().with_position(x, y);
+            }
+        });
         Ok(())
     }
     fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String> {
@@ -729,12 +764,28 @@ fn list_app_dir_globs_match_as_documented() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn list_app_dir_refuses_a_pattern_it_cannot_honour() {
+async fn select_option_with_no_values_argument_is_a_missing_parameter() {
     let st = state();
     let bridge = AppBridge::answering(&st, "null");
     let h = handler(&st, &bridge);
-    let msg = err_text(&call(&h, "list_app_dir", json!({"pattern": "[ab].db"})).await);
-    assert!(msg.contains("pattern"), "{msg}");
+    let msg = err_text(
+        &call(
+            &h,
+            "interact",
+            json!({"action": "select_option", "ref_id": "e1"}),
+        )
+        .await,
+    );
+    assert!(msg.contains("values"), "{msg}");
+    assert_eq!(bridge.evals_containing("selectOption"), 0);
+    // An explicit empty list is the request to clear a `<select multiple>`.
+    let _ = call(
+        &h,
+        "interact",
+        json!({"action": "select_option", "ref_id": "e1", "values": []}),
+    )
+    .await;
+    assert_eq!(bridge.evals_containing("selectOption"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -795,9 +846,252 @@ async fn window_resize_and_move_report_what_the_os_applied() {
         json!({"width": 5000, "height": 4000}),
         "{out}"
     );
+    assert!(out.get("settled").is_none(), "{out}");
     let out = ok_json(&call(&h, "window", json!({"action": "move_to", "x": 9, "y": 8})).await);
     assert_eq!(out["requested"], json!({"x": 9, "y": 8}), "{out}");
-    assert_eq!(out["x"], 0, "the mock window stays put: {out}");
+    assert_eq!(out["x"], 9, "{out}");
+    assert!(out.get("settled").is_none(), "{out}");
+}
+
+/// Linux and macOS apply a resize or move after the call returns: reading back at once reported
+/// the size the window had before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn window_resize_and_move_wait_for_an_os_that_applies_them_later() {
+    let st = state();
+    let mut bridge = AppBridge::answering(&st, "null");
+    bridge.os_apply_delay = Some(Duration::from_millis(120));
+    let h = handler(&st, &bridge);
+    let out = ok_json(
+        &call(
+            &h,
+            "window",
+            json!({"action": "resize", "width": 640, "height": 480}),
+        )
+        .await,
+    );
+    assert_eq!(out["width"], 640, "{out}");
+    assert_eq!(out["height"], 480, "{out}");
+    assert!(out.get("settled").is_none(), "{out}");
+    let out = ok_json(&call(&h, "window", json!({"action": "move_to", "x": 9, "y": 8})).await);
+    assert_eq!(out["x"], 9, "{out}");
+    assert!(out.get("settled").is_none(), "{out}");
+}
+
+/// A window manager may ignore the request: the result says so, in bounded time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn window_resize_and_move_say_when_nothing_changed() {
+    let st = state();
+    let mut bridge = AppBridge::answering(&st, "null");
+    bridge.os_ignores_geometry = true;
+    let h = handler(&st, &bridge);
+    let start = Instant::now();
+    let out = ok_json(
+        &call(
+            &h,
+            "window",
+            json!({"action": "resize", "width": 640, "height": 480}),
+        )
+        .await,
+    );
+    assert_eq!(out["width"], 800, "the real size: {out}");
+    assert_eq!(out["settled"], false, "{out}");
+    let out = ok_json(&call(&h, "window", json!({"action": "move_to", "x": 9, "y": 8})).await);
+    assert_eq!(out["x"], 0, "{out}");
+    assert_eq!(out["settled"], false, "{out}");
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// `wait_for` reports a timeout as `ok:false`, but a condition that can never hold is a mistake
+/// in the call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_for_an_invalid_selector_is_a_tool_error_and_a_timeout_is_not() {
+    let st = state();
+    let bridge = AppBridge::answering(
+        &st,
+        r#"{"__victauri_ok":{"ok":false,"error":"invalid CSS selector: ## - bad","hint":"CHECK_INPUT","elapsed_ms":0},"__victauri_type":"value"}"#,
+    );
+    let h = handler(&st, &bridge);
+    let msg = err_text(
+        &call(
+            &h,
+            "wait_for",
+            json!({"condition": "selector", "value": "##"}),
+        )
+        .await,
+    );
+    assert!(msg.contains("invalid CSS selector"), "{msg}");
+    assert!(msg.contains("CHECK_INPUT"), "{msg}");
+
+    let st = state();
+    let bridge = AppBridge::answering(
+        &st,
+        r#"{"__victauri_ok":{"ok":false,"error":"timeout after 50ms","elapsed_ms":50},"__victauri_type":"value"}"#,
+    );
+    let h = handler(&st, &bridge);
+    let out = ok_json(
+        &call(
+            &h,
+            "wait_for",
+            json!({"condition": "selector", "value": "#x", "timeout_ms": 50}),
+        )
+        .await,
+    );
+    assert_eq!(out["ok"], false, "{out}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logs_bodies_false_is_passed_to_the_page_for_ipc_and_network() {
+    const EMPTY: &str = r#"{"__victauri_ok":[],"__victauri_type":"value"}"#;
+    for (action, method) in [("ipc", "getIpcLog"), ("network", "getNetworkLog")] {
+        let st = state();
+        let bridge = AppBridge::answering(&st, EMPTY);
+        let h = handler(&st, &bridge);
+        let _ = call(
+            &h,
+            "logs",
+            json!({"action": action, "bodies": false, "limit": 1000}),
+        )
+        .await;
+        assert_eq!(
+            bridge.evals_containing("{ bodies: false }"),
+            1,
+            "{action}: {:?}",
+            bridge.evals.lock().unwrap().last()
+        );
+        assert_eq!(bridge.evals_containing(method), 1, "{action}");
+
+        let st = state();
+        let bridge = AppBridge::answering(&st, EMPTY);
+        let h = handler(&st, &bridge);
+        let _ = call(&h, "logs", json!({"action": action})).await;
+        assert_eq!(
+            bridge.evals_containing("bodies"),
+            0,
+            "{action}: the default keeps them"
+        );
+    }
+    // With wait_for_capture too.
+    let st = state();
+    let bridge = AppBridge::answering(&st, EMPTY);
+    let h = handler(&st, &bridge);
+    let _ = call(
+        &h,
+        "logs",
+        json!({"action": "ipc", "bodies": false, "wait_for_capture": true}),
+    )
+    .await;
+    assert_eq!(bridge.evals_containing("{ bodies: false }"), 1);
+}
+
+/// The stuck-page detour must not stay in the app's history: `go_back` would land on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_health_detour_is_replaced_not_left_in_history() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    let landing = bridge.clone();
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    // The cross-site detour lands, and then the page's own script replaces it.
+    let port = st.port.load(Ordering::Relaxed);
+    let lander = std::thread::spawn(move || {
+        for _ in 0..1000 {
+            if landing.evals_containing("location.replace(") > 0 {
+                landing.set_window_url("main", "http://tauri.localhost/index.html");
+                return;
+            }
+            if landing
+                .native_calls()
+                .iter()
+                .any(|(_, c)| c.ends_with("/health"))
+            {
+                landing.set_window_url("main", &format!("http://127.0.0.1:{port}/health"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert_eq!(out["recovered"], true, "{out}");
+    let _ = lander.join();
+    assert_eq!(
+        bridge.evals_containing("location.replace(\"http://tauri.localhost/index.html\")"),
+        1,
+        "the detour's entry is replaced"
+    );
+    let calls = bridge.native_calls();
+    assert_eq!(
+        calls.iter().filter(|(_, c)| c.ends_with("/health")).count(),
+        1,
+        "{calls:?}"
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|(_, c)| c.starts_with("navigate http://tauri.localhost")),
+        "a native navigation would push another entry: {calls:?}"
+    );
+}
+
+/// A webview that refuses the script navigation (or a detour that never landed) still gets there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_detour_that_cannot_be_replaced_falls_back_to_a_native_navigation() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    let landing = bridge.clone();
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    let port = st.port.load(Ordering::Relaxed);
+    // The detour lands; the script navigation does nothing.
+    let lander = std::thread::spawn(move || {
+        for _ in 0..1000 {
+            if landing
+                .native_calls()
+                .iter()
+                .any(|(_, c)| c.ends_with("/health"))
+            {
+                landing.set_window_url("main", &format!("http://127.0.0.1:{port}/health"));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert_eq!(out["recovered"], true, "{out}");
+    let _ = lander.join();
+    assert_eq!(
+        bridge.native_calls().last().map(|(_, c)| c.as_str()),
+        Some("navigate http://tauri.localhost/index.html")
+    );
+}
+
+/// Explicit null is a value (`present_value`): it is stored, not reported as missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn storage_set_stores_an_explicit_null() {
+    let st = state();
+    let bridge = AppBridge::answering(
+        &st,
+        r#"{"__victauri_ok":{"ok":true},"__victauri_type":"value"}"#,
+    );
+    let h = handler(&st, &bridge);
+    let r = call(
+        &h,
+        "storage",
+        json!({"action": "set", "key": "k", "value": null}),
+    )
+    .await;
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+    assert_eq!(bridge.evals_containing(r#"setLocalStorage("k", null)"#), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
