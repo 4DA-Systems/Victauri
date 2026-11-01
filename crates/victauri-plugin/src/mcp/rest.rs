@@ -12,6 +12,8 @@ struct ToolInfo {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// The tool's parameters as JSON Schema, for REST-only clients.
+    input_schema: serde_json::Value,
 }
 
 pub enum ToolCallError {
@@ -23,6 +25,9 @@ pub fn router(handler: VictauriMcpHandler) -> axum::Router {
     axum::Router::new()
         .route("/", axum::routing::get(list_tools))
         .route("/{tool_name}", axum::routing::post(call_tool))
+        // `read_body_with_deadline` has already enforced this path's limit (see `body_limit`),
+        // and this overrides the router-wide default that would refuse a large `recording` body.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(handler)
 }
 
@@ -34,6 +39,7 @@ async fn list_tools(State(handler): State<VictauriMcpHandler>) -> Json<Vec<ToolI
         .map(|t| ToolInfo {
             name: t.name.to_string(),
             description: t.description.as_deref().map(String::from),
+            input_schema: serde_json::Value::Object((*t.input_schema).clone()),
         })
         .collect();
     Json(tools)

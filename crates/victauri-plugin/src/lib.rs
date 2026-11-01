@@ -993,6 +993,17 @@ impl VictauriBuilder {
             });
         }
 
+        // Redaction that lost a custom pattern still looks active, so a pattern that does not
+        // compile stops the build rather than leak what it was meant to cover.
+        for pattern in &self.redaction_patterns {
+            if let Err(e) = regex::Regex::new(pattern) {
+                return Err(BuilderError::InvalidRedactionPattern {
+                    pattern: pattern.clone(),
+                    reason: e.to_string(),
+                });
+            }
+        }
+
         let timeout = self.resolve_eval_timeout();
         if timeout.as_secs() == 0 || timeout.as_secs() > MAX_EVAL_TIMEOUT_SECS {
             return Err(BuilderError::InvalidEvalTimeout {
@@ -1011,7 +1022,7 @@ impl VictauriBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`BuilderError`] if the port, event capacity, recorder capacity, or eval
+    /// Returns [`BuilderError`] if a custom redaction pattern, the port, event capacity, recorder capacity, or eval
     /// timeout are outside their valid ranges (debug builds only).
     pub fn build<R: Runtime>(self) -> Result<TauriPlugin<R>, BuilderError> {
         #[cfg(not(debug_assertions))]
@@ -1156,11 +1167,7 @@ impl VictauriBuilder {
                              the discovery directory"
                         );
                     } else {
-                        tracing::warn!(
-                            "Victauri MCP server running WITHOUT auth — any localhost process can \
-                             access all tools. Use VictauriBuilder::auth_enabled() or set \
-                             VICTAURI_AUTH_TOKEN for shared/CI environments."
-                        );
+                        tracing::warn!("{AUTH_DISABLED_WARNING}");
                     }
 
                     state.startup_timeline.mark("server_spawning");
@@ -1401,6 +1408,12 @@ fn env_truthy(name: &str) -> bool {
     })
 }
 
+/// Logged when the server runs with no token, which only an explicit `auth_disabled()` causes.
+#[cfg(any(debug_assertions, test))]
+const AUTH_DISABLED_WARNING: &str = "Victauri MCP server running WITHOUT auth — any localhost \
+     process can access all tools. Remove the VictauriBuilder::auth_disabled() call to turn auth \
+     back on (the VICTAURI_AUTH_TOKEN environment variable does not override it).";
+
 /// Emits an unmissable startup banner whenever the introspection server activates.
 ///
 /// Victauri is a debug-only tool that exposes JS eval, IPC, the filesystem, and
@@ -1411,7 +1424,7 @@ fn env_truthy(name: &str) -> bool {
 /// no visible signal.
 #[cfg(debug_assertions)]
 fn emit_security_banner(port: u16) {
-    tracing::warn!(
+    let banner = format!(
         "┌─ VICTAURI INTROSPECTION SERVER ACTIVE ─────────────────────────────\n\
          │ Listening on http://127.0.0.1:{port} — exposes JS eval, IPC, the\n\
          │ filesystem, and SQLite to local clients. DEBUG-ONLY developer tool;\n\
@@ -1421,6 +1434,10 @@ fn emit_security_banner(port: u16) {
          │ with the VICTAURI_DISABLE=1 environment variable.\n\
          └────────────────────────────────────────────────────────────────────"
     );
+    tracing::warn!("{banner}");
+    // An app with no tracing subscriber (only `log`, say) prints nothing for the line above, and
+    // this banner must never be silent.
+    eprintln!("{banner}");
 }
 
 /// Resolve configured `db_search_paths` against multiple stable anchors so a
@@ -1918,6 +1935,30 @@ mod tests {
         let builder = VictauriBuilder::new().port(0);
         let err = builder.validate().unwrap_err();
         assert!(matches!(err, BuilderError::InvalidPort { port: 0, .. }));
+    }
+
+    /// Redaction that silently lost its custom patterns still looks active: fail at startup.
+    #[test]
+    fn builder_rejects_an_invalid_redaction_pattern() {
+        let builder = VictauriBuilder::new()
+            .add_redaction_pattern("ACME_\\w+")
+            .add_redaction_pattern("[invalid");
+        let err = builder.validate().unwrap_err();
+        assert!(err.to_string().contains("[invalid"), "{err}");
+        assert!(
+            VictauriBuilder::new()
+                .add_redaction_pattern("ACME_\\w+")
+                .validate()
+                .is_ok()
+        );
+    }
+
+    /// `auth_disabled()` beats the env var, so the warning must not offer it as the fix.
+    #[test]
+    fn auth_disabled_warning_names_what_actually_turns_auth_back_on() {
+        assert!(AUTH_DISABLED_WARNING.contains("auth_disabled()"));
+        assert!(!AUTH_DISABLED_WARNING.contains("set VICTAURI_AUTH_TOKEN"));
+        assert!(!AUTH_DISABLED_WARNING.contains("auth_enabled()"));
     }
 
     #[test]

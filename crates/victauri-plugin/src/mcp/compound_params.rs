@@ -285,7 +285,10 @@ impl fmt::Display for ManageAction {
 pub struct WindowParams {
     /// Action to perform: `get_state`, list, manage, resize, `move_to`, `set_title`.
     pub action: WindowAction,
-    /// Target window label.
+    /// Target window label. Also accepts `webview_label`, `window` and `window_label`, as every
+    /// other tool does: an unknown key would be dropped and the action would hit the default
+    /// window instead.
+    #[serde(alias = "webview_label", alias = "window", alias = "window_label")]
     pub label: Option<String>,
     /// Window management action (for manage): minimize, unminimize, maximize, unmaximize, close, focus, show, hide, fullscreen, unfullscreen, `always_on_top`, `not_always_on_top`.
     pub manage_action: Option<ManageAction>,
@@ -337,7 +340,8 @@ pub struct StorageParams {
     pub storage_type: Option<StorageType>,
     /// Key to read, write, or delete.
     pub key: Option<String>,
-    /// Value to store (for set action). Will be JSON-serialized if not a string.
+    /// Value to store (required for set). Will be JSON-serialized if not a string.
+    #[serde(default, deserialize_with = "super::backend_params::present_value")]
     pub value: Option<serde_json::Value>,
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]

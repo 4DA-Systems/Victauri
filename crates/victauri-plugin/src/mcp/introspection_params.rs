@@ -60,8 +60,13 @@ pub struct IntrospectParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
 
-    /// For `contract_record`: optional arguments to pass when invoking the command.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// For `contract_record`: optional arguments to pass when invoking the command (a JSON
+    /// object, as for `invoke_command`).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::backend_params::deserialize_optional_object"
+    )]
     pub args: Option<serde_json::Value>,
 
     /// For `db_health`: path to the `SQLite` database file. Read only by the
@@ -164,6 +169,11 @@ pub struct ExplainParams {
     pub seconds: Option<u64>,
 
     /// Window to read activity from when no recording is active (default: the main window).
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "window")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "window",
+        alias = "window_label"
+    )]
     pub webview_label: Option<String>,
 }

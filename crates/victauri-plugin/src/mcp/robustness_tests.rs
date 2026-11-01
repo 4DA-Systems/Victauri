@@ -376,7 +376,8 @@ async fn huge_look_back_windows_do_not_panic() {
             serde_json::json!({"action": action, "seconds": 10_000_000_000_000_u64}),
         )
         .await;
-        assert_ne!(r.is_error, Some(true), "{action}: {}", text(&r));
+        // This bridge has no page, so the honest answer is "cannot read": never a panic.
+        assert!(text(&r).contains("cannot read"), "{action}: {}", text(&r));
     }
     let r = call(
         &h,

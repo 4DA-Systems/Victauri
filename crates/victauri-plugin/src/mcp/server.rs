@@ -452,10 +452,29 @@ pub async fn start_server_reporting_port<R: Runtime>(
     Ok(())
 }
 
+/// The error for a port range that could not be bound, with the OS's reason: on Windows a range
+/// can be reserved (Hyper-V, WSL) with nothing listening on it, which no port scan shows.
+pub(super) fn bind_failure_message(
+    first: u16,
+    last: u16,
+    error: Option<&std::io::Error>,
+) -> String {
+    let reason = error.map_or_else(String::new, |e| format!(": {e}"));
+    let hint = if cfg!(windows) {
+        " (a port can also be reserved with nothing listening on it: see `netsh int ipv4 show \
+         excludedportrange protocol=tcp`)"
+    } else {
+        ""
+    };
+    format!("could not bind to any port in range {first}-{last}{reason}{hint}")
+}
+
 async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
-    if let Ok(listener) = tokio::net::TcpListener::bind(format!("127.0.0.1:{preferred}")).await {
-        return Ok((listener, preferred));
-    }
+    let mut last_error = match tokio::net::TcpListener::bind(format!("127.0.0.1:{preferred}")).await
+    {
+        Ok(listener) => return Ok((listener, preferred)),
+        Err(e) => e,
+    };
 
     for offset in 1..=PORT_FALLBACK_RANGE {
         // Saturating/checked add: a `preferred` near u16::MAX (e.g. 65530) would
@@ -463,14 +482,19 @@ async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u1
         let Some(port) = preferred.checked_add(offset) else {
             break;
         };
-        if let Ok(listener) = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
-            return Ok((listener, port));
+        match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
+            Ok(listener) => return Ok((listener, port)),
+            Err(e) => last_error = e,
         }
     }
 
     anyhow::bail!(
-        "could not bind to any port in range {preferred}-{}",
-        preferred.saturating_add(PORT_FALLBACK_RANGE)
+        "{}",
+        bind_failure_message(
+            preferred,
+            preferred.saturating_add(PORT_FALLBACK_RANGE),
+            Some(&last_error)
+        )
     )
 }
 

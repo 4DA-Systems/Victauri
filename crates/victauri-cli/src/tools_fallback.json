@@ -92,7 +92,7 @@
     "name": "logs"
   },
   {
-    "description": "Navigation and dialog control. Actions: go_to (navigate to URL), go_back (browser back), get_history (navigation log), set_dialog_response (auto-respond to alert/confirm/prompt), get_dialog_log (captured dialog events). Subject to privacy controls for go_to and set_dialog_response.",
+    "description": "Navigation and dialog control. Actions: go_to (navigate to URL, natively, so it also recovers a hung page or one outside the app; warns when the URL is outside the app), go_back (browser back; on a page that stopped answering, returns natively to the last known URL inside the app), get_history (navigation log), set_dialog_response (auto-respond to alert/confirm/prompt), get_dialog_log (captured dialog events). Subject to privacy controls for go_to and set_dialog_response.",
     "name": "navigate"
   },
   {
@@ -104,7 +104,7 @@
     "name": "read_app_file"
   },
   {
-    "description": "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, were answered by a route rule, or were captured on Tauri's postMessage IPC path are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
+    "description": "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress; a session over 2 MiB imports only over REST, POST /api/tools/recording, up to 48 MiB), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, were answered by a route rule, or were captured on Tauri's postMessage IPC path are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
     "name": "recording"
   },
   {
