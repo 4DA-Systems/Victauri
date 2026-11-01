@@ -28,8 +28,15 @@ Run it:
 
 ```bash
 pnpm tauri dev                                   # start your app
-cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke   # run tests (from the app crate)
+cd src-tauri && CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke -- --test-threads=1
 ```
+
+Run the tests from the app crate, in a second terminal:
+
+- `--test-threads=1`: every test drives the same running app, so tests running in parallel change each
+  other's page and fail.
+- `CARGO_TARGET_DIR=target-test`: on Windows the running app locks its `.exe`, and `cargo test` would
+  rebuild it (`Access is denied`). Its own target directory avoids that.
 
 ## Test Client
 
@@ -100,7 +107,7 @@ For direct MCP tool access using ref handles:
 |--------|-------------|
 | `eval_js(expr)` | Evaluate JavaScript |
 | `dom_snapshot()` | Get full DOM tree |
-| `find_elements(selector)` | Find elements by CSS |
+| `find_elements(query)` | Find elements, e.g. `find_elements(json!({"css": "button"}))` |
 | `click(ref_id)` | Click element |
 | `fill(ref_id, value)` | Fill input |
 | `type_text(ref_id, text)` | Type characters |
@@ -689,7 +696,7 @@ use victauri_test::{VictauriClient, SmokeConfig};
 
 #[tokio::test]
 async fn smoke() {
-    let mut client = VictauriClient::connect(7373).await.unwrap();
+    let mut client = VictauriClient::discover().await.unwrap();
 
     let report = client.smoke_test().await.unwrap();
     println!("Passed: {}/{}", report.passed_count(), report.total_count());

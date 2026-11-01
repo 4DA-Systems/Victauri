@@ -116,10 +116,10 @@ Start your app, then run the smoke suite:
 
 ```bash
 npm run tauri dev                                # start your app (or pnpm/yarn/bun tauri dev)
-cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke   # in a second terminal (the tests live in src-tauri/tests)
+cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke -- --test-threads=1   # in a second terminal; tests share one app
 ```
 
-On Windows the running app locks its `.exe`, and `cargo test` rebuilds it, so give the test run its own target directory: `CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke`.
+On Windows the running app locks its `.exe`, and `cargo test` rebuilds it, so give the test run its own target directory: `CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke -- --test-threads=1`.
 
 Or use the CLI for instant validation:
 

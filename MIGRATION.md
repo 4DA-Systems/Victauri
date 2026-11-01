@@ -83,10 +83,9 @@ parsed `e<digits>` must stop.
   button inputs and for values a number/date/time/range/color field rejects; the old value is kept.
   `type_text` over 20,000 characters errors. `select_option` errors for unknown or disabled values and
   fires `input` before `change`; `values:[]` clears a multi-select. `opacity:0` elements are actionable;
-  a click lands on the hit descendant; an ancestor on top counts as covering only if the element has
-  left that ancestor's box, or a label operating that control. A child painted behind its own ancestor
-  (negative z-index) is therefore clicked rather than reported covered. Keyboard events carry `code`,
-  `keyCode` and `which`.
+  a click lands on the hit descendant; an ancestor on top counts as covering, after one scroll attempt,
+  except a label operating that control and an SVG or wrapped inline element still visibly inside it.
+  Keyboard events carry `code`, `keyCode` and `which`.
 - **Snapshots** list `opacity:0` elements (`[transparent]`) and visible children of `visibility:hidden`
   parents.
 - **`logs`:** `console`, `navigation`, `dialogs` and `events` default to the newest 100 with trimmed
@@ -95,7 +94,7 @@ parsed `e<digits>` must stop.
   `resize` and `move_to` report what the OS applied, plus `requested`; they wait up to about 500 ms for
   the change to land and add `settled:false` if it never does.
 - **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
-  `/health` first, costing about 2 s and that history entry. `go_back` on a stopped page returns
+  `/health` first and replaces that history entry, adding up to about 6 s. `go_back` on a stopped page returns
   `{ok, recovered, url, note}`.
 - **`explain` and `introspect coverage`** on an unreadable page are tool errors, where they reported a
   clean result. `command_timings` adds `ipc_read_error`.

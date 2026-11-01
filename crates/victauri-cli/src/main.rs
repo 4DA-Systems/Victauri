@@ -977,6 +977,15 @@ fn connect_failure_message(detail: &str) -> String {
     format!("Could not connect to Victauri server: {detail}\n\n{hint}")
 }
 
+/// Where a project's agent configs live. `init` writes them at the project root, and the docs run
+/// commands from the app crate, so from `src-tauri` that is the parent directory.
+fn agent_config_root(cwd: &std::path::Path) -> &std::path::Path {
+    match cwd.parent() {
+        Some(parent) if cwd.file_name().is_some_and(|name| name == "src-tauri") => parent,
+        _ => cwd,
+    }
+}
+
 /// Names from a ghost-report list whose items are `{ "name": … }` objects (the plugin's
 /// shape: `frontend_only` holds `GhostCommand`s, `confirmed_ghosts` holds `{name, error}`),
 /// or bare strings (older plugins). Deduplicated in order; page-controlled, so sanitized.
@@ -1306,7 +1315,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     }
 
     // Check 6: an agent client is wired (any project-level MCP config with a victauri server)
-    let configured = agents::configured_project_clients(&cwd);
+    let configured = agents::configured_project_clients(agent_config_root(&cwd));
     if configured.is_empty() {
         eprintln!("  [WARN] No agent client configured for Victauri in this project");
         eprintln!(
@@ -4742,6 +4751,14 @@ mod tests {
         assert!(content.contains("XDG_RUNTIME_DIR"));
         assert!(content.contains("victauri-<uid>"));
         assert!(content.contains("victauri check"));
+    }
+
+    #[test]
+    fn agent_configs_are_looked_for_at_the_project_root() {
+        let project = std::path::Path::new("app");
+        assert_eq!(agent_config_root(&project.join("src-tauri")), project);
+        assert_eq!(agent_config_root(project), project);
+        assert_eq!(agent_config_root(&project.join("src")), project.join("src"));
     }
 
     #[test]
