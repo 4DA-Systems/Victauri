@@ -136,6 +136,21 @@ pub trait WebviewBridge: Send + Sync {
         )
     }
 
+    /// [`native_click`](Self::native_click), given the page's `devicePixelRatio` when it reported
+    /// one: the only scale that includes webview zoom.
+    ///
+    /// # Errors
+    /// As [`native_click`](Self::native_click).
+    fn native_click_scaled(
+        &self,
+        label: Option<&str>,
+        x: f64,
+        y: f64,
+        _device_pixel_ratio: Option<f64>,
+    ) -> Result<(), String> {
+        self.native_click(label, x, y)
+    }
+
     /// Click at logical (CSS-pixel) coordinates within the target window's
     /// content area, as a trusted OS mouse event.
     ///
@@ -864,7 +879,20 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     fn native_click(&self, label: Option<&str>, x: f64, y: f64) -> Result<(), String> {
         let hwnd = self.get_native_handle(label)?;
         win_focus(hwnd)?;
-        win_click(hwnd, x, y)
+        win_click(hwnd, x, y, None)
+    }
+
+    #[cfg(windows)]
+    fn native_click_scaled(
+        &self,
+        label: Option<&str>,
+        x: f64,
+        y: f64,
+        device_pixel_ratio: Option<f64>,
+    ) -> Result<(), String> {
+        let hwnd = self.get_native_handle(label)?;
+        win_focus(hwnd)?;
+        win_click(hwnd, x, y, device_pixel_ratio)
     }
 
     fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
@@ -1299,11 +1327,22 @@ fn win_send_key(key: &str) -> Result<(), String> {
     }
 }
 
+/// CSS pixels to physical client pixels. The page's `devicePixelRatio` is the true scale: it
+/// includes webview zoom, which the window's DPI knows nothing about (measured on `WebView2` at
+/// zoom 0.75, 1 and 1.5: an element's painted position is its CSS position times the ratio).
+#[cfg(windows)]
+fn css_to_client_pixels(x: f64, y: f64, device_pixel_ratio: Option<f64>, dpi: u32) -> (f64, f64) {
+    let scale = device_pixel_ratio
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or(if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 });
+    (x * scale, y * scale)
+}
+
 /// Click at logical (CSS-pixel) coordinates within the window's content area
 /// via an absolute-positioned `SendInput` mouse sequence (move + down + up).
 #[allow(unsafe_code)]
 #[cfg(windows)]
-fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
+fn win_click(hwnd: isize, x: f64, y: f64, device_pixel_ratio: Option<f64>) -> Result<(), String> {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -1320,9 +1359,7 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
     // SAFETY: GetDpiForWindow/GetClientRect/GetSystemMetrics/ClientToScreen are safe to call
     // with a valid HWND; GetClientRect and ClientToScreen write into our stack RECT/POINT.
     let (nx, ny) = unsafe {
-        let dpi = GetDpiForWindow(h);
-        let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
-        let (px, py) = (x * scale, y * scale);
+        let (px, py) = css_to_client_pixels(x, y, device_pixel_ratio, GetDpiForWindow(h));
         // Client coordinates: the client rect's origin is always (0, 0).
         let mut client = RECT::default();
         GetClientRect(h, &mut client)
@@ -1694,6 +1731,23 @@ mod tests {
             0,
             "a caller that gave up ran its job"
         );
+    }
+
+    /// Zoom 1.5 at 96 DPI: scaling by the DPI alone would click at an element's CSS position.
+    #[cfg(windows)]
+    #[test]
+    fn trusted_click_scales_by_the_pages_ratio_so_zoom_counts() {
+        assert_eq!(
+            super::css_to_client_pixels(200.0, 120.0, Some(1.5), 96),
+            (300.0, 180.0)
+        );
+        // No usable ratio from the page: the window's DPI.
+        for ratio in [None, Some(0.0), Some(f64::NAN), Some(-1.0)] {
+            assert_eq!(
+                super::css_to_client_pixels(200.0, 120.0, ratio, 144),
+                (300.0, 180.0)
+            );
+        }
     }
 
     /// R4-IN2: a trusted click was only checked for landing on OUR top-level window — which

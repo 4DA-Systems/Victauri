@@ -348,6 +348,7 @@ fn capture_window_wgc_on_com_thread(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32
         D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
         D3D11CreateDevice, ID3D11Device, ID3D11Texture2D,
     };
+    use windows::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
     use windows::Win32::Graphics::Dxgi::IDXGIDevice;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
     use windows::Win32::System::WinRT::Direct3D11::{
@@ -381,8 +382,22 @@ fn capture_window_wgc_on_com_thread(hwnd: isize) -> anyhow::Result<(Vec<u8>, u32
         if !ClientToScreen(hwnd, &mut client_origin).as_bool() {
             anyhow::bail!("ClientToScreen failed for window handle");
         }
-        let crop_x = u32::try_from(client_origin.x - window_rect.left).unwrap_or(0);
-        let crop_y = u32::try_from(client_origin.y - window_rect.top).unwrap_or(0);
+        // The frame starts at the DWM extended frame bounds, inside the window rect's invisible
+        // resize border on a decorated window. Without DWM's answer, the window rect is the best
+        // there is (and is right for an undecorated window).
+        let mut frame_rect = window_rect;
+        if DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            std::ptr::from_mut(&mut frame_rect).cast(),
+            std::mem::size_of::<RECT>() as u32,
+        )
+        .is_err()
+        {
+            frame_rect = window_rect;
+        }
+        let crop_x = u32::try_from(client_origin.x - frame_rect.left).unwrap_or(0);
+        let crop_y = u32::try_from(client_origin.y - frame_rect.top).unwrap_or(0);
         let crop_w = u32::try_from(client_rect.right).unwrap_or(0);
         let crop_h = u32::try_from(client_rect.bottom).unwrap_or(0);
         if crop_w == 0 || crop_h == 0 {
@@ -1234,6 +1249,104 @@ mod tests {
         let data = vec![0u8, 0, 0, 0];
         let (rgba, _, _) = convert_bgra_frame(&data, 4, 1, 1, (0, 0, 1, 1)).unwrap();
         assert_eq!(&rgba[..], &[0, 0, 0, 0]);
+    }
+
+    /// A decorated window has an invisible resize border, part of its window rect but not of the
+    /// WGC frame: measuring the crop from the window rect shifted the image, losing the left
+    /// edge and leaving transparent columns on the right. Paints its own window and sends no
+    /// input, but needs a desktop session.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires an interactive desktop session (real window + DWM)"]
+    #[allow(unsafe_code)]
+    async fn wgc_capture_of_a_decorated_window_keeps_its_edges() {
+        use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+        use windows::Win32::Graphics::Gdi::{
+            BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, MSG,
+            PostMessageW, RegisterClassW, SW_SHOWNOACTIVATE, ShowWindow, WINDOW_EX_STYLE, WM_CLOSE,
+            WM_PAINT, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        };
+        use windows::core::w;
+
+        // Grey, with a red left edge and a blue right edge.
+        unsafe extern "system" fn wndproc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+            // SAFETY: the standard paint sequence on the window this proc belongs to.
+            unsafe {
+                if m == WM_PAINT {
+                    let mut ps = PAINTSTRUCT::default();
+                    let dc = BeginPaint(h, &mut ps);
+                    let mut r = RECT::default();
+                    let _ = GetClientRect(h, &mut r);
+                    let fill = |rc: RECT, c: u32| {
+                        let b = CreateSolidBrush(COLORREF(c));
+                        FillRect(dc, &rc, b);
+                        let _ = DeleteObject(b.into());
+                    };
+                    fill(r, 0x0080_8080);
+                    fill(RECT { right: 4, ..r }, 0x0000_00FF);
+                    fill(
+                        RECT {
+                            left: r.right - 4,
+                            ..r
+                        },
+                        0x00FF_0000,
+                    );
+                    let _ = EndPaint(h, &ps);
+                    return LRESULT(0);
+                }
+                DefWindowProcW(h, m, w, l)
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // SAFETY: window creation and a message loop on this thread, with valid arguments.
+            unsafe {
+                let class = WNDCLASSW {
+                    lpfnWndProc: Some(wndproc),
+                    lpszClassName: w!("VictauriDecoratedCaptureTest"),
+                    ..Default::default()
+                };
+                RegisterClassW(&class);
+                let h = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("VictauriDecoratedCaptureTest"),
+                    w!("victauri capture test"),
+                    WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                    120,
+                    120,
+                    640,
+                    420,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                let _ = ShowWindow(h, SW_SHOWNOACTIVATE);
+                tx.send(h.0 as isize).unwrap();
+                let mut msg = MSG::default();
+                while GetMessageW(&mut msg, Some(h), 0, 0).0 > 0 {
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+        let hwnd = rx.recv().unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        let captured = capture_window_wgc_raw(hwnd).await;
+        // SAFETY: posting to a window this test owns.
+        let _ = unsafe { PostMessageW(Some(HWND(hwnd as *mut _)), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        let (rgba, w, h) = captured.unwrap();
+        let (w, h) = (w as usize, h as usize);
+        let at = |x: usize| &rgba[(h / 2 * w + x) * 4..(h / 2 * w + x) * 4 + 4];
+        assert_eq!(at(0), [255, 0, 0, 255], "left edge");
+        assert_eq!(at(w - 1), [0, 0, 255, 255], "right edge");
+        assert!(
+            rgba.chunks_exact(4).all(|p| p[3] == 255),
+            "transparent pixels"
+        );
     }
 
     /// Live WGC capture against a real on-screen window — whatever is in the

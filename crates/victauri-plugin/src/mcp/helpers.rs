@@ -655,7 +655,7 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
              return __no('the frame holding the element is covered at the click point'); \
            __f=__p; \
          }} \
-         return {{x:__x, y:__y}}",
+         return {{x:__x, y:__y, dpr:window.devicePixelRatio}}",
         js_string(ref_id)
     )
 }

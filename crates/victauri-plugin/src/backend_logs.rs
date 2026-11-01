@@ -248,7 +248,9 @@ fn value_len(v: &serde_json::Value) -> usize {
 
 #[derive(Default)]
 struct Ring {
-    entries: VecDeque<BackendLogEntry>,
+    // Shared, so a reader copies the handles under the lock and does its work after releasing it:
+    // every logging thread, the UI thread among them, needs this lock on each event.
+    entries: VecDeque<Arc<BackendLogEntry>>,
     next_seq: u64,
     bytes: usize,
     /// Entries evicted to respect capacity (lifetime).
@@ -305,18 +307,31 @@ impl std::ops::DerefMut for RingGuard<'_> {
     }
 }
 
-/// `format!("{value:?}")`, except formatting stops once `max` bytes are written: a huge
-/// `Debug` value (a multi-megabyte buffer recorded as a field or by `#[instrument]`) then costs
-/// at most `max` bytes instead of its whole size, on every event that carries it.
-fn debug_bounded(value: &dyn std::fmt::Debug, max: usize) -> String {
+/// How much output past its budget a value may produce before formatting is stopped.
+const MAX_DISCARDED_FORMAT_BYTES: usize = 256 * 1024;
+
+/// `format!`, except that the text is cut at `max` bytes, it never panics on a failing `Display`
+/// (`to_string` does), and a huge value stops being formatted: a multi-megabyte buffer recorded as
+/// a field or by `#[instrument]` then costs a bounded amount on every event that carries it.
+///
+/// The writer only errors once the discard window is used up too. An app's `Debug`/`Display` never
+/// sees a write fail against a `String`, so one that unwraps its writes would panic in the app's
+/// log call. That remains possible for such an impl producing more than the window; stopping is
+/// what keeps the cost of a huge value bounded for every other impl.
+fn format_bounded(args: std::fmt::Arguments<'_>, max: usize) -> String {
     struct Bounded {
         out: String,
         max: usize,
         cut: bool,
+        discarded: usize,
     }
     impl std::fmt::Write for Bounded {
         fn write_str(&mut self, s: &str) -> std::fmt::Result {
-            let room = self.max.saturating_sub(self.out.len());
+            let room = if self.cut {
+                0
+            } else {
+                self.max.saturating_sub(self.out.len())
+            };
             if s.len() <= room {
                 self.out.push_str(s);
                 return Ok(());
@@ -327,20 +342,29 @@ fn debug_bounded(value: &dyn std::fmt::Debug, max: usize) -> String {
             }
             self.out.push_str(&s[..end]);
             self.cut = true;
-            // Stop the formatter: the rest would be discarded anyway.
-            Err(std::fmt::Error)
+            self.discarded = self.discarded.saturating_add(s.len() - end);
+            if self.discarded > MAX_DISCARDED_FORMAT_BYTES {
+                return Err(std::fmt::Error);
+            }
+            Ok(())
         }
     }
     let mut b = Bounded {
         out: String::new(),
         max,
         cut: false,
+        discarded: 0,
     };
-    let _ = write!(b, "{value:?}");
+    let _ = b.write_fmt(args);
     if b.cut {
         b.out.push_str("…[truncated]");
     }
     b.out
+}
+
+/// [`format_bounded`] for a `Debug` value.
+fn debug_bounded(value: &dyn std::fmt::Debug, max: usize) -> String {
+    format_bounded(format_args!("{value:?}"), max)
 }
 
 thread_local! {
@@ -466,7 +490,7 @@ impl LogBuffer {
         ring.next_seq += 1;
         ring.totals[entry.level.index()] += 1;
         ring.bytes += entry.approx_bytes();
-        ring.entries.push_back(entry);
+        ring.entries.push_back(Arc::new(entry));
         while ring.entries.len() > capacity || (ring.bytes > max_bytes && ring.entries.len() > 1) {
             if let Some(old) = ring.entries.pop_front() {
                 ring.bytes = ring.bytes.saturating_sub(old.approx_bytes());
@@ -505,45 +529,53 @@ impl LogBuffer {
     /// Run a query against the buffer.
     #[must_use]
     pub fn query(&self, q: &LogQuery) -> LogPage {
-        let ring = self.lock();
-        let oldest_seq = ring.entries.front().map_or(ring.next_seq, |e| e.seq);
+        let (candidates, oldest_seq, buffer_next_seq, evicted, gap) = {
+            let ring = self.lock();
+            let from = q.since_seq.map_or(0, |since| ring.index_of(since));
+            (
+                ring.entries.range(from..).cloned().collect::<Vec<_>>(),
+                ring.entries.front().map_or(ring.next_seq, |e| e.seq),
+                ring.next_seq,
+                ring.evicted,
+                q.since_seq.is_some_and(|s| ring.evicted_since(s) > 0),
+            )
+        };
         let matcher = q.matcher();
         let mut matched: Vec<BackendLogEntry> = Vec::new();
         let mut total_matched = 0usize;
-        if let Some(since) = q.since_seq {
+        if q.since_seq.is_some() {
             // A cursor read pages FORWARD: the oldest matches after the cursor, so a reader
             // that fell behind by more than `limit` continues from `next_seq` instead of
             // silently skipping the middle of a burst.
-            for e in ring.entries.range(ring.index_of(since)..) {
+            for e in &candidates {
                 if matcher.matches(e) {
                     total_matched += 1;
                     if matched.len() < q.limit {
-                        matched.push(e.clone());
+                        matched.push((**e).clone());
                     }
                 }
             }
         } else {
             // Newest-first scan so `limit` keeps the most recent matches, then flip.
-            for e in ring.entries.iter().rev() {
+            for e in candidates.iter().rev() {
                 if !matcher.matches(e) {
                     continue;
                 }
                 total_matched += 1;
                 if matched.len() < q.limit {
-                    matched.push(e.clone());
+                    matched.push((**e).clone());
                 }
             }
             matched.reverse();
         }
         let truncated = total_matched > matched.len();
-        let gap = q.since_seq.is_some_and(|s| ring.evicted_since(s) > 0);
         LogPage {
-            next_seq: page_next_seq(q.since_seq, truncated, &matched, ring.next_seq),
+            next_seq: page_next_seq(q.since_seq, truncated, &matched, buffer_next_seq),
             truncated,
             total_matched,
             entries: matched,
             oldest_seq,
-            evicted: ring.evicted,
+            evicted,
             gap,
         }
     }
@@ -558,16 +590,18 @@ impl LogBuffer {
         min_level: LogLevel,
         limit: usize,
     ) -> (Vec<BackendLogEntry>, usize) {
-        let ring = self.lock();
-        let all: Vec<&BackendLogEntry> = ring
-            .entries
-            .range(ring.index_of(from)..)
-            .take_while(|e| e.seq < to)
-            .filter(|e| e.level >= min_level)
-            .collect();
+        let all: Vec<Arc<BackendLogEntry>> = {
+            let ring = self.lock();
+            ring.entries
+                .range(ring.index_of(from)..)
+                .take_while(|e| e.seq < to)
+                .filter(|e| e.level >= min_level)
+                .cloned()
+                .collect()
+        };
         let total = all.len();
         let start = total.saturating_sub(limit);
-        (all[start..].iter().map(|e| (*e).clone()).collect(), total)
+        (all[start..].iter().map(|e| (**e).clone()).collect(), total)
     }
 
     /// Aggregate view: counts, noisiest targets, repeated message templates,
@@ -575,13 +609,21 @@ impl LogBuffer {
     /// before paging raw entries.
     #[must_use]
     pub fn digest(&self, recent: usize, top: usize) -> LogDigest {
-        let ring = self.lock();
+        let (entries, next_seq, evicted, totals) = {
+            let ring = self.lock();
+            (
+                ring.entries.iter().cloned().collect::<Vec<_>>(),
+                ring.next_seq,
+                ring.evicted,
+                ring.totals,
+            )
+        };
         let mut in_buffer = [0u64; 5];
         let mut targets: HashMap<&str, u64> = HashMap::new();
         let mut templates: HashMap<(LogLevel, String, String), TemplateStat> = HashMap::new();
         let mut recent_problems: VecDeque<BackendLogEntry> = VecDeque::new();
         let mut panics: Vec<BackendLogEntry> = Vec::new();
-        for e in &ring.entries {
+        for e in &entries {
             in_buffer[e.level.index()] += 1;
             *targets.entry(e.target.as_str()).or_default() += 1;
             let key = (e.level, e.target.clone(), message_template(&e.message));
@@ -596,13 +638,13 @@ impl LogBuffer {
             stat.last_ts_ms = e.ts_ms;
             stat.last_seq = e.seq;
             if e.level >= LogLevel::Warn {
-                recent_problems.push_back(e.clone());
+                recent_problems.push_back((**e).clone());
                 if recent_problems.len() > recent {
                     recent_problems.pop_front();
                 }
             }
             if e.source == LogSource::Panic {
-                panics.push(e.clone());
+                panics.push((**e).clone());
             }
         }
         let mut top_targets: Vec<(String, u64)> = targets
@@ -633,12 +675,12 @@ impl LogBuffer {
         });
         repeated.truncate(top);
         LogDigest {
-            buffered: ring.entries.len(),
-            next_seq: ring.next_seq,
-            evicted: ring.evicted,
-            oldest_ts_ms: ring.entries.front().map(|e| e.ts_ms),
-            newest_ts_ms: ring.entries.back().map(|e| e.ts_ms),
-            lifetime_counts: level_map(&ring.totals),
+            buffered: entries.len(),
+            next_seq,
+            evicted,
+            oldest_ts_ms: entries.first().map(|e| e.ts_ms),
+            newest_ts_ms: entries.last().map(|e| e.ts_ms),
+            lifetime_counts: level_map(&totals),
             buffered_counts: level_map(&in_buffer),
             top_targets: top_targets
                 .into_iter()
@@ -676,17 +718,26 @@ impl LogBuffer {
                 notified.as_mut().enable();
             }
             {
-                let ring = self.lock();
-                missed += ring.evicted_since(scanned_to);
                 // Only the entries not checked yet: an index jump, not a rescan of the whole
-                // ring under the lock the app's loggers need on every wake-up.
-                for e in ring.entries.range(ring.index_of(scanned_to)..) {
+                // ring. The predicate runs after the lock is released: it may redact, and the
+                // app's loggers need the lock on every event.
+                let fresh: Vec<Arc<BackendLogEntry>> = {
+                    let ring = self.lock();
+                    missed += ring.evicted_since(scanned_to);
+                    let fresh = ring
+                        .entries
+                        .range(ring.index_of(scanned_to)..)
+                        .cloned()
+                        .collect();
+                    // Everything below next_seq is checked just below.
+                    scanned_to = scanned_to.max(ring.next_seq);
+                    fresh
+                };
+                for e in &fresh {
                     if pred(e) {
-                        return (Some(e.clone()), missed);
+                        return (Some((**e).clone()), missed);
                     }
                 }
-                // Everything below next_seq has now been checked once.
-                scanned_to = scanned_to.max(ring.next_seq);
             }
             if tokio::time::timeout_at(deadline, PollInNotifyScope(notified.as_mut()))
                 .await
@@ -893,7 +944,8 @@ pub fn entry_contains(e: &BackendLogEntry, needle: &str) -> bool {
 }
 
 /// The cursor a [`LogPage`] hands back: the end of the buffer, unless a cursor read was cut by
-/// its limit — then just past the last entry returned, so the next read continues there.
+/// its limit — then just past the last entry returned (or where it started, with `limit: 0`), so
+/// the next read continues there.
 #[must_use]
 pub fn page_next_seq(
     since_seq: Option<u64>,
@@ -901,8 +953,9 @@ pub fn page_next_seq(
     entries: &[BackendLogEntry],
     buffer_next_seq: u64,
 ) -> u64 {
-    match entries.last() {
-        Some(last) if since_seq.is_some() && truncated => last.seq + 1,
+    match (since_seq, entries.last()) {
+        (Some(_), Some(last)) if truncated => last.seq + 1,
+        (Some(since), None) if truncated => since,
         _ => buffer_next_seq,
     }
 }
@@ -1157,6 +1210,8 @@ fn current_thread_name() -> Option<String> {
 #[cfg(debug_assertions)]
 pub struct BackendLogLayer {
     buffer: Arc<LogBuffer>,
+    /// The subscriber below this layer states a level hint (see `max_level_hint`).
+    inner_has_hint: bool,
 }
 
 #[cfg(debug_assertions)]
@@ -1171,7 +1226,10 @@ impl BackendLogLayer {
     /// A layer writing into a specific buffer (tests); apps use [`log_layer`].
     #[must_use]
     pub const fn with_buffer(buffer: Arc<LogBuffer>) -> Self {
-        Self { buffer }
+        Self {
+            buffer,
+            inner_has_hint: false,
+        }
     }
 }
 
@@ -1239,12 +1297,18 @@ impl<S> Layer<S> for BackendLogLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
-    // An upper bound, not a filter: this layer never disables anything for other layers (a
-    // `Layer::enabled` returning false would). Without a hint, an app whose own layers all use
-    // per-layer filters ends up with a global max level of TRACE, so every trace-level callsite
-    // in every dependency would be built for this layer alone.
+    fn on_layer(&mut self, subscriber: &mut S) {
+        self.inner_has_hint = subscriber.max_level_hint().is_some();
+    }
+
+    // `Layered` takes the max of the hints, and an absent hint (a layer that wants everything)
+    // loses to any `Some`, so hinting unconditionally lowered the process-wide max level for an
+    // app's unfiltered layers. Hint only above a subscriber that already states one: there this
+    // can only raise the level, and an app whose own layers all use per-layer filters still does
+    // not build every trace-level callsite of every dependency for this layer alone.
     fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        Some(capture_level().to_level_filter())
+        self.inner_has_hint
+            .then(|| capture_level().to_level_filter())
     }
 
     fn on_new_span(
@@ -1256,7 +1320,9 @@ where
         let mut v = SpanVisitor::default();
         attrs.record(&mut v);
         if let Some(span) = ctx.span(id) {
-            span.extensions_mut().insert(SpanFields(v.0));
+            // `replace`: a second capture layer in the subscriber stores the same type, and
+            // `insert` asserts it is absent.
+            span.extensions_mut().replace(SpanFields(v.0));
         }
     }
 
@@ -1267,18 +1333,16 @@ where
         ctx: Context<'_, S>,
     ) {
         if let Some(span) = ctx.span(id) {
-            let mut ext = span.extensions_mut();
             let mut v = SpanVisitor(
-                ext.get_mut::<SpanFields>()
+                span.extensions_mut()
+                    .get_mut::<SpanFields>()
                     .map(|f| std::mem::take(&mut f.0))
                     .unwrap_or_default(),
             );
+            // Outside the extensions lock: a recorded value's `Debug` may log in this span, and
+            // `on_event` takes that lock on the same thread.
             values.record(&mut v);
-            if let Some(f) = ext.get_mut::<SpanFields>() {
-                f.0 = v.0;
-            } else {
-                ext.insert(SpanFields(v.0));
-            }
+            span.extensions_mut().replace(SpanFields(v.0));
         }
     }
 
@@ -1398,7 +1462,7 @@ impl Visit for EventVisitor {
     }
 
     fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
-        let mut text = value.to_string();
+        let mut text = format_bounded(format_args!("{value}"), MAX_FIELD_BYTES);
         let mut source = value.source();
         let mut depth = 0;
         while let Some(s) = source {
@@ -1499,7 +1563,7 @@ impl log::Log for VictauriLogger {
             ts_ms: now_ms(),
             level: LogLevel::from_log(record.level()),
             target: record.target().to_string(),
-            message: truncate_string(record.args().to_string(), MAX_MESSAGE_BYTES),
+            message: format_bounded(*record.args(), MAX_MESSAGE_BYTES),
             fields,
             spans: Vec::new(),
             thread: current_thread_name(),
@@ -1603,32 +1667,58 @@ fn pending_backtraces() -> &'static Mutex<HashMap<u32, Arc<PendingBacktrace>>> {
     PENDING.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Replace every `backtrace_id` placeholder in `value` (an entry, or any JSON holding entries)
-/// with the symbolised, trimmed backtrace. Runs on the reading side — the server's runtime —
-/// and resolves each backtrace once.
+/// Symbolisations running now. Std holds its global backtrace lock throughout one, so a capture
+/// would wait for it (see `capture_panic`).
+static SYMBOLISING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The panic-entry fields inside `map`, if `map` is a captured panic.
+fn panic_fields(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+) -> Option<&mut serde_json::Map<String, serde_json::Value>> {
+    if map.get("source").and_then(serde_json::Value::as_str) != Some("panic") {
+        return None;
+    }
+    map.get_mut("fields")?.as_object_mut()
+}
+
+/// Replace the `backtrace_id` placeholder of every captured panic in `value` (an entry, or JSON
+/// holding entries) with the symbolised, trimmed backtrace; each is resolved once. Only a panic
+/// entry's own fields are touched: anything else with that key is the app's data. So pass the
+/// entries, never JSON holding a command's result, which could imitate one.
 pub fn resolve_backtraces(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
-            if let Some(id) = map
-                .get("backtrace_id")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|id| u32::try_from(id).ok())
-            {
-                let slot = pending_backtraces()
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&id)
-                    .cloned();
-                if let Some(slot) = slot {
-                    let text = slot.resolved.get_or_init(|| {
-                        truncate_string(
-                            trim_backtrace(&slot.backtrace.to_string()),
-                            MAX_BACKTRACE_BYTES,
-                        )
-                    });
-                    map.insert("backtrace".into(), text.clone().into());
+            if let Some(fields) = panic_fields(map) {
+                let id = fields
+                    .get("backtrace_id")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|id| u32::try_from(id).ok());
+                if let Some(id) = id {
+                    let slot = pending_backtraces()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&id)
+                        .cloned();
+                    if let Some(slot) = slot {
+                        let text = slot.resolved.get_or_init(|| {
+                            struct Running;
+                            impl Drop for Running {
+                                fn drop(&mut self) {
+                                    SYMBOLISING.fetch_sub(1, Ordering::Relaxed);
+                                }
+                            }
+                            SYMBOLISING.fetch_add(1, Ordering::Relaxed);
+                            let _running = Running;
+                            truncate_string(
+                                trim_backtrace(&slot.backtrace.to_string()),
+                                MAX_BACKTRACE_BYTES,
+                            )
+                        });
+                        fields.insert("backtrace".into(), text.clone().into());
+                    }
+                    fields.remove("backtrace_id");
                 }
-                map.remove("backtrace_id");
+                return;
             }
             for v in map.values_mut() {
                 resolve_backtraces(v);
@@ -1636,6 +1726,41 @@ pub fn resolve_backtraces(value: &mut serde_json::Value) {
         }
         serde_json::Value::Array(items) => items.iter_mut().for_each(resolve_backtraces),
         _ => {}
+    }
+}
+
+/// Whether [`resolve_backtraces`] has a backtrace left to symbolise in `value`.
+fn needs_symbolising(value: &mut serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => match panic_fields(map) {
+            Some(fields) => fields
+                .get("backtrace_id")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|id| u32::try_from(id).ok())
+                .is_some_and(|id| {
+                    pending_backtraces()
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .get(&id)
+                        .is_some_and(|slot| slot.resolved.get().is_none())
+                }),
+            None => map.values_mut().any(needs_symbolising),
+        },
+        serde_json::Value::Array(items) => items.iter_mut().any(needs_symbolising),
+        _ => false,
+    }
+}
+
+/// [`resolve_backtraces`] for an async tool handler: symbolising takes seconds on Windows, and the
+/// server has two async workers (two concurrent reads would stop `/health` and every tool), so
+/// the worker is handed off for it.
+pub fn resolve_backtraces_off_worker(value: &mut serde_json::Value) {
+    let multi_thread = tokio::runtime::Handle::try_current()
+        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
+    if multi_thread && needs_symbolising(value) {
+        tokio::task::block_in_place(|| resolve_backtraces(value));
+    } else {
+        resolve_backtraces(value);
     }
 }
 
@@ -1653,8 +1778,19 @@ fn capture_panic(buffer: &LogBuffer, info: &std::panic::PanicHookInfo<'_>) {
         .location()
         .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
     let mut fields = serde_json::Map::new();
-    let n = BACKTRACES_TAKEN.fetch_add(1, Ordering::Relaxed);
-    if n < MAX_PANIC_BACKTRACES {
+    // A capture waits on std's backtrace lock while a reader symbolises, and this thread may be
+    // the UI thread. The entry is what matters. (Std's default hook, which runs before this one,
+    // takes the same lock: that wait remains, and only symbolising out of process would end it.)
+    let n = if SYMBOLISING.load(Ordering::Relaxed) > 0 {
+        fields.insert(
+            "backtrace".into(),
+            "omitted — another panic's backtrace was being symbolised".into(),
+        );
+        None
+    } else {
+        Some(BACKTRACES_TAKEN.fetch_add(1, Ordering::Relaxed))
+    };
+    if let Some(n) = n.filter(|n| *n < MAX_PANIC_BACKTRACES) {
         let slot = Arc::new(PendingBacktrace {
             backtrace: std::backtrace::Backtrace::force_capture(),
             resolved: OnceLock::new(),
@@ -1666,7 +1802,7 @@ fn capture_panic(buffer: &LogBuffer, info: &std::panic::PanicHookInfo<'_>) {
             fields.insert("backtrace_id".into(), n.into());
             fields.insert("backtrace".into(), "(symbolised when read)".into());
         }
-    } else {
+    } else if n.is_some() {
         fields.insert(
             "backtrace".into(),
             format!("omitted — only the first {MAX_PANIC_BACKTRACES} panics carry a backtrace")
