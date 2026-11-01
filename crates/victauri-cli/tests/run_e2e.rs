@@ -204,10 +204,10 @@ fn a_closed_stderr_does_not_change_the_exit_code() {
 }
 
 /// A child that ignores SIGTERM held `victauri run` forever: the signal was forwarded once and
-/// nothing followed it. `signals` stop signals are sent 200 ms apart; the launcher must then end
+/// nothing followed it. `signals` stop signals are sent `apart` apart; the launcher must then end
 /// within `within`, having recorded the kill.
 #[cfg(not(windows))]
-fn stubborn_child_is_killed(signals: usize, within: Duration) {
+fn stubborn_child_is_killed(signals: usize, apart: Duration, within: Duration) {
     let t = Temp::new();
     let cap = t.path("c.jsonl");
     let pid_file = t.path("pid");
@@ -233,7 +233,7 @@ fn stubborn_child_is_killed(signals: usize, within: Duration) {
     let start = Instant::now();
     for i in 0..signals {
         if i > 0 {
-            std::thread::sleep(Duration::from_millis(200));
+            std::thread::sleep(apart);
         }
         Command::new("kill")
             .args(["-TERM", &launcher.0.id().to_string()])
@@ -260,13 +260,62 @@ fn stubborn_child_is_killed(signals: usize, within: Duration) {
 #[cfg(not(windows))]
 #[test]
 fn a_child_ignoring_sigterm_is_killed_in_the_end() {
-    stubborn_child_is_killed(1, Duration::from_secs(20));
+    stubborn_child_is_killed(1, Duration::ZERO, Duration::from_secs(20));
 }
 
 #[cfg(not(windows))]
 #[test]
 fn a_second_stop_signal_kills_at_once() {
-    stubborn_child_is_killed(2, Duration::from_secs(6));
+    stubborn_child_is_killed(2, Duration::from_millis(1_500), Duration::from_secs(6));
+}
+
+/// `timeout`, `npm` and `concurrently` signal the launcher AND the group it is in, so one stop
+/// reaches the launcher twice within moments, with the child already shutting down on its copy.
+/// The echo used to count as "kill it now", which cut every such graceful shutdown short.
+#[cfg(not(windows))]
+#[test]
+fn a_stop_signal_echoed_by_a_wrapper_leaves_a_graceful_shutdown_alone() {
+    let t = Temp::new();
+    let cap = t.path("c.jsonl");
+    let pid_file = t.path("pid");
+    let marker = t.path("graceful");
+    let argv = t.script(
+        "app",
+        "",
+        &format!(
+            "trap 'sleep 1; echo done > \"{}\"; exit 0' TERM\necho $$ > '{}'\nwhile :; do sleep 0.1; done\n",
+            marker.display(),
+            pid_file.display()
+        ),
+    );
+    let mut args = vec!["run", "--capture", cap.to_str().unwrap(), "--"];
+    args.extend(argv.iter().map(String::as_str));
+    let mut launcher = KillOnDrop(
+        t.victauri(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let app_pid = wait_for_pid(&pid_file);
+    let kill = |pid: u32| {
+        Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .status()
+            .unwrap();
+    };
+    kill(launcher.0.id());
+    kill(app_pid);
+    std::thread::sleep(Duration::from_millis(100));
+    kill(launcher.0.id());
+    let start = Instant::now();
+    while launcher.0.try_wait().unwrap().is_none() && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(marker.exists(), "the child was killed during its shutdown");
+    let capture = std::fs::read_to_string(&cap).unwrap();
+    assert!(!capture.contains("SIGKILL"), "{capture}");
 }
 
 /// An agent harness or `timeout` that stops the launcher left the app holding its port and its
