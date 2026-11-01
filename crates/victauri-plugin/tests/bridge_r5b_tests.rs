@@ -59,6 +59,19 @@ fn run_tests(def: &TestDef) -> Option<Vec<TestResult>> {
     }
     let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
     let json = serde_json::to_string(def).expect("serialize test def");
+    // `addRoute` is agent-only: every spelling the page code here uses goes through the key.
+    let agent_add = format!(
+        "window.__VICTAURI__._agent('{}').addRoute(",
+        victauri_plugin::js_bridge::agent_key()
+    );
+    let json = [
+        "window.__VICTAURI__.addRoute(",
+        "V.addRoute(",
+        "v.addRoute(",
+        "b.addRoute(",
+    ]
+    .iter()
+    .fold(json, |j, spelling| j.replace(spelling, &agent_add));
     tmp.write_all(json.as_bytes()).expect("write test def");
     tmp.flush().expect("flush temp file");
     let output = Command::new("node")
