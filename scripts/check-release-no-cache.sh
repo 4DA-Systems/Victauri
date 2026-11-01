@@ -13,13 +13,17 @@ vscode="${2:-$root/.github/workflows/release-vscode.yml}"
 deps="${3:-$root/.github/actions/linux-deps/action.yml}"
 fail=0
 
+# A `cache` key, quoted or not, up to its value.
+cache_key="[\"']?[A-Za-z-]*[Cc][Aa][Cc][Hh][Ee][\"']?[[:space:]]*:[[:space:]]*"
 for f in "$release" "$vscode"; do
   [ -s "$f" ] || { echo "ERROR: $f is missing or empty"; exit 1; }
-  # Also `cache:` keys, which is how setup-node and friends switch a cache on: quoted or not,
-  # anything but false. setup-rust-toolchain caches unless told otherwise, so naming it is enough.
-  hits="$(sed -E 's/(^|[[:space:]])#.*$//' "$f" |
-    grep -nEi 'rust-cache|setup-rust-toolchain|actions/cache|sccache|^[[:space:]]*(-[[:space:]]*)?[a-z-]*cache:[[:space:]]*[^[:space:]]' |
-    grep -vEi '^[0-9]+:[[:space:]]*(-[[:space:]]*)?[a-z-]*cache:[[:space:]]*["'"'"']?false["'"'"']?[[:space:]]*$' || true)"
+  # Also `cache` keys, which is how setup-node and friends switch a cache on: on their own line or
+  # in a `{ flow, mapping }`, anything but false. So each pair saying false is dropped first, and
+  # any key left is a finding. setup-rust-toolchain caches unless told otherwise, so naming it is
+  # enough.
+  hits="$(sed -E -e 's/(^|[[:space:]])#.*$//' \
+    -e "s/${cache_key}[\"']?[Ff][Aa][Ll][Ss][Ee][\"']?([[:space:]]*([,}]|\$))/\\1/g" "$f" |
+    grep -nEi "rust-cache|setup-rust-toolchain|actions/cache|sccache|(^[[:space:]]*(-[[:space:]]*)?|[{,][[:space:]]*)${cache_key}[^[:space:]]" || true)"
   if [ -n "$hits" ]; then
     echo "ERROR: $f restores a cache:"
     echo "$hits"
@@ -47,12 +51,13 @@ if ! grep -q 'uses:[[:space:]]*\./\.github/actions/linux-deps' "$release"; then
 fi
 
 # ...and the opt-out has to reach every cache step in the action. Judged per step, whichever way
-# round its keys are and whatever starts it, and a guard with an `||` guards nothing.
+# round its keys are and whatever starts it. A guard is `inputs.cache == 'true'`, alone or first
+# before an `&&`: negated, compared further or beside an `||` it guards nothing.
 bad="$(awk '
   function close_step() { if (open && !guarded) printf "%d\n", at; open = 0; guarded = 0 }
   /^[[:space:]]*-[[:space:]]/ { close_step() }
-  /^[[:space:]]*(-[[:space:]]+)?if:.*inputs\.cache[[:space:]]*==[[:space:]]*.true./ && !/\|\|/ { guarded = 1 }
-  /uses:[[:space:]]*actions\/cache/ { seen = 1; open = 1; at = NR }
+  /^[[:space:]]*(-[[:space:]]+)?if:[[:space:]]*"?(\$\{\{)?[[:space:]]*inputs\.cache[[:space:]]*==[[:space:]]*.true.[[:space:]]*(&&.*|\}\}"?[[:space:]]*|"?[[:space:]]*)$/ && !/\|\|/ { guarded = 1 }
+  /uses.?:[[:space:]]*.?actions\/cache/ { seen = 1; open = 1; at = NR }
   END { close_step(); if (!seen) print "no actions/cache step found" }
 ' "$deps")"
 if [ -n "$bad" ]; then
