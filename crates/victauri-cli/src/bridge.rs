@@ -228,10 +228,22 @@ pub async fn run(wait: bool, app: Option<String>) -> Result<()> {
     // availability poller from ever firing — H2 in the audit). The async loop stays responsive.
     let (line_tx, mut line_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     std::thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in stdin.lock().lines() {
-            let Ok(line) = line else { break };
-            if line_tx.send(line).is_err() {
+        let mut stdin = std::io::stdin().lock();
+        let mut bytes = Vec::new();
+        loop {
+            bytes.clear();
+            // Not `lines()`: it reports invalid UTF-8 as an error, indistinguishable there from a
+            // dead stdin, and one bad line silently shut the bridge down. Invalid UTF-8 is just
+            // another line that cannot be parsed.
+            match stdin.read_until(b'\n', &mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let Ok(line) = std::str::from_utf8(&bytes) else {
+                eprintln!("victauri-bridge: dropped a stdin line that is not valid UTF-8");
+                continue;
+            };
+            if line_tx.send(line.to_string()).is_err() {
                 break; // async side gone
             }
         }
@@ -304,6 +316,11 @@ fn handle_line(bridge: &Arc<Bridge>, one_way: &tokio::sync::mpsc::Sender<Value>,
     let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     match method {
+        // No `id`: a notification, which JSON-RPC never answers, and not a handshake to cache.
+        // Neither means anything to a backend either.
+        "initialize" | "ping" if !expects_reply(&msg) => {
+            eprintln!("victauri-bridge: dropped an id-less {method} (a notification)");
+        }
         // ── Answered locally, inline — never block on a backend ─────────────
         "initialize" => {
             // Cache for the lazy backend handshake, then reply immediately.
@@ -598,6 +615,24 @@ fn error_for_request(msg: &Value, code: i64, message: &str) -> String {
     .to_string()
 }
 
+/// Whether one of `payloads` is the response to the request `msg`: its id, and no `method` (a
+/// server-initiated request may reuse the same id, in its own id space).
+fn answers_request(payloads: &[String], msg: &Value) -> bool {
+    payloads.iter().any(|p| {
+        serde_json::from_str::<Value>(p)
+            .is_ok_and(|v| v.get("method").is_none() && v.get("id") == msg.get("id"))
+    })
+}
+
+/// The tool-call error when `VICTAURI_PORT` names a port nothing healthy answers on.
+fn pin_down_message(port: u16) -> String {
+    format!(
+        "Victauri backend not reachable: no running Victauri app answers on VICTAURI_PORT={port}. \
+         The pin is honoured, so no other running app was used. Start or restart that app, or \
+         unset VICTAURI_PORT."
+    )
+}
+
 /// Actionable message returned when a tool call can't reach a backend.
 fn unreachable_message() -> String {
     "Victauri backend not reachable: no running Tauri app with the Victauri plugin (debug \
@@ -813,6 +848,7 @@ async fn forward_with_retries(bridge: &Bridge, msg: &Value) -> ForwardResult {
         // #1 rule (never reuse a cached connection); the retry loop's restart patience still
         // applies once a live trusted backend is found, and the next call ~1s later succeeds.
         Selection::None => return ForwardResult::Unreachable(unreachable_message()),
+        Selection::PinDown(port) => return ForwardResult::Unreachable(pin_down_message(port)),
         Selection::Refused(why) => return ForwardResult::Unreachable(why),
     };
 
@@ -874,7 +910,18 @@ async fn forward_with_retries(bridge: &Bridge, msg: &Value) -> ForwardResult {
                     )]);
                 }
 
-                return ForwardResult::Payloads(out.payloads);
+                // The same for a stream that ended with payloads, none of which answers this id
+                // (only a progress notification, say). What it did carry is still relayed.
+                let mut payloads = out.payloads;
+                if !is_notification && !answers_request(&payloads, msg) {
+                    payloads.push(error_for_request(
+                        msg,
+                        -32603,
+                        "backend ended the response without answering this request; a tool call \
+                         may already have taken effect",
+                    ));
+                }
+                return ForwardResult::Payloads(payloads);
             }
             Err(e) => {
                 eprintln!(
@@ -1036,12 +1083,19 @@ async fn post_message(
 /// live, health-checked backends and select the one matching `app` (or the sole one). Does
 /// not sleep or retry — callers add patience if they want it.
 async fn scan_once(app: Option<&str>) -> Selection {
-    // Explicit env override wins (a developer pinning a specific port).
-    if let Ok(p) = std::env::var("VICTAURI_PORT")
-        && let Ok(port) = p.trim().parse::<u16>()
-        && health_ok(port).await
+    // Explicit env override wins (a developer pinning a specific port), also when it is down or
+    // too busy to answer: falling through to discovery would send the call, with its token, to
+    // whichever other app is running. 0 is no port, as in victauri-test's discovery.
+    if let Some(port) = std::env::var("VICTAURI_PORT")
+        .ok()
+        .and_then(|p| p.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
     {
-        return port_override(port, app).await;
+        return if health_ok(port).await {
+            port_override(port, app).await
+        } else {
+            Selection::PinDown(port)
+        };
     }
 
     // Liveness-FIRST, then health. On Unix `alive_pids` snapshots our user's live PIDs in ONE
@@ -1244,6 +1298,10 @@ async fn discover_and_select(wait: bool, app: Option<&str>) -> Result<ServerInfo
                 }
                 tokio::time::sleep(delay).await;
             }
+            Selection::PinDown(_) if attempt + 1 < max_attempts => {
+                tokio::time::sleep(delay).await;
+            }
+            Selection::PinDown(port) => bail!("{}", pin_down_message(port)),
             Selection::None => {
                 bail!(
                     "Could not connect to Victauri server.\n\
@@ -1275,6 +1333,8 @@ enum Selection {
     One(ServerInfo),
     None,
     Ambiguous(Vec<String>),
+    /// `VICTAURI_PORT` is set and nothing healthy answers there. Discovery is not consulted.
+    PinDown(u16),
     /// A backend was resolved but must not be used: its identity does not match the app
     /// selector (R5B-BR6 / R5B-PORTAPP1). The message says why.
     Refused(String),
@@ -1303,6 +1363,10 @@ pub async fn resolve_backend(
         Selection::Ambiguous(labels) => Err(format!(
             "several Victauri apps are running — pick one with --app <identifier>:\n  {}",
             labels.join("\n  ")
+        )),
+        // The `no running` prefix: `victauri logs` treats this as "that app is down".
+        Selection::PinDown(port) => Err(format!(
+            "no running Victauri app answers on VICTAURI_PORT={port}"
         )),
         Selection::Refused(why) => Err(why),
     }

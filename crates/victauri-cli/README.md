@@ -54,8 +54,11 @@ victauri setup all --dry-run        # show what would change
 Existing files are merged, never clobbered: the entry is inserted as text, so comments
 (JSONC), formatting and key order survive, and the result is re-parsed and verified before it
 is written. An existing `victauri` entry is left exactly as it is, so re-running changes
-nothing. A malformed file is left untouched and the entry to add by hand is printed. Nothing
-outside the project is written without `--user-config`. Opt out by deleting the entry, the
+nothing. A malformed file is left untouched and the entry to add by hand is printed. `setup`
+exits non-zero when a config could not be written, or when an existing entry does not run the
+bridge or is pinned to another app. Nothing outside the project is written without
+`--user-config`; user-level entries have no `--app`, because they serve every project (the bridge
+uses the single running app, or lists them if there are several). Opt out by deleting the entry, the
 `VICTAURI:BEGIN … VICTAURI:END` block, or `.claude/skills/victauri/`.
 
 With `--optional`, the dependencies are `optional = true` behind a `victauri` Cargo feature, the
@@ -186,6 +189,12 @@ gone:
 victauri run -- npm run tauri dev
 victauri logs --stdout --follow
 ```
+
+Stopping the launcher stops the app: on Windows however the launcher dies (a job object takes the
+process tree), on Unix for SIGTERM and SIGHUP (forwarded to the command after 2 seconds, and the
+exit is recorded; SIGKILL cannot be seen, so it orphans the app). What the app left running when
+it exited normally is left alone. At each run, captures of apps that are gone are deleted past 7
+days old or beyond the newest 20; a `--capture <file>` is never deleted.
 
 Structured capture needs one line in the app's logging setup — `.with(victauri_plugin::log_layer())`
 on a `tracing_subscriber` registry, or `victauri_plugin::log_logger()` for `log` / `tauri-plugin-log`.
