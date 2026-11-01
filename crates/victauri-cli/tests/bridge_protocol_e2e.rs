@@ -259,6 +259,19 @@ async fn stateless_mcp(
                 .body(axum::body::Body::from_stream(body))
                 .unwrap()
         }
+        Some("tools/call") if v.pointer("/params/name") == Some(&json!("notification_only")) => {
+            b.tool_calls.fetch_add(1, Ordering::SeqCst);
+            // A complete stream with a notification and no response for the request's id.
+            let body = format!(
+                "data: {}\n\n",
+                json!({"jsonrpc":"2.0","method":"notifications/progress",
+                       "params":{"progressToken":1,"progress":1}})
+            );
+            axum::response::Response::builder()
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(body))
+                .unwrap()
+        }
         Some("tools/call") if v.pointer("/params/name") == Some(&json!("slow")) => {
             b.tool_calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(SLOW_CALL).await;
@@ -597,4 +610,97 @@ async fn victauri_port_and_a_different_app_selector_are_refused_clearly() {
     let r = h.recv_reply();
     assert!(r.get("result").is_some(), "{r}");
     assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 1);
+}
+
+/// A pin is a pin: with `VICTAURI_PORT` naming an app that is down (or too busy for `/health`),
+/// the bridge fell through to discovery and sent a side-effecting call, with that app's token, to
+/// whatever else was running. `victauri call` already honoured the pin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_victauri_port_pin_that_is_down_never_reaches_another_app() {
+    let closed = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.local_addr().unwrap().port().to_string()
+    };
+    let backend = Backend::default();
+    let mut h = Harness::start(
+        backend_routes(&backend),
+        false,
+        &[("VICTAURI_PORT", closed.as_str())],
+    )
+    .await;
+    h.send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"invoke_command","arguments":{"command":"delete_everything"}}}));
+    let r = h.recv_reply();
+    assert_eq!(r["id"], 2, "{r}");
+    let text = r.to_string();
+    assert!(text.contains("VICTAURI_PORT"), "must name the pin: {text}");
+    assert!(text.contains(&closed), "must name the port: {text}");
+    assert_eq!(
+        backend.tool_calls.load(Ordering::SeqCst),
+        0,
+        "the other app received the call"
+    );
+}
+
+/// `VICTAURI_PORT=0` is no pin (victauri-test filters it out too), so discovery still applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn victauri_port_zero_is_not_a_pin() {
+    let backend = Backend::default();
+    let mut h = Harness::start(backend_routes(&backend), false, &[("VICTAURI_PORT", "0")]).await;
+    h.send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+        "params":{"name":"get_plugin_info","arguments":{}}}));
+    let r = h.recv_reply();
+    assert!(r.get("result").is_some(), "{r}");
+    assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 1);
+}
+
+/// One invalid UTF-8 line looked like EOF to `lines()`: the bridge exited silently with code 0
+/// and the client lost its server. Invalid JSON that IS valid UTF-8 was already survivable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_invalid_utf8_line_does_not_shut_the_bridge_down() {
+    let backend = Backend::default();
+    let mut h = Harness::start(backend_routes(&backend), false, &[]).await;
+    h.stdin.write_all(b"{\xff\xfe}\n").unwrap();
+    h.stdin.flush().unwrap();
+    h.send(&json!({"jsonrpc":"2.0","id":"after","method":"ping"}));
+    let r = h.recv_reply();
+    assert_eq!(r["id"], "after", "{r}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if h.stderr.lock().unwrap().iter().any(|l| l.contains("UTF-8")) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!(
+        "the bad line must be logged: {:?}",
+        h.stderr.lock().unwrap()
+    );
+}
+
+/// The "never leave an id hanging" check looked for an empty result, so a stream carrying only a
+/// notification relayed that and left the client waiting forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stream_with_no_response_still_answers_the_request() {
+    let backend = Backend::default();
+    let mut h = Harness::start(backend_routes(&backend), false, &[]).await;
+    h.send(&json!({"jsonrpc":"2.0","id":"sse","method":"tools/call",
+        "params":{"name":"notification_only","arguments":{}}}));
+    let r = h.recv_reply();
+    assert_eq!(r["id"], "sse", "{r}");
+    assert!(r.get("error").is_some(), "{r}");
+    assert_eq!(backend.tool_calls.load(Ordering::SeqCst), 1, "no replay");
+}
+
+/// A message with no `id` is a notification: JSON-RPC never answers one. `ping` and `initialize`
+/// were matched before that check, and an id-less `initialize` replaced the cached handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn id_less_ping_and_initialize_get_no_response() {
+    let backend = Backend::default();
+    let mut h = Harness::start(backend_routes(&backend), false, &[]).await;
+    h.send(&json!({"jsonrpc":"2.0","method":"ping"}));
+    h.send(&json!({"jsonrpc":"2.0","method":"initialize","params":{}}));
+    h.send(&json!({"jsonrpc":"2.0","id":"next","method":"ping"}));
+    let r = h.recv_reply();
+    assert_eq!(r["id"], "next", "a notification was answered: {r}");
 }
