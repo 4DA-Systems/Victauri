@@ -104,8 +104,7 @@ pub struct ListAppDirParams {
     pub path: Option<String>,
     /// Only return files whose name matches this glob (directories are always listed): `*` is
     /// any run of characters, `?` one character (e.g. "*.sqlite", "app-?.db"); anything else,
-    /// `[` and `]` included, matches itself. A pattern with
-    /// `[` or `]` is refused.
+    /// `[` and `]` included, matches itself.
     pub pattern: Option<String>,
     /// Maximum directory depth to recurse. Default: 1 (immediate children only).
     pub max_depth: Option<u32>,

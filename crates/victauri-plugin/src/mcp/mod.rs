@@ -5411,7 +5411,12 @@ impl VictauriMcpHandler {
             )
             .await
         {
-            Ok(result) => return CallToolResult::success(vec![ContentBlock::text(result)]),
+            Ok(result) => {
+                return match self.missing_bridge_error(&result, label).await {
+                    Some(refused) => refused,
+                    None => CallToolResult::success(vec![ContentBlock::text(result)]),
+                };
+            }
             Err(f) if f.kind == EvalFailureKind::NotSent && f.message.contains(BRIDGE_DOWN) => {
                 f.message
             }
