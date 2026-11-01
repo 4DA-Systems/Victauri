@@ -74,7 +74,7 @@ fn field_pairs(
 fn clamp_limit(limit: Option<usize>) -> usize {
     limit
         .unwrap_or(DEFAULT_BACKEND_LIMIT)
-        .clamp(1, MAX_BACKEND_LIMIT)
+        .min(MAX_BACKEND_LIMIT)
 }
 
 fn sources_json() -> serde_json::Value {
@@ -216,7 +216,7 @@ impl VictauriMcpHandler {
                 obj.insert("hint".into(), hint.into());
             }
         }
-        backend_logs::resolve_backtraces(&mut out);
+        backend_logs::resolve_backtraces_off_worker(&mut out);
         json_result(&out)
     }
 
@@ -282,7 +282,7 @@ impl VictauriMcpHandler {
                 );
             }
         }
-        backend_logs::resolve_backtraces(&mut out);
+        backend_logs::resolve_backtraces_off_worker(&mut out);
         json_result(&out)
     }
 
@@ -424,7 +424,7 @@ impl VictauriMcpHandler {
                 "entry": entry,
                 "elapsed_ms": elapsed_ms,
             });
-            backend_logs::resolve_backtraces(&mut out);
+            backend_logs::resolve_backtraces_off_worker(&mut out);
             return json_result(&out);
         }
         let mut out = serde_json::json!({
@@ -446,7 +446,7 @@ impl VictauriMcpHandler {
         if !sources.any_structured() {
             out["hint"] = no_structured_hint(sources).into();
         }
-        backend_logs::resolve_backtraces(&mut out);
+        backend_logs::resolve_backtraces_off_worker(&mut out);
         json_result(&out)
     }
 
@@ -515,7 +515,8 @@ impl VictauriMcpHandler {
             .unwrap_or_else(|_| serde_json::Value::String(raw_result.to_string()));
         let mut out = serde_json::json!({ "result": result });
         self.add_backend_logs(&mut out, from);
-        backend_logs::resolve_backtraces(&mut out);
+        // The entries only: `result` is the command's own data.
+        backend_logs::resolve_backtraces_off_worker(&mut out["backend_logs"]);
         json_result(&out)
     }
 
@@ -524,7 +525,7 @@ impl VictauriMcpHandler {
     pub(super) fn backend_logs_error(&self, message: &str, from: u64) -> CallToolResult {
         let mut out = serde_json::json!({ "error": message });
         self.add_backend_logs(&mut out, from);
-        backend_logs::resolve_backtraces(&mut out);
+        backend_logs::resolve_backtraces_off_worker(&mut out["backend_logs"]);
         let text = serde_json::to_string(&out).unwrap_or_else(|_| message.to_string());
         CallToolResult::error(vec![rmcp::model::ContentBlock::text(text)])
     }
@@ -667,6 +668,144 @@ mod tests {
 
         let found = call(&h, "logs", json!({"action": "backend", "filter": "SLOW"})).await;
         assert_eq!(found["entries"][0]["message"], "sync slow");
+    }
+
+    /// `limit: 0` returns no entries, as the schema says, and a cursor read does not move past
+    /// what it did not return.
+    #[tokio::test]
+    async fn logs_backend_limit_zero_returns_none_and_keeps_the_cursor() {
+        let (h, buf) = handler();
+        emit(&buf, || {
+            for i in 0..3 {
+                tracing::info!(target: "app", "line {i}");
+            }
+        });
+        let plain = call(&h, "logs", json!({"action": "backend", "limit": 0})).await;
+        assert_eq!(plain["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(plain["total_matched"], 3);
+        let cursor = call(
+            &h,
+            "logs",
+            json!({"action": "backend", "limit": 0, "since_seq": 1}),
+        )
+        .await;
+        assert_eq!(cursor["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(cursor["truncated"], true);
+        assert_eq!(cursor["next_seq"], 1);
+    }
+
+    /// `with_logs` must hand a command's result back untouched, whatever its keys are called.
+    #[test]
+    fn attached_logs_do_not_edit_the_command_result() {
+        let (h, _) = handler();
+        let r = h.attach_backend_logs(r#"{"backtrace_id":7,"user":"kept"}"#, 0);
+        let out: serde_json::Value = serde_json::from_str(&text(&r)).unwrap();
+        assert_eq!(out["result"], json!({"backtrace_id": 7, "user": "kept"}));
+    }
+
+    /// The first read of a panic symbolises its backtrace, for seconds on Windows, under std's
+    /// global backtrace lock. Two concurrent reads must not take both of the server's async
+    /// workers with them, and a panic elsewhere must not wait for it.
+    #[test]
+    fn symbolising_a_panic_blocks_neither_the_workers_nor_another_panic() {
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "VICTAURI_TEST_SYMBOLISE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp::backend_log_tools::tests::symbolising_a_panic_blocks_neither_the_workers_nor_another_panic",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}\n{}\n{}",
+                out.status,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+        // The app's hook does nothing; std's default hook has its own wait on the same lock
+        // (see `capture_panic`), which is not Victauri's to remove.
+        std::panic::set_hook(Box::new(|_| {}));
+        backend_logs::install_panic_hook();
+        let _ = std::panic::catch_unwind(|| panic!("first"));
+        let page = backend_logs::global().query(&backend_logs::LogQuery::default());
+        assert_eq!(page.entries.len(), 1);
+        let state = VictauriState::for_tests();
+        let buf = Arc::clone(&state.backend_logs);
+        buf.push(page.entries[0].clone());
+        let h = Arc::new(VictauriMcpHandler::new(
+            Arc::new(state),
+            Arc::new(NoWebview),
+        ));
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (gap, read_took, panic_took) = runtime.block_on(async {
+            let ticker = tokio::spawn(async {
+                let mut worst = Duration::ZERO;
+                let mut last = Instant::now();
+                loop {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    worst = worst.max(last.elapsed());
+                    last = Instant::now();
+                    if worst > Duration::from_secs(120) {
+                        return worst;
+                    }
+                    tokio::task::yield_now().await;
+                    if STOP.load(std::sync::atomic::Ordering::Relaxed) {
+                        return worst;
+                    }
+                }
+            });
+            static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            let started = Instant::now();
+            let reads: Vec<_> = (0..2)
+                .map(|_| {
+                    let h = Arc::clone(&h);
+                    tokio::spawn(
+                        async move { call(&h, "logs", json!({"action": "backend"})).await },
+                    )
+                })
+                .collect();
+            // Not a Tokio timer: with both workers pinned, nothing would drive it.
+            std::thread::sleep(Duration::from_millis(50));
+            let panic_took = tokio::task::spawn_blocking(|| {
+                let t = Instant::now();
+                let _ = std::panic::catch_unwind(|| panic!("second"));
+                t.elapsed()
+            })
+            .await
+            .unwrap();
+            for read in reads {
+                let out = read.await.unwrap();
+                let backtrace = out["entries"][0]["fields"]["backtrace"].as_str().unwrap();
+                assert!(backtrace != "(symbolised when read)", "{backtrace}");
+            }
+            let read_took = started.elapsed();
+            STOP.store(true, std::sync::atomic::Ordering::Relaxed);
+            (ticker.await.unwrap(), read_took, panic_took)
+        });
+        println!("read {read_took:?}, worst timer gap {gap:?}, other panic {panic_took:?}");
+        // The positive control: symbolising has to be slow for this to say anything.
+        assert!(read_took > Duration::from_millis(200), "{read_took:?}");
+        assert!(
+            gap < read_took / 2,
+            "workers pinned: {gap:?} of {read_took:?}"
+        );
+        assert!(
+            panic_took < read_took / 2,
+            "a panic waited for the resolve: {panic_took:?} of {read_took:?}"
+        );
     }
 
     #[tokio::test]
