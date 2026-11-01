@@ -62,7 +62,8 @@ it said. The changes most likely to reach you come first.
 Ref ids changed from `e12` to a page-tagged form such as `k3f9e12`. Treat them as opaque. A ref from
 before a reload or from another window now fails at once with
 `ref not found: … previous page load …`, where it could resolve to a different element. Code that
-parsed `e<digits>` must stop.
+parses refs out of a snapshot by looking for `[e` must stop: read the first `[…]` instead. A bare
+`e12` written into a test still means counter 12 on the current page.
 
 ### Tools
 

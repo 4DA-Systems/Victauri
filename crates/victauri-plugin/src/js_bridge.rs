@@ -256,8 +256,20 @@ const INIT_SCRIPT_BODY: &str = r#"
         return pick(0, 26) + pick(1, 36) + pick(2, 36) + pick(3, 36);
     })();
     var REF_PREFIX = PAGE_TAG + 'e';
+    // A bare `e12` is this page's counter 12. No plugin since the tag was added issues one, so it
+    // can only be a test or script written against the older form, never a stale ref held across
+    // a reload.
+    function isBareCounter(refId) {
+        if (typeof refId !== 'string' || refId.length < 2 || refId.charAt(0) !== 'e') return false;
+        for (var i = 1; i < refId.length; i++) {
+            var c = refId.charCodeAt(i);
+            if (c < 48 || c > 57) return false;
+        }
+        return true;
+    }
     function isForeignRef(refId) {
-        return typeof refId !== 'string' || REFLECT_APPLY(STR_INDEXOF, refId, [REF_PREFIX]) !== 0;
+        return typeof refId !== 'string'
+            || (REFLECT_APPLY(STR_INDEXOF, refId, [REF_PREFIX]) !== 0 && !isBareCounter(refId));
     }
     function foreignRefError(refId) {
         return isForeignRef(refId)
@@ -270,6 +282,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     }
 
     function resolveRef(refId) {
+        if (isBareCounter(refId)) refId = REF_PREFIX + refId.slice(1);
         var direct = REFLECT_APPLY(MAP_GET, refMap, [refId]);
         if (direct) {
             if (direct.isConnected) return direct;
@@ -2755,7 +2768,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             // DOM stats
             result.dom = {
                 elements: document.querySelectorAll('*').length,
-                max_depth: (function() { var d = 0; var walk = function(el, depth) { if (depth > d) d = depth; for (var i = 0; i < el.children.length && i < 5; i++) walk(el.children[i], depth + 1); }; walk(document.body, 0); return d; })(),
+                max_depth: (function() { var d = 0; var walk = function(el, depth) { if (depth > d) d = depth; for (var i = 0; i < el.children.length && i < 5; i++) walk(el.children[i], depth + 1); }; if (document.body) walk(document.body, 0); return d; })(),
                 event_listeners: listenerCount,
             };
 

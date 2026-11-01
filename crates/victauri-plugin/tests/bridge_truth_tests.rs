@@ -149,6 +149,19 @@ fn refs_carry_a_per_page_tag() {
     );
 }
 
+/// A reload leaves the page with no body for a moment, and agents read metrics during it.
+#[test]
+fn page_reads_survive_a_page_with_no_body() {
+    check(&[(
+        "no_body",
+        "<p>x</p>",
+        "document.body.remove(); \
+         var m = B.getPerformanceMetrics(); T(m && !m.error, J(m)); \
+         var s = B.snapshot(); T(s, 'snapshot'); \
+         var a = B.auditAccessibility(); T(a && a.summary, J(a));",
+    )]);
+}
+
 #[test]
 fn a_ref_from_another_page_load_fails_at_once_and_says_so() {
     check(&[
@@ -163,10 +176,15 @@ fn a_ref_from_another_page_load_fails_at_once_and_says_so() {
              T(Date.now() - t0 < 1000, 'must not wait out the timeout');",
         ),
         (
-            "legacy_bare_counter",
-            "<button>x</button>",
-            "B.snapshot(); var r = await B.click('e1', 100); \
-             T(r.ok === false && r.error.indexOf('previous page load') !== -1, J(r));",
+            "bare_counter_means_this_page",
+            "<button id=b>x</button>",
+            "var n = 0; $('#b').onclick = function() { n++; }; \
+             var tagged = refOf('#b'); var bare = tagged.slice(4); T(/^e\\d+$/.test(bare), bare); \
+             var r = await B.click(bare, 300); T(r.ok, J(r)); T(n === 1, 'n=' + n); \
+             var s = B.getStyles(bare); T(!s.error, J(s)); \
+             var gone = await B.click('e99999', 100); \
+             T(gone.ok === false && gone.error.indexOf('ref not found: e99999') === 0, J(gone)); \
+             T(gone.error.indexOf('previous page load') === -1, J(gone));",
         ),
         (
             "read_tools",

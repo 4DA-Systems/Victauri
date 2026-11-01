@@ -373,7 +373,7 @@ impl VictauriClient {
         } else {
             format!(
                 "0 critical; {serious} serious, {moderate} moderate, {minor} minor \
-                 (run assert_accessible to fail on these)"
+                 (violations and warnings; assert_accessible fails on any violation)"
             )
         })
     }
