@@ -154,6 +154,27 @@ test("after a disconnect nothing is sent, and the token is gone", async () => {
   }
 });
 
+test("a disconnect during the connect's probe is not overwritten", async () => {
+  const app = await fakeServer("com.real.app", { infoDelayMs: 300 });
+  const client = new VictauriClient();
+  try {
+    stubConfig.pollInterval = 60_000;
+    const connecting = client.connect(app.port, "tok", { identifier: "com.real.app" });
+    while (!app.seen.some((s) => s.path === "/info")) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    client.disconnect();
+    await connecting;
+    assert.equal(client.connectionState, "disconnected");
+    const before = app.seen.length;
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(app.seen.length, before, "no refresh and no poll started");
+  } finally {
+    client.dispose();
+    await app.close();
+  }
+});
+
 test("a connect after a disconnect works again", async () => {
   const app = await fakeServer("com.real.app");
   const client = new VictauriClient();

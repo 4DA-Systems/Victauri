@@ -42,13 +42,7 @@ impl Config {
     fn from_env() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let (arg_port, arg_app) = parse_args(&args);
-        let explicit_port = std::env::var("VICTAURI_PORT")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .or(arg_port)
-            // 0 is no port (victauri-test filters it too). As an "explicit" port it skipped
-            // discovery, polled nothing, and so fired recovery against a healthy app.
-            .filter(|p: &u16| *p != 0);
+        let explicit_port = explicit_port(std::env::var("VICTAURI_PORT").ok().as_deref(), arg_port);
         Self {
             port: explicit_port.unwrap_or(DEFAULT_PORT),
             port_explicit: explicit_port.is_some(),
@@ -65,6 +59,15 @@ impl Config {
             on_failure_cmd: std::env::var("VICTAURI_ON_FAILURE").ok(),
         }
     }
+}
+
+/// The explicitly configured port: `VICTAURI_PORT`, else the positional argument.
+fn explicit_port(env: Option<&str>, arg: Option<u16>) -> Option<u16> {
+    // 0 is no port (victauri-test filters it too). As an "explicit" port it skipped discovery,
+    // polled nothing, and so fired recovery against a healthy app.
+    env.and_then(|s| s.trim().parse().ok())
+        .filter(|p: &u16| *p != 0)
+        .or(arg.filter(|p| *p != 0))
 }
 
 /// Parse CLI args: an optional positional `PORT` and `--app <id>` / `--app=<id>`.
@@ -846,6 +849,17 @@ mod tests {
             std::env::remove_var("VICTAURI_ON_FAILURE");
             std::env::remove_var("VICTAURI_APP");
         }
+    }
+
+    /// `VICTAURI_PORT=0` says "no port from the environment", which must not discard the one
+    /// given on the command line.
+    #[test]
+    fn a_zero_port_in_the_environment_keeps_the_argument() {
+        assert_eq!(explicit_port(Some("0"), Some(7380)), Some(7380));
+        assert_eq!(explicit_port(Some("0"), None), None);
+        assert_eq!(explicit_port(None, Some(0)), None);
+        assert_eq!(explicit_port(Some("9999"), Some(7380)), Some(9999));
+        assert_eq!(explicit_port(Some("junk"), Some(7380)), Some(7380));
     }
 
     #[test]

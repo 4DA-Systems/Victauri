@@ -43,9 +43,16 @@ const EXIT_TAIL_LINES: usize = 12;
 /// enough for a crash's output to be read; `--capture <file>` paths are never touched.
 const CAPTURE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 const CAPTURE_KEEP: usize = 20;
-/// On Unix: how long a stop signal waits before being forwarded (see [`forward_stop`]).
+/// On Unix: how long a stop signal waits before being forwarded (see [`on_stop_signal`]).
 #[cfg(unix)]
 const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// [`STOP_GRACE`] with a terminal attached, where the signal is probably Ctrl+C: the child has it
+/// too, and may be cleaning up with a handler for SIGINT and none for SIGTERM.
+#[cfg(unix)]
+const STOP_GRACE_TERMINAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// On Unix: how long a child gets to act on SIGTERM before SIGKILL.
+#[cfg(unix)]
+const STOP_KILL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Directory holding console captures: `console` under the per-user discovery root, created
 /// owner-only and trust-checked (see [`crate::bridge::private_subdir`]). Captures hold whatever
@@ -417,17 +424,49 @@ fn pass_through<W: Write>(dst: &mut W, mut bytes: &[u8]) {
 
 /// The stop-signal handler. `ctrlc` does not say which signal arrived, and Ctrl+C already reached
 /// the child through the terminal's process group: forwarding at once would hit a child that is
-/// shutting down gracefully on SIGINT with a SIGTERM too. So it waits a moment, and forwards
-/// only to a child still running. Only the direct child: its own group would need `setpgid`,
+/// shutting down gracefully on SIGINT with a SIGTERM too. So it waits a moment, forwards only to a
+/// child still running, and ends with SIGKILL, since `victauri run` waits for the child and a child
+/// that ignores SIGTERM would hold it forever. A second signal asks for that at once. It runs on
+/// its own thread because `ctrlc` delivers signals one handler call at a time, so a handler that
+/// slept could not hear the second. Only the direct child: its own group would need `setpgid`,
 /// which takes it out of the terminal's foreground group and so breaks Ctrl+C.
 #[cfg(unix)]
-fn forward_stop(child_pid: &std::sync::atomic::AtomicU32) {
-    std::thread::sleep(STOP_GRACE);
+fn on_stop_signal(
+    child_pid: &Arc<std::sync::atomic::AtomicU32>,
+    signals: &std::sync::atomic::AtomicU32,
+) {
+    if signals.fetch_add(1, std::sync::atomic::Ordering::AcqRel) > 0 {
+        signal_child(child_pid, "KILL");
+        return;
+    }
+    let child_pid = Arc::clone(child_pid);
+    std::thread::spawn(move || {
+        use std::io::IsTerminal;
+        std::thread::sleep(if std::io::stdin().is_terminal() {
+            STOP_GRACE_TERMINAL
+        } else {
+            STOP_GRACE
+        });
+        signal_child(&child_pid, "TERM");
+        std::thread::sleep(STOP_KILL_AFTER);
+        signal_child(&child_pid, "KILL");
+    });
+}
+
+/// Signal the child, if it is still running.
+#[cfg(unix)]
+fn signal_child(child_pid: &std::sync::atomic::AtomicU32, signal: &str) {
     let pid = child_pid.load(std::sync::atomic::Ordering::Acquire);
     if pid != 0 {
         // The shell builtin: `kill` is not a binary everywhere (NixOS, Guix, minimal containers).
         let _ = Command::new("sh")
-            .args(["-c", "kill -TERM \"$1\"", "victauri-run", &pid.to_string()])
+            .args([
+                "-c",
+                "kill -s \"$1\" \"$2\"",
+                "victauri-run",
+                signal,
+                &pid.to_string(),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -571,7 +610,8 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     #[cfg(unix)]
     let _ = {
         let child_pid = Arc::clone(&child_pid);
-        ctrlc::set_handler(move || forward_stop(&child_pid))
+        let signals = std::sync::atomic::AtomicU32::new(0);
+        ctrlc::set_handler(move || on_stop_signal(&child_pid, &signals))
     };
     #[cfg(not(unix))]
     let _ = ctrlc::set_handler(|| {});

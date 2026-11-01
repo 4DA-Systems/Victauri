@@ -75,6 +75,8 @@ export const stubConfig: Record<string, unknown> = {};
 export const stubWorkspaceConfig: Record<string, unknown> = {};
 /** `tauri.conf.json` files `workspace.findFiles` reports, as their file paths. */
 export const stubWorkspaceFiles: string[] = [];
+/** How many times the extension has searched the workspace. */
+export const stubCounters = { findFiles: 0 };
 
 export const workspace = {
   getConfiguration: () => ({
@@ -89,7 +91,10 @@ export const workspace = {
       workspaceFolderValue: undefined,
     }),
   }),
-  findFiles: async () => stubWorkspaceFiles.map((fsPath) => ({ fsPath })),
+  findFiles: async () => {
+    stubCounters.findFiles++;
+    return stubWorkspaceFiles.map((fsPath) => ({ fsPath }));
+  },
   openTextDocument: async (doc: { content: string }) => {
     openedDocuments.push(doc.content);
     return doc;

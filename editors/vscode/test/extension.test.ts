@@ -18,6 +18,7 @@ import {
   statusBar,
   stubAnswers,
   stubConfig,
+  stubCounters,
   stubWorkspaceConfig,
   stubWorkspaceFiles,
 } from "./vscode-stub";
@@ -341,6 +342,55 @@ test("only another app running: a manual connect warns, auto-connect stays away"
   const text = toasts().join("\n");
   assert.match(text, /com\.mine\.app/);
   assert.match(text, /com\.other\.app/);
+});
+
+test("another project's app is reported once, and the workspace is not searched every retry", async () => {
+  const other = await serve("com.other.app");
+  advertise(other.port, "tok-o", "com.other.app");
+  workspaceConf({ identifier: "com.mine.app" });
+  stubConfig.autoConnect = true;
+  stubCounters.findFiles = 0;
+  start();
+  await new Promise((r) => setTimeout(r, 11_000)); // the first try and two retries
+  const said = toasts().filter((t) => t.includes("com.other.app"));
+  assert.equal(said.length, 1, toasts().join(" | "));
+  assert.match(said[0], /com\.mine\.app/);
+  assert.equal(stubCounters.findFiles, 1, "the search is not repeated on every retry");
+  assert.deepEqual(other.seen, [], "still stays away from it");
+  await run("victauri.connect");
+  assert.equal(stubCounters.findFiles, 2, "a deliberate Connect looks again");
+});
+
+test("one failed connect does not poison every later one", async () => {
+  const app = await serve();
+  advertise(app.port, "tok", "com.example.victauri-demo");
+  stubConfig.port = app.port;
+  stubConfig.authToken = "tok";
+  stubWorkspaceConfig.port = app.port;
+  stubAnswers.warning = "Send the token";
+  start();
+  const update = context.workspaceState.update;
+  context.workspaceState.update = async () => {
+    throw new Error("storage is gone");
+  };
+  await assert.rejects(Promise.resolve(run("victauri.connect")), /storage is gone/);
+  context.workspaceState.update = update;
+  await run("victauri.connect");
+  assert.equal(statusBar.command, "victauri.disconnect", "the second connect ran");
+});
+
+test("Disconnect during a connect wins, and no one is told it connected", async () => {
+  const s = await fakeServer("com.example.victauri-demo", { infoDelayMs: 300 });
+  servers.push(s);
+  advertise(s.port, "tok", "com.example.victauri-demo");
+  start();
+  const connecting = run("victauri.connect");
+  await until("the probe", () => s.seen.some((x) => x.path === "/info"));
+  await run("victauri.disconnect");
+  await connecting;
+  await new Promise((r) => setTimeout(r, 100));
+  assert.equal(statusBar.command, "victauri.connect", "it stays disconnected");
+  assert.ok(!toasts().some((t) => /Connected/.test(t)), toasts().join(" | "));
 });
 
 test("auto-connect finds an app started after VS Code, with no error toast", async () => {

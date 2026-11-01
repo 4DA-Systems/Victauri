@@ -558,11 +558,17 @@ const MAX_SQL_NESTING: usize = 256;
 /// a call no deadline can interrupt: measured 209 s for 30,974 CTEs (the 1 MB size cap).
 #[cfg(feature = "sqlite")]
 const MAX_SQL_SELECTS: usize = 2_000;
-/// Most nesting a database's views may add up to. Views stack when one selects from another, so
-/// the whole schema is charged: each view costs 1 plus its own nesting or SELECT count, whichever
-/// is larger. Preparing a chain is quadratic too: measured 195 s for 9,900 views, so about 8 s here.
+/// Most nesting one chain of views may add up to, a chain being views that select from each other
+/// (see [`deepest_view_chain`]). Each view on it costs 1 plus its own nesting or SELECT count,
+/// whichever is larger. Preparing a chain is quadratic too: measured 195 s for 9,900 views, so about
+/// 8 s here. Views that repeat one another (`FROM v a, v b`, doubling per level) are not charged
+/// for the repeats: `SQLite` refuses those itself, when one is used, within seconds (measured: at
+/// most 9 s, "too many FROM clause terms" or "too many references").
 #[cfg(feature = "sqlite")]
 const MAX_SCHEMA_VIEW_NESTING: usize = 2_000;
+/// Most view text [`check_schema_nesting`] holds to work out the chains.
+#[cfg(feature = "sqlite")]
+const MAX_SCHEMA_VIEW_TEXT_BYTES: usize = 16 * 1024 * 1024;
 /// The longest schema entry the nesting check itself will parse (see [`check_schema_nesting`]).
 #[cfg(feature = "sqlite")]
 const SCHEMA_CHECK_PARSE_BYTES: i32 = 4_096;
@@ -605,7 +611,139 @@ fn sql_nesting(sql: &str) -> (usize, usize) {
             depth = depth.saturating_sub(1);
         }
     }
-    (deepest, masked.matches("select").count())
+    let selects = masked
+        .split(|c: char| !is_sqlite_id_char(c))
+        .filter(|word| *word == "select")
+        .count();
+    (deepest, selects)
+}
+
+/// A view's definition split into words: bare words, the content of quoted spans (`SQLite` takes a
+/// string where a name is expected, so all four quote styles can name a view), and `.`. Lowercase,
+/// as names compare without regard to ASCII case.
+#[cfg(feature = "sqlite")]
+fn sql_words(sql: &str) -> Vec<String> {
+    let cleaned = scan_sql(sql).cleaned;
+    let mut words = Vec::new();
+    let mut chars = cleaned.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' | '"' | '`' | '[' => {
+                let close = if c == '[' { ']' } else { c };
+                let mut word = String::new();
+                while let Some(n) = chars.next() {
+                    if n != close {
+                        word.push(n);
+                    } else if c != '[' && chars.peek() == Some(&close) {
+                        chars.next();
+                        word.push(n);
+                    } else {
+                        break;
+                    }
+                }
+                words.push(word.to_ascii_lowercase());
+            }
+            '.' => words.push(".".to_string()),
+            c if is_sqlite_id_char(c) => {
+                let mut word = String::from(c);
+                while let Some(n) = chars.next_if(|n| is_sqlite_id_char(*n)) {
+                    word.push(n);
+                }
+                words.push(word.to_ascii_lowercase());
+            }
+            _ => {}
+        }
+    }
+    words
+}
+
+/// The name a schema entry defines a view under, and how many of `words` that takes, if it is a
+/// view. `SQLite` builds its schema by parsing this text, and at most compares the `type` and
+/// `name` columns with it ignoring case (not at all under `writable_schema`), so a working view
+/// can say `type='VIEW'` or a BLOB.
+#[cfg(feature = "sqlite")]
+fn view_definition(words: &[String]) -> Option<(&str, usize)> {
+    let word = |i: usize| words.get(i).map(String::as_str);
+    let mut at = 1;
+    if word(0)? != "create" {
+        return None;
+    }
+    if matches!(word(at), Some("temp" | "temporary")) {
+        at += 1;
+    }
+    if word(at)? != "view" {
+        return None;
+    }
+    at += 1;
+    if (word(at), word(at + 1), word(at + 2)) == (Some("if"), Some("not"), Some("exists")) {
+        at += 3;
+    }
+    if word(at + 1) == Some(".") {
+        at += 2;
+    }
+    Some((word(at)?, at + 1))
+}
+
+/// The most nesting any chain of views adds up to: the largest sum of `cost` along views that
+/// select from each other. Anything in a definition spelled like a view's name counts as selecting
+/// from it, which can only overcharge (a column of that name). A cycle is not followed:
+/// `SQLite` refuses a circular view when it expands it.
+#[cfg(feature = "sqlite")]
+fn deepest_view_chain(views: &[(String, usize)]) -> usize {
+    const UNSEEN: u8 = 0;
+    const OPEN: u8 = 1;
+    const DONE: u8 = 2;
+    let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut own: Vec<usize> = Vec::new();
+    let mut parsed = Vec::with_capacity(views.len());
+    for (text, cost) in views {
+        let words = sql_words(text);
+        let Some((name, body)) = view_definition(&words) else {
+            continue;
+        };
+        // A repeated name is one node charged for all of its definitions.
+        let node = *index.entry(name.to_string()).or_insert_with(|| {
+            own.push(0);
+            own.len() - 1
+        });
+        own[node] = own[node].max(*cost);
+        parsed.push((node, words, body));
+    }
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); own.len()];
+    for (node, words, body) in &parsed {
+        let found = words[*body..].iter().filter_map(|w| index.get(w).copied());
+        deps[*node].extend(found);
+    }
+    drop(parsed);
+    // Depth first with an explicit stack: a chain can be as long as the file allows.
+    let mut state = vec![UNSEEN; own.len()];
+    let mut chain = vec![0usize; own.len()];
+    let mut deepest = 0;
+    for root in 0..own.len() {
+        if state[root] != UNSEEN {
+            continue;
+        }
+        state[root] = OPEN;
+        let mut stack = vec![(root, 0usize)];
+        while let Some((node, next)) = stack.last_mut() {
+            let node = *node;
+            if let Some(&dep) = deps[node].get(*next) {
+                *next += 1;
+                if state[dep] == UNSEEN {
+                    state[dep] = OPEN;
+                    stack.push((dep, 0));
+                }
+            } else {
+                // A dependency still open is a cycle, and its `chain` is still 0.
+                let below = deps[node].iter().map(|d| chain[*d]).max().unwrap_or(0);
+                chain[node] = own[node].saturating_add(below);
+                deepest = deepest.max(chain[node]);
+                state[node] = DONE;
+                stack.pop();
+            }
+        }
+    }
+    deepest
 }
 
 /// Refuse a database whose schema is nested deeply enough to threaten the stack. `SQLite` parses
@@ -656,11 +794,12 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
         .or_else(|_| conn.prepare(READ_SCHEMA))
         .map_err(load_error)?;
     let mut rows = stmt.query([]).map_err(load_error)?;
-    let mut view_nesting = 0usize;
+    let mut views: Vec<(String, usize)> = Vec::new();
+    let mut view_bytes = 0usize;
     loop {
         let row = match rows.next() {
             Ok(Some(row)) => row,
-            Ok(None) => return Ok(()),
+            Ok(None) => break,
             Err(e) if e.sqlite_error_code() == Some(rusqlite::ffi::ErrorCode::TooBig) => {
                 return Err(format!(
                     "refusing to open this database: a schema entry is too long (over \
@@ -697,17 +836,27 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
                 name()
             ));
         }
-        if matches!(row.get_ref(0), Ok(rusqlite::types::ValueRef::Text(b"view"))) {
-            view_nesting = view_nesting.saturating_add(nesting.max(selects) + 1);
-            if view_nesting > MAX_SCHEMA_VIEW_NESTING {
+        if view_definition(&sql_words(&text)).is_some() {
+            view_bytes = view_bytes.saturating_add(text.len());
+            if view_bytes > MAX_SCHEMA_VIEW_TEXT_BYTES {
                 return Err(format!(
-                    "refusing to open this database: its views nest up to {view_nesting} levels \
-                     when chained (the limit is {MAX_SCHEMA_VIEW_NESTING}); expanding them could \
-                     overflow the stack and end the app"
+                    "refusing to open this database: its views' definitions exceed \
+                     {MAX_SCHEMA_VIEW_TEXT_BYTES} bytes, more than the check of how they chain \
+                     will hold"
                 ));
             }
+            views.push((text.into_owned(), nesting.max(selects) + 1));
         }
     }
+    let view_nesting = deepest_view_chain(&views);
+    if view_nesting > MAX_SCHEMA_VIEW_NESTING {
+        return Err(format!(
+            "refusing to open this database: its views nest up to {view_nesting} levels when \
+             chained (the limit is {MAX_SCHEMA_VIEW_NESTING}); expanding them could overflow the \
+             stack and end the app"
+        ));
+    }
+    Ok(())
 }
 
 /// Open a database file Victauri did not create as read-only UNTRUSTED input: with
@@ -776,6 +925,33 @@ struct SqlScan {
     masked: String,
 }
 
+/// `SQLite`'s `IdChar`: every byte >= 0x80 is one, whatever Unicode says of the character.
+#[cfg(feature = "sqlite")]
+fn is_sqlite_id_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '$' || !c.is_ascii()
+}
+
+/// `sqlite3Isspace`: ASCII only, and unlike `char::is_ascii_whitespace` it includes `\x0b`.
+#[cfg(feature = "sqlite")]
+fn is_sqlite_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r')
+}
+
+/// Whether what follows a `$ : @ #` gives it a name: `SQLite` needs one identifier character,
+/// after any number of `::`.
+#[cfg(feature = "sqlite")]
+fn parameter_name_follows(mut rest: std::iter::Peekable<std::str::Chars<'_>>) -> bool {
+    while let Some(c) = rest.next() {
+        if is_sqlite_id_char(c) {
+            return true;
+        }
+        if c != ':' || rest.next() != Some(':') {
+            return false;
+        }
+    }
+    false
+}
+
 #[cfg(feature = "sqlite")]
 fn scan_sql(sql: &str) -> SqlScan {
     let mut cleaned = String::with_capacity(sql.len());
@@ -787,25 +963,27 @@ fn scan_sql(sql: &str) -> SqlScan {
             // Tcl-style `$a(…)` suffix and reads it as part of the SAME token up to `)` or
             // whitespace, so a quote inside it does not open a string. Treating that quote as
             // one let `SELECT $a(') ; DELETE …'` pass as a single statement (round-4 review).
-            '$' | ':' | '@' | '#'
-                if chars
-                    .peek()
-                    .is_some_and(|n| n.is_alphanumeric() || *n == '_' || *n == '$') =>
-            {
+            '$' | ':' | '@' | '#' if parameter_name_follows(chars.clone()) => {
                 cleaned.push(c);
                 masked.push(c);
                 while let Some(&n) = chars.peek() {
-                    if n.is_alphanumeric() || n == '_' || n == '$' || (n == ':' && c == '$') {
+                    let continues =
+                        is_sqlite_id_char(n) || (n == ':' && chars.clone().nth(1) == Some(':'));
+                    if !continues {
+                        break;
+                    }
+                    chars.next();
+                    cleaned.push(n);
+                    masked.push(n);
+                    if n == ':' {
                         chars.next();
                         cleaned.push(n);
                         masked.push(n);
-                    } else {
-                        break;
                     }
                 }
                 if chars.peek() == Some(&'(') {
                     while let Some(&n) = chars.peek() {
-                        if n.is_whitespace() {
+                        if is_sqlite_space(n) {
                             break;
                         }
                         chars.next();
@@ -2344,6 +2522,155 @@ mod tests {
         assert_eq!(health["integrity_check"], "ok");
     }
 
+    /// Rewrite the `type` column of every `CREATE VIEW` row.
+    fn set_view_rows_type(path: &Path, type_sql: &str) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA writable_schema=ON; UPDATE sqlite_master SET type = {type_sql} \
+             WHERE sql LIKE 'CREATE VIEW%';"
+        ))
+        .unwrap();
+    }
+
+    /// `type='VIEW'` or a BLOB still makes a working view (`SQLite` compares the column ignoring
+    /// case, as text), so the view budget cannot key on the exact text `view`.
+    #[test]
+    fn a_views_budget_does_not_depend_on_its_type_column() {
+        for type_sql in ["'VIEW'", "'View'", "CAST('view' AS BLOB)"] {
+            let (_small, path) = db_with_schema_rows(&view_chain(3));
+            set_view_rows_type(&path, type_sql);
+            let r = query(&path, "SELECT * FROM v2", &[], None).unwrap();
+            assert_eq!(r["row_count"], 3, "{type_sql}: it must be a working view");
+
+            let (_big, path) = db_with_schema_rows(&view_chain(30_000));
+            set_view_rows_type(&path, type_sql);
+            let err = check_schema_nesting(&path).expect_err(type_sql);
+            assert!(err.contains("nest"), "{type_sql}: {err}");
+        }
+    }
+
+    /// What is on one chain is what expanding a view has to walk. A big schema of views that do
+    /// not build on each other costs nothing of the kind.
+    #[test]
+    fn many_unrelated_views_open() {
+        let rows: Vec<(String, String)> = (0..3_000)
+            .map(|i| {
+                (
+                    format!("u{i}"),
+                    format!("CREATE VIEW u{i} AS SELECT (id + 1) AS n FROM users"),
+                )
+            })
+            .collect();
+        let (_f, path) = db_with_schema_rows(&rows);
+        let r = query(&path, "SELECT * FROM u2999", &[], None).unwrap();
+        assert_eq!(r["row_count"], 3);
+    }
+
+    /// However a link is spelled, it is a link: the budget must not be blind to it.
+    #[test]
+    fn view_chains_are_seen_through_every_spelling() {
+        type Link = fn(&str) -> String;
+        let spellings: [(&str, Link); 6] = [
+            ("bare", |v| v.to_string()),
+            ("upper", |v| v.to_uppercase()),
+            ("double-quoted", |v| format!("\"{v}\"")),
+            ("bracketed", |v| format!("[{v}]")),
+            ("backticked", |v| format!("`{v}`")),
+            ("schema-qualified", |v| format!("main.{v}")),
+        ];
+        for (what, link) in spellings {
+            let rows: Vec<(String, String)> = (0..2_500)
+                .map(|i| {
+                    let from = if i == 0 {
+                        "users".to_string()
+                    } else {
+                        link(&format!("v{}", i - 1))
+                    };
+                    let sql = format!("CREATE VIEW v{i} AS SELECT id FROM {from}");
+                    (format!("v{i}"), sql)
+                })
+                .collect();
+            let (_f, path) = db_with_schema_rows(&rows);
+            let err = check_schema_nesting(&path).expect_err(what);
+            assert!(err.contains("nest"), "{what}: {err}");
+        }
+    }
+
+    /// The text is what gets parsed, so it names the view, and a definition may be spelled with a
+    /// comment or `IF NOT EXISTS`.
+    #[test]
+    fn a_views_name_comes_from_its_definition() {
+        let rows: Vec<(String, String)> = (0..2_500)
+            .map(|i| {
+                let from = if i == 0 {
+                    "users".to_string()
+                } else {
+                    format!("v{}", i - 1)
+                };
+                let sql =
+                    format!("CREATE /* c */ VIEW IF NOT EXISTS main.v{i} AS SELECT id FROM {from}");
+                (format!("decoy{i}"), sql)
+            })
+            .collect();
+        let (_f, path) = db_with_schema_rows(&rows);
+        let err = check_schema_nesting(&path).unwrap_err();
+        assert!(err.contains("nest"), "{err}");
+    }
+
+    /// `SQLite` refuses a circular view when it is used. Charging one must terminate.
+    #[test]
+    fn circular_views_do_not_hang_the_check() {
+        let rows = vec![
+            (
+                "a".to_string(),
+                "CREATE VIEW a AS SELECT * FROM b".to_string(),
+            ),
+            (
+                "b".to_string(),
+                "CREATE VIEW b AS SELECT * FROM a".to_string(),
+            ),
+            (
+                "c".to_string(),
+                "CREATE VIEW c AS SELECT * FROM c".to_string(),
+            ),
+        ];
+        let (_f, path) = db_with_schema_rows(&rows);
+        check_schema_nesting(&path).unwrap();
+        let err = query(&path, "SELECT * FROM a", &[], None).unwrap_err();
+        assert!(err.contains("circular"), "{err}");
+    }
+
+    /// The text of every view has to be held to work out the chains, so it is bounded.
+    #[test]
+    fn the_views_total_text_is_bounded() {
+        let filler = "x".repeat(MAX_QUERY_SQL_BYTES - 200);
+        let rows: Vec<(String, String)> = (0..MAX_SCHEMA_VIEW_TEXT_BYTES / filler.len() + 2)
+            .map(|i| {
+                let sql = format!("CREATE VIEW big{i} AS SELECT '{filler}' AS p");
+                (format!("big{i}"), sql)
+            })
+            .collect();
+        let (_f, path) = db_with_schema_rows(&rows);
+        // On a busy machine, reading this much can run out the check's own budget first.
+        let err = check_schema_nesting(&path).unwrap_err();
+        assert!(
+            err.contains("refusing") || err.contains("timed out"),
+            "{err}"
+        );
+    }
+
+    /// `selected_x` is a column, not a SELECT: 2,500 of them in one view are not nesting.
+    #[test]
+    fn identifiers_containing_select_are_not_counted() {
+        let columns = (0..2_500)
+            .map(|i| format!("1 AS selected_{i}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(sql_nesting(&format!("SELECT {columns}")).1, 1);
+        assert_eq!(sql_nesting("SELECT 1 UNION select 2").1, 2);
+        assert_eq!(sql_nesting("SELECT 'select' AS \"select\"").1, 1);
+    }
+
     /// A `.db` that is not `SQLite` (Windows' `Thumbs.db`) must not beat a real database by size.
     #[test]
     fn auto_selection_skips_files_that_are_not_sqlite() {
@@ -3516,6 +3843,47 @@ mod tests {
         ] {
             assert_eq!(validate_query(sql), Ok(()), "must allow: {sql}");
         }
+    }
+
+    /// The same class, wherever the scanner's idea of the token differed from `SQLite`'s: every
+    /// byte >= 0x80 is an identifier character there (`€` is not alphanumeric to Rust), a `::`
+    /// continues any parameter name, and only ASCII whitespace ends the `(…)` suffix.
+    #[test]
+    fn the_scanner_reads_a_parameter_token_as_sqlite_does() {
+        let (_f, path) = create_test_db();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        for sql in [
+            "SELECT $\u{20ac}(') ; CREATE TABLE stacked(x) --'",
+            "SELECT :\u{20ac}(') ; CREATE TABLE stacked(x) --'",
+            "SELECT $a\u{20ac}(') ; CREATE TABLE stacked(x) --'",
+            "SELECT @a::(') ; CREATE TABLE stacked(x) --'",
+            "SELECT :a::b(') ; CREATE TABLE stacked(x) --'",
+            "SELECT $a(\u{a0}') ; CREATE TABLE stacked(x) --'",
+            "SELECT $a(\u{2003}') ; CREATE TABLE stacked(x) --'",
+        ] {
+            assert!(
+                sqlite_runs_a_second_statement(&conn, sql),
+                "SQLite's reading of {sql}"
+            );
+            let err = validate_query(sql).expect_err(sql);
+            assert!(err.contains("stacked queries"), "{sql}: {err}");
+        }
+        for sql in [
+            "SELECT '\u{20ac};' AS s",
+            "SELECT 1 AS \u{20ac}",
+            "SELECT :\u{20ac}",
+            "SELECT $a::b FROM t",
+        ] {
+            assert_eq!(validate_query(sql), Ok(()), "must allow: {sql}");
+        }
+    }
+
+    /// Whether `SQLite` itself runs the `CREATE TABLE stacked` at the end of `sql` as a statement.
+    fn sqlite_runs_a_second_statement(conn: &rusqlite::Connection, sql: &str) -> bool {
+        let _ = conn.execute_batch(sql);
+        let ran = conn.prepare("SELECT * FROM stacked").is_ok();
+        let _ = conn.execute_batch("DROP TABLE IF EXISTS stacked");
+        ran
     }
 
     /// R4-DB1: the other direction — a comment marker inside a string made the old stripper

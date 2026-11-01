@@ -15,8 +15,11 @@ fail=0
 
 for f in "$release" "$vscode"; do
   [ -s "$f" ] || { echo "ERROR: $f is missing or empty"; exit 1; }
-  # Also `cache:` keys, which is how setup-node and friends switch a cache on.
-  hits="$(sed -E 's/(^|[[:space:]])#.*$//' "$f" | grep -nEi 'rust-cache|actions/cache|sccache|^[[:space:]]*(-[[:space:]]*)?cache:[[:space:]]*[^"[:space:]]' || true)"
+  # Also `cache:` keys, which is how setup-node and friends switch a cache on: quoted or not,
+  # anything but false. setup-rust-toolchain caches unless told otherwise, so naming it is enough.
+  hits="$(sed -E 's/(^|[[:space:]])#.*$//' "$f" |
+    grep -nEi 'rust-cache|setup-rust-toolchain|actions/cache|sccache|^[[:space:]]*(-[[:space:]]*)?[a-z-]*cache:[[:space:]]*[^[:space:]]' |
+    grep -vEi '^[0-9]+:[[:space:]]*(-[[:space:]]*)?[a-z-]*cache:[[:space:]]*["'"'"']?false["'"'"']?[[:space:]]*$' || true)"
   if [ -n "$hits" ]; then
     echo "ERROR: $f restores a cache:"
     echo "$hits"
@@ -43,12 +46,14 @@ if ! grep -q 'uses:[[:space:]]*\./\.github/actions/linux-deps' "$release"; then
   fail=1
 fi
 
-# ...and the opt-out has to reach every cache step in the action.
+# ...and the opt-out has to reach every cache step in the action. Judged per step, whichever way
+# round its keys are and whatever starts it, and a guard with an `||` guards nothing.
 bad="$(awk '
-  /^[[:space:]]*-[[:space:]]+name:/ { guarded = 0 }
-  /^[[:space:]]*if:.*inputs\.cache[[:space:]]*==[[:space:]]*.true./ { guarded = 1 }
-  /uses:[[:space:]]*actions\/cache/ { seen = 1; if (!guarded) printf "%d\n", NR }
-  END { if (!seen) print "no actions/cache step found" }
+  function close_step() { if (open && !guarded) printf "%d\n", at; open = 0; guarded = 0 }
+  /^[[:space:]]*-[[:space:]]/ { close_step() }
+  /^[[:space:]]*(-[[:space:]]+)?if:.*inputs\.cache[[:space:]]*==[[:space:]]*.true./ && !/\|\|/ { guarded = 1 }
+  /uses:[[:space:]]*actions\/cache/ { seen = 1; open = 1; at = NR }
+  END { close_step(); if (!seen) print "no actions/cache step found" }
 ' "$deps")"
 if [ -n "$bad" ]; then
   echo "ERROR: $deps has a cache step not guarded by inputs.cache: $bad"

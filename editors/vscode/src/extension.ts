@@ -23,6 +23,8 @@ let outputChannel: vscode.OutputChannel;
 /** How often to look for the app while disconnected with `victauri.autoConnect` on. */
 const AUTO_CONNECT_RETRY_MS = 5_000;
 const TOKEN_CONSENT_KEY = "victauri.tokenAllowedForPort";
+/** How long a retry reuses the workspace's identifiers rather than searching for them again. */
+const WORKSPACE_IDS_REUSE_MS = 60_000;
 
 /** `user`: the Connect command. `auto`: activation and the retry timer, which must stay quiet. */
 type ConnectMode = "user" | "auto";
@@ -34,6 +36,7 @@ let autoConnectPaused = false;
 /** What auto-connect last said, so a retry every few seconds does not repeat it. */
 let lastAutoReport: string | undefined;
 let lastAnnouncedApp: string | undefined;
+let workspaceIdsCache: { ids: string[]; at: number } | undefined;
 
 function report(mode: ConnectMode, show: (text: string) => void, text: string): void {
   if (mode === "auto") {
@@ -55,8 +58,15 @@ async function portAnswers(port: number): Promise<boolean> {
   }
 }
 
-/** The identifiers the workspace's Tauri configs name: its own app, among those running. */
-async function workspaceIdentifiers(): Promise<string[]> {
+/**
+ * The identifiers the workspace's Tauri configs name: its own app, among those running. Auto-connect
+ * retries every few seconds, and searching the whole workspace that often is not free, so it
+ * reuses a recent answer. A deliberate Connect always looks again.
+ */
+async function workspaceIdentifiers(mode: ConnectMode): Promise<string[]> {
+  if (mode === "auto" && workspaceIdsCache && Date.now() - workspaceIdsCache.at < WORKSPACE_IDS_REUSE_MS) {
+    return workspaceIdsCache.ids;
+  }
   const files = await vscode.workspace.findFiles(
     "**/{tauri.conf.json,tauri.conf.json5,Tauri.toml}",
     "**/{node_modules,target}/**",
@@ -71,7 +81,8 @@ async function workspaceIdentifiers(): Promise<string[]> {
       // unreadable config: it names nothing
     }
   }
-  return [...ids];
+  workspaceIdsCache = { ids: [...ids], at: Date.now() };
+  return workspaceIdsCache.ids;
 }
 
 /**
@@ -116,14 +127,17 @@ async function connectOnce(context: vscode.ExtensionContext, mode: ConnectMode):
     { port: settings.port, token },
     scan,
     settings.defaultPort,
-    scan.live.length > 0 ? await workspaceIdentifiers() : []
+    scan.live.length > 0 ? await workspaceIdentifiers(mode) : []
   );
   if (!resolution.ok) {
     report(mode, showError, `Victauri: ${resolution.message}`);
     return;
   }
   // Another project's app is not this workspace's: only a deliberate Connect binds to it.
-  if (mode === "auto" && resolution.otherProject) return;
+  if (mode === "auto" && resolution.otherProject) {
+    report(mode, showInfo, `Victauri: ${resolution.warning} Not connecting; run Victauri: Connect to use it.`);
+    return;
+  }
   if (resolution.warning) {
     report(mode, showWarning, `Victauri: ${resolution.warning}`);
   }
@@ -150,6 +164,8 @@ async function connectOnce(context: vscode.ExtensionContext, mode: ConnectMode):
           }
         : {}
     );
+    // The user pressed Disconnect while that ran.
+    if (client.connectionState !== "connected") return;
     lastAutoReport = undefined;
     const app = vouched?.identifier;
     if (mode === "user" || app !== lastAnnouncedApp) {
@@ -167,11 +183,17 @@ function runConnect(context: vscode.ExtensionContext, mode: ConnectMode): Promis
   if (mode === "auto" && connectBusy) return Promise.resolve();
   if (mode === "user") autoConnectPaused = false;
   connectBusy = true;
+  // The caller hears of its own failure. The next connect must still run after it.
   connectQueue = connectQueue
+    .catch(() => undefined)
     .then(() => connectOnce(context, mode))
     .finally(() => {
       connectBusy = false;
     });
+  // Nobody awaits an automatic one, and it has to stay quiet about repeats.
+  if (mode === "auto") {
+    return connectQueue.catch((e: unknown) => report(mode, showError, `Victauri: ${String(e)}`));
+  }
   return connectQueue;
 }
 
@@ -180,6 +202,7 @@ export function activate(context: vscode.ExtensionContext): void {
   autoConnectPaused = false;
   lastAutoReport = undefined;
   lastAnnouncedApp = undefined;
+  workspaceIdsCache = undefined;
   outputChannel = vscode.window.createOutputChannel("Victauri");
 
   // Status bar

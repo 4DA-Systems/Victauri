@@ -984,6 +984,47 @@ fn console_capture_reader_resumes_from_offsets_and_skips_partial_records() {
     assert_eq!(more[0].offset, next);
 }
 
+/// Review of the CLI follower's rotation gap: a cursor is a byte offset, and once `victauri run`
+/// rotated the capture it pointed into the middle of a different file. The unread tail of the
+/// rotated file was lost and the new file's start skipped, with nothing said.
+#[test]
+fn a_cursor_read_survives_a_rotation() {
+    fn record(n: usize, text: &str) -> String {
+        format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"{text}{n}\"}}\n")
+    }
+    /// All a follower reads from `cursor` on, as it would: on while `more`, then one more poll.
+    fn follow(path: &std::path::Path, mut cursor: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        for _ in 0..8 {
+            let (lines, next, _) =
+                read_console_capture_window(path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+            out.extend(lines.into_iter().map(|l| l.text));
+            cursor = next;
+        }
+        out
+    }
+    for new_file_lines in [1usize, 50] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        let old: String = (0..4).map(|n| record(n, "old")).collect();
+        std::fs::write(&path, &old).unwrap();
+        let (_, cursor) = read_console_capture(&path, Some(0), 0).unwrap();
+        let cursor = cursor - (2 * record(0, "old").len()) as u64;
+
+        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+        // Short: the cursor is past its end. Long: the cursor lands inside a record.
+        let new: String = (0..new_file_lines)
+            .map(|n| record(n, "a-new-line-of-another-length-"))
+            .collect();
+        std::fs::write(&path, &new).unwrap();
+
+        let got = follow(&path, cursor);
+        let mut want = vec!["old2".to_string(), "old3".to_string()];
+        want.extend((0..new_file_lines).map(|n| format!("a-new-line-of-another-length-{n}")));
+        assert_eq!(got, want, "new file of {new_file_lines} line(s)");
+    }
+}
+
 /// Release review: a cursor read stops at its byte window (16 MiB), and `logs stdout` reported
 /// `truncated: false` whenever the LINE limit was not hit — on a 40 MB capture an agent read
 /// the first window, saw nothing truncated, and never reached the panic further on. The reader

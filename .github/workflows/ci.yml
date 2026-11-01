@@ -88,7 +88,7 @@ jobs:
 
       - name: Release workflows restore no cache
         if: matrix.os == 'ubuntu-latest'
-        run: bash scripts/check-release-no-cache.sh
+        run: bash scripts/check-release-no-cache.sh && bash scripts/test-check-release-no-cache.sh
 
       # Enforce the pre-push gate installer's security regressions in CI (not just the local hook). Runs on
       # all 3 OSes so the platform-gated cases actually execute somewhere: macOS exercises real symlinks +
