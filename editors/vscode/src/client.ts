@@ -1,6 +1,8 @@
 import * as vscode from "vscode";
 
 import type { DiscoveredServer } from "./discovery";
+import { pollIntervalMs } from "./settings";
+import { showWarning } from "./toast";
 
 export interface ToolInfo {
   name: string;
@@ -20,10 +22,11 @@ export interface WindowState {
 export interface IpcEntry {
   command: string;
   timestamp: number;
-  status: number;
-  duration_ms: number;
-  method: string;
-  url: string;
+  /** `ok` / `error` / `pending` / `unknown` (the bridge's reading of Tauri's outcome). */
+  status: string | number;
+  duration_ms: number | null;
+  /** The command's error text, when `status` is `error`. */
+  error?: string | null;
 }
 
 export interface DomNode {
@@ -48,6 +51,31 @@ export interface DiagnosticsResult {
 }
 
 export type ConnectionState = "disconnected" | "connecting" | "connected";
+
+/**
+ * Limits on one request, including its body. An app may legitimately return a large screenshot
+ * (a 4K PNG is tens of MB in base64), so the size limit is generous. Tests shorten them.
+ */
+export const requestLimits = { timeoutMs: 30_000, maxResponseBytes: 64 * 1024 * 1024 };
+
+/** A response whose body has already been read, within `requestLimits`. */
+interface BufferedResponse {
+  status: number;
+  ok: boolean;
+  statusText: string;
+  headers: Headers;
+  text: string;
+}
+
+function isWindowState(w: unknown): w is WindowState {
+  if (typeof w !== "object" || w === null) return false;
+  const { label, size, position } = w as Partial<WindowState>;
+  const pair = (p: unknown) =>
+    Array.isArray(p) && p.length === 2 && p.every((n) => typeof n === "number");
+  return typeof label === "string" && pair(size) && pair(position);
+}
+
+const BASE64 = /^[A-Za-z0-9+/]+={0,2}$/;
 
 /**
  * Whether a `GET /health` status proves the server is alive: a 2xx, or a 429 — `/health` is
@@ -99,6 +127,8 @@ export class VictauriClient {
   private pollTimer: ReturnType<typeof setInterval> | undefined;
   /** A poll is running: the next tick is skipped rather than overlapping it (R5-VSC1). */
   private refreshing = false;
+  /** Which `startPolling` is current: a poll left over from an earlier one is ignored. */
+  private pollGeneration = 0;
   private readonly onStateChange = new vscode.EventEmitter<ConnectionState>();
   private readonly onDataUpdate = new vscode.EventEmitter<void>();
 
@@ -119,6 +149,16 @@ export class VictauriClient {
     return this.state;
   }
 
+  /** The discovered app's identifier, while connected to one. */
+  get appIdentifier(): string | undefined {
+    return this.identifier;
+  }
+
+  /** The port currently connected to (it changes when a restarted app is followed). */
+  get connectedPort(): number {
+    return this.port;
+  }
+
   async connect(port: number, authToken?: string, options: ConnectOptions = {}): Promise<void> {
     this.pointAt(port, authToken ?? "");
     this.identifier = options.identifier;
@@ -127,7 +167,7 @@ export class VictauriClient {
     this.setState("connecting");
 
     try {
-      const resp = await this.fetch("/health");
+      const resp = await this.rawFetch("/health", undefined, false);
       if (!healthStatusMeansAlive(resp.status)) {
         throw new Error(`Health check failed: ${resp.status}`);
       }
@@ -138,7 +178,8 @@ export class VictauriClient {
       await this.probeAuthenticated();
       this.setState("connected");
       await this.refreshAll();
-      this.startPolling();
+      // The user may have pressed Disconnect during that first load.
+      if (this.state === "connected") this.startPolling();
     } catch (e) {
       this.setState("disconnected");
       throw e;
@@ -147,6 +188,12 @@ export class VictauriClient {
 
   disconnect(): void {
     this.stopPolling();
+    // Nothing is sent from here until the next connect: an open screenshot panel still has a
+    // Refresh button.
+    this.pointAt(0, "");
+    this.identifier = undefined;
+    this.discover = undefined;
+    this.refusedReason = undefined;
     this.setState("disconnected");
     this.windows = [];
     this.ipcLog = [];
@@ -196,11 +243,11 @@ export class VictauriClient {
    * restarted app is re-resolved by identity (R5-VSC1). On a mismatch nothing more is sent to
    * this endpoint until the user reconnects.
    */
-  private async checkIdentity(resp: Response): Promise<void> {
+  private async checkIdentity(resp: BufferedResponse): Promise<void> {
     if (this.identifier === undefined) return;
     let reported: unknown;
     try {
-      reported = ((await resp.json()) as { app_identifier?: unknown } | null)?.app_identifier;
+      reported = (JSON.parse(resp.text) as { app_identifier?: unknown } | null)?.app_identifier;
     } catch {
       reported = undefined;
     }
@@ -270,12 +317,13 @@ export class VictauriClient {
     name: string,
     args: Record<string, unknown> = {}
   ): Promise<unknown> {
+    if (this.state !== "connected") throw new Error("Victauri: not connected");
     const resp = await this.fetch(`/api/tools/${name}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(args),
     });
-    const text = await resp.text();
+    const text = resp.text;
     let body: { result?: unknown; error?: string } | undefined;
     try {
       body = JSON.parse(text) as { result?: unknown; error?: string };
@@ -299,10 +347,10 @@ export class VictauriClient {
       type?: string;
       data?: string;
     } | null;
-    if (result && typeof result === "object" && "data" in result) {
-      return result.data as string;
-    }
-    return null;
+    // Anything else would land in the panel's HTML: this answer can come from whatever holds
+    // the port, not only from the plugin.
+    const data = result && typeof result === "object" ? result.data : undefined;
+    return typeof data === "string" && BASE64.test(data) ? data : null;
   }
 
   async evalJs(code: string): Promise<unknown> {
@@ -341,23 +389,10 @@ export class VictauriClient {
 
   private async refreshWindows(): Promise<void> {
     try {
-      const result = (await this.callTool("window", {
-        action: "list",
-      })) as string[];
+      // With no label this answers with every window, as an array.
+      const result = await this.callTool("window", { action: "get_state" });
       if (Array.isArray(result)) {
-        const states: WindowState[] = [];
-        for (const label of result) {
-          try {
-            const s = (await this.callTool("window", {
-              action: "get_state",
-              label,
-            })) as WindowState;
-            states.push(s);
-          } catch {
-            // skip windows that fail
-          }
-        }
-        this.windows = states;
+        this.windows = result.filter(isWindowState);
       }
     } catch {
       // keep stale data
@@ -451,9 +486,11 @@ export class VictauriClient {
 
   private startPolling(): void {
     this.stopPolling();
-    const interval = vscode.workspace
-      .getConfiguration("victauri")
-      .get<number>("pollInterval", 2000);
+    const interval = pollIntervalMs(
+      vscode.workspace.getConfiguration("victauri").get<unknown>("pollInterval")
+    );
+    this.refreshing = false;
+    const generation = ++this.pollGeneration;
     this.pollTimer = setInterval(() => {
       // A refresh on a slow app can outlast the interval: skip this tick instead of stacking
       // a second concurrent refresh on top of it (R5-VSC1).
@@ -463,15 +500,15 @@ export class VictauriClient {
         .catch((e: unknown) => {
           // Server went down (or the token stopped working, e.g. the app was
           // restarted and minted a fresh one): disconnect so the UI says so.
-          if (this.state !== "connected") return;
+          if (generation !== this.pollGeneration || this.state !== "connected") return;
           this.disconnect();
           this.onDataUpdate.fire();
-          vscode.window.showWarningMessage(
+          showWarning(
             `Victauri: Lost connection to Tauri app — ${e instanceof Error ? e.message : String(e)}`
           );
         })
         .finally(() => {
-          this.refreshing = false;
+          if (generation === this.pollGeneration) this.refreshing = false;
         });
     }, interval);
   }
@@ -491,6 +528,7 @@ export class VictauriClient {
   }
 
   private stopPolling(): void {
+    this.pollGeneration++;
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = undefined;
@@ -502,34 +540,66 @@ export class VictauriClient {
     this.onStateChange.fire(s);
   }
 
-  /** Every request goes through here; a token-bearing one is vouched for first. */
-  private async fetch(path: string, init?: RequestInit): Promise<Response> {
-    if (path !== "/health") await this.ensureEndpointTrusted();
+  /** Every request but `/health` goes through here; a token-bearing one is vouched for first. */
+  private async fetch(path: string, init?: RequestInit): Promise<BufferedResponse> {
+    await this.ensureEndpointTrusted();
     return this.rawFetch(path, init);
   }
 
+  /** The timeout and size limit cover the body too: a stalled body must not hang the poller. */
   private async rawFetch(
     path: string,
-    init?: RequestInit
-  ): Promise<Response> {
+    init?: RequestInit,
+    sendToken = true
+  ): Promise<BufferedResponse> {
     const headers: Record<string, string> = {
       ...(init?.headers as Record<string, string>),
     };
-    if (this.token) {
+    if (this.token && sendToken) {
       headers["Authorization"] = `Bearer ${this.token}`;
     }
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 30_000);
+    const timeout = setTimeout(() => controller.abort(), requestLimits.timeoutMs);
     try {
-      return await fetch(`${this.baseUrl}${path}`, {
+      const resp = await fetch(`${this.baseUrl}${path}`, {
         ...init,
         headers,
         signal: controller.signal,
       });
+      return {
+        status: resp.status,
+        ok: resp.ok,
+        statusText: resp.statusText,
+        headers: resp.headers,
+        text: await readCapped(resp, requestLimits.maxResponseBytes),
+      };
+    } catch (e) {
+      if (!controller.signal.aborted) throw e;
+      throw new Error(
+        `Victauri: port ${this.port} did not answer ${path} within ${requestLimits.timeoutMs} ms`
+      );
     } finally {
       clearTimeout(timeout);
     }
   }
+}
+
+async function readCapped(resp: Response, limit: number): Promise<string> {
+  if (!resp.body) return "";
+  const reader = resp.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+    if (total > limit) {
+      await reader.cancel().catch(() => undefined);
+      throw new Error(`Victauri: refused an answer larger than ${limit} bytes`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf-8");
 }
 
 /** `fetch` rejects with a `TypeError` when no HTTP response arrived at all. */

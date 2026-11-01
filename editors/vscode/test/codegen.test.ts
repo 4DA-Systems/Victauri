@@ -6,6 +6,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
+import { TauriCommandLensProvider } from "../src/codeLens";
 import { DomExplorerProvider } from "../src/domExplorerView";
 import { escapeRustStr, generateCommandTest } from "../src/rustCodegen";
 
@@ -31,25 +32,50 @@ function endOfRustLiteral(line: string, start: number): number {
   throw new Error(`unterminated literal in: ${line}`);
 }
 
-test("an accessible name cannot break out of Locator::text", () => {
-  const code = provider().generateTestCode({ tag: "div", ref_id: "e1", name: INJECTION });
-  const line = code.split("\n").find((l) => l.includes("Locator::text("));
-  assert.ok(line, code);
-  const open = line.indexOf("Locator::text(") + "Locator::text(".length;
-  const end = endOfRustLiteral(line, open);
-  // The whole injected text stays inside the one literal: after it comes only `)`.
-  assert.equal(line.slice(end), ")", `the literal must end the call:\n${code}`);
-  assert.ok(line.slice(open, end).includes("std::process::exit(1)"), line);
+test("an accessible name cannot break out of a Locator literal", () => {
+  for (const node of [
+    { tag: "div", name: INJECTION },
+    { tag: "button", role: "button", name: INJECTION },
+    { tag: "input", role: "textbox", name: INJECTION },
+  ]) {
+    const code = provider().generateTestCode({ ...node, ref_id: "e1" });
+    const line = code.split("\n").find((l) => l.includes(INJECTION.slice(0, 1) + "\\\""));
+    assert.ok(line, code);
+    const open = line.indexOf('"', line.indexOf("Locator::") === -1 ? 0 : line.lastIndexOf('("') + 1);
+    const end = endOfRustLiteral(line, open);
+    assert.ok(line.slice(open, end).includes("std::process::exit(1)"), line);
+    assert.ok(/^\)/.test(line.slice(end)), `the literal must end the call:\n${code}`);
+  }
 });
 
-test("a ref id cannot break out of client.click / client.fill", () => {
-  for (const tag of ["button", "input"]) {
-    const code = provider().generateTestCode({ tag, ref_id: INJECTION });
-    const line = code.split("\n")[1];
-    const open = line.indexOf("(") + 1;
-    const end = endOfRustLiteral(line, open);
-    assert.ok(/^(\)|, "test value"\))\.await\.unwrap\(\);$/.test(line.slice(end)), line);
-  }
+test("a generated test selects by role and name: a ref means nothing on a fresh app", () => {
+  const button = provider().generateTestCode({
+    tag: "button",
+    role: "tab",
+    name: "Home",
+    ref_id: "e5",
+  });
+  assert.ok(button.includes('Locator::role("tab")'), button);
+  assert.ok(button.includes('.name("Home")'), button);
+  assert.ok(button.includes(".click(&mut client)"), button);
+  assert.ok(!button.includes("e5"), `no session-scoped ref: ${button}`);
+
+  const input = provider().generateTestCode({ tag: "input", role: "textbox", name: "Email" });
+  assert.ok(input.includes('.fill(&mut client, "test value")'), input);
+
+  const heading = provider().generateTestCode({ tag: "h1", role: "heading", text: "Title" });
+  assert.ok(heading.includes('Locator::text("Title")'), heading);
+  assert.ok(heading.includes(".to_be_visible()"), heading);
+});
+
+test("an element with nothing to locate it by is a visible todo, not an empty passing test", () => {
+  const code = provider().generateTestCode({ tag: "div", ref_id: "e9" });
+  assert.ok(code.includes("todo!("), code);
+  const hostile = provider().generateTestCode({ tag: INJECTION });
+  const line = hostile.split("\n").find((l) => l.includes("todo!("));
+  assert.ok(line, hostile);
+  const open = line.indexOf('"', line.indexOf(", ") + 1);
+  assert.equal(line.slice(endOfRustLiteral(line, open)), ");", line);
 });
 
 test("control, bidi and newline characters are escaped like escape_rust_str", () => {
@@ -63,8 +89,47 @@ test("control, bidi and newline characters are escaped like escape_rust_str", ()
 
 test("generated command tests are unchanged for normal names", () => {
   const code = generateCommandTest("get_settings");
-  assert.ok(code.startsWith("e2e_test!(test_get_settings, |client| async move {"), code);
+  assert.ok(code.includes("e2e_test!(test_get_settings, |client| async move {"), code);
   assert.ok(code.includes('.invoke_command("get_settings", None)'), code);
+});
+
+test("a generated command test does not reject a command that returns null, a bool or a list", () => {
+  const code = generateCommandTest("save");
+  assert.ok(!code.includes("is_object()"), code);
+  assert.ok(code.includes(".unwrap()"), "a command error still fails the test");
+});
+
+function lensNames(source: string): string[] {
+  const lines = source.split("\n");
+  const doc = {
+    languageId: "rust",
+    lineCount: lines.length,
+    lineAt: (i: number) => ({ text: lines[i] }),
+    uri: {},
+  };
+  return new TauriCommandLensProvider()
+    .provideCodeLenses(doc as never)
+    .map((l) => (l.command?.arguments as string[])[0]);
+}
+
+test("CodeLens finds every form of command function", () => {
+  for (const [sig, name] of [
+    ["fn a()", "a"],
+    ["pub fn b()", "b"],
+    ["async fn c()", "c"],
+    ["pub async fn d()", "d"],
+    ["pub(crate) fn e()", "e"],
+    ["pub(crate) async fn f()", "f"],
+    ["pub(in crate::x) async fn g()", "g"],
+    ["async unsafe fn h()", "h"],
+    ["pub unsafe fn i()", "i"],
+    ["pub fn r#type()", "type"],
+  ]) {
+    assert.deepEqual(lensNames(`#[tauri::command]\n${sig} {}`), [name], sig);
+  }
+  assert.deepEqual(lensNames('#[tauri::command(rename_all = "snake_case")]\nfn j() {}'), ["j"]);
+  assert.deepEqual(lensNames("#[tauri::command]\n#[inspectable]\nfn k() {}"), ["k"]);
+  assert.deepEqual(lensNames("fn not_a_command() {}"), []);
 });
 
 // The real proof: rustc lexes every generated literal back to the original text.

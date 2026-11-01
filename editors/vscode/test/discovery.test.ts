@@ -14,6 +14,7 @@ import {
   homeStateRoot,
   ownerCheckEnv,
   pidLiveness,
+  resetOwnerCheckBackoff,
   resolveConnection,
   scanServers,
 } from "../src/discovery";
@@ -155,7 +156,7 @@ test("windows: a discovery directory owned by another account is not trusted", a
     }
     // Force the real owner check even though the test root sits inside the user profile.
     const result = await scanServers((pid) => (pid >= 201 ? "own" : "dead"), [root], {
-      profileDir: "Z:\victauri-no-such-profile",
+      profileDir: "Z:\\victauri-no-such-profile",
     });
     assert.deepEqual(
       result.live.map((s) => s.pid),
@@ -224,10 +225,11 @@ test("windows: a failed owner check fails closed but is retried, not cached", as
     } finally {
       process.env.SystemRoot = savedRoot;
     }
+    resetOwnerCheckBackoff(); // what a Connect does; otherwise a failure waits out its backoff
     assert.equal(
       await dirIsTrusted(mine, opts),
       true,
-      "the failed check must not be cached: the next scan asks again"
+      "the failed check must not be cached: a later scan asks again"
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -258,4 +260,35 @@ test("unix: the home fallback root is scanned after <temp>/victauri-<uid>, befor
   const at = roots.indexOf(home!);
   assert.ok(at > 0 && at < roots.length - 1, JSON.stringify(roots));
   assert.ok(roots[at - 1].endsWith(`victauri-${process.geteuid!()}`), JSON.stringify(roots));
+});
+
+// A junction in a parent directory is not visible to a lexical comparison, so "inside the profile"
+// must be asked of the real path. SYSTEM stands in for "another user" (elevated runs only).
+test("windows: a planted directory reached through a junction inside the profile is not trusted", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("windows only");
+    return;
+  }
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "victauri-vsc-junction-"));
+  try {
+    const profile = path.join(base, "profile");
+    const shared = path.join(base, "shared");
+    const planted = path.join(shared, "victauri", "777");
+    fs.mkdirSync(profile);
+    fs.mkdirSync(planted, { recursive: true });
+    if (spawnSync("icacls", [planted, "/setowner", "*S-1-5-18", "/q"]).status !== 0) {
+      t.skip("cannot change a directory's owner (not elevated)");
+      return;
+    }
+    fs.symlinkSync(shared, path.join(profile, "Temp"), "junction");
+    const viaJunction = path.join(profile, "Temp", "victauri", "777");
+    assert.equal(await dirIsTrusted(planted, { profileDir: profile }), false, "direct path");
+    assert.equal(await dirIsTrusted(viaJunction, { profileDir: profile }), false, "via junction");
+    // A real directory inside the profile still needs no check.
+    const inside = path.join(profile, "own");
+    fs.mkdirSync(inside);
+    assert.equal(await dirIsTrusted(inside, { profileDir: profile }), true);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
 });

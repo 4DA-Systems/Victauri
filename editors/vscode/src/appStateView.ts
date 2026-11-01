@@ -136,15 +136,16 @@ export class AppStateProvider implements vscode.TreeDataProvider<StateNode> {
           description: `${heap.used_mb.toFixed(1)} / ${(heap.total_mb ?? 0).toFixed(1)} MB`,
         });
       }
-      const dom = perf.dom_stats as { element_count?: number; max_depth?: number } | undefined;
-      if (dom?.element_count != null) {
+      const dom = perf.dom as { elements?: number; max_depth?: number } | undefined;
+      if (dom?.elements != null) {
         children.push({
           kind: "performance",
           label: "DOM Elements",
-          description: `${dom.element_count} (depth ${dom.max_depth ?? "?"})`,
+          description: `${dom.elements} (depth ${dom.max_depth ?? "?"})`,
         });
       }
-      const longTasks = perf.long_task_count as number | undefined;
+      // No `count` on an engine without the Long Tasks API (WebKit): no row, rather than a 0.
+      const longTasks = (perf.long_tasks as { count?: number } | undefined)?.count;
       if (longTasks != null) {
         children.push({
           kind: "performance",

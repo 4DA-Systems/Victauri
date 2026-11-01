@@ -34,8 +34,17 @@
   "homepage": "https://github.com/4DA-Systems/victauri",
   "qna": "https://github.com/4DA-Systems/victauri/discussions",
   "activationEvents": [
-    "workspaceContains:**/tauri.conf.json"
+    "workspaceContains:**/tauri.conf.json",
+    "workspaceContains:**/tauri.conf.json5",
+    "workspaceContains:**/Tauri.toml"
   ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Victauri connects to a local app, and its settings choose where."
+    },
+    "virtualWorkspaces": false
+  },
   "icon": "media/icon.png",
   "galleryBanner": {
     "color": "#0d0d0d",
@@ -48,7 +57,7 @@
         {
           "id": "victauri",
           "title": "Victauri",
-          "icon": "media/icon.png"
+          "icon": "media/activitybar.svg"
         }
       ]
     },
@@ -178,6 +187,14 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        { "command": "victauri.copyRefId", "when": "false" },
+        { "command": "victauri.generateTest", "when": "false" },
+        { "command": "victauri.generateTestForCommand", "when": "false" },
+        { "command": "victauri.clickElement", "when": "false" },
+        { "command": "victauri.highlightElement", "when": "false" },
+        { "command": "victauri.inspectStyles", "when": "false" }
+      ],
       "view/title": [
         {
           "command": "victauri.refreshAll",
@@ -217,8 +234,10 @@
       "title": "Victauri",
       "properties": {
         "victauri.port": {
-          "type": "number",
+          "type": "integer",
           "default": 7373,
+          "minimum": 1,
+          "maximum": 65535,
           "description": "Port of the Victauri server"
         },
         "victauri.autoConnect": {
@@ -229,12 +248,14 @@
         "victauri.pollInterval": {
           "type": "number",
           "default": 2000,
-          "description": "Polling interval in milliseconds for live updates"
+          "minimum": 500,
+          "description": "Polling interval in milliseconds for live updates (at least 500)"
         },
         "victauri.authToken": {
           "type": "string",
           "default": "",
-          "description": "Bearer token for authenticated connections"
+          "scope": "machine",
+          "description": "Bearer token for authenticated connections. User settings only. Sent to a port chosen by workspace settings only after you confirm it."
         }
       }
     }
@@ -242,9 +263,10 @@
   "scripts": {
     "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
     "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --watch",
+    "vscode:prepublish": "npm run build",
     "package": "npx --no-install vsce package",
     "lint": "tsc --noEmit && tsc --noEmit -p test",
-    "test": "esbuild test/codegen.test.ts test/discovery.test.ts test/client.test.ts --bundle --platform=node --format=cjs --outdir=out-test --alias:vscode=./test/vscode-stub.ts --log-level=warning && node --test out-test/codegen.test.js out-test/discovery.test.js out-test/client.test.js"
+    "test": "esbuild test/codegen.test.ts test/discovery.test.ts test/client.test.ts test/views.test.ts test/extension.test.ts test/limits.test.ts --bundle --platform=node --format=cjs --outdir=out-test --alias:vscode=./test/vscode-stub.ts --log-level=warning && node --test out-test/codegen.test.js out-test/discovery.test.js out-test/client.test.js out-test/views.test.js out-test/extension.test.js out-test/limits.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
