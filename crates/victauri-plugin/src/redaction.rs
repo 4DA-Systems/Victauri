@@ -349,6 +349,8 @@ impl Redactor {
                 });
                 let mut changed = false;
                 let mut new_map = serde_json::Map::new();
+                let mut last_suffix: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
                 for (key, val) in map {
                     let secret = is_sensitive_key(key) || (named_secret && key == "value");
                     let new_val = if secret && !val.is_boolean() {
@@ -361,11 +363,18 @@ impl Redactor {
                     let new_key = self.redact_regex(key);
                     changed |= new_key != *key;
                     // Keys that redact to the same text must not overwrite each other's values.
+                    // The search resumes where the last one stopped: from `#2` every time, an
+                    // object of many such keys cost quadratic time on every result.
                     let mut unique = new_key.clone();
-                    let mut n = 1;
-                    while new_map.contains_key(&unique) {
-                        n += 1;
-                        unique = format!("{new_key}#{n}");
+                    if new_map.contains_key(&unique) {
+                        let n = last_suffix.entry(new_key.clone()).or_insert(1);
+                        loop {
+                            *n += 1;
+                            unique = format!("{new_key}#{n}");
+                            if !new_map.contains_key(&unique) {
+                                break;
+                            }
+                        }
                     }
                     new_map.insert(unique, new_val.unwrap_or_else(|| val.clone()));
                 }
@@ -750,6 +759,42 @@ mod tests {
         let mut values: Vec<i64> = map.values().map(|n| n.as_i64().unwrap()).collect();
         values.sort_unstable();
         assert_eq!(values, [1, 2, 3], "{out}");
+    }
+
+    /// Finding the next free suffix started from `#2` for every key, so this took minutes: an app
+    /// (or a page) could stall every tool result behind one object with many e-mail shaped keys.
+    #[test]
+    fn many_keys_redacted_to_the_same_text_stay_cheap() {
+        let n = 50_000;
+        let input = serde_json::Value::Object(
+            (0..n)
+                .map(|i| (format!("u{i}@example.com"), serde_json::Value::from(i)))
+                .collect(),
+        )
+        .to_string();
+        let (done, finished) = std::sync::mpsc::channel();
+        // A thread, so a regression fails here instead of holding the suite for minutes.
+        std::thread::spawn(move || {
+            let _ = done.send(Redactor::default().redact(&input));
+        });
+        let out = finished
+            .recv_timeout(std::time::Duration::from_secs(90))
+            .expect("redacting colliding keys must stay close to linear");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v.as_object().unwrap().len(), n);
+        assert!(!out.contains("example.com"));
+    }
+
+    /// A key already spelled like a generated suffix is not overwritten.
+    #[test]
+    fn a_generated_suffix_does_not_overwrite_a_real_key() {
+        let r = Redactor::default();
+        let out = r.redact(
+            r#"{"[REDACTED]#2":"real","ann@example.com":1,"bob@example.com":2,"cy@example.com":3}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v.as_object().unwrap().len(), 4, "{out}");
+        assert_eq!(v["[REDACTED]#2"], "real", "{out}");
     }
 
     /// `RegexSet::new` fails as a whole, so one bad pattern used to drop the good ones too.

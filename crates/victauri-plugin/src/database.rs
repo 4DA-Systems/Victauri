@@ -686,13 +686,12 @@ fn view_definition(words: &[String]) -> Option<(&str, usize)> {
 
 /// The most nesting any chain of views adds up to: the largest sum of `cost` along views that
 /// select from each other. Anything in a definition spelled like a view's name counts as selecting
-/// from it, which can only overcharge (a column of that name). A cycle is not followed:
-/// `SQLite` refuses a circular view when it expands it.
+/// from it, which can only overcharge (a column of that name). Strings count too: `SQLite` takes
+/// `FROM 'v1'` as a name. So mentions can close a cycle a real chain runs through, and views that
+/// reach each other are charged together, each once. That bounds any real chain among them.
 #[cfg(feature = "sqlite")]
 fn deepest_view_chain(views: &[(String, usize)]) -> usize {
-    const UNSEEN: u8 = 0;
-    const OPEN: u8 = 1;
-    const DONE: u8 = 2;
+    const UNSEEN: usize = 0;
     let mut index: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut own: Vec<usize> = Vec::new();
     let mut parsed = Vec::with_capacity(views.len());
@@ -715,32 +714,66 @@ fn deepest_view_chain(views: &[(String, usize)]) -> usize {
         deps[*node].extend(found);
     }
     drop(parsed);
-    // Depth first with an explicit stack: a chain can be as long as the file allows.
-    let mut state = vec![UNSEEN; own.len()];
+    // Tarjan's strongly connected components, depth first with an explicit stack: a chain can be as
+    // long as the file allows. A group closes only after every group it depends on, so `chain` is
+    // final for all of those; for its own members it is still 0.
+    let mut order = vec![UNSEEN; own.len()];
+    let mut low = vec![UNSEEN; own.len()];
+    let mut open = vec![false; own.len()];
+    let mut group: Vec<usize> = Vec::new();
     let mut chain = vec![0usize; own.len()];
+    let mut visited = 0;
     let mut deepest = 0;
     for root in 0..own.len() {
-        if state[root] != UNSEEN {
+        if order[root] != UNSEEN {
             continue;
         }
-        state[root] = OPEN;
+        visited += 1;
+        order[root] = visited;
+        low[root] = visited;
+        open[root] = true;
+        group.push(root);
         let mut stack = vec![(root, 0usize)];
         while let Some((node, next)) = stack.last_mut() {
             let node = *node;
             if let Some(&dep) = deps[node].get(*next) {
                 *next += 1;
-                if state[dep] == UNSEEN {
-                    state[dep] = OPEN;
+                if order[dep] == UNSEEN {
+                    visited += 1;
+                    order[dep] = visited;
+                    low[dep] = visited;
+                    open[dep] = true;
+                    group.push(dep);
                     stack.push((dep, 0));
+                } else if open[dep] {
+                    low[node] = low[node].min(order[dep]);
                 }
-            } else {
-                // A dependency still open is a cycle, and its `chain` is still 0.
-                let below = deps[node].iter().map(|d| chain[*d]).max().unwrap_or(0);
-                chain[node] = own[node].saturating_add(below);
-                deepest = deepest.max(chain[node]);
-                state[node] = DONE;
-                stack.pop();
+                continue;
             }
+            stack.pop();
+            if let Some((parent, _)) = stack.last() {
+                low[*parent] = low[*parent].min(low[node]);
+            }
+            if low[node] != order[node] {
+                continue;
+            }
+            let start = group.iter().rposition(|m| *m == node).unwrap_or(0);
+            let members = group.split_off(start);
+            let cost = members
+                .iter()
+                .fold(0usize, |sum, m| sum.saturating_add(own[*m]));
+            let below = members
+                .iter()
+                .flat_map(|m| &deps[*m])
+                .map(|d| chain[*d])
+                .max()
+                .unwrap_or(0);
+            let total = cost.saturating_add(below);
+            for m in members {
+                open[m] = false;
+                chain[m] = total;
+            }
+            deepest = deepest.max(total);
         }
     }
     deepest
@@ -922,10 +955,12 @@ static READ_ONLY_PREFIXES: &[&str] = &["select", "pragma", "explain", "with"];
 /// One quote- and comment-aware pass over agent-supplied SQL (R4-DB1), following `SQLite`'s
 /// tokenizer: `'…'` strings (`''` escapes), `"…"` and `` `…` `` identifiers (doubled-quote
 /// escapes), `[…]` identifiers (no escape), `--` to end of line, and `/* … */` (not nested;
-/// an unterminated comment or quote runs to the end of input, as in `SQLite`).
+/// an unterminated comment or quote runs to the end of input, as in `SQLite`). U+FEFF where a token
+/// could start is whitespace, and `$` inside a name is part of the name.
 #[cfg(feature = "sqlite")]
 struct SqlScan {
-    /// The SQL with every comment replaced by one space; quoted spans kept verbatim.
+    /// The SQL with every comment and every U+FEFF `SQLite` skips replaced by one space; quoted
+    /// spans kept verbatim.
     cleaned: String,
     /// `cleaned` with the CONTENT of every quoted span replaced by `_` (the delimiters are
     /// kept), so a search for `;` or `=` only ever sees code.
@@ -964,13 +999,23 @@ fn scan_sql(sql: &str) -> SqlScan {
     let mut cleaned = String::with_capacity(sql.len());
     let mut masked = String::with_capacity(sql.len());
     let mut chars = sql.chars().peekable();
+    // Whether the character before this one belongs to a bare name or number. Every byte of U+FEFF
+    // and `$` is an identifier character, so what they mean depends on it.
+    let mut in_word = false;
     while let Some(c) = chars.next() {
+        let after_word = std::mem::replace(&mut in_word, false);
         match c {
+            '\u{feff}' if !after_word => {
+                cleaned.push(' ');
+                masked.push(' ');
+            }
             // A named parameter (`$a`, `:a`, `@a`, `#a`). SQLite's tokenizer also accepts a
             // Tcl-style `$a(…)` suffix and reads it as part of the SAME token up to `)` or
             // whitespace, so a quote inside it does not open a string. Treating that quote as
             // one let `SELECT $a(') ; DELETE …'` pass as a single statement (round-4 review).
-            '$' | ':' | '@' | '#' if parameter_name_follows(chars.clone()) => {
+            '$' | ':' | '@' | '#'
+                if !(c == '$' && after_word) && parameter_name_follows(chars.clone()) =>
+            {
                 cleaned.push(c);
                 masked.push(c);
                 while let Some(&n) = chars.peek() {
@@ -1050,6 +1095,7 @@ fn scan_sql(sql: &str) -> SqlScan {
                 }
             }
             _ => {
+                in_word = is_sqlite_id_char(c);
                 cleaned.push(c);
                 masked.push(c);
             }
@@ -2577,13 +2623,15 @@ mod tests {
     #[test]
     fn view_chains_are_seen_through_every_spelling() {
         type Link = fn(&str) -> String;
-        let spellings: [(&str, Link); 6] = [
+        let spellings: [(&str, Link); 7] = [
             ("bare", |v| v.to_string()),
             ("upper", |v| v.to_uppercase()),
             ("double-quoted", |v| format!("\"{v}\"")),
             ("bracketed", |v| format!("[{v}]")),
             ("backticked", |v| format!("`{v}`")),
             ("schema-qualified", |v| format!("main.{v}")),
+            // `SQLite` reads U+FEFF at the start of a token as whitespace.
+            ("byte-order-mark", |v| format!("\u{feff}{v}")),
         ];
         for (what, link) in spellings {
             let rows: Vec<(String, String)> = (0..2_500)
@@ -2601,6 +2649,156 @@ mod tests {
             let err = check_schema_nesting(&path).expect_err(what);
             assert!(err.contains("nest"), "{what}: {err}");
         }
+    }
+
+    /// Two spellings `SQLite` accepts that the scanner read differently: U+FEFF starting a token is
+    /// whitespace to `SQLite`, and `$` inside a name is part of the name, not a parameter. Each hid
+    /// a whole chain from the budget.
+    #[test]
+    fn views_spelled_with_a_byte_order_mark_or_a_dollar_are_seen() {
+        type Definition = fn(usize) -> String;
+        let spellings: [(&str, Definition); 2] = [
+            ("byte order mark before VIEW", |i| {
+                let from = if i == 0 {
+                    "users".to_string()
+                } else {
+                    format!("\u{feff}v{}", i - 1)
+                };
+                format!("CREATE \u{feff}VIEW v{i} AS SELECT id FROM {from}")
+            }),
+            ("dollar in the name", |i| {
+                if i == 0 {
+                    "CREATE VIEW v$0(' -- ') AS SELECT id FROM users".to_string()
+                } else {
+                    format!(
+                        "CREATE VIEW v${i}(' -- ') AS SELECT \" -- \" FROM v${}",
+                        i - 1
+                    )
+                }
+            }),
+        ];
+        for (what, definition) in spellings {
+            // SQLite itself takes this spelling, and it is a working chain.
+            let (_small, small) = create_test_db();
+            let conn = rusqlite::Connection::open(&small).unwrap();
+            for i in 0..5 {
+                conn.execute_batch(&definition(i)).expect(what);
+            }
+            let last = if what.contains("dollar") { "v$4" } else { "v4" };
+            conn.prepare(&format!("SELECT * FROM \"{last}\""))
+                .expect(what);
+
+            let rows: Vec<(String, String)> = (0..2_500)
+                .map(|i| (format!("row{i}"), definition(i)))
+                .collect();
+            let (_f, path) = db_with_schema_rows(&rows);
+            let err = check_schema_nesting(&path).expect_err(what);
+            assert!(err.contains("nest"), "{what}: {err}");
+        }
+    }
+
+    /// The same two misreadings, where they meet the guards on an agent's query.
+    #[test]
+    fn the_scanner_tokenizes_a_byte_order_mark_and_a_dollar_as_sqlite_does() {
+        let ctes: Vec<String> = (0..3_000)
+            .map(|i| format!("c{i} AS (\u{feff}SELECT 1)"))
+            .collect();
+        let sql = format!("WITH {} SELECT 1", ctes.join(","));
+        assert_eq!(sql_nesting(&sql).1, 3_001);
+        assert!(is_read_only("\u{feff}SELECT 1"));
+        assert_eq!(statement_count("\u{feff}SELECT 1;\u{feff}"), 1);
+        // Only at the start of a token: inside a name it is a name character.
+        assert_eq!(sql_words("a\u{feff}b"), ["a\u{feff}b"]);
+        assert_eq!(sql_words("\u{feff}\u{feff}a b"), ["a", "b"]);
+
+        // A name holding `$`: the `;` is inside a string.
+        assert_eq!(statement_count("SELECT a$b('x y;z') FROM t"), 1);
+        assert_eq!(statement_count("SELECT a$b(1); SELECT 2"), 2);
+        // A real parameter keeps its Tcl-style suffix, which swallows the quote, so the `;` counts:
+        // after a byte order mark, a string or a comment too. SQLite agrees.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for two in [
+            "SELECT $a(') ; SELECT 2 --'",
+            "SELECT \u{feff}$a(') ; SELECT 2 --'",
+            "SELECT 'x',$a(') ; SELECT 2 --'",
+            "SELECT 1,/* c */$a(') ; SELECT 2 --'",
+        ] {
+            assert_eq!(statement_count(two), 2, "{two}");
+            let first = conn.prepare(two).expect(two);
+            assert_eq!(first.parameter_name(1), Some("$a(')"), "{two}");
+        }
+        // Straight after a string or a comment, too: neither is a word for `$` to continue.
+        assert_eq!(statement_count("SELECT 'x'$a(') ; SELECT 2 --'"), 2);
+        assert_eq!(statement_count("SELECT 1/* c */$a(') ; SELECT 2 --'"), 2);
+        // Inside a name, a byte order mark does not end it, so `$b` is no parameter.
+        assert_eq!(statement_count("SELECT a\u{feff}$b('x y;z') FROM t"), 1);
+    }
+
+    /// A true chain of 1,500 views, each also naming the next in a string, read as a cycle: an edge
+    /// into a view still open charged nothing, and starting in the middle halved the bill.
+    #[test]
+    fn mentions_that_close_a_cycle_cannot_halve_a_chain() {
+        let n = 1_500;
+        let definition = |i: usize| {
+            let from = if i == 0 {
+                "users".to_string()
+            } else {
+                format!("v{}", i - 1)
+            };
+            format!(
+                "CREATE VIEW v{i} AS SELECT id, 'v{}' AS note FROM {from}",
+                i + 1
+            )
+        };
+        let mut order = vec![n / 2];
+        order.extend((0..n).filter(|i| *i != n / 2));
+        let rows: Vec<(String, String)> = order
+            .iter()
+            .map(|i| (format!("v{i}"), definition(*i)))
+            .collect();
+        let views: Vec<(String, usize)> = rows.iter().map(|(_, sql)| (sql.clone(), 2)).collect();
+        assert!(
+            deepest_view_chain(&views) >= 2 * n,
+            "{}",
+            deepest_view_chain(&views)
+        );
+        let (_f, path) = db_with_schema_rows(&rows);
+        let err = check_schema_nesting(&path).unwrap_err();
+        assert!(err.contains("nest"), "{err}");
+    }
+
+    #[test]
+    fn a_view_chain_is_charged_for_every_view_it_can_reach() {
+        let views = |sql: &[&str]| -> Vec<(String, usize)> {
+            sql.iter().map(|s| ((*s).to_string(), 2)).collect()
+        };
+        // A cycle group costs all of its members, once, plus what lies below and above it.
+        let group = views(&[
+            "CREATE VIEW a AS SELECT * FROM b, d",
+            "CREATE VIEW b AS SELECT * FROM a",
+            "CREATE VIEW c AS SELECT * FROM a",
+            "CREATE VIEW d AS SELECT 1",
+            "CREATE VIEW lone AS SELECT 1",
+        ]);
+        assert_eq!(deepest_view_chain(&group), 8);
+        // A view naming itself is not a longer chain.
+        assert_eq!(
+            deepest_view_chain(&views(&["CREATE VIEW c AS SELECT * FROM c"])),
+            2
+        );
+        // A diamond counts one path, not both.
+        let diamond = views(&[
+            "CREATE VIEW top AS SELECT * FROM l, r",
+            "CREATE VIEW l AS SELECT * FROM base",
+            "CREATE VIEW r AS SELECT * FROM base",
+            "CREATE VIEW base AS SELECT 1",
+        ]);
+        assert_eq!(deepest_view_chain(&diamond), 6);
+        // Unrelated views are not a chain, however many.
+        let many: Vec<(String, usize)> = (0..5_000)
+            .map(|i| (format!("CREATE VIEW v{i} AS SELECT id FROM users"), 2))
+            .collect();
+        assert_eq!(deepest_view_chain(&many), 2);
     }
 
     /// The text is what gets parsed, so it names the view, and a definition may be spelled with a

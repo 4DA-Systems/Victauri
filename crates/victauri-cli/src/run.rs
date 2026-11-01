@@ -50,6 +50,10 @@ const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 /// too, and may be cleaning up with a handler for SIGINT and none for SIGTERM.
 #[cfg(unix)]
 const STOP_GRACE_TERMINAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// On Unix: a further stop signal this soon after the first is the same stop, see
+/// [`on_stop_signal`].
+#[cfg(unix)]
+const STOP_ECHO: std::time::Duration = std::time::Duration::from_secs(1);
 /// On Unix: how long a child gets to act on SIGTERM before SIGKILL.
 #[cfg(unix)]
 const STOP_KILL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
@@ -426,17 +430,24 @@ fn pass_through<W: Write>(dst: &mut W, mut bytes: &[u8]) {
 /// the child through the terminal's process group: forwarding at once would hit a child that is
 /// shutting down gracefully on SIGINT with a SIGTERM too. So it waits a moment, forwards only to a
 /// child still running, and ends with SIGKILL, since `victauri run` waits for the child and a child
-/// that ignores SIGTERM would hold it forever. A second signal asks for that at once. It runs on
-/// its own thread because `ctrlc` delivers signals one handler call at a time, so a handler that
-/// slept could not hear the second. Only the direct child: its own group would need `setpgid`,
-/// which takes it out of the terminal's foreground group and so breaks Ctrl+C.
+/// that ignores SIGTERM would hold it forever. A later signal asks for that at once, but not one
+/// within [`STOP_ECHO`] of the first: `timeout`, `npm` and `concurrently` signal this process and
+/// its group, so one stop can arrive twice with the child already shutting down on its own copy.
+/// It runs on its own thread because `ctrlc` delivers signals one handler call at a time, so a
+/// handler that slept could not hear the second. Only the direct child: its own group would need
+/// `setpgid`, which takes it out of the terminal's foreground group and so breaks Ctrl+C.
 #[cfg(unix)]
 fn on_stop_signal(
     child_pid: &Arc<std::sync::atomic::AtomicU32>,
-    signals: &std::sync::atomic::AtomicU32,
+    first_signal: &std::sync::OnceLock<std::time::Instant>,
 ) {
-    if signals.fetch_add(1, std::sync::atomic::Ordering::AcqRel) > 0 {
-        signal_child(child_pid, "KILL");
+    if first_signal.set(std::time::Instant::now()).is_err() {
+        if first_signal
+            .get()
+            .is_some_and(|first| first.elapsed() >= STOP_ECHO)
+        {
+            signal_child(child_pid, "KILL");
+        }
         return;
     }
     let child_pid = Arc::clone(child_pid);
@@ -610,8 +621,8 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     #[cfg(unix)]
     let _ = {
         let child_pid = Arc::clone(&child_pid);
-        let signals = std::sync::atomic::AtomicU32::new(0);
-        ctrlc::set_handler(move || on_stop_signal(&child_pid, &signals))
+        let first_signal = std::sync::OnceLock::new();
+        ctrlc::set_handler(move || on_stop_signal(&child_pid, &first_signal))
     };
     #[cfg(not(unix))]
     let _ = ctrlc::set_handler(|| {});

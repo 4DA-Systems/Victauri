@@ -933,6 +933,50 @@ async fn ipc_was_not_called_cannot_pass_on_a_page_whose_ipc_is_unobservable() {
     assert!(report.all_passed(), "{report:?}");
 }
 
+/// `logs` is empty, then each follow-up read answers as `tool` says. Only a plugin that really has
+/// no answer may let the check pass: a passing "was not called" must have looked.
+fn negative_ipc_check_with(tool: &'static str, answer: &'static str) -> Handler {
+    Arc::new(move |name, _| {
+        if name == tool {
+            return Err(answer.to_string());
+        }
+        match name {
+            "logs" => Ok("[]".to_string()),
+            "check_ipc_integrity" => Ok(integrity_with_capture("full")),
+            _ => Ok("0".to_string()),
+        }
+    })
+}
+
+#[tokio::test]
+async fn ipc_was_not_called_fails_when_it_could_not_check_for_blindness() {
+    const NOT_RESPONDING: &str = "bridge not responding in window main: it may still be loading";
+    for tool in ["check_ipc_integrity", "eval_js"] {
+        let (mut c, _) = client(negative_ipc_check_with(tool, NOT_RESPONDING)).await;
+        let report = c.verify().ipc_was_not_called("x").run().await.unwrap();
+        assert!(!report.all_passed(), "{tool}: {report:?}");
+        assert!(
+            report.results[0].detail.contains("bridge not responding"),
+            "{tool}: {report:?}"
+        );
+    }
+    // Refused by the app's privacy settings: those reads have nothing to say, as before.
+    for (tool, disabled) in [
+        (
+            "check_ipc_integrity",
+            "tool 'check_ipc_integrity' is disabled by privacy configuration",
+        ),
+        (
+            "eval_js",
+            "tool 'eval_js' is disabled by privacy configuration",
+        ),
+    ] {
+        let (mut c, _) = client(negative_ipc_check_with(tool, disabled)).await;
+        let report = c.verify().ipc_was_not_called("x").run().await.unwrap();
+        assert!(report.all_passed(), "{tool}: {report:?}");
+    }
+}
+
 #[tokio::test]
 async fn no_ghost_commands_cannot_pass_on_a_page_whose_ipc_is_unobservable() {
     let (mut c, _) = client(blind_page("none")).await;

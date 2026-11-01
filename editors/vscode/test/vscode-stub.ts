@@ -105,7 +105,12 @@ export const workspace = {
 /** Every string any toast was asked to show, in order. */
 export const shownMessages: Array<{ kind: string; text: string; items: unknown[] }> = [];
 /** What a modal `showWarningMessage` answers: tests set the button to "press". */
-export const stubAnswers: { warning: string | undefined; input: string | undefined } = {
+export const stubAnswers: {
+  warning: string | undefined;
+  input: string | undefined;
+  /** Set to keep a warning open until the promise settles: a dialog the user has not answered. */
+  warningOpenUntil?: Promise<void>;
+} = {
   warning: undefined,
   input: undefined,
 };
@@ -126,6 +131,7 @@ const toast =
   (kind: string) =>
   async (text: string, ...items: unknown[]): Promise<string | undefined> => {
     shownMessages.push({ kind, text, items });
+    if (kind === "warning") await stubAnswers.warningOpenUntil;
     return kind === "warning" ? stubAnswers.warning : undefined;
   };
 

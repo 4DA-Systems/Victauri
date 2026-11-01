@@ -36,6 +36,19 @@ reset; add_step actions/setup-node@v4 'cache: "false"' vscode.yml; expect_pass '
 reset; add_step actions/setup-node@v4 'package-manager-cache: false' vscode.yml
 expect_pass 'package-manager-cache: false'
 
+# Other ways to write the same key.
+flow() { reset; printf '      - uses: actions/setup-node@v4\n        with: %s\n' "$1" >>"$tmp/vscode.yml"; }
+flow '{ cache: npm }'; expect_refused "a flow mapping"
+flow '{ node-version: 20, cache: "npm" }'; expect_refused "a flow mapping, second key"
+flow '{ cache: false, package-manager-cache: true }'; expect_refused "one false key beside a true one"
+flow '{ cache: false }'; expect_pass "a flow mapping that says false"
+flow '{ node-version: 20, cache: "false", package-manager-cache: false }'
+expect_pass "a flow mapping, every key false"
+reset; add_step actions/setup-node@v4 '"cache": npm' vscode.yml; expect_refused 'a double-quoted key'
+reset; add_step actions/setup-node@v4 "'cache': npm" vscode.yml; expect_refused 'a single-quoted key'
+reset; add_step actions/setup-node@v4 '"cache": false' vscode.yml; expect_pass 'a quoted key that says false'
+reset; printf '      - name: Build with no cache here\n' >>"$tmp/vscode.yml"; expect_pass "a step name"
+
 # Caches by default, so its very name is the finding.
 reset; printf '      - uses: actions-rust-lang/setup-rust-toolchain@v1\n' >>"$tmp/release.yml"
 expect_refused "setup-rust-toolchain"
@@ -55,6 +68,15 @@ expect_pass "a guarded step with the if after the uses"
 reset
 printf "      - name: x\n        if: inputs.cache == 'true' || true\n        uses: actions/cache@v4\n" >>"$tmp/deps.yml"
 expect_refused "a guard that always passes"
+guard() { reset; printf "      - name: x\n        if: %s\n        uses: actions/cache@v4\n" "$1" >>"$tmp/deps.yml"; }
+guard "\${{ !(inputs.cache == 'true') }}"; expect_refused "an inverted guard"
+guard "\${{ ! inputs.cache == 'true' }}"; expect_refused "an inverted guard, no parentheses"
+guard "inputs.cache != 'true'"; expect_refused "a guard for the opposite"
+guard "inputs.cache == 'true' == false"; expect_refused "a guard compared with false"
+guard "\${{ inputs.cache == 'true' }}"; expect_pass "a guard in an expression"
+guard "inputs.cache == 'true' && runner.os == 'Linux'"; expect_pass "a guard with a further condition"
+guard "\${{ inputs.cache == 'true' && !cancelled() }}"; expect_pass "a further condition holding a !"
+reset; printf "      - uses: 'actions/cache@v4'\n" >>"$tmp/deps.yml"; expect_refused "a quoted uses"
 
 [ "$fail" -eq 0 ] && echo "check-release-no-cache: all fixtures behave"
 exit "$fail"

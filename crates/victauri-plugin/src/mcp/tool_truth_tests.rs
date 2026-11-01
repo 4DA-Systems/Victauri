@@ -593,6 +593,7 @@ async fn a_page_without_the_bridge_is_an_error_for_every_bridge_call() {
             json!({"action": "fill", "ref_id": "k3f9e1", "value": "x"}),
         ),
         ("input", json!({"action": "press_key", "key": "Enter"})),
+        ("navigate", json!({"action": "go_back"})),
         ("inspect", json!({"action": "audit_accessibility"})),
         (
             "storage",
