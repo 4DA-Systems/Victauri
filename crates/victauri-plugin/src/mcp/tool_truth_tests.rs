@@ -489,6 +489,69 @@ async fn go_back_on_a_dead_page_returns_to_the_last_url_inside_the_app() {
     );
 }
 
+/// An app whose window starts on a custom `WebviewUrl::External` is neither its dev server nor
+/// Tauri's protocol, and `navigate go_to` called its own pages "outside the app".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_origin_the_bridge_answers_on_is_the_apps() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    bridge.set_window_url("main", "https://app.example.com/start?x=1");
+    let h = handler(&st, &bridge);
+
+    // The very first call, and a port is another origin.
+    let own = "https://app.example.com/settings";
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_to", "url": own})).await);
+    assert!(out.get("warning").is_none(), "{out}");
+    let other_port = "https://app.example.com:8443/";
+    let out = ok_json(
+        &call(
+            &h,
+            "navigate",
+            json!({"action": "go_to", "url": other_port}),
+        )
+        .await,
+    );
+    assert!(out.get("warning").is_some(), "{out}");
+    let outside = "https://elsewhere.example/";
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_to", "url": outside})).await);
+    assert!(
+        out["warning"]
+            .as_str()
+            .unwrap()
+            .contains(outside.trim_end_matches('/')),
+        "{out}"
+    );
+
+    // And it is somewhere `go_back` can return to.
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.set_window_url("main", outside);
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert_eq!(out["recovered"], true, "{out}");
+    assert_eq!(out["url"], "https://app.example.com/start?x=1", "{out}");
+}
+
+/// A window that never answered proves nothing about the page it shows, and a page with no origin
+/// of its own (`about:blank`) makes nothing inside the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_origin_no_bridge_answered_on_stays_outside() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    bridge.set_window_url("main", "https://never.example/");
+    bridge.dead.store(true, Ordering::SeqCst);
+    let h = handler(&st, &bridge);
+    let url = "https://never.example/x";
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_to", "url": url})).await);
+    assert!(out.get("warning").is_some(), "{out}");
+
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    bridge.set_window_url("main", "about:blank");
+    let h = handler(&st, &bridge);
+    let url = "https://elsewhere.example/";
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_to", "url": url})).await);
+    assert!(out.get("warning").is_some(), "{out}");
+}
+
 /// A window that never answered has no bridge at all: `go_back` must not invent a navigation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn go_back_on_a_window_that_never_answered_reports_the_failure() {
