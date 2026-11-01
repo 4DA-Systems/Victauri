@@ -18,7 +18,7 @@ Get application configuration, directory paths, environment, discovered database
 
 **Parameters:** None required.
 
-**Returns:** `{config, paths, databases, process, environment}`
+**Returns:** `{config, paths, databases, process, env}`
 
 ---
 
@@ -34,7 +34,7 @@ Browse files in app backend directories (data, config, log, local_data).
 | `pattern` | string | no | Glob to filter entries (e.g. `*.db`) |
 | `max_depth` | number | no | Recursion depth (default: 1) |
 
-**Returns:** `{root, entries: [{name, path, is_dir, size, modified}]}`
+**Returns:** `{base, path, exists, count, truncated, entries: [{name, path, is_dir, size, modified}]}`
 
 A listing stops (and reports `truncated`) at 10,000 returned entries, 100,000 examined entries, or
 5 s — whichever comes first — so a pattern that matches nothing in a huge tree still returns.
@@ -119,8 +119,8 @@ Evaluate JavaScript in the webview and return the result.
 **Auto-`return`:** a single bare expression is auto-wrapped with `return`
 (`document.title` → `return document.title`). **Multi-statement code must include
 an explicit `return`** — e.g. `localStorage.setItem('k','v'); return localStorage.getItem('k')` —
-or be wrapped in an IIFE; otherwise only the first statement runs. async/await is
-supported.
+or be wrapped in an IIFE. Without one every statement still runs, but the result is `undefined`.
+async/await is supported.
 
 JavaScript errors (thrown exceptions) return an MCP error with `isError: true`.
 `undefined` returns `"undefined"`, `null` returns `null`. A **syntax error** is
@@ -188,6 +188,7 @@ Invoke a Tauri command from the backend.
 | `command` | string | yes | Command name |
 | `args` | object | no | Arguments to pass |
 | `timeout_ms` | integer | no | Time budget for the whole call — sending the command and waiting for its result (default: the plugin eval timeout, 30 s; max 300000). Raise it for legitimately slow commands. `victauri-test`: `invoke_command_with_timeout` |
+| `with_logs` | boolean | no | The result becomes `{"result": …, "backend_logs": […]}`: every backend log entry (debug and above) captured while the command ran, including concurrent background activity in that window. Needs backend capture |
 
 **Example:**
 ```json
@@ -229,10 +230,13 @@ Compare frontend and backend state to detect drift.
 **Example:**
 ```json
 {
-  "frontend_expr": "document.title",
+  "frontend_expr": "({title: document.title})",
   "backend_state": {"title": "My App"}
 }
 ```
+
+The expression must produce the same shape as the backend state: `document.title` on its own is a
+string, which diverges from `{"title": "My App"}` at `$` even when the title is right.
 
 ---
 
@@ -460,6 +464,10 @@ may still settle) or `[hint: CHECK_INPUT]` (wrong target). The same applies to
 | `focus` | `ref_id` | Focus an element |
 | `scroll_into_view` | `ref_id` | Scroll element into viewport |
 | `select_option` | `ref_id`, `value` or `values` | Select option(s) in a `<select>` |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
 | `trusted` | boolean | no | `click`: deliver a real OS mouse click (`isTrusted: true`) at the element's centre. Refused if the point is outside the window's client area. Windows only; the app window must be in the foreground |
 | `x` | number | no | `scroll_into_view` without `ref_id`: horizontal scroll position in px |
 | `y` | number | no | `scroll_into_view` without `ref_id`: vertical scroll position in px |
@@ -489,6 +497,10 @@ Text input and keyboard operations.
 | `fill` | `ref_id`, `value` | Set input value directly |
 | `type_text` | `ref_id`, `text` | Type character-by-character |
 | `press_key` | `key` | Press a keyboard key |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
 | `trusted` | boolean | no | `type_text`/`press_key`: deliver real OS keyboard input (`isTrusted: true`). The element is focused first and the call is refused if focus does not land on it. Windows only; the app window must be in the foreground |
 
 **Trusted (OS-level) input:** add `"trusted": true` to `type_text` or `press_key` to
@@ -631,7 +643,11 @@ CSS inspection, accessibility, and performance profiling.
 | `clear_highlights` | — | Remove all debug overlays |
 | `audit_accessibility` | — | Run WCAG accessibility audit |
 | `get_performance` | — | Get performance metrics |
-| `label` | string | no | `highlight`: text shown above the overlay |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `highlight_label` | string | no | `highlight`: text shown above the overlay |
 
 **Example:**
 ```json
@@ -655,6 +671,10 @@ CSS injection for debugging and prototyping.
 |--------|-----------|-------------|
 | `inject` | `css` | Inject custom CSS (replaces previous) |
 | `remove` | — | Remove injected CSS |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
 | `allow_remote` | boolean | no | Allow `@import` and remote `url(...)` in injected CSS (default false: blocked, because remote references turn `css inject` into an exfiltration channel) |
 
 **Example:**
@@ -682,6 +702,10 @@ Access all captured logs from the application.
 | `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Without `since_seq` the newest `limit` entries; with it the oldest after the cursor, and `next_seq` continues after them (read on while `truncated`) |
 | `backend_digest` | `limit` (top N per list, default 10) | Start here: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic |
 | `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited. `since_seq` pages forward like `backend` |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
 | `filter` | string | no | `network`: URL substring filter; `backend`/`stdout`: case-insensitive text match |
 | `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |
 
@@ -959,9 +983,6 @@ Quantitative, deterministic, cross-platform access to the webview's animation en
 | `list` | `webview_label` | `getAnimations()` introspection: declared timing (duration/delay/easing/iterations), computed progress, keyframes, play state, and the animating target. An animation only appears while running/pending — trigger it first. |
 | `scrub` | `selector`, `points`, `capture`, `webview_label` | Pauses the target's animation and seeks it to N evenly-spaced points (`await animation.ready` + double-rAF freezes each frame), returning the exact geometry curve (rect + transform + opacity per point). With `capture: true`, also returns a single contact-sheet **filmstrip PNG** of the whole arc plus a manifest. **CSS-driven animations only** (JS/rAF animations are not seekable — errors clearly and suggests `sample`). |
 | `sample` | `record`, `selector`, `webview_label` | Real-time `requestAnimationFrame` recorder, decoupled from the blocking eval so event-triggered sweeps are catchable: `record: true` arms a watcher, trigger the animation, then `record: false` reads the measured per-frame curve, jank stats (dropped frames, max frame gap), and declared-vs-measured duration. Works for **any** animation including JS/rAF-driven ones. |
-| `restore` | boolean | no | `scrub`: resume the animation afterwards (default true); false leaves it paused at the last point |
-| `cols` | integer | no | `scrub` with `capture`: filmstrip grid columns (default ≈ √points) |
-| `clear` | boolean | no | `sample` read: clear the recorded sessions after returning them |
 
 **Parameters:**
 | Name | Type | Required | Description |
@@ -971,9 +992,12 @@ Quantitative, deterministic, cross-platform access to the webview's animation en
 | `points` | integer | no | Number of evenly-spaced seek points for `scrub` (default: 6) |
 | `capture` | boolean | no | For `scrub`: also return a filmstrip PNG of the arc |
 | `record` | boolean | for `sample` | `true` to arm the recorder, `false` to read results |
+| `restore` | boolean | no | `scrub`: resume the animation afterwards (default true); false leaves it paused at the last point |
+| `cols` | integer | no | `scrub` with `capture`: filmstrip grid columns (default ≈ √points) |
+| `clear` | boolean | no | `sample` read: clear the recorded sessions after returning them |
 | `webview_label` | string | no | Target webview window |
 
-> **Filmstrip + transparent windows:** `scrub`'s filmstrip uses native window capture, which cannot see transparent / GPU-composited windows (no DWM redirection surface). On such a window the capture now **fails with an actionable error** rather than returning a blank frame — use an opaque window, or `list` / `sample` / `scrub` without `capture`.
+> **Filmstrip + transparent windows:** `scrub`'s filmstrip uses native window capture. On Windows that is Windows.Graphics.Capture, which sees transparent / GPU-composited windows. Only its GDI fallback cannot (no DWM redirection surface), and there the capture **fails with an actionable error** rather than returning a blank frame — use an opaque window, or `list` / `sample` / `scrub` without `capture`.
 
 **Examples:**
 ```json

@@ -8,13 +8,12 @@ Victauri supports Tauri 2.0 and later. It is not compatible with Tauri 1.x due t
 
 ### Does Victauri work with any frontend framework?
 
-Yes. Victauri is framework-agnostic. It has been tested with:
+Yes, by design. The JS bridge operates at the DOM level and does not depend on any framework internals, so any framework that renders to the DOM should work. It has been run with:
 - React (18, 19)
 - Vue 3 / Nuxt
-- Svelte / SvelteKit
-- Any framework that renders to the DOM
+- Plain HTML/JS
 
-The JS bridge operates at the DOM level and does not depend on any framework internals.
+It has not been run on a Svelte or SvelteKit app. See [Compatibility](compatibility.md#apps-victauri-has-actually-run-on).
 
 ### Can I use Victauri in production?
 

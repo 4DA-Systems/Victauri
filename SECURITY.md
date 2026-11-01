@@ -42,8 +42,9 @@ We follow coordinated disclosure. We will credit reporters unless they prefer an
 
 - **Tauri core vulnerabilities** — report these to the [Tauri security team](https://github.com/tauri-apps/tauri/security/policy)
 - **Application-level business logic** — vulnerabilities in apps that use Victauri as a dependency are the responsibility of those app authors
-- **Release builds with default settings** — Victauri plugin code is gated behind `#[cfg(debug_assertions)]`, so it does not exist in a standard release binary. Note the exception: a release profile compiled with `debug-assertions = true` *will* include the server — set `VICTAURI_DISABLE=1` in that environment (see the [Security guide](docs/src/security.md#the-one-way-this-gate-can-fail))
+- **Release builds with default settings** — Victauri plugin code is gated behind `#[cfg(debug_assertions)]`, so it does not exist in a standard release binary. Note the exception: a release profile compiled with `debug-assertions = true` *will* include the server — set `VICTAURI_DISABLE=1` in that environment (see the [Security guide](docs/src/security.md#the-one-way-this-gate-can-fail--and-how-to-stop-it))
 - **Denial of service against localhost** — the MCP server is intentionally a debug-only, local-only interface
+- **A page forging its own results** — webview tools read through JavaScript that runs in the page's realm, so script in a page can change what `eval_js`, `dom_snapshot` and the log tools report for its window, and can make IPC calls the log does not show. Results and logs are evidence against a buggy page, not a hostile one (see the [Security guide](docs/src/security.md#what-page-script-can-and-cannot-do-to-the-bridge)). A way for a page to reach *beyond* its own window is in scope
 
 ## Security Design
 

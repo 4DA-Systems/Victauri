@@ -131,9 +131,10 @@ Before interactions (click, fill, type, hover), the bridge performs Playwright-g
 5. Element is not covered by another element (hit-test)
 6. Element does not have `pointer-events:none`
 7. Element is in viewport (with auto-scroll)
-8. Element is stable (not animating)
-9. Element is attached to DOM
-10. Element is actionable for the specific operation
+8. Element is attached to DOM
+9. Element is actionable for the specific operation
+
+Stability is not checked: a click on an element that is mid-animation lands wherever it is at that moment.
 
 ## Dual Protocol: MCP + REST
 
