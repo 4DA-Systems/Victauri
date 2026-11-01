@@ -100,8 +100,13 @@ async fn mock_mcp_handler(State(state): State<MockState>, body: String) -> Respo
             }
 
             let content_text = match tool_name.as_str() {
-                "eval_js" => json!({"result": "evaluated"}).to_string(),
-                "dom_snapshot" => json!({"role": "document", "children": []}).to_string(),
+                // The value of the expression, as `eval_with_return` unwraps it.
+                "eval_js" => json!("evaluated").to_string(),
+                // `snapshot('compact')` in the bridge.
+                "dom_snapshot" => json!({
+                    "tree": "[e1] body\n  [e2] button \"OK\"", "stale_refs": [], "format": "compact"
+                })
+                .to_string(),
                 "find_elements" => json!([{
                     "ref_id": "k3f9e1", "tag": "button", "role": "button", "name": null, "text": "OK",
                     "bounds": {"x": 0, "y": 0, "width": 10, "height": 10},
@@ -129,7 +134,8 @@ async fn mock_mcp_handler(State(state): State<MockState>, body: String) -> Respo
                     }))
                     .into_response();
                 }
-                "invoke_command" => json!({"result": "invoked"}).to_string(),
+                // The command's own return value, unwrapped.
+                "invoke_command" => json!({"status": "ready"}).to_string(),
                 "logs" => json!([{"command": "greet"}]).to_string(),
                 "verify_state" => json!({"passed": true, "divergences": []}).to_string(),
                 "detect_ghost_commands" => json!({
@@ -152,11 +158,35 @@ async fn mock_mcp_handler(State(state): State<MockState>, body: String) -> Respo
                 .to_string(),
                 "resolve_command" => json!([{"name": "save", "score": 0.9}]).to_string(),
                 "get_registry" => json!([{"name": "greet"}]).to_string(),
-                "get_memory_stats" => json!({"working_set_bytes": 50000000}).to_string(),
-                "get_plugin_info" => json!({"version": "0.1.0", "uptime_secs": 100}).to_string(),
+                // `memory.rs` on Windows.
+                "get_memory_stats" => json!({
+                    "working_set_bytes": 50000000, "peak_working_set_bytes": 60000000,
+                    "page_file_bytes": 40000000, "peak_page_file_bytes": 45000000,
+                    "page_fault_count": 1000
+                })
+                .to_string(),
+                "get_plugin_info" => json!({
+                    "version": "0.10.3", "bridge_version": "0.10.3", "port": 7373,
+                    "app": {"identifier": "com.example.app", "product_name": "Example"},
+                    "tools": {"total": 35, "enabled": 35, "enabled_list": [], "disabled_list": []},
+                    "commands": {"allowlist": null, "blocklist": []},
+                    "privacy": {"profile": "full", "redaction_enabled": false},
+                    "capacities": {"event_log": 10000, "eval_timeout_secs": 30},
+                    "registered_commands": 1, "tool_invocations": 1, "uptime_secs": 100
+                })
+                .to_string(),
                 "storage" => json!({"ok": true}).to_string(),
                 "navigate" => json!({"ok": true}).to_string(),
-                "recording" => json!({"started": true, "session_id": "test"}).to_string(),
+                "recording" => match arguments["action"].as_str().unwrap_or("") {
+                    "start" => json!({"started": true, "session_id": "test"}).to_string(),
+                    // A `RecordedSession`.
+                    "stop" => json!({
+                        "id": "test", "started_at": "2026-11-01T00:00:00Z",
+                        "events": [], "checkpoints": []
+                    })
+                    .to_string(),
+                    _ => json!({"ok": true}).to_string(),
+                },
                 "inspect" => {
                     let action = arguments["action"].as_str().unwrap_or("");
                     match action {
@@ -895,10 +925,7 @@ async fn response_parsed_as_json() {
     let mut client = VictauriClient::connect(port).await.unwrap();
 
     let result = client.eval_js("1+1").await.unwrap();
-    assert!(
-        result.is_object() || result.is_string(),
-        "result should be parsed JSON"
-    );
+    assert_eq!(result, json!("evaluated"));
 }
 
 #[tokio::test]

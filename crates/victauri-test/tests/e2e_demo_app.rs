@@ -580,16 +580,18 @@ e2e_test!(assert_semantic_greater_than, {
 e2e_test!(memory_stats_has_working_set, {
     let mut client = VictauriClient::discover().await.unwrap();
     let result = client.get_memory_stats().await.unwrap();
-    let text = serde_json::to_string(&result).unwrap();
-    assert!(text.contains("working_set") || text.contains("rss") || text.contains("bytes"));
+    // The key differs by platform (`memory.rs`); one of them must be there.
+    assert!(
+        result["working_set_bytes"].is_u64() || result["resident_bytes"].is_u64(),
+        "{result}"
+    );
 });
 
 e2e_test!(memory_stats_nonzero, {
     let mut client = VictauriClient::discover().await.unwrap();
-    let result = client.get_memory_stats().await.unwrap();
-    // At least one memory metric should be non-zero
-    let text = serde_json::to_string(&result).unwrap();
-    assert!(text.contains(|c: char| c.is_ascii_digit() && c != '0'));
+    let stats = client.memory_stats().await.unwrap();
+    // A live webview host holds well over a megabyte.
+    assert!(stats.working_set_bytes > 1_048_576, "{stats:?}");
 });
 
 // ── Plugin Info ─────────────────────────────────────────────────────────────
@@ -597,8 +599,12 @@ e2e_test!(memory_stats_nonzero, {
 e2e_test!(plugin_info_version, {
     let mut client = VictauriClient::discover().await.unwrap();
     let result = client.get_plugin_info().await.unwrap();
-    let text = serde_json::to_string(&result).unwrap();
-    assert!(text.contains("0.1") || text.contains("version"));
+    let version = result["version"].as_str().expect("version");
+    assert_eq!(version.split('.').count(), 3, "{version}");
+    assert!(
+        version.split('.').all(|part| part.parse::<u64>().is_ok()),
+        "{version}"
+    );
 });
 
 e2e_test!(plugin_info_tool_count, {
