@@ -409,7 +409,8 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             } else {
                 ipc_blind_note(client).await?
             };
-            let inconclusive = !found && blind.is_none() && network_log_is_full(client, &log).await;
+            let inconclusive =
+                !found && blind.is_none() && network_log_is_full(client, &log).await?;
             Ok(CheckResult {
                 description: check.description(),
                 passed: !found && blind.is_none() && !inconclusive,
@@ -619,12 +620,24 @@ const PAGE_TEXT_JS: &str = "(function() { \
          } \
          return read(document.body); })()";
 
+/// Whether this plugin will never answer the call: the app's privacy settings disable the tool, or
+/// the plugin is too old to have it. Anything else (a page still loading, a busy UI thread) says
+/// nothing about the app, and a negative check that could not look has not passed.
+fn plugin_will_not_answer(error: &TestError) -> bool {
+    match error {
+        TestError::ToolError(message) => message.contains("is disabled by privacy configuration"),
+        // Method not found, or the unknown tool `rmcp` reports as invalid params.
+        TestError::Mcp { code, .. } => matches!(*code, -32601 | -32602),
+        _ => false,
+    }
+}
+
 /// Why a negative IPC check means nothing here, when Victauri reports it cannot observe this page's
 /// IPC. A plugin without the report (or that refuses the tool) has nothing to say.
 async fn ipc_blind_note(client: &mut VictauriClient) -> Result<Option<String>, TestError> {
     let integrity = match client.check_ipc_integrity().await {
         Ok(integrity) => integrity,
-        Err(TestError::ToolError(_) | TestError::Mcp { .. }) => return Ok(None),
+        Err(e) if plugin_will_not_answer(&e) => return Ok(None),
         Err(other) => return Err(other),
     };
     let blind = integrity
@@ -655,17 +668,21 @@ fn log_entry_count(log: &Value) -> usize {
 
 /// Whether older entries may have rolled off the log `ipc_log` was read from. IPC calls share the
 /// bridge's network log with other requests, so the IPC list alone can look short of a full log.
-/// A failed count (eval disabled by the app's privacy profile) falls back to that list.
-async fn network_log_is_full(client: &mut VictauriClient, ipc_log: &Value) -> bool {
+/// With eval disabled by the app's privacy profile, that list is all there is to go on.
+async fn network_log_is_full(
+    client: &mut VictauriClient,
+    ipc_log: &Value,
+) -> Result<bool, TestError> {
     const COUNT_JS: &str =
         "(window.__VICTAURI__?.getNetworkLog(null, 0, { bodies: false }) || []).length";
-    let network = client
-        .eval_js(COUNT_JS)
-        .await
-        .ok()
-        .and_then(|count| count.as_u64());
-    log_entry_count(ipc_log) >= LOG_WINDOW
-        || network.is_some_and(|count| count >= LOG_WINDOW as u64)
+    if log_entry_count(ipc_log) >= LOG_WINDOW {
+        return Ok(true);
+    }
+    match client.eval_js(COUNT_JS).await {
+        Ok(count) => Ok(count.as_u64().is_some_and(|n| n >= LOG_WINDOW as u64)),
+        Err(e) if plugin_will_not_answer(&e) => Ok(false),
+        Err(other) => Err(other),
+    }
 }
 
 fn log_full_detail(which: &str) -> String {
