@@ -521,8 +521,9 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
 /// so the most a log read can return. The log tools default to the newest 100 when not told.
 pub const LOG_WINDOW: usize = 1000;
 
-/// The text a user can read on the page, from the same read `expect_text` polls, plus same-origin
-/// frames. A `null` means there is no page to read, which must not pass as "text not found".
+/// The text a user can read on the page: the bridge's `getPageText`, the read `expect_text` polls,
+/// or the same read done here on a plugin too old to have it. A `null` means there is no page to
+/// read, which must not pass as "text not found" (`getPageText` alone answers '' there).
 async fn page_text(client: &mut VictauriClient) -> Result<String, TestError> {
     match client.eval_js(PAGE_TEXT_JS).await? {
         Value::String(text) => Ok(text),
@@ -534,6 +535,9 @@ async fn page_text(client: &mut VictauriClient) -> Result<String, TestError> {
 }
 
 const PAGE_TEXT_JS: &str = "(function() { \
+         if (!document.body) return null; \
+         var bridge = window.__VICTAURI__; \
+         if (bridge && bridge.getPageText) return bridge.getPageText(); \
          function read(root) { \
            var text = (typeof root.innerText === 'string' ? root.innerText : root.textContent) || ''; \
            var els = root.querySelectorAll('*'); \
@@ -546,7 +550,7 @@ const PAGE_TEXT_JS: &str = "(function() { \
            } \
            return text; \
          } \
-         return document.body ? read(document.body) : null; })()";
+         return read(document.body); })()";
 
 fn log_entry_count(log: &Value) -> usize {
     log.as_array()
@@ -799,6 +803,9 @@ var document = {{ body: {{ innerText: "top", querySelectorAll: function() {{ ret
   {{ tagName: "IFRAME", contentDocument: {{ body: frameBody }} }},
   {{ tagName: "IFRAME", get contentDocument() {{ throw new Error("cross-origin"); }} }}
 ]; }} }} }};
+var window = {{}};
+console.log(JSON.stringify({PAGE_TEXT_JS}));
+window.__VICTAURI__ = {{ getPageText: function() {{ return "from bridge"; }} }};
 console.log(JSON.stringify({PAGE_TEXT_JS}));
 document = {{ body: null }};
 console.log(JSON.stringify({PAGE_TEXT_JS}));
@@ -821,7 +828,10 @@ console.log(JSON.stringify({PAGE_TEXT_JS}));
         );
         let stdout = String::from_utf8_lossy(&out.stdout);
         let lines: Vec<&str> = stdout.lines().collect();
-        assert_eq!(lines, ["\"top in shadow in frame\"", "null"]);
+        assert_eq!(
+            lines,
+            ["\"top in shadow in frame\"", "\"from bridge\"", "null"]
+        );
     }
 
     #[test]

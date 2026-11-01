@@ -814,11 +814,11 @@ impl Locator {
         let js = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
         let contains = |text: &str| {
             format!(
-                "norm(el.textContent).toLowerCase().indexOf(norm({}).toLowerCase()) !== -1",
+                "norm(full(el)).toLowerCase().indexOf(norm({}).toLowerCase()) !== -1",
                 js(text)
             )
         };
-        let equals = |text: &str| format!("norm(el.textContent) === norm({})", js(text));
+        let equals = |text: &str| format!("norm(full(el)) === norm({})", js(text));
 
         let mut conditions = Vec::new();
         let mut substring_in_query = false;
@@ -947,12 +947,18 @@ impl Locator {
 /// The most matches a locator will work with; asked for as this plus one, to detect more.
 const MAX_MATCHES: usize = 1000;
 
-/// JS answering, for each ref, whether its element meets all of `conditions`. Text is compared with
-/// whitespace collapsed, as the bridge's `text_exact` does.
+/// JS answering, for each ref, whether its element meets all of `conditions`. Text is what the
+/// bridge's `text` / `text_exact` judge: `textContent` without script and style source, whitespace
+/// collapsed. A stricter reading here would drop elements the bridge rightly matched.
 fn page_filter_js(refs: &[&str], conditions: &[String]) -> String {
     format!(
         "(function() {{ var refs = {}; var out = []; \
          var norm = function(s) {{ return (s || '').replace(/\\s+/g, ' ').trim(); }}; \
+         var full = function(n) {{ var t = ''; var kids = n.childNodes || []; \
+           for (var k = 0; k < kids.length; k++) {{ var c = kids[k]; \
+             if (c.nodeType === 3) t += c.nodeValue; \
+             else if (c.nodeType === 1 && !/^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE)$/.test(c.tagName)) t += full(c); }} \
+           return t; }}; \
          for (var i = 0; i < refs.length; i++) {{ \
            var el = window.__VICTAURI__?.getRef(refs[i]); \
            out[i] = !!el && {}; }} \
@@ -2034,7 +2040,10 @@ async function run(name, el, want) {{
         let program = format!(
             r#"
 function el(text, attrs) {{
-  return {{ textContent: text,
+  return {{ childNodes: [
+              {{ nodeType: 3, nodeValue: text }},
+              {{ nodeType: 1, tagName: "STYLE", childNodes: [{{ nodeType: 3, nodeValue: "p {{}}" }}] }}
+            ],
            getAttribute: function(k) {{ return k in attrs ? attrs[k] : null; }},
            hasAttribute: function(k) {{ return k in attrs; }} }};
 }}

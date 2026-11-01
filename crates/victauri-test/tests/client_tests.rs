@@ -103,7 +103,7 @@ async fn mock_mcp_handler(State(state): State<MockState>, body: String) -> Respo
                 "eval_js" => json!({"result": "evaluated"}).to_string(),
                 "dom_snapshot" => json!({"role": "document", "children": []}).to_string(),
                 "find_elements" => json!([{
-                    "ref_id": "e1", "tag": "button", "role": "button", "name": null, "text": "OK",
+                    "ref_id": "k3f9e1", "tag": "button", "role": "button", "name": null, "text": "OK",
                     "bounds": {"x": 0, "y": 0, "width": 10, "height": 10},
                     "visible": true, "enabled": true, "value": null
                 }])
@@ -274,12 +274,12 @@ async fn client_click_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.click("e5").await;
+    let _ = client.click("k3f9e5").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "click");
-    assert_eq!(log[0].1["ref_id"], "e5");
+    assert_eq!(log[0].1["ref_id"], "k3f9e5");
 }
 
 // ── fill ──────────────────────────────────────────────────────────────────
@@ -289,12 +289,12 @@ async fn client_fill_sends_input() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.fill("e2", "hello world").await;
+    let _ = client.fill("k3f9e2", "hello world").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "input");
     assert_eq!(log[0].1["action"], "fill");
-    assert_eq!(log[0].1["ref_id"], "e2");
+    assert_eq!(log[0].1["ref_id"], "k3f9e2");
     assert_eq!(log[0].1["value"], "hello world");
 }
 
@@ -305,12 +305,12 @@ async fn client_type_text_sends_input() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.type_text("e3", "typing").await;
+    let _ = client.type_text("k3f9e3", "typing").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "input");
     assert_eq!(log[0].1["action"], "type_text");
-    assert_eq!(log[0].1["ref_id"], "e3");
+    assert_eq!(log[0].1["ref_id"], "k3f9e3");
     assert_eq!(log[0].1["text"], "typing");
 }
 
@@ -336,12 +336,12 @@ async fn client_hover_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.hover("e7").await;
+    let _ = client.hover("k3f9e7").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "hover");
-    assert_eq!(log[0].1["ref_id"], "e7");
+    assert_eq!(log[0].1["ref_id"], "k3f9e7");
 }
 
 // ── focus ─────────────────────────────────────────────────────────────────
@@ -351,12 +351,12 @@ async fn client_focus_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.focus("e8").await;
+    let _ = client.focus("k3f9e8").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "focus");
-    assert_eq!(log[0].1["ref_id"], "e8");
+    assert_eq!(log[0].1["ref_id"], "k3f9e8");
 }
 
 // ── scroll_to ─────────────────────────────────────────────────────────────
@@ -366,12 +366,12 @@ async fn client_scroll_to_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.scroll_to("e9").await;
+    let _ = client.scroll_to("k3f9e9").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "scroll_into_view");
-    assert_eq!(log[0].1["ref_id"], "e9");
+    assert_eq!(log[0].1["ref_id"], "k3f9e9");
 }
 
 // ── select_option ─────────────────────────────────────────────────────────
@@ -381,12 +381,12 @@ async fn client_select_option_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.select_option("e10", &["opt1", "opt2"]).await;
+    let _ = client.select_option("k3f9e10", &["opt1", "opt2"]).await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "select_option");
-    assert_eq!(log[0].1["ref_id"], "e10");
+    assert_eq!(log[0].1["ref_id"], "k3f9e10");
     assert_eq!(log[0].1["values"], json!(["opt1", "opt2"]));
 }
 

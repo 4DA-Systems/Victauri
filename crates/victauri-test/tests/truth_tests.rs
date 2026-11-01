@@ -297,7 +297,7 @@ fn appears_on_third_poll(read: &'static str) -> Handler {
             if *n < 3 {
                 return Ok("[]".to_string());
             }
-            return Ok(json!([el("e1", "div", "Done")]).to_string());
+            return Ok(json!([el("k3f9e1", "div", "Done")]).to_string());
         }
         Ok(read.to_string())
     })
@@ -331,7 +331,7 @@ async fn a_ref_that_went_stale_is_not_an_empty_value() {
     // What `element_script` returns when the ref no longer resolves.
     let (mut c, _) = client(Arc::new(|name, _| {
         if name == "find_elements" {
-            Ok(json!([el("e1", "div", "Done")]).to_string())
+            Ok(json!([el("k3f9e1", "div", "Done")]).to_string())
         } else {
             Ok(json!({"__victauri_missing_ref": true}).to_string())
         }
@@ -365,8 +365,8 @@ async fn and_has_attribute_selects_rather_than_being_ignored() {
     // A plugin that ignores `attribute`, returning both buttons: the page check must still hold.
     let (mut c, calls) = client(Arc::new(|name, args| match name {
         "find_elements" => Ok(json!([
-            el("e1", "button", "Delete everything"),
-            el("e2", "button", "Save")
+            el("k3f9e1", "button", "Delete everything"),
+            el("k3f9e2", "button", "Save")
         ])
         .to_string()),
         "eval_js" => {
@@ -383,13 +383,13 @@ async fn and_has_attribute_selects_rather_than_being_ignored() {
     assert_eq!(args["attribute"], "data-action");
     assert_eq!(args["attribute_value"], "save");
     let calls = calls.lock().unwrap();
-    assert_eq!(calls.last().unwrap().1["ref_id"], "e2");
+    assert_eq!(calls.last().unwrap().1["ref_id"], "k3f9e2");
 }
 
 /// `findElements` honouring its cap over a 120-row page.
 fn page_of_rows(rows: usize) -> Handler {
     let page: Vec<Value> = (0..rows)
-        .map(|i| el(&format!("e{i}"), "li", &format!("row {i}")))
+        .map(|i| el(&format!("k3f9e{i}"), "li", &format!("row {i}")))
         .collect();
     Arc::new(move |name, args| {
         if name != "find_elements" {
@@ -413,7 +413,10 @@ async fn counts_and_positions_see_past_fifty_results() {
             .is_err()
     );
     Locator::css("li").last().click(&mut c).await.unwrap();
-    assert_eq!(calls.lock().unwrap().last().unwrap().1["ref_id"], "e119");
+    assert_eq!(
+        calls.lock().unwrap().last().unwrap().1["ref_id"],
+        "k3f9e119"
+    );
     Locator::css("li").nth(60).click(&mut c).await.unwrap();
 }
 
@@ -451,7 +454,7 @@ async fn text_filters_are_applied_by_the_bridge_on_the_full_text() {
 #[tokio::test]
 async fn a_second_role_narrows_instead_of_replacing_the_first() {
     let (mut c, calls) = client(Arc::new(|_, _| {
-        let mut button = el("e1", "button", "Go");
+        let mut button = el("k3f9e1", "button", "Go");
         button["role"] = json!("button");
         Ok(json!([button]).to_string())
     }))
@@ -473,7 +476,7 @@ async fn presence_and_count_include_hidden_elements() {
 
     // A display:none element is still in the DOM.
     let hidden = || {
-        let mut e = el("e1", "div", "");
+        let mut e = el("k3f9e1", "div", "");
         e["visible"] = json!(false);
         Ok(json!([e]).to_string())
     };
@@ -507,7 +510,7 @@ async fn a_malformed_find_elements_answer_is_not_zero_elements() {
 async fn press_key_focuses_the_located_element_first() {
     let (mut c, calls) = client(Arc::new(|name, _| {
         if name == "find_elements" {
-            Ok(json!([el("e7", "input", "")]).to_string())
+            Ok(json!([el("k3f9e7", "input", "")]).to_string())
         } else {
             Ok("{\"ok\":true}".to_string())
         }
@@ -521,7 +524,7 @@ async fn press_key_focuses_the_located_element_first() {
     let names: Vec<&str> = calls.iter().map(|(name, _)| name.as_str()).collect();
     assert_eq!(names, ["find_elements", "interact", "input"]);
     assert_eq!(calls[1].1["action"], "focus");
-    assert_eq!(calls[1].1["ref_id"], "e7");
+    assert_eq!(calls[1].1["ref_id"], "k3f9e7");
     assert_eq!(calls[2].1["key"], "Enter");
 }
 
@@ -749,6 +752,44 @@ async fn coverage_says_when_the_page_ipc_cannot_be_seen() {
     );
 }
 
+// ── The deepest-match shape ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_text_locator_works_with_the_deepest_match_having_no_role() {
+    // <button><span>Save</span></button>: bare text answers with the span, role null.
+    let (mut c, calls) = client(Arc::new(|name, _| {
+        if name == "find_elements" {
+            Ok(json!([el("k3f9e4", "span", "Save")]).to_string())
+        } else {
+            Ok("{\"ok\":true}".to_string())
+        }
+    }))
+    .await;
+    Locator::text("Save").click(&mut c).await.unwrap();
+    assert_eq!(calls.lock().unwrap().last().unwrap().1["ref_id"], "k3f9e4");
+
+    // With a role, the bridge judges depth among elements having that role, so the query must
+    // carry both for it to answer with the button; `and_role` must not filter the span client-side
+    // out of a query that never named a role.
+    let (mut c, calls) = client(Arc::new(|_, _| {
+        let mut button = el("k3f9e3", "button", "Save");
+        button["role"] = json!("button");
+        Ok(json!([button]).to_string())
+    }))
+    .await;
+    let n = Locator::text("Save")
+        .and_role("button")
+        .count(&mut c)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+    let args = bridge_args(&calls);
+    assert_eq!(
+        (&args["text"], &args["role"]),
+        (&json!("Save"), &json!("button"))
+    );
+}
+
 // ── Smoke helpers ───────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -756,7 +797,7 @@ async fn an_empty_snapshot_is_not_valid() {
     let (mut c, _) = client(answers(r#"{"tree":"","stale_refs":[],"format":"compact"}"#)).await;
     assert!(c.assert_dom_snapshot_valid().await.is_err());
     let (mut c, _) = client(answers(
-        r#"{"tree":"[e0] body\n","stale_refs":[],"format":"compact"}"#,
+        r#"{"tree":"[k3f9e0] body\n","stale_refs":[],"format":"compact"}"#,
     ))
     .await;
     c.assert_dom_snapshot_valid().await.unwrap();
@@ -800,9 +841,9 @@ async fn text_by_id_is_the_text_content() {
     let (mut c, _) = client(Arc::new(|name, _| {
         if name == "dom_snapshot" {
             Ok(
-                json!({"tree":{"ref_id":"e0","tag":"body","text":null,"attributes":{},"children":[
-                {"ref_id":"e1","tag":"p","text":null,"attributes":{"id":"wrapper"},"children":[
-                    {"ref_id":"e2","tag":"span","text":"hello","attributes":{},"children":[]}]}
+                json!({"tree":{"ref_id":"k3f9e0","tag":"body","text":null,"attributes":{},"children":[
+                {"ref_id":"k3f9e1","tag":"p","text":null,"attributes":{"id":"wrapper"},"children":[
+                    {"ref_id":"k3f9e2","tag":"span","text":"hello","attributes":{},"children":[]}]}
             ]},"stale_refs":[],"format":"json"})
                 .to_string(),
             )

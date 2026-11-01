@@ -272,7 +272,7 @@ impl<'a> WaitForBuilder<'a> {
 ///
 /// let mut client = VictauriClient::connect(7373).await.unwrap();
 /// let title = client.eval_js("document.title").await.unwrap();
-/// client.click("e3").await.unwrap();
+/// client.click("k3f9e3").await.unwrap(); // a ref from a snapshot or find_elements
 /// let snapshot = client.dom_snapshot().await.unwrap();
 /// ```
 pub struct VictauriClient {
