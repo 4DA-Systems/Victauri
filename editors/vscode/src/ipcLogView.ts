@@ -1,6 +1,17 @@
 import * as vscode from "vscode";
 import { IpcEntry, VictauriClient } from "./client";
 
+/**
+ * What an entry's status means. The bridge reports `ok` / `error` / `pending` / `unknown`; the
+ * HTTP status says nothing, as a failed Tauri command answers 200 too. Numbers are only for a
+ * plugin older than that field.
+ */
+function outcome(status: unknown): "ok" | "error" | "neutral" {
+  if (status === "ok" || status === 200) return "ok";
+  if (status === "pending" || status === "unknown") return "neutral";
+  return "error";
+}
+
 export class IpcLogProvider
   implements vscode.TreeDataProvider<IpcEntry>
 {
@@ -19,7 +30,8 @@ export class IpcLogProvider
     );
 
     const duration = entry.duration_ms != null ? `${entry.duration_ms}ms` : "";
-    const status = entry.status === 200 ? "" : ` [${entry.status}]`;
+    const result = outcome(entry.status);
+    const status = result === "ok" ? "" : ` [${entry.status}]`;
     item.description = `${duration}${status}`;
 
     item.tooltip = [
@@ -27,14 +39,15 @@ export class IpcLogProvider
       `Status: ${entry.status}`,
       `Duration: ${entry.duration_ms ?? "?"}ms`,
       `Time: ${new Date(entry.timestamp).toLocaleTimeString()}`,
+      ...(entry.error ? [`Error: ${entry.error}`] : []),
     ].join("\n");
 
-    item.iconPath = new vscode.ThemeIcon(
-      entry.status === 200 ? "check" : "error",
-      entry.status === 200
-        ? new vscode.ThemeColor("testing.iconPassed")
-        : new vscode.ThemeColor("testing.iconFailed")
-    );
+    item.iconPath =
+      result === "ok"
+        ? new vscode.ThemeIcon("check", new vscode.ThemeColor("testing.iconPassed"))
+        : result === "error"
+          ? new vscode.ThemeIcon("error", new vscode.ThemeColor("testing.iconFailed"))
+          : new vscode.ThemeIcon("circle-outline");
 
     item.contextValue = "ipcEntry";
     return item;

@@ -56,28 +56,39 @@ export function rustStr(s: string): string {
   return `"${escapeRustStr(s)}"`;
 }
 
+const IMPORTS = "// In tests/*.rs, with: use victauri_test::{e2e_test, Locator};";
+
+/**
+ * How a test finds this element again. Never its ref: a ref only means something after a snapshot
+ * in the session that took it, so a generated `client.click("e3")` failed on a fresh app.
+ */
+function locatorFor(node: DomNode): string | undefined {
+  if (node.role && node.name) return `Locator::role(${rustStr(node.role)}).name(${rustStr(node.name)})`;
+  const text = node.name || node.text;
+  return text ? `Locator::text(${rustStr(text)})` : undefined;
+}
+
 /** The `e2e_test!` generated for a DOM Explorer node ("Generate Test for Element"). */
 export function generateElementTest(node: DomNode): string {
-  const lines: string[] = [];
-  lines.push("e2e_test!(test_element, |client| async move {");
-
-  if (node.ref_id) {
-    const refId = rustStr(node.ref_id);
-    if (node.tag === "input" || node.tag === "textarea") {
-      lines.push(`    client.fill(${refId}, "test value").await.unwrap();`);
-    } else if (node.tag === "button" || node.tag === "a") {
-      lines.push(`    client.click(${refId}).await.unwrap();`);
-    } else if (node.name) {
-      lines.push(
-        `    Locator::text(${rustStr(node.name)})`,
-        `        .expect(&mut client)`,
-        `        .to_be_visible()`,
-        `        .await`,
-        `        .unwrap();`
-      );
-    }
+  const lines: string[] = [IMPORTS, "e2e_test!(test_element, |client| async move {"];
+  const locator = locatorFor(node);
+  if (!locator) {
+    // Not an empty test that passes: say what is missing where it will be seen.
+    const why = `<${node.tag}> has no role, name or text to find it by: give it a data-testid and use Locator::test_id`;
+    lines.push(`    todo!("{}", ${rustStr(why)});`);
+  } else if (node.tag === "input" || node.tag === "textarea") {
+    lines.push(`    ${locator}`, `        .fill(&mut client, "test value")`, "        .await", "        .unwrap();");
+  } else if (node.tag === "button" || node.tag === "a") {
+    lines.push(`    ${locator}`, "        .click(&mut client)", "        .await", "        .unwrap();");
+  } else {
+    lines.push(
+      `    ${locator}`,
+      "        .expect(&mut client)",
+      "        .to_be_visible()",
+      "        .await",
+      "        .unwrap();"
+    );
   }
-
   lines.push("});");
   return lines.join("\n");
 }
@@ -90,18 +101,19 @@ export function generateElementTest(node: DomNode): string {
 export function generateCommandTest(fnName: string): string {
   const ident = fnName.replace(/[^A-Za-z0-9_]/g, "_");
   const name = escapeRustStr(fnName);
-  // Inside `assert!`'s format string the name's own braces must be doubled too — before
+  // Inside `println!`'s format string the name's own braces must be doubled too — before
   // escaping, so the braces of a `\u{…}` escape are left alone.
   const fmtName = escapeRustStr(fnName.replace(/[{}]/g, (b) => b + b));
-  return `e2e_test!(test_${ident}, |client| async move {
+  return `${IMPORTS}
+e2e_test!(test_${ident}, |client| async move {
+    // Fails if the command errors. If it takes arguments, pass Some(serde_json::json!({ ... })).
     let result = client
         .invoke_command("${name}", None)
         .await
         .unwrap();
 
-    // Verify the command executed successfully
-    assert!(result.is_object() || result.is_string() || result.is_number(),
-        "${fmtName} should return a value, got: {result}");
+    // A command may return anything, even null: assert on what this one should return.
+    println!("${fmtName} returned: {result}");
 });
 `;
 }

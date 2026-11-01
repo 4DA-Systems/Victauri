@@ -2,8 +2,10 @@ import * as vscode from "vscode";
 
 const COMMAND_PATTERN =
   /^\s*#\[tauri::command(?:\(.*\))?\]\s*$/;
+// Rust's order of qualifiers: visibility, async, unsafe. The group leaves out a raw identifier's
+// `r#`, which is not part of the command's name.
 const FN_PATTERN =
-  /^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)/;
+  /^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s+(?:r#)?(\w+)/;
 
 export class TauriCommandLensProvider implements vscode.CodeLensProvider {
   provideCodeLenses(document: vscode.TextDocument): vscode.CodeLens[] {
