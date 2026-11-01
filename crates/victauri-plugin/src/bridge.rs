@@ -757,6 +757,27 @@ pub(crate) fn closure_may_have_run(error: &str) -> bool {
     error.contains(STARTED_OUTCOME_UNKNOWN) || error.contains(PANICKED_ON_MAIN)
 }
 
+/// Tauri's custom protocol, as each platform's webview serves it. `useHttpsScheme` moves it to
+/// `https://` where it is an `http://` origin (the `http://` one then serves nothing).
+fn custom_protocol_entry(https: bool) -> String {
+    if cfg!(any(windows, target_os = "android")) {
+        format!(
+            "{}://tauri.localhost/",
+            if https { "https" } else { "http" }
+        )
+    } else {
+        "tauri://localhost/".to_string()
+    }
+}
+
+/// Whether the app's windows set `useHttpsScheme`. Read through serde: the field does not exist on
+/// the oldest Tauri 2 this crate supports.
+fn uses_https_scheme<W: serde::Serialize>(windows: &[W]) -> bool {
+    windows.iter().any(|window| {
+        serde_json::to_value(window).is_ok_and(|v| v["useHttpsScheme"] == serde_json::json!(true))
+    })
+}
+
 impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
         let label = label.map(str::to_string);
@@ -975,12 +996,9 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
         if let Some(dev_url) = &self.config().build.dev_url {
             return Some(dev_url.to_string());
         }
-        // Tauri's custom protocol, as each platform's webview serves it.
-        Some(if cfg!(any(windows, target_os = "android")) {
-            "http://tauri.localhost/".to_string()
-        } else {
-            "tauri://localhost/".to_string()
-        })
+        Some(custom_protocol_entry(uses_https_scheme(
+            &self.config().app.windows,
+        )))
     }
 
     fn app_data_dir(&self) -> Result<std::path::PathBuf, String> {
@@ -1412,6 +1430,34 @@ fn win_click(hwnd: isize, x: f64, y: f64, device_pixel_ratio: Option<f64>) -> Re
             "SendInput delivered {sent}/{} mouse events",
             inputs.len()
         ))
+    }
+}
+
+#[cfg(test)]
+mod https_entry_tests {
+    use tauri::utils::config::WindowConfig;
+
+    use super::{custom_protocol_entry, uses_https_scheme};
+
+    /// On the real config type: the field is read by its serialized name.
+    #[test]
+    fn use_https_scheme_is_read_from_the_real_window_config() {
+        let plain: WindowConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let https: WindowConfig =
+            serde_json::from_value(serde_json::json!({"useHttpsScheme": true})).unwrap();
+        assert!(!uses_https_scheme(std::slice::from_ref(&plain)));
+        assert!(uses_https_scheme(&[plain, https]));
+        assert!(!uses_https_scheme::<WindowConfig>(&[]));
+    }
+
+    #[test]
+    fn the_entry_url_follows_the_scheme_where_the_scheme_exists() {
+        if cfg!(windows) {
+            assert_eq!(custom_protocol_entry(true), "https://tauri.localhost/");
+            assert_eq!(custom_protocol_entry(false), "http://tauri.localhost/");
+        } else {
+            assert_eq!(custom_protocol_entry(true), "tauri://localhost/");
+        }
     }
 }
 

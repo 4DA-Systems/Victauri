@@ -95,6 +95,15 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
         return serde_json::json!({ "error": msg });
     }
 
+    // One result and a note about it (`eval_js`) is still one result.
+    if let [ContentBlock::Text(value), ContentBlock::Text(note)] = result.content.as_slice()
+        && note.text.starts_with("note: ")
+    {
+        let parsed = serde_json::from_str::<serde_json::Value>(&value.text)
+            .unwrap_or_else(|_| serde_json::Value::String(value.text.clone()));
+        return serde_json::json!({ "result": parsed, "note": note.text });
+    }
+
     if result.content.len() == 1 {
         return match &result.content[0] {
             ContentBlock::Text(tc) => {
@@ -171,6 +180,22 @@ mod tests {
         assert_eq!(json["result"]["type"], "image");
         assert_eq!(json["result"]["data"], "aWJhc2U2NA==");
         assert_eq!(json["result"]["mimeType"], "image/png");
+    }
+
+    /// `eval_js` adds a note to a block's `undefined`; a REST caller still gets one result.
+    #[test]
+    fn a_result_with_a_note_keeps_the_single_result_shape() {
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("undefined"),
+            ContentBlock::text("note: code starting with `{` runs as a block"),
+        ]);
+        let json = to_rest_json(result);
+        assert_eq!(json["result"], "undefined");
+        assert_eq!(json["note"], "note: code starting with `{` runs as a block");
+        // Anything else with several blocks stays a list.
+        let result =
+            CallToolResult::success(vec![ContentBlock::text("one"), ContentBlock::text("two")]);
+        assert!(to_rest_json(result)["result"].is_array());
     }
 
     #[test]

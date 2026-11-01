@@ -863,9 +863,12 @@ pub struct LogsParams {
     /// For backend: only entries whose structured fields equal these values
     /// (text compare, case-insensitive), e.g. `{"run_type": "foreground_fast"}`.
     pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
-    /// Maximum number of entries to return; 0 returns none. Defaults: 100 for ipc and
-    /// network, 20 for `slow_ipc`, everything captured for the other actions.
+    /// Maximum number of entries to return, keeping the newest; 0 returns none. Defaults to 100,
+    /// and 20 for `slow_ipc`.
     pub limit: Option<usize>,
+    /// For ipc and network: false leaves out args and request/response bodies, so a read of many
+    /// entries stays small. Default true.
+    pub bodies: Option<bool>,
     /// Threshold in milliseconds for slow IPC calls (for `slow_ipc`).
     pub threshold_ms: Option<u64>,
     /// When true (for ipc action), await up to 500ms for the latest IPC entry's

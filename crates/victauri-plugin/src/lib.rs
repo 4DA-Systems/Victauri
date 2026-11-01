@@ -1433,7 +1433,35 @@ fn emit_security_banner(port: u16) {
     tracing::warn!("{banner}");
     // An app with no tracing subscriber (only `log`, say) prints nothing for the line above, and
     // this banner must never be silent.
-    eprintln!("{banner}");
+    write_banner(&mut std::io::stderr(), &banner);
+}
+
+/// Not `eprintln!`: it panics when stderr is gone (a closed pipe), and this runs on the way to
+/// `on_ready`, which would then never run.
+#[cfg(debug_assertions)]
+fn write_banner(out: &mut impl std::io::Write, banner: &str) {
+    let _ = writeln!(out, "{banner}");
+}
+
+#[cfg(all(test, debug_assertions))]
+mod banner_tests {
+    struct GoneStderr;
+    impl std::io::Write for GoneStderr {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_closed_stderr_does_not_panic_the_banner() {
+        super::write_banner(&mut GoneStderr, "banner");
+        let mut out = Vec::new();
+        super::write_banner(&mut out, "banner");
+        assert_eq!(out, b"banner\n");
+    }
 }
 
 /// Resolve configured `db_search_paths` against multiple stable anchors so a

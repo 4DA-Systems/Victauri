@@ -529,14 +529,6 @@ fn click_handles_svg_opacity_and_hit_targets() {
              var r = await B.click(refOf('#w'), 200); T(r.ok, J(r)); T($('#c').checked, 'toggled');",
         ),
         (
-            "ancestor_on_top_is_covered",
-            "<div id=a><button id=b>x</button></div>",
-            "var n = 0; $('#b').onclick = function(){n++}; \
-             document.elementFromPoint = function(){ return $('#a'); }; \
-             var r = await B.click(refOf('#b'), 150); \
-             T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);",
-        ),
-        (
             "label_of_the_control_on_top_is_not_covering",
             "<label id=l>Name <input type=checkbox id=c></label>",
             "document.elementFromPoint = function(){ return $('#l'); }; \
@@ -825,12 +817,6 @@ fn wait_for_survives_a_missing_body() {
             "var r = await Promise.race([ B.waitFor({condition:'selector', value:'##', timeout_ms:5000, poll_ms:10}), \
                new Promise(function(res){ setTimeout(function(){ res('HUNG'); }, 1500); }) ]); \
              T(r !== 'HUNG' && r.ok === false, J(r));",
-        ),
-        (
-            "text_gone_with_no_body_is_met",
-            "<div>x</div>",
-            "document.documentElement.removeChild(document.body); \
-             var r = await B.waitFor({condition:'text_gone', value:'x', timeout_ms:50}); T(r.ok, J(r));",
         ),
     ]);
 }
@@ -1121,4 +1107,278 @@ fn trusted_probe_matches_the_actionability_rules() {
         ),
         ("foreign_ref", "<i></i>", foreign.as_str()),
     ]);
+}
+
+// ── 0.10.3 review round ──────────────────────────────────────────────────────
+
+/// What an element does not paint itself (a stroke-only circle, a `<g>` with an empty centre, a
+/// wrapped inline link with its centre in a line gap) is hit-tested as its ancestor. That is no
+/// cover: the element is still there, inside the ancestor's box.
+#[test]
+fn an_ancestor_hit_is_cover_only_when_the_element_left_its_box() {
+    const RECTS: &str = r"
+        function box(el, x, y, w, h) { el.getBoundingClientRect = function() {
+            return { left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, x: x, y: y }; }; }
+    ";
+    let inside = format!(
+        r"{RECTS}
+        box($('#a'), 0, 0, 200, 200); box($('#s'), 50, 50, 20, 20);
+        var n = 0; $('#s').addEventListener('click', function() {{ n++; }});
+        document.elementFromPoint = function() {{ return $('#a'); }};
+        var r = await B.click(refOf('#s'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    );
+    let outside = format!(
+        r"{RECTS}
+        box($('#a'), 0, 0, 200, 200); box($('#b'), 400, 400, 20, 20);
+        var n = 0; $('#b').onclick = function() {{ n++; }};
+        document.elementFromPoint = function() {{ return $('#a'); }};
+        var r = await B.click(refOf('#b'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);"
+    );
+    let wrapped = format!(
+        r"{RECTS}
+        box($('#l'), 0, 0, 100, 40);
+        $('#l').getClientRects = function() {{ return [{{ left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16 }},
+            {{ left: 0, top: 24, right: 30, bottom: 40, width: 30, height: 16 }}]; }};
+        var n = 0; $('#l').addEventListener('click', function(e) {{ e.preventDefault(); n++; }});
+        document.elementFromPoint = function(x) {{ return x === 90 ? $('#l') : $('#o'); }};
+        var r = await B.click(refOf('#l'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    );
+    let wrapped_covered = format!(
+        r"{RECTS}
+        box($('#l'), 0, 0, 100, 40);
+        $('#l').getClientRects = function() {{ return [{{ left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16 }},
+            {{ left: 0, top: 24, right: 30, bottom: 40, width: 30, height: 16 }}]; }};
+        document.elementFromPoint = function() {{ return $('#o'); }};
+        var r = await B.click(refOf('#l'), 150); T(r.ok === false, J(r));"
+    );
+    check(&[
+        (
+            "stroke_only_svg",
+            "<div id=a><svg width=9 height=9><circle id=s r=4></circle></svg></div>",
+            &inside,
+        ),
+        (
+            "outside_the_box",
+            "<div id=a><button id=b>x</button></div>",
+            &outside,
+        ),
+        (
+            "wrapped_inline_probes_its_first_line",
+            "<p><a id=l href='#x'>wrapped</a><span id=o>other</span></p>",
+            &wrapped,
+        ),
+        (
+            "wrapped_inline_really_covered",
+            "<p><a id=l href='#x'>wrapped</a><span id=o>other</span></p>",
+            &wrapped_covered,
+        ),
+    ]);
+}
+
+#[test]
+fn wait_for_is_not_met_by_a_page_with_no_body_and_rejects_a_bad_selector() {
+    check(&[
+        (
+            "text_gone",
+            "<div>x</div>",
+            "document.documentElement.removeChild(document.body); \
+             var r = await B.waitFor({condition:'text_gone', value:'x', timeout_ms:50, poll_ms:10}); \
+             T(r.ok === false && r.error.indexOf('timeout') === 0, J(r));",
+        ),
+        (
+            "selector_gone",
+            "<div id=x></div>",
+            "document.documentElement.removeChild(document.body); \
+             var r = await B.waitFor({condition:'selector_gone', value:'#x', timeout_ms:50, poll_ms:10}); \
+             T(r.ok === false && r.error.indexOf('timeout') === 0, J(r));",
+        ),
+        (
+            "text_gone_waits_for_the_new_body",
+            "<div>old</div>",
+            "var body = document.body; document.documentElement.removeChild(body); \
+             setTimeout(function(){ body.textContent = 'new'; document.documentElement.appendChild(body); }, 40); \
+             var r = await B.waitFor({condition:'text_gone', value:'old', timeout_ms:2000, poll_ms:10}); T(r.ok, J(r));",
+        ),
+        (
+            "invalid_selector_is_rejected",
+            "<div></div>",
+            "var r = await B.waitFor({condition:'selector_gone', value:'##', timeout_ms:5000, poll_ms:10}); \
+             T(r.ok === false && r.hint === 'CHECK_INPUT', J(r)); \
+             T(r.error.indexOf('invalid CSS selector') === 0, J(r));",
+        ),
+        (
+            "ipc_idle_cannot_be_judged_blind",
+            "<div></div>",
+            "console.warn('IPC custom protocol failed, Tauri will now use the postMessage interface instead'); \
+             T(B.getIpcCaptureStatus().capture === 'none', 'capture'); \
+             var r = await B.waitFor({condition:'ipc_idle', timeout_ms:2000, poll_ms:10}); \
+             T(r.ok === false && r.ipc_capture === 'none', J(r)); T(r.elapsed_ms < 1000, J(r));",
+        ),
+    ]);
+}
+
+#[test]
+fn a_reopened_xhr_owns_its_delay_timer() {
+    check(&[
+        (
+            "abort_cancels_the_second_delay_after_the_first_timer_fired",
+            "<div></div>",
+            "AGENT.addRoute({pattern:'/slow', action:'delay', delay_ms: 300}); \
+             var ev = []; var x = new XMLHttpRequest(); \
+             ['abort','loadend'].forEach(function(t){ x.addEventListener(t, function(){ev.push(t)}); }); \
+             x.open('GET', 'http://127.0.0.1:9/slow'); x.send(); \
+             await new Promise(function(r){setTimeout(r, 150)}); \
+             x.open('GET', 'http://127.0.0.1:9/slow?2'); x.send(); \
+             await new Promise(function(r){setTimeout(r, 200)}); \
+             x.abort(); \
+             T(J(ev) === '[\"abort\",\"loadend\"]', J(ev)); \
+             var log = B.getNetworkLog(); T(log[1].status === 'aborted', J(log));",
+        ),
+        (
+            "abort_after_reopen_with_no_send_fires_nothing",
+            "<div></div>",
+            "AGENT.addRoute({pattern:'/slow', action:'delay', delay_ms: 300}); \
+             var ev = []; var x = new XMLHttpRequest(); \
+             ['abort','loadend'].forEach(function(t){ x.addEventListener(t, function(){ev.push(t)}); }); \
+             x.open('GET', 'http://127.0.0.1:9/slow'); x.send(); \
+             x.open('GET', 'http://127.0.0.1:9/other'); x.abort(); \
+             T(J(ev) === '[]', J(ev));",
+        ),
+    ]);
+}
+
+#[test]
+fn abort_after_a_route_delay_ended_does_not_rewrite_the_entry() {
+    check_web(&[(
+        "fulfilled_then_aborted",
+        "<div></div>",
+        "AGENT.addRoute({pattern:'/m', action:'fulfill', body:'{}', delay_ms: 10}); \
+         var c = new AbortController(); \
+         var resp = await fetch('http://h/m', {signal: c.signal}); T(resp.ok, 'ok'); \
+         var before = B.getNetworkLog()[0].status; c.abort(); \
+         var e = B.getNetworkLog()[0]; T(e.status === before && e.status !== 'aborted', J(e));",
+    )]);
+}
+
+#[test]
+fn find_elements_normalises_the_text_needle_and_label_queries_follow_the_rules() {
+    check(&[
+        (
+            "whitespace_in_the_needle",
+            "<p id=p>hello   there</p>",
+            "var r = B.findElements({text:'hello  \\n there'}); T(r.length === 1 && r[0].tag === 'p', J(r)); \
+             T(B.findElements({text:'  '}).length === 0, 'blank needle must not match everything');",
+        ),
+        (
+            "label_dedupes",
+            "<label for=i>Name</label><label for=i>Name again</label><input id=i>",
+            "var r = B.findElements({label:'name'}); T(r.length === 1, J(r));",
+        ),
+        (
+            "label_respects_hidden",
+            "<label for=h>Secret</label><input id=h style='display:none'>",
+            "T(B.findElements({label:'secret'}).length === 0, 'hidden'); \
+             var r = B.findElements({label:'secret', include_hidden:true}); \
+             T(r.length === 1 && r[0].visible === false, J(r));",
+        ),
+    ]);
+}
+
+#[test]
+fn select_option_with_no_values_clears_only_a_multi_select() {
+    check(&[
+        (
+            "multiple_clears",
+            "<select multiple id=s><option value=a selected>A<option value=b selected>B</select>",
+            "var n = 0; $('#s').addEventListener('change', function(){n++}); \
+             var r = await B.selectOption(refOf('#s'), [], 200); T(r.ok, J(r)); \
+             T($('#s').selectedOptions.length === 0, 'cleared'); T(n === 1, 'change fired');",
+        ),
+        (
+            "single_still_refuses",
+            "<select id=s><option value=a>A<option value=b>B</select>",
+            "var r = await B.selectOption(refOf('#s'), [], 200); T(r.ok === false, J(r));",
+        ),
+    ]);
+}
+
+#[test]
+fn a_transparent_subtree_is_marked_all_the_way_down() {
+    check(&[(
+        "children",
+        "<div style='opacity:0'><section><button>in</button></section></div><button>out</button>",
+        "var t = B.snapshot().tree.split('\\n'); \
+         var inn = t.filter(function(l){return l.indexOf('\"in\"') !== -1})[0]; \
+         var out = t.filter(function(l){return l.indexOf('\"out\"') !== -1})[0]; \
+         T(inn.indexOf('[transparent]') !== -1, inn); T(out.indexOf('[transparent]') === -1, out); \
+         var buttons = []; (function walk(n){ if (n.tag === 'button') buttons.push(n); (n.children||[]).forEach(walk); })(B.snapshot('json').tree); \
+         T(buttons[0].transparent === true, J(buttons[0])); T(!buttons[1].transparent, J(buttons[1]));",
+    )]);
+}
+
+/// The log projections used to read "no bridge" as "nothing happened": `?.get() || []`.
+#[test]
+fn log_projections_refuse_a_page_with_no_bridge() {
+    use victauri_plugin::mcp::ipc_log_js::{
+        ghost_ipc_outcomes_js, ipc_catalog_projection_js, ipc_integrity_js,
+        ipc_timing_projection_js, slow_ipc_js, trimmed_log_js,
+    };
+    let build = |name: &str, code: String| {
+        (
+            name.to_string(),
+            format!(
+                "var threw = null; try {{ new Function('window', {src})({{}}); }} catch (e) {{ threw = e.message; }} \
+                 T(threw === 'the page has no Victauri bridge', 'got: ' + threw);",
+                src = serde_json::to_string(&code).unwrap()
+            ),
+        )
+    };
+    let cases = [
+        build(
+            "trimmed",
+            trimmed_log_js("window.__VICTAURI__?.getIpcLog(5)", 5),
+        ),
+        build("integrity", ipc_integrity_js(1000)),
+        build("slow", slow_ipc_js(10, 5)),
+        build("ghost", ghost_ipc_outcomes_js(None)),
+        build("timing", ipc_timing_projection_js(None)),
+        build("catalog", ipc_catalog_projection_js().to_string()),
+    ];
+    let cases: Vec<(&str, &str, &str)> = cases
+        .iter()
+        .map(|(n, c)| (n.as_str(), "<div></div>", c.as_str()))
+        .collect();
+    check(&cases);
+}
+
+/// `ipc_was_called_with` must be able to tell "called with other args" from "args not in the log".
+#[test]
+fn ipc_log_entries_say_when_args_are_not_complete() {
+    use victauri_plugin::mcp::ipc_log_js::trimmed_log_js;
+    let trim = trimmed_log_js("window.__VICTAURI__.getIpcLog(0)", 100);
+    let code = format!(
+        r"
+        function call(cmd, body) {{ return fetch('http://ipc.localhost/' + cmd, {{ method: 'POST', body: body }}).catch(function() {{}}); }}
+        await call('small', JSON.stringify({{ a: 1 }}));
+        await call('none', '{{}}');
+        await call('trimmed', JSON.stringify({{ s: 'x'.repeat(5000) }}));
+        await call('huge', JSON.stringify({{ s: 'x'.repeat(70000) }}));
+        await call('binary', new Uint8Array(3));
+        var by = {{}};
+        B.getIpcLog().forEach(function(e) {{ by[e.command] = e; }});
+        T(by.small.args.a === 1 && by.small.args_truncated === undefined, J(by.small));
+        T(by.none.args_truncated === undefined, J(by.none));
+        T(by.trimmed.args_truncated === undefined, 'whole in the bridge');
+        T(by.huge.args_truncated === true, 'over the capture cap');
+        T(J(by.binary.args) === '{{}}' && by.binary.args_truncated === true, J(by.binary));
+        var view = {{}};
+        (function() {{ {trim} }})().forEach(function(e) {{ view[e.command] = e; }});
+        T(view.small.args.a === 1 && view.small.args_truncated === undefined, J(view.small));
+        T(view.trimmed.args_truncated === true && typeof view.trimmed.args === 'string', J(view.trimmed).slice(0, 200));
+        var light = B.getIpcLog(0, {{ bodies: false }});
+        T(light.every(function(e) {{ return e.args === undefined && e.args_truncated === undefined; }}), 'bodies:false');
+        "
+    );
+    check(&[("args", "<div></div>", &code)]);
 }

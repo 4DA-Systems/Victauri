@@ -48,10 +48,11 @@ use crate::VictauriState;
 use crate::bridge::WebviewBridge;
 
 use helpers::{
-    RecoveryHint, build_ghost_report, ghost_ipc_outcomes_js, ghost_ipc_projection_js,
-    ipc_catalog_projection_js, ipc_timing_projection_js, ipc_timing_stats, js_string, json_result,
-    json_truthy, merge_command_catalog, missing_param, sanitize_css_color, sanitize_injected_css,
-    tool_disabled, tool_error, tool_error_with_hint, truncate_at_char_boundary, validate_url,
+    NO_BRIDGE_GUARD, RecoveryHint, build_ghost_report, ghost_ipc_outcomes_js,
+    ghost_ipc_projection_js, ipc_catalog_projection_js, ipc_timing_projection_js, ipc_timing_stats,
+    js_string, json_result, json_truthy, merge_command_catalog, missing_param, sanitize_css_color,
+    sanitize_injected_css, tool_disabled, tool_error, tool_error_with_hint,
+    truncate_at_char_boundary, validate_url,
 };
 
 // MCP tool *parameter* types are an internal protocol surface: they are deserialized
@@ -395,6 +396,9 @@ const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long a page that stopped answering gets to be replaced (see `leave_stuck_page`).
 const STUCK_PAGE_LEAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long `window resize` / `move_to` wait for the OS to apply the change (see `settle_window`).
+const WINDOW_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How a failed liveness probe starts (see `probe_bridge`).
 const BRIDGE_DOWN: &str = "bridge not responding";
@@ -1049,7 +1053,16 @@ impl VictauriMcpHandler {
             .eval_with_return_timeout(&code, params.webview_label.as_deref(), eval_timeout)
             .await
         {
-            Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
+            // A timeout is an answer (`ok:false`). A hint means the wait could never have ended
+            // well: a mistake in the call.
+            Ok(result) => {
+                let refused = page_json::parse_page_json::<serde_json::Value>(&result)
+                    .is_ok_and(|v| v.get("hint").is_some());
+                match page_action_error(&result).filter(|_| refused) {
+                    Some(message) => tool_error(message),
+                    None => CallToolResult::success(vec![ContentBlock::text(result)]),
+                }
+            }
             Err(e) => tool_error(e),
         }
     }
@@ -1547,23 +1560,13 @@ impl VictauriMcpHandler {
         {
             return tool_error(e);
         }
-        // A pattern that could never match used to read as an empty directory.
-        if let Some(pattern) = params.pattern.as_deref() {
-            if pattern.len() > MAX_GLOB_PATTERN_LEN {
-                return tool_error_with_hint(
-                    format!("pattern longer than {MAX_GLOB_PATTERN_LEN} bytes"),
-                    RecoveryHint::CheckInput,
-                );
-            }
-            if pattern.contains(['[', ']']) {
-                return tool_error_with_hint(
-                    format!(
-                        "pattern '{pattern}' uses a character class, which is not supported: \
-                         use `*` (any run of characters) and `?` (one character)"
-                    ),
-                    RecoveryHint::CheckInput,
-                );
-            }
+        if let Some(pattern) = params.pattern.as_deref()
+            && pattern.len() > MAX_GLOB_PATTERN_LEN
+        {
+            return tool_error_with_hint(
+                format!("pattern longer than {MAX_GLOB_PATTERN_LEN} bytes"),
+                RecoveryHint::CheckInput,
+            );
         }
         let base = match self.resolve_app_dir(params.directory) {
             Ok(d) => d,
@@ -2014,13 +2017,15 @@ impl VictauriMcpHandler {
                     return missing_param("ref_id", "select_option");
                 };
                 let values_vec;
+                // An explicit `values: []` clears a `<select multiple>`; forgetting the argument
+                // must not.
                 let values: &[String] = match (&params.values, &params.value) {
                     (Some(v), _) => v,
                     (None, Some(v)) => {
                         values_vec = vec![v.clone()];
                         &values_vec
                     }
-                    (None, None) => &[],
+                    (None, None) => return missing_param("values", "select_option"),
                 };
                 let values_json =
                     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string());
@@ -2153,7 +2158,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Window management. Actions: get_state (window positions/sizes/visibility), list (all window labels), manage (minimize/maximize/close/focus/show/hide/fullscreen/always_on_top), resize, move_to, set_title, introspectability (probe every window and report which Victauri can actually see — a visible window that comes back introspectable:false is almost always missing the \"victauri:default\" capability; run this FIRST when eval_js/dom_snapshot/animation return nothing for a multi-window app).",
+        description = "Window management. Actions: get_state (window positions/sizes/visibility), list (all window labels), manage (minimize/maximize/close/focus/show/hide/fullscreen/always_on_top), resize and move_to (report the size or position read back, with settled:false if the window did not change within 500 ms), set_title, introspectability (probe every window and report which Victauri can actually see — a visible window that comes back introspectable:false is almost always missing the \"victauri:default\" capability; run this FIRST when eval_js/dom_snapshot/animation return nothing for a multi-window app).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2217,22 +2222,26 @@ impl VictauriMcpHandler {
                         RecoveryHint::CheckInput,
                     );
                 }
-                match self
-                    .bridge
-                    .resize_window(params.label.as_deref(), width, height)
-                {
+                let label = params.label.as_deref();
+                let before = self.read_back_window(label).map(|s| s.size);
+                match self.bridge.resize_window(label, width, height) {
                     Ok(()) => {
                         // What the window IS now (physical pixels, as `get_state` reports), since
                         // the OS clamps, and a request in logical pixels differs on a scaled
                         // display. Falls back to the request if it cannot be read back.
-                        let actual = self.read_back_window(params.label.as_deref());
-                        let (w, h) = actual.as_ref().map_or((width, height), |s| s.size);
-                        let result = serde_json::json!({
+                        let (actual, settled) = self
+                            .settle_window(label, before, (width, height), |s| s.size)
+                            .await;
+                        let (w, h) = actual.unwrap_or((width, height));
+                        let mut result = serde_json::json!({
                             "ok": true,
                             "width": w,
                             "height": h,
                             "requested": {"width": width, "height": height},
                         });
+                        if !settled {
+                            result["settled"] = serde_json::json!(false);
+                        }
                         CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e),
@@ -2248,16 +2257,23 @@ impl VictauriMcpHandler {
                 let Some(y) = params.y else {
                     return missing_param("y", "move_to");
                 };
-                match self.bridge.move_window(params.label.as_deref(), x, y) {
+                let label = params.label.as_deref();
+                let before = self.read_back_window(label).map(|s| s.position);
+                match self.bridge.move_window(label, x, y) {
                     Ok(()) => {
-                        let actual = self.read_back_window(params.label.as_deref());
-                        let (ax, ay) = actual.as_ref().map_or((x, y), |s| s.position);
-                        let result = serde_json::json!({
+                        let (actual, settled) = self
+                            .settle_window(label, before, (x, y), |s| s.position)
+                            .await;
+                        let (ax, ay) = actual.unwrap_or((x, y));
+                        let mut result = serde_json::json!({
                             "ok": true,
                             "x": ax,
                             "y": ay,
                             "requested": {"x": x, "y": y},
                         });
+                        if !settled {
+                            result["settled"] = serde_json::json!(false);
+                        }
                         CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e),
@@ -3448,12 +3464,27 @@ impl VictauriMcpHandler {
                                         .is_ok()
                                     });
                                     let advice = fitting.map_or_else(
-                                        || "call scrub without `capture` for the geometry curve                                             (or shrink the window)"
-                                            .to_string(),
+                                        || {
+                                            "call scrub without `capture` for the geometry curve \
+                                             (or shrink the window)"
+                                                .to_string()
+                                        },
                                         |n| format!("use `points` <= {n} (or more `cols`)"),
                                     );
+                                    // Restored before answering: the guard's spawned restore
+                                    // could land inside the retry this error invites, and resume
+                                    // the animations that retry has just paused.
+                                    let _ = self
+                                        .eval_with_return_timeout(
+                                            &restore_code,
+                                            label,
+                                            SCRUB_RESTORE_TIMEOUT,
+                                        )
+                                        .await;
+                                    guard.armed = None;
                                     return tool_error(format!(
-                                        "animation scrub capture refused before capturing: {e};                                          {advice}"
+                                        "animation scrub capture refused before capturing: {e}; \
+                                         {advice}"
                                     ));
                                 }
                                 manifest.push(serde_json::json!({
@@ -3560,7 +3591,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Application logs and monitoring. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms; entries captured on Tauri's postMessage IPC fallback carry transport:'post_message', see get_diagnostics ipc_capture), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation). BACKEND (the Rust side — what the app prints to its debug console): backend (structured Rust log entries — tracing/log records with typed fields + span context, plus captured panics; filter by level / target prefix / filter text / `fields` (structured-field equality), page with since_seq→next_seq), backend_digest (START HERE: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic — one cheap call instead of paging thousands of lines), stdout (raw stdout/stderr lines when the app was launched via `victauri run` — also shows how the process exited).",
+        description = "Application logs and monitoring. The page-side actions return the newest 100 entries unless `limit` says otherwise; ipc and network take bodies=false to leave out args and request/response bodies, so a large read stays small. Actions: console (captured console.log/warn/error), network (intercepted fetch/XHR), ipc (IPC call log — set wait_for_capture=true to await response capture up to 500ms; entries captured on Tauri's postMessage IPC fallback carry transport:'post_message', see get_diagnostics ipc_capture), navigation (URL change history), dialogs (alert/confirm/prompt events), events (combined event stream), slow_ipc (find slow IPC calls), clear (DELETES the captured IPC + network logs — use for per-test isolation). BACKEND (the Rust side — what the app prints to its debug console): backend (structured Rust log entries — tracing/log records with typed fields + span context, plus captured panics; filter by level / target prefix / filter text / `fields` (structured-field equality), page with since_seq→next_seq), backend_digest (START HERE: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic — one cheap call instead of paging thousands of lines), stdout (raw stdout/stderr lines when the app was launched via `victauri run` — also shows how the process exited).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3603,7 +3634,13 @@ impl VictauriMcpHandler {
                     .as_ref()
                     .map_or_else(|| "null".to_string(), |f| js_string(f));
                 let limit = params.limit.unwrap_or(DEFAULT_LOG_LIMIT);
-                let source = format!("window.__VICTAURI__?.getNetworkLog({filter_arg}, {limit})");
+                let source = if params.bodies == Some(false) {
+                    format!(
+                        "window.__VICTAURI__?.getNetworkLog({filter_arg}, {limit}, {{ bodies: false }})"
+                    )
+                } else {
+                    format!("window.__VICTAURI__?.getNetworkLog({filter_arg}, {limit})")
+                };
                 let code = trimmed_log_js(&source, limit);
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
@@ -3611,9 +3648,16 @@ impl VictauriMcpHandler {
             LogsAction::Ipc => {
                 let wait = params.wait_for_capture.unwrap_or(false);
                 let limit = params.limit.unwrap_or(DEFAULT_LOG_LIMIT);
+                let call_args = if params.bodies == Some(false) {
+                    format!("{limit}, {{ bodies: false }}")
+                } else {
+                    limit.to_string()
+                };
                 if wait {
-                    let inner =
-                        trimmed_log_js(&format!("window.__VICTAURI__.getIpcLog({limit})"), limit);
+                    let inner = trimmed_log_js(
+                        &format!("window.__VICTAURI__.getIpcLog({call_args})"),
+                        limit,
+                    );
                     let code = format!(
                         r"return (async function() {{
                             await window.__VICTAURI__.waitForIpcComplete(500);
@@ -3629,8 +3673,10 @@ impl VictauriMcpHandler {
                         Err(e) => tool_error(e),
                     }
                 } else {
-                    let code =
-                        trimmed_log_js(&format!("window.__VICTAURI__?.getIpcLog({limit})"), limit);
+                    let code = trimmed_log_js(
+                        &format!("window.__VICTAURI__?.getIpcLog({call_args})"),
+                        limit,
+                    );
                     self.eval_bridge(&code, params.webview_label.as_deref())
                         .await
                 }
@@ -5159,6 +5205,32 @@ impl VictauriMcpHandler {
             })
     }
 
+    /// Reads a resized or moved window back until it matches the request or has changed: Linux
+    /// and macOS apply both after the call returns, so an immediate read reports the old value.
+    /// `false` when it never did within [`WINDOW_SETTLE_WAIT`] (a window manager may ignore the
+    /// request; a request equal to the current size on a scaled display also ends up here).
+    async fn settle_window<T: PartialEq + Send + Sync>(
+        &self,
+        label: Option<&str>,
+        before: Option<T>,
+        requested: T,
+        read: fn(&victauri_core::WindowState) -> T,
+    ) -> (Option<T>, bool) {
+        let give_up = std::time::Instant::now() + WINDOW_SETTLE_WAIT;
+        loop {
+            let now = self.read_back_window(label).map(|s| read(&s));
+            if let Some(value) = &now
+                && (*value == requested || before.as_ref().is_some_and(|b| b != value))
+            {
+                return (now, true);
+            }
+            if std::time::Instant::now() >= give_up {
+                return (now, false);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
     /// The state of the window `label` targets (see `find_window` for `None`), if readable.
     fn read_back_window(&self, label: Option<&str>) -> Option<victauri_core::WindowState> {
         let states = self.bridge.try_get_window_states(label).ok()?;
@@ -5210,22 +5282,58 @@ impl VictauriMcpHandler {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(current.label, current.url);
         }
-        self.leave_stuck_page(label).await?;
+        let detour = self.leave_stuck_page(label).await?;
+        self.navigate_from(detour, label, url).await
+    }
+
+    /// Navigate from where a detour left the window. A native navigation adds a history entry, and
+    /// `go_back` would then land on the detour, a page with no bridge: on the detour page script
+    /// replaces its own entry instead. A native navigation still follows if that did not work.
+    async fn navigate_from(
+        &self,
+        detour: Option<String>,
+        label: Option<&str>,
+        url: &str,
+    ) -> Result<(), String> {
+        if let Some(detour) = detour {
+            let replace = format!("location.replace({})", js_string(url));
+            if self.bridge.eval_webview(label, &replace).is_ok()
+                && self.window_leaves(label, &detour).await
+            {
+                return Ok(());
+            }
+        }
         self.bridge.navigate_webview(label, url)
+    }
+
+    /// Waits for the window to show a URL other than `url`.
+    async fn window_leaves(&self, label: Option<&str>, url: &str) -> bool {
+        let give_up = std::time::Instant::now() + STUCK_PAGE_LEAVE_WAIT;
+        while std::time::Instant::now() < give_up {
+            if self
+                .read_back_window(label)
+                .is_some_and(|window| window.url != url)
+            {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        false
     }
 
     /// A same-site navigation waits on the page's renderer, so it never lands while that page
     /// spins in an endless loop (measured on `WebView2`: not in 90 s, `about:blank` first did not
     /// help either). A cross-site one gets a fresh renderer, and this server's own `/health` is a
     /// cross-site page that is always there. Only for a page that stopped answering.
-    async fn leave_stuck_page(&self, label: Option<&str>) -> Result<(), String> {
+    /// The detour's URL, when the window is on it.
+    async fn leave_stuck_page(&self, label: Option<&str>) -> Result<Option<String>, String> {
         if self.probe_bridge(label, None, None).await.is_ok() {
-            return Ok(());
+            return Ok(None);
         }
         self.detour_through_health(label).await
     }
 
-    async fn detour_through_health(&self, label: Option<&str>) -> Result<(), String> {
+    async fn detour_through_health(&self, label: Option<&str>) -> Result<Option<String>, String> {
         // Sites ignore the port, so the host must differ from a dev server's.
         let host = match self.bridge.app_entry_url().and_then(|u| {
             url::Url::parse(&u)
@@ -5244,11 +5352,11 @@ impl VictauriMcpHandler {
                 .read_back_window(label)
                 .is_some_and(|window| window.url == detour)
             {
-                break;
+                return Ok(Some(detour));
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        Ok(())
+        Ok(None)
     }
 
     /// `navigate go_to`. Native rather than `location.href`: page script cannot run on a hung
@@ -5324,7 +5432,7 @@ impl VictauriMcpHandler {
         };
         // The probe behind `error` already said the page is not answering.
         let left = match self.detour_through_health(label).await {
-            Ok(()) => self.bridge.navigate_webview(label, &target),
+            Ok(detour) => self.navigate_from(detour, label, &target).await,
             Err(e) => Err(e),
         };
         if let Err(e) = left {
@@ -6553,7 +6661,7 @@ fn trim_field_js() -> String {
 #[must_use]
 pub fn ipc_integrity_js(threshold_ms: i64) -> String {
     format!(
-        r"return (function() {{
+        r"{NO_BRIDGE_GUARD} return (function() {{
                 var V = window.__VICTAURI__;
                 var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
                 var now = Date.now();
@@ -6604,9 +6712,9 @@ pub fn ipc_integrity_js(threshold_ms: i64) -> String {
 pub fn slow_ipc_js(threshold_ms: u64, limit: usize) -> String {
     let trim_field = trim_field_js();
     format!(
-        r"return (function() {{
+        r"{NO_BRIDGE_GUARD} return (function() {{
                 {trim_field}
-                function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) o[k] = trimField(e[k]); }} return o; }}
+                function trimEntry(e) {{ if (e == null || typeof e !== 'object') return e; var o = {{}}; for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) {{ o[k] = trimField(e[k]); if (k === 'args' && o[k] !== e[k]) o.args_truncated = true; }} }} return o; }}
                 var V = window.__VICTAURI__;
                 var log = V?.getIpcLog(0, {{ bodies: false }}) || [];
                 var slow = log.filter(function(c) {{ return (c.duration_ms || 0) > {threshold_ms}; }});
@@ -6637,12 +6745,17 @@ const IPC_CAPTURE_STATUS_JS: &str = "return (window.__VICTAURI__ && typeof windo
 pub fn trimmed_log_js(source_expr: &str, limit: usize) -> String {
     let trim_field = trim_field_js();
     format!(
-        r"return (function() {{
+        r"{NO_BRIDGE_GUARD} return (function() {{
             {trim_field}
             function trimEntry(e) {{
                 if (e == null || typeof e !== 'object') return e;
                 var out = Array.isArray(e) ? [] : {{}};
-                for (var k in e) {{ if (Object.prototype.hasOwnProperty.call(e, k)) out[k] = trimField(e[k]); }}
+                for (var k in e) {{
+                    if (!Object.prototype.hasOwnProperty.call(e, k)) continue;
+                    out[k] = trimField(e[k]);
+                    // A marker now stands in for the arguments: readers must not compare against it.
+                    if ((k === 'args' || k === 'request_args') && out[k] !== e[k]) out.args_truncated = true;
+                }}
                 return out;
             }}
             var arr = {source_expr} || [];
@@ -7702,7 +7815,7 @@ mod tests {
         );
         let code = trimmed_log_js(&source, 10);
         let script = format!(
-            "const r = (function() {{ {code} }})(); \
+            "const window = {{ __VICTAURI__: {{}} }}; const r = (function() {{ {code} }})(); \
              console.log('OUT:' + r[0].body.isWellFormed() + ':' + r[0].body.indexOf('bytes truncated'));"
         );
         let Some(out) = run_node(&script) else {
