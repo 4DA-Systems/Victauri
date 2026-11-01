@@ -28,6 +28,8 @@ jobs:
 
       - name: Compare repo versions vs published registries
         id: versions
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set +e
           DRIFT=0
@@ -76,6 +78,24 @@ jobs:
           else ST="✅ in sync"; fi
           echo "| VS Code Marketplace (4da-systems.victauri) | $REPO_VSC | $PUB_VSC | $ST |" >> "$GITHUB_STEP_SUMMARY"
 
+          # --- MCP Registry: 0.9.0 went unlisted, and nothing here noticed ---
+          PUB_MCP=$(curl -fsSL -A "$UA" "https://registry.modelcontextprotocol.io/v0.1/servers?search=io.github.4DA-Systems/victauri&version=latest" 2>/dev/null \
+            | jq -r '[.servers[].server | select(.name == "io.github.4DA-Systems/victauri") | .version][0] // "unknown"' 2>/dev/null)
+          if is_unknown "$PUB_MCP" || is_unknown "$REPO_CRATE"; then
+            PUB_MCP=unknown; ST="⚠️ UNKNOWN (not found / query failed)"; UNKNOWN=1
+          elif newer "$REPO_CRATE" "$PUB_MCP"; then ST="❌ DRIFT (repo ahead — run mcp-registry.yml)"; DRIFT=1
+          else ST="✅ in sync"; fi
+          echo "| MCP Registry (io.github.4DA-Systems/victauri) | $REPO_CRATE | $PUB_MCP | $ST |" >> "$GITHUB_STEP_SUMMARY"
+
+          # --- GitHub Release (the binaries). Sorted by version: the API's order is not. ---
+          PUB_REL=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[] | select(.draft | not) | .tag_name' 2>/dev/null \
+            | grep -E '^v[0-9]' | sed 's/^v//' | sort -V | tail -n 1)
+          if is_unknown "$PUB_REL" || is_unknown "$REPO_CRATE"; then
+            PUB_REL=unknown; ST="⚠️ UNKNOWN (not found / query failed)"; UNKNOWN=1
+          elif newer "$REPO_CRATE" "$PUB_REL"; then ST="❌ DRIFT (repo ahead — tag the release)"; DRIFT=1
+          else ST="✅ in sync"; fi
+          echo "| GitHub Release (binaries) | $REPO_CRATE | $PUB_REL | $ST |" >> "$GITHUB_STEP_SUMMARY"
+
           echo "drift=$DRIFT" >> "$GITHUB_OUTPUT"
           echo "unknown=$UNKNOWN" >> "$GITHUB_OUTPUT"
 
@@ -99,7 +119,7 @@ jobs:
       - name: Fail if anything drifted
         if: steps.versions.outputs.drift != '0'
         run: |
-          echo "::error::A published surface is behind the repo — see the job summary. Publish it (tag vscode-v* / npm-v* / v*) or bump the repo."
+          echo "::error::A published surface is behind the repo — see the job summary. Publish it (RELEASING.md) or bump the repo."
           exit 1
 
   # CI's `cargo audit` / `cargo deny` run only on PRs and main pushes, and Dependabot alerts are

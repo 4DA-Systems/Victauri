@@ -60,7 +60,7 @@ check_not() {
 }
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  Victauri Deep Integration Test — Demo App (23 commands)   ║"
+echo "║  Victauri Deep Integration Test — Demo App (25 commands)   ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 
@@ -73,7 +73,7 @@ R=$(curl -s "$BASE/health")
 check "1.1 health endpoint" "$R" '"status".*"ok"'
 
 R=$(curl -s "$BASE/info")
-check "1.2 info shows 23 commands" "$R" '"commands_registered":23'
+check "1.2 info shows 25 commands" "$R" '"commands_registered":25'
 check "1.3 info auth disabled" "$R" '"auth_required":false'
 check "1.4 info version is semver" "$R" '"version":"[0-9]+\.[0-9]+\.[0-9]+"'
 check "1.5 info port correct" "$R" "\"port\":$PORT"

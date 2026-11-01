@@ -156,7 +156,7 @@ console run under `victauri run -- <dev command>` (victauri-cli). Details and li
 | Tool | What it does |
 |---|---|
 | **`window`** | Get state, list windows, manage, resize, move, set title |
-| **`storage`** | Read/write localStorage, sessionStorage, cookies |
+| **`storage`** | Read/write localStorage and sessionStorage; read cookies |
 | **`navigate`** | Go to URL, go back, get history, configure dialog responses |
 | **`recording`** | Start/stop sessions, checkpoints, get events, export/import |
 | **`logs`** | Console, network, IPC, navigation, dialog logs — and the Rust backend's own log (`backend`, `backend_digest`, `stdout`) |
@@ -164,7 +164,7 @@ console run under `victauri run -- <dev command>` (victauri-cli). Details and li
 | **`fault`** | Inject IPC faults: delay, error, drop, corrupt (chaos engineering) |
 | **`explain`** | Natural-language narration: summary, last action, diff |
 | `get_plugin_info` | Victauri config: port, enabled tools, version |
-| `get_diagnostics` | Server health, compatibility warnings, tool status |
+| `get_diagnostics` | Compatibility warnings and page facts (`warnings`, `info`) |
 
 ## Security
 

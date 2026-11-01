@@ -222,7 +222,7 @@ e2e_test!(counter_state_sync, |client| async move {
     // Verify both layers agree
     let report = client.verify()
         .state_matches(
-            "parseInt(document.getElementById('counter-value').textContent)",
+            "({counter: parseInt(document.getElementById('counter-value').textContent)})",
             json!({"counter": 2}),
         )
         .ipc_was_called("increment")
@@ -274,11 +274,11 @@ WCAG checks built in — no external tools needed:
 ```rust
 e2e_test!(accessibility_check, |client| async move {
     let audit = client.audit_accessibility().await.unwrap();
-    let violations = audit["summary"]["violations"].as_u64().unwrap_or(0);
+    let violations = audit["violations"].as_array().expect("audit has a violations array");
 
-    assert!(violations == 0,
+    assert!(violations.is_empty(),
         "a11y violations found: {}",
-        serde_json::to_string_pretty(&audit["violations"]).unwrap_or_default()
+        serde_json::to_string_pretty(violations).unwrap_or_default()
     );
 });
 ```
@@ -292,19 +292,17 @@ e2e_test!(performance_budget, |client| async move {
     let perf = client.get_performance_metrics().await.unwrap();
 
     // DOM interactive under 3 seconds
-    if let Some(ms) = perf["navigation"]["domInteractive"].as_f64() {
-        assert!(ms < 3000.0, "DOM interactive: {ms}ms");
-    }
+    let ms = perf["navigation"]["dom_interactive_ms"].as_f64().expect("navigation timing");
+    assert!(ms < 3000.0, "DOM interactive: {ms}ms");
 
-    // JS heap under 100MB
-    if let Some(mb) = perf["jsHeap"]["usedMB"].as_f64() {
+    // JS heap under 100MB (Chromium/WebView2 only; WebKit does not report it)
+    if let Some(mb) = perf["js_heap"]["used_mb"].as_f64() {
         assert!(mb < 100.0, "JS heap: {mb}MB");
     }
 
     // Under 500 DOM elements
-    if let Some(count) = perf["dom"]["elementCount"].as_u64() {
-        assert!(count < 500, "DOM elements: {count}");
-    }
+    let count = perf["dom"]["elements"].as_u64().expect("DOM stats");
+    assert!(count < 500, "DOM elements: {count}");
 });
 ```
 
@@ -321,10 +319,10 @@ e2e_test!(multi_window, |client| async move {
         .collect();
     assert!(labels.contains(&"main"));
 
-    // Check state of specific window
+    // State of a specific window: an array, with `size` as [width, height]
     let state = client.get_window_state(Some("main")).await.unwrap();
-    assert!(state["visible"].as_bool().unwrap());
-    assert!(state["width"].as_f64().unwrap() > 0.0);
+    assert!(state[0]["visible"].as_bool().unwrap());
+    assert!(state[0]["size"][0].as_f64().unwrap() > 0.0);
 });
 ```
 
@@ -372,17 +370,19 @@ victauri coverage --threshold 80
 
 Output:
 ```
-IPC Command Coverage Report
-────────────────────────────
-  greet              ✓ covered
-  increment          ✓ covered
-  add_todo           ✓ covered
-  delete_todo        ✗ NOT covered
-  update_settings    ✗ NOT covered
+IPC Coverage: 60.0% (3/5 commands tested)
 
-Coverage: 3/5 commands (60.0%)
-✗ Below threshold of 80%
+Most called:
+     2x  greet
+     1x  add_todo
+     1x  increment
+
+Untested (2):
+  - delete_todo
+  - update_settings
 ```
+
+With `--threshold`, a result below it exits non-zero.
 
 ---
 
@@ -470,28 +470,33 @@ Coverage gate ──────────────── victauri coverage
 |---|---|---|
 | Linux | `xvfb-run --auto-servernum` | X11 `GetImage` (pure Wayland fails safely) |
 | macOS | None needed | `CGWindowListCreateImage` |
-| Windows | None needed | `PrintWindow` + `GetDIBits` |
+| Windows | None needed | Windows.Graphics.Capture, falling back to `PrintWindow` + `GetDIBits` |
 
 ---
 
 ## REST API
 
-Every Victauri tool is also accessible via plain HTTP — useful for scripts, CI pipelines, or any language:
+Every Victauri tool is also accessible via plain HTTP — useful for scripts, CI pipelines, or any language.
+Auth is on by default, so a request needs the token from the app's
+[discovery directory](security.md#discovery-directory-protection). From a shell, `victauri call` finds it for you:
 
 ```bash
-# List tools
-curl http://127.0.0.1:7373/api/tools
+# No token handling
+victauri tools
+victauri call eval_js code=document.title
 
-# Evaluate JS
+# Plain HTTP, with TOKEN read from <discovery root>/<pid>/token
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7373/api/tools
+
 curl -X POST http://127.0.0.1:7373/api/tools/eval_js \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"code": "document.title"}'
 
-# Get memory stats
-curl -X POST http://127.0.0.1:7373/api/tools/get_memory_stats
-
-# Take screenshot
-curl -X POST http://127.0.0.1:7373/api/tools/screenshot -d '{}'
+curl -X POST http://127.0.0.1:7373/api/tools/get_memory_stats \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
 ```
 
 ---
@@ -499,7 +504,7 @@ curl -X POST http://127.0.0.1:7373/api/tools/screenshot -d '{}'
 ## Further Reading
 
 - [Victauri README](https://github.com/4DA-Systems/victauri) — full tool reference, architecture, quick start
-- [Demo app tests](https://github.com/4DA-Systems/victauri/tree/main/examples/demo-app/tests) — 20 integration tests demonstrating every pattern
+- [Demo app tests](https://github.com/4DA-Systems/victauri/tree/main/examples/demo-app/tests) — integration tests demonstrating every pattern
 - [Agent session example](https://github.com/4DA-Systems/victauri/blob/main/examples/agent-session.md) — real AI agent session transcript
 - [Tauri testing docs](https://v2.tauri.app/develop/tests/) — official Tauri testing guidance
 - [MCP protocol](https://modelcontextprotocol.io) — the protocol Victauri speaks

@@ -162,7 +162,7 @@ VictauriBuilder::new()
     .build().unwrap()
 ```
 
-The allowlist takes priority: if set, only listed commands are permitted regardless of the blocklist.
+The blocklist wins: a command on both lists is refused. With an allowlist set, only listed commands are permitted.
 
 ### Output Redaction
 
@@ -243,11 +243,13 @@ VictauriBuilder::new()
 
 | Variable | Description |
 |----------|-------------|
-| `VICTAURI_PORT` | Override the MCP server port |
-| `VICTAURI_AUTH_TOKEN` | Enable auth with this token |
-| `VICTAURI_EVAL_TIMEOUT` | Eval timeout in seconds |
+| `VICTAURI_PORT` | MCP server port, used when the builder did not call `.port()` |
+| `VICTAURI_AUTH_TOKEN` | Fixed auth token, used when the builder did not call `.auth_token()` or `.auth_disabled()` |
+| `VICTAURI_EVAL_TIMEOUT` | Eval timeout in seconds. Overrides `.eval_timeout()` |
 
-Environment variables take priority over builder settings.
+The builder wins for the port and the token: an app that calls `.port(7373)` ignores `VICTAURI_PORT`,
+and `.auth_disabled()` also beats `VICTAURI_AUTH_TOKEN`, so that variable cannot turn auth back on.
+Only `VICTAURI_EVAL_TIMEOUT` overrides the builder.
 
 ## Watchdog Configuration
 
@@ -255,7 +257,8 @@ The `victauri-watchdog` binary is configured entirely via environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VICTAURI_PORT` | 7373 | Port to monitor |
+| `VICTAURI_PORT` | discovered, else 7373 | Port to monitor. Setting it skips discovery |
+| `VICTAURI_APP` | (none) | Discovery selector: app identifier or product name (same as `--app`) |
 | `VICTAURI_INTERVAL` | 5 | Health check interval in seconds |
 | `VICTAURI_MAX_FAILURES` | 3 | Consecutive failures before recovery action |
 | `VICTAURI_ON_FAILURE` | (none) | Shell command to execute on failure |

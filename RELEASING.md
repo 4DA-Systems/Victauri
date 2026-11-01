@@ -1,17 +1,23 @@
 # Releasing Victauri
 
-Each surface ships **independently, on its own tag** — push a tag, a pipeline does
-the rest (test → build → publish). No surface can silently rot, because the only way
-it updates is a tag that runs the full build+publish, and a weekly **Surface Audit**
-fails loudly if any published version falls behind the repo.
+Each surface ships **independently**, and a weekly **Surface Audit** fails loudly if any
+published version falls behind the repo.
+
+**Two paths in this repo are written but have never run:**
+
+- **Crates:** `release.yml`'s Trusted Publishing steps. Every release so far published the six crates
+  locally first, so the workflow skipped them. The local publish below is the proven path.
+- **VS Code extension:** `release-vscode.yml`'s publish job. The extension ships by manual `.vsix` upload.
 
 ## Required GitHub secrets (Settings → Secrets and variables → Actions)
 
+None is needed for the paths in use. These are for the unproven ones.
+
 | Secret | Used by | Scope |
 |---|---|---|
-| *(none for crates.io)* | core release → crates.io | **Trusted Publishing (OIDC)** since 0.10.1: the `publish` job exchanges a GitHub OIDC token for a ~30-minute crates.io token (`rust-lang/crates-io-auth-action`, revoked when the job ends). One-time setup, by a crate owner, for **each of the six crates** on crates.io: crate → Settings → Trusted Publishing → Add → GitHub, owner `4DA-Systems`, repository `Victauri`, workflow `release.yml`, environment `release`. Configure **all six before tagging**: the token covers only the crates configured, so a missing one fails the publish at that crate after the earlier ones are live, and `github-release` (which needs `publish`) is skipped until the config is fixed and the job re-run (published crates are skipped). If Trusted Publishing is unavailable, publishing all six crates locally first still works: when every crate is already on crates.io at the tag's version the workflow skips authentication and publishing and goes on to the GitHub Release. Optionally then enable "trusted publishing only" on each crate and delete any old `CARGO_REGISTRY_TOKEN` secret — the workflow no longer reads it. |
-| `VSCE_PAT` | VS Code release → Marketplace | Azure DevOps PAT, *Marketplace → Manage* (publisher `4da-systems`) |
-| `OVSX_TOKEN` *(optional)* | VS Code release → Open VSX | open-vsx.org token (Cursor / VSCodium / agent IDEs) |
+| *(none for crates.io)* | core release → crates.io | **Trusted Publishing (OIDC), written since 0.10.1 and never exercised:** nothing confirms that the six crates have the publisher configured, and no preflight checks it. The `publish` job exchanges a GitHub OIDC token for a ~30-minute crates.io token (`rust-lang/crates-io-auth-action`, revoked when the job ends). One-time setup, by a crate owner, for **each of the six crates** on crates.io: crate → Settings → Trusted Publishing → Add → GitHub, owner `4DA-Systems`, repository `Victauri`, workflow `release.yml`, environment `release`. Configure **all six before tagging**: the token covers only the crates configured, so a missing one fails the publish at that crate after the earlier ones are live, and `github-release` (which needs `publish`) is skipped until the config is fixed and the job re-run (published crates are skipped). If Trusted Publishing is unavailable, publishing all six crates locally first still works: when every crate is already on crates.io at the tag's version the workflow skips authentication and publishing and goes on to the GitHub Release. Optionally then enable "trusted publishing only" on each crate and delete any old `CARGO_REGISTRY_TOKEN` secret — the workflow no longer reads it. |
+| `VSCE_PAT` | `release-vscode.yml` → Marketplace (not set; the workflow's publish would fail) | Azure DevOps PAT, *Marketplace → Manage* (publisher `4da-systems`) |
+| `OVSX_TOKEN` *(optional)* | `release-vscode.yml` → Open VSX (not set) | open-vsx.org token (Cursor / VSCodium / agent IDEs) |
 
 > **Browser mode was removed (2026-06-09).** The `victauri-browser` crate, the Chrome/Firefox
 > extensions, and the `@4da/victauri-browser` npm package are gone (crates.io yanked, npm
@@ -45,47 +51,80 @@ Two layers now prevent that:
 4. **Publish runs verified-then-tokenless** — `release.yml` first runs
    `cargo publish --workspace --dry-run` with no token present, then uploads each crate with
    `--no-verify` in a step that alone holds the token, so no build script ever runs next to it.
+5. **No caches in `release.yml`** — a tag run reads main's cache scope, and `compat.yml` runs
+   third-party build scripts in it, so a restored entry could reach the shipped binaries.
+   `scripts/check-release-no-cache.sh` (in CI) fails if a cache comes back.
 
 **Recommended flow:** `preflight` → push to `main` → **wait for CI green on all platforms** →
 bump + tag. (Pushing commit + tag together still works — the gate waits for CI to finish, up
 to ~40 min, then requires success.)
 
-## Core (crates + binaries) — `v*`
+## Core (crates + binaries) — `vMAJOR.MINOR.PATCH`
+
+The tag pattern is `v[0-9]+.[0-9]+.[0-9]+`, so it never matches a `vscode-v*` tag.
+
+**The proven path, used for every release so far: publish locally, then tag.** Crates cannot be
+unpublished, so wait for main's CI on the merge commit first, and use a clean worktree at that commit.
 
 ```bash
 ./scripts/bump-version.sh 0.8.0     # updates the workspace version everywhere
-# edit CHANGELOG.md, commit
-git tag v0.8.0 && git push origin main --tags
+# edit CHANGELOG.md, merge to main, wait for CI green on the merge commit. Then, at that commit:
+cargo publish --workspace --dry-run --locked     # with no token in the environment
+CARGO_REGISTRY_TOKEN=<operator token> cargo publish --workspace --no-verify --locked
+git tag v0.8.0 && git push origin v0.8.0
 ```
-`release.yml`: test gate → cross-platform binaries (cli/watchdog) →
-publish the crates to crates.io in dependency order → GitHub Release.
+
+`release.yml` then runs: test gate → cross-platform binaries (cli/watchdog) → require CI green →
+verify packages → publish (every crate is already live at the tag's version, so authentication and
+upload are skipped) → GitHub Release.
+
+The publish job still waits for approval in the `release` environment, even with nothing to upload.
+"Require CI green" fails if main's CI has not finished green: rerun the failed jobs once it has.
+
+**Trusted Publishing is unproven.** Tagging without a local publish would run that path for the first
+time. Do it only on a release you are ready to finish by hand: a crate without the publisher configured
+fails at its own turn, after the earlier crates are irreversibly live.
 
 Then list the release in the **MCP Registry** (`server.json`, name
 `io.github.4DA-Systems/victauri` — the namespace is the GitHub login and is matched
-case-sensitively): run the **MCP Registry** workflow (`gh workflow run mcp-registry.yml`) once the
-crates are on crates.io. It logs in with the workflow's GitHub OIDC token (no secret, no
+case-sensitively): run the **MCP Registry** workflow (`gh workflow run mcp-registry.yml`, from `main`: it refuses any other
+ref) once the crates are on crates.io. It logs in with the workflow's GitHub OIDC token (no secret, no
 interactive login), checks that server.json's version is published and its description fits the
 schema (≤ 100 characters), and runs a pinned, checksum-verified `mcp-publisher publish`. (By hand:
 `mcp-publisher login github && mcp-publisher publish`.) The registry reads the `mcp-name:` line
 from the README of the *published* `victauri-cli` version, so it must be right before the crate
 is uploaded.
 
-## VS Code extension — `vscode-v*` (decoupled)
+## VS Code extension (decoupled)
+
+**The real flow is a manual `.vsix` upload.** Hand a `.vsix` over only after its commit is merged and
+main's full CI is green, including the Windows extension leg (`VS Code extension (windows-latest)`).
+Build it from that commit:
 
 ```bash
-# bump ONLY the extension when it actually changes:
-cd editors/vscode && npm version 0.7.2 --no-git-tag-version && cd ../..
-git commit -am "vscode: ..." && git tag vscode-v0.7.2 && git push origin main --tags
+cd editors/vscode
+npm version 0.7.2 --no-git-tag-version    # bump ONLY the extension, when it actually changes
+# commit, merge, wait for CI green. Then, at the merge commit:
+npm ci --ignore-scripts --no-audit --no-fund
+npm run lint
+npm run build
+npm test
+npx --no-install vsce package --no-dependencies -o victauri-0.7.2.vsix
 ```
-`release-vscode.yml`: typecheck → build → verify tag==package.json → publish to
-Marketplace (+ Open VSX if `OVSX_TOKEN` set) → attach `.vsix` to a GitHub Release.
-Run it from the Actions tab with `dry_run=true` to build/package without publishing.
+
+Upload it at `marketplace.visualstudio.com/manage/publishers/4da-systems` → Victauri.
+
+**`release-vscode.yml` has never published.** Its `dry_run=true` mode gives you a CI-built `.vsix` from any
+branch. A `vscode-v*` tag would run: typecheck → build → verify tag==package.json → require CI green for
+the commit (main's push run, plus the Windows leg by name) → publish to Marketplace (+ Open VSX if
+`OVSX_TOKEN` set) → attach the `.vsix` to a GitHub Release. It stays unused until `VSCE_PAT` is set in the
+`release` environment, and a tag pushed without it fails at the publish step.
 
 ## Surface Audit (rot detector)
 
 `surface-audit.yml` runs **Mondays 09:00 UTC** (and on demand). It compares the repo
 version of each surface against what's actually published (crates.io, VS Code
-Marketplace), verifies the VS Code extension still builds, and **fails (emails you)**
+Marketplace, MCP Registry, GitHub Release binaries), verifies the VS Code extension still builds, and **fails (emails you)**
 if anything drifted. This is what stops a repeat of the 0.2.0-vs-0.7.1 rot.
 
 ## Versioning rule

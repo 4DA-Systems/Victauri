@@ -1,5 +1,9 @@
 name: Release VS Code Extension
 
+# NOT how the extension ships today: this workflow's publish path has never run, and the
+# environment holds no VSCE_PAT. The real flow is the manual .vsix upload in RELEASING.md. Use
+# dry_run=true to get a CI-built .vsix.
+#
 # Decoupled from the core workspace release. Ships ONLY when you tag it:
 #   git tag vscode-v0.7.1 && git push origin vscode-v0.7.1
 # Or run manually (workflow_dispatch):
@@ -90,9 +94,62 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The build job above runs on Ubuntu only, and the Windows-only discovery owner check is what
+  # broke 0.10.2 and 0.10.3. Require main's full CI for this exact commit before publishing, the
+  # same gate as release.yml, and name the Windows extension leg so it cannot pass unnoticed.
+  require-ci-green:
+    name: Require CI green for this commit
+    if: startsWith(github.ref, 'refs/tags/vscode-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')
+    runs-on: ubuntu-latest
+    # Higher than the in-step poll budget (80 x 30s = 40 min): a backstop, not a cut of the wait.
+    timeout-minutes: 50
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Wait for and require CI success
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          WINDOWS_LEG: VS Code extension (windows-latest)
+        run: |
+          cmp=$(gh api "repos/$REPO/compare/$SHA...main" --jq '.status' 2>/dev/null || echo error)
+          if [ "$cmp" != "ahead" ] && [ "$cmp" != "identical" ]; then
+            echo "::error::$SHA is not on main (compare status: $cmp). Tag a commit merged to main."
+            exit 1
+          fi
+          for i in $(seq 1 80); do
+            # Only a push run on main tested exactly this commit.
+            run=$(gh api "repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&branch=main&per_page=1" \
+                    --jq '.workflow_runs[0] | "\(.id)|\(.status)|\(.conclusion)"' 2>/dev/null || echo "|none|")
+            id="${run%%|*}"
+            rest="${run#*|}"
+            status="${rest%%|*}"
+            concl="${rest##*|}"
+            echo "  attempt $i/80: ci status=$status conclusion=$concl"
+            if [ "$status" = "completed" ]; then
+              if [ "$concl" != "success" ]; then
+                echo "::error::CI concluded '$concl' for $SHA. Refusing to publish."
+                exit 1
+              fi
+              leg=$(gh api --paginate "repos/$REPO/actions/runs/$id/jobs?per_page=100" \
+                      --jq ".jobs[] | select(.name == \"$WINDOWS_LEG\") | .conclusion" 2>/dev/null || echo error)
+              if [ "$leg" != "success" ]; then
+                echo "::error::'$WINDOWS_LEG' concluded '${leg:-<no such job>}' for $SHA. Refusing to publish."
+                exit 1
+              fi
+              echo "CI and '$WINDOWS_LEG' are green for $SHA."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::Timed out waiting for CI on $SHA. Refusing to publish (no proven-green run)."
+          exit 1
+
   publish:
     name: Publish VS Code extension
-    needs: build
+    needs: [build, require-ci-green]
     # Only when actually publishing: a tag push, or a manual dispatch with dry_run=false.
     # Dry runs never enter the `release` environment, so they work from any branch.
     if: startsWith(github.ref, 'refs/tags/vscode-v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'false')

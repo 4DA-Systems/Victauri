@@ -105,7 +105,7 @@ For direct MCP tool access using ref handles:
 | `fill(ref_id, value)` | Fill input |
 | `type_text(ref_id, text)` | Type characters |
 | `press_key(key)` | Press keyboard key |
-| `screenshot(label)` | Capture PNG |
+| `screenshot()` | Capture PNG of the default window |
 | `get_window_state(label)` | Window position/size |
 | `list_windows()` | All window labels |
 | `invoke_command(name, args)` | Call Tauri command |
@@ -116,7 +116,7 @@ For direct MCP tool access using ref handles:
 | `detect_ghost_commands()` | Unregistered commands |
 | `check_ipc_integrity()` | IPC health |
 | `assert_semantic(expr, label, cond, expected)` | Semantic assertion |
-| `wait_for(condition, value, timeout)` | Wait for condition |
+| `wait_for(condition, value, timeout_ms, poll_ms)` | Wait for condition |
 | `start_recording(session_id)` | Begin time-travel |
 | `stop_recording()` | End recording |
 | `logs("console", limit)` | Console / network / IPC entries |
@@ -266,7 +266,10 @@ async fn settings_flow() {
 
 ## Zero-Boilerplate Tests
 
-The `e2e_test!` macro handles skip-when-no-server and auto-connect:
+The `e2e_test!` macro connects for you and skips the test unless `VICTAURI_E2E` is set. It does
+not look for a server: with the variable set and no server running the test fails at connect, and
+without it a skipped test prints a skip line but still counts as passed in `cargo test`'s totals.
+`VICTAURI_E2E=0` counts as not set. So set the variable in CI, or a green run may have checked nothing.
 
 ```rust
 use victauri_test::{e2e_test, VictauriClient};
@@ -331,11 +334,14 @@ Detect when the frontend and backend disagree:
 
 ```rust
 let result = client.verify_state(
-    "document.querySelector('.theme-label').textContent",
+    "({theme: document.querySelector('.theme-label').textContent})",
     json!({"theme": "dark"})
 ).await?;
 assert!(result["divergences"].as_array().unwrap().is_empty());
 ```
+
+The expression must produce the same shape as the backend state. A bare string compared to
+`{"theme": "dark"}` is a divergence at `$`, however right the text is.
 
 ### Ghost Command Detection
 
@@ -520,9 +526,12 @@ Run WCAG-based accessibility checks against your running app:
 
 ```rust
 let audit = client.audit_accessibility().await?;
-let violations = audit["summary"]["violations"].as_u64().unwrap_or(0);
-assert_eq!(violations, 0, "Accessibility violations found: {audit}");
+let violations = audit["violations"].as_array().expect("audit has a violations array");
+assert!(violations.is_empty(), "Accessibility violations found: {violations:?}");
 ```
+
+`violations` is the list of findings. `summary` holds the counts by severity:
+`critical`, `serious`, `moderate`, `minor` and `total`.
 
 Checks include: images without alt text, unlabeled form inputs, empty buttons/links, heading hierarchy, color contrast (WCAG AA), ARIA role validity, positive tabindex, missing document language and title.
 
@@ -542,14 +551,18 @@ Track navigation timing, memory usage, and resource loading:
 ```rust
 let metrics = client.get_performance_metrics().await?;
 
-let heap_mb = metrics["heap"]["usedJSHeapSize"]
-    .as_f64().unwrap_or(0.0) / 1_048_576.0;
-assert!(heap_mb < 256.0, "Heap usage too high: {heap_mb:.1} MB");
-
-let load_ms = metrics["navigation"]["loadEventEnd"]
-    .as_f64().unwrap_or(0.0);
+let load_ms = metrics["navigation"]["load_event_ms"]
+    .as_f64().expect("navigation timing is present");
 assert!(load_ms < 3000.0, "Page load too slow: {load_ms:.0}ms");
+
+// Chromium/WebView2 only: on WebKit `js_heap` is `{"unavailable": true, ...}`.
+if let Some(heap_mb) = metrics["js_heap"]["used_mb"].as_f64() {
+    assert!(heap_mb < 256.0, "Heap usage too high: {heap_mb:.1} MB");
+}
 ```
+
+Read a metric with `expect` rather than `unwrap_or(0.0)`: a default turns a wrong key into a limit
+that can never fail.
 
 Or use the assertion helper with a budget:
 
@@ -676,7 +689,7 @@ use victauri_test::{VictauriClient, SmokeConfig};
 
 #[tokio::test]
 async fn smoke() {
-    let client = VictauriClient::connect(7373).await.unwrap();
+    let mut client = VictauriClient::connect(7373).await.unwrap();
 
     let report = client.smoke_test().await.unwrap();
     println!("Passed: {}/{}", report.passed_count(), report.total_count());
@@ -687,12 +700,16 @@ async fn smoke() {
         max_dom_complete_ms: 3000,
         max_heap_mb: 150.0,
     };
-    let report = client.smoke_test_with_config(config).await.unwrap();
+    let report = client.smoke_test_with_config(&config).await.unwrap();
     assert!(report.all_passed());
 }
 ```
 
 The 11 checks: `eval_js` works, DOM snapshot valid, screenshot captures an image, windows exist, IPC integrity healthy, no uncaught errors, accessibility audit, DOM complete under the load budget (`--max-load-ms`), JS heap under the memory budget (`--max-heap-mb`), recording lifecycle, and health endpoint hardened.
+
+The accessibility check fails only on `critical` findings and reports the serious, moderate and
+minor counts in its detail. For a strict gate use `assert_accessible` or `assert_no_a11y_violations`,
+which fail on any violation.
 
 Reports include timing data and can export to JUnit XML for CI integration.
 
@@ -762,8 +779,9 @@ async fn notification_window() {
         .iter().filter_map(|w| w.as_str()).collect();
     assert!(labels.contains(&"main"));
 
+    // An array of window states, even for one label.
     let state = client.get_window_state(Some("main")).await.unwrap();
-    assert!(state["visible"].as_bool().unwrap());
+    assert!(state[0]["visible"].as_bool().unwrap());
 }
 ```
 
@@ -829,16 +847,16 @@ victauri watch --filter smoke                     # Only re-run specific test fi
 
 Runs 11 built-in checks against your running app:
 
-1. Server connectivity
-2. JavaScript evaluation
-3. DOM snapshot validity
-4. Screenshot capture
-5. Window enumeration
-6. IPC integrity
-7. Accessibility audit (violations)
-8. Accessibility audit (warnings)
-9. DOM load performance
-10. Heap memory usage
+1. JavaScript evaluation
+2. DOM snapshot validity
+3. Screenshot capture
+4. Window enumeration
+5. IPC integrity
+6. No uncaught errors
+7. Accessibility audit (fails on critical findings)
+8. DOM load performance
+9. Heap memory usage
+10. Recording lifecycle (skipped if another client is recording)
 11. Health endpoint hardening
 
 Exit code 0 if all pass, 1 if any fail. Ideal for CI gates.
