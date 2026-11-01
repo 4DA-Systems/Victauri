@@ -3181,6 +3181,52 @@ const INIT_SCRIPT_BODY: &str = r#"
     var scrubState = null;
     var sweepState = null;
 
+    // Seeking a paused animation through its delay, its iterations or its end fires the page's own
+    // animation events (a toast removes itself, a route transition completes) for what is only a
+    // scrub. This capture listener is the bridge's, so it runs before any the page adds, and stops
+    // those events for the scrubbed target until two frames after the restore: events are dispatched
+    // in the frame after the seek. Synthetic events and other elements are the page's business.
+    var SCRUB_EVENTS = ['animationstart', 'animationend', 'animationiteration', 'animationcancel',
+        'transitionrun', 'transitionstart', 'transitionend', 'transitioncancel'];
+    var scrubQuiet = [];
+    function quietScrubEvent(e) {
+        if (!scrubQuiet.length || e.isTrusted !== true) return;
+        for (var i = 0; i < scrubQuiet.length; i++) {
+            if (scrubQuiet[i].el === e.target) { e.stopImmediatePropagation(); return; }
+        }
+    }
+    function listenForScrubEvents(target) {
+        for (var i = 0; i < SCRUB_EVENTS.length; i++) target.addEventListener(SCRUB_EVENTS[i], quietScrubEvent, true);
+    }
+    listenForScrubEvents(window);
+    // These events are not composed: from inside a shadow tree they never reach the window.
+    function holdScrubEvents(el) {
+        var hold = { el: el, root: null };
+        var root = typeof el.getRootNode === 'function' ? el.getRootNode() : null;
+        if (root && root !== el.ownerDocument && root.host) {
+            hold.root = root;
+            listenForScrubEvents(root);
+        }
+        scrubQuiet[scrubQuiet.length] = hold;
+        return hold;
+    }
+    function releaseScrubEvents(hold) {
+        var released = false;
+        function release() {
+            if (released) return;
+            released = true;
+            for (var i = 0; i < scrubQuiet.length; i++) {
+                if (scrubQuiet[i] === hold) { removeAt(scrubQuiet, i); break; }
+            }
+            if (hold.root) {
+                for (var k = 0; k < SCRUB_EVENTS.length; k++) hold.root.removeEventListener(SCRUB_EVENTS[k], quietScrubEvent, true);
+            }
+        }
+        requestAnimationFrame(function() { requestAnimationFrame(release); });
+        // rAF does not fire in a hidden or minimized window.
+        SET_TIMEOUT(release, 1000);
+    }
+
     // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
     // every op — and every callback an op creates — is strict: a page hook on a built-in an op
     // calls then cannot reach the op through `.caller` (and call it without the key), nor the
@@ -3337,8 +3383,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             var duration = Math.max.apply(null, ends);
             // What restore must put back. Read before pausing, or every animation reads paused.
             var saved = anims.map(function(a) { return { time: a.currentTime, state: a.playState }; });
+            // A scrub replaced without a restore leaves that target to the page again.
+            if (scrubState) releaseScrubEvents(scrubState.hold);
+            var hold = holdScrubEvents(el);
             anims.forEach(function(a) { try { a.pause(); } catch (e) {} });
-            scrubState = { el: el, anims: anims, ends: ends, saved: saved, duration: duration };
+            scrubState = { el: el, anims: anims, ends: ends, saved: saved, duration: duration, hold: hold };
             return Promise.all(anims.map(function(a) { return a.ready.catch(function(){}); }))
                 .then(function() {
                     var b = el.getBoundingClientRect();
@@ -3402,6 +3451,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     } catch (e) {}
                 });
             }
+            releaseScrubEvents(S.hold);
             scrubState = null;
             return { restored: true, resumed: !!resume };
         },

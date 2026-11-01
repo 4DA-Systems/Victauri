@@ -511,3 +511,86 @@ fn a_regex_that_can_hang_the_page_is_refused_at_add() {
         ),
     ]);
 }
+
+// ── Animation events during a scrub ──────────────────────────────────────────
+
+/// A paused CSS animation, as far as the bridge reads one.
+const ANIMATED: &str = r"
+    window.fakeAnimation = function(el) { return {
+        effect: { target: el, getComputedTiming: function() { return { endTime: 1000 }; } },
+        currentTime: 500, playState: 'running', ready: Promise.resolve(),
+        pause: function() { this.playState = 'paused'; }, play: function() { this.playState = 'running'; },
+        finish: function() { this.playState = 'finished'; },
+    }; };
+    window.animate = function(sel) { var el = $(sel); var a = fakeAnimation(el);
+        el.getAnimations = function() { return [a]; }; return a; };
+    window.frames = function(n) { return new Promise(function(done) {
+        (function step(left) { if (!left) done(); else requestAnimationFrame(function() { step(left - 1); }); })(n); }); };
+    window.heard = [];
+    ['animationstart','animationend','animationiteration','transitionend'].forEach(function(t) {
+        window.addEventListener(t, function(e) { heard.push(t + ':' + e.target.id); });
+        document.addEventListener(t, function(e) { heard.push('doc-' + t + ':' + e.target.id); }, true);
+    });
+";
+
+#[test]
+fn a_scrub_keeps_animation_events_from_the_page() {
+    let during = format!(
+        "{ANIMATED} animate('#a'); var p = await AGENT.scrubPrepare('#a'); T(p.prepared, J(p)); \
+         ['animationstart','animationend','animationiteration','transitionend'].forEach(function(t) {{ __vtestTrustedEvent($('#a'), t); }}); \
+         T(heard.length === 0, 'reached the page: ' + J(heard));"
+    );
+    let other_elements = format!(
+        "{ANIMATED} animate('#a'); await AGENT.scrubPrepare('#a'); \
+         __vtestTrustedEvent($('#b'), 'animationend'); \
+         T(J(heard) === '[\"doc-animationend:b\",\"animationend:b\"]', J(heard));"
+    );
+    let synthetic_from_the_page = format!(
+        "{ANIMATED} animate('#a'); await AGENT.scrubPrepare('#a'); \
+         $('#a').dispatchEvent(new Event('animationend', {{bubbles:true}})); \
+         T(J(heard) === '[\"doc-animationend:a\",\"animationend:a\"]', J(heard));"
+    );
+    let after_restore = format!(
+        "{ANIMATED} animate('#a'); await AGENT.scrubPrepare('#a'); AGENT.scrubRestore(true); \
+         __vtestTrustedEvent($('#a'), 'animationend'); T(heard.length === 0, 'just after restore: ' + J(heard)); \
+         await frames(3); \
+         __vtestTrustedEvent($('#a'), 'animationend'); \
+         T(J(heard) === '[\"doc-animationend:a\",\"animationend:a\"]', 'after two frames: ' + J(heard));"
+    );
+    let no_scrub = format!(
+        "{ANIMATED} __vtestTrustedEvent($('#a'), 'animationstart'); \
+         T(J(heard) === '[\"doc-animationstart:a\",\"animationstart:a\"]', J(heard));"
+    );
+    let a_second_scrub_stays_quiet = format!(
+        "{ANIMATED} animate('#a'); await AGENT.scrubPrepare('#a'); AGENT.scrubRestore(true); \
+         await AGENT.scrubPrepare('#a'); await frames(3); \
+         __vtestTrustedEvent($('#a'), 'animationend'); \
+         T(heard.length === 0, 'the first restore ended the second scrub: ' + J(heard));"
+    );
+    let replaced_scrub_is_released = format!(
+        "{ANIMATED} animate('#a'); animate('#b'); await AGENT.scrubPrepare('#a'); await AGENT.scrubPrepare('#b'); \
+         await frames(3); __vtestTrustedEvent($('#a'), 'animationend'); \
+         T(J(heard) === '[\"doc-animationend:a\",\"animationend:a\"]', 'a is not being scrubbed any more: ' + J(heard)); \
+         heard.length = 0; __vtestTrustedEvent($('#b'), 'animationend'); T(heard.length === 0, J(heard));"
+    );
+    let inside_a_shadow_root = format!(
+        "{ANIMATED} var host = $('#a'), sr = host.attachShadow({{mode:'open'}}); sr.innerHTML = '<i id=in></i>'; \
+         var inner = sr.getElementById('in'), a = fakeAnimation(inner), got = 0; inner.getAnimations = function() {{ return [a]; }}; \
+         inner.addEventListener('animationend', function() {{ got++; }}); \
+         document.getAnimations = function() {{ return [a]; }}; \
+         await AGENT.scrubPrepare(null); __vtestTrustedEvent(inner, 'animationend'); \
+         T(got === 0, 'a listener inside the shadow tree heard it'); \
+         AGENT.scrubRestore(true); await frames(3); __vtestTrustedEvent(inner, 'animationend'); T(got === 1, 'after: ' + got);"
+    );
+    let html = "<div id=a></div><div id=b></div>";
+    check(&[
+        ("during", html, &during),
+        ("other_elements_keep_theirs", html, &other_elements),
+        ("synthetic_events_pass", html, &synthetic_from_the_page),
+        ("two_frames_after_restore", html, &after_restore),
+        ("no_scrub_no_effect", html, &no_scrub),
+        ("second_scrub", html, &a_second_scrub_stays_quiet),
+        ("replaced_scrub", html, &replaced_scrub_is_released),
+        ("shadow_root", html, &inside_a_shadow_root),
+    ]);
+}

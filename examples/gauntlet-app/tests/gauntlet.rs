@@ -757,6 +757,68 @@ gauntlet!(xhr_route_fulfill_reports_the_mock, base, {
     assert_eq!(rows[5]["value"], Value::Null, "{}", rows[5]);
 });
 
+// ── 22. A scrub keeps its seeks' animation events from the page ──────────────
+
+gauntlet!(scrub_events_do_not_reach_the_page, base, {
+    let setup = r"
+        var style = document.createElement('style'); style.id = 'scrub-css';
+        style.textContent = '#scrub-t, #scrub-u { width: 10px; height: 10px; } \
+            #scrub-t { animation: sweepBroken 300ms linear 4000ms 3 both; } \
+            #scrub-u { animation: sweepBroken 100ms linear infinite; }';
+        document.head.appendChild(style);
+        window.__heard = [];
+        ['scrub-t', 'scrub-u'].forEach(function(id) {
+            var el = document.createElement('div'); el.id = id; document.body.appendChild(el);
+            ['animationstart', 'animationend', 'animationiteration'].forEach(function(t) {
+                el.addEventListener(t, function() { window.__heard.push(id + ':' + t); });
+            });
+        });
+        return 1";
+    let r = call(&base, "eval_js", json!({ "code": setup })).await;
+    assert_eq!(result(&r), &json!(1), "{r}");
+    // Its delay phase, every iteration and back: each crossing would fire an event.
+    let scrub = call(
+        &base,
+        "animation",
+        json!({ "action": "scrub", "selector": "#scrub-t", "points": 12, "capture": false }),
+    )
+    .await;
+    assert!(scrub.get("error").is_none(), "{scrub}");
+    let read =
+        "return window.__heard.filter(function(h) { return h.indexOf('scrub-t') === 0; }).length";
+    let during = call(&base, "eval_js", json!({ "code": read })).await;
+    let other = call(
+        &base,
+        "eval_js",
+        json!({ "code": "return window.__heard.filter(function(h) { return h.indexOf('scrub-u') === 0; }).length" }),
+    )
+    .await;
+    // The animation, restored, then runs for real: its own events do reach the page.
+    let mut natural = Value::Null;
+    for _ in 0..40 {
+        natural = call(&base, "eval_js", json!({ "code": read })).await;
+        if natural["result"].as_u64().unwrap_or(0) >= 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let _ = call(
+        &base,
+        "eval_js",
+        json!({ "code": "document.getElementById('scrub-t').remove(); document.getElementById('scrub-u').remove(); document.getElementById('scrub-css').remove(); return 1" }),
+    )
+    .await;
+    assert_eq!(result(&during), &json!(0), "reached the page: {during}");
+    assert!(
+        result(&other).as_u64().unwrap_or(0) > 0,
+        "another element lost its events: {other}"
+    );
+    assert!(
+        natural["result"].as_u64().unwrap_or(0) >= 4,
+        "the real run's events never reached the page: {natural}"
+    );
+});
+
 // ── 23-25. DISPLAY-GATED: screenshot + filmstrip + trusted input ─────────────
 // These need a real window server (Screen Recording on macOS); they run on the
 // macOS validation box and local Windows (VICTAURI_GAUNTLET_DISPLAY=1) and skip

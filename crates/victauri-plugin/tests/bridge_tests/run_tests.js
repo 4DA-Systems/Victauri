@@ -22,6 +22,7 @@ const { JSDOM } = require("jsdom");
 const { fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
 const { implForWrapper } = require("jsdom/lib/jsdom/living/generated/utils.js");
 const MouseEventIface = require("jsdom/lib/jsdom/living/generated/MouseEvent.js");
+const EventIface = require("jsdom/lib/jsdom/living/generated/Event.js");
 const { fireAPageTransitionEvent } = require("jsdom/lib/jsdom/living/helpers/page-transition-event.js");
 
 const testDefPath = process.argv[2];
@@ -326,6 +327,11 @@ async function run() {
         bubbles: true,
         cancelable: true,
       });
+    };
+
+    // Dispatch a TRUSTED bubbling event, as the browser does for an animation event.
+    window.__vtestTrustedEvent = function (el, type) {
+      fireAnEvent(type, implForWrapper(el), EventIface, { bubbles: true });
     };
 
     // Dispatch a TRUSTED pagehide / pageshow on the window, as the browser does on a real
