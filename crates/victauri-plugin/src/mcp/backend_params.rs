@@ -13,7 +13,7 @@ use serde::Deserialize;
 /// error, forcing agents to fall back to `eval_js` + `__TAURI_INTERNALS__.invoke`. The intent
 /// of a stringified object is unambiguous; anything else (scalar, array, non-object string)
 /// stays rejected.
-fn deserialize_optional_object<'de, D>(
+pub(super) fn deserialize_optional_object<'de, D>(
     deserializer: D,
 ) -> Result<Option<serde_json::Value>, D::Error>
 where
@@ -30,6 +30,16 @@ where
         },
         Some(_) => Err(serde::de::Error::custom(CONTRACT)),
     }
+}
+
+/// A JSON value where an explicit `null` is a value, not "absent": plain `Option<Value>` reads
+/// both as `None`, so a caller could never compare with null or store it. Use with
+/// `#[serde(default)]`, which leaves an absent key `None`.
+pub(super) fn present_value<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 /// Parameters for the `get_registry` tool.
@@ -92,7 +102,9 @@ pub struct ListAppDirParams {
     pub directory: Option<AppDir>,
     /// Optional subdirectory path relative to the chosen root (e.g. "databases").
     pub path: Option<String>,
-    /// Only return entries matching this glob pattern (e.g. "*.sqlite", "*.db").
+    /// Only return files whose name matches this glob (directories are always listed): `*` is
+    /// any run of characters, `?` one character (e.g. "*.sqlite", "app-?.db"). A pattern with
+    /// `[` or `]` is refused.
     pub pattern: Option<String>,
     /// Maximum directory depth to recurse. Default: 1 (immediate children only).
     pub max_depth: Option<u32>,

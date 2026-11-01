@@ -173,6 +173,85 @@ async fn drain(state: &Arc<VictauriState>, bridge: &Arc<dyn WebviewBridge>) -> O
     crate::mcp::server::drain_window_into_recording(state, bridge, "main").await
 }
 
+/// Events reach the recorder from the once-a-second drain, so a checkpoint taken between drains
+/// stamped a stale index and everything since the last drain landed on the wrong side of it, for
+/// good: `events_between` returned nothing for events that ran between the two checkpoints.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_includes_what_the_page_captured_before_it() {
+    let state = state();
+    let page = PageBridge::new(&state);
+    let bridge: Arc<dyn WebviewBridge> = Arc::new(page.clone());
+    let h = VictauriMcpHandler::new(state.clone(), Arc::clone(&bridge));
+    let _ = call(&h, "recording", json!({"action": "start"})).await;
+    let ms = || chrono::Utc::now().timestamp_millis() + 1_000;
+
+    page.push(&console_json("before c1", ms()));
+    let r = call(
+        &h,
+        "recording",
+        json!({"action": "checkpoint", "checkpoint_id": "c1"}),
+    )
+    .await;
+    assert_ne!(r.is_error, Some(true), "{}", text(&r));
+    page.push(&console_json("between one", ms()));
+    page.push(&console_json("between two", ms()));
+    let _ = call(
+        &h,
+        "recording",
+        json!({"action": "checkpoint", "checkpoint_id": "c2"}),
+    )
+    .await;
+    page.push(&console_json("after c2", ms()));
+
+    let between = call(
+        &h,
+        "recording",
+        json!({"action": "events_between", "from": "c1", "to": "c2"}),
+    )
+    .await;
+    let out = text(&between);
+    assert!(
+        out.contains("between one") && out.contains("between two"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("before c1") && !out.contains("after c2"),
+        "{out}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_checkpoint_id_must_be_non_empty_and_unused() {
+    let state = state();
+    let page = PageBridge::new(&state);
+    let bridge: Arc<dyn WebviewBridge> = Arc::new(page.clone());
+    let h = VictauriMcpHandler::new(state.clone(), Arc::clone(&bridge));
+    let _ = call(&h, "recording", json!({"action": "start"})).await;
+    let first = call(
+        &h,
+        "recording",
+        json!({"action": "checkpoint", "checkpoint_id": "a"}),
+    )
+    .await;
+    assert_ne!(first.is_error, Some(true), "{}", text(&first));
+    let again = call(
+        &h,
+        "recording",
+        json!({"action": "checkpoint", "checkpoint_id": "a"}),
+    )
+    .await;
+    assert_eq!(again.is_error, Some(true), "{}", text(&again));
+    assert!(text(&again).contains("already"), "{}", text(&again));
+    let empty = call(
+        &h,
+        "recording",
+        json!({"action": "checkpoint", "checkpoint_id": ""}),
+    )
+    .await;
+    assert_eq!(empty.is_error, Some(true), "{}", text(&empty));
+    assert_eq!(state.recorder.checkpoint_count(), 1);
+}
+
 // C5 / V-10: an event stamped ahead of the Rust clock was re-read on every drain (the
 // clamp-to-now watermark never got past it): one event, recorded 5 times in 5 drains.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

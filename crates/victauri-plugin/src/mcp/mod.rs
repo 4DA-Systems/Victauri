@@ -22,6 +22,8 @@ mod robustness_tests;
 mod server;
 #[cfg(test)]
 mod tool_result_tests;
+#[cfg(test)]
+mod tool_truth_tests;
 mod verification_params;
 mod webview_params;
 mod window_params;
@@ -111,6 +113,25 @@ const DEFAULT_LOG_LIMIT: usize = 100;
 /// Large request/response bodies are truncated with a marker so the aggregate
 /// log stays well under [`MAX_EVAL_RESULT_LEN`] even on heavy-traffic apps.
 const MAX_LOG_FIELD_BYTES: usize = 4096;
+
+/// Longest `path` the file tools accept. A real relative path is far shorter; checking one of
+/// 900 KB walked its ancestors with a quadratic number of filesystem calls and froze the server.
+const MAX_APP_PATH_LEN: usize = 4096;
+/// Longest `input type_text`. Per-character typing is quadratic in the page and cannot be
+/// cancelled: 100 KB took 7 s, 1.1 MB wedged the page for over ten minutes. `fill` has no such cost.
+const MAX_TYPE_TEXT_LEN: usize = 64 * 1024;
+/// Longest `list_app_dir` glob pattern.
+const MAX_GLOB_PATTERN_LEN: usize = 1024;
+
+fn check_app_path_len(path: &str) -> Result<(), String> {
+    if path.len() > MAX_APP_PATH_LEN {
+        return Err(format!(
+            "path too long ({} bytes, the limit is {MAX_APP_PATH_LEN})",
+            path.len()
+        ));
+    }
+    Ok(())
+}
 
 /// Hard cap on entries returned by `list_app_dir` (recursive). Without it a
 /// directory with millions of files (or a wide tree at max depth) would build an
@@ -372,6 +393,12 @@ fn resource_allowed(privacy: &crate::privacy::PrivacyConfig, uri: &str) -> bool 
 
 const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// How long a page that stopped answering gets to be replaced (see `leave_stuck_page`).
+const STUCK_PAGE_LEAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How a failed liveness probe starts (see `probe_bridge`).
+const BRIDGE_DOWN: &str = "bridge not responding";
+
 const SAFE_ENV_PREFIXES: &[&str] = &[
     "HOME",
     "USER",
@@ -446,6 +473,10 @@ pub struct VictauriMcpHandler {
     probe_timeout: std::time::Duration,
     /// Deadline for one `read_app_file` read ([`READ_APP_FILE_TIMEOUT`]; likewise).
     file_read_timeout: std::time::Duration,
+    /// Windows whose bridge has answered a probe (see `bridge_has_answered`).
+    answered_windows: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Per window, the last URL seen inside the app before a native navigation.
+    last_app_urls: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 #[tool_router]
@@ -596,68 +627,9 @@ impl VictauriMcpHandler {
             ));
         }
 
-        // ── Fault injection check ──
-        if let Some(fault) = self.state.fault_registry.check_and_trigger(&params.command) {
-            match fault {
-                crate::introspection::FaultType::Delay { delay_ms } => {
-                    tracing::info!(
-                        command = %params.command,
-                        delay_ms = delay_ms,
-                        "fault injection: delaying command"
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
-                    // After delay, continue with normal execution below
-                }
-                crate::introspection::FaultType::Error { ref message } => {
-                    tracing::info!(
-                        command = %params.command,
-                        "fault injection: returning error"
-                    );
-                    return tool_error(format!(
-                        "[FAULT INJECTED] command '{}': {message}",
-                        params.command
-                    ));
-                }
-                crate::introspection::FaultType::Drop => {
-                    tracing::info!(
-                        command = %params.command,
-                        "fault injection: dropping response"
-                    );
-                    return CallToolResult::success(vec![ContentBlock::text("{}")]);
-                }
-                crate::introspection::FaultType::Corrupt => {
-                    tracing::info!(
-                        command = %params.command,
-                        "fault injection: corrupting response"
-                    );
-                    // Execute normally but mangle the response
-                    let args_json = params.args.unwrap_or(serde_json::json!({}));
-                    let args_str =
-                        serde_json::to_string(&args_json).unwrap_or_else(|_| "{}".to_string());
-                    let code = format!(
-                        "return window.__TAURI_INTERNALS__.invoke({}, {args_str})",
-                        js_string(&params.command)
-                    );
-                    if let Ok(result) = self
-                        .eval_with_return(&code, params.webview_label.as_deref())
-                        .await
-                    {
-                        let corrupted = format!(
-                            "{{\"__corrupted\":true,\"original_length\":{},\"fault\":\"corrupt\"}}",
-                            result.len()
-                        );
-                        return CallToolResult::success(vec![ContentBlock::text(corrupted)]);
-                    }
-                    return CallToolResult::success(vec![ContentBlock::text(
-                        "{\"__corrupted\":true,\"fault\":\"corrupt\",\"note\":\"original invocation also failed\"}",
-                    )]);
-                }
-            }
-        }
-
-        // ── Normal execution with timing ──
         // `with_logs` returns backend log entries, so it needs `logs.backend` like reading them
-        // directly — checked before the command runs, so a refused read has no side effects.
+        // directly — checked before anything runs (or a fault is spent), so a refused read has no
+        // side effects.
         let with_logs = params.with_logs.unwrap_or(false);
         if with_logs && !self.state.privacy.is_call_allowed("logs", "logs.backend") {
             return tool_disabled("logs.backend");
@@ -667,16 +639,91 @@ impl VictauriMcpHandler {
             Some(cursor) => self.backend_logs_error(&message, cursor),
             None => tool_error(message),
         };
-        let start = std::time::Instant::now();
+        let succeed = |result: &str| match log_cursor {
+            Some(cursor) => self.attach_backend_logs(result, cursor),
+            None => CallToolResult::success(vec![ContentBlock::text(result)]),
+        };
+        let had_args = params
+            .args
+            .as_ref()
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|args| !args.is_empty());
         let args_json = params.args.unwrap_or(serde_json::json!({}));
         let args_str = serde_json::to_string(&args_json).unwrap_or_else(|_| "{}".to_string());
         let code = format!(
             "return window.__TAURI_INTERNALS__.invoke({}, {args_str})",
             js_string(&params.command)
         );
-        let timeout = params.timeout_ms.map_or(self.state.eval_timeout, |ms| {
+        // The budget covers the whole call, so an injected delay counts against it.
+        let mut timeout = params.timeout_ms.map_or(self.state.eval_timeout, |ms| {
             std::time::Duration::from_millis(ms.clamp(1, MAX_INVOKE_TIMEOUT_MS))
         });
+
+        // ── Fault injection check ──
+        if let Some(fault) = self.state.fault_registry.check_and_trigger(&params.command) {
+            match fault {
+                crate::introspection::FaultType::Delay { delay_ms } => {
+                    tracing::info!(
+                        command = %params.command,
+                        delay_ms = delay_ms,
+                        "fault injection: delaying command"
+                    );
+                    let delay = std::time::Duration::from_millis(delay_ms);
+                    if delay >= timeout {
+                        tokio::time::sleep(timeout).await;
+                        return fail(format!(
+                            "[FAULT INJECTED] command '{}': the injected {delay_ms} ms delay \
+                             outlasted the call's time budget ({}), so the command was not sent",
+                            params.command,
+                            format_timeout(timeout)
+                        ));
+                    }
+                    tokio::time::sleep(delay).await;
+                    timeout -= delay;
+                    // After delay, continue with normal execution below
+                }
+                crate::introspection::FaultType::Error { ref message } => {
+                    tracing::info!(
+                        command = %params.command,
+                        "fault injection: returning error"
+                    );
+                    return fail(format!(
+                        "[FAULT INJECTED] command '{}': {message}",
+                        params.command
+                    ));
+                }
+                crate::introspection::FaultType::Drop => {
+                    tracing::info!(
+                        command = %params.command,
+                        "fault injection: dropping response"
+                    );
+                    return succeed("{}");
+                }
+                crate::introspection::FaultType::Corrupt => {
+                    tracing::info!(
+                        command = %params.command,
+                        "fault injection: corrupting response"
+                    );
+                    // Execute normally but mangle the response
+                    if let Ok(result) = self
+                        .eval_outcome(&code, params.webview_label.as_deref(), timeout)
+                        .await
+                    {
+                        let corrupted = format!(
+                            "{{\"__corrupted\":true,\"original_length\":{},\"fault\":\"corrupt\"}}",
+                            result.len()
+                        );
+                        return succeed(&corrupted);
+                    }
+                    return succeed(
+                        "{\"__corrupted\":true,\"fault\":\"corrupt\",\"note\":\"original invocation also failed\"}",
+                    );
+                }
+            }
+        }
+
+        // ── Normal execution with timing ──
+        let start = std::time::Instant::now();
         let result = self
             .eval_outcome(&code, params.webview_label.as_deref(), timeout)
             .await;
@@ -700,10 +747,7 @@ impl VictauriMcpHandler {
                         params.command
                     ));
                 }
-                if let Some(cursor) = log_cursor {
-                    return self.attach_backend_logs(&result, cursor);
-                }
-                CallToolResult::success(vec![ContentBlock::text(result)])
+                succeed(&result)
             }
             // Only a call that was SENT and then ran out of time can be a slow command; one that
             // never left (a busy UI thread, a dead page) is not helped by a longer timeout hint.
@@ -717,6 +761,13 @@ impl VictauriMcpHandler {
                     f.message
                 ))
             }
+            // Tauri's "missing required key x" for a call with no `args` is nearly always
+            // arguments written flat, next to `command`, where serde drops them.
+            Err(f) if !had_args && f.message.contains("missing required key") => fail(format!(
+                "invoke_command failed: {} The command's arguments go nested under `args`: \
+                     {{\"command\":\"{}\",\"args\":{{...}}}}.",
+                f.message, params.command
+            )),
             Err(f) => fail(format!("invoke_command failed: {}", f.message)),
         }
     }
@@ -921,6 +972,16 @@ impl VictauriMcpHandler {
             WaitCondition::Log => {
                 return self.wait_for_log(&params, timeout_ms, poll).await;
             }
+            // Without a value these can never be met as asked, and used to poll to the timeout.
+            WaitCondition::Text
+            | WaitCondition::TextGone
+            | WaitCondition::Selector
+            | WaitCondition::SelectorGone
+            | WaitCondition::Url
+                if params.value.as_deref().is_none_or(str::is_empty) =>
+            {
+                return missing_param("value", &format!("wait_for({})", params.condition));
+            }
             _ => {}
         }
 
@@ -1049,13 +1110,27 @@ impl VictauriMcpHandler {
                         .map_or(true, |ts| ts.with_timezone(&chrono::Utc) >= baseline)
             });
             if let Some(ev) = matched {
+                // The wait is how async work is awaited, so it works under every profile; the
+                // payload is event-bus data, so it takes the capability that reads the bus.
+                let mut event = serde_json::json!({
+                    "name": ev.name,
+                    "timestamp": ev.timestamp,
+                });
+                if self
+                    .state
+                    .privacy
+                    .is_call_allowed("introspect", "introspect.event_bus")
+                {
+                    event["payload"] = serde_json::json!(ev.payload);
+                } else {
+                    event["payload_omitted"] = serde_json::json!(
+                        "reading event payloads needs introspect.event_bus, which the privacy \
+                         configuration does not allow"
+                    );
+                }
                 return json_result(&serde_json::json!({
                     "ok": true,
-                    "event": {
-                        "name": ev.name,
-                        "payload": ev.payload,
-                        "timestamp": ev.timestamp,
-                    },
+                    "event": event,
                     "elapsed_ms": start.elapsed().as_millis() as u64,
                 }));
             }
@@ -1416,18 +1491,36 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<ListAppDirParams>,
     ) -> CallToolResult {
+        // Lexical traversal guard BEFORE any filesystem access: a `..` or absolute sub-path
+        // is rejected as traversal up front.
+        if let Some(sub) = params.path.as_deref()
+            && let Err(e) =
+                check_app_path_len(sub).and_then(|()| Self::lexical_safe(std::path::Path::new(sub)))
+        {
+            return tool_error(e);
+        }
+        // A pattern that could never match used to read as an empty directory.
+        if let Some(pattern) = params.pattern.as_deref() {
+            if pattern.len() > MAX_GLOB_PATTERN_LEN {
+                return tool_error_with_hint(
+                    format!("pattern longer than {MAX_GLOB_PATTERN_LEN} bytes"),
+                    RecoveryHint::CheckInput,
+                );
+            }
+            if pattern.contains(['[', ']']) {
+                return tool_error_with_hint(
+                    format!(
+                        "pattern '{pattern}' uses a character class, which is not supported: \
+                         use `*` (any run of characters) and `?` (one character)"
+                    ),
+                    RecoveryHint::CheckInput,
+                );
+            }
+        }
         let base = match self.resolve_app_dir(params.directory) {
             Ok(d) => d,
             Err(e) => return tool_error(e),
         };
-
-        // Lexical traversal guard BEFORE any filesystem access: a `..` or absolute sub-path
-        // is rejected as traversal up front.
-        if let Some(sub) = params.path.as_deref()
-            && let Err(e) = Self::lexical_safe(std::path::Path::new(sub))
-        {
-            return tool_error(e);
-        }
         // Every filesystem call below is synchronous and unbounded in the directory's size, so
         // the whole walk runs on the blocking pool (it used to run on an async worker).
         let walk = tokio::task::spawn_blocking(move || Self::list_app_dir_blocking(&base, &params));
@@ -1494,31 +1587,41 @@ impl VictauriMcpHandler {
         &self,
         Parameters(params): Parameters<ReadAppFileParams>,
     ) -> CallToolResult {
-        let base = match self.resolve_app_dir(params.directory) {
-            Ok(d) => d,
-            Err(e) => return tool_error(e),
-        };
-
         // Lexical traversal guard FIRST — before the existence check — so a
         // traversal attempt (`..` / absolute) is rejected as traversal rather
         // than leaking whether the out-of-tree target exists via "file not
         // found". `safe_within` (which canonicalizes) stays below as
         // defense-in-depth for real files.
-        if let Err(e) = Self::lexical_safe(std::path::Path::new(&params.path)) {
+        if let Err(e) = check_app_path_len(&params.path)
+            .and_then(|()| Self::lexical_safe(std::path::Path::new(&params.path)))
+        {
             return tool_error(e);
         }
-        let target = base.join(&params.path);
-        // Refused as traversal whether or not a symlinked-out target exists (no oracle).
-        match Self::contained_or_missing(&base, &target) {
-            Ok(true) => {}
-            Ok(false) => return tool_error(format!("file not found: {}", params.path)),
+        let base = match self.resolve_app_dir(params.directory) {
+            Ok(d) => d,
             Err(e) => return tool_error(e),
-        }
-        if let Err(e) = Self::safe_within(&base, &target) {
+        };
+        let target = base.join(&params.path);
+        // Synchronous filesystem checks (a slow disk can take seconds): off the server's async
+        // workers.
+        let checked = {
+            let (base, target, shown) = (base.clone(), target.clone(), params.path.clone());
+            tokio::task::spawn_blocking(move || {
+                // Refused as traversal whether or not a symlinked-out target exists (no oracle).
+                if !Self::contained_or_missing(&base, &target)? {
+                    return Err(format!("file not found: {shown}"));
+                }
+                Self::safe_within(&base, &target)?;
+                if !target.is_file() {
+                    return Err(format!("not a file: {shown}"));
+                }
+                Ok(())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("path check failed: {e}")))
+        };
+        if let Err(e) = checked {
             return tool_error(e);
-        }
-        if !target.is_file() {
-            return tool_error(format!("not a file: {}", params.path));
         }
 
         let max_bytes = params.max_bytes.unwrap_or(1_048_576).min(10_485_760);
@@ -1922,6 +2025,16 @@ impl VictauriMcpHandler {
                 let Some(text) = &params.text else {
                     return missing_param("text", "type_text");
                 };
+                if text.len() > MAX_TYPE_TEXT_LEN {
+                    return tool_error_with_hint(
+                        format!(
+                            "text is {} bytes; type_text types one character at a time and is \
+                             limited to {MAX_TYPE_TEXT_LEN}. Use action=fill to set a long value.",
+                            text.len()
+                        ),
+                        RecoveryHint::CheckInput,
+                    );
+                }
                 if params.trusted.unwrap_or(false) {
                     // Focus the element via JS — and confirm focus landed on it, since the OS
                     // keystrokes go to whatever holds focus — then deliver real OS keystrokes
@@ -2060,8 +2173,17 @@ impl VictauriMcpHandler {
                     .resize_window(params.label.as_deref(), width, height)
                 {
                     Ok(()) => {
-                        let result =
-                            serde_json::json!({"ok": true, "width": width, "height": height});
+                        // What the window IS now (physical pixels, as `get_state` reports), since
+                        // the OS clamps, and a request in logical pixels differs on a scaled
+                        // display. Falls back to the request if it cannot be read back.
+                        let actual = self.read_back_window(params.label.as_deref());
+                        let (w, h) = actual.as_ref().map_or((width, height), |s| s.size);
+                        let result = serde_json::json!({
+                            "ok": true,
+                            "width": w,
+                            "height": h,
+                            "requested": {"width": width, "height": height},
+                        });
                         CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e),
@@ -2079,7 +2201,14 @@ impl VictauriMcpHandler {
                 };
                 match self.bridge.move_window(params.label.as_deref(), x, y) {
                     Ok(()) => {
-                        let result = serde_json::json!({"ok": true, "x": x, "y": y});
+                        let actual = self.read_back_window(params.label.as_deref());
+                        let (ax, ay) = actual.as_ref().map_or((x, y), |s| s.position);
+                        let result = serde_json::json!({
+                            "ok": true,
+                            "x": ax,
+                            "y": ay,
+                            "requested": {"x": x, "y": y},
+                        });
                         CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e),
@@ -2125,8 +2254,22 @@ impl VictauriMcpHandler {
                     .map(|k| js_string(k))
                     .unwrap_or_default();
                 let code = format!("return window.__VICTAURI__?.{method}({key_arg})");
-                self.eval_bridge(&code, params.webview_label.as_deref())
-                    .await
+                let result = self
+                    .eval_bridge(&code, params.webview_label.as_deref())
+                    .await;
+                // The read returns the bare value, so key redaction has no key to go on; only
+                // this handler knows which key it was.
+                if self.state.privacy.redaction_enabled
+                    && params
+                        .key
+                        .as_deref()
+                        .is_some_and(crate::redaction::is_sensitive_key)
+                    && result.is_error != Some(true)
+                    && !matches!(result.content.first(), Some(ContentBlock::Text(t)) if t.text == "null")
+                {
+                    return CallToolResult::success(vec![ContentBlock::text("\"[REDACTED]\"")]);
+                }
+                result
             }
             StorageAction::Set => {
                 if !self.state.privacy.is_tool_enabled("set_storage") {
@@ -2146,13 +2289,11 @@ impl VictauriMcpHandler {
                         "storage key '{key}' is protected by privacy configuration"
                     ));
                 }
-                let value = params
-                    .value
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
+                let Some(value) = &params.value else {
+                    return missing_param("value", "set");
+                };
                 let value_json =
-                    serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string());
+                    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
                 let code = format!(
                     "return window.__VICTAURI__?.{method}({}, {value_json})",
                     js_string(key)
@@ -2186,7 +2327,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Navigation and dialog control. Actions: go_to (navigate to URL), go_back (browser back), get_history (navigation log), set_dialog_response (auto-respond to alert/confirm/prompt), get_dialog_log (captured dialog events). Subject to privacy controls for go_to and set_dialog_response.",
+        description = "Navigation and dialog control. Actions: go_to (navigate to URL, natively, so it also recovers a hung page or one outside the app; warns when the URL is outside the app), go_back (browser back; on a page that stopped answering, returns natively to the last known URL inside the app), get_history (navigation log), set_dialog_response (auto-respond to alert/confirm/prompt), get_dialog_log (captured dialog events). Subject to privacy controls for go_to and set_dialog_response.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2203,20 +2344,10 @@ impl VictauriMcpHandler {
                 let Some(url) = &params.url else {
                     return missing_param("url", "go_to");
                 };
-                if let Err(e) = validate_url(url, self.state.allow_file_navigation) {
-                    return tool_error(e);
-                }
-                let code = format!("return window.__VICTAURI__?.navigate({})", js_string(url));
-                self.eval_bridge(&code, params.webview_label.as_deref())
+                self.navigate_go_to(url, params.webview_label.as_deref())
                     .await
             }
-            NavigateAction::GoBack => {
-                self.eval_bridge(
-                    "return window.__VICTAURI__?.navigateBack()",
-                    params.webview_label.as_deref(),
-                )
-                .await
-            }
+            NavigateAction::GoBack => self.navigate_go_back(params.webview_label.as_deref()).await,
             NavigateAction::GetHistory => {
                 self.eval_bridge(
                     "return window.__VICTAURI__?.getNavigationLog()",
@@ -2258,7 +2389,7 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, were answered by a route rule, or were captured on Tauri's postMessage IPC path are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
+        description = "Time-travel recording. Actions: start (begin recording), stop (end and return session), checkpoint (save state snapshot), list_checkpoints, get_events (since index), events_between (two checkpoints), get_replay (IPC replay sequence), export (session as JSON), import (load a session from JSON as the active recording; refused while one is in progress; a session over 2 MiB imports only over REST, POST /api/tools/recording, up to 48 MiB), replay (re-invoke the recorded IPC commands that succeeded with no arguments, each in the window that made it — their side effects happen again; calls that had arguments, failed, never completed, were answered by a route rule, or were captured on Tauri's postMessage IPC path are skipped, and webview_label limits replay to that window's calls), flush (immediately drain pending events into recording without waiting for the 1-second poll).",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2267,7 +2398,7 @@ impl VictauriMcpHandler {
         )
     )]
     async fn recording(&self, Parameters(params): Parameters<RecordingParams>) -> CallToolResult {
-        const MAX_SESSION_JSON: usize = 10 * 1024 * 1024;
+        const MAX_SESSION_JSON: usize = hardening::MAX_SESSION_JSON_BYTES;
         if !self.state.privacy.is_tool_enabled("recording") {
             return tool_disabled("recording");
         }
@@ -2326,6 +2457,34 @@ impl VictauriMcpHandler {
                 let id = params
                     .checkpoint_id
                     .unwrap_or_else(|| format!("cp-{}", uuid::Uuid::new_v4()));
+                // `events_between` resolves an id to its first checkpoint, so a repeated id
+                // silently measured from the wrong one.
+                if id.is_empty() {
+                    return tool_error_with_hint(
+                        "checkpoint_id must not be empty (omit it to get a generated id)",
+                        RecoveryHint::CheckInput,
+                    );
+                }
+                if self
+                    .state
+                    .recorder
+                    .get_checkpoints()
+                    .iter()
+                    .any(|c| c.id == id)
+                {
+                    return tool_error_with_hint(
+                        format!("checkpoint '{id}' already exists in this recording"),
+                        RecoveryHint::CheckInput,
+                    );
+                }
+                // Events reach the recorder from the once-a-second drain, so the index stamped
+                // below must first take in what the page has captured: a stale one puts everything
+                // since the last drain on the wrong side of this checkpoint, for good.
+                let unreachable = if self.state.recorder.is_recording() {
+                    self.final_recording_flush().await
+                } else {
+                    Vec::new()
+                };
                 let state = params.state.unwrap_or(serde_json::Value::Null);
                 match self
                     .state
@@ -2333,11 +2492,14 @@ impl VictauriMcpHandler {
                     .checkpoint(id.clone(), params.checkpoint_label, state)
                 {
                     Ok(()) => {
-                        let result = serde_json::json!({
+                        let mut result = serde_json::json!({
                             "created": true,
                             "checkpoint_id": id,
                             "event_index": self.state.recorder.event_count(),
                         });
+                        if !unreachable.is_empty() {
+                            result["unreachable_windows"] = serde_json::json!(unreachable);
+                        }
                         CallToolResult::success(vec![ContentBlock::text(result.to_string())])
                     }
                     Err(e) => tool_error(e.to_string()),
@@ -2383,13 +2545,22 @@ impl VictauriMcpHandler {
                     return missing_param("session_json", "import");
                 };
                 if session_json.len() > MAX_SESSION_JSON {
-                    return tool_error("session JSON exceeds maximum size (10 MB)");
+                    return tool_error(format!(
+                        "session JSON exceeds the maximum size ({} MiB)",
+                        MAX_SESSION_JSON / (1024 * 1024)
+                    ));
                 }
-                let session: victauri_core::RecordedSession =
-                    match serde_json::from_str(session_json) {
-                        Ok(s) => s,
-                        Err(e) => return tool_error(format!("invalid session JSON: {e}")),
-                    };
+                // Tens of megabytes of JSON is real CPU time: off the server's async workers.
+                let raw = session_json.clone();
+                let parsed = tokio::task::spawn_blocking(move || {
+                    serde_json::from_str::<victauri_core::RecordedSession>(&raw)
+                })
+                .await;
+                let session = match parsed {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => return tool_error(format!("invalid session JSON: {e}")),
+                    Err(e) => return tool_error(format!("session import failed: {e}")),
+                };
 
                 let result = serde_json::json!({
                     "imported": true,
@@ -2873,6 +3044,20 @@ impl VictauriMcpHandler {
         }
         match params.action {
             TraceAction::Start => {
+                // Hidden windows are skipped frame by frame, but a label that names no window
+                // could never capture anything and used to report `started: true`.
+                if let Some(label) = params.webview_label.as_deref() {
+                    match self.bridge.try_list_window_labels() {
+                        Ok(labels) if !labels.iter().any(|l| l == label) => {
+                            return tool_error(format!(
+                                "window not found: '{label}' (use window.list to see available \
+                                 labels)"
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => return tool_error(ui_busy(&e)),
+                    }
+                }
                 let interval = params.interval_ms.unwrap_or(500);
                 let max_frames = params.max_frames.unwrap_or(60);
                 let label = params.webview_label.clone();
@@ -2957,6 +3142,7 @@ impl VictauriMcpHandler {
                 }))
             }
             TraceAction::Stop => {
+                let was_active = self.state.screencast.is_active();
                 let (frame_count, owned) = self.state.screencast.stop();
                 let timestamps = self.state.screencast.frame_timestamps();
                 let duration_ms = timestamps.last().copied().unwrap_or(0);
@@ -2972,7 +3158,7 @@ impl VictauriMcpHandler {
                     None => self.state.recorder.event_count(),
                 };
                 json_result(&serde_json::json!({
-                    "stopped": true,
+                    "stopped": was_active,
                     "frame_count": frame_count,
                     "duration_ms": duration_ms,
                     "frame_timestamps_ms": timestamps,
@@ -3064,6 +3250,9 @@ impl VictauriMcpHandler {
                     .await
                 {
                     Ok(result_str) => {
+                        if let Some(message) = page_action_error(&result_str) {
+                            return tool_error(message);
+                        }
                         match serde_json::from_str::<serde_json::Value>(&result_str) {
                             Ok(v) => json_result(&v),
                             Err(_) => CallToolResult::success(vec![ContentBlock::text(result_str)]),
@@ -3102,6 +3291,9 @@ impl VictauriMcpHandler {
                 };
                 match self.eval_with_return(&code, label).await {
                     Ok(result_str) => {
+                        if let Some(message) = page_action_error(&result_str) {
+                            return tool_error(message);
+                        }
                         match serde_json::from_str::<serde_json::Value>(&result_str) {
                             Ok(v) => json_result(&v),
                             Err(_) => CallToolResult::success(vec![ContentBlock::text(result_str)]),
@@ -3131,7 +3323,10 @@ impl VictauriMcpHandler {
             Err(e) => return tool_error(format!("scrub prepare failed: {e}")),
         };
         if prep_v.get("prepared").and_then(serde_json::Value::as_bool) != Some(true) {
-            // Surface the helpful error/info object (no target, JS-driven, etc.).
+            // Surface the helpful error (no target, JS-driven, etc.) as the failure it is.
+            if let Some(error) = prep_v.get("error").and_then(serde_json::Value::as_str) {
+                return tool_error(error);
+            }
             return json_result(&prep_v);
         }
 
@@ -3480,14 +3675,22 @@ impl VictauriMcpHandler {
                 // makes hundreds of real calls. The IPC log captures those with
                 // duration; the name+duration projection stays under the eval cap.
                 let code = ipc_timing_projection_js(None);
-                let mut ipc_traffic = match self
+                // `commands` above stays useful without the page, so an unreadable log does not
+                // fail the call; it must not read as "no traffic" though.
+                let (mut ipc_traffic, ipc_read_error) = match self
                     .eval_with_return(&code, params.webview_label.as_deref())
                     .await
                 {
-                    Ok(json_str) => page_json::parse_page_json::<Vec<serde_json::Value>>(&json_str)
-                        .map(|entries| ipc_timing_stats(&entries))
-                        .unwrap_or_default(),
-                    Err(_) => Vec::new(),
+                    Ok(json_str) => {
+                        match page_json::parse_page_json::<Vec<serde_json::Value>>(&json_str) {
+                            Ok(entries) => (ipc_timing_stats(&entries), None),
+                            Err(_) => (
+                                Vec::new(),
+                                Some("the page has no Victauri bridge".to_string()),
+                            ),
+                        }
+                    }
+                    Err(e) => (Vec::new(), Some(e)),
                 };
                 if let Some(threshold) = params.slow_threshold_ms {
                     ipc_traffic.retain(|s| {
@@ -3500,7 +3703,8 @@ impl VictauriMcpHandler {
                 let ipc_capture = self
                     .ipc_capture_status(params.webview_label.as_deref())
                     .await;
-                let result = serde_json::json!({
+                let unread = ipc_read_error.is_some();
+                let mut result = serde_json::json!({
                     "commands": stats,
                     "total_commands_profiled": driven_count,
                     "ipc_capture": ipc_capture,
@@ -3516,6 +3720,11 @@ impl VictauriMcpHandler {
                              log (per-command call_count + min/max/avg/p95 latency) — that is \
                              the one reflecting actual usage.",
                 });
+                if unread {
+                    result["ipc_traffic"] = serde_json::Value::Null;
+                    result["ipc_commands_observed"] = serde_json::Value::Null;
+                    result["ipc_read_error"] = serde_json::json!(ipc_read_error);
+                }
                 json_result(&result)
             }
             IntrospectAction::Coverage => {
@@ -3532,6 +3741,7 @@ impl VictauriMcpHandler {
                 // silently returning an empty set and reporting "0 invoked" despite live
                 // traffic. This is the same name projection ghost detection uses.
                 let code = ghost_ipc_projection_js(None);
+                // Coverage IS the log: unreadable must not read as "nothing was invoked".
                 let (invoked, ipc_calls_observed): (std::collections::HashSet<String>, usize) =
                     match self
                         .eval_with_return(&code, params.webview_label.as_deref())
@@ -3543,10 +3753,14 @@ impl VictauriMcpHandler {
                                     let count = names.len();
                                     (names.into_iter().collect(), count)
                                 }
-                                Err(_) => (std::collections::HashSet::new(), 0),
+                                Err(_) => {
+                                    return tool_error(
+                                        "cannot read the IPC log: the page has no Victauri bridge",
+                                    );
+                                }
                             }
                         }
-                        Err(_) => (std::collections::HashSet::new(), 0),
+                        Err(e) => return tool_error(format!("cannot read the IPC log: {e}")),
                     };
 
                 let uncovered: Vec<&String> = registered
@@ -4125,9 +4339,13 @@ impl VictauriMcpHandler {
             ExplainAction::Summary => {
                 let secs = params.seconds.unwrap_or(30);
                 let since = bounded::secs_ago(chrono::Utc::now(), secs);
-                let events = self
+                let events = match self
                     .explain_events(since, params.webview_label.as_deref())
-                    .await;
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(e) => return tool_error(e),
+                };
 
                 let mut ipc_count = 0u64;
                 let mut dom_mutations = 0u64;
@@ -4218,9 +4436,13 @@ impl VictauriMcpHandler {
             ExplainAction::LastAction => {
                 let secs = params.seconds.unwrap_or(5);
                 let since = bounded::secs_ago(chrono::Utc::now(), secs);
-                let events = self
+                let events = match self
                     .explain_events(since, params.webview_label.as_deref())
-                    .await;
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(e) => return tool_error(e),
+                };
 
                 let timeline: Vec<serde_json::Value> = events
                     .iter()
@@ -4336,9 +4558,13 @@ impl VictauriMcpHandler {
             ExplainAction::Diff => {
                 let secs = params.seconds.unwrap_or(10);
                 let since = bounded::secs_ago(chrono::Utc::now(), secs);
-                let events = self
+                let events = match self
                     .explain_events(since, params.webview_label.as_deref())
-                    .await;
+                    .await
+                {
+                    Ok(events) => events,
+                    Err(e) => return tool_error(e),
+                };
 
                 let mut ipc_commands: Vec<String> = Vec::new();
                 let mut dom_changes = 0u64;
@@ -4410,6 +4636,8 @@ impl VictauriMcpHandler {
             file_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_FILE_READS)),
             probe_timeout: PROBE_TIMEOUT,
             file_read_timeout: READ_APP_FILE_TIMEOUT,
+            answered_windows: Arc::default(),
+            last_app_urls: Arc::default(),
         }
     }
 
@@ -4782,27 +5010,36 @@ impl VictauriMcpHandler {
         &self,
         since: chrono::DateTime<chrono::Utc>,
         webview_label: Option<&str>,
-    ) -> Vec<victauri_core::AppEvent> {
+    ) -> Result<Vec<victauri_core::AppEvent>, String> {
         if self.state.recorder.is_recording() {
-            return self.state.event_log.since(since);
+            return Ok(self.state.event_log.since(since));
         }
         let code = format!(
             "return window.__VICTAURI__?.getEventStream({})",
             since.timestamp_millis()
         );
-        let Ok(raw) = self.eval_with_return(&code, webview_label).await else {
-            return self.state.event_log.since(since);
+        // An unreadable page knows nothing: answering from the (undrained) log said "No errors"
+        // about a frozen app or a window that does not exist.
+        let unreadable = |why: &str| {
+            format!(
+                "cannot read the window's live event stream, and no recording is active, so \
+                 nothing is known about its recent activity: {why}"
+            )
         };
+        let raw = self
+            .eval_with_return(&code, webview_label)
+            .await
+            .map_err(|e| unreadable(&e))?;
         let label = webview_label.unwrap_or("main");
         let mut events: Vec<victauri_core::AppEvent> =
             page_json::parse_page_json::<Vec<serde_json::Value>>(&raw)
-                .unwrap_or_default()
+                .map_err(|_| unreadable("the page has no Victauri bridge"))?
                 .iter()
                 .filter_map(|ev| crate::mcp::server::parse_bridge_event_from(ev, label))
                 .filter(|ev| !ev.is_internal() && ev.timestamp() >= since)
                 .collect();
         events.sort_by_key(victauri_core::AppEvent::timestamp);
-        events
+        Ok(events)
     }
 
     /// Resolve the EXACT window a native capture (`screenshot`, `trace`) should target, and
@@ -4853,6 +5090,196 @@ impl VictauriMcpHandler {
             })
     }
 
+    /// The state of the window `label` targets (see `find_window` for `None`), if readable.
+    fn read_back_window(&self, label: Option<&str>) -> Option<victauri_core::WindowState> {
+        let states = self.bridge.try_get_window_states(label).ok()?;
+        match label {
+            Some(_) => states.into_iter().next(),
+            None => Self::default_window_state(states),
+        }
+    }
+
+    /// The window a `None` label acts on, by the same preference as the bridge's `find_window`.
+    fn default_window_state(
+        mut states: Vec<victauri_core::WindowState>,
+    ) -> Option<victauri_core::WindowState> {
+        states.sort_by(|a, b| a.label.cmp(&b.label));
+        let at = states
+            .iter()
+            .position(|s| s.label == "main")
+            .or_else(|| states.iter().position(|s| s.visible))
+            .or(if states.is_empty() { None } else { Some(0) })?;
+        Some(states.swap_remove(at))
+    }
+
+    /// Whether `url` is the app itself: its dev server, or Tauri's custom protocol.
+    fn is_app_url(&self, url: &str) -> bool {
+        let Ok(parsed) = url::Url::parse(url) else {
+            return false;
+        };
+        let tauri_origin = match parsed.scheme() {
+            "tauri" => parsed.host_str() == Some("localhost"),
+            "http" | "https" => parsed.host_str() == Some("tauri.localhost"),
+            _ => false,
+        };
+        tauri_origin
+            || self
+                .bridge
+                .app_entry_url()
+                .and_then(|entry| url::Url::parse(&entry).ok())
+                .is_some_and(|entry| entry.origin() == parsed.origin())
+    }
+
+    /// Navigate natively, remembering the page being left if it is inside the app, so `go_back`
+    /// can return from a page with no bridge.
+    async fn navigate_natively(&self, url: &str, label: Option<&str>) -> Result<(), String> {
+        if let Some(current) = self.read_back_window(label)
+            && self.is_app_url(&current.url)
+        {
+            self.last_app_urls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(current.label, current.url);
+        }
+        self.leave_stuck_page(label).await?;
+        self.bridge.navigate_webview(label, url)
+    }
+
+    /// A same-site navigation waits on the page's renderer, so it never lands while that page
+    /// spins in an endless loop (measured on `WebView2`: not in 90 s, `about:blank` first did not
+    /// help either). A cross-site one gets a fresh renderer, and this server's own `/health` is a
+    /// cross-site page that is always there. Only for a page that stopped answering.
+    async fn leave_stuck_page(&self, label: Option<&str>) -> Result<(), String> {
+        if self.probe_bridge(label, None, None).await.is_ok() {
+            return Ok(());
+        }
+        self.detour_through_health(label).await
+    }
+
+    async fn detour_through_health(&self, label: Option<&str>) -> Result<(), String> {
+        // Sites ignore the port, so the host must differ from a dev server's.
+        let host = match self.bridge.app_entry_url().and_then(|u| {
+            url::Url::parse(&u)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+        }) {
+            Some(entry_host) if entry_host == "127.0.0.1" => "localhost",
+            _ => "127.0.0.1",
+        };
+        let port = self.state.port.load(Ordering::Relaxed);
+        let detour = format!("http://{host}:{port}/health");
+        self.bridge.navigate_webview(label, &detour)?;
+        let give_up = std::time::Instant::now() + STUCK_PAGE_LEAVE_WAIT;
+        while std::time::Instant::now() < give_up {
+            if self
+                .read_back_window(label)
+                .is_some_and(|window| window.url == detour)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(())
+    }
+
+    /// `navigate go_to`. Native rather than `location.href`: page script cannot run on a hung
+    /// page, or on a page outside the app (no capability, so the bridge cannot answer), and that
+    /// made a mistyped URL cost the whole session.
+    async fn navigate_go_to(&self, url: &str, label: Option<&str>) -> CallToolResult {
+        let in_app = self.is_app_url(url);
+        if !in_app && let Err(e) = validate_url(url, self.state.allow_file_navigation) {
+            return tool_error(e);
+        }
+        if let Err(e) = self.navigate_natively(url, label).await {
+            return tool_error(e);
+        }
+        let mut result = serde_json::json!({"ok": true, "url": url});
+        if !in_app {
+            let app = self
+                .bridge
+                .app_entry_url()
+                .unwrap_or_else(|| "the app's URL".to_string());
+            let target = url::Url::parse(url)
+                .map_or_else(|_| url.to_string(), |u| u.origin().ascii_serialization());
+            result["warning"] = serde_json::json!(format!(
+                "{target} is outside the app ({app}): tools that read the page will report that \
+                 the bridge is not responding until it is back. Return with navigate go_back, or \
+                 go_to {app}."
+            ));
+        }
+        json_result(&result)
+    }
+
+    /// `navigate go_back`: `history.back()` in the page, or, on a page that has stopped
+    /// answering, a native navigation to the last URL known to be inside the app. A window whose
+    /// bridge never answered gets the bridge error: nothing says going anywhere would help.
+    async fn navigate_go_back(&self, label: Option<&str>) -> CallToolResult {
+        let error = match self
+            .eval_outcome(
+                "return window.__VICTAURI__?.navigateBack()",
+                label,
+                self.state.eval_timeout,
+            )
+            .await
+        {
+            Ok(result) => return CallToolResult::success(vec![ContentBlock::text(result)]),
+            Err(f) if f.kind == EvalFailureKind::NotSent && f.message.contains(BRIDGE_DOWN) => {
+                f.message
+            }
+            Err(f) => return tool_error(f.message),
+        };
+        let current = self.read_back_window(label);
+        let window = current.as_ref().map_or_else(
+            || label.unwrap_or_default().to_string(),
+            |s| s.label.clone(),
+        );
+        if !self.bridge_has_answered(&window) {
+            return tool_error(error);
+        }
+        let remembered = self
+            .last_app_urls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&window)
+            .cloned();
+        let target = remembered
+            .or_else(|| {
+                current
+                    .as_ref()
+                    .map(|s| s.url.clone())
+                    .filter(|url| self.is_app_url(url))
+            })
+            .or_else(|| self.bridge.app_entry_url());
+        let Some(target) = target else {
+            return tool_error(error);
+        };
+        // The probe behind `error` already said the page is not answering.
+        let left = match self.detour_through_health(label).await {
+            Ok(()) => self.bridge.navigate_webview(label, &target),
+            Err(e) => Err(e),
+        };
+        if let Err(e) = left {
+            return tool_error(format!("{error}; navigating to {target} also failed: {e}"));
+        }
+        json_result(&serde_json::json!({
+            "ok": true,
+            "recovered": true,
+            "url": target,
+            "note": "the page was not answering, so history.back() could not run; navigated \
+                     natively to the last known URL inside the app",
+        }))
+    }
+
+    /// Whether this window's bridge has ever answered: proof it has the capability (which is
+    /// fixed at build time), so a later silence is the page, not the configuration.
+    fn bridge_has_answered(&self, label: &str) -> bool {
+        self.answered_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(label)
+            || self.state.page_loads.latest(label).is_some()
+    }
+
     /// Whether `target` exists, after refusing it if it resolves outside `base`.
     ///
     /// For a missing target, containment is decided on its deepest EXISTING ancestor, so a
@@ -4883,17 +5310,34 @@ impl VictauriMcpHandler {
         Ok(exists)
     }
 
+    /// `*` matches any run of characters and `?` one character; anything else matches itself.
+    /// Iterative, resuming from the last `*`, so a hostile pattern costs O(name * pattern).
     fn matches_glob(name: &str, pattern: &str) -> bool {
-        if pattern == "*" {
-            return true;
+        let name: Vec<char> = name.chars().collect();
+        let pattern: Vec<char> = pattern.chars().collect();
+        let (mut n, mut p) = (0, 0);
+        let mut star: Option<(usize, usize)> = None;
+        while n < name.len() {
+            match pattern.get(p) {
+                Some('*') => {
+                    star = Some((p, n));
+                    p += 1;
+                }
+                Some(&c) if c == '?' || c == name[n] => {
+                    n += 1;
+                    p += 1;
+                }
+                _ => {
+                    let Some((star_p, star_n)) = star else {
+                        return false;
+                    };
+                    star = Some((star_p, star_n + 1));
+                    p = star_p + 1;
+                    n = star_n + 1;
+                }
+            }
         }
-        if let Some(suffix) = pattern.strip_prefix("*.") {
-            return name.ends_with(&format!(".{suffix}"));
-        }
-        if let Some(prefix) = pattern.strip_suffix("*") {
-            return name.starts_with(prefix);
-        }
-        name == pattern
+        pattern[p..].iter().all(|c| *c == '*')
     }
 
     /// Probe every window's JS bridge and report which are introspectable. A
@@ -4912,14 +5356,25 @@ impl VictauriMcpHandler {
         };
         let mut report = Vec::with_capacity(labels.len());
         let mut blind = 0usize;
+        let mut never_answered = 0usize;
         for label in &labels {
             let visible = states.iter().find(|s| &s.label == label).map(|s| s.visible);
             let introspectable = self.probe_bridge(Some(label), None, None).await.is_ok();
+            let page_gone_silent = !introspectable && self.bridge_has_answered(label);
             if !introspectable {
                 blind += 1;
+                if !page_gone_silent {
+                    never_answered += 1;
+                }
             }
             let note = if introspectable {
                 "ok — Victauri JS bridge is responding".to_string()
+            } else if page_gone_silent {
+                "NOT responding, but its bridge answered earlier in this session, so the setup is \
+                 fine: the page's JS thread is busy (an endless loop, a blocking synchronous \
+                 command) or it navigated away from the app. navigate go_to the app's URL \
+                 recovers it."
+                    .to_string()
             } else if visible == Some(true) {
                 format!(
                     "NOT introspectable although the window is visible — almost certainly missing \
@@ -4939,7 +5394,10 @@ impl VictauriMcpHandler {
                 "note": note,
             }));
         }
-        let hint = if blind > 0 {
+        let hint = if blind > 0 && never_answered == 0 {
+            "Windows with introspectable:false answered earlier in this session and have stopped: \
+             see each window's note. Their setup is fine."
+        } else if blind > 0 {
             "Windows with introspectable:false have no working Victauri JS bridge — eval_js, \
              dom_snapshot, animation, find_elements, etc. cannot see them. The usual cause is a \
              missing \"victauri:default\" capability for that window: Tauri's per-window permission \
@@ -5099,21 +5557,39 @@ impl VictauriMcpHandler {
         let probe = crate::js_bridge::eval_probe_script(&id);
         let injected = {
             let _budget = deadline.map(|d| crate::bridge::CallBudget::until(d.into_std()));
-            self.bridge.eval_webview(webview_label, &probe)
+            self.bridge.eval_webview_resolved(webview_label, &probe)
         };
-        if let Err(e) = injected {
-            return Err(format!("eval injection failed: {e}"));
-        }
+        let resolved = match injected {
+            Ok(resolved) => resolved,
+            Err(e) => return Err(format!("eval injection failed: {e}")),
+        };
+        // The window's real name: nothing is labelled "default". (Empty: a bridge that cannot say.)
+        let window = if resolved.is_empty() {
+            webview_label.unwrap_or("the default window")
+        } else {
+            resolved.as_str()
+        };
         let wait = answer_by.map_or(PROBE_ANSWER_WINDOW, |d| {
             d.saturating_duration_since(tokio::time::Instant::now())
                 .min(PROBE_ANSWER_WINDOW)
         });
         if let Ok(Ok(raw)) = tokio::time::timeout(wait, rx).await {
+            self.answered_windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(window.to_string());
             Ok(crate::js_bridge::probe_answer_nonce(&raw))
-        } else {
-            let label = webview_label.unwrap_or("default");
+        } else if self.bridge_has_answered(window) {
             Err(format!(
-                "bridge not responding on window '{label}' — the window may be hidden, \
+                "{BRIDGE_DOWN} on window '{window}' — it answered earlier in this session, so \
+                 this is the page, not the setup: its JS thread is not responding (an endless \
+                 loop, a blocking synchronous command) or it navigated away from the app. Check \
+                 with `window` get_state and the `screenshot` tool; `navigate` go_to the app's \
+                 URL recovers it."
+            ))
+        } else {
+            Err(format!(
+                "{BRIDGE_DOWN} on window '{window}' — the window may be hidden, \
                  missing the victauri capability, or the JS bridge is not loaded (e.g. the page \
                  failed to load: a dev-server connection-refused or blank error page has no JS \
                  bridge — check the window with the `screenshot` tool, which works regardless)"
@@ -5730,6 +6206,10 @@ impl ServerHandler for VictauriMcpHandler {
                 .enable_resources()
                 .build(),
         )
+        .with_server_info(rmcp::model::Implementation::new(
+            "victauri",
+            env!("CARGO_PKG_VERSION"),
+        ))
         .with_instructions(SERVER_INSTRUCTIONS)
     }
 
@@ -5921,7 +6401,10 @@ impl ServerHandler for VictauriMcpHandler {
             json
         };
 
-        Ok(ReadResourceResult::new(vec![ResourceContents::text(json, uri)]).into())
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(json, uri).with_mime_type("application/json"),
+        ])
+        .into())
     }
 
     // `resources/subscribe` is legacy-protocol-only under MCP 2026-07-28 (replaced by

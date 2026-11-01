@@ -85,6 +85,22 @@ pub trait WebviewBridge: Send + Sync {
     ///
     /// Returns an error string if no matching window is found or the title change fails.
     fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String>;
+    /// Navigate a window's webview to `url` from the native side, so it works when the page's
+    /// JS thread is hung or the current page has no bridge. The default falls back to page
+    /// script, for bridges with no native side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if no matching window is found or the URL cannot be loaded.
+    fn navigate_webview(&self, label: Option<&str>, url: &str) -> Result<(), String> {
+        let url = serde_json::to_string(url).map_err(|e| e.to_string())?;
+        self.eval_webview(label, &format!("window.location.href = {url}"))
+    }
+    /// The URL the app itself is served from (its dev server, or Tauri's custom protocol), if
+    /// known: what `navigate` treats as "inside the app".
+    fn app_entry_url(&self) -> Option<String> {
+        None
+    }
 
     // ── Native (OS-level, trusted) input ───────────────────────────────────
     //
@@ -913,6 +929,30 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
 
             window.set_title(&title).map_err(|e| e.to_string())
         })?
+    }
+
+    fn navigate_webview(&self, label: Option<&str>, url: &str) -> Result<(), String> {
+        let label = label.map(str::to_string);
+        let url = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+        on_main(self, "navigate_webview", move |app| {
+            let windows = app.webview_windows();
+            // `navigate` took `&mut self` in early Tauri 2 releases, so a mutable handle.
+            #[allow(unused_mut)]
+            let mut window = find_window(&windows, label.as_deref())?.clone();
+            window.navigate(url).map_err(|e| e.to_string())
+        })?
+    }
+
+    fn app_entry_url(&self) -> Option<String> {
+        if let Some(dev_url) = &self.config().build.dev_url {
+            return Some(dev_url.to_string());
+        }
+        // Tauri's custom protocol, as each platform's webview serves it.
+        Some(if cfg!(any(windows, target_os = "android")) {
+            "http://tauri.localhost/".to_string()
+        } else {
+            "tauri://localhost/".to_string()
+        })
     }
 
     fn app_data_dir(&self) -> Result<std::path::PathBuf, String> {

@@ -18,6 +18,24 @@ use crate::auth::RateLimiterState;
 /// axum's `DefaultBodyLimit` never applied to it).
 pub const MAX_REQUEST_BODY_BYTES: usize = 2 * 1024 * 1024;
 
+/// Largest session `recording import` accepts: a full recording (50,000 events) exports to tens
+/// of megabytes, and an export that cannot be imported again is no export.
+pub const MAX_SESSION_JSON_BYTES: usize = 48 * 1024 * 1024;
+
+/// Body limit of the one REST route that carries a session: the session JSON-escaped into a
+/// string (pretty-printed JSON grows about a quarter). `/mcp` keeps the small limit, since rmcp
+/// reads that body itself.
+const MAX_RECORDING_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most a request to `path` may send.
+fn body_limit(path: &str) -> usize {
+    if path == "/api/tools/recording" {
+        MAX_RECORDING_BODY_BYTES
+    } else {
+        MAX_REQUEST_BODY_BYTES
+    }
+}
+
 /// How long a client gets to deliver a request body once its headers have arrived.
 pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -187,28 +205,34 @@ pub async fn read_body_with_deadline(request: Request, next: Next) -> Response {
     buffer_body(request, next, BODY_READ_TIMEOUT).await
 }
 
+/// The `{"error": …}` body REST promises, for answers given before a handler runs.
+fn json_error(status: StatusCode, message: &str) -> Response {
+    (status, axum::Json(serde_json::json!({ "error": message }))).into_response()
+}
+
 async fn buffer_body(request: Request, next: Next, deadline: Duration) -> Response {
     let (parts, body) = request.into_parts();
-    match tokio::time::timeout(deadline, axum::body::to_bytes(body, MAX_REQUEST_BODY_BYTES)).await {
+    let limit = body_limit(parts.uri.path());
+    match tokio::time::timeout(deadline, axum::body::to_bytes(body, limit)).await {
         Ok(Ok(bytes)) => {
             next.run(Request::from_parts(parts, axum::body::Body::from(bytes)))
                 .await
         }
-        Ok(Err(e)) if e.to_string().contains("length limit") => (
+        Ok(Err(e)) if e.to_string().contains("length limit") => json_error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "request body exceeds the 2 MiB limit",
-        )
-            .into_response(),
-        Ok(Err(e)) => (
+            &format!(
+                "request body exceeds the {} MiB limit",
+                limit / (1024 * 1024)
+            ),
+        ),
+        Ok(Err(e)) => json_error(
             StatusCode::BAD_REQUEST,
-            format!("failed to read request body: {e}"),
-        )
-            .into_response(),
-        Err(_) => (
+            &format!("failed to read request body: {e}"),
+        ),
+        Err(_) => json_error(
             StatusCode::REQUEST_TIMEOUT,
             "request body was not received in time",
-        )
-            .into_response(),
+        ),
     }
 }
 

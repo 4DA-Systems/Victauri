@@ -126,7 +126,7 @@ pub struct WaitForParams {
     /// For the `expression` condition: the JSON value the expression must equal
     /// to satisfy the wait. When omitted, the wait is satisfied as soon as the
     /// expression evaluates to a truthy value.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::backend_params::present_value")]
     pub expected: Option<serde_json::Value>,
     /// For the `event` condition: how far back (in milliseconds) to look for a
     /// matching event when the wait begins, so an event that fired just before
