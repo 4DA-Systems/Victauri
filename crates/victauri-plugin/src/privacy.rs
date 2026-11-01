@@ -95,6 +95,18 @@ impl PrivacyConfig {
             return false;
         }
         is_allowed_by_profile(self.profile, tool_or_action)
+            || (tool_or_action == "invoke_command" && self.test_profile_allowlists_commands())
+    }
+
+    /// `Test` opens `invoke_command` for the commands an allowlist names (`is_invoke_allowed`
+    /// decides each one). It is not in the profile matrix, because without an allowlist it stays
+    /// closed.
+    fn test_profile_allowlists_commands(&self) -> bool {
+        self.profile == PrivacyProfile::Test
+            && self
+                .command_allowlist
+                .as_ref()
+                .is_some_and(|allow| !allow.is_empty())
     }
 
     /// Whether `name` is in `disabled_tools` under either of its spellings: a few

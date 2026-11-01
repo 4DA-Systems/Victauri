@@ -4,6 +4,7 @@
 //! wrappers around the pure-logic security primitives in [`super::security`].
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::extract::Request;
 use axum::http::StatusCode;
@@ -13,6 +14,58 @@ use axum::response::Response;
 use crate::security::{self, RateLimiter, constant_time_eq, is_allowed_origin, is_localhost_host};
 
 const BEARER_PREFIX_LEN: usize = "Bearer ".len();
+
+/// Least time between log lines for one kind of refused request.
+const REFUSAL_LOG_INTERVAL_MS: u64 = 10_000;
+
+/// Rate limits the log line of one kind of refused request. The guards run ahead of the rate
+/// limiter (so a refusal spends no token), which left their logging unbounded: any local process
+/// or web page could flood the app's console, and under `victauri run` rotate real output out of
+/// the capture. The lines also carry no request text, which a page could otherwise plant in logs
+/// an agent reads.
+struct RefusalLog {
+    /// Milliseconds since the Unix epoch of the last line; 0 means none yet.
+    last_ms: AtomicU64,
+    /// Refusals since then.
+    suppressed: AtomicU64,
+}
+
+impl RefusalLog {
+    const fn new() -> Self {
+        Self {
+            last_ms: AtomicU64::new(0),
+            suppressed: AtomicU64::new(0),
+        }
+    }
+
+    /// Record a refusal at `now_ms`. `Some(n)` means log one line now, covering `n` earlier
+    /// refusals that were not logged.
+    fn admit(&self, now_ms: u64) -> Option<u64> {
+        let last = self.last_ms.load(Ordering::Relaxed);
+        let due = last == 0 || now_ms.saturating_sub(last) >= REFUSAL_LOG_INTERVAL_MS;
+        if due
+            && self
+                .last_ms
+                .compare_exchange(last, now_ms.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            return Some(self.suppressed.swap(0, Ordering::Relaxed));
+        }
+        self.suppressed.fetch_add(1, Ordering::Relaxed);
+        None
+    }
+
+    fn admit_now(&self) -> Option<u64> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+        self.admit(now_ms)
+    }
+}
+
+static AUTH_REFUSALS: RefusalLog = RefusalLog::new();
+static HOST_REFUSALS: RefusalLog = RefusalLog::new();
+static ORIGIN_REFUSALS: RefusalLog = RefusalLog::new();
 
 /// Shared authentication state holding the optional Bearer token for the MCP
 /// server.
@@ -43,7 +96,12 @@ pub async fn require_auth(
     if bearer_matches(request.headers(), expected) {
         Ok(next.run(request).await)
     } else {
-        tracing::warn!("Victauri: rejected request — invalid or missing auth token");
+        if let Some(suppressed) = AUTH_REFUSALS.admit_now() {
+            tracing::warn!(
+                "Victauri: rejected request — invalid or missing auth token \
+                 ({suppressed} more since the last such line)"
+            );
+        }
         Err(StatusCode::UNAUTHORIZED)
     }
 }
@@ -115,7 +173,12 @@ pub async fn dns_rebinding_guard(request: Request, next: Next) -> Result<Respons
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     if !is_localhost_host(host) {
-        tracing::warn!("DNS rebinding attempt blocked: Host={host}");
+        if let Some(suppressed) = HOST_REFUSALS.admit_now() {
+            tracing::warn!(
+                "Victauri: blocked a request whose Host header is not localhost (DNS rebinding \
+                 guard; {suppressed} more since the last such line)"
+            );
+        }
         return Err(StatusCode::FORBIDDEN);
     }
     Ok(next.run(request).await)
@@ -136,7 +199,12 @@ pub async fn origin_guard(request: Request, next: Next) -> Result<Response, Stat
     if let Some(site) = request.headers().get("sec-fetch-site")
         && site.as_bytes() != b"none"
     {
-        tracing::warn!("Browser-initiated request blocked: Sec-Fetch-Site={site:?}");
+        if let Some(suppressed) = ORIGIN_REFUSALS.admit_now() {
+            tracing::warn!(
+                "Victauri: blocked a browser-initiated request ({suppressed} more since the last \
+                 such line)"
+            );
+        }
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(origin) = request.headers().get("origin") {
@@ -145,7 +213,12 @@ pub async fn origin_guard(request: Request, next: Next) -> Result<Response, Stat
         match origin.to_str() {
             Ok(origin) if is_allowed_origin(origin) => {}
             _ => {
-                tracing::warn!("Cross-origin request blocked: Origin={origin:?}");
+                if let Some(suppressed) = ORIGIN_REFUSALS.admit_now() {
+                    tracing::warn!(
+                        "Victauri: blocked a cross-origin request ({suppressed} more since the \
+                         last such line)"
+                    );
+                }
                 return Err(StatusCode::FORBIDDEN);
             }
         }
@@ -177,4 +250,26 @@ pub async fn security_headers(request: Request, next: Next) -> Response {
         axum::http::HeaderValue::from_static("default-src 'none'"),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refusal_log_admits_one_line_per_interval_and_counts_the_rest() {
+        let log = RefusalLog::new();
+        assert_eq!(log.admit(1_000), Some(0), "the first refusal is logged");
+        for t in 1_001..1_500 {
+            assert_eq!(log.admit(t), None);
+        }
+        assert_eq!(
+            log.admit(1_000 + REFUSAL_LOG_INTERVAL_MS),
+            Some(499),
+            "the next line says how many went unlogged"
+        );
+        assert_eq!(log.admit(1_001 + REFUSAL_LOG_INTERVAL_MS), None);
+        // A clock that goes backwards never panics, and never logs early.
+        assert_eq!(log.admit(5), None);
+    }
 }

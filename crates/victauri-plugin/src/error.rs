@@ -39,6 +39,15 @@ pub enum BuilderError {
         /// Why the timeout is invalid.
         reason: String,
     },
+
+    /// A custom redaction pattern does not compile.
+    #[error("invalid redaction pattern '{pattern}': {reason}")]
+    InvalidRedactionPattern {
+        /// The pattern that failed.
+        pattern: String,
+        /// The regex compiler's error.
+        reason: String,
+    },
 }
 
 /// Errors that can occur during MCP server operation, tool execution, or webview interaction.
