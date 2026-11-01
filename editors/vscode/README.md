@@ -13,7 +13,7 @@
 
 1. Add `victauri-plugin` to your Tauri app ([one-line setup](https://github.com/4DA-Systems/victauri#quick-start))
 2. Run your app in debug mode
-3. The extension auto-connects when it detects `tauri.conf.json` in your workspace
+3. The extension connects when it finds a `tauri.conf.json` (or `tauri.conf.json5`, `Tauri.toml`) in your workspace, and keeps looking if the app is not up yet or restarts. It connects by itself only to this workspace's app (matched by `identifier`) or, if the config names none, to the single running app. To bind to another project's app, run `Victauri: Connect to Tauri App`.
 
 That's it. The sidebar populates with live app state, the DOM tree, and IPC traffic.
 
@@ -25,7 +25,7 @@ That's it. The sidebar populates with live app state, the DOM tree, and IPC traf
 |---|---|
 | **App State** | Windows (size, visibility, URL), memory usage, JS heap, DOM stats, long tasks, plugin version, diagnostic warnings |
 | **DOM Explorer** | Full accessible tree with ref IDs, ARIA roles, element bounds. Right-click to interact, inspect, or generate tests |
-| **IPC Log** | Live Tauri command log with status codes, duration, timestamps |
+| **IPC Log** | Live Tauri command log with each command's outcome (ok, error, pending, unknown), duration, timestamps, and the error text in the tooltip |
 
 ### Screenshot Panel
 
@@ -33,7 +33,7 @@ That's it. The sidebar populates with live app state, the DOM tree, and IPC traf
 
 ### CodeLens — Test Generation
 
-Every `#[tauri::command]` function in Rust files gets a "Generate Victauri test" lens. Click it to scaffold an `e2e_test!` block that invokes the command and verifies the result.
+A `#[tauri::command]` function in a Rust file gets a "Generate Victauri test" lens. Click it to scaffold an `e2e_test!` block that invokes the command and fails if it errors; add your own assertions on the result and pass any arguments it takes.
 
 ### DOM Interactions
 
@@ -43,7 +43,7 @@ Right-click any element in the DOM Explorer:
 - **Highlight Element** — draw a colored overlay on the element
 - **Inspect Styles** — dump computed CSS to the Output panel
 - **Copy Ref ID** — copy the element's ref handle
-- **Generate Test** — scaffold a test for the element
+- **Generate Test** — scaffold a test that finds the element by role and name (or text). An element with neither gets a visible `todo!()`
 
 ### Accessibility Audit
 
@@ -75,10 +75,10 @@ Right-click any element in the DOM Explorer:
 
 | Setting | Default | Description |
 |---|---|---|
-| `victauri.port` | `7373` | Port of the Victauri server |
+| `victauri.port` | `7373` | Port of the Victauri server (1-65535; anything else is ignored with a warning) |
 | `victauri.autoConnect` | `true` | Auto-connect when a Tauri project is detected |
-| `victauri.pollInterval` | `2000` | Polling interval (ms) for live updates |
-| `victauri.authToken` | `""` | Bearer token for authenticated connections |
+| `victauri.pollInterval` | `2000` | Polling interval (ms) for live updates (at least 500) |
+| `victauri.authToken` | `""` | Bearer token for authenticated connections. User settings only; sent to a port set by workspace settings only after you confirm that port |
 
 ## How It Works
 
