@@ -89,6 +89,37 @@ pub struct VerifyReport {
     pub results: Vec<CheckResult>,
 }
 
+impl Check {
+    /// What this check asserts. Also the description of a check that could not run.
+    fn description(&self) -> String {
+        match self {
+            Self::HasText(text) => format!("page contains \"{text}\""),
+            Self::HasNoText(text) => format!("page does NOT contain \"{text}\""),
+            Self::IpcWasCalled(command) => format!("IPC command \"{command}\" was called"),
+            Self::IpcWasCalledWith(command, args) => {
+                format!("IPC \"{command}\" called with {args}")
+            }
+            Self::IpcWasNotCalled(command) => format!("IPC command \"{command}\" was NOT called"),
+            Self::NetworkRequest {
+                method: Some(m),
+                url_contains,
+            } => format!("network {m} request to \"*{url_contains}*\""),
+            Self::NetworkRequest {
+                method: None,
+                url_contains,
+            } => format!("network request to \"*{url_contains}*\""),
+            Self::NoNetworkRequest { url_contains } => {
+                format!("NO network request to \"*{url_contains}*\"")
+            }
+            Self::NoConsoleErrors => "no console errors".to_string(),
+            Self::StateMatches { frontend_expr, .. } => format!("state matches ({frontend_expr})"),
+            Self::IpcHealthy => "IPC integrity healthy".to_string(),
+            Self::NoGhostCommands => "no ghost commands".to_string(),
+            Self::CoverageAbove(threshold) => format!("IPC coverage >= {threshold:.1}%"),
+        }
+    }
+}
+
 impl VerifyReport {
     /// Creates a report from individual check results (e.g. to export custom
     /// checks through [`Self::to_junit`]).
@@ -197,7 +228,8 @@ impl<'a> VerifyBuilder<'a> {
     /// The bridge keeps the newest 1000 network entries, IPC included. Once that log is full an
     /// older call may have rolled off, so this check then fails as inconclusive rather than pass on
     /// what it cannot see. To assert on a busy app, use [`VictauriClient::create_ipc_checkpoint`]
-    /// and [`VictauriClient::get_ipc_calls_since`].
+    /// and [`VictauriClient::get_ipc_calls_since`]. It also fails when Victauri reports it cannot
+    /// observe the page's IPC at all (`ipc_capture` `none`).
     #[must_use]
     pub fn ipc_was_not_called(mut self, command: &str) -> Self {
         self.checks
@@ -225,7 +257,8 @@ impl<'a> VerifyBuilder<'a> {
         self
     }
 
-    /// Assert that no console errors were logged.
+    /// Assert that no console errors were logged. Inconclusive, and so failed, once the 1000-entry
+    /// console log is full (see [`Self::ipc_was_not_called`]) and it shows no error.
     #[must_use]
     pub fn no_console_errors(mut self) -> Self {
         self.checks.push(Check::NoConsoleErrors);
@@ -255,6 +288,7 @@ impl<'a> VerifyBuilder<'a> {
     /// Assert that there are no confirmed ghost commands: commands the frontend invoked that only
     /// ever failed with "command not found". Weaker candidates (`frontend_only`, which may be real
     /// commands that merely returned an error) are named in the detail but do not fail the check.
+    /// Fails when Victauri reports it cannot observe the page's IPC at all (`ipc_capture` `none`).
     #[must_use]
     pub fn no_ghost_commands(mut self) -> Self {
         self.checks.push(Check::NoGhostCommands);
@@ -277,13 +311,26 @@ impl<'a> VerifyBuilder<'a> {
     /// # Errors
     ///
     /// Returns [`TestError`] only on transport/connection failures.
-    /// Check failures are reported in the [`VerifyReport`], not as errors.
+    /// Check failures are reported in the [`VerifyReport`], not as errors. So is a check that could
+    /// not run (a tool error, a read over the result cap): it fails, with the reason as its detail,
+    /// and the other checks still report.
     pub async fn run(self) -> Result<VerifyReport, TestError> {
         let client = self.client;
         let mut results = Vec::with_capacity(self.checks.len());
 
         for check in self.checks {
-            let result = run_check(client, &check).await?;
+            let result = match run_check(client, &check).await {
+                Ok(result) => result,
+                Err(e @ (TestError::Connection { .. } | TestError::Request(_))) => return Err(e),
+                Err(e) => CheckResult::new(
+                    check.description(),
+                    false,
+                    format!(
+                        "the check could not run: {}",
+                        crate::terminal::single_line(&e.to_string())
+                    ),
+                ),
+            };
             results.push(result);
         }
 
@@ -296,7 +343,7 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
         Check::HasText(text) => {
             let found = page_text(client).await?.contains(text.as_str());
             Ok(CheckResult {
-                description: format!("page contains \"{text}\""),
+                description: check.description(),
                 passed: found,
                 detail: if found {
                     String::new()
@@ -309,7 +356,7 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
         Check::HasNoText(text) => {
             let found = page_text(client).await?.contains(text.as_str());
             Ok(CheckResult {
-                description: format!("page does NOT contain \"{text}\""),
+                description: check.description(),
                 passed: !found,
                 detail: if found {
                     format!("text \"{text}\" was found on the page but shouldn't be")
@@ -320,10 +367,10 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             })
         }
         Check::IpcWasCalled(command) => {
-            let log = client.get_ipc_log(Some(LOG_WINDOW)).await?;
+            let log = client.logs_without_bodies("ipc", LOG_WINDOW).await?;
             let found = ipc_log_contains_command(&log, command);
             Ok(CheckResult {
-                description: format!("IPC command \"{command}\" was called"),
+                description: check.description(),
                 passed: found,
                 detail: if found {
                     String::new()
@@ -337,10 +384,15 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             let log = client.get_ipc_log(Some(LOG_WINDOW)).await?;
             let (found, actual_args) = ipc_log_find_with_args(&log, command, expected_args);
             Ok(CheckResult {
-                description: format!("IPC \"{command}\" called with {expected_args}"),
+                description: check.description(),
                 passed: found,
                 detail: if found {
                     String::new()
+                } else if ipc_log_args_truncated(&log, command) {
+                    format!(
+                        "command \"{command}\" was called, but the log truncated its args, so \
+                         they could not be compared"
+                    )
                 } else if let Some(actual) = actual_args {
                     format!("command called but with args: {actual}")
                 } else {
@@ -350,14 +402,21 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             })
         }
         Check::IpcWasNotCalled(command) => {
-            let log = client.get_ipc_log(Some(LOG_WINDOW)).await?;
+            let log = client.logs_without_bodies("ipc", LOG_WINDOW).await?;
             let found = ipc_log_contains_command(&log, command);
-            let inconclusive = !found && network_log_is_full(client, &log).await;
+            let blind = if found {
+                None
+            } else {
+                ipc_blind_note(client).await?
+            };
+            let inconclusive = !found && blind.is_none() && network_log_is_full(client, &log).await;
             Ok(CheckResult {
-                description: format!("IPC command \"{command}\" was NOT called"),
-                passed: !found && !inconclusive,
+                description: check.description(),
+                passed: !found && blind.is_none() && !inconclusive,
                 detail: if found {
                     format!("command \"{command}\" WAS called but shouldn't have been")
+                } else if let Some(note) = blind {
+                    note
                 } else if inconclusive {
                     log_full_detail("IPC")
                 } else {
@@ -370,14 +429,10 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             method,
             url_contains,
         } => {
-            let log = client.logs("network", Some(LOG_WINDOW)).await?;
+            let log = client.logs_without_bodies("network", LOG_WINDOW).await?;
             let found = network_log_matches(&log, method.as_deref(), url_contains);
-            let desc = match method {
-                Some(m) => format!("network {m} request to \"*{url_contains}*\""),
-                None => format!("network request to \"*{url_contains}*\""),
-            };
             Ok(CheckResult {
-                description: desc,
+                description: check.description(),
                 passed: found,
                 detail: if found {
                     String::new()
@@ -388,11 +443,11 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             })
         }
         Check::NoNetworkRequest { url_contains } => {
-            let log = client.logs("network", Some(LOG_WINDOW)).await?;
+            let log = client.logs_without_bodies("network", LOG_WINDOW).await?;
             let found = network_log_matches(&log, None, url_contains);
             let inconclusive = !found && log_entry_count(&log) >= LOG_WINDOW;
             Ok(CheckResult {
-                description: format!("NO network request to \"*{url_contains}*\""),
+                description: check.description(),
                 passed: !found && !inconclusive,
                 detail: if found {
                     format!("found network request matching \"{url_contains}\" but shouldn't have")
@@ -407,10 +462,13 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
         Check::NoConsoleErrors => {
             let log = client.logs("console", Some(LOG_WINDOW)).await?;
             let errors = console_log_errors(&log);
+            let inconclusive = errors.is_empty() && log_entry_count(&log) >= LOG_WINDOW;
             Ok(CheckResult {
-                description: "no console errors".to_string(),
-                passed: errors.is_empty(),
-                detail: if errors.is_empty() {
+                description: check.description(),
+                passed: errors.is_empty() && !inconclusive,
+                detail: if inconclusive {
+                    console_log_full_detail()
+                } else if errors.is_empty() {
                     String::new()
                 } else {
                     format!("{} error(s): {}", errors.len(), errors.join("; "))
@@ -430,7 +488,7 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             Ok(CheckResult {
-                description: format!("state matches ({frontend_expr})"),
+                description: check.description(),
                 passed,
                 detail: if passed {
                     String::new()
@@ -445,7 +503,7 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             let result = client.check_ipc_integrity().await?;
             let healthy = crate::client::ipc_integrity_is_healthy(&result);
             Ok(CheckResult {
-                description: "IPC integrity healthy".to_string(),
+                description: check.description(),
                 passed: healthy,
                 detail: if healthy {
                     String::new()
@@ -461,7 +519,7 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             // A plugin too old to report it fails closed rather than pass unseen.
             let Some(confirmed) = result.get("confirmed_ghosts").and_then(Value::as_array) else {
                 return Ok(CheckResult {
-                    description: "no ghost commands".to_string(),
+                    description: check.description(),
                     passed: false,
                     detail: "the plugin's report has no `confirmed_ghosts`; \
                              upgrade victauri-plugin to run this check"
@@ -473,15 +531,24 @@ async fn run_check(client: &mut VictauriClient, check: &Check) -> Result<CheckRe
             // filing"): a real command that only returned a domain error lands there even when
             // `reliability` is high, which only means the registry is not empty.
             let candidates = command_names(result.get("frontend_only"));
+            let capture = result
+                .pointer("/ipc_capture/capture")
+                .and_then(Value::as_str);
             Ok(CheckResult {
-                description: "no ghost commands".to_string(),
-                passed: confirmed.is_empty(),
+                description: check.description(),
+                passed: confirmed.is_empty() && capture != Some("none"),
                 detail: if !confirmed.is_empty() {
                     format!(
                         "{} confirmed ghost command(s): {}",
                         confirmed.len(),
                         command_names(Some(&Value::Array(confirmed.clone()))).join(", ")
                     )
+                } else if capture == Some("none") {
+                    capture_note(&result)
+                } else if capture == Some("requests_only") {
+                    "IPC capture on this page is `requests_only`: calls are seen but not their \
+                     outcomes, so a ghost cannot be confirmed"
+                        .to_string()
                 } else if !candidates.is_empty() {
                     format!(
                         "{} unconfirmed candidate(s), not treated as ghosts: {}",
@@ -552,6 +619,34 @@ const PAGE_TEXT_JS: &str = "(function() { \
          } \
          return read(document.body); })()";
 
+/// Why a negative IPC check means nothing here, when Victauri reports it cannot observe this page's
+/// IPC. A plugin without the report (or that refuses the tool) has nothing to say.
+async fn ipc_blind_note(client: &mut VictauriClient) -> Result<Option<String>, TestError> {
+    let integrity = match client.check_ipc_integrity().await {
+        Ok(integrity) => integrity,
+        Err(TestError::ToolError(_) | TestError::Mcp { .. }) => return Ok(None),
+        Err(other) => return Err(other),
+    };
+    let blind = integrity
+        .pointer("/ipc_capture/capture")
+        .and_then(Value::as_str)
+        == Some("none");
+    Ok(blind.then(|| capture_note(&integrity)))
+}
+
+/// A report's `ipc_capture.note`, safe to print: it can quote nothing from the page today, but
+/// every other detail here is treated this way.
+fn capture_note(report: &Value) -> String {
+    let note = report
+        .pointer("/ipc_capture/note")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    format!(
+        "inconclusive: Victauri cannot observe this page's IPC (capture: none). {}",
+        crate::terminal::single_line(note)
+    )
+}
+
 fn log_entry_count(log: &Value) -> usize {
     log.as_array()
         .or_else(|| log.get("entries").and_then(Value::as_array))
@@ -578,6 +673,14 @@ fn log_full_detail(which: &str) -> String {
         "inconclusive: the {which} log holds its maximum of {LOG_WINDOW} entries, so an older \
          match may have rolled off. On a busy app, take a checkpoint first \
          (create_ipc_checkpoint / get_ipc_calls_since)"
+    )
+}
+
+/// A console log holding its maximum: the reason an absence in it proves nothing.
+pub fn console_log_full_detail() -> String {
+    format!(
+        "inconclusive: the console log holds its maximum of {LOG_WINDOW} entries, so an older error \
+         may have rolled off. On a chatty app, clear the log first (logs {{action:\"clear\"}})"
     )
 }
 
@@ -643,6 +746,22 @@ fn ipc_log_find_with_args(
         }
     }
     (false, last_args)
+}
+
+/// Whether the log could not keep some call's arguments whole, so a mismatch proves nothing.
+fn ipc_log_args_truncated(log: &Value, command: &str) -> bool {
+    log.as_array()
+        .or_else(|| log.get("entries").and_then(Value::as_array))
+        .into_iter()
+        .flatten()
+        .filter(|entry| entry.get("command").and_then(Value::as_str) == Some(command))
+        .any(|entry| {
+            entry.get("args_truncated").and_then(Value::as_bool) == Some(true)
+                || entry
+                    .get("args")
+                    .and_then(Value::as_str)
+                    .is_some_and(|args| args.starts_with("[truncated "))
+        })
 }
 
 fn args_match(actual: &Value, expected: &Value) -> bool {
@@ -751,7 +870,12 @@ pub fn assert_ipc_called(log: &Value, command: &str) {
 pub fn assert_ipc_called_with(log: &Value, command: &str, expected_args: &Value) {
     let (found, actual_args) = ipc_log_find_with_args(log, command, expected_args);
     if !found {
-        if let Some(actual) = actual_args {
+        if ipc_log_args_truncated(log, command) {
+            panic!(
+                "IPC command \"{command}\" was called, but the log truncated its args, so they \
+                 could not be compared (expected: {expected_args})"
+            );
+        } else if let Some(actual) = actual_args {
             panic!(
                 "IPC command \"{command}\" was called but with different args:\n  expected: {expected_args}\n  actual:   {actual}"
             );
@@ -897,6 +1021,28 @@ console.log(JSON.stringify({PAGE_TEXT_JS}));
         let (found, actual) = ipc_log_find_with_args(&log, "save", &json!({"theme": "dark"}));
         assert!(!found);
         assert_eq!(actual, Some(json!({"theme": "light"})));
+    }
+
+    /// `trimField` turns over-long args into this text, and lane A's `args_truncated` marks it.
+    #[test]
+    fn truncated_args_are_not_reported_as_a_mismatch() {
+        let marked = json!([{"command": "save", "args": {}, "args_truncated": true}]);
+        let marker = json!([{"command": "save", "args": "[truncated 5000 bytes]"}]);
+        let whole = json!([{"command": "save", "args": {"theme": "light"}}]);
+        assert!(ipc_log_args_truncated(&marked, "save"));
+        assert!(ipc_log_args_truncated(&marker, "save"));
+        assert!(!ipc_log_args_truncated(&whole, "save"));
+        assert!(!ipc_log_args_truncated(&marked, "other"));
+
+        let payload = std::panic::catch_unwind(|| {
+            assert_ipc_called_with(&marked, "save", &json!({"theme": "dark"}));
+        })
+        .unwrap_err();
+        let msg = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(msg.contains("truncated"), "{msg}");
     }
 
     #[test]

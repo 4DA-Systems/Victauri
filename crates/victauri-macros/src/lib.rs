@@ -128,6 +128,8 @@ fn expand(input: ItemFn, attrs: InspectableAttrs) -> proc_macro2::TokenStream {
     let expanded = quote! {
         #input
 
+        // Hidden: generated, so a consumer with `#![deny(missing_docs)]` cannot document it.
+        #[doc(hidden)]
         #[allow(dead_code, non_snake_case)]
         #vis fn #schema_fn_name() -> victauri_core::registry::CommandInfo {
             // Built via constructors, not a struct literal: `CommandInfo` and

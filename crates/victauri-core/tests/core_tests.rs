@@ -2650,3 +2650,33 @@ fn recent_ipc_calls_and_command_names_match_the_full_log() {
     let names: Vec<String> = log.ipc_command_names().into_iter().collect();
     assert_eq!(names, vec!["cmd0", "cmd1", "cmd2"]);
 }
+
+#[test]
+fn contains_on_an_array_uses_the_same_equality_as_equals() {
+    use serde_json::json;
+    use victauri_core::{AssertionCondition, SemanticAssertion, evaluate_assertion};
+    let contains = |actual: serde_json::Value, expected: serde_json::Value| {
+        let a = SemanticAssertion::new("c", AssertionCondition::Contains, expected);
+        evaluate_assertion(actual, &a).passed
+    };
+    assert!(contains(json!([1.0, 2.0]), json!(1)));
+    assert!(contains(json!([1, 2]), json!(2.0)));
+    assert!(contains(json!(["3"]), json!(3)));
+    assert!(contains(json!([{"n": 1.0}]), json!({"n": 1})));
+    assert!(!contains(json!([1, 2]), json!(3)));
+    assert!(!contains(json!(["1.10"]), json!("1.1")));
+    assert!(!contains(json!([null]), json!("null")));
+}
+
+/// The tool's report is a different shape (`ipc_integrity_js`). Parsing one as this type must be a
+/// loud error, whatever the report says, never a report with fields read as zero.
+#[test]
+fn the_tools_integrity_report_is_not_this_type() {
+    use serde_json::json;
+    let tool = json!({"healthy": true, "total_calls": 3, "pending_count": 0, "stale_count": 0,
+        "error_count": 1, "stale_calls": [], "errored_calls": [{"command": "save"}],
+        "warning": null, "ipc_capture": null});
+    assert!(
+        serde_json::from_value::<victauri_core::verification::IpcIntegrityReport>(tool).is_err()
+    );
+}

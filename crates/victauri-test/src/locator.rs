@@ -525,14 +525,22 @@ impl Locator {
         Ok(value_to_string(&val))
     }
 
-    /// Whether the resolved element is visible.
+    /// Whether the resolved element is visible: chosen among the elements that are not hidden, as
+    /// [`to_be_visible`](LocatorExpect::to_be_visible) chooses it, so a hidden duplicate ahead of a
+    /// visible match does not make this `false`.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::ElementNotFound`] if no element matches.
     pub async fn is_visible(&self, client: &mut VictauriClient) -> Result<bool, TestError> {
-        let el = self.resolve_attached(client).await?;
-        Ok(el.visible)
+        match self.resolve_one(client).await {
+            Ok(el) => Ok(el.visible),
+            Err(TestError::ElementNotFound(_)) => {
+                // None visible: `false` if it exists at all.
+                self.resolve_attached(client).await.map(|_| false)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Whether the resolved element is enabled (not disabled).
@@ -1051,7 +1059,9 @@ impl fmt::Display for Locator {
 /// needs an element to say something about. Only [`to_be_hidden`](Self::to_be_hidden),
 /// `.not().to_be_visible()`, [`to_be_detached`](Self::to_be_detached), `.not().to_be_attached()`
 /// and `to_have_count(0)` are satisfied by absence. Any other failure (a dead app, an invalid
-/// selector, a tool error) is returned at once and never counts as the condition being met.
+/// selector, a tool error) is returned at once and never counts as the condition being met. A page
+/// with no body yet (mid-navigation) has no answer either way: it is retried until the timeout and
+/// then returned as that error, whatever the assertion.
 pub struct LocatorExpect<'a> {
     locator: &'a Locator,
     client: &'a mut VictauriClient,
@@ -1200,12 +1210,13 @@ impl<'a> LocatorExpect<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
-    /// [`TestError::ElementNotFound`] if the element never appears.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time,
+    /// [`TestError::ElementNotFound`] if the element never appears, and [`TestError::Assertion`] if
+    /// the element has no `value` (it is not a form control), negated or not.
     pub async fn to_have_value(self, expected: &str) -> Result<(), TestError> {
         let desc = self.describe(&format!("have value \"{expected}\""));
         self.poll_read(
-            "return el.value || \"\";",
+            &value_read_js(),
             |val| value_to_string(val) == expected,
             &desc,
         )
@@ -1241,9 +1252,18 @@ impl<'a> LocatorExpect<'a> {
         let locator = self.locator.clone();
         let client = self.client;
         loop {
-            let matches = locator.resolve_all(client).await?.len() == expected;
-            if matches != negated {
-                return Ok(());
+            match locator.resolve_all(client).await {
+                Ok(all) => {
+                    if (all.len() == expected) != negated {
+                        return Ok(());
+                    }
+                }
+                Err(e) if page_not_ready(&e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                }
+                Err(e) => return Err(e),
             }
             if Instant::now() >= deadline {
                 return Err(TestError::Timeout(format!(
@@ -1259,25 +1279,29 @@ impl<'a> LocatorExpect<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
-    /// [`TestError::ElementNotFound`] if the element never appears.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time,
+    /// [`TestError::ElementNotFound`] if the element never appears, and [`TestError::Assertion`] if
+    /// the element has no checked state, negated or not.
     pub async fn to_be_checked(self) -> Result<(), TestError> {
         let desc = self.describe("be checked");
-        let body = format!("{CHECKED_STATE_JS} return isOn();");
-        self.poll_read(&body, is_true, &desc).await
+        self.poll_read(&checked_read_js(), is_true, &desc).await
     }
 
     /// Wait until the element is unchecked.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Timeout`] if the condition is not met in time, and
-    /// [`TestError::ElementNotFound`] if the element never appears.
+    /// Returns [`TestError::Timeout`] if the condition is not met in time,
+    /// [`TestError::ElementNotFound`] if the element never appears, and [`TestError::Assertion`] if
+    /// the element has no checked state (a wrong element is not "unchecked"), negated or not.
     pub async fn to_be_unchecked(self) -> Result<(), TestError> {
         let desc = self.describe("be unchecked");
-        let body = format!("{CHECKED_STATE_JS} return isOn();");
-        self.poll_read(&body, |val| val.as_bool() == Some(false), &desc)
-            .await
+        self.poll_read(
+            &checked_read_js(),
+            |val| val.as_bool() == Some(false),
+            &desc,
+        )
+        .await
     }
 
     /// Wait until the element exists in the DOM, visible or not.
@@ -1321,6 +1345,13 @@ impl<'a> LocatorExpect<'a> {
             let attached = match locator.resolve_attached(client).await {
                 Ok(_) => true,
                 Err(TestError::ElementNotFound(_)) => false,
+                Err(e) if page_not_ready(&e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    tokio::time::sleep(poll).await;
+                    continue;
+                }
                 Err(e) => return Err(e),
             };
             if attached == want_attached {
@@ -1370,6 +1401,12 @@ impl<'a> LocatorExpect<'a> {
                     }
                     false
                 }
+                Err(e) if page_not_ready(&e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                    false
+                }
                 Err(e) => return Err(e),
             };
             if condition_met {
@@ -1409,6 +1446,11 @@ impl<'a> LocatorExpect<'a> {
                         return Err(e);
                     }
                 }
+                Err(e) if page_not_ready(&e) => {
+                    if Instant::now() >= deadline {
+                        return Err(e);
+                    }
+                }
                 Err(e) => return Err(e),
             }
             if Instant::now() >= deadline {
@@ -1423,6 +1465,12 @@ impl<'a> LocatorExpect<'a> {
 }
 
 const TEXT_CONTENT_JS: &str = "return el.textContent || \"\";";
+
+/// `find_elements` on a document with no body yet (a navigation in progress): no answer about any
+/// element, so an expectation waits it out and it can never read as "no elements".
+fn page_not_ready(error: &TestError) -> bool {
+    matches!(error, TestError::ToolError(msg) if msg.starts_with("page not ready"))
+}
 
 fn is_true(val: &Value) -> bool {
     val.as_bool() == Some(true)
@@ -1466,6 +1514,32 @@ fn set_checked_js(want: bool) -> String {
     )
 }
 
+/// The read behind the checked matchers. An element with no checked state is an error rather than
+/// `false`, which would pass `to_be_unchecked` and `.not().to_be_checked()` on a wrong element.
+fn checked_read_js() -> String {
+    format!(
+        "{CHECKED_STATE_JS} \
+         var attr = function(n) {{ return el.getAttribute ? el.getAttribute(n) : null; }}; \
+         if (el.type !== 'checkbox' && el.type !== 'radio' \
+             && attr('aria-checked') === null && attr('aria-pressed') === null \
+             && !/^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(attr('role') || '') \
+             && !('checked' in el && el.tagName !== 'INPUT')) \
+           return {{ {ERROR_KEY}: 'this element has no checked state (not a checkbox, radio or ARIA \
+             toggle)' }}; \
+         return isOn();"
+    )
+}
+
+/// The read behind `to_have_value`. An element with no `value` is an error rather than `""`, which
+/// would pass `to_have_value("")` and `.not().to_have_value("x")` on a wrong element.
+fn value_read_js() -> String {
+    format!(
+        "if (!('value' in el)) return {{ {ERROR_KEY}: 'this element has no value (not a form \
+           control)' }}; \
+         return el.value === null || el.value === undefined ? \"\" : el.value;"
+    )
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 fn value_to_string(val: &Value) -> String {
@@ -1482,6 +1556,91 @@ fn value_to_string(val: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Runs `js_body` as an [`element_script`] in Node, once per fake element in `elements` (a JS
+    /// array literal), and returns each answer as JSON.
+    fn run_on_elements(js_body: &str, elements: &str) -> Option<Vec<Value>> {
+        let script = element_script("e1", js_body);
+        let program = format!(
+            "var window = {{}}; var fakes = {elements}; fakes.forEach(function(el) {{ \
+             if (el.attrs) el.getAttribute = function(n) {{ \
+               return Object.prototype.hasOwnProperty.call(el.attrs, n) ? el.attrs[n] : null; }}; \
+             window.__VICTAURI__ = {{ getRef: function() {{ return el; }} }}; \
+             console.log(JSON.stringify({script})); }});"
+        );
+        let out = match std::process::Command::new("node")
+            .args(["-e", &program])
+            .output()
+        {
+            Ok(out) => out,
+            Err(e) => {
+                eprintln!("skipping: node is not available ({e})");
+                return None;
+            }
+        };
+        assert!(
+            out.status.success(),
+            "node failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_checked_matchers_refuse_an_element_with_no_checked_state() {
+        let Some(answers) = run_on_elements(
+            &checked_read_js(),
+            r#"[
+              {tagName:"INPUT",type:"checkbox",checked:false,attrs:{}},
+              {tagName:"INPUT",type:"radio",checked:true,attrs:{}},
+              {tagName:"BUTTON",attrs:{"aria-checked":"false"}},
+              {tagName:"BUTTON",attrs:{"aria-pressed":"true"}},
+              {tagName:"BUTTON",attrs:{role:"switch"}},
+              {tagName:"MD-CHECKBOX",checked:false,attrs:{}},
+              {tagName:"DIV",attrs:{}},
+              {tagName:"INPUT",type:"text",checked:false,attrs:{}}
+            ]"#,
+        ) else {
+            return;
+        };
+        assert_eq!(
+            answers[..6],
+            [
+                json!(false),
+                json!(true),
+                json!(false),
+                json!(true),
+                json!(false),
+                json!(false)
+            ]
+        );
+        for wrong in &answers[6..] {
+            assert!(wrong[ERROR_KEY].is_string(), "{wrong}");
+        }
+    }
+
+    #[test]
+    fn to_have_value_refuses_an_element_with_no_value() {
+        let Some(answers) = run_on_elements(
+            &value_read_js(),
+            r#"[
+              {tagName:"INPUT",value:""},
+              {tagName:"INPUT",value:"typed"},
+              {tagName:"LI",value:0},
+              {tagName:"DIV"}
+            ]"#,
+        ) else {
+            return;
+        };
+        assert_eq!(answers[..3], [json!(""), json!("typed"), json!(0)]);
+        assert!(answers[3][ERROR_KEY].is_string(), "{}", answers[3]);
+        assert_eq!(value_to_string(&answers[2]), "0");
+    }
 
     #[test]
     fn locator_role_build_query() {
