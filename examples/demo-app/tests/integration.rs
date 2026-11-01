@@ -303,7 +303,7 @@ e2e_test!(dom_snapshot_has_elements, |client| async move {
         "snapshot tree should contain body element"
     );
     assert!(
-        tree.contains("[e"),
+        tree.lines().any(|l| l.trim_start().starts_with('[')),
         "snapshot tree should contain ref handles"
     );
 });
