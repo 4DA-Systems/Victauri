@@ -393,6 +393,32 @@ test("Disconnect during a connect wins, and no one is told it connected", async 
   assert.ok(!toasts().some((t) => /Connected/.test(t)), toasts().join(" | "));
 });
 
+test("Disconnect before a connect reaches the app wins over it, and over one queued behind it", async () => {
+  const app = await serve();
+  stubConfig.authToken = "USER-LEVEL-SECRET";
+  stubWorkspaceConfig.port = app.port;
+  start();
+  stubAnswers.warning = "Send the token";
+  let answer = (): void => undefined;
+  stubAnswers.warningOpenUntil = new Promise((r) => (answer = r));
+  try {
+    const first = run("victauri.connect");
+    await until("the dialog", () => toasts().some((t) => t.includes("Send your victauri.authToken")));
+    const queued = run("victauri.connect");
+    await run("victauri.disconnect");
+    answer();
+    await first;
+    await queued;
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(app.seen, [], "nothing was sent");
+    assert.equal(statusBar.command, "victauri.connect", "it stays disconnected");
+  } finally {
+    stubAnswers.warningOpenUntil = undefined;
+  }
+  await run("victauri.connect");
+  assert.equal(statusBar.command, "victauri.disconnect", "a later Connect still connects");
+});
+
 test("auto-connect finds an app started after VS Code, with no error toast", async () => {
   stubConfig.autoConnect = true;
   start();

@@ -33,6 +33,8 @@ let connectQueue: Promise<void> = Promise.resolve();
 let connectBusy = false;
 /** The user pressed Disconnect: auto-connect leaves them alone until they connect again. */
 let autoConnectPaused = false;
+/** How many times the user has pressed Disconnect, so a connect under way can tell. */
+let disconnects = 0;
 /** What auto-connect last said, so a retry every few seconds does not repeat it. */
 let lastAutoReport: string | undefined;
 let lastAnnouncedApp: string | undefined;
@@ -110,7 +112,11 @@ async function tokenForPort(
   return settings.token;
 }
 
-async function connectOnce(context: vscode.ExtensionContext, mode: ConnectMode): Promise<void> {
+async function connectOnce(
+  context: vscode.ExtensionContext,
+  mode: ConnectMode,
+  disconnectsWhenAsked: number
+): Promise<void> {
   if (mode === "user") resetOwnerCheckBackoff();
 
   const settings = readConnectionSettings(vscode.workspace.getConfiguration("victauri"));
@@ -149,6 +155,10 @@ async function connectOnce(context: vscode.ExtensionContext, mode: ConnectMode):
     if (settings.port === undefined || !(await portAnswers(actualPort))) return;
   }
 
+  // The user pressed Disconnect after asking for this: a dialog, a scan or a probe ran in between,
+  // or it was queued behind another connect. Nothing has been sent yet, and nothing will be.
+  if (disconnects !== disconnectsWhenAsked) return;
+
   try {
     // A discovered endpoint is re-checked against discovery before the token is sent
     // again, and followed by identity if the app restarts (R5-VSC1). An explicitly
@@ -183,10 +193,11 @@ function runConnect(context: vscode.ExtensionContext, mode: ConnectMode): Promis
   if (mode === "auto" && connectBusy) return Promise.resolve();
   if (mode === "user") autoConnectPaused = false;
   connectBusy = true;
+  const disconnectsWhenAsked = disconnects;
   // The caller hears of its own failure. The next connect must still run after it.
   connectQueue = connectQueue
     .catch(() => undefined)
-    .then(() => connectOnce(context, mode))
+    .then(() => connectOnce(context, mode, disconnectsWhenAsked))
     .finally(() => {
       connectBusy = false;
     });
@@ -244,6 +255,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     vscode.commands.registerCommand("victauri.disconnect", () => {
       autoConnectPaused = true;
+      disconnects++;
       client.disconnect();
       showInfo("Victauri: Disconnected");
     }),
