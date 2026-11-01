@@ -52,6 +52,8 @@ VICTAURI_ON_FAILURE="systemctl restart my-tauri-app" victauri-watchdog
 | `VICTAURI_ON_FAILURE` | _(none)_ | Shell command to execute on failure threshold |
 
 The recovery command fires once per failure cycle. If the server comes back, the counter resets.
+It may stay in the foreground (a restart command that runs the app): after 60 seconds the
+watchdog stops waiting, logs that, and resumes monitoring. It never kills the command.
 
 ## Documentation
 
