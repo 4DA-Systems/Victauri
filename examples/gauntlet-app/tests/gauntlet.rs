@@ -623,7 +623,78 @@ gauntlet!(animation_lists_and_scrubs_the_sweep, base, {
     );
 });
 
-// ── 19-21. DISPLAY-GATED: screenshot + filmstrip + trusted input ─────────────
+// ── 19. Hit testing, on this engine ──────────────────────────────────────────
+
+gauntlet!(click_reaches_only_what_a_user_can_reach, base, {
+    // What a click can reach is the engine's answer (`elementFromPoint` / `elementsFromPoint`
+    // honouring clipping, clip-path, ::after, z-order), so this is proven per engine, not in one.
+    // The fixtures show, run and remove themselves inside this one call.
+    let r = call(
+        &base,
+        "eval_js",
+        json!({ "code": "return await window.__hitFixtures.run()" }),
+    )
+    .await;
+    let rows = first_array(result(&r));
+    assert!(rows.len() > 30, "no fixtures ran: {r}");
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter(|row| row["want"] != row["got"])
+        .map(ToString::to_string)
+        .collect();
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+    // The point a trusted click would use is on the element: not the empty middle of a ring, or
+    // the hole in a control.
+    let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap().clone();
+    for id in ["hf_stroke", "hf_donut", "hf_ring_with_dot"] {
+        let found = row(id);
+        assert_eq!(found["point_hits"], json!(true), "{found}");
+        assert_eq!(found["at_centre"], json!(false), "{found}");
+    }
+    assert_eq!(row("hf_wrapped")["point_hits"], json!(true));
+});
+
+// ── 20. `navigate go_back` recovers a page that stopped answering ────────────
+
+gauntlet!(go_back_recovers_a_stopped_page, base, {
+    // The stop is bounded so the shared page comes back on its own even if the recovery does not,
+    // and the battery waits for the page to be ready again before the next test.
+    const STOP_MS: u64 = 60_000;
+    let stop = format!(
+        "setTimeout(function() {{ var end = Date.now() + {STOP_MS}; while (Date.now() < end) {{}} }}, 0); return 1"
+    );
+    let r = call(&base, "eval_js", json!({ "code": stop })).await;
+    assert_eq!(result(&r), &json!(1), "{r}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    let back = call(&base, "navigate", json!({ "action": "go_back" })).await;
+    let back = result(&back).clone();
+    assert_eq!(back["recovered"], json!(true), "{back}");
+
+    let ready = "return document.body && document.body.getAttribute('data-gauntlet-ready')";
+    let mut answered = Value::Null;
+    while started.elapsed() < std::time::Duration::from_secs(45) {
+        answered = call(&base, "eval_js", json!({ "code": ready })).await;
+        if answered["result"] == json!("1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        answered["result"],
+        json!("1"),
+        "the page never answered again after go_back, {:?} in: {answered}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(STOP_MS - 10_000),
+        "it answered only because the stop ended: {:?}",
+        started.elapsed()
+    );
+});
+
+// ── 23-25. DISPLAY-GATED: screenshot + filmstrip + trusted input ─────────────
 // These need a real window server (Screen Recording on macOS); they run on the
 // macOS validation box and local Windows (VICTAURI_GAUNTLET_DISPLAY=1) and skip
 // on headless Linux CI.
