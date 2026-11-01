@@ -1113,13 +1113,18 @@ fn trusted_probe_matches_the_actionability_rules() {
 
 /// What an element does not paint itself (a stroke-only circle, a `<g>` with an empty centre, a
 /// wrapped inline link with its centre in a line gap) is hit-tested as its ancestor. That is no
-/// cover: the element is still there, inside the ancestor's box.
+/// cover unless it was clipped away. Everything else hit as its ancestor IS covered: a button in a
+/// closed accordion, under its parent's `::after` or behind its parent reported actionable, and a
+/// click then "worked" on something no user could reach.
 #[test]
-fn an_ancestor_hit_is_cover_only_when_the_element_left_its_box() {
+fn an_ancestor_hit_is_cover_except_for_what_paints_off_centre() {
     const RECTS: &str = r"
         function box(el, x, y, w, h) { el.getBoundingClientRect = function() {
             return { left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, x: x, y: y }; }; }
     ";
+    const LINES: &str = r"$('#l').getClientRects = function() { return [
+        { left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16 },
+        { left: 0, top: 24, right: 30, bottom: 40, width: 30, height: 16 }]; };";
     let inside = format!(
         r"{RECTS}
         box($('#a'), 0, 0, 200, 200); box($('#s'), 50, 50, 20, 20);
@@ -1152,7 +1157,71 @@ fn an_ancestor_hit_is_cover_only_when_the_element_left_its_box() {
         document.elementFromPoint = function() {{ return $('#o'); }};
         var r = await B.click(refOf('#l'), 150); T(r.ok === false, J(r));"
     );
+    // A button inside the box of the ancestor that is hit: the box says nothing about cover.
+    let plain_under_ancestor = format!(
+        r"{RECTS}
+        box($('#a'), 0, 0, 200, 200); box($('#b'), 50, 50, 20, 20);
+        var n = 0; $('#b').onclick = function() {{ n++; }};
+        document.elementFromPoint = function() {{ return $('#a'); }};
+        var r = await B.click(refOf('#b'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);"
+    );
+    let svg_in_closed_box = format!(
+        r"{RECTS}
+        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 0); box($('#s'), 50, 50, 20, 20);
+        var n = 0; $('#s').addEventListener('click', function() {{ n++; }});
+        document.elementFromPoint = function() {{ return $('#a'); }};
+        var r = await B.click(refOf('#s'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);"
+    );
+    // Clipping on the other axis only leaves the element in place.
+    let svg_in_one_axis_clip = format!(
+        r"{RECTS}
+        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 80); box($('#s'), 50, 50, 20, 20);
+        var n = 0; $('#s').addEventListener('click', function() {{ n++; }});
+        document.elementFromPoint = function() {{ return $('#a'); }};
+        var r = await B.click(refOf('#s'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    );
+    let wrapped_gap_hits_ancestor = format!(
+        r"{RECTS} {LINES}
+        box($('#p'), 0, 0, 100, 40); box($('#l'), 0, 0, 100, 40);
+        var n = 0; $('#l').addEventListener('click', function(e) {{ e.preventDefault(); n++; }});
+        document.elementFromPoint = function() {{ return $('#p'); }};
+        var r = await B.click(refOf('#l'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    );
+    let wrapped_in_closed_box = format!(
+        r"{RECTS} {LINES}
+        box($('#o'), 0, 0, 100, 100); box($('#p'), 0, 0, 100, 0); box($('#l'), 0, 0, 100, 40);
+        document.elementFromPoint = function() {{ return $('#o'); }};
+        var r = await B.click(refOf('#l'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
+    );
     check(&[
+        (
+            "plain_button_under_its_ancestor",
+            "<div id=a><button id=b>x</button></div>",
+            &plain_under_ancestor,
+        ),
+        (
+            "svg_in_a_closed_box",
+            "<div id=a><div id=c style='overflow-x:hidden;overflow-y:hidden'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
+            &svg_in_closed_box,
+        ),
+        (
+            "svg_clipped_on_one_axis_only",
+            "<div id=a><div id=c style='overflow-y:hidden'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
+            &svg_in_one_axis_clip,
+        ),
+        (
+            "wrapped_inline_with_its_centre_in_a_line_gap",
+            "<p id=p><a id=l href='#x'>wrapped</a></p>",
+            &wrapped_gap_hits_ancestor,
+        ),
+        (
+            "wrapped_inline_in_a_closed_box",
+            "<div id=o><p id=p style='overflow-x:hidden;overflow-y:hidden'><a id=l href='#x'>wrapped</a></p></div>",
+            &wrapped_in_closed_box,
+        ),
         (
             "stroke_only_svg",
             "<div id=a><svg width=9 height=9><circle id=s r=4></circle></svg></div>",

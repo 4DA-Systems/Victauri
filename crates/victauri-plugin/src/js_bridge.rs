@@ -914,6 +914,27 @@ const INIT_SCRIPT_BODY: &str = r#"
     function hitCovers(hit, el) {
         return !!hit && hit !== el && !composedContains(el, hit) && !labelOperates(hit, el);
     }
+    // Shapes whose bounding box says nothing about what they paint at its centre: SVG, and an
+    // inline element wrapped over several lines.
+    function paintsOffCentre(el) {
+        if (el.namespaceURI === 'http://www.w3.org/2000/svg') return true;
+        var lines = typeof el.getClientRects === 'function' ? el.getClientRects() : null;
+        return !!lines && lines.length > 1;
+    }
+    // Whether the ancestors of `el`, up to and including `top`, clip its box to nothing.
+    function clippedAwayBelow(top, el, win) {
+        var r = el.getBoundingClientRect();
+        var left = r.left, right = r.right, y0 = r.top, y1 = r.bottom;
+        for (var n = el; n && n !== top;) {
+            n = n.assignedSlot || n.parentNode || n.host;
+            if (!n || n.nodeType !== 1) continue;
+            var cs = win.getComputedStyle(n);
+            var box = n.getBoundingClientRect();
+            if (cs.overflowX && cs.overflowX !== 'visible') { left = Math.max(left, box.left); right = Math.min(right, box.right); }
+            if (cs.overflowY && cs.overflowY !== 'visible') { y0 = Math.max(y0, box.top); y1 = Math.min(y1, box.bottom); }
+        }
+        return left >= right || y0 >= y1;
+    }
     function checkActionable(el) {
         if (!el || !el.isConnected) return { error: 'element is detached from DOM', hint: 'RETRY_LATER' };
         if (isDisabledControl(el)) return { error: 'element is disabled (disabled attribute)', hint: 'RETRY_LATER' };
@@ -966,12 +987,10 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
         }
         // What does not paint its own centre (a stroke-only circle, a `<g>` with an empty centre,
-        // a line gap) is hit as its ancestor. That is cover only once the element has left the
-        // ancestor's box: scrolled out, or clipped away.
-        if (hitCovers(topEl, el) && composedContains(topEl, el)) {
-            var anc = topEl.getBoundingClientRect();
-            if (rect.left < anc.right && rect.right > anc.left && rect.top < anc.bottom && rect.bottom > anc.top) return null;
-        }
+        // a line gap) is hit as its ancestor, unless it was clipped away. Nothing else gets this
+        // pass: a button in a closed accordion, under its parent's `::after`, or behind its parent
+        // is hit as that ancestor too, and there the ancestor really is what a click would reach.
+        if (hitCovers(topEl, el) && composedContains(topEl, el) && paintsOffCentre(el) && !clippedAwayBelow(topEl, el, win)) return null;
         if (hitCovers(topEl, el)) {
             var tag = topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
             var info = tag;
