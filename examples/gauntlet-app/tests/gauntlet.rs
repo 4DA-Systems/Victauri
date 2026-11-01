@@ -114,6 +114,83 @@ macro_rules! gauntlet {
     };
 }
 
+// ── 0. Native window read-back ───────────────────────────────────────────────
+
+gauntlet!(window_resize_and_move_report_the_settled_geometry, base, {
+    // Linux and macOS apply a resize or move after the call returns. A result without
+    // `settled:false` promises the value it reports is what the window has: an immediate read-back
+    // reported the old one.
+    async fn state(base: &str) -> Value {
+        let r = call(
+            base,
+            "window",
+            json!({"action": "get_state", "label": "main"}),
+        )
+        .await;
+        first_array(result(&r))
+            .first()
+            .cloned()
+            .unwrap_or_else(|| result(&r).clone())
+    }
+    let before = state(&base).await;
+    let (w, h) = (
+        before["size"][0].as_u64().unwrap(),
+        before["size"][1].as_u64().unwrap(),
+    );
+    let (x, y) = (
+        before["position"][0].as_i64().unwrap(),
+        before["position"][1].as_i64().unwrap(),
+    );
+
+    let r = call(
+        &base,
+        "window",
+        json!({"action": "resize", "label": "main", "width": w / 2 + 37, "height": h / 2 + 23}),
+    )
+    .await;
+    let resized = result(&r).clone();
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let now = state(&base).await;
+    if resized.get("settled").is_none() {
+        assert_ne!(
+            (resized["width"].as_u64(), resized["height"].as_u64()),
+            (Some(w), Some(h)),
+            "{resized}"
+        );
+        assert_eq!(resized["width"], now["size"][0], "{resized} vs {now}");
+        assert_eq!(resized["height"], now["size"][1], "{resized} vs {now}");
+    }
+
+    let r = call(
+        &base,
+        "window",
+        json!({"action": "move_to", "label": "main", "x": x + 31, "y": y + 17}),
+    )
+    .await;
+    let moved = result(&r).clone();
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let now = state(&base).await;
+    if moved.get("settled").is_none() {
+        assert_eq!(moved["x"], now["position"][0], "{moved} vs {now}");
+        assert_eq!(moved["y"], now["position"][1], "{moved} vs {now}");
+    }
+
+    // Leave it as it was for the rest of the battery. (`resize` takes logical pixels, so this is
+    // exact only at scale 1, which is enough.)
+    let _ = call(
+        &base,
+        "window",
+        json!({"action": "resize", "label": "main", "width": w, "height": h}),
+    )
+    .await;
+    let _ = call(
+        &base,
+        "window",
+        json!({"action": "move_to", "label": "main", "x": x, "y": y}),
+    )
+    .await;
+});
+
 // ── 1. Registry scale ────────────────────────────────────────────────────────
 
 gauntlet!(registry_scale_not_truncated, base, {
