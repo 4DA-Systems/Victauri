@@ -2985,7 +2985,8 @@ impl VictauriMcpHandler {
             - `list`: list active rules.\n\
             - `clear` (by `id`) / `clear_all`: remove rules.\n\
             - `matches`: log of intercepted requests.\n\
-            Note: fetch and XHR support all behaviors. \
+            Note: fetch and XHR support all behaviors. A regex that can hang the page (nested \
+            quantifiers such as `(a+)+`) is refused at `add`. \
             Top-level navigation, sub-resource (img/css), and WebSocket traffic are not intercepted. \
             Tauri IPC: on the fetch transport (desktop, until a fallback) a rule matching an IPC URL \
             (http(s)://ipc.localhost/<cmd> or ipc://localhost/<cmd>) DOES change what the app's real \

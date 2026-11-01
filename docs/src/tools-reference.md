@@ -772,6 +772,14 @@ page-scoped (cleared on reload).
 > `responseType`, with its usual events. Top-level navigation, sub-resources
 > (img/css), and WebSocket frames are not intercepted.
 >
+> **A regex that can hang the page is refused at `add`.** JavaScript has no regex
+> timeout, and a rule's regex runs on the page's main thread against every request
+> URL. A repeated group that can match the same text in more than one way is
+> refused: `(a+)+`, `(a*)*`, `(a|aa)+`, `(.*)*`, `(\d+)*`. `^/api/(users|items)/\d+$`,
+> `.*\.png$` and `(/\w+)+` are fine. This is a check on nesting, not a proof: slow
+> patterns with no repeated group (`.*.*.*.*x`) still get through, and a few harmless
+> ones are refused (`(ab|ac)+`, whose branches start alike).
+>
 > **Rules on Tauri IPC change what the app's real `invoke` gets.** On the fetch
 > transport (`http://ipc.localhost/<cmd>` on Windows — `https://ipc.localhost/<cmd>` with `useHttpsScheme` — `ipc://localhost/<cmd>` on
 > macOS/Linux — the desktop default until a fallback), Tauri's `invoke` goes

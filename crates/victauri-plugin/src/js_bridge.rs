@@ -775,6 +775,191 @@ const INIT_SCRIPT_BODY: &str = r#"
         } catch (e) { return false; }
     }
 
+    // A regex that can hang the page, told apart before it runs. JavaScript has no regex timeout,
+    // and a rule's regex runs on the main thread against every request URL. What backtracks
+    // exponentially is a repetition with more than one way to divide the same text between its
+    // iterations: `(a+)+`, `(a|aa)+`, `(a+b*)+`. So the pattern is parsed down to its atoms, and
+    // each repeated group is refused if two neighbouring atoms, one of them of variable length, can
+    // take the same character (the last and first atoms of an iteration are neighbours too), or if
+    // two of its branches can start alike. `(/\w+)+` is not: `/` cannot be taken by `\w+`.
+    //
+    // This is star height, not a proof. It does not catch what is polynomial rather than exponential
+    // outside a repeated group (`.*.*.*.*x`), and it refuses a few patterns that are harmless
+    // (`(ab|ac)+`, whose branches start alike).
+    function parseRegexShape(src) {
+        var i = 0, n = src.length;
+        function skipTo(c) { while (i < n && src[i] !== c) i++; i++; }
+        function quantifier(atom) {
+            var c = src[i], min, max;
+            if (c === '*') { min = 0; max = Infinity; i++; }
+            else if (c === '+') { min = 1; max = Infinity; i++; }
+            else if (c === '?') { min = 0; max = 1; i++; }
+            else if (c === '{') {
+                // Anything but `{n}`, `{n,}`, `{n,m}` is a literal brace, already taken as an atom.
+                var j = i + 1, a = '', b = '', comma = false;
+                while (src[j] >= '0' && src[j] <= '9') a += src[j++];
+                if (src[j] === ',') { comma = true; j++; }
+                while (src[j] >= '0' && src[j] <= '9') b += src[j++];
+                if (a === '' || src[j] !== '}') return;
+                min = +a;
+                max = !comma ? min : (b === '' ? Infinity : +b);
+                i = j + 1;
+            } else return;
+            if (src[i] === '?') i++; // lazy
+            atom.min = min;
+            atom.max = max;
+        }
+        function atom() {
+            var start = i, c = src[i++], made = { min: 1, max: 1, start: start };
+            if (c === '(') {
+                if (src[i] === '?') {
+                    var d = src[i + 1];
+                    if (d === '=' || d === '!') { made.zero = true; i += 2; }
+                    else if (d === '<' && (src[i + 2] === '=' || src[i + 2] === '!')) { made.zero = true; i += 3; }
+                    else if (d === '<') skipTo('>');
+                    else skipTo(':');
+                }
+                made.alts = alternatives();
+                i++; // the `)`
+                return made;
+            }
+            if (c === '[') {
+                while (i < n && src[i] !== ']') { if (src[i] === '\\') i++; i++; }
+                i++;
+            } else if (c === '^' || c === '$') {
+                made.zero = true;
+            } else if (c === '\\') {
+                var e = src[i++];
+                if (e === 'b' || e === 'B') made.zero = true;
+                else if (e >= '1' && e <= '9') {
+                    while (src[i] >= '0' && src[i] <= '9') i++;
+                    made.any = true; // a backreference: any text, of any length
+                } else if (e === 'k' && src[i] === '<') { skipTo('>'); made.any = true; }
+                else if (e === 'x') i += 2;
+                else if (e === 'u') { if (src[i] === '{') skipTo('}'); else i += 4; }
+                else if (e === 'c') i += 1;
+            }
+            made.text = REFLECT_APPLY(STR_SUBSTRING, src, [start, i]);
+            return made;
+        }
+        function alternatives() {
+            var alts = [[]];
+            while (i < n && src[i] !== ')') {
+                if (src[i] === '|') { i++; alts[alts.length] = []; continue; }
+                var made = atom();
+                quantifier(made);
+                made.end = i;
+                var seq = alts[alts.length - 1];
+                seq[seq.length] = made;
+            }
+            return alts;
+        }
+        return alternatives();
+    }
+    function regexHangRisk(src) {
+        var alts = parseRegexShape(src);
+        // The characters tried: ASCII, and every other character the pattern names.
+        var probes = [];
+        for (var c = 0; c < 128; c++) probes[probes.length] = String.fromCharCode(c);
+        for (var u = 0; u < src.length; u++) { if (src.charCodeAt(u) > 127) probes[probes.length] = src[u]; }
+        probes[probes.length] = '\u00e9';
+        probes[probes.length] = '\u2028';
+        function chars(a) {
+            if (a.chars) return a.chars;
+            var out = [], k;
+            if (a.alts) {
+                for (k = 0; k < probes.length; k++) out[k] = false;
+                a.alts.forEach(function(seq) { seq.forEach(function(sub) {
+                    if (sub.zero) return;
+                    var inner = chars(sub);
+                    for (var m = 0; m < probes.length; m++) out[m] = out[m] || inner[m];
+                }); });
+            } else if (a.any) {
+                for (k = 0; k < probes.length; k++) out[k] = true;
+            } else {
+                try {
+                    var re = new REGEXP_CTOR('^(?:' + a.text + ')$');
+                    for (k = 0; k < probes.length; k++) out[k] = REFLECT_APPLY(REGEXP_TEST, re, [probes[k]]);
+                } catch (e) {
+                    for (k = 0; k < probes.length; k++) out[k] = true;
+                }
+            }
+            a.chars = out;
+            return out;
+        }
+        function overlap(a, b) {
+            var x = chars(a), y = chars(b);
+            for (var k = 0; k < x.length; k++) { if (x[k] && y[k]) return true; }
+            return false;
+        }
+        // An iteration's real atoms: no zero-width ones, and a plain group is its contents.
+        function flat(seq) {
+            var out = [];
+            seq.forEach(function(a) {
+                if (a.zero) return;
+                if (a.alts && a.alts.length === 1 && a.min === 1 && a.max === 1) out = out.concat(flat(a.alts[0]));
+                else out[out.length] = a;
+            });
+            return out;
+        }
+        function varies(a) {
+            if (a.any || a.min !== a.max) return true;
+            if (!a.alts) return false;
+            return a.alts.some(function(seq) {
+                var f = flat(seq);
+                return (a.alts.length > 1 && f.length !== 1) || f.some(varies);
+            });
+        }
+        function nullable(a) {
+            if (a.any || a.min === 0) return true;
+            return !!a.alts && a.alts.some(function(seq) { return flat(seq).every(nullable); });
+        }
+        // What can start (or, reversed, end) an iteration: up to the first atom it cannot skip.
+        function reach(seq) {
+            var out = [];
+            for (var k = 0; k < seq.length; k++) {
+                out[out.length] = seq[k];
+                if (!nullable(seq[k])) break;
+            }
+            return out;
+        }
+        function clash(a, b) { return (varies(a) || varies(b)) && overlap(a, b); }
+        function ambiguous(group) {
+            var branches = group.alts.map(flat);
+            var heads = branches.map(reach);
+            var tails = branches.map(function(seq) { return reach(seq.slice().reverse()); });
+            for (var b = 0; b < branches.length; b++) {
+                if (branches[b].every(nullable)) return true;
+                for (var other = b + 1; other < branches.length; other++) {
+                    if (heads[b].some(function(x) { return heads[other].some(function(y) { return overlap(x, y); }); })) return true;
+                }
+                for (var k = 0; k < branches[b].length; k++) {
+                    for (var l = k + 1; l < branches[b].length; l++) {
+                        if (clash(branches[b][k], branches[b][l])) return true;
+                        if (!nullable(branches[b][l])) break;
+                    }
+                }
+                for (var next = 0; next < branches.length; next++) {
+                    if (tails[b].some(function(x) { return heads[next].some(function(y) { return clash(x, y); }); })) return true;
+                }
+            }
+            return false;
+        }
+        function visit(list) {
+            for (var q = 0; q < list.length; q++) {
+                for (var r = 0; r < list[q].length; r++) {
+                    var a = list[q][r];
+                    if (!a.alts) continue;
+                    if (!a.zero && a.max >= 2 && ambiguous(a)) return REFLECT_APPLY(STR_SUBSTRING, src, [a.start, a.end]);
+                    var inner = visit(a.alts);
+                    if (inner) return inner;
+                }
+            }
+            return null;
+        }
+        return visit(alts);
+    }
+
     function matchRoute(url, method) {
         if (!routeRules.length) return null;
         if (isVictauriInternalUrl(url)) return null;
@@ -3033,6 +3218,14 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (matchType === 'regex') {
             try { new REGEXP_CTOR('' + rule.pattern); } catch (e) {
                 return { ok: false, error: 'invalid regex pattern: ' + e.message };
+            }
+            var hangs;
+            try { hangs = regexHangRisk('' + rule.pattern); } catch (e) { hangs = 'this pattern'; }
+            if (hangs) {
+                return { ok: false, error: 'regex pattern can hang the page: ' + hangs + ' repeats a group'
+                    + ' that can match the same text in more than one way, and JavaScript has no regex timeout.'
+                    + ' Make each repetition match in one way only (a separator it cannot take itself, as in'
+                    + ' (/\\w+)+, or no inner quantifier), or use match_type glob or substring.' };
             }
         }
         if (rule.headers !== undefined && rule.headers !== null

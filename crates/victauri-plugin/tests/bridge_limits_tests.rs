@@ -399,3 +399,115 @@ fn a_fulfilled_xhr_has_the_lifecycle_of_a_request() {
         ("native_when_no_mock", "<div></div>", not_matching_is_native),
     ]);
 }
+
+// ── A route regex that can hang the page ─────────────────────────────────────
+
+/// JavaScript has no regex timeout, and a rule's regex runs on the main thread against every
+/// request URL. What repeats a group that can match the same text in more than one way is refused.
+#[test]
+fn a_regex_that_can_hang_the_page_is_refused_at_add() {
+    let refused = [
+        r"(a+)+",
+        r"(a*)*",
+        r"(a|aa)+",
+        r"(.*)*",
+        r"(\d+)*",
+        r"^(a+)+$",
+        r"(a+)+?",
+        r"(?:a+)+",
+        r"(?<n>a+)+",
+        r"((a+))+",
+        r"((a+)b*)+",
+        r"(a+){2,}",
+        r"(a+){2}",
+        r"(a?a)+",
+        r"(a?b?)+",
+        r"(\w+\s?)+",
+        r"(a|a)*",
+        r"(\w|\d)+",
+        r"(a|ab)+",
+        r"(a|)+",
+        r"(a+|b)+",
+        r"(xa+|a+y)+",
+        r"(x+x+y)+",
+        r"(a+,a+)+",
+        r"(.*a)+",
+        r"(a.*)+",
+        r"(/.*)+",
+        r"((ab)+)+",
+        r"(([a-z])+)+",
+        r"(\1a+)+",
+        r"(?=(a+)+)x",
+        r"x|(a+)+",
+    ];
+    let allowed = [
+        r"^/api/(users|items)/\d+$",
+        r".*\.png$",
+        r"^https?://",
+        r"/v[0-9]+/",
+        r"(a|b)+",
+        r"(foo|bar)*",
+        r"(ab)+",
+        r"(aa)+",
+        r"(a{2})+",
+        r"(a+)",
+        r"(a+)?",
+        r"(a*)b",
+        r"(/\w+)+",
+        r"(/[^/]*)*",
+        r"(\.[a-z]+)+$",
+        r"(\w+/)+",
+        r"(\w+\s)+",
+        r"(a+b)+",
+        r"(a+b+)+",
+        r"(\s*,\s*\w+)*",
+        r"(\d{1,3}\.){3}\d{1,3}",
+        r"((a|b)+c)+",
+        r"((a|b)c)+",
+        r"(?:https?|wss?)://[^/]+/",
+        r"[(]a+[)]+",
+        r"\(a+\)+",
+        r"a{2,}",
+        r"x{",
+        r"(a+)|(b+)",
+    ];
+    let list = |patterns: &[&str]| serde_json::to_string(patterns).expect("json");
+    let refused_code = format!(
+        "{}.forEach(function(p) {{ \
+           var r = AGENT.addRoute({{pattern:p, match_type:'regex', action:'block'}}); \
+           T(r.ok === false, 'allowed ' + p); \
+           T(r.error.indexOf('can hang the page') !== -1, p + ': ' + r.error); \
+         }}); T(B.getRouteRules().length === 0, 'none stored');",
+        list(&refused)
+    );
+    let allowed_code = format!(
+        "{}.forEach(function(p) {{ \
+           var r = AGENT.addRoute({{pattern:p, match_type:'regex', action:'block'}}); \
+           T(r.ok === true, 'refused ' + p + ': ' + r.error); \
+         }});",
+        list(&allowed)
+    );
+    check(&[
+        ("refused", "<div></div>", &refused_code),
+        ("allowed", "<div></div>", &allowed_code),
+        (
+            "other_match_types_are_not_regexes",
+            "<div></div>",
+            "T(AGENT.addRoute({pattern:'(a+)+', action:'block'}).ok, 'substring'); \
+             T(AGENT.addRoute({pattern:'(a+)+', match_type:'glob', action:'block'}).ok, 'glob'); \
+             T(AGENT.addRoute({pattern:'(a+)+', match_type:'exact', action:'block'}).ok, 'exact');",
+        ),
+        (
+            "the_error_quotes_the_group",
+            "<div></div>",
+            "var r = AGENT.addRoute({pattern:'^/x/(a+)+$', match_type:'regex', action:'block'}); \
+             T(r.error.indexOf('(a+)+') !== -1, r.error);",
+        ),
+        (
+            "invalid_regex_keeps_its_own_error",
+            "<div></div>",
+            "var r = AGENT.addRoute({pattern:'(a+', match_type:'regex', action:'block'}); \
+             T(r.error.indexOf('invalid regex pattern') === 0, r.error);",
+        ),
+    ]);
+}
