@@ -1754,7 +1754,7 @@ fn needs_symbolising(value: &mut serde_json::Value) -> bool {
 /// [`resolve_backtraces`] for an async tool handler: symbolising takes seconds on Windows, and the
 /// server has two async workers (two concurrent reads would stop `/health` and every tool), so
 /// the worker is handed off for it.
-pub(crate) fn resolve_backtraces_off_worker(value: &mut serde_json::Value) {
+pub fn resolve_backtraces_off_worker(value: &mut serde_json::Value) {
     let multi_thread = tokio::runtime::Handle::try_current()
         .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread);
     if multi_thread && needs_symbolising(value) {

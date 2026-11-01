@@ -1280,7 +1280,7 @@ mod tests {
                     let dc = BeginPaint(h, &mut ps);
                     let mut r = RECT::default();
                     let _ = GetClientRect(h, &mut r);
-                    let mut fill = |rc: RECT, c: u32| {
+                    let fill = |rc: RECT, c: u32| {
                         let b = CreateSolidBrush(COLORREF(c));
                         FillRect(dc, &rc, b);
                         let _ = DeleteObject(b.into());

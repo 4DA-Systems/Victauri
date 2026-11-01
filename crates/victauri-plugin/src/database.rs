@@ -2314,7 +2314,7 @@ mod tests {
         assert_eq!(health["integrity_check"], "ok");
     }
 
-    /// A `.db` that is not SQLite (Windows' `Thumbs.db`) must not beat a real database by size.
+    /// A `.db` that is not `SQLite` (Windows' `Thumbs.db`) must not beat a real database by size.
     #[test]
     fn auto_selection_skips_files_that_are_not_sqlite() {
         let dir = tempfile::tempdir().unwrap();
@@ -2327,7 +2327,7 @@ mod tests {
         assert_eq!(classify_databases(&dirs).len(), 1);
     }
 
-    /// An empty file is what SQLite itself treats as a new database.
+    /// An empty file is what `SQLite` itself treats as a new database.
     #[test]
     fn auto_selection_keeps_an_empty_file() {
         let dir = tempfile::tempdir().unwrap();

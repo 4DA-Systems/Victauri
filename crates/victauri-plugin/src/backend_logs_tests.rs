@@ -672,6 +672,7 @@ impl std::error::Error for DisplayFails {}
 /// never sees against a `String`: an impl that unwraps its writes would panic in the app's log
 /// call, on whatever thread made it.
 #[test]
+#[allow(clippy::items_after_statements)]
 fn a_log_call_does_not_panic_in_the_capture_path() {
     let buf = Arc::new(LogBuffer::default());
     with_capture(&buf, || {

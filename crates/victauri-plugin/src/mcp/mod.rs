@@ -1781,8 +1781,9 @@ impl VictauriMcpHandler {
                     }
                     let bridge = self.bridge.clone();
                     let label = params.webview_label.clone();
+                    let ratio = point.get("dpr").and_then(serde_json::Value::as_f64);
                     let native = tokio::task::spawn_blocking(move || {
-                        bridge.native_click(label.as_deref(), x, y)
+                        bridge.native_click_scaled(label.as_deref(), x, y, ratio)
                     })
                     .await
                     .unwrap_or_else(|e| Err(format!("native input task failed: {e}")));

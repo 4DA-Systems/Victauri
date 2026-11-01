@@ -707,6 +707,7 @@ mod tests {
     /// global backtrace lock. Two concurrent reads must not take both of the server's async
     /// workers with them, and a panic elsewhere must not wait for it.
     #[test]
+    #[allow(clippy::items_after_statements)]
     fn symbolising_a_panic_blocks_neither_the_workers_nor_another_panic() {
         use std::time::{Duration, Instant};
         const CHILD: &str = "VICTAURI_TEST_SYMBOLISE_CHILD";
