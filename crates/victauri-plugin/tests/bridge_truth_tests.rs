@@ -484,6 +484,24 @@ fn fieldset_disabled_is_disabled_everywhere() {
     ]);
 }
 
+/// A text query returns the deepest match, often a span: it must report its control's state.
+#[test]
+fn content_of_a_disabled_control_is_disabled() {
+    let html = "<button id=b disabled><span id=s>Save</span></button>\
+                <div role=button aria-disabled=true><span id=a>Open</span></div>\
+                <fieldset disabled><span id=f>note</span></fieldset>\
+                <button id=ok><span id=live>Go</span></button>";
+    check(&[(
+        "state",
+        html,
+        "T(B.findElements({css:'#s'})[0].enabled === false, 'span in disabled button'); \
+         T(B.findElements({css:'#a'})[0].enabled === false, 'span in aria-disabled'); \
+         T(B.findElements({css:'#live'})[0].enabled === true, 'span in live button'); \
+         T(B.findElements({css:'#f'})[0].enabled === true, 'plain text in a fieldset is no control'); \
+         var r = await B.click(refOf('#s'), 100); T(r.ok === false && r.error.indexOf('disabled') !== -1, J(r));",
+    )]);
+}
+
 #[test]
 fn click_handles_svg_opacity_and_hit_targets() {
     check(&[

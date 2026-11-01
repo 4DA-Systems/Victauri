@@ -639,6 +639,38 @@ async fn wait_for_without_a_value_fails_at_once_instead_of_polling_to_the_timeou
     }
 }
 
+/// `wait_for expected` and `assert_semantic equals` must agree on what equal means.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn wait_for_expected_compares_like_assert_semantic() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, "5");
+    let h = handler(&st, &bridge);
+    for expected in [json!(5), json!(5.0), json!("5")] {
+        let out = ok_json(
+            &call(
+                &h,
+                "wait_for",
+                json!({"condition": "expression", "value": "5", "expected": expected, "timeout_ms": 100}),
+            )
+            .await,
+        );
+        assert_eq!(out["ok"], true, "{expected}: {out}");
+    }
+    let bridge = AppBridge::answering(&st, "null");
+    let h = handler(&st, &bridge);
+    let r = call(
+        &h,
+        "wait_for",
+        json!({"condition": "expression", "value": "null", "expected": "null", "timeout_ms": 100}),
+    )
+    .await;
+    assert!(
+        r.is_error == Some(true) || ok_json(&r)["ok"] != true,
+        "null must not equal \"null\": {}",
+        text(&r)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_explicit_null_is_a_value_to_compare_with() {
     let st = state();

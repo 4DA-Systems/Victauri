@@ -1096,7 +1096,9 @@ impl VictauriMcpHandler {
                 Ok(raw) => {
                     let val = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
                     let met = match &params.expected {
-                        Some(expected) => &val == expected,
+                        Some(expected) => {
+                            victauri_core::verification::json_values_equal(&val, expected)
+                        }
                         None => json_truthy(&val),
                     };
                     if met {
@@ -2570,8 +2572,14 @@ impl VictauriMcpHandler {
                 let Some(to) = &params.to else {
                     return missing_param("to", "events_between");
                 };
-                match self.state.recorder.events_between_checkpoints(from, to) {
-                    Ok(events) => json_result(&events),
+                match self.state.recorder.checkpoint_window(from, to) {
+                    Ok(window) if window.dropped == 0 => json_result(&window.events),
+                    // A complete window stays a bare array; a partial one must say it is partial.
+                    Ok(window) => json_result(&serde_json::json!({
+                        "events": window.events,
+                        "dropped": window.dropped,
+                        "note": "the recording's ring buffer evicted the oldest events of this window",
+                    })),
                     Err(e) => tool_error(e.to_string()),
                 }
             }

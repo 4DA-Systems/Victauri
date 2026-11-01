@@ -220,6 +220,54 @@ async fn a_checkpoint_includes_what_the_page_captured_before_it() {
     );
 }
 
+/// A window the ring buffer has partly evicted must say so; a complete one keeps its bare array.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn events_between_reports_what_the_ring_buffer_evicted() {
+    let mut s = VictauriState::for_tests();
+    s.eval_timeout = std::time::Duration::from_millis(100);
+    s.recorder = victauri_core::EventRecorder::new(5);
+    let state = Arc::new(s);
+    let page = PageBridge::new(&state);
+    let bridge: Arc<dyn WebviewBridge> = Arc::new(page.clone());
+    let h = VictauriMcpHandler::new(state.clone(), Arc::clone(&bridge));
+    let _ = call(&h, "recording", json!({"action": "start"})).await;
+    let mark = |id: &'static str| json!({"action": "checkpoint", "checkpoint_id": id});
+    let _ = call(&h, "recording", mark("a")).await;
+    for i in 0..10 {
+        state
+            .recorder
+            .record_event(AppEvent::console("log", format!("{i}"), chrono::Utc::now()));
+    }
+    let _ = call(&h, "recording", mark("b")).await;
+    state
+        .recorder
+        .record_event(AppEvent::console("log", "after", chrono::Utc::now()));
+    let _ = call(&h, "recording", mark("c")).await;
+
+    let partial = call(
+        &h,
+        "recording",
+        json!({"action": "events_between", "from": "a", "to": "b"}),
+    )
+    .await;
+    let partial: serde_json::Value = serde_json::from_str(&text(&partial)).unwrap();
+    assert_eq!(partial["dropped"], 6, "{partial}");
+    assert_eq!(
+        partial["events"].as_array().map(Vec::len),
+        Some(4),
+        "{partial}"
+    );
+
+    let complete = call(
+        &h,
+        "recording",
+        json!({"action": "events_between", "from": "b", "to": "c"}),
+    )
+    .await;
+    let complete: serde_json::Value = serde_json::from_str(&text(&complete)).unwrap();
+    assert_eq!(complete.as_array().map(Vec::len), Some(1), "{complete}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_checkpoint_id_must_be_non_empty_and_unused() {
     let state = state();

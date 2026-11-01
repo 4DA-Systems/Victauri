@@ -889,10 +889,16 @@ const INIT_SCRIPT_BODY: &str = r#"
     // clobbering named control.
     function isDisabledControl(el) {
         if (el.disabled === true) return true;
-        try { return !!REFLECT_APPLY(EL_MATCHES, el, [':disabled']); } catch (e) { return false; }
+        try {
+            if (REFLECT_APPLY(EL_MATCHES, el, [':disabled'])) return true;
+            // A text query returns the deepest match, often a span inside the control. A fieldset
+            // is left out: plain content in a disabled fieldset is not a control.
+            return !!REFLECT_APPLY(EL_CLOSEST, el, ['button:disabled, select:disabled, optgroup:disabled, option:disabled']);
+        } catch (e) { return false; }
     }
     function isAriaDisabled(el) {
-        try { return elAttr(el, 'aria-disabled') === 'true'; } catch (e) { return false; }
+        // aria-disabled applies to the element's descendants too.
+        try { return !!REFLECT_APPLY(EL_CLOSEST, el, ['[aria-disabled="true"]']); } catch (e) { return false; }
     }
     function isElEnabled(el) { return !isDisabledControl(el) && !isAriaDisabled(el); }
     // A `<label>` (or something inside one) for `el`: clicking it operates `el`, as a user clicking
@@ -1087,6 +1093,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     var EL_GET_ATTR = EL_PROTO && EL_PROTO.getAttribute;
     var EL_HAS_ATTR = EL_PROTO && EL_PROTO.hasAttribute;
     var EL_MATCHES = EL_PROTO && EL_PROTO.matches;
+    var EL_CLOSEST = EL_PROTO && EL_PROTO.closest;
     var EL_RECT = EL_PROTO && EL_PROTO.getBoundingClientRect;
     var EL_CHILDREN_GET = EL_PROTO && protoGetter(EL_PROTO, 'children');
     var EL_TAG_GET = EL_PROTO && protoGetter(EL_PROTO, 'tagName');

@@ -576,7 +576,8 @@ async fn network_log_is_full(client: &mut VictauriClient, ipc_log: &Value) -> bo
 fn log_full_detail(which: &str) -> String {
     format!(
         "inconclusive: the {which} log holds its maximum of {LOG_WINDOW} entries, so an older \
-         match may have rolled off"
+         match may have rolled off. On a busy app, take a checkpoint first \
+         (create_ipc_checkpoint / get_ipc_calls_since)"
     )
 }
 

@@ -1994,6 +1994,35 @@ fn json_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
     counter.0
 }
 
+/// Whether `encoded`, the re-encoding of the JSON text `source`, holds the same bytes apart from
+/// whitespace between tokens and their order. Re-encoding only sorts keys, drops duplicates and
+/// reformats numbers and escapes, and the last three all change the byte counts.
+#[cfg(feature = "sqlite")]
+fn same_json_content(source: &str, encoded: &str) -> bool {
+    let mut counts = [0i64; 256];
+    let (mut in_string, mut escaped) = (false, false);
+    for &b in source.as_bytes() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if matches!(b, b' ' | b'\t' | b'\n' | b'\r') {
+            continue;
+        }
+        counts[usize::from(b)] += 1;
+    }
+    for &b in encoded.as_bytes() {
+        counts[usize::from(b)] -= 1;
+    }
+    counts.iter().all(|&c| c == 0)
+}
+
 /// Convert one result cell to JSON if its encoded size fits `budget` bytes, returning the value
 /// and that size. The size is taken from the RAW cell before converting (a blob's base64 length
 /// is computed, not encoded), so a cell that does not fit is never materialized.
@@ -2034,11 +2063,12 @@ fn cell_to_json(
                 let n = json_len(&v);
                 return (n <= budget).then_some((v, n));
             }
-            // JSON text is decoded only if that loses nothing. Re-encoding changes big numbers,
-            // `1.10`, duplicate and unsorted keys and whitespace, so those stay the stored string.
+            // JSON text is decoded unless that changes data: big numbers, `1.10` and duplicate keys
+            // stay the stored string. Key order and whitespace carry no data.
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&s)
                 && (parsed.is_object() || parsed.is_array())
-                && serde_json::to_string(&parsed).is_ok_and(|encoded| encoded == *s)
+                && serde_json::to_string(&parsed)
+                    .is_ok_and(|encoded| same_json_content(&s, &encoded))
             {
                 let n = json_len(&parsed);
                 (parsed, n)
@@ -2380,9 +2410,8 @@ mod tests {
         for text in [
             r#"{"id":123456789012345678901234567890}"#,
             r#"{"id2":1.10}"#,
-            r#"{"z":1,"a":2}"#,
             r#"{"a":2,"a":3}"#,
-            " [1] ",
+            r#"{"e":1e3}"#,
         ] {
             assert_eq!(
                 one_value(&path, &format!("SELECT '{text}' AS v")),
@@ -2390,10 +2419,23 @@ mod tests {
                 "{text}"
             );
         }
-        // JSON that survives the trip is still decoded.
+        // JSON that survives the trip is still decoded. Key order and whitespace carry no data, and
+        // real JSON columns have both, so neither may turn a column into a string.
         assert_eq!(
             one_value(&path, r#"SELECT '{"a":1,"b":[2,"x"]}' AS v"#),
             serde_json::json!({"a": 1, "b": [2, "x"]})
+        );
+        assert_eq!(
+            one_value(&path, r#"SELECT '{"theme":"dark","lang":"en"}' AS v"#),
+            serde_json::json!({"theme": "dark", "lang": "en"})
+        );
+        assert_eq!(
+            one_value(&path, r#"SELECT '{ "z" : [1, 2], "a b" : "c  d" }' AS v"#),
+            serde_json::json!({"z": [1, 2], "a b": "c  d"})
+        );
+        assert_eq!(
+            one_value(&path, "SELECT ' [1] ' AS v"),
+            serde_json::json!([1])
         );
         // Infinities are not SQL NULL.
         assert_eq!(
