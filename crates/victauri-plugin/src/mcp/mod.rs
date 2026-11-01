@@ -428,6 +428,29 @@ fn is_safe_env_key(key: &str) -> bool {
         && !SECRET_ENV_SUBSTRINGS.iter().any(|s| upper.contains(s))
 }
 
+/// How long the scrub restore may take: it is a quick page op, and it also runs on failure paths
+/// where the page may not answer.
+const SCRUB_RESTORE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Restores a scrubbed page's animations if `animation_scrub` ends before its own restore.
+struct ScrubRestoreGuard {
+    armed: Option<(VictauriMcpHandler, String, Option<String>)>,
+}
+
+impl Drop for ScrubRestoreGuard {
+    fn drop(&mut self) {
+        if let Some((handler, code, label)) = self.armed.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            rt.spawn(async move {
+                let _ = handler
+                    .eval_with_return_timeout(&code, label.as_deref(), SCRUB_RESTORE_TIMEOUT)
+                    .await;
+            });
+        }
+    }
+}
+
 /// MCP tool handler that dispatches tool calls to the webview bridge and state.
 #[derive(Clone)]
 pub struct VictauriMcpHandler {
@@ -472,6 +495,17 @@ impl VictauriMcpHandler {
             .eval_with_return(&params.code, params.webview_label.as_deref())
             .await
         {
+            // JavaScript reads a leading `{` as a block, so `{a: 1}` is a labelled statement that
+            // quietly yields undefined. (Retrying as an expression needs a compile check CSP blocks.)
+            Ok(result) if result == "undefined" && params.code.trim_start().starts_with('{') => {
+                CallToolResult::success(vec![
+                    ContentBlock::text(result),
+                    ContentBlock::text(
+                        "note: code starting with `{` runs as a block, not an object literal; \
+                         wrap it in parentheses to get the value: ({a: 1})",
+                    ),
+                ])
+            }
             Ok(result) => CallToolResult::success(vec![ContentBlock::text(result)]),
             Err(e) => tool_error(e),
         }
@@ -516,6 +550,18 @@ impl VictauriMcpHandler {
         let mut parts: Vec<String> = Vec::new();
         if let Some(t) = &params.text {
             parts.push(format!("text: {}", js_string(t)));
+        }
+        if let Some(t) = &params.text_exact {
+            parts.push(format!("text_exact: {}", js_string(t)));
+        }
+        if let Some(a) = &params.attribute {
+            parts.push(format!("attribute: {}", js_string(a)));
+        }
+        if let Some(v) = &params.attribute_value {
+            parts.push(format!("attribute_value: {}", js_string(v)));
+        }
+        if let Some(true) = params.include_hidden {
+            parts.push("include_hidden: true".to_string());
         }
         if let Some(r) = &params.role {
             parts.push(format!("role: {}", js_string(r)));
@@ -2802,10 +2848,10 @@ impl VictauriMcpHandler {
                 if let Some(t) = params.times {
                     rule["times"] = serde_json::json!(t);
                 }
-                let code = format!(
-                    "return window.__VICTAURI__?.addRoute({})",
+                let code = crate::js_bridge::agent_op_call_js(&format!(
+                    "addRoute({})",
                     js_string(&rule.to_string())
-                );
+                ));
                 self.eval_page_action(&code, params.webview_label.as_deref())
                     .await
             }
@@ -3094,7 +3140,9 @@ impl VictauriMcpHandler {
                     .selector
                     .as_deref()
                     .map_or_else(|| "null".to_string(), js_string);
-                let code = if params.record.unwrap_or(false) {
+                let code = if params.disarm.unwrap_or(false) {
+                    crate::js_bridge::agent_op_call_js("disarmSweep()")
+                } else if params.record.unwrap_or(false) {
                     crate::js_bridge::agent_op_call_js(&format!("installSweepRecorder({sel})"))
                 } else {
                     let clear = params.clear.unwrap_or(false);
@@ -3122,15 +3170,29 @@ impl VictauriMcpHandler {
             .as_deref()
             .map_or_else(|| "null".to_string(), js_string);
 
+        let resume = params.restore.unwrap_or(true);
+        let restore_code = crate::js_bridge::agent_op_call_js(&format!("scrubRestore({resume})"));
+        // Whatever ends this call (an early return, a cancelled request dropping the future), the
+        // page's animations must not stay paused.
+        let mut guard = ScrubRestoreGuard {
+            armed: Some((
+                self.clone(),
+                restore_code.clone(),
+                params.webview_label.clone(),
+            )),
+        };
+
         // 1. Prepare: pause the target's animations, learn the timeline length.
         let prep_code = crate::js_bridge::agent_op_call_js(&format!("scrubPrepare({sel})"));
         let prep_v = match self.eval_with_return(&prep_code, label).await {
             Ok(s) => {
                 serde_json::from_str::<serde_json::Value>(&s).unwrap_or(serde_json::Value::Null)
             }
+            // The pause runs before the wait that timed out, so the guard restores.
             Err(e) => return tool_error(format!("scrub prepare failed: {e}")),
         };
         if prep_v.get("prepared").and_then(serde_json::Value::as_bool) != Some(true) {
+            guard.armed = None; // nothing was paused
             // Surface the helpful error/info object (no target, JS-driven, etc.).
             return json_result(&prep_v);
         }
@@ -3142,8 +3204,6 @@ impl VictauriMcpHandler {
                 .cols
                 .unwrap_or_else(|| crate::filmstrip::default_cols(n))
         };
-        let resume = params.restore.unwrap_or(true);
-        let restore_code = crate::js_bridge::agent_op_call_js(&format!("scrubRestore({resume})"));
         let mut curve: Vec<serde_json::Value> = Vec::with_capacity(points);
         let mut frames: Vec<crate::filmstrip::Frame> = Vec::new();
         let mut manifest: Vec<serde_json::Value> = Vec::new();
@@ -3173,7 +3233,6 @@ impl VictauriMcpHandler {
                                         FILMSTRIP_GAP,
                                     )
                                 {
-                                    let _ = self.eval_with_return(&restore_code, label).await;
                                     let fitting = (2..points).rev().find(|&n| {
                                         crate::filmstrip::check_sheet(
                                             frame.w,
@@ -3207,15 +3266,28 @@ impl VictauriMcpHandler {
                     }
                     curve.push(v);
                 }
-                Err(e) => curve.push(serde_json::json!({ "progress": progress, "error": e })),
+                // A window that cannot answer one seek will not answer the next: each would cost
+                // the full eval timeout.
+                Err(e) => {
+                    curve.push(serde_json::json!({ "progress": progress, "error": e }));
+                    break;
+                }
             }
         }
 
         // 3. Restore (resume) or leave paused.
-        let _ = self.eval_with_return(&restore_code, label).await;
+        guard.armed = None;
+        let restored = self
+            .eval_with_return_timeout(&restore_code, label, SCRUB_RESTORE_TIMEOUT)
+            .await
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("restored").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
 
         let mut meta = serde_json::json!({
             "scrubbed": true,
+            "restored": restored,
             "points": points,
             "duration_ms": prep_v.get("duration").cloned().unwrap_or(serde_json::Value::Null),
             "anim_count": prep_v.get("anim_count").cloned().unwrap_or(serde_json::Value::Null),
@@ -3317,11 +3389,7 @@ impl VictauriMcpHandler {
                 } else {
                     format!("window.__VICTAURI__?.getConsoleLogs({since_arg})")
                 };
-                let code = if let Some(limit) = params.limit {
-                    format!("return ({base} || []).slice(-{limit})")
-                } else {
-                    format!("return {base}")
-                };
+                let code = trimmed_log_js(&base, params.limit.unwrap_or(DEFAULT_LOG_LIMIT));
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
@@ -3364,22 +3432,18 @@ impl VictauriMcpHandler {
                 }
             }
             LogsAction::Navigation => {
-                let code = if let Some(limit) = params.limit {
-                    format!(
-                        "return (window.__VICTAURI__?.getNavigationLog() || []).slice(-{limit})"
-                    )
-                } else {
-                    "return window.__VICTAURI__?.getNavigationLog()".to_string()
-                };
+                let code = trimmed_log_js(
+                    "window.__VICTAURI__?.getNavigationLog()",
+                    params.limit.unwrap_or(DEFAULT_LOG_LIMIT),
+                );
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
             LogsAction::Dialogs => {
-                let code = if let Some(limit) = params.limit {
-                    format!("return (window.__VICTAURI__?.getDialogLog() || []).slice(-{limit})")
-                } else {
-                    "return window.__VICTAURI__?.getDialogLog()".to_string()
-                };
+                let code = trimmed_log_js(
+                    "window.__VICTAURI__?.getDialogLog()",
+                    params.limit.unwrap_or(DEFAULT_LOG_LIMIT),
+                );
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
@@ -3390,11 +3454,7 @@ impl VictauriMcpHandler {
                 } else {
                     format!("window.__VICTAURI__?.getEventStream({since_arg})")
                 };
-                let code = if let Some(limit) = params.limit {
-                    format!("return ({base} || []).slice(-{limit})")
-                } else {
-                    format!("return {base}")
-                };
+                let code = trimmed_log_js(&base, params.limit.unwrap_or(DEFAULT_LOG_LIMIT));
                 self.eval_bridge(&code, params.webview_label.as_deref())
                     .await
             }
@@ -5387,9 +5447,10 @@ impl VictauriMcpHandler {
         // a busy main thread delaying the code past it reported a parse error for code that
         // then ran (an `invoke_command` retried on that ran twice).
         // The settle logic lives in the bridge's closure-private state (see `_evalBegin` /
-        // `_evalCheck` / `_evalSettle` in js_bridge.rs): the page can neither enumerate pending
-        // eval ids nor suppress results, each outcome is delivered at most once, and
-        // serialization uses a `JSON.stringify` captured before any page script ran.
+        // `_evalCheck` / `_evalSettle` in js_bridge.rs): each outcome is delivered at most once,
+        // and serialization uses a `JSON.stringify` captured before any page script ran. This
+        // protects against a buggy page, not a hostile one: the code runs in the page's realm and
+        // the result travels through the page's `fetch`, which page script can read, rewrite or drop.
         // Out of time before the code is sent (a slow probe on a busy UI thread): send nothing —
         // the code never runs, and the agent is told exactly that.
         if tokio::time::Instant::now() >= send_deadline {

@@ -780,6 +780,8 @@ pub struct AnimationParams {
     pub record: Option<bool>,
     /// (`sample`, read) If true, clear recorded sessions after returning them.
     pub clear: Option<bool>,
+    /// (`sample`) If true, stop an armed recorder; what it captured stays readable.
+    pub disarm: Option<bool>,
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,

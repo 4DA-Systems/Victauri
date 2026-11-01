@@ -602,3 +602,151 @@ async fn page_successes_stay_successes() {
         assert_eq!(r, answer, "{tool} {args}");
     }
 }
+
+// ── Animation scrub lifecycle, eval note, log defaults, find_elements forwarding ─────────────
+
+fn scrub_bridge(state: &Arc<VictauriState>, seek_fails: bool) -> ScriptBridge {
+    ScriptBridge::new(
+        state,
+        Arc::new(move |_, script: &str| {
+            if script.contains("scrubPrepare") {
+                return Some(page_value(
+                    &json!({"prepared": true, "anim_count": 1, "duration": 100}),
+                ));
+            }
+            if script.contains("scrubSeek") {
+                return Some(if seek_fails {
+                    r#"{"__victauri_err":"seek failed"}"#.to_string()
+                } else {
+                    page_value(&json!({"t": 1}))
+                });
+            }
+            if script.contains("scrubRestore") {
+                return Some(page_value(&json!({"restored": true, "resumed": true})));
+            }
+            None
+        }),
+    )
+}
+
+fn scripts_with(bridge: &ScriptBridge, needle: &str) -> usize {
+    bridge
+        .evals
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, s)| s.contains(needle))
+        .count()
+}
+
+#[tokio::test]
+async fn scrub_reports_that_it_restored() {
+    let state = state();
+    let bridge = scrub_bridge(&state, false);
+    let h = handler(&state, &bridge);
+    let r = ok_json(&call(&h, "animation", json!({"action": "scrub", "points": 3})).await);
+    assert_eq!(r["restored"], json!(true), "{r}");
+    assert_eq!(scripts_with(&bridge, "scrubSeek("), 3);
+    assert_eq!(scripts_with(&bridge, "scrubRestore("), 1);
+}
+
+#[tokio::test]
+async fn scrub_stops_at_the_first_failed_seek_and_still_restores() {
+    let state = state();
+    let bridge = scrub_bridge(&state, true);
+    let h = handler(&state, &bridge);
+    let r = ok_json(&call(&h, "animation", json!({"action": "scrub", "points": 20})).await);
+    assert_eq!(scripts_with(&bridge, "scrubSeek("), 1, "{r}");
+    assert_eq!(scripts_with(&bridge, "scrubRestore("), 1, "{r}");
+}
+
+#[tokio::test]
+async fn scrub_restores_when_prepare_fails_after_pausing() {
+    let state = state();
+    let bridge = ScriptBridge::new(
+        &state,
+        Arc::new(|_, script: &str| {
+            Some(if script.contains("scrubPrepare") {
+                r#"{"__victauri_err":"prepare failed"}"#.to_string()
+            } else {
+                page_value(&json!({"restored": true}))
+            })
+        }),
+    );
+    let h = handler(&state, &bridge);
+    let r = call(&h, "animation", json!({"action": "scrub"})).await;
+    assert_eq!(r.is_error, Some(true));
+    for _ in 0..50 {
+        if scripts_with(&bridge, "scrubRestore(") == 1 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the guard never restored");
+}
+
+#[tokio::test]
+async fn sample_disarm_reaches_the_bridge() {
+    let state = state();
+    let bridge = ScriptBridge::answering(&state, &page_value(&json!({"disarmed": true})));
+    let h = handler(&state, &bridge);
+    let r = ok_json(&call(&h, "animation", json!({"action": "sample", "disarm": true})).await);
+    assert_eq!(r["disarmed"], json!(true));
+    assert_eq!(scripts_with(&bridge, "disarmSweep("), 1);
+}
+
+#[tokio::test]
+async fn eval_of_a_leading_brace_explains_the_undefined() {
+    let state = state();
+    let bridge = ScriptBridge::answering(
+        &state,
+        r#"{"__victauri_ok":null,"__victauri_type":"undefined"}"#,
+    );
+    let h = handler(&state, &bridge);
+    let r = call(&h, "eval_js", json!({"code": "{a: 1}"})).await;
+    let all = serde_json::to_string(&r.content).unwrap_or_default();
+    assert!(
+        all.contains("undefined") && all.contains("parentheses"),
+        "{all}"
+    );
+    let plain = call(&h, "eval_js", json!({"code": "void 0"})).await;
+    assert_eq!(plain.content.len(), 1, "no note on an ordinary undefined");
+}
+
+#[tokio::test]
+async fn logs_without_limit_are_bounded_and_trimmed() {
+    for action in ["console", "navigation", "dialogs", "events"] {
+        let state = state();
+        let bridge = ScriptBridge::answering(&state, &page_value(&json!([])));
+        let h = handler(&state, &bridge);
+        let _ = call(&h, "logs", json!({"action": action})).await;
+        assert!(
+            scripts_with(&bridge, "trimField") >= 1
+                && scripts_with(&bridge, &format!("arr.length > {DEFAULT_LOG_LIMIT}")) >= 1,
+            "{action} must go through trimmed_log_js with the default limit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn find_elements_forwards_the_contract_keys() {
+    let state = state();
+    let bridge = ScriptBridge::answering(&state, &page_value(&json!([])));
+    let h = handler(&state, &bridge);
+    let _ = call(
+        &h,
+        "find_elements",
+        json!({"text_exact": "T", "attribute": "data-x", "attribute_value": "1",
+               "include_hidden": true, "max_results": 5000}),
+    )
+    .await;
+    for key in [
+        "text_exact: \"T\"",
+        "attribute: \"data-x\"",
+        "attribute_value: \"1\"",
+        "include_hidden: true",
+        "max_results: 5000",
+    ] {
+        assert_eq!(scripts_with(&bridge, key), 1, "{key}");
+    }
+}

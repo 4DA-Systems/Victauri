@@ -58,6 +58,19 @@ fn run_tests(def: &TestDef) -> Option<Vec<TestResult>> {
     }
     let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
     let json = serde_json::to_string(def).expect("serialize test def");
+    // `addRoute` is agent-only: every spelling the page code here uses goes through the key.
+    let agent_add = format!(
+        "window.__VICTAURI__._agent('{}').addRoute(",
+        victauri_plugin::js_bridge::agent_key()
+    );
+    let json = [
+        "window.__VICTAURI__.addRoute(",
+        "V.addRoute(",
+        "v.addRoute(",
+        "b.addRoute(",
+    ]
+    .iter()
+    .fold(json, |j, spelling| j.replace(spelling, &agent_add));
     tmp.write_all(json.as_bytes()).expect("write test def");
     tmp.flush().expect("flush temp file");
     let output = Command::new("node")
@@ -257,14 +270,18 @@ fn r4_js2_agent_key_unreachable_from_page_hooks() {
         } };
         ",
     );
+    // In setup, not the test body: the body is on the stack when hooks run, and adding a rule
+    // takes the key, which the test then rightly finds reachable.
+    let setup = format!(
+        "{setup}\nvar __ops = {ops}; __ops.addRoute({{ pattern: 'never-matches-1', action: 'block' }}); \
+         __ops.addRoute({{ pattern: 'never-matches-2', action: 'block' }}); __ops = null;"
+    );
     let def = def(
         Some(setup),
         vec![case(
             "hooked built-ins never reach the agent key or an agent-only op",
             r"
             var V = window.__VICTAURI__;
-            V.addRoute({ pattern: 'never-matches-1', action: 'block' });
-            V.addRoute({ pattern: 'never-matches-2', action: 'block' });
             await fetch('http://ipc.localhost/some_cmd', { method: 'POST', body: '{}' });
             __hookMethod(Array.prototype, 'filter');
             __hookMethod(Array.prototype, 'splice');

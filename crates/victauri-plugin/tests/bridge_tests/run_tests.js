@@ -137,6 +137,10 @@ async function run() {
       };
     };
 
+    // The bridge's walkers read Element.prototype's method (a form's named controls can shadow
+    // the one on the instance), so the stub lives there too; covers SVG as well.
+    window.Element.prototype.getBoundingClientRect = window.HTMLElement.prototype.getBoundingClientRect;
+
     // Stub getComputedStyle to return basic visible values.
     const origGCS = window.getComputedStyle;
     window.getComputedStyle = function (el) {

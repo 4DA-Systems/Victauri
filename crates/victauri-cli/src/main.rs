@@ -2665,7 +2665,20 @@ fn snapshot_element_count(snap: &serde_json::Value) -> u64 {
             .lines()
             .filter(|line| {
                 let t = line.trim_start();
-                t.strip_prefix("[e").is_some_and(|rest| {
+                // `[k3f9e12]` (a 4-char page tag since 0.10.3), or `[e12]` from an older plugin.
+                t.strip_prefix('[').is_some_and(|rest| {
+                    let tagged = rest.get(..5).filter(|head| {
+                        head.ends_with('e')
+                            && head[..4]
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    });
+                    let Some(rest) = rest
+                        .strip_prefix('e')
+                        .or_else(|| tagged.and_then(|head| rest.strip_prefix(head)))
+                    else {
+                        return false;
+                    };
                     let digits = rest.chars().take_while(char::is_ascii_digit).count();
                     digits > 0 && rest[digits..].starts_with(']')
                 })
@@ -4378,6 +4391,11 @@ mod tests {
             "format": "compact"
         });
         assert_eq!(snapshot_element_count(&compact), 3);
+        let tagged = serde_json::json!({
+            "tree": "[k3f9e1] body\n  [k3f9e20] button \"Save\"\n  [toolong1e3] x\n  [k3f9] y\n",
+            "format": "compact"
+        });
+        assert_eq!(snapshot_element_count(&tagged), 2);
         let json_tree = serde_json::json!({
             "tree": {"ref_id": "e1", "children": [
                 {"ref_id": "e2", "children": []},

@@ -618,8 +618,8 @@ pub fn trusted_focus_probe_js(ref_id: &str) -> String {
 #[must_use]
 pub fn trusted_click_probe_js(ref_id: &str) -> String {
     format!(
-        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
-         if(!__e) return null; \
+        "var __v=window.__VICTAURI__,__id={}, __e=__v&&__v.getRef(__id); \
+         if(!__e){{var __m=__v&&__v.foreignRefError(__id);return __m?{{error:__m}}:null;}} \
          function __no(m){{return {{error:m}};}} \
          function __in(w,x,y){{return x>=0&&y>=0&&x<w.innerWidth&&y<w.innerHeight;}} \
          function __hit(d,x,y){{var h=d.elementFromPoint(x,y),g=0; \
@@ -630,10 +630,11 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
          if(!__e.isConnected) return __no('element is detached from the DOM'); \
          __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
          var __d=__e.ownerDocument||document, __w=__d.defaultView||window; \
-         if(__e.disabled||(__e.getAttribute&&__e.getAttribute('aria-disabled')==='true')) \
+         if(__e.disabled===true||(__e.matches&&__e.matches(':disabled'))|| \
+            (__e.getAttribute&&__e.getAttribute('aria-disabled')==='true')) \
            return __no('element is disabled'); \
          var __s=__w.getComputedStyle(__e); \
-         if(__s.display==='none'||__s.visibility==='hidden'||parseFloat(__s.opacity)<0.01) \
+         if(__s.display==='none'||__s.visibility==='hidden') \
            return __no('element is not visible'); \
          if(__s.pointerEvents==='none') return __no('element has pointer-events: none'); \
          var __b=__e.getBoundingClientRect(); \
