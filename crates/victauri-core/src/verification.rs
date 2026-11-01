@@ -57,6 +57,13 @@ fn compare_values(
     if frontend == backend {
         return;
     }
+    // `5` from the webview and a Rust f64's `5.0` are the same number: JavaScript has no float
+    // form, so a textual difference between them is not a divergence.
+    if let (serde_json::Value::Number(f), serde_json::Value::Number(b)) = (frontend, backend)
+        && numbers_equal(f, b)
+    {
+        return;
+    }
 
     if depth >= MAX_COMPARE_DEPTH {
         divergences.push(Divergence {
@@ -629,16 +636,83 @@ fn coerce_f64(v: &serde_json::Value) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()))
 }
 
-fn values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    if a == b {
-        return true;
+fn integer_value(n: &serde_json::Number) -> Option<i128> {
+    n.as_i64()
+        .map(i128::from)
+        .or_else(|| n.as_u64().map(i128::from))
+}
+
+/// Numeric equality: integers exactly (two 64-bit ids differing in the last digit are NOT equal,
+/// which comparing as `f64` would say they are), floats within a few units of relative rounding
+/// error (`0.1 + 0.2` equals `0.3`, `1e-20` does not equal `2e-20`).
+#[allow(clippy::cast_possible_truncation)] // the float is whole and in range, checked first
+fn numbers_equal(a: &serde_json::Number, b: &serde_json::Number) -> bool {
+    match (integer_value(a), integer_value(b), a.as_f64(), b.as_f64()) {
+        (Some(x), Some(y), _, _) => x == y,
+        (Some(int), None, _, Some(float)) | (None, Some(int), Some(float), _) => {
+            // Exactly representable as an integer, or not equal at all. Past 2^127 no i64/u64
+            // can match, and the cast would saturate.
+            float.fract() == 0.0 && float.abs() < 2f64.powi(127) && float as i128 == int
+        }
+        (None, None, Some(x), Some(y)) => {
+            x == y || (x - y).abs() <= 4.0 * f64::EPSILON * x.abs().max(y.abs())
+        }
+        _ => false,
     }
-    if let (Some(na), Some(nb)) = (coerce_f64(a), coerce_f64(b)) {
-        (na - nb).abs() < f64::EPSILON
-    } else {
-        let sa = a.as_str().map_or_else(|| a.to_string(), str::to_owned);
-        let sb = b.as_str().map_or_else(|| b.to_string(), str::to_owned);
-        sa == sb
+}
+
+fn strictly_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(x), Value::Number(y)) => numbers_equal(x, y),
+        (Value::Array(x), Value::Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(p, q)| strictly_equal(p, q))
+        }
+        (Value::Object(x), Value::Object(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .all(|(k, p)| y.get(k).is_some_and(|q| strictly_equal(p, q)))
+        }
+        _ => a == b,
+    }
+}
+
+/// `s` as a number, only if that number prints back as exactly `s`: `"3"` and `"3.5"` are numbers,
+/// while `"007"`, `"+5"`, `"1e3"` and `"1.10"` are text that merely parses as one.
+fn canonical_number(s: &str) -> Option<serde_json::Number> {
+    serde_json::from_str::<serde_json::Number>(s)
+        .ok()
+        .filter(|n| n.to_string() == s)
+}
+
+/// The one definition of "equal" for checking a runtime value against an expected one, used by
+/// the `equals` / `not_equals` assertion conditions.
+///
+/// - Values are compared as JSON, by type: `null` is not `"null"`, `true` is not `"true"`, and an
+///   object is not its serialized text. Different strings are never equal, whatever they parse to
+///   (`"1.10"` is not `"1.1"`).
+/// - Numbers compare by value at any depth: `1` equals `1.0`; integers compare exactly.
+/// - One coercion, at the top level only: a number equals a string that is that number's canonical
+///   text, because DOM reads return text (`textContent` `"3"` equals `3`; `"3.0"` also equals `3`,
+///   but `"007"`, `"+5"` and `"1e3"` do not).
+///
+/// ```
+/// use serde_json::json;
+/// use victauri_core::verification::json_values_equal;
+///
+/// assert!(json_values_equal(&json!("3"), &json!(3)));
+/// assert!(json_values_equal(&json!(1), &json!(1.0)));
+/// assert!(!json_values_equal(&json!("1.10"), &json!("1.1")));
+/// assert!(!json_values_equal(&json!(null), &json!("null")));
+/// ```
+#[must_use]
+pub fn json_values_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Number(n), Value::String(s)) | (Value::String(s), Value::Number(n)) => {
+            canonical_number(s).is_some_and(|parsed| numbers_equal(&parsed, n))
+        }
+        _ => strictly_equal(a, b),
     }
 }
 
@@ -658,8 +732,8 @@ pub fn evaluate_assertion(
     assertion: &SemanticAssertion,
 ) -> AssertionResult {
     let passed = match assertion.condition {
-        AssertionCondition::Equals => values_equal(&actual, &assertion.expected),
-        AssertionCondition::NotEquals => !values_equal(&actual, &assertion.expected),
+        AssertionCondition::Equals => json_values_equal(&actual, &assertion.expected),
+        AssertionCondition::NotEquals => !json_values_equal(&actual, &assertion.expected),
         AssertionCondition::Contains => match (&actual, &assertion.expected) {
             (serde_json::Value::String(a), serde_json::Value::String(e)) => a.contains(e.as_str()),
             (serde_json::Value::Array(arr), val) => arr.contains(val),
