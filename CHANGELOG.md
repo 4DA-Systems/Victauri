@@ -38,8 +38,8 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   while being recorded and two capture layers in one subscriber no longer panic or deadlock; symbolising a
   panic no longer blocks workers or another panic; `log_layer()` no longer lowers the global max level.
 - `navigate go_to` out of the app left a dead page with no way back; a page stopped by `while(true)` now
-  recovers through a detour on WebView2, and on Linux by ending the one web process whose main thread spun without
-  once sleeping, only while every other window that has answered still answers; the result names it (`ended_web_process`).
+  recovers through a detour on WebView2, and on Linux by ending the one web process whose main thread spun throughout,
+  only while every other window that has answered still answers; the result names it (`ended_web_process`).
   `recovered` and `ok` mean the page answers at the
   new URL, where they used to mean a navigation was sent: WebKit's URL reads the new address while the old
   script still runs. The demo's sync window-building command deadlocked.

@@ -1128,32 +1128,34 @@ pub fn enumerate_child_processes() -> Vec<ChildProcessInfo> {
 }
 
 /// The one page process whose main thread wanted the CPU flat out between two
-/// [`web_main_thread_cpu`] readings and did not once rest: a page spinning in a loop. Ticks are
-/// `USER_HZ`, 100 per second on every Linux ABI. Wanting it is not enough: on an overloaded core a
-/// thread working 25% of the time waits for the rest, and read as flat out with 64 others running.
-/// But it still sleeps (2.5 times a second there), and a loop does not. A loop that makes the page's
-/// collector wait for its helpers may not qualify, and then the call reports that the page does not
-/// answer. `None` when no process qualified, or several did: nothing says which window's page each
-/// one renders.
+/// [`web_main_thread_cpu`] readings, and either never rested or really got most of it: a page
+/// spinning in a loop. Ticks are `USER_HZ`, 100 per second on every Linux ABI. Wanting it is not
+/// enough: on an overloaded core a thread working 25% of the time waits for the rest, and read as
+/// flat out with 64 others running (102 ticks/s wanted, 1 on the CPU, 2.5 sleeps/s). A bare loop
+/// never sleeps, however little CPU it gets (0 in 5 s). A loop that allocates does, waiting for the
+/// collector's helpers (1,300/s), and it gets the CPU (over 90 ticks/s on a free core): under load
+/// that one may not qualify, and the call then reports that the page does not answer. `None` when no
+/// process qualified, or several did: nothing says which window's page each one renders.
 ///
 /// [`web_main_thread_cpu`]: crate::bridge::WebviewBridge::web_main_thread_cpu
 #[must_use]
 pub(crate) fn spinning_web_process(
-    before: &[(u32, u64, u64)],
-    after: &[(u32, u64, u64)],
+    before: &[(u32, u64, u64, u64)],
+    after: &[(u32, u64, u64, u64)],
     elapsed: std::time::Duration,
 ) -> Option<u32> {
     let seconds = elapsed.as_secs_f64();
-    let mut spinning = after.iter().filter(|(pid, ticks, sleeps)| {
+    let mut spinning = after.iter().filter(|(pid, wanted, on_cpu, sleeps)| {
         before
             .iter()
-            .find(|(earlier, _, _)| earlier == pid)
-            .is_some_and(|(_, was, slept)| {
-                ticks.saturating_sub(*was) as f64 >= seconds * 100.0 * 0.9
-                    && sleeps.saturating_sub(*slept) as f64 <= seconds
+            .find(|(earlier, _, _, _)| earlier == pid)
+            .is_some_and(|(_, wanted_was, on_cpu_was, slept)| {
+                wanted.saturating_sub(*wanted_was) as f64 >= seconds * 100.0 * 0.9
+                    && (sleeps.saturating_sub(*slept) as f64 <= seconds
+                        || on_cpu.saturating_sub(*on_cpu_was) as f64 >= seconds * 100.0 * 0.6)
             })
     });
-    let (pid, _, _) = spinning.next()?;
+    let (pid, _, _, _) = spinning.next()?;
     spinning.next().is_none().then_some(*pid)
 }
 
@@ -1181,17 +1183,18 @@ fn cpu_ticks_from_stat(stat: &str) -> Option<u64> {
     Some(utime + stime)
 }
 
-/// Clock ticks a thread wanted the CPU, from the contents of `/proc/<pid>/task/<tid>/schedstat`:
-/// nanoseconds on it, then nanoseconds waiting for it. A loop wants it all the time, however few it
-/// gets: on 2 CPUs with 4 Workers elsewhere a stuck page's main thread measured 41 ticks/s on the CPU
-/// and 105 wanted, and a healthy one 0. `None` when the kernel keeps no such figures (all zero).
+/// Clock ticks a thread wanted the CPU, and of those it got, from the contents of
+/// `/proc/<pid>/task/<tid>/schedstat`: nanoseconds on it, then nanoseconds waiting for it. A loop
+/// wants it all the time, however few it gets: on 2 CPUs with 4 Workers elsewhere a stuck page's main
+/// thread measured 41 ticks/s on the CPU and 105 wanted, and a healthy one 0. `None` when the kernel
+/// keeps no such figures (all zero).
 #[cfg(any(target_os = "linux", test))]
-fn runnable_ticks_from_schedstat(schedstat: &str) -> Option<u64> {
+fn cpu_ticks_from_schedstat(schedstat: &str) -> Option<(u64, u64)> {
     let mut fields = schedstat.split_ascii_whitespace();
     let on_cpu: u64 = fields.next()?.parse().ok()?;
     let waiting: u64 = fields.next()?.parse().ok()?;
-    let ticks = (on_cpu + waiting) / 10_000_000;
-    (ticks > 0).then_some(ticks)
+    let wanted = (on_cpu + waiting) / 10_000_000;
+    (wanted > 0).then_some((wanted, on_cpu / 10_000_000))
 }
 
 /// The kernel's process name is cut to 15 characters.
@@ -1204,21 +1207,22 @@ fn web_processes_linux() -> impl Iterator<Item = u32> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn web_main_thread_cpu_linux() -> Vec<(u32, u64, u64)> {
+pub(crate) fn web_main_thread_cpu_linux() -> Vec<(u32, u64, u64, u64)> {
     web_processes_linux()
         .filter_map(|pid| {
             // `/proc/<pid>/stat` sums every thread: a healthy page's Workers would read as flat out.
             let thread = format!("/proc/{pid}/task/{pid}");
             let status = std::fs::read_to_string(format!("{thread}/status")).ok()?;
             let sleeps = voluntary_switches_from_status(&status)?;
-            let wanted = std::fs::read_to_string(format!("{thread}/schedstat"))
+            let ticks = std::fs::read_to_string(format!("{thread}/schedstat"))
                 .ok()
-                .and_then(|schedstat| runnable_ticks_from_schedstat(&schedstat));
-            if let Some(wanted) = wanted {
-                return Some((pid, wanted, sleeps));
+                .and_then(|schedstat| cpu_ticks_from_schedstat(&schedstat));
+            if let Some((wanted, on_cpu)) = ticks {
+                return Some((pid, wanted, on_cpu, sleeps));
             }
             let stat = std::fs::read_to_string(format!("{thread}/stat")).ok()?;
-            Some((pid, cpu_ticks_from_stat(&stat)?, sleeps))
+            let on_cpu = cpu_ticks_from_stat(&stat)?;
+            Some((pid, on_cpu, on_cpu, sleeps))
         })
         .collect()
 }
@@ -2205,35 +2209,47 @@ mod tests {
     #[test]
     fn what_a_thread_wanted_of_the_cpu_is_read_in_ticks() {
         assert_eq!(
-            runnable_ticks_from_schedstat("1500000000 3500000000 42\n"),
-            Some(500)
+            cpu_ticks_from_schedstat("1500000000 3500000000 42\n"),
+            Some((500, 150))
         );
-        assert_eq!(runnable_ticks_from_schedstat("0 0 0\n"), None);
-        assert_eq!(runnable_ticks_from_schedstat("garbage"), None);
-        assert_eq!(runnable_ticks_from_schedstat(""), None);
+        assert_eq!(cpu_ticks_from_schedstat("0 0 0\n"), None);
+        assert_eq!(cpu_ticks_from_schedstat("garbage"), None);
+        assert_eq!(cpu_ticks_from_schedstat(""), None);
     }
 
     #[test]
     fn only_a_single_main_thread_at_full_speed_counts_as_spinning() {
         let five_s = std::time::Duration::from_secs(5);
-        let before = [(1, 100, 7), (2, 100, 7), (3, 100, 7)];
+        let before = [(1, 100, 100, 7), (2, 100, 100, 7), (3, 100, 100, 7)];
         // 5 s at 100 ticks/s for one, a busy page's 60% for another.
         assert_eq!(
-            spinning_web_process(&before, &[(1, 600, 7), (2, 400, 7), (3, 101, 7)], five_s),
+            spinning_web_process(
+                &before,
+                &[(1, 600, 600, 7), (2, 400, 400, 7), (3, 101, 101, 7)],
+                five_s
+            ),
             Some(1)
         );
         assert_eq!(
-            spinning_web_process(&before, &[(1, 400, 7), (2, 400, 7), (3, 101, 7)], five_s),
+            spinning_web_process(
+                &before,
+                &[(1, 400, 400, 7), (2, 400, 400, 7), (3, 101, 101, 7)],
+                five_s
+            ),
             None,
             "busy is not stopped"
         );
         assert_eq!(
-            spinning_web_process(&before, &[(1, 600, 7), (2, 600, 7), (3, 101, 7)], five_s),
+            spinning_web_process(
+                &before,
+                &[(1, 600, 600, 7), (2, 600, 600, 7), (3, 101, 101, 7)],
+                five_s
+            ),
             None,
             "nothing says which window's page each one renders"
         );
         assert_eq!(
-            spinning_web_process(&before, &[(9, 9000, 0)], five_s),
+            spinning_web_process(&before, &[(9, 9000, 9000, 0)], five_s),
             None,
             "a process that started meanwhile has no earlier reading"
         );
@@ -2245,13 +2261,22 @@ mod tests {
     #[test]
     fn a_thread_that_rests_is_not_spinning_however_long_it_waits() {
         let five_s = std::time::Duration::from_secs(5);
-        let before = [(1, 100, 7)];
-        // 2.5 sleeps a second, as measured there.
-        assert_eq!(spinning_web_process(&before, &[(1, 610, 19)], five_s), None);
+        let before = [(1, 100, 100, 7)];
+        // 1 tick a second on the CPU and 2.5 sleeps, as measured there.
         assert_eq!(
-            spinning_web_process(&before, &[(1, 610, 12)], five_s),
+            spinning_web_process(&before, &[(1, 610, 105, 19)], five_s),
+            None
+        );
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 610, 105, 12)], five_s),
             Some(1),
-            "a stray one or two does not make it healthy"
+            "a bare loop under load: starved, and a stray sleep or two"
+        );
+        // Measured on WebKitGTK: 1,300 sleeps a second through the collector, with the CPU to itself.
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 590, 560, 6000)], five_s),
+            Some(1),
+            "a loop that allocates"
         );
     }
 

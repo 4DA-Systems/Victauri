@@ -223,11 +223,13 @@ recovery killed a healthy window's process when Workers kept it busy, then spare
 contention (main thread only, and time waiting for the CPU counts); a reader racing a rotation lost
 thousands of lines silently (one open for a file's tag and bytes); the regex check became an automaton
 check. Second: an exact count hid ambiguity from it (`(?:a{2}b|aab)+$` hung the page), and counting wait
-time made a healthy page on an overloaded core read as spinning (a thread that sleeps does not qualify).
+time made a healthy page on an overloaded core read as spinning. Sleeps alone would not do: measured live,
+a bare loop sleeps 0 times in 5 s and an allocating one 1,300 times a second through its collector, so a
+process qualifies when it wants the CPU flat out and either never rests or really gets most of it.
 
 Known, not fixed: a polynomial route regex with no repeated group (`.*.*.*.*x`) can still stall the page;
-on macOS a page stuck in a loop cannot be left until its script ends (the call errors), and on Linux
-neither can one whose loop sleeps through its collector; a web process spinning in a window whose bridge
+on macOS a page stuck in a loop cannot be left until its script ends (the call errors), and on a loaded
+Linux machine neither can one whose loop allocates; a web process spinning in a window whose bridge
 never answered could be taken for the target's; `DeathWatch` signals only the direct child, so what `npm`
 started may stay.
 

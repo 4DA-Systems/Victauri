@@ -107,9 +107,10 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   `/health` first and replaces that history entry, and `go_back` returns `{ok, recovered, url, note}`.
   Going to a page inside the app, both now report success only once the page answers there, and are
   errors otherwise, which can take about 20 s. On Linux, if the main thread of one web process spun
-  throughout without sleeping and every other window that has answered still answers, that process is
+  throughout and every other window that has answered still answers, that process is
   ended to get off the page (about 15 s, with a logged warning), and the result says `ended_web_process:
-  <pid>`. A page looping through a collector that sleeps may not qualify, and the call then errors. On
+  <pid>`. A loop that allocates sleeps through its collector, and qualifies only with most of a core to
+  itself: on a loaded machine the call may error instead. On
   macOS the navigation lands when the script ends. `go_to` outside the app from a stopped page says in
   its `warning` that it may not land until the script ends. An origin a
   bridge has answered on counts as inside the app, so `go_to` no longer warns about a custom
