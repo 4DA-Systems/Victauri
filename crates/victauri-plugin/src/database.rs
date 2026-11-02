@@ -618,12 +618,26 @@ fn sql_nesting(sql: &str) -> (usize, usize) {
     (deepest, selects)
 }
 
-/// A view's definition split into words: bare words, the content of quoted spans (`SQLite` takes a
-/// string where a name is expected, so all four quote styles can name a view), and `.`. Lowercase,
-/// as names compare without regard to ASCII case.
+/// One token of a view's definition (see [`sql_words`]).
 #[cfg(feature = "sqlite")]
-fn sql_words(sql: &str) -> Vec<String> {
+struct SqlWord {
+    /// Lowercase, as names compare without regard to ASCII case.
+    text: String,
+    /// Written in quotes: then it is a name, never a keyword or punctuation.
+    quoted: bool,
+}
+
+/// A view's definition split into tokens: bare words, the content of quoted spans (`SQLite` takes a
+/// string where a name is expected, so all four quote styles can name a view), and `.` `,` `(` `)`.
+/// A parameter is not read as `SQLite` reads it (`:select` gives the word `select`): a view holding
+/// one does not load at all.
+#[cfg(feature = "sqlite")]
+fn sql_words(sql: &str) -> Vec<SqlWord> {
     let cleaned = scan_sql(sql).cleaned;
+    let bare = |text: String| SqlWord {
+        text,
+        quoted: false,
+    };
     let mut words = Vec::new();
     let mut chars = cleaned.chars().peekable();
     while let Some(c) = chars.next() {
@@ -641,15 +655,18 @@ fn sql_words(sql: &str) -> Vec<String> {
                         break;
                     }
                 }
-                words.push(word.to_ascii_lowercase());
+                words.push(SqlWord {
+                    text: word.to_ascii_lowercase(),
+                    quoted: true,
+                });
             }
-            '.' => words.push(".".to_string()),
+            '.' | ',' | '(' | ')' => words.push(bare(c.to_string())),
             c if is_sqlite_id_char(c) => {
                 let mut word = String::from(c);
                 while let Some(n) = chars.next_if(|n| is_sqlite_id_char(*n)) {
                     word.push(n);
                 }
-                words.push(word.to_ascii_lowercase());
+                words.push(bare(word.to_ascii_lowercase()));
             }
             _ => {}
         }
@@ -662,8 +679,8 @@ fn sql_words(sql: &str) -> Vec<String> {
 /// `name` columns with it ignoring case (not at all under `writable_schema`), so a working view
 /// can say `type='VIEW'` or a BLOB.
 #[cfg(feature = "sqlite")]
-fn view_definition(words: &[String]) -> Option<(&str, usize)> {
-    let word = |i: usize| words.get(i).map(String::as_str);
+fn view_definition(words: &[SqlWord]) -> Option<(&str, usize)> {
+    let word = |i: usize| words.get(i).map(|w| w.text.as_str());
     let mut at = 1;
     if word(0)? != "create" {
         return None;
@@ -684,11 +701,89 @@ fn view_definition(words: &[String]) -> Option<(&str, usize)> {
     Some((word(at)?, at + 1))
 }
 
+/// What a view's body may select from: every name where `SQLite`'s grammar takes a table. That is a
+/// FROM clause (to its WHERE, GROUP, HAVING, ORDER or LIMIT, and not a join's condition, which a
+/// `,` or JOIN ends) and the name after IN (`x IN v`, which expands `v` from inside any expression).
+/// A result list and the other clauses name only columns, and subqueries in them are read by the
+/// same rules. Those keywords are all reserved, so bare they cannot be names, and anything else
+/// spelled like a name in a FROM clause (an alias, a table-valued function's argument) counts,
+/// which can only overcharge. Strings count: `SQLite` takes `FROM 'v1'` as a name.
+#[cfg(feature = "sqlite")]
+fn table_mentions(body: &[SqlWord]) -> Vec<&str> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Clause {
+        Expressions,
+        Tables,
+        JoinCondition,
+    }
+    let name_at = |at: usize| {
+        body.get(at)
+            .filter(|w| w.quoted || !matches!(w.text.as_str(), "(" | ")" | "," | "."))
+    };
+    let mut mentions = Vec::new();
+    // One clause per open parenthesis. A parenthesis in a FROM clause is more of it (`FROM (a, b)`);
+    // one anywhere else holds expressions until a subquery says otherwise.
+    let mut clauses = vec![Clause::Expressions];
+    for (at, word) in body.iter().enumerate() {
+        let Some(clause) = clauses.last_mut() else {
+            break;
+        };
+        if word.quoted {
+            if *clause == Clause::Tables {
+                mentions.push(word.text.as_str());
+            }
+            continue;
+        }
+        match word.text.as_str() {
+            "(" => {
+                let inner = if *clause == Clause::Tables {
+                    Clause::Tables
+                } else {
+                    Clause::Expressions
+                };
+                clauses.push(inner);
+            }
+            ")" => {
+                if clauses.len() > 1 {
+                    clauses.pop();
+                }
+            }
+            "." => {}
+            "," => {
+                if *clause == Clause::JoinCondition {
+                    *clause = Clause::Tables;
+                }
+            }
+            "select" | "where" | "group" | "having" | "order" | "limit" => {
+                *clause = Clause::Expressions;
+            }
+            "from" | "join" => *clause = Clause::Tables,
+            "on" | "using" if *clause == Clause::Tables => *clause = Clause::JoinCondition,
+            "in" => {
+                // `x IN v` or `x IN main.v`; `x IN (…)` is read as what it holds.
+                if let Some(name) = name_at(at + 1) {
+                    mentions.push(name.text.as_str());
+                    if body.get(at + 2).is_some_and(|w| !w.quoted && w.text == ".")
+                        && let Some(table) = name_at(at + 3)
+                    {
+                        mentions.push(table.text.as_str());
+                    }
+                }
+            }
+            name => {
+                if *clause == Clause::Tables {
+                    mentions.push(name);
+                }
+            }
+        }
+    }
+    mentions
+}
+
 /// The most nesting any chain of views adds up to: the largest sum of `cost` along views that
-/// select from each other. Anything in a definition spelled like a view's name counts as selecting
-/// from it, which can only overcharge (a column of that name). Strings count too: `SQLite` takes
-/// `FROM 'v1'` as a name. So mentions can close a cycle a real chain runs through, and views that
-/// reach each other are charged together, each once. That bounds any real chain among them.
+/// select from each other, as [`table_mentions`] reads it. Mentions can close a cycle a real chain
+/// runs through (an alias spelled like a view), so views that reach each other are charged
+/// together, each once. That bounds any real chain among them.
 #[cfg(feature = "sqlite")]
 fn deepest_view_chain(views: &[(String, usize)]) -> usize {
     const UNSEEN: usize = 0;
@@ -710,7 +805,9 @@ fn deepest_view_chain(views: &[(String, usize)]) -> usize {
     }
     let mut deps: Vec<Vec<usize>> = vec![Vec::new(); own.len()];
     for (node, words, body) in &parsed {
-        let found = words[*body..].iter().filter_map(|w| index.get(w).copied());
+        let found = table_mentions(&words[*body..])
+            .into_iter()
+            .filter_map(|name| index.get(name).copied());
         deps[*node].extend(found);
     }
     drop(parsed);
@@ -2708,8 +2805,10 @@ mod tests {
         assert!(is_read_only("\u{feff}SELECT 1"));
         assert_eq!(statement_count("\u{feff}SELECT 1;\u{feff}"), 1);
         // Only at the start of a token: inside a name it is a name character.
-        assert_eq!(sql_words("a\u{feff}b"), ["a\u{feff}b"]);
-        assert_eq!(sql_words("\u{feff}\u{feff}a b"), ["a", "b"]);
+        let texts =
+            |sql: &str| -> Vec<String> { sql_words(sql).into_iter().map(|w| w.text).collect() };
+        assert_eq!(texts("a\u{feff}b"), ["a\u{feff}b"]);
+        assert_eq!(texts("\u{feff}\u{feff}a b"), ["a", "b"]);
 
         // A name holding `$`: the `;` is inside a string.
         assert_eq!(statement_count("SELECT a$b('x y;z') FROM t"), 1);
@@ -2767,6 +2866,164 @@ mod tests {
         let (_f, path) = db_with_schema_rows(&rows);
         let err = check_schema_nesting(&path).unwrap_err();
         assert!(err.contains("nest"), "{err}");
+    }
+
+    /// Review: a hub view `data` over 500 shards that each have a column `data` was charged as one
+    /// cycle (2,001), and a healthy database refused: a column name counted as a link back.
+    #[test]
+    fn a_column_named_like_a_view_is_not_a_link() {
+        let (_f, path) = create_test_db();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE t(id INTEGER, data TEXT)")
+            .unwrap();
+        for i in 0..500 {
+            conn.execute_batch(&format!(
+                "CREATE VIEW s{i}(id, data) AS SELECT id, COALESCE(TRIM(data), 0) AS data FROM t \
+                 WHERE data IS NOT NULL ORDER BY data"
+            ))
+            .unwrap();
+        }
+        let shards: Vec<String> = (0..500).map(|i| format!("SELECT * FROM s{i}")).collect();
+        conn.execute_batch(&format!(
+            "CREATE VIEW data AS {}",
+            shards.join(" UNION ALL ")
+        ))
+        .unwrap();
+        conn.prepare("SELECT count(*) FROM data").unwrap();
+        drop(conn);
+        check_schema_nesting(&path).unwrap();
+        query(&path, "SELECT count(*) AS n FROM data", &[], None).unwrap();
+    }
+
+    /// Every clause that cannot name a table: none of these views selects from `b`.
+    #[test]
+    fn only_the_places_that_name_a_table_are_links() {
+        for sql in [
+            "SELECT b FROM t",
+            "SELECT t.b, 'b' AS note, \"b\" FROM t",
+            "SELECT COALESCE(b, (b)) FROM t",
+            "SELECT 1 FROM t WHERE b > 0 GROUP BY b HAVING b ORDER BY b LIMIT b",
+            "SELECT 1 FROM t JOIN u ON t.b = u.b",
+            "SELECT 1 FROM t JOIN u USING (b)",
+            "SELECT 1 WHERE b",
+            "SELECT x IN (b) FROM t",
+            "WITH c(b) AS (SELECT 1) SELECT * FROM c",
+        ] {
+            let views = [
+                (format!("CREATE VIEW a AS {sql}"), 2),
+                ("CREATE VIEW b AS SELECT 1".to_string(), 2),
+            ];
+            assert_eq!(deepest_view_chain(&views), 2, "{sql}");
+        }
+        let columns = [
+            ("CREATE VIEW a(b) AS SELECT 1".to_string(), 2),
+            ("CREATE VIEW b AS SELECT 1".to_string(), 2),
+        ];
+        assert_eq!(deepest_view_chain(&columns), 2);
+    }
+
+    /// Everything `SQLite` itself expands as a table, wherever it stands in the statement: each
+    /// spelling works as a chain, and a long one of it is refused. `FROM` is not the only way in
+    /// (`x IN v`), the words that end a result list can be quoted, and tables follow a join
+    /// condition.
+    #[test]
+    fn a_table_named_anywhere_is_still_a_link() {
+        type Definition = fn(&str) -> String;
+        let spellings: [(&str, Definition); 16] = [
+            ("IN a view", |v| format!("SELECT 1 IN {v}")),
+            ("NOT IN a schema's view", |v| {
+                format!("SELECT 1 NOT IN main.{v}")
+            }),
+            ("IN a string", |v| format!("SELECT 1 IN '{v}'")),
+            ("IN in a function", |v| format!("SELECT abs(1 IN {v})")),
+            ("IN in WHERE", |v| format!("SELECT 1 WHERE 1 IN {v}")),
+            ("scalar subquery", |v| {
+                format!("SELECT (SELECT 1 FROM {v}) AS x")
+            }),
+            ("from a string", |v| format!("SELECT 1 FROM '{v}'")),
+            ("subquery in WHERE", |v| {
+                format!("SELECT 1 WHERE (SELECT 1 FROM {v})")
+            }),
+            ("compound", |v| format!("SELECT 1 UNION SELECT 1 FROM {v}")),
+            ("values compound", |v| {
+                format!("VALUES(1) UNION ALL SELECT 1 FROM {v}")
+            }),
+            ("quoted select before the table", |v| {
+                format!("SELECT 1 AS \"select\" FROM users, {v}")
+            }),
+            ("a table named select", |v| {
+                format!("SELECT 1 FROM users AS \"select\", {v}")
+            }),
+            ("after a join condition", |v| {
+                format!("SELECT 1 FROM users a JOIN users b ON a.id = b.id, {v}")
+            }),
+            ("join after a join condition", |v| {
+                format!("SELECT 1 FROM users a JOIN users b ON a.id = b.id LEFT JOIN {v}")
+            }),
+            ("after USING", |v| {
+                format!("SELECT 1 FROM users a JOIN users b USING (id), {v}")
+            }),
+            ("parenthesised join", |v| {
+                format!("SELECT 1 FROM (users a JOIN users b ON a.id IN (1, 2), {v})")
+            }),
+        ];
+        for (what, body) in spellings {
+            let definition = |i: usize| {
+                if i == 0 {
+                    "CREATE VIEW v0 AS SELECT id FROM users".to_string()
+                } else {
+                    format!("CREATE VIEW v{i} AS {}", body(&format!("v{}", i - 1)))
+                }
+            };
+            // SQLite itself takes this spelling, and it is a working chain.
+            let rows: Vec<(String, String)> =
+                (0..5).map(|i| (format!("v{i}"), definition(i))).collect();
+            let (_small, small) = db_with_schema_rows(&rows);
+            let conn = rusqlite::Connection::open(&small).unwrap();
+            let run = conn.prepare("SELECT * FROM v4");
+            assert!(run.is_ok(), "{what}: {:?}", run.err());
+            drop(run);
+            drop(conn);
+
+            let chain: Vec<(String, usize)> = (0..1_000).map(|i| (definition(i), 2)).collect();
+            assert_eq!(deepest_view_chain(&chain), 2_000, "{what}");
+        }
+    }
+
+    /// [`table_mentions`] takes these bare words for keywords, so a view must not be able to use
+    /// one as a name, or a name after it would go unread.
+    #[test]
+    fn the_keywords_that_end_a_table_list_are_reserved() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        for word in [
+            "select", "from", "join", "where", "group", "having", "order", "limit", "on", "using",
+            "in",
+        ] {
+            assert!(
+                conn.execute_batch(&format!("CREATE TABLE {word}(x)"))
+                    .is_err(),
+                "{word}"
+            );
+        }
+    }
+
+    /// The tokenizer behind the chain check does not read parameters as `SQLite` does, and need
+    /// not: `SQLite` refuses a whole schema holding a view with one, whatever follows.
+    #[test]
+    fn a_view_holding_a_parameter_does_not_load() {
+        for body in [
+            "SELECT 1 FROM users a JOIN users b ON :select, users c",
+            "SELECT $a(') FROM users --'",
+        ] {
+            let rows = vec![("p".to_string(), format!("CREATE VIEW p AS {body}"))];
+            let (_f, path) = db_with_schema_rows(&rows);
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let err = conn.prepare("SELECT * FROM users").err();
+            assert!(
+                format!("{err:?}").contains("parameters are not allowed in views"),
+                "{body}: {err:?}"
+            );
+        }
     }
 
     #[test]

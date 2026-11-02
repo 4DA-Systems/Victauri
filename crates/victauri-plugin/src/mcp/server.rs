@@ -189,7 +189,9 @@ fn build_app_full_inner(
     // Build `/mcp` as its own router so the stateless session-id backfill layer applies ONLY to
     // that route. Axum applies a `.layer(...)` to the routes already registered on the router at
     // the call site; routes chained on afterwards (`/api/tools`, `/info`, `/health`) are excluded.
-    let mut mcp_router = axum::Router::new().route_service("/mcp", mcp_service);
+    let mut mcp_router = axum::Router::new()
+        .route_service("/mcp", mcp_service)
+        .layer(axum::middleware::from_fn(refuse_non_object_tool_arguments));
     if !stateful {
         mcp_router = mcp_router.layer(axum::middleware::from_fn(backfill_stateless_session_id));
     }
@@ -215,6 +217,8 @@ fn build_app_full_inner(
                         "commands_registered": s.registry.count(),
                         "events_captured": s.event_log.len(),
                         "port": s.port.load(Ordering::Relaxed),
+                        // Tells a discovery entry for this process from a stale one on this port.
+                        "pid": std::process::id(),
                         "auth_required": info_auth,
                         "privacy_mode": privacy_enabled,
                     }))
@@ -278,6 +282,60 @@ fn build_app_full_inner(
         .layer(axum::middleware::from_fn(
             super::hardening::close_on_rejection,
         ))
+}
+
+/// Answer a `tools/call` whose `params` or `arguments` are not an object with what is wrong.
+///
+/// rmcp cannot read one as a tool call, so it takes the request for an unknown method and answers
+/// `-32601` with the message `tools/call`, which says the method does not exist. The body is
+/// already in memory (see `read_body_with_deadline`).
+async fn refuse_non_object_tool_arguments(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let (parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, super::hardening::MAX_REQUEST_BODY_BYTES).await
+    else {
+        return axum::http::StatusCode::PAYLOAD_TOO_LARGE.into_response();
+    };
+    if let Ok(call) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && call["method"] == "tools/call"
+    {
+        let kind = |value: &serde_json::Value| match value {
+            serde_json::Value::String(_) => "a string",
+            serde_json::Value::Array(_) => "an array",
+            serde_json::Value::Number(_) => "a number",
+            _ => "a boolean",
+        };
+        let params = &call["params"];
+        let problem = if !(params.is_object() || params.is_null()) {
+            Some(format!(
+                "tools/call: `params` must be an object, not {}",
+                kind(params)
+            ))
+        } else if !(params["arguments"].is_object() || params["arguments"].is_null()) {
+            Some(format!(
+                "tools/call: `arguments` must be an object holding the tool's parameters, not {}",
+                kind(&params["arguments"])
+            ))
+        } else {
+            None
+        };
+        if let Some(message) = problem {
+            return axum::Json(serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": call["id"],
+                "error": { "code": -32602, "message": message },
+            }))
+            .into_response();
+        }
+    }
+    next.run(axum::extract::Request::from_parts(
+        parts,
+        axum::body::Body::from(bytes),
+    ))
+    .await
 }
 
 /// Refuse a browser-originated request body that is not JSON (415).

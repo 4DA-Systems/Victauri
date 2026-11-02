@@ -1025,6 +1025,188 @@ fn a_cursor_read_survives_a_rotation() {
     }
 }
 
+/// A `victauri run` that was killed writes no exit record. The app can outlive it (SIGKILL on
+/// Unix), and then `logs stdout` read on as if all were well, with nothing more ever to come.
+#[test]
+fn a_capture_says_when_its_launcher_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("4242-1730000000000.jsonl");
+    std::fs::write(&path, capture_record(0, "line")).unwrap();
+    assert_eq!(launcher_gone(&path, |pid| pid == 4242), Some(4242));
+    assert_eq!(
+        launcher_gone(&path, |_| false),
+        None,
+        "the launcher is alive"
+    );
+
+    let exit = "{\"t\":9,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n";
+    std::fs::write(&path, format!("{}{exit}", capture_record(0, "line"))).unwrap();
+    assert_eq!(launcher_gone(&path, |_| true), None, "it said how it ended");
+
+    // A `--capture` file has no pid in its name.
+    let named = dir.path().join("my-capture.jsonl");
+    std::fs::write(&named, capture_record(0, "line")).unwrap();
+    assert_eq!(launcher_gone(&named, |_| true), None);
+}
+
+/// An exit record carries up to 12 stderr lines of 64 KiB: the tail read must hold all of it.
+#[test]
+fn a_long_exit_record_is_seen_as_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("4242-1730000000000.jsonl");
+    let tail: Vec<String> = (0..12).map(|_| "x".repeat(64 * 1024)).collect();
+    let exit = serde_json::json!({"t": 9, "s": "exit", "l": "crashed", "tail": tail});
+    std::fs::write(&path, format!("{}{exit}\n", capture_record(0, "line"))).unwrap();
+    assert_eq!(launcher_gone(&path, |_| true), None);
+}
+
+/// On Linux, a real process: a zombie its parent has not reaped is gone too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dead_process_is_seen_as_dead() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    assert!(!process_is_dead(child.id()));
+    child.kill().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(process_is_dead(child.id()), "unreaped");
+    child.wait().unwrap();
+    assert!(process_is_dead(child.id()), "reaped");
+    assert!(!process_is_dead(std::process::id()));
+}
+
+/// A bare offset cannot see a rotation whose new file has a record boundary exactly there: the
+/// rotated file's tail and the new file's start went unread, with nothing said.
+#[test]
+fn a_cursor_on_a_record_boundary_of_the_new_file_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let record = capture_record;
+    let old: String = (0..4).map(|n| record(n, "old")).collect();
+    std::fs::write(&path, &old).unwrap();
+    // The first two read.
+    let cursor = (2 * record(0, "old").len()) as u64;
+    let read = read_console_cursor(&path, Some(0), 0, cursor).unwrap();
+    assert_eq!(read.lines.len(), 2);
+    let cursor = read.cursor(read.next);
+
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    let new: String = (0..4).map(|n| record(n, "new")).collect();
+    std::fs::write(&path, &new).unwrap();
+
+    let (got, at, lost) = follow_cursor(&path, cursor);
+    assert_eq!(got, ["old2", "old3", "new0", "new1", "new2", "new3"]);
+    assert!(!lost);
+    // And on from there: the new file grew, nothing again from before.
+    let mut more = new.clone();
+    more.push_str(&record(4, "new"));
+    std::fs::write(&path, &more).unwrap();
+    assert_eq!(follow_cursor(&path, at).0, ["new4"]);
+}
+
+/// All a follower reads from `cursor` on, as it would, with where it ended and whether it was told
+/// that lines were lost.
+fn follow_cursor(path: &std::path::Path, mut cursor: u64) -> (Vec<String>, u64, bool) {
+    let (mut got, mut lost) = (Vec::new(), false);
+    for _ in 0..8 {
+        let read = read_console_cursor(path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+        lost |= read.lost;
+        cursor = read.cursor(read.next);
+        got.extend(read.lines.into_iter().map(|l| l.text));
+    }
+    (got, cursor, lost)
+}
+
+fn capture_record(n: usize, text: &str) -> String {
+    format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"{text}{n}\"}}\n")
+}
+
+/// Two rotations between reads: the file the cursor was in is gone, and that is said.
+#[test]
+fn a_cursor_whose_file_rotated_away_says_lines_were_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    std::fs::write(&path, capture_record(0, "first")).unwrap();
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    let cursor = read.cursor(read.next);
+
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(&path, capture_record(0, "second")).unwrap();
+    std::fs::remove_file(path.with_extension("jsonl.1")).unwrap();
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(&path, capture_record(0, "third")).unwrap();
+
+    let first_read = read_console_cursor(&path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(first_read.lost);
+    let at = first_read.cursor(first_read.next);
+    assert_eq!(first_read.lines[0].text, "third0");
+    let (got, _, lost) = follow_cursor(&path, at);
+    assert!(got.is_empty() && !lost, "said once: {got:?}");
+}
+
+/// A cursor from before tags, or a line's `offset`, reads as it always did.
+#[test]
+fn a_bare_offset_is_still_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let body: String = (0..3).map(|n| capture_record(n, "line")).collect();
+    std::fs::write(&path, &body).unwrap();
+    let offset = capture_record(0, "line").len() as u64;
+    let (got, at, lost) = follow_cursor(&path, offset);
+    assert_eq!(got, ["line1", "line2"]);
+    assert!(!lost);
+    assert!(
+        at > body.len() as u64,
+        "what it returns carries the tag: {at}"
+    );
+    let line_offset = read_console_cursor(&path, Some(at), 0, CONSOLE_READ_WINDOW)
+        .unwrap()
+        .next;
+    assert_eq!(line_offset, body.len() as u64);
+
+    // Past a rotation, by where it lands.
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(
+        &path,
+        capture_record(0, "new-and-longer-than-the-old-file-was"),
+    )
+    .unwrap();
+    let (got, _, lost) = follow_cursor(&path, offset);
+    assert_eq!(
+        got,
+        ["line1", "line2", "new-and-longer-than-the-old-file-was0"]
+    );
+    assert!(!lost);
+}
+
+/// JavaScript clients read a cursor as a double, and a file with no complete record has no tag.
+#[test]
+fn a_cursor_is_exact_in_a_double_and_needs_a_first_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    std::fs::write(&path, "{\"t\":1,\"s\":\"out\",\"l\":\"partial").unwrap();
+    assert_eq!(capture_tag(&path), None);
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert_eq!(read.cursor(read.next), 0);
+
+    std::fs::write(&path, capture_record(0, "line")).unwrap();
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(capture_tag(&path).is_some_and(|tag| tag > 0 && tag < 1 << CURSOR_TAG_BITS));
+    let cursor = read.cursor((1 << CURSOR_OFFSET_BITS) - 1);
+    assert!(cursor < 1 << 53);
+    assert_eq!(
+        cursor & ((1 << CURSOR_OFFSET_BITS) - 1),
+        (1 << CURSOR_OFFSET_BITS) - 1
+    );
+    assert_eq!(
+        read.cursor(1 << CURSOR_OFFSET_BITS),
+        1 << CURSOR_OFFSET_BITS,
+        "no room: bare"
+    );
+}
+
 /// Release review: a cursor read stops at its byte window (16 MiB), and `logs stdout` reported
 /// `truncated: false` whenever the LINE limit was not hit — on a 40 MB capture an agent read
 /// the first window, saw nothing truncated, and never reached the panic further on. The reader
@@ -1177,6 +1359,47 @@ fn registry_recipe_captures_what_the_global_filter_allows() {
     let page = buf.query(&LogQuery::default());
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].message, "kept");
+}
+
+/// Documented limit: the capture leaves the embedded MCP SDK's lines out, the app's console does
+/// not, and the filter the page gives hides them (`rmcp::service` logs at INFO during MCP calls).
+#[test]
+fn the_documented_filter_hides_the_sdks_lines_from_the_console() {
+    #[derive(Clone, Default)]
+    struct Console(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Console {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let run = |filter: &str| {
+        let console = Console::default();
+        let writer = console.clone();
+        let buf = Arc::new(LogBuffer::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(filter))
+            .with(tracing_subscriber::fmt::layer().with_writer(move || writer.clone()))
+            .with(Some(BackendLogLayer::with_buffer(Arc::clone(&buf))));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "rmcp::service", "Service initialized as server");
+            tracing::info!(target: "app", "kept");
+        });
+        let page = buf.query(&LogQuery::default());
+        assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
+        assert_eq!(page.entries[0].message, "kept");
+        let printed = console.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&printed).into_owned()
+    };
+    let plain = run("info");
+    assert!(plain.contains("Service initialized"), "{plain}");
+    assert!(plain.contains("kept"), "{plain}");
+    let quiet = run("info,rmcp=warn");
+    assert!(!quiet.contains("Service initialized"), "{quiet}");
+    assert!(quiet.contains("kept"), "{quiet}");
 }
 
 /// Documented recipe for `fmt().init()` apps: `fmt()...finish().with(log_layer())`.

@@ -304,14 +304,14 @@ impl VictauriMcpHandler {
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_lowercase);
-        match backend_logs::read_console_capture_window(
+        match backend_logs::read_console_cursor(
             &path,
             params.since_seq,
             STDOUT_TAIL_BYTES,
             backend_logs::CONSOLE_READ_WINDOW,
         ) {
-            Ok((lines, next, more_in_file)) => {
-                let mut matched: Vec<_> = lines
+            Ok(mut read) => {
+                let mut matched: Vec<_> = std::mem::take(&mut read.lines)
                     .into_iter()
                     .filter(|l| {
                         min_level.is_none_or(|min| l.level.is_some_and(|lv| lv >= min))
@@ -323,16 +323,35 @@ impl VictauriMcpHandler {
                     })
                     .collect();
                 let total = matched.len();
-                let next = page_console_lines(&mut matched, limit, params.since_seq, next);
-                json_result(&serde_json::json!({
+                let next = page_console_lines(&mut matched, limit, params.since_seq, read.next);
+                let mut out = serde_json::json!({
                     "lines": matched,
                     "total_matched": total,
                     // Cut by the line limit, or by the read window with more of the capture
                     // after it: either way, read on from `next_seq`.
-                    "truncated": total > limit || (params.since_seq.is_some() && more_in_file),
-                    "next_seq": next,
+                    "truncated": total > limit || (params.since_seq.is_some() && read.more),
+                    "next_seq": read.cursor(next),
                     "path": path.to_string_lossy(),
-                }))
+                });
+                if !(total > limit || read.more)
+                    && let Some(pid) =
+                        backend_logs::launcher_gone(&path, backend_logs::process_is_dead)
+                {
+                    out["launcher_gone"] = serde_json::json!({
+                        "pid": pid,
+                        "note": format!(
+                            "`victauri run` (pid {pid}) was killed: this capture ends here, though \
+                             the app is still running, and how the app ends will not be recorded"
+                        ),
+                    });
+                }
+                if read.lost {
+                    out["gap"] = true.into();
+                    out["note"] = "the capture rotated more than once since this cursor was \
+                                   taken; the lines between are gone"
+                        .into();
+                }
+                json_result(&out)
             }
             Err(e) => tool_error(format!(
                 "cannot read the console capture at {}: {e}",
@@ -466,8 +485,14 @@ impl VictauriMcpHandler {
         // Start from a bounded tail so the look-back works without rescanning a huge file.
         let mut cursor: Option<u64> = None;
         loop {
-            match backend_logs::read_console_capture(&path, cursor, STDOUT_TAIL_BYTES) {
-                Ok((lines, next)) => {
+            match backend_logs::read_console_cursor(
+                &path,
+                cursor,
+                STDOUT_TAIL_BYTES,
+                backend_logs::CONSOLE_READ_WINDOW,
+            ) {
+                Ok(mut read) => {
+                    let lines = std::mem::take(&mut read.lines);
                     if let Some(line) = lines.into_iter().find(|l| {
                         l.ts_ms >= cutoff
                             && (min_level == LogLevel::Trace
@@ -483,7 +508,7 @@ impl VictauriMcpHandler {
                             "elapsed_ms": u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                         }));
                     }
-                    cursor = Some(next);
+                    cursor = Some(read.cursor(read.next));
                 }
                 Err(e) => {
                     return tool_error(format!(
@@ -1024,7 +1049,7 @@ mod tests {
         }
     }
 
-    /// The same for the `victauri run` capture (`logs stdout`), whose cursor is a byte offset.
+    /// The same for the `victauri run` capture (`logs stdout`), by byte offset.
     #[test]
     fn a_stdout_cursor_read_pages_forward_through_the_capture() {
         let dir = tempfile::tempdir().unwrap();

@@ -514,10 +514,23 @@ pub struct VictauriMcpHandler {
     probe_timeout: std::time::Duration,
     /// Deadline for one `read_app_file` read ([`READ_APP_FILE_TIMEOUT`]; likewise).
     file_read_timeout: std::time::Duration,
-    /// Windows whose bridge has answered a probe (see `bridge_has_answered`).
-    answered_windows: Arc<std::sync::Mutex<HashSet<String>>>,
+    /// Windows whose bridge has answered a probe (see `bridge_has_answered`), each with the page
+    /// load it last answered from.
+    answered_windows: Arc<std::sync::Mutex<HashMap<String, Option<u64>>>>,
+    /// The origins a bridge has answered on (see `is_app_url`).
+    answered_origins: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per window, the last URL seen inside the app before a native navigation.
     last_app_urls: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+/// A captured window as a tool result: the image, then which window it is, since `screenshot {}`
+/// chooses one for the caller. A plain text block, because clients show text and drop `_meta`. The
+/// image stays first: `VictauriClient::call_tool` and the older CLIs read the first block.
+pub(crate) fn screenshot_result(png_base64: String, window: &str) -> CallToolResult {
+    CallToolResult::success(vec![
+        ContentBlock::image(png_base64, "image/png"),
+        ContentBlock::text(format!("note: captured window {window:?}")),
+    ])
 }
 
 #[tool_router]
@@ -867,7 +880,7 @@ impl VictauriMcpHandler {
                 Ok(png_bytes) => {
                     use base64::Engine;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-                    CallToolResult::success(vec![ContentBlock::image(b64, "image/png")])
+                    screenshot_result(b64, &target_label)
                 }
                 Err(e) => tool_error(format!("screenshot capture failed: {e}")),
             },
@@ -4779,6 +4792,7 @@ impl VictauriMcpHandler {
             probe_timeout: PROBE_TIMEOUT,
             file_read_timeout: READ_APP_FILE_TIMEOUT,
             answered_windows: Arc::default(),
+            answered_origins: Arc::default(),
             last_app_urls: Arc::default(),
         }
     }
@@ -5280,7 +5294,9 @@ impl VictauriMcpHandler {
         Some(states.swap_remove(at))
     }
 
-    /// Whether `url` is the app itself: its dev server, or Tauri's custom protocol.
+    /// Whether `url` is the app itself: its dev server, Tauri's custom protocol, or an origin a
+    /// bridge has answered on. The last is an app whose window starts on a custom
+    /// `WebviewUrl::External`: only a page holding the capability can answer.
     fn is_app_url(&self, url: &str) -> bool {
         let Ok(parsed) = url::Url::parse(url) else {
             return false;
@@ -5296,6 +5312,36 @@ impl VictauriMcpHandler {
                 .app_entry_url()
                 .and_then(|entry| url::Url::parse(&entry).ok())
                 .is_some_and(|entry| entry.origin() == parsed.origin())
+            || self
+                .answered_origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&parsed.origin().ascii_serialization())
+    }
+
+    /// Note that `window`'s bridge answered, and which origin it answered on. The window's own URL
+    /// rather than the page's word for it, read once per page load: a probe runs before every eval.
+    fn note_bridge_answer(&self, window: &str) {
+        let load = self.state.page_loads.latest(window).map(|load| load.seq);
+        let seen = self
+            .answered_windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(window.to_string(), load);
+        if seen == Some(load) {
+            return;
+        }
+        let origin = self
+            .read_back_window(Some(window))
+            .and_then(|state| url::Url::parse(&state.url).ok())
+            .map(|url| url.origin())
+            .filter(url::Origin::is_tuple);
+        if let Some(origin) = origin {
+            self.answered_origins
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(origin.ascii_serialization());
+        }
     }
 
     /// Navigate natively, remembering the page being left if it is inside the app, so `go_back`
@@ -5491,7 +5537,9 @@ impl VictauriMcpHandler {
     /// page, or on a page outside the app (no capability, so the bridge cannot answer), and that
     /// made a mistyped URL cost the whole session.
     async fn navigate_go_to(&self, url: &str, label: Option<&str>) -> CallToolResult {
-        let in_app = self.is_app_url(url);
+        // Maybe the first call of the session: nothing has answered yet to say what is inside.
+        let in_app = self.is_app_url(url)
+            || (self.probe_bridge(label, None, None).await.is_ok() && self.is_app_url(url));
         if !in_app && let Err(e) = validate_url(url, self.state.allow_file_navigation) {
             return tool_error(e);
         }
@@ -5587,7 +5635,7 @@ impl VictauriMcpHandler {
         self.answered_windows
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(label)
+            .contains_key(label)
             || self.state.page_loads.latest(label).is_some()
     }
 
@@ -5916,10 +5964,7 @@ impl VictauriMcpHandler {
                 .min(PROBE_ANSWER_WINDOW)
         });
         if let Ok(Ok(raw)) = tokio::time::timeout(wait, rx).await {
-            self.answered_windows
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(window.to_string());
+            self.note_bridge_answer(window);
             Ok(crate::js_bridge::probe_answer_nonce(&raw))
         } else if self.bridge_has_answered(window) {
             Err(format!(

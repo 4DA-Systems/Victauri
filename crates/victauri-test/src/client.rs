@@ -1715,12 +1715,17 @@ impl VictauriClient {
             .await
     }
 
-    /// Search for elements by various criteria without a full snapshot.
+    /// Search for elements by various criteria without a full snapshot: the tool's parameters as
+    /// an object (`json!({"role": "button"})`), or a string, which is a CSS selector.
     ///
     /// # Errors
     ///
     /// Returns errors from [`VictauriClient::call_tool`].
     pub async fn find_elements(&mut self, query: Value) -> Result<Value, TestError> {
+        let query = match query {
+            Value::String(css) => json!({ "css": css }),
+            other => other,
+        };
         self.call_tool("find_elements", query).await
     }
 

@@ -103,6 +103,19 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
             .unwrap_or_else(|_| serde_json::Value::String(value.text.clone()));
         return serde_json::json!({ "result": parsed, "note": note.text });
     }
+    // The same for `screenshot`: the image, and which window it is.
+    if let [ContentBlock::Image(image), ContentBlock::Text(note)] = result.content.as_slice()
+        && note.text.starts_with("note: ")
+    {
+        return serde_json::json!({
+            "result": {
+                "type": "image",
+                "data": image.data,
+                "mimeType": image.mime_type,
+            },
+            "note": note.text,
+        });
+    }
 
     if result.content.len() == 1 {
         return match &result.content[0] {
@@ -170,6 +183,36 @@ mod tests {
         let json = to_rest_json(result);
         assert_eq!(json["error"], "eval timed out after 30s");
         assert!(json.get("result").is_none());
+    }
+
+    /// `screenshot {}` picks a window for the caller, so its MCP result names it in a text block.
+    /// REST keeps its one image shape, with the note beside it as for `eval_js`.
+    #[test]
+    fn a_screenshot_names_its_window_and_keeps_the_rest_shape() {
+        let result = crate::mcp::screenshot_result("aWJhc2U2NA==".to_string(), "main");
+        assert!(matches!(result.content[0], ContentBlock::Image(_)));
+        let ContentBlock::Text(note) = &result.content[1] else {
+            panic!("{:?}", result.content);
+        };
+        assert_eq!(note.text, "note: captured window \"main\"");
+
+        let json = to_rest_json(result);
+        assert_eq!(json["result"]["type"], "image");
+        assert_eq!(json["result"]["data"], "aWJhc2U2NA==");
+        assert_eq!(json["result"]["mimeType"], "image/png");
+        assert_eq!(json["note"], "note: captured window \"main\"");
+    }
+
+    /// An image with other text (`animation scrub`'s manifest) is not a note about it.
+    #[test]
+    fn an_image_with_text_that_is_no_note_stays_a_list() {
+        let result = CallToolResult::success(vec![
+            ContentBlock::image("aWJhc2U2NA==", "image/png"),
+            ContentBlock::text("{\"points\":2}"),
+        ]);
+        let json = to_rest_json(result);
+        assert_eq!(json["result"][0]["type"], "image");
+        assert_eq!(json["result"][1]["type"], "text");
     }
 
     #[test]

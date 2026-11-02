@@ -1230,6 +1230,38 @@ async fn smoke_budgets_say_when_they_measured_nothing() {
     assert!(dom.passed && !dom.skipped, "{dom:?}");
 }
 
+/// The first launch of an app measured 12,480 ms (11.1 s on a CI runner), which is the cold webview
+/// starting, not the app: the default is a sanity check, and it must not fail a first-time user.
+#[tokio::test]
+async fn a_cold_first_launch_passes_the_default_load_budget_and_shows_what_it_measured() {
+    const COLD: &str = r#"{"navigation":{"dom_complete_ms":12480,"load_event_ms":12490},"js_heap":{"used_mb":10.5}}"#;
+    let checks = smoke_with(COLD, "[]".to_string()).await;
+    let dom = named(&checks, "DOM complete");
+    assert!(dom.passed && !dom.skipped, "{dom:?}");
+    assert!(dom.detail.contains("12480"), "{dom:?}");
+
+    // A budget someone chose stays exact.
+    let (mut c, _) = client(answers(COLD)).await;
+    let config = victauri_test::smoke::SmokeConfig {
+        max_dom_complete_ms: 12_479,
+        ..Default::default()
+    };
+    let report = c.smoke_test_with_config(&config).await.unwrap();
+    let dom = named(&report.checks, "DOM complete");
+    assert!(!dom.passed, "{dom:?}");
+    assert!(dom.detail.contains("12480"), "{dom:?}");
+    assert!(
+        c.assert_dom_complete_under(Duration::from_millis(12_480))
+            .await
+            .is_ok()
+    );
+    assert!(
+        c.assert_dom_complete_under(Duration::from_millis(12_479))
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn a_budget_that_was_exceeded_still_fails() {
     let (mut c, _) = client(answers(METRICS_MEASURED)).await;
@@ -1238,6 +1270,24 @@ async fn a_budget_that_was_exceeded_still_fails() {
         c.assert_dom_complete_under(Duration::from_millis(1))
             .await
             .is_err()
+    );
+}
+
+/// `find_elements` takes a `Value`, so `"button".into()` compiles. It went out as the tool's
+/// arguments and came back as `Mcp { code: -32601, message: "tools/call" }`.
+#[tokio::test]
+async fn find_elements_takes_a_string_as_a_css_selector() {
+    let (mut c, calls) = client(answers_empty()).await;
+    c.find_elements("button".into()).await.unwrap();
+    c.find_elements(json!({"role": "button"})).await.unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls[0],
+        ("find_elements".to_string(), json!({"css": "button"}))
+    );
+    assert_eq!(
+        calls[1],
+        ("find_elements".to_string(), json!({"role": "button"}))
     );
 }
 

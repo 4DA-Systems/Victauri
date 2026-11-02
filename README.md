@@ -461,7 +461,7 @@ The action installs `victauri-cli`, waits for the server to become healthy, and 
 | Input | Default | Description |
 |---|---|---|
 | `port` | `7373` | Victauri server port |
-| `max-load-ms` | `10000` | Maximum DOM complete time (ms) |
+| `max-load-ms` | `20000` | Maximum DOM complete time (ms) |
 | `max-heap-mb` | `512` | Maximum JS heap usage (MB) |
 | `junit-path` | | Path to write JUnit XML report |
 | `coverage` | `false` | Run IPC coverage report after tests |

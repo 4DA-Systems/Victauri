@@ -392,6 +392,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             label: l,
             page,
             restarted,
+            asked_ms,
         }) = reattach(&opts, &args, cursor, &label, pid, Duration::from_secs(20)).await
         else {
             eprintln!("victauri logs: app went away (crashed, closed or rebuilding)");
@@ -422,7 +423,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         print_page(&page, &opts);
         cursor = page["next_seq"].as_u64().unwrap_or(0);
         behind = page["truncated"] == true;
-        last_ok_ms = now_ms();
+        last_ok_ms = asked_ms;
         pid = page_pid(&page);
         backend = b;
         label = l;
@@ -488,13 +489,40 @@ fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
         return;
     };
     let picked = final_moments(&lines, since_ts_ms, opts);
-    if picked.is_empty() {
+    let unknown = unknown_exit(path, &lines);
+    if picked.is_empty() && unknown.is_none() {
         return;
     }
     eprintln!("victauri logs: how the previous process ended (from its `victauri run` capture):");
-    for l in picked {
+    for l in picked.into_iter().chain(&unknown) {
         emit(&render_console(l), opts.json, l);
     }
+}
+
+/// What a reader can say that a killed launcher could not: a capture whose `victauri run` is dead
+/// and which holds no exit record never will (a launcher writes one whenever it can, so it was
+/// killed outright). A record in the shape of the launcher's own, so a monitor reading stdout sees
+/// it too; `unknown` tells it from one the launcher wrote. It is not written to the capture. `lines`
+/// are the capture's newest records, where an exit record would be.
+fn unknown_exit(path: &Path, lines: &[Value]) -> Option<Value> {
+    if lines.iter().any(|l| l["s"] == "exit") {
+        return None;
+    }
+    let pid = crate::run::dead_launcher(path)?;
+    let at = lines
+        .last()
+        .and_then(|l| l["t"].as_u64())
+        .unwrap_or_else(now_ms);
+    Some(json!({
+        "t": at,
+        "s": "exit",
+        "l": format!(
+            "exit unknown: `victauri run` (pid {pid}) was killed, so how the app ended was not \
+             recorded"
+        ),
+        "tail": [],
+        "unknown": true,
+    }))
 }
 
 /// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
@@ -512,6 +540,8 @@ struct Reattached {
     label: String,
     page: Value,
     restarted: bool,
+    /// When the request for `page` went out (see `last_ok_ms` in [`cmd_logs`]).
+    asked_ms: u64,
 }
 
 /// Re-resolve the app through discovery until `max` passes, and read the log from `cursor`.
@@ -533,28 +563,42 @@ async fn reattach(
         let Ok((backend, label)) = Backend::connect(opts.app.as_deref()).await else {
             continue;
         };
-        let Ok(page) = backend.logs(args.clone()).await else {
+        let Ok((page, restarted, asked_ms)) =
+            read_reattached(&backend, args, cursor, label != old_label, known_pid).await
+        else {
             continue;
-        };
-        let restarted = label != old_label || is_new_process(&page, cursor, known_pid);
-        let page = if restarted {
-            let mut from_start = args.clone();
-            from_start["since_seq"] = 0.into();
-            match backend.logs(from_start).await {
-                Ok(p) => p,
-                Err(_) => continue,
-            }
-        } else {
-            page
         };
         return Some(Reattached {
             backend,
             label,
             page,
             restarted,
+            asked_ms,
         });
     }
     None
+}
+
+/// The first page after re-attaching, whether it came from a new process, and when the request
+/// for it went out. From a new process it is read from the start, by a second request.
+async fn read_reattached(
+    backend: &Backend,
+    args: &Value,
+    cursor: u64,
+    relabelled: bool,
+    known_pid: Option<u64>,
+) -> Result<(Value, bool, u64)> {
+    let asked_ms = now_ms();
+    let page = backend.logs(args.clone()).await?;
+    let restarted = relabelled || is_new_process(&page, cursor, known_pid);
+    if !restarted {
+        return Ok((page, false, asked_ms));
+    }
+    let mut from_start = args.clone();
+    from_start["since_seq"] = 0.into();
+    let asked_ms = now_ms();
+    let page = backend.logs(from_start).await?;
+    Ok((page, true, asked_ms))
 }
 
 /// The app is gone: show what it printed in its final moments, then how it exited, from its
@@ -683,10 +727,16 @@ async fn follow_stdout_via_app(
             }
             Err(e) => return Err(e),
         };
+        warn_gap(&page);
         if let Some(lines) = page["lines"].as_array() {
             for l in lines {
                 emit(&render_console(l), opts.json, l);
             }
+        }
+        // The app outlived its launcher: nothing more reaches the capture.
+        if let Some(note) = page["launcher_gone"]["note"].as_str() {
+            eprintln!("victauri logs: {}", clean(note));
+            return Ok(());
         }
         if !opts.follow {
             return Ok(());
@@ -743,17 +793,43 @@ async fn follow_capture(
         }
         saw_exit |= l["s"] == "exit";
     }
+    // Nothing more will come from a launcher that is gone, so there is nothing to follow.
+    if let Some(unknown) = unknown_exit(&path, &lines) {
+        emit(&render_console(&unknown), opts.json, &unknown);
+        return Ok(());
+    }
     if !opts.follow || (saw_exit && stop_after_idle.is_some()) {
         return Ok(());
     }
     let mut idle = Duration::ZERO;
+    let mut launcher_checked = std::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
-        let lines = read_followed(&path, &mut cursor)?;
+        let mut lines = read_followed(&path, &mut cursor)?;
         if lines.is_empty() {
             idle += Duration::from_millis(opts.interval_ms);
             if stop_after_idle.is_some_and(|max| idle >= max) {
                 return Ok(());
+            }
+            // Not every poll: on Unix asking costs a process. Dead first, then read: a launcher
+            // that exited normally has written its exit record by the time it is gone.
+            if launcher_checked.elapsed() >= LAUNCHER_CHECK_EVERY {
+                launcher_checked = std::time::Instant::now();
+                if crate::run::dead_launcher(&path).is_some() {
+                    lines = read_followed(&path, &mut cursor)?;
+                    let seen_exit = lines.iter().any(|l| l["s"] == "exit");
+                    for l in &lines {
+                        if console_line_passes(l, opts) {
+                            emit(&render_console(l), opts.json, l);
+                        }
+                    }
+                    if !seen_exit
+                        && let Some(unknown) = unknown_exit(&path, &read_capture(&path, None)?.0)
+                    {
+                        emit(&render_console(&unknown), opts.json, &unknown);
+                    }
+                    return Ok(());
+                }
             }
         } else {
             idle = Duration::ZERO;
@@ -768,6 +844,9 @@ async fn follow_capture(
         }
     }
 }
+
+/// How often a follower with nothing to read asks whether the capture's launcher is still there.
+const LAUNCHER_CHECK_EVERY: Duration = Duration::from_secs(2);
 
 /// How much of a capture's first bytes tells one file from the next.
 const CAPTURE_HEAD_BYTES: u64 = 256;
@@ -952,6 +1031,70 @@ mod tests {
         got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
         got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
         assert_eq!(got, ["line 3", "line 4"]);
+    }
+
+    /// A mock of `/api/tools/logs`: answers `pid` late, and records when each request arrived.
+    async fn slow_logs_backend(pid: u64) -> (Backend, std::sync::Arc<std::sync::Mutex<Vec<u64>>>) {
+        let arrived = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&arrived);
+        let app = axum::Router::new().route(
+            "/api/tools/logs",
+            axum::routing::post(move || {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    seen.lock().unwrap().push(now_ms());
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    axum::Json(json!({"result": {"next_seq": 500, "sources": {"pid": pid}}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = Backend {
+            http: reqwest::Client::new(),
+            base: format!("http://127.0.0.1:{port}"),
+            token: None,
+        };
+        (backend, arrived)
+    }
+
+    /// After a re-attach the "last answered" moment was taken once the response was in. A line
+    /// printed while the server was answering is in no page, and it then fell before that moment,
+    /// so the previous process's final moments left it out. As for an ordinary poll, the moment is
+    /// when the request went out.
+    #[tokio::test]
+    async fn the_moment_after_a_reattach_is_when_the_request_went_out() {
+        let args = json!({"action": "backend"});
+        let (backend, arrived) = slow_logs_backend(1).await;
+        let (_, restarted, asked_ms) = read_reattached(&backend, &args, 100, false, Some(1))
+            .await
+            .unwrap();
+        assert!(!restarted);
+        let read = arrived.lock().unwrap()[0];
+        assert!(
+            asked_ms <= read,
+            "stamped {}ms after the read",
+            asked_ms - read
+        );
+
+        // A new process: the page that counts is the second request's.
+        let (backend, arrived) = slow_logs_backend(2).await;
+        let (_, restarted, asked_ms) = read_reattached(&backend, &args, 100, false, Some(1))
+            .await
+            .unwrap();
+        assert!(restarted);
+        let arrived = arrived.lock().unwrap().clone();
+        assert_eq!(arrived.len(), 2);
+        assert!(
+            asked_ms <= arrived[1],
+            "stamped {}ms after the read",
+            asked_ms - arrived[1]
+        );
+        assert!(
+            asked_ms >= arrived[0],
+            "before the first request even arrived"
+        );
     }
 
     /// A capture that was empty when the follower attached is the ordinary start of a run.
