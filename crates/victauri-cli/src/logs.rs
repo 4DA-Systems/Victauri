@@ -860,13 +860,15 @@ struct CaptureCursor {
 /// The first bytes of a capture; `None` when it cannot be read (between the launcher's rename
 /// and its new file, for one).
 fn capture_head(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
+    open_capture_head(&mut std::fs::File::open(path).ok()?)
+}
+
+/// The first bytes of this open capture. It leaves the position wherever the read ended.
+fn open_capture_head(file: &mut std::fs::File) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).ok()?;
     let mut head = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(CAPTURE_HEAD_BYTES)
-        .read_to_end(&mut head)
-        .ok()?;
+    file.take(CAPTURE_HEAD_BYTES).read_to_end(&mut head).ok()?;
     Some(head)
 }
 
@@ -885,26 +887,52 @@ fn same_capture(seen: &[u8], now: &[u8]) -> bool {
 /// to `.jsonl.1` and starts a new one, so the unread tail is in the rotated file. A length check
 /// cannot see a rotation whose new file has already grown past the cursor; the first record has
 /// a timestamp and differs. If the rotated file is not the one being read either (a second
-/// rotation between two polls), those lines are gone, and that is said.
+/// rotation between two polls), those lines are gone, and that is said. A file's head and its bytes
+/// come from one open, as the names can move on between two.
 fn read_followed(path: &Path, cursor: &mut CaptureCursor) -> Result<Vec<Value>> {
-    let Some(head) = capture_head(path) else {
-        return Ok(Vec::new());
+    let (lines, lost) = read_followed_noting_loss(path, cursor)?;
+    if lost {
+        eprintln!(
+            "victauri logs: [the capture rotated more than once between two reads; some lines \
+             were lost]"
+        );
+    }
+    Ok(lines)
+}
+
+/// [`read_followed`], saying whether lines were lost rather than printing it.
+fn read_followed_noting_loss(
+    path: &Path,
+    cursor: &mut CaptureCursor,
+) -> Result<(Vec<Value>, bool)> {
+    let mut lost = false;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok((Vec::new(), false));
+    };
+    let Some(head) = open_capture_head(&mut file) else {
+        return Ok((Vec::new(), false));
     };
     if !same_capture(&cursor.head, &head) {
-        let rotated = path.with_extension("jsonl.1");
-        if capture_head(&rotated).is_some_and(|h| same_capture(&cursor.head, &h)) {
-            let (lines, next) = read_capture(&rotated, Some(cursor.offset))?;
+        let rotated = std::fs::File::open(path.with_extension("jsonl.1"));
+        let same_file = rotated.ok().and_then(|mut rotated| {
+            let seen = open_capture_head(&mut rotated)?;
+            same_capture(&cursor.head, &seen).then_some(rotated)
+        });
+        if let Some(mut rotated) = same_file {
+            let (lines, next) = read_open_capture(&mut rotated, Some(cursor.offset))?;
             let advanced = next != cursor.offset;
             cursor.offset = next;
             // Larger than one read: stay on it until it is drained.
             if advanced {
-                return Ok(lines);
+                return Ok((lines, false));
             }
         } else {
-            eprintln!(
-                "victauri logs: [the capture rotated more than once between two reads; some \
-                 lines were lost]"
-            );
+            lost = true;
+        }
+        // A new file with no head yet could not tell the next rotation from itself: wait here,
+        // where a rotation still shows, and say any loss when the file can be named.
+        if head.is_empty() {
+            return Ok((Vec::new(), false));
         }
         *cursor = CaptureCursor {
             offset: 0,
@@ -914,17 +942,22 @@ fn read_followed(path: &Path, cursor: &mut CaptureCursor) -> Result<Vec<Value>> 
     if head.len() > cursor.head.len() {
         cursor.head = head;
     }
-    let (lines, next) = read_capture(path, Some(cursor.offset))?;
+    let (lines, next) = read_open_capture(&mut file, Some(cursor.offset))?;
     cursor.offset = next;
-    Ok(lines)
+    Ok((lines, lost))
 }
 
 /// Read JSONL capture records from `from` (or the whole file). Tolerates a
 /// partially written last line and a file rotated under us.
 fn read_capture(path: &Path, from: Option<u64>) -> Result<(Vec<Value>, u64)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f =
+    let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    read_open_capture(&mut file, from)
+}
+
+/// [`read_capture`] of a file already open.
+fn read_open_capture(f: &mut std::fs::File, from: Option<u64>) -> Result<(Vec<Value>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
     let len = f.metadata()?.len();
     // Without a cursor, read the newest `MAX_READ` bytes: a capture grows to 64 MB before it
     // rotates, and reading from the start showed lines from the middle of a long session —
@@ -994,6 +1027,80 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A follower racing a writer that rotates as `victauri run` does: every line arrives once or
+    /// its loss is said. The head and the bytes came from two opens, so a rotation between them read
+    /// the new file at an offset meant for the old one.
+    #[test]
+    fn a_follower_racing_rotations_loses_no_line_silently() {
+        use std::io::Write as _;
+        const TOTAL: u64 = 150_000;
+        const ROTATE_AT: u64 = 80_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        let write_line = |file: &mut std::fs::File, i: u64| {
+            let line = format!(
+                "{{\"t\":{i},\"s\":\"out\",\"l\":\"{i} {}\"}}\n",
+                "x".repeat(60)
+            );
+            file.write_all(line.as_bytes()).unwrap();
+            line.len() as u64
+        };
+        let mut first = std::fs::File::create(&path).unwrap();
+        let mut written = write_line(&mut first, 0);
+        let head = capture_head(&path).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut file = first;
+                let mut rotations = 0u32;
+                for i in 1..TOTAL {
+                    written += write_line(&mut file, i);
+                    if written >= ROTATE_AT {
+                        drop(file);
+                        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+                        file = std::fs::File::create(&path).unwrap();
+                        written = 0;
+                        rotations += 1;
+                    }
+                    if i % 200 == 0 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+                rotations
+            })
+        };
+        let mut cursor = CaptureCursor { offset: 0, head };
+        let mut expected = 0u64;
+        let (mut silent, mut reported, mut duplicates) = (0u64, 0u64, 0u64);
+        let give_up = std::time::Instant::now() + Duration::from_secs(60);
+        while expected < TOTAL && std::time::Instant::now() < give_up {
+            let (lines, lost) = read_followed_noting_loss(&path, &mut cursor).unwrap();
+            for (at, line) in lines.iter().enumerate() {
+                let i = line["t"].as_u64().unwrap();
+                if i < expected {
+                    duplicates += 1;
+                    continue;
+                }
+                if i > expected {
+                    if lost && at == 0 {
+                        reported += i - expected;
+                    } else {
+                        silent += i - expected;
+                    }
+                }
+                expected = i + 1;
+            }
+        }
+        let rotations = writer.join().unwrap();
+        assert!(rotations > 100, "{rotations} rotations");
+        assert_eq!(
+            (silent, duplicates),
+            (0, 0),
+            "silently lost, duplicated; reported lost {reported}, over {rotations} rotations"
+        );
+        assert_eq!(expected, TOTAL, "reported lost {reported}");
+    }
 
     fn record(n: u64) -> String {
         format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"line {n}\"}}\n")

@@ -1432,3 +1432,82 @@ fn a_none_layer_is_inert() {
     let subscriber = tracing_subscriber::registry().with(None::<BackendLogLayer>);
     tracing::subscriber::with_default(subscriber, || tracing::info!(target: "app", "fine"));
 }
+
+/// A reader racing a writer that rotates as `victauri run` does: every line arrives once or is
+/// reported lost. The tag and the bytes used to come from two opens, so a rotation between them read
+/// the new file from an offset meant for the old one, and the lines before it went unsaid.
+#[test]
+fn a_reader_racing_rotations_loses_no_line_silently() {
+    use std::io::Write as _;
+    const TOTAL: u64 = 150_000;
+    const ROTATE_AT: u64 = 80_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let write_line = |file: &mut std::fs::File, i: u64| {
+        let line = format!(
+            "{{\"t\":{i},\"s\":\"out\",\"l\":\"{i} {}\"}}\n",
+            "x".repeat(60)
+        );
+        file.write_all(line.as_bytes()).unwrap();
+        line.len() as u64
+    };
+    let mut first = std::fs::File::create(&path).unwrap();
+    let mut written = write_line(&mut first, 0);
+    let writer = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let mut file = first;
+            let mut rotations = 0u32;
+            for i in 1..TOTAL {
+                written += write_line(&mut file, i);
+                if written >= ROTATE_AT {
+                    drop(file);
+                    // A reader may hold either file open: renaming has to work regardless.
+                    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+                    file = std::fs::File::create(&path).unwrap();
+                    written = 0;
+                    rotations += 1;
+                }
+                if i % 200 == 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            }
+            rotations
+        })
+    };
+    let mut cursor = 0;
+    let mut expected = 0u64;
+    let (mut silent, mut reported, mut duplicates) = (0u64, 0u64, 0u64);
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while expected < TOTAL && std::time::Instant::now() < give_up {
+        // The instant between the rename and the new file has no file: the tool says so, and the
+        // next call reads on.
+        let Ok(read) = read_console_cursor(&path, Some(cursor), 1 << 20, 1 << 24) else {
+            continue;
+        };
+        for line in &read.lines {
+            let i: u64 = line.text.split(' ').next().unwrap().parse().unwrap();
+            if i < expected {
+                duplicates += 1;
+                continue;
+            }
+            if i > expected {
+                if read.lost {
+                    reported += i - expected;
+                } else {
+                    silent += i - expected;
+                }
+            }
+            expected = i + 1;
+        }
+        cursor = read.cursor(read.next);
+    }
+    let rotations = writer.join().unwrap();
+    assert!(rotations > 100, "{rotations} rotations");
+    assert_eq!(
+        (silent, duplicates),
+        (0, 0),
+        "silently lost, duplicated; reported lost {reported}, over {rotations} rotations"
+    );
+    assert_eq!(expected, TOTAL, "reported lost {reported}");
+}
