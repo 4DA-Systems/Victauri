@@ -53,29 +53,20 @@
     ["hf_corner_free", "ok", `<div class="hf-hole" style="width:100px;height:40px"><button id="hf_corner_free" style="width:100px;height:40px">x</button></div>`],
   ];
 
-  const CSS = `
-    #hf-layer { position: fixed; inset: 0; z-index: 2147483647; background: #fff; color: #000; overflow: hidden; }
-    .hf-cell { position: absolute; width: 120px; height: 105px; overflow: visible; }
-    .hf-sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0, 0, 0, 0); }
-    .hf-rip { position: relative; }
-    .hf-rip::after { content: ""; position: absolute; inset: 0; background: rgba(0, 0, 0, 0.02); }
-    .hf-over { position: relative; width: 110px; height: 90px; }
-    .hf-over::after { content: ""; position: absolute; inset: 0; background: #fff; }
-    .hf-hole { position: relative; }
-    .hf-hole::after { content: ""; position: absolute; left: 30%; top: 30%; width: 40%; height: 40%; background: #fff; }
-  `;
-
   async function run() {
-    const style = document.createElement("style");
-    style.textContent = CSS;
     const layer = document.createElement("div");
     layer.id = "hf-layer";
     layer.innerHTML = FIXTURES.map(
       (f, i) => `<div class="hf-cell" style="left:${(i % 8) * 120}px;top:${Math.floor(i / 8) * 105}px">${f[2]}</div>`,
-    ).join("");
+    )
+      .join("")
+      .replaceAll(' style="', ' data-hf-style="');
+    // The page CSP refuses inline style attributes, not the CSSOM.
+    for (const el of layer.querySelectorAll("[data-hf-style]")) {
+      el.style.cssText = el.getAttribute("data-hf-style");
+    }
     // Fixture clicks stay here: a link must not move the page.
     layer.addEventListener("click", (e) => e.preventDefault(), true);
-    document.head.appendChild(style);
     document.body.appendChild(layer);
     const bridge = window.__VICTAURI__;
     const rows = [];
@@ -97,7 +88,6 @@
       }
     } finally {
       layer.remove();
-      style.remove();
     }
     return rows;
   }

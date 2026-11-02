@@ -723,7 +723,7 @@ gauntlet!(xhr_route_fulfill_reports_the_mock, base, {
                         : type === 'document' ? r
                         : r });
             };
-            x.open('GET', 'https://example.invalid/gauntlet-xhr-mock'); x.responseType = type; x.send();
+            x.open('GET', 'https://example.invalid/gauntlet-xhr-mock'); x.responseType = type; seen.length = 0; x.send();
         }); }
         var out = [];
         for (var t of ['', 'text', 'json', 'arraybuffer', 'blob', 'document']) out.push(await one(t));
@@ -761,14 +761,11 @@ gauntlet!(xhr_route_fulfill_reports_the_mock, base, {
 
 gauntlet!(scrub_events_do_not_reach_the_page, base, {
     let setup = r"
-        var style = document.createElement('style'); style.id = 'scrub-css';
-        style.textContent = '#scrub-t, #scrub-u { width: 10px; height: 10px; } \
-            #scrub-t { animation: sweepBroken 300ms linear 4000ms 3 both; } \
-            #scrub-u { animation: sweepBroken 100ms linear infinite; }';
-        document.head.appendChild(style);
         window.__heard = [];
-        ['scrub-t', 'scrub-u'].forEach(function(id) {
-            var el = document.createElement('div'); el.id = id; document.body.appendChild(el);
+        [['scrub-t', '300ms linear 4000ms 3 both'], ['scrub-u', '100ms linear infinite']].forEach(function(f) {
+            var id = f[0], el = document.createElement('div'); el.id = id; document.body.appendChild(el);
+            // The CSSOM: the page's CSP refuses inline styles.
+            el.style.cssText = 'width: 10px; height: 10px; animation: sweepBroken ' + f[1];
             ['animationstart', 'animationend', 'animationiteration'].forEach(function(t) {
                 el.addEventListener(t, function() { window.__heard.push(id + ':' + t); });
             });
@@ -805,7 +802,7 @@ gauntlet!(scrub_events_do_not_reach_the_page, base, {
     let _ = call(
         &base,
         "eval_js",
-        json!({ "code": "document.getElementById('scrub-t').remove(); document.getElementById('scrub-u').remove(); document.getElementById('scrub-css').remove(); return 1" }),
+        json!({ "code": "document.getElementById('scrub-t').remove(); document.getElementById('scrub-u').remove(); return 1" }),
     )
     .await;
     assert_eq!(result(&during), &json!(0), "reached the page: {during}");
