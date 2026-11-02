@@ -61,7 +61,9 @@ to ~40 min, then requires success.)
 
 ## Core (crates + binaries) — `vMAJOR.MINOR.PATCH`
 
-The tag pattern is `v[0-9]+.[0-9]+.[0-9]+`, so it never matches a `vscode-v*` tag.
+The tag pattern is `v[0-9]+.[0-9]+.[0-9]+`, so it never matches a `vscode-v*` tag. The `release-tags`
+ruleset blocks moving or deleting `v*` and `vscode-v*` tags, so a wrong tag cannot be repointed: cut a new
+version. Creating one is allowed.
 
 **The proven path, used for every release so far: publish locally, then tag.** Crates cannot be
 unpublished, so wait for main's CI on the merge commit first, and use a clean worktree at that commit.

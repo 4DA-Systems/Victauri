@@ -84,10 +84,12 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   button inputs and for values a number/date/time/range/color field rejects; the old value is kept.
   `type_text` over 20,000 characters errors. `select_option` errors for unknown or disabled values and
   fires `input` before `change`; `values:[]` clears a multi-select. `opacity:0` elements are actionable;
-  a click lands on the hit descendant; an ancestor on top counts as covering, after one scroll attempt,
-  except a label operating that control, an SVG or wrapped inline element still visibly inside it, the
-  content of a control hit as that control, and an element whose visible part is what a click reaches.
-  A control with a hole at its centre (`clip-path`) is reported covered.
+  a click lands on the hit descendant. Whether a click reaches an element is now the browser's answer
+  at real points: its centre, then its SVG outline, line boxes, a 5x5 grid and its descendants. So a
+  control with a hole at its centre, a stroke-only circle and a link with no box of its own are
+  clickable, and content clipped away inside a control is covered. A sibling at the centre of an
+  ordinary element is still cover. A trusted click takes the point found, must hit the element itself,
+  and refuses inside an `aria-disabled` ancestor.
   Keyboard events carry `code`, `keyCode` and `which`.
 - **Snapshots** list `opacity:0` elements (`[transparent]`) and visible children of `visibility:hidden`
   parents.
@@ -97,8 +99,13 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   `resize` and `move_to` report what the OS applied, plus `requested`; they wait up to about 500 ms for
   the change to land and add `settled:false` if it never does.
 - **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
-  `/health` first and replaces that history entry, adding up to about 6 s. `go_back` on a stopped page returns
-  `{ok, recovered, url, note}`.
+  `/health` first and replaces that history entry, and `go_back` returns `{ok, recovered, url, note}`.
+  Going to a page inside the app, both now report success only once the page answers there, and are
+  errors otherwise, which can take about 20 s. On Linux, if one web process spun at full CPU throughout
+  and every other window that has answered still answers, that process is ended to get off the page
+  (about 15 s, with a logged warning). On macOS the navigation lands when the script ends. An origin a
+  bridge has answered on counts as inside the app, so `go_to` no longer warns about a custom
+  `WebviewUrl::External` start page.
 - **`explain` and `introspect coverage`** on an unreadable page are tool errors, where they reported a
   clean result. `command_timings` adds `ipc_read_error`.
 - **`recording`:** `checkpoint` drains first (up to 3 s, reports `unreachable_windows`) and refuses empty
@@ -113,10 +120,27 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   answer `undefined` or an empty list as a success.
 - **`logs ipc` and `logs network`** gain `bodies:false`. IPC entries carry `args_truncated:true` when
   `args` is not what was sent.
-- **`route add`** rejects invalid regex, non-object headers and unknown actions. XHR `fulfill` is tagged
-  and warned, not implemented. **`window.__VICTAURI__.addRoute`** is gone from the page-visible API.
-- **`logs stdout` and `wait_for log`:** a cursor landing after a rotation drains the rotated file and
-  reports `truncated:true`.
+- **`route add`** rejects invalid regex, non-object headers and unknown actions, and a regex that can
+  hang the page: a repeated group that can match the same text in more than one way, such as `(a+)+`.
+  A few harmless patterns are refused too (`(foo|fab)+`), and `([?&][^=&]+=[^&]*)*$` is ambiguous on `?`:
+  use `glob` or `substring`, or make each repetition match one way. **XHR `fulfill` now works**, so a
+  matching XHR that used to reach the network gets the mock, and `xhr_note` and `fulfill_not_applied` are
+  gone. **`window.__VICTAURI__.addRoute`** is gone from the page-visible API.
+- **`logs stdout`:** treat `next_seq` as opaque and pass it back. It now holds the file's tag above the
+  offset, so it is much larger than a byte offset; `lines[].offset` is still a byte offset, and a bare
+  offset still works as before. `gap:true` says the capture rotated twice and lines are gone.
+  `launcher_gone` says `victauri run` was killed. A rotation drains the rotated file and reports
+  `truncated:true`.
+- **`victauri logs`** can end a capture with a synthetic EXIT line (`"unknown": true` in JSON) when the
+  launcher was killed, and `--follow` stops there.
+- **`screenshot`** adds a text block after the image over MCP, `note: captured window "main"`, and a
+  `note` beside the image over REST. `victauri call screenshot` prints it.
+- **`/mcp`** answers `-32602` for a `tools/call` whose `params` or `arguments` are not an object, where it
+  answered `-32601`. **`/info`** adds `pid`.
+- **`animation scrub`** keeps its seeks' animation and transition events from the page.
+- **Smoke:** the default DOM complete budget is 20 s in `SmokeConfig`, `victauri test` and the GitHub Action
+  (it was 10 s, which a first launch can miss). A budget you set is unchanged. `victauri run` on Unix keeps a
+  small `sh` helper alive, so that killing the launcher stops the app.
 - **Also:** `list_app_dir pattern` has real `*`/`?`; `[`/`]` match literally. Paths over 4096 bytes are refused.
   `trace start` on an unknown window errors. `storage set` needs a `value`. `animation` failures are tool
   errors. `contract_record` refuses non-object args. A fault delay counts against `timeout_ms`. MCP

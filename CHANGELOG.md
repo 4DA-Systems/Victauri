@@ -37,7 +37,12 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   while being recorded and two capture layers in one subscriber no longer panic or deadlock; symbolising a
   panic no longer blocks workers or another panic; `log_layer()` no longer lowers the global max level.
 - `navigate go_to` out of the app left a dead page with no way back; a page stopped by `while(true)` now
-  recovers through a detour on WebView2. The demo's sync window-building command deadlocked.
+  recovers through a detour on WebView2, and on Linux by ending the one web process spinning at full CPU, only
+  while every other window that has answered still answers. `recovered` and `ok` mean the page answers at the
+  new URL, where they used to mean a navigation was sent: WebKit's URL reads the new address while the old
+  script still runs. The demo's sync window-building command deadlocked.
+- A route regex that can hang the page is refused at `add`, by what a repeated group can match. Polynomial
+  patterns with no repeated group (`.*.*.*.*x`) still get through.
 
 ### Fixed: JS bridge
 
@@ -48,9 +53,14 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
 - `find_elements` computes accessible names and honest `visible`/`enabled`, returns deepest text matches, and
   gains `attribute`, `attribute_value`, `text_exact` and `include_hidden`.
 - Actionability: SVG, `opacity:0` styled controls, MUI wrappers, labels, disabled fieldsets, shadow DOM events,
-  contenteditable and same-origin iframes. An element whose hit is its ancestor counts as covered, including closed
-  accordions, `.sr-only` and `::after` overlays, unless it is SVG or wrapped inline content still visible, the content
-  of a control such as a `.stretched-link`, or partly clipped with its visible part reachable.
+  contenteditable and same-origin iframes. Whether a click reaches an element is now the browser's answer at real
+  points of it (centre, SVG outline, line boxes, a grid, descendants), not geometry: closed accordions, `.sr-only` and
+  `::after` overlays are covered, and a control with a hole, a stroke-only circle and a link with no box of its own
+  are clickable. A trusted click uses the point found. Checked in real Edge (47 fixtures) and on WebKitGTK.
+- `route` `fulfill` works on XMLHttpRequest, compared event for event with a real server in 21 scenarios. It used
+  to send the request and say so.
+- `animation scrub` no longer fires the page's own animation and transition events for its seeks: a toast
+  removing itself on `animationend` survives a scrub.
 - A bridge call or log read on a page with no bridge is a tool error; it used to answer `undefined` or an empty list
   as a success.
 - `type_text` no longer corrupts number and date inputs. Log entries are bounded. Scrubbing restores the
@@ -65,8 +75,15 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
 
 ### Fixed: CLI and watchdog
 
-- `victauri run`: output reaches the terminal as it arrives, killing the launcher takes the app with it, and a closed
-  stderr no longer changes the exit code. Old captures are pruned.
+- `victauri run`: output reaches the terminal as it arrives, killing the launcher takes the app with it, on Unix
+  even by SIGKILL (a small helper), and a closed stderr no longer changes the exit code. Old captures are pruned.
+  A launcher killed outright is now said, by `logs stdout` (`launcher_gone`) and `victauri logs`.
+- A stale discovery entry whose PID was reused, naming the current app's port, no longer makes `--app` refuse with
+  "several apps": the server says which entry is real (`/info` now reports `pid`). In the CLI, bridge, test client
+  and VS Code extension.
+- `logs stdout` cursors hold the file's tag, so a rotation landing on a record boundary is seen and two rotations
+  are reported as a gap.
+- `victauri test` first-launch default is 20 s: a cold webview measured 12.5 s against the old 10 s budget.
 - Bridge: a `VICTAURI_PORT` pin that is down never reaches another app. Invalid UTF-8 no longer shuts it down.
 - `victauri logs --follow` loses nothing across rotation. `setup` no longer pins user-level configs to one project
   and reports failures in its exit code. Output from a hostile plugin cannot drive the terminal.
@@ -76,7 +93,13 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
 ### Fixed: other
 
 - Screenshots of decorated windows keep their edges (Windows.Graphics.Capture crop). Trusted clicks respect page zoom.
-- Database discovery skips non-SQLite files and finds `.db3`.
+- Database discovery skips non-SQLite files and finds `.db3`. The view-chain budget reads only places that name a
+  table, so a column named like a view no longer refuses a healthy database.
+- `/mcp` names the problem when `arguments` is not an object, where it said the method does not exist.
+  `find_elements` in the test client takes a string as CSS. `screenshot` names the window it captured.
+- rmcp's per-request INFO lines no longer reach an app's console by default (`info,rmcp=warn`).
+- A bare `e0` ref means that counter on the current page: a real consumer's suite hardcoded one. Performance metrics
+  survive a reload's moment with no body.
 
 ### Changed: release and CI
 
