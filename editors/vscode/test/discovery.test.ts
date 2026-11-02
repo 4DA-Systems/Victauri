@@ -376,7 +376,7 @@ test("claims a server refused all stay ambiguous, never 'no app'", async () => {
   const port = (server.address() as AddressInfo).port;
   try {
     const stale = app(port, "stale", "com.a", 1);
-    const noToken: DiscoveredServer = { port, identifier: "com.a", pid: 2 };
+    const noToken: DiscoveredServer = { port, token: undefined, identifier: "com.a", pid: 2 };
     assert.deepEqual(await settlePortClaims([noToken, stale]), [noToken, stale]);
     const other = app(port, "other", "com.a", 3);
     assert.deepEqual(await settlePortClaims([stale, other]), [stale, other]);
