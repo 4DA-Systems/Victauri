@@ -251,13 +251,13 @@ impl WebviewBridge for AppBridge {
     fn app_entry_url(&self) -> Option<String> {
         Some("http://tauri.localhost/".to_string())
     }
-    fn web_main_thread_cpu(&self) -> Vec<(u32, u64)> {
+    fn web_main_thread_cpu(&self) -> Vec<(u32, u64, u64)> {
         let reading = self.cpu_readings.fetch_add(1, Ordering::SeqCst) as u64;
         self.web_processes
             .lock()
             .unwrap()
             .iter()
-            .map(|(pid, ticks)| (*pid, reading * ticks))
+            .map(|(pid, ticks)| (*pid, reading * ticks, 0))
             .collect()
     }
     /// A new process serves the next navigation, which the page answers.

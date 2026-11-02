@@ -1061,10 +1061,13 @@ fn a_capture_says_when_its_launcher_is_gone() {
 fn a_long_exit_record_is_seen_as_one() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("4242-1730000000000.jsonl");
-    let tail: Vec<String> = (0..12).map(|_| "x".repeat(64 * 1024)).collect();
-    let exit = serde_json::json!({"t": 9, "s": "exit", "l": "crashed", "tail": tail});
-    std::fs::write(&path, format!("{}{exit}\n", capture_record(0, "line"))).unwrap();
-    assert_eq!(launcher_gone(&path, Some(4242), |_| true), None);
+    // A control character takes six bytes in the record, so this is the longest one can be.
+    for fill in ["x", "\u{1}"] {
+        let tail: Vec<String> = (0..12).map(|_| fill.repeat(64 * 1024)).collect();
+        let exit = serde_json::json!({"t": 9, "s": "exit", "l": "crashed", "tail": tail});
+        std::fs::write(&path, format!("{}{exit}\n", capture_record(0, "line"))).unwrap();
+        assert_eq!(launcher_gone(&path, Some(4242), |_| true), None, "{fill:?}");
+    }
 }
 
 /// On Linux, a real process: a zombie its parent has not reaped is gone too.

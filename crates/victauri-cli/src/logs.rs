@@ -485,7 +485,9 @@ fn final_moments<'a>(lines: &'a [Value], since_ts_ms: u64, opts: &LogsOptions) -
 }
 
 fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
-    let Ok((lines, _, unknown)) = read_capture_and_end(path, crate::run::dead_launcher) else {
+    let Ok(CaptureEnd { lines, unknown, .. }) =
+        read_capture_and_end(path, crate::run::dead_launcher)
+    else {
         return;
     };
     let picked = final_moments(&lines, since_ts_ms, opts);
@@ -523,16 +525,31 @@ fn unknown_exit(pid: u32, lines: &[Value]) -> Option<Value> {
     }))
 }
 
+/// What [`read_capture_and_end`] found.
+struct CaptureEnd {
+    lines: Vec<Value>,
+    /// Where to read on from, in the file `head` came from: one open, as the names can move on.
+    cursor: CaptureCursor,
+    unknown: Option<Value>,
+}
+
 /// A capture's newest records, where they end, and [`unknown_exit`]'s record if it has one.
 fn read_capture_and_end(
     path: &Path,
     dead_launcher: impl Fn(&Path) -> Option<u32>,
-) -> Result<(Vec<Value>, u64, Option<Value>)> {
+) -> Result<CaptureEnd> {
     // Dead first, then read: what it wrote before it was gone is then in the read.
     let gone = dead_launcher(path);
-    let (lines, offset) = read_capture(path, None)?;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let head = open_capture_head(&mut file).unwrap_or_default();
+    let (lines, offset) = read_open_capture(&mut file, None)?;
     let unknown = gone.and_then(|pid| unknown_exit(pid, &lines));
-    Ok((lines, offset, unknown))
+    Ok(CaptureEnd {
+        lines,
+        cursor: CaptureCursor { offset, head },
+        unknown,
+    })
 }
 
 /// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
@@ -791,9 +808,11 @@ async fn follow_capture(
         "victauri logs: console capture {}",
         clean(&path.display().to_string())
     );
-    let head = capture_head(&path).unwrap_or_default();
-    let (lines, offset, unknown) = read_capture_and_end(&path, crate::run::dead_launcher)?;
-    let mut cursor = CaptureCursor { offset, head };
+    let CaptureEnd {
+        lines,
+        mut cursor,
+        unknown,
+    } = read_capture_and_end(&path, crate::run::dead_launcher)?;
     let recent: Vec<&Value> = if let Some(ts) = since_ts_ms {
         lines
             .iter()
@@ -876,6 +895,7 @@ struct CaptureCursor {
 
 /// The first bytes of a capture; `None` when it cannot be read (between the launcher's rename
 /// and its new file, for one).
+#[cfg(test)]
 fn capture_head(path: &Path) -> Option<Vec<u8>> {
     open_capture_head(&mut std::fs::File::open(path).ok()?)
 }
@@ -1066,7 +1086,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("c.jsonl");
         std::fs::write(&path, "{\"t\":1,\"s\":\"out\",\"l\":\"line\"}\n").unwrap();
-        let (lines, _, unknown) = read_capture_and_end(&path, |path| {
+        let CaptureEnd { lines, unknown, .. } = read_capture_and_end(&path, |path| {
             use std::io::Write as _;
             let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
             file.write_all(b"{\"t\":2,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n")

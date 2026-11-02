@@ -943,7 +943,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (low.length === 1) probe(low.charCodeAt(0));
         }
         for (var c = 0; c < 256; c++) probe(c);
-        var outside = [0x2028, 0x2029, 0x3000, 0xfeff, 0x4e2d, 0xd83d, 0xffff];
+        // Every `\s` is here, as a range can hold one with nothing else naming it, and what folds
+        // into ASCII under `i`.
+        var outside = [0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008,
+            0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff, 0x17f, 0x212a, 0x4e2d,
+            0xd83d, 0xffff];
         for (var w = 0; w < outside.length; w++) probe(outside[w]);
         for (var u = 0; u < src.length; u++) {
             var code = src.charCodeAt(u);
@@ -1037,7 +1041,20 @@ const INIT_SCRIPT_BODY: &str = r#"
                 follow[at] = newSet();
                 var only = newSet();
                 add(only, at, 1);
-                // `a{2}` has one way through it; `a{1,3}` has as many as `a+`, for this purpose.
+                // `a{2}` is two characters, and `aa` the same text: a position for each.
+                if (!a.any && a.min === a.max && a.max >= 2) {
+                    spend(a.max * 50);
+                    for (var n = 1; n < a.max; n++) {
+                        var step = positions.length;
+                        positions[step] = positions[at];
+                        follow[step] = newSet();
+                        add(follow[step - 1], step, 1);
+                    }
+                    var end = newSet();
+                    add(end, positions.length - 1, 1);
+                    return { nulls: 0, first: only, last: end };
+                }
+                // `a{1,3}` has as many ways through it as `a+`, for this purpose.
                 if (a.any || (a.min !== a.max && a.max >= 2)) add(follow[at], at, 1);
                 return { nulls: (a.any || a.min === 0) ? 1 : 0, first: only, last: only };
             }
@@ -1570,6 +1587,7 @@ const INIT_SCRIPT_BODY: &str = r#"
     var STR_INDEXOF = String.prototype.indexOf;
     var STR_SUBSTRING = String.prototype.substring;
     var STR_TO_LOWER = String.prototype.toLowerCase;
+    var STR_TRIM = String.prototype.trim;
     var ARRAY_BUFFER_SLICE = ArrayBuffer.prototype.slice;
     // Native `Request` getters. They brand-check (throw for anything but a genuine Request), so
     // they tell a real Request apart from a look-alike object and read what fetch really uses —
@@ -4961,7 +4979,11 @@ const INIT_SCRIPT_BODY: &str = r#"
         // are `isTrusted: false`; the accessors are not the native functions, as a page comparing
         // them can see; `responseXML.URL` is the page's; `lengthComputable` follows the mock, which
         // knows its size; `getAllResponseHeaders` has only the mock's headers; Chromium also fires
-        // `upload` abort and timeout on a request with no body, and the mock follows the spec.
+        // `upload` abort and timeout on a request with no body, and the mock follows the spec; an
+        // `upload` listener added after `send` still hears (it cannot be told a listener was added);
+        // a `Content-Type` that is not a valid type is passed on, not replaced as an engine would;
+        // `responseXML.contentType` is `application/xml` for any XML type; the upload total of a
+        // form or a document is 0.
         var XHR_PROTO = XMLHttpRequest.prototype;
         var TEXT_ENCODER = null;
         try { TEXT_ENCODER = new window.TextEncoder(); } catch (e) { TEXT_ENCODER = null; }
@@ -4992,18 +5014,20 @@ const INIT_SCRIPT_BODY: &str = r#"
             var st = XHR_NET_GET(xhrNet, xhr);
             var mime = st.mime || m.headers['content-type'] || '';
             var semi = REFLECT_APPLY(STR_INDEXOF, mime, [';']);
-            return REFLECT_APPLY(STR_TO_LOWER, semi < 0 ? mime : REFLECT_APPLY(STR_SUBSTRING, mime, [0, semi]), []).trim();
+            return REFLECT_APPLY(STR_TRIM, REFLECT_APPLY(STR_TO_LOWER, semi < 0 ? mime : REFLECT_APPLY(STR_SUBSTRING, mime, [0, semi]), []), []);
         }
-        // What `send` reports as the upload's total, in bytes. A form's size is the engine's own
-        // to work out (its boundary), so that one reads as unknown.
+        // What `send` reports as the upload's total, in bytes. A form's or a document's is the
+        // engine's own to work out, so those read as unknown (null). Anything else is sent as its
+        // string, and a conversion that throws throws out of `send`, as on a real request.
         function xhrBodySize(body) {
             if (body === null || body === undefined) return 0;
             if (typeof body === 'object') {
                 try {
                     if (BLOB_CTOR && body instanceof BLOB_CTOR) return body.size;
                     if (typeof body.byteLength === 'number') return body.byteLength;
-                    if (typeof URLSearchParams !== 'function' || !(body instanceof URLSearchParams)) return 0;
-                } catch (e) { return 0; }
+                    if (typeof FormData === 'function' && body instanceof FormData) return null;
+                    if (typeof Document === 'function' && body instanceof Document) return null;
+                } catch (e) { return null; }
             }
             var text = toStringExact(body);
             return TEXT_ENCODER ? REFLECT_APPLY(TEXT_ENCODE, TEXT_ENCODER, [text]).length : text.length;
@@ -5141,11 +5165,15 @@ const INIT_SCRIPT_BODY: &str = r#"
         // Answer a matching request with the rule's mock: `send` does not reach the network. The
         // transitions come in one later task, stopping as soon as a handler moved the XHR on.
         function xhrFulfill(xhr, st, entry, route, net, body) {
+            var verb = REFLECT_APPLY(STR_TO_LOWER, net.method, []);
+            var hasBody = body !== null && body !== undefined && verb !== 'get' && verb !== 'head';
+            // First: a body that cannot be converted throws, and no request has started.
+            var sent = hasBody ? xhrBodySize(body) : 0;
             var m = {
                 state: 1, failed: false, timer: null, arm: null, uploading: null,
                 status: route.status, status_text: route.status_text,
                 headers: mockHeaders(route),
-                body: mockBody(route) || '',
+                body: verb === 'head' ? '' : (mockBody(route) || ''),
                 url: xhrResponseUrl(net.url),
             };
             st.mock = m;
@@ -5166,13 +5194,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                 }
                 return;
             }
-            var verb = REFLECT_APPLY(STR_TO_LOWER, net.method, []);
-            var hasBody = body !== null && body !== undefined && verb !== 'get' && verb !== 'head';
-            var sent = hasBody ? xhrBodySize(body) : 0;
             xhrFire(xhr, xhrEvent('loadstart', 0, 0));
             if (hasBody) {
                 m.uploading = xhr.upload;
-                xhrFire(xhr.upload, xhrEvent('loadstart', 0, sent));
+                xhrFire(xhr.upload, xhrEvent('loadstart', 0, sent || 0));
             }
             if (st.mock !== m || m.state !== 1) return;
             function moved(state) { return st.mock !== m || m.state !== state; }
@@ -5181,10 +5206,13 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (moved(1)) return;
                 if (hasBody) {
                     m.uploading = null;
-                    xhrFire(xhr.upload, xhrEvent('progress', sent, sent));
-                    xhrFire(xhr.upload, xhrEvent('load', sent, sent));
-                    xhrFire(xhr.upload, xhrEvent('loadend', sent, sent));
-                    if (moved(1)) return;
+                    // An empty body has nothing to report past its `loadstart`.
+                    if (sent !== 0) {
+                        xhrFire(xhr.upload, xhrEvent('progress', sent || 0, sent || 0));
+                        xhrFire(xhr.upload, xhrEvent('load', sent || 0, sent || 0));
+                        xhrFire(xhr.upload, xhrEvent('loadend', sent || 0, sent || 0));
+                        if (moved(1)) return;
+                    }
                 }
                 m.state = 2;
                 xhrFire(xhr, new Event('readystatechange'));
@@ -5211,12 +5239,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                 m.failed = true;
                 m.state = 4;
                 xhrFinish(entry, 'timeout');
+                // It has timed out: these fire whatever a handler did to the XHR.
                 xhrFire(xhr, new Event('readystatechange'));
-                if (moved(4)) return;
                 xhrEndUpload(m, 'timeout');
-                if (moved(4)) return;
                 xhrFire(xhr, xhrEvent('timeout', 0, 0));
-                if (moved(4)) return;
                 xhrFire(xhr, xhrEvent('loadend', 0, 0));
             }
             // A `timeout` the mock's delay runs past ends it as it would end a slow request.
@@ -5304,7 +5330,11 @@ const INIT_SCRIPT_BODY: &str = r#"
                 } catch (e) {}
                 return undefined;
             }
-            return REFLECT_APPLY(origAbort, this, arguments);
+            var ret = REFLECT_APPLY(origAbort, this, arguments);
+            // Called from `readystatechange` at DONE it fires no `load`, `abort` or `loadend`, so
+            // nothing else closes the entry, and it would hold `network_idle` off for good.
+            if (st && st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+            return ret;
         };
         XMLHttpRequest.prototype.send = function() {
             var st = XHR_NET_GET(xhrNet, this);

@@ -101,12 +101,12 @@ pub trait WebviewBridge: Send + Sync {
     fn app_entry_url(&self) -> Option<String> {
         None
     }
-    /// CPU time so far, in clock ticks, on it or waiting for it, of the main thread of each child
-    /// process that renders the app's pages, as `(pid, ticks)`: where a page's script runs, and a
-    /// Worker's does not. Empty
-    /// where page processes are not the app's children (macOS, Windows): see
+    /// CPU time so far, in clock ticks, on it or waiting for it, and how many times it gave the CPU
+    /// up of its own accord, of the main thread of each child process that renders the app's pages,
+    /// as `(pid, ticks, sleeps)`: where a page's script runs, and a Worker's does not. Empty where
+    /// page processes are not the app's children (macOS, Windows): see
     /// [`end_web_process`](Self::end_web_process).
-    fn web_main_thread_cpu(&self) -> Vec<(u32, u64)> {
+    fn web_main_thread_cpu(&self) -> Vec<(u32, u64, u64)> {
         Vec::new()
     }
     /// End a process listed by [`web_main_thread_cpu`](Self::web_main_thread_cpu), the only way out of a
@@ -1013,7 +1013,7 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     }
 
     #[cfg(target_os = "linux")]
-    fn web_main_thread_cpu(&self) -> Vec<(u32, u64)> {
+    fn web_main_thread_cpu(&self) -> Vec<(u32, u64, u64)> {
         crate::introspection::web_main_thread_cpu_linux()
     }
 

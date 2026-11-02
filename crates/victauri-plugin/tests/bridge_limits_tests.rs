@@ -440,6 +440,13 @@ fn a_regex_that_can_hang_the_page_is_refused_at_add() {
         r"x|(a+)+",
         // Ambiguity in a subgroup of a repeated group: nothing about the group itself shows it.
         r"(x(a|a)y)+",
+        // An exact count is that many characters: `a{2}` and `aa` are the same text.
+        r"(?:a{2}b|aab)+$",
+        r"(a{4}b|a{2}a{2}b)+$",
+        r"(?:a{2,2}c|aac)+$",
+        r"(?:v(?:\d{2}|\d\d)/)+$",
+        // Two sets that share one character, named by neither: U+1680 is `\s`.
+        r"(?:\s|[Ā-ᜀ])+$",
         r"((a|a)y)+",
         r"(x(a+|a+)y)+",
         r"(x(a+a+)?y)+$",
@@ -509,6 +516,8 @@ fn a_regex_that_can_hang_the_page_is_refused_at_add() {
         r"(/api|/app)+",
         r"(user|users)+",
         r"(a|ab)+",
+        r"(?:\w{2})+",
+        r"(a{2}b)+",
         // Escapes that are well formed are one character.
         r"(\x41b)+",
         r"(\u0041b)+",

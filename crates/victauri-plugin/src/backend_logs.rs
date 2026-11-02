@@ -1930,8 +1930,8 @@ pub struct ConsoleLine {
 pub const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
 
 /// How much of a capture's end holds its exit record, if it has one: a line per stderr tail entry,
-/// 12 of up to 64 KiB each.
-const EXIT_RECORD_MAX_BYTES: u64 = 2 * 1024 * 1024;
+/// 12 of up to 64 KiB each, and a control character in one is written as six bytes (`\u0001`).
+const EXIT_RECORD_MAX_BYTES: u64 = 5 * 1024 * 1024;
 
 /// The pid of the `victauri run` that wrote the capture at `path`, when that process is gone and
 /// the capture does not say how the app ended: it was killed outright. Then nothing more will reach
