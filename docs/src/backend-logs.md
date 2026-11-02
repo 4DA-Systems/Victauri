@@ -144,7 +144,9 @@ registry.init();
   app's own file logging for that.
 - **Victauri's own lines are excluded** (`victauri_*`, the embedded `rmcp` SDK): every agent
   request produces some, so capturing them would let reading the log generate log noise. Set
-  `VICTAURI_LOG_INTERNAL=1` to keep them. Tokio's own runtime instrumentation (`tokio::*`,
+  `VICTAURI_LOG_INTERNAL=1` to keep them. That is the capture only: with an `info` filter the
+  SDK's `rmcp::service` INFO lines still reach the app's console during MCP calls, and
+  `EnvFilter::new("info,rmcp=warn")` hides them. Tokio's own runtime instrumentation (`tokio::*`,
   `runtime::*` — what `tokio_unstable` emits for tokio-console) is always excluded: part of it is
   emitted while Tokio holds internal locks.
 - **Panics.** The hook is installed when the plugin builds (debug builds) and chains the hook

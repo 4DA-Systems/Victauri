@@ -1179,6 +1179,47 @@ fn registry_recipe_captures_what_the_global_filter_allows() {
     assert_eq!(page.entries[0].message, "kept");
 }
 
+/// Documented limit: the capture leaves the embedded MCP SDK's lines out, the app's console does
+/// not, and the filter the page gives hides them (`rmcp::service` logs at INFO during MCP calls).
+#[test]
+fn the_documented_filter_hides_the_sdks_lines_from_the_console() {
+    #[derive(Clone, Default)]
+    struct Console(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Console {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let run = |filter: &str| {
+        let console = Console::default();
+        let writer = console.clone();
+        let buf = Arc::new(LogBuffer::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(filter))
+            .with(tracing_subscriber::fmt::layer().with_writer(move || writer.clone()))
+            .with(Some(BackendLogLayer::with_buffer(Arc::clone(&buf))));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "rmcp::service", "Service initialized as server");
+            tracing::info!(target: "app", "kept");
+        });
+        let page = buf.query(&LogQuery::default());
+        assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
+        assert_eq!(page.entries[0].message, "kept");
+        let printed = console.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&printed).into_owned()
+    };
+    let plain = run("info");
+    assert!(plain.contains("Service initialized"), "{plain}");
+    assert!(plain.contains("kept"), "{plain}");
+    let quiet = run("info,rmcp=warn");
+    assert!(!quiet.contains("Service initialized"), "{quiet}");
+    assert!(quiet.contains("kept"), "{quiet}");
+}
+
 /// Documented recipe for `fmt().init()` apps: `fmt()...finish().with(log_layer())`.
 #[test]
 fn fmt_builder_recipe_captures() {
