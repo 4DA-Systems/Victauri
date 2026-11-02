@@ -1025,6 +1025,58 @@ fn a_cursor_read_survives_a_rotation() {
     }
 }
 
+/// A `victauri run` that was killed writes no exit record. The app can outlive it (SIGKILL on
+/// Unix), and then `logs stdout` read on as if all were well, with nothing more ever to come.
+#[test]
+fn a_capture_says_when_its_launcher_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("4242-1730000000000.jsonl");
+    std::fs::write(&path, capture_record(0, "line")).unwrap();
+    assert_eq!(launcher_gone(&path, |pid| pid == 4242), Some(4242));
+    assert_eq!(
+        launcher_gone(&path, |_| false),
+        None,
+        "the launcher is alive"
+    );
+
+    let exit = "{\"t\":9,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n";
+    std::fs::write(&path, format!("{}{exit}", capture_record(0, "line"))).unwrap();
+    assert_eq!(launcher_gone(&path, |_| true), None, "it said how it ended");
+
+    // A `--capture` file has no pid in its name.
+    let named = dir.path().join("my-capture.jsonl");
+    std::fs::write(&named, capture_record(0, "line")).unwrap();
+    assert_eq!(launcher_gone(&named, |_| true), None);
+}
+
+/// An exit record carries up to 12 stderr lines of 64 KiB: the tail read must hold all of it.
+#[test]
+fn a_long_exit_record_is_seen_as_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("4242-1730000000000.jsonl");
+    let tail: Vec<String> = (0..12).map(|_| "x".repeat(64 * 1024)).collect();
+    let exit = serde_json::json!({"t": 9, "s": "exit", "l": "crashed", "tail": tail});
+    std::fs::write(&path, format!("{}{exit}\n", capture_record(0, "line"))).unwrap();
+    assert_eq!(launcher_gone(&path, |_| true), None);
+}
+
+/// On Linux, a real process: a zombie its parent has not reaped is gone too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dead_process_is_seen_as_dead() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    assert!(!process_is_dead(child.id()));
+    child.kill().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(process_is_dead(child.id()), "unreaped");
+    child.wait().unwrap();
+    assert!(process_is_dead(child.id()), "reaped");
+    assert!(!process_is_dead(std::process::id()));
+}
+
 /// A bare offset cannot see a rotation whose new file has a record boundary exactly there: the
 /// rotated file's tail and the new file's start went unread, with nothing said.
 #[test]

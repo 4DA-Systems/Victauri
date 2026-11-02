@@ -20,7 +20,8 @@
 //! Stopping the launcher stops the app: otherwise an agent harness or `timeout` leaves it holding
 //! its port and single-instance lock. On Windows a job object takes the whole tree when the
 //! launcher dies, however it dies. On Unix SIGTERM/SIGHUP are forwarded and the exit is recorded;
-//! SIGKILL cannot be seen, so it still orphans the app.
+//! SIGKILL cannot be seen, so a small helper does it (see [`DeathWatch`]). A launcher killed outright
+//! records nothing, and `victauri logs` says so when it reads the capture.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -112,6 +113,16 @@ fn capture_group(file_name: &str) -> Option<(u32, &str)> {
         return None;
     }
     Some((pid.parse().ok()?, base))
+}
+
+/// The pid of the `victauri run` that wrote the capture at `path`, when its name holds one (a
+/// `--capture` file's does not) and that process is definitely gone. A reused pid just looks alive.
+#[must_use]
+pub fn dead_launcher(path: &Path) -> Option<u32> {
+    let (pid, _) = capture_group(path.file_name()?.to_str()?)?;
+    victauri_test::process::liveness(pid)
+        .is_dead()
+        .then_some(pid)
 }
 
 /// Delete old captures of apps that are gone: those past [`CAPTURE_MAX_AGE`], then all but the
@@ -464,6 +475,53 @@ fn on_stop_signal(
     });
 }
 
+/// On Unix: stops the child when this process dies, even by SIGKILL. `PR_SET_PDEATHSIG` would need
+/// `unsafe` (`pre_exec`) and only exists on Linux. This is a shell holding the read end of a pipe:
+/// the write end is here and nowhere else (Rust opens pipes close-on-exec), so its `read` returns
+/// when this process is gone, however it went. It stops the child as [`on_stop_signal`] does, and
+/// like it, only the direct child. It ignores what a terminal or `timeout` sends the whole group: it
+/// must outlive a stop that this process is handling, and the disarming line ends it.
+#[cfg(unix)]
+struct DeathWatch(std::process::Child);
+
+#[cfg(unix)]
+impl DeathWatch {
+    /// `None` when no shell can be started: the app still runs, unguarded as it always was.
+    fn start(child_pid: u32) -> Option<Self> {
+        Command::new("sh")
+            .args([
+                "-c",
+                "trap '' INT HUP TERM\n\
+                 read -r disarmed\n\
+                 [ -n \"$disarmed\" ] && exit 0\n\
+                 kill -s TERM \"$1\" 2>/dev/null || exit 0\n\
+                 i=0\n\
+                 while [ \"$i\" -lt \"$2\" ] && kill -0 \"$1\" 2>/dev/null; do\n\
+                 sleep 1\n\
+                 i=$((i + 1))\n\
+                 done\n\
+                 kill -s KILL \"$1\" 2>/dev/null\n",
+                "victauri-run-watch",
+                &child_pid.to_string(),
+                &STOP_KILL_AFTER.as_secs().to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+            .map(Self)
+    }
+
+    /// The child is done: the helper must never signal its pid, which may be reused.
+    fn disarm(mut self) {
+        if let Some(mut stdin) = self.0.stdin.take() {
+            let _ = stdin.write_all(b"disarmed\n");
+        }
+        let _ = self.0.wait();
+    }
+}
+
 /// Signal the child, if it is still running.
 #[cfg(unix)]
 fn signal_child(child_pid: &std::sync::atomic::AtomicU32, signal: &str) {
@@ -650,7 +708,9 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
 
     #[cfg(unix)]
     child_pid.store(child.id(), std::sync::atomic::Ordering::Release);
-    // Dies with this process, however it dies. Best effort: without a job the app still runs.
+    // Dies with this process, however it dies. Best effort: without these the app still runs.
+    #[cfg(unix)]
+    let watch = DeathWatch::start(child.id());
     #[cfg(windows)]
     let job = victauri_test::process::KillOnCloseJob::assign(&child);
 
@@ -666,6 +726,10 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     // daemon) is not ours to kill, and a pid that has been reaped must never be signalled.
     #[cfg(unix)]
     child_pid.store(0, std::sync::atomic::Ordering::Release);
+    #[cfg(unix)]
+    if let Some(watch) = watch {
+        watch.disarm();
+    }
     #[cfg(windows)]
     if let Some(job) = job {
         job.disarm();

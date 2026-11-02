@@ -176,8 +176,12 @@ registry.init();
   they are formatted, so a multi-megabyte argument costs a few kilobytes). For a very chatty
   app, raise the level with `VICTAURI_LOG_LEVEL=info`.
 - **Keep the launcher alive.** `victauri run` owns the app's stdout/stderr pipes. Ctrl+C reaches
-  both; but if the launcher alone is killed, the app's next console write fails (on Unix a
-  `println!` then panics on the broken pipe).
+  both. A launcher killed outright takes the app with it (on Windows a job object, the whole
+  tree; on Unix a small helper process, the direct child only, so what `npm` started may stay and
+  its next console write fails: a `println!` then panics on the broken pipe). It records nothing,
+  so `victauri logs` ends such a capture with an `EXIT` line saying the exit is unknown, and `logs
+  stdout` reports `launcher_gone` while the app lives on. A `--capture` file's name does not hold
+  the launcher's pid, so neither can say so for one.
 
 ## A server that stays up when the app hangs
 

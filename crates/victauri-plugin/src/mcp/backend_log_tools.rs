@@ -333,6 +333,18 @@ impl VictauriMcpHandler {
                     "next_seq": read.cursor(next),
                     "path": path.to_string_lossy(),
                 });
+                if !(total > limit || read.more)
+                    && let Some(pid) =
+                        backend_logs::launcher_gone(&path, backend_logs::process_is_dead)
+                {
+                    out["launcher_gone"] = serde_json::json!({
+                        "pid": pid,
+                        "note": format!(
+                            "`victauri run` (pid {pid}) was killed: this capture ends here, though \
+                             the app is still running, and how the app ends will not be recorded"
+                        ),
+                    });
+                }
                 if read.lost {
                     out["gap"] = true.into();
                     out["note"] = "the capture rotated more than once since this cursor was \

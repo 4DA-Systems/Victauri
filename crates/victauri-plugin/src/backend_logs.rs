@@ -1919,6 +1919,60 @@ pub struct ConsoleLine {
 /// Most bytes of a console capture one read takes (a capture rotates at 64 MB).
 pub const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
 
+/// How much of a capture's end holds its exit record, if it has one: a line per stderr tail entry,
+/// 12 of up to 64 KiB each.
+const EXIT_RECORD_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// The pid of the `victauri run` that wrote the capture at `path`, when that process is gone and
+/// the capture does not say how the app ended: it was killed outright. Then nothing more will reach
+/// the capture, though this app lives on. The pid comes from the capture's name (`<pid>-<ms>.jsonl`);
+/// a `--capture` file's name holds none.
+#[must_use]
+pub fn launcher_gone(path: &std::path::Path, is_dead: impl Fn(u32) -> bool) -> Option<u32> {
+    let name = path.file_name()?.to_str()?;
+    let (pid, ms) = name.strip_suffix(".jsonl")?.split_once('-')?;
+    let pid: u32 = pid.parse().ok()?;
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) || !is_dead(pid) {
+        return None;
+    }
+    let (lines, _, _) =
+        read_capture_window(path, None, EXIT_RECORD_MAX_BYTES, CONSOLE_READ_WINDOW).ok()?;
+    (!lines.iter().any(|line| line.stream == "exit")).then_some(pid)
+}
+
+/// Whether `pid` is definitely gone. Only asked of a launcher, whose death the app can outlive only
+/// on Unix: on Windows a job object takes the app with it, so a running app means it is alive.
+#[must_use]
+pub fn process_is_dead(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // A zombie is gone too, and `kill -0` cannot tell. The state follows the `)` of the name.
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat
+                .rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with(['Z', 'X'])),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        // The shell builtin, as `victauri run` signals: `kill` is not a binary everywhere.
+        std::process::Command::new("sh")
+            .args(["-c", "kill -0 \"$1\"", "victauri-plugin", &pid.to_string()])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|status| !status.success())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Bits of a [`ConsoleRead`] cursor holding the byte offset: 8 GiB, and a capture rotates at 64 MiB.
 const CURSOR_OFFSET_BITS: u32 = 33;
 /// Bits above them holding the file's tag. 53 in all: the cursor stays exact as a JSON number in a

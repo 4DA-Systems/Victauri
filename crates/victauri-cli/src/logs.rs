@@ -489,13 +489,40 @@ fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
         return;
     };
     let picked = final_moments(&lines, since_ts_ms, opts);
-    if picked.is_empty() {
+    let unknown = unknown_exit(path, &lines);
+    if picked.is_empty() && unknown.is_none() {
         return;
     }
     eprintln!("victauri logs: how the previous process ended (from its `victauri run` capture):");
-    for l in picked {
+    for l in picked.into_iter().chain(&unknown) {
         emit(&render_console(l), opts.json, l);
     }
+}
+
+/// What a reader can say that a killed launcher could not: a capture whose `victauri run` is dead
+/// and which holds no exit record never will (a launcher writes one whenever it can, so it was
+/// killed outright). A record in the shape of the launcher's own, so a monitor reading stdout sees
+/// it too; `unknown` tells it from one the launcher wrote. It is not written to the capture. `lines`
+/// are the capture's newest records, where an exit record would be.
+fn unknown_exit(path: &Path, lines: &[Value]) -> Option<Value> {
+    if lines.iter().any(|l| l["s"] == "exit") {
+        return None;
+    }
+    let pid = crate::run::dead_launcher(path)?;
+    let at = lines
+        .last()
+        .and_then(|l| l["t"].as_u64())
+        .unwrap_or_else(now_ms);
+    Some(json!({
+        "t": at,
+        "s": "exit",
+        "l": format!(
+            "exit unknown: `victauri run` (pid {pid}) was killed, so how the app ended was not \
+             recorded"
+        ),
+        "tail": [],
+        "unknown": true,
+    }))
 }
 
 /// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
@@ -706,6 +733,11 @@ async fn follow_stdout_via_app(
                 emit(&render_console(l), opts.json, l);
             }
         }
+        // The app outlived its launcher: nothing more reaches the capture.
+        if let Some(note) = page["launcher_gone"]["note"].as_str() {
+            eprintln!("victauri logs: {}", clean(note));
+            return Ok(());
+        }
         if !opts.follow {
             return Ok(());
         }
@@ -761,17 +793,43 @@ async fn follow_capture(
         }
         saw_exit |= l["s"] == "exit";
     }
+    // Nothing more will come from a launcher that is gone, so there is nothing to follow.
+    if let Some(unknown) = unknown_exit(&path, &lines) {
+        emit(&render_console(&unknown), opts.json, &unknown);
+        return Ok(());
+    }
     if !opts.follow || (saw_exit && stop_after_idle.is_some()) {
         return Ok(());
     }
     let mut idle = Duration::ZERO;
+    let mut launcher_checked = std::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
-        let lines = read_followed(&path, &mut cursor)?;
+        let mut lines = read_followed(&path, &mut cursor)?;
         if lines.is_empty() {
             idle += Duration::from_millis(opts.interval_ms);
             if stop_after_idle.is_some_and(|max| idle >= max) {
                 return Ok(());
+            }
+            // Not every poll: on Unix asking costs a process. Dead first, then read: a launcher
+            // that exited normally has written its exit record by the time it is gone.
+            if launcher_checked.elapsed() >= LAUNCHER_CHECK_EVERY {
+                launcher_checked = std::time::Instant::now();
+                if crate::run::dead_launcher(&path).is_some() {
+                    lines = read_followed(&path, &mut cursor)?;
+                    let seen_exit = lines.iter().any(|l| l["s"] == "exit");
+                    for l in &lines {
+                        if console_line_passes(l, opts) {
+                            emit(&render_console(l), opts.json, l);
+                        }
+                    }
+                    if !seen_exit
+                        && let Some(unknown) = unknown_exit(&path, &read_capture(&path, None)?.0)
+                    {
+                        emit(&render_console(&unknown), opts.json, &unknown);
+                    }
+                    return Ok(());
+                }
             }
         } else {
             idle = Duration::ZERO;
@@ -786,6 +844,9 @@ async fn follow_capture(
         }
     }
 }
+
+/// How often a follower with nothing to read asks whether the capture's launcher is still there.
+const LAUNCHER_CHECK_EVERY: Duration = Duration::from_secs(2);
 
 /// How much of a capture's first bytes tells one file from the next.
 const CAPTURE_HEAD_BYTES: u64 = 256;

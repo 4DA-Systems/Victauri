@@ -389,6 +389,296 @@ fn stopping_the_launcher_takes_the_app_with_it() {
     }
 }
 
+/// `victauri run` under a default capture in the private directory, printing one line and then
+/// sleeping, with its output read away. The capture's name holds the launcher's pid, which is what
+/// tells a reader whose capture it is.
+fn run_a_sleeping_app(t: &Temp) -> (KillOnDrop, PathBuf) {
+    let argv = t.script(
+        "app",
+        "echo last words\r\nping -n 60 127.0.0.1 >nul",
+        "echo last words\nexec sleep 60\n",
+    );
+    let mut args = vec!["run", "--"];
+    args.extend(argv.iter().map(String::as_str));
+    let launcher = KillOnDrop(
+        t.victauri(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let name = format!("{}-", launcher.0.id());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let capture = captures_under(t)
+            .into_iter()
+            .find(|p| p.file_name().unwrap().to_string_lossy().starts_with(&name));
+        if let Some(capture) = capture
+            && std::fs::read_to_string(&capture).is_ok_and(|text| text.contains("last words"))
+        {
+            return (launcher, capture);
+        }
+        assert!(Instant::now() < deadline, "no capture appeared");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The default captures under `t`'s private temp root, whichever discovery root took them.
+fn captures_under(t: &Temp) -> Vec<PathBuf> {
+    let roots = std::fs::read_dir(t.0.path())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("victauri")
+        });
+    roots
+        .flat_map(|root| {
+            std::fs::read_dir(root.join("console"))
+                .into_iter()
+                .flatten()
+        })
+        .flatten()
+        .map(|e| e.path())
+        .collect()
+}
+
+/// A killed `victauri run` writes no exit record, on Windows always and on Unix after SIGKILL. The
+/// launcher cannot say so, but a reader can: the capture's pid is dead and nothing says how it ended.
+#[test]
+fn a_reader_says_when_the_launcher_was_killed() {
+    let t = Temp::new();
+    let (mut launcher, capture) = run_a_sleeping_app(&t);
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+
+    let out = t.victauri(&["logs", "--stdout"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("last words"), "{text}");
+    assert!(text.contains("EXIT"), "{text}");
+    assert!(text.contains("killed"), "{text}");
+    assert!(text.contains("unknown"), "{text}");
+    assert!(text.contains(&launcher.0.id().to_string()), "{text}");
+
+    // In JSON too, and it is not written into the capture: it is what the reader worked out.
+    let out = t
+        .victauri(&["logs", "--stdout", "--json"])
+        .output()
+        .unwrap();
+    let last = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .last()
+        .unwrap()
+        .to_string();
+    let record: serde_json::Value = serde_json::from_str(&last).unwrap();
+    assert_eq!(record["s"], "exit", "{record}");
+    assert_eq!(record["unknown"], true, "{record}");
+    assert!(
+        !std::fs::read_to_string(&capture)
+            .unwrap()
+            .contains("unknown")
+    );
+
+    // A follower has nothing to wait for.
+    let started = Instant::now();
+    let out = t
+        .victauri(&["logs", "--stdout", "--follow"])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(15),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("unknown"));
+}
+
+/// A follower attached while the launcher runs learns of its death, without an exit record to wait for.
+#[test]
+fn a_follower_says_when_the_launcher_is_killed_under_it() {
+    let t = Temp::new();
+    let (mut launcher, _capture) = run_a_sleeping_app(&t);
+    let follower = t
+        .victauri(&["logs", "--stdout", "--follow", "--interval-ms", "100"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(victauri_test::process::is_own_live_process(follower.id()));
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+    let pid = follower.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(follower.wait_with_output());
+    });
+    let Ok(out) = rx.recv_timeout(Duration::from_secs(20)) else {
+        kill_pid(pid);
+        panic!("the follower kept waiting for a launcher that is gone");
+    };
+    let text = String::from_utf8_lossy(&out.unwrap().stdout).into_owned();
+    assert!(text.contains("last words"), "{text}");
+    assert!(text.contains("unknown"), "{text}");
+}
+
+/// A launcher that ended normally recorded how the app ended: nothing is unknown, and a capture
+/// whose launcher is alive is not read as a dead one.
+#[test]
+fn a_recorded_exit_and_a_live_launcher_are_not_called_unknown() {
+    let t = Temp::new();
+    let (mut launcher, _capture) = run_a_sleeping_app(&t);
+    let out = t.victauri(&["logs", "--stdout"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("last words") && !text.contains("unknown"),
+        "{text}"
+    );
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+
+    let t = Temp::new();
+    let argv = t.script("done", "echo bye\r\nexit /b 4", "echo bye\nexit 4\n");
+    let mut args = vec!["run", "--"];
+    args.extend(argv.iter().map(String::as_str));
+    let status = t
+        .victauri(&args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap()
+        .status;
+    assert_eq!(status.code(), Some(4));
+    let out = t.victauri(&["logs", "--stdout"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("code 4") && !text.contains("unknown"),
+        "{text}"
+    );
+}
+
+/// SIGKILL cannot be handled, so nothing in this process can stop the app. A small helper holding
+/// a pipe from the launcher can: the pipe closes when the launcher dies, however it dies.
+#[cfg(not(windows))]
+#[test]
+fn a_launcher_killed_outright_takes_the_app_with_it() {
+    let t = Temp::new();
+    let cap = t.path("c.jsonl");
+    let pid_file = t.path("pid");
+    let argv = t.script(
+        "app",
+        "",
+        &format!("echo $$ > '{}'\nexec sleep 60\n", pid_file.display()),
+    );
+    let mut args = vec!["run", "--capture", cap.to_str().unwrap(), "--"];
+    args.extend(argv.iter().map(String::as_str));
+    let mut launcher = KillOnDrop(
+        t.victauri(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let app_pid = wait_for_pid(&pid_file);
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while victauri_test::process::is_own_live_process(app_pid) {
+        if Instant::now() > deadline {
+            kill_pid(app_pid);
+            panic!("the app outlived a launcher killed with SIGKILL");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// ... and one that ignores SIGTERM too, as `victauri run` itself ends such a child.
+#[cfg(not(windows))]
+#[test]
+fn a_launcher_killed_outright_takes_a_stubborn_app_with_it() {
+    let t = Temp::new();
+    let cap = t.path("c.jsonl");
+    let pid_file = t.path("pid");
+    let argv = t.script(
+        "app",
+        "",
+        &format!(
+            "trap '' TERM\necho $$ > '{}'\nwhile :; do sleep 1; done\n",
+            pid_file.display()
+        ),
+    );
+    let mut args = vec!["run", "--capture", cap.to_str().unwrap(), "--"];
+    args.extend(argv.iter().map(String::as_str));
+    let mut launcher = KillOnDrop(
+        t.victauri(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let app_pid = wait_for_pid(&pid_file);
+    launcher.0.kill().unwrap();
+    launcher.0.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while victauri_test::process::is_own_live_process(app_pid) {
+        if Instant::now() > deadline {
+            kill_pid(app_pid);
+            panic!("a child ignoring SIGTERM outlived its killed launcher");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// The helper is for a launcher that dies: when the app exits it goes too, or every run would leave
+/// a shell behind, waiting to signal a pid that may be someone else's by then.
+#[cfg(not(windows))]
+#[test]
+fn the_app_exiting_ends_the_helper() {
+    fn helper_listed(app_pid: u32) -> bool {
+        let ps = Command::new("ps")
+            .args(["-ww", "-eo", "args"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&ps.stdout)
+            .lines()
+            .any(|l| l.contains("victauri-run-watch") && l.contains(&format!(" {app_pid} ")))
+    }
+    let t = Temp::new();
+    let cap = t.path("c.jsonl");
+    let pid_file = t.path("pid");
+    let argv = t.script(
+        "app",
+        "",
+        &format!("echo $$ > '{}'\nsleep 3\nexit 0\n", pid_file.display()),
+    );
+    let mut args = vec!["run", "--capture", cap.to_str().unwrap(), "--"];
+    args.extend(argv.iter().map(String::as_str));
+    let mut launcher = KillOnDrop(
+        t.victauri(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let app_pid = wait_for_pid(&pid_file);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !helper_listed(app_pid) {
+        assert!(Instant::now() < deadline, "the helper is not running");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(launcher.0.wait().unwrap().success());
+    assert!(!helper_listed(app_pid), "the helper outlived the app");
+}
+
 /// The job object is only for a launcher that DIES: something the app deliberately left running
 /// when it exited normally (a dev server, a daemon) is not ours to kill.
 #[test]
