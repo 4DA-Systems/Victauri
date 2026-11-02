@@ -92,5 +92,77 @@
     return rows;
   }
 
-  window.__hitFixtures = { run };
+  // Thin strokes: the point a trusted click would use must be on the stroke in the pixel the click
+  // is delivered to (the native side truncates x * devicePixelRatio). The page cannot send an OS
+  // click, so it asks the engine what is at that pixel's coordinate, where the event hit-tests.
+  function thin() {
+    const NS = "http://www.w3.org/2000/svg";
+    const layer = document.createElement("div");
+    layer.id = "hf-layer";
+    const svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("width", "700");
+    svg.setAttribute("height", "500");
+    layer.appendChild(svg);
+    document.body.appendChild(layer);
+    const ratio = window.devicePixelRatio || 1;
+    const out = { ok: 0, missed: 0, refused: 0, first_miss: null };
+    try {
+      for (let i = 0; i < 120; i++) {
+        const c = document.createElementNS(NS, "circle");
+        c.setAttribute("cx", String(40 + (i % 10) * 65 + ((0.37 * i) % 1)));
+        c.setAttribute("cy", String(40 + Math.floor(i / 10) * 38 + ((0.61 * i) % 1)));
+        c.setAttribute("r", String(9 + (i % 9)));
+        c.setAttribute("fill", "none");
+        c.setAttribute("stroke", "black");
+        c.setAttribute("stroke-width", "1");
+        svg.appendChild(c);
+        const point = window.__VICTAURI__.hitPoint(c, true);
+        if (point.error) {
+          out.refused++;
+        } else {
+          const x = Math.trunc(point.x * ratio) / ratio;
+          const y = Math.trunc(point.y * ratio) / ratio;
+          if (document.elementFromPoint(x, y) === c) out.ok++;
+          else {
+            out.missed++;
+            out.first_miss = out.first_miss || { point, x, y };
+          }
+        }
+        c.remove();
+      }
+    } finally {
+      layer.remove();
+    }
+    return out;
+  }
+
+  // A button in a same-origin frame with the given styles on the frame, and on a wrapper around it.
+  // Returns the button's ref, for the trusted click probe. No inline style attributes: see the CSS.
+  function frame(frameStyle, wrapperStyle) {
+    frameClean();
+    const wrapper = document.createElement("div");
+    wrapper.id = "hf-frame-wrapper";
+    wrapper.style.cssText = "position:fixed;left:40px;top:40px;width:320px;height:320px;z-index:2147483647";
+    wrapper.style.cssText += wrapperStyle || "";
+    const f = document.createElement("iframe");
+    f.style.cssText = "border:0;width:300px;height:300px;background:#fff;" + (frameStyle || "");
+    wrapper.appendChild(f);
+    document.body.appendChild(wrapper);
+    const d = f.contentDocument;
+    const b = d.createElement("button");
+    b.id = "hf-framed";
+    b.textContent = "hf framed button";
+    b.style.cssText = "position:absolute;left:100px;top:100px;width:60px;height:40px";
+    d.body.appendChild(b);
+    return window.__VICTAURI__.findElements({ tag: "button", text: "hf framed button" })[0].ref_id;
+  }
+  function frameClean() {
+    const old = document.getElementById("hf-frame-wrapper");
+    if (old) old.remove();
+  }
+  function supportsZoom() {
+    return typeof CSS !== "undefined" && CSS.supports("zoom", "2");
+  }
+
+  window.__hitFixtures = { run, thin, frame, frameClean, supportsZoom };
 })();
