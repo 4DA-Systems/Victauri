@@ -622,7 +622,7 @@ pub fn trusted_focus_probe_js(ref_id: &str) -> String {
 /// through same-origin frames,
 /// adding each frame's content offset and requiring the point to stay inside every
 /// viewport on the way and the frame itself to be the element hit there. Layout is page
-/// data, so the native side clamps the point to the window's client area as well.
+/// data, so the native side refuses a point outside the window's client area as well.
 ///
 /// The walk can only add offsets. A frame that is scaled, rotated or zoomed, on itself or on an
 /// ancestor, or a pinch-zoomed page, moves its content somewhere those offsets do not reach, and

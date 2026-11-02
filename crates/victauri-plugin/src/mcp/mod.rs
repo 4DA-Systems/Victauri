@@ -605,6 +605,10 @@ pub struct VictauriMcpHandler {
     /// The nonce of the page that last answered in each window: a page answering with another is
     /// a new page, and with the same one has not left.
     page_nonces: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// One native navigation at a time. A recovery's detour makes the window read as outside the app,
+    /// so a second call would report success on a page still stuck; and one resuming a paused process
+    /// would let its page answer the other's question, and be ended for it.
+    native_navigation: Arc<tokio::sync::Mutex<()>>,
     /// The origins a bridge has answered on (see `is_app_url`).
     answered_origins: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per window, the last URL seen inside the app before a native navigation.
@@ -4880,6 +4884,7 @@ impl VictauriMcpHandler {
             file_read_timeout: READ_APP_FILE_TIMEOUT,
             answered_windows: Arc::default(),
             page_nonces: Arc::default(),
+            native_navigation: Arc::default(),
             answered_origins: Arc::default(),
             last_app_urls: Arc::default(),
         }
@@ -5439,6 +5444,7 @@ impl VictauriMcpHandler {
         url: &str,
         label: Option<&str>,
     ) -> Result<NativeNavigation, String> {
+        let _one_at_a_time = self.native_navigation.lock().await;
         if let Some(current) = self.read_back_window(label)
             && self.is_app_url(&current.url)
         {
@@ -5771,6 +5777,7 @@ impl VictauriMcpHandler {
             return tool_error(error);
         };
         // The probe behind `error` already said the page is not answering.
+        let _one_at_a_time = self.native_navigation.lock().await;
         let navigation = match self.recover_stopped_page(label, &target).await {
             Ok(navigation) if navigation.answers => navigation,
             Ok(navigation) => return tool_error(navigation.not_answering_message(&target)),

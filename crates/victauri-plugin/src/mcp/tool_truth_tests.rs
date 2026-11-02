@@ -712,6 +712,31 @@ async fn the_process_of_a_window_that_answers_is_not_ended() {
     assert_eq!(*bridge.sibling_answers.lock().unwrap(), Some(true));
 }
 
+/// Two calls at once on a stuck page: the second waits for the first, so it cannot report success on
+/// the strength of the first one's detour, and nothing is ended twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn navigations_at_once_take_turns() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    *bridge.web_processes.lock().unwrap() = vec![(22, 100_000)];
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.stays_dead.store(true, Ordering::SeqCst);
+    let target = json!({"action": "go_to", "url": "http://tauri.localhost/index.html"});
+    let (first, second) = tokio::join!(
+        call(&h, "navigate", target.clone()),
+        call(&h, "navigate", target.clone())
+    );
+    assert_eq!(ok_json(&first)["ok"], true);
+    assert_eq!(ok_json(&second)["ok"], true);
+    assert_eq!(*bridge.ended.lock().unwrap(), vec![22]);
+    assert_eq!(*bridge.paused.lock().unwrap(), vec![22]);
+}
+
 /// A process ended is not resumed: it is gone, and its pid may not be its own for long.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_process_that_was_ended_is_not_resumed() {

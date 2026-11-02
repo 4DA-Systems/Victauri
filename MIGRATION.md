@@ -106,8 +106,8 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
 - **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
   `/health` first and replaces that history entry, and `go_back` returns `{ok, recovered, url, note}`.
   Going to a page inside the app, both now report success only once a new page answers there, and are
-  errors otherwise, which can take about 30 s. `go_to` from a page that answers still reports `ok` once the
-  navigation is sent. On Linux, if the main thread of one web process spun
+  errors otherwise, which can take about 30 s. `go_to` from a page that answers, or from one outside the app, still reports `ok` once
+  the navigation is sent. Native navigations take turns, so a second call can wait out the first. On Linux, if the main thread of one web process spun
   throughout and every other window that has answered still answers with that process paused, that process
   is ended to get off the page (about 15 s, with a logged warning), and the result says `ended_web_process:
   <pid>` with a note. A page that was only slow looks the same, so its work is lost. Profiles that may not
