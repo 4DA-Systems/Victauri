@@ -744,7 +744,7 @@ async fn follow_stdout_via_app(
             }
         }
         // The app outlived its launcher: nothing more reaches the capture.
-        if let Some(note) = page["launcher_gone"]["note"].as_str() {
+        if let Some(note) = launcher_gone_note(&page, capture_path.as_deref()) {
             eprintln!("victauri logs: {}", clean(note));
             return Ok(());
         }
@@ -763,6 +763,13 @@ async fn follow_stdout_via_app(
             tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
         }
     }
+}
+
+/// What the app says of a killed launcher, believed only of a capture `victauri run` named itself:
+/// one elsewhere is a `--capture` file, which has no launcher to speak of, and a follow ends on this.
+fn launcher_gone_note<'a>(page: &'a Value, capture_path: Option<&Path>) -> Option<&'a str> {
+    capture_path?;
+    page["launcher_gone"]["note"].as_str()
 }
 
 /// Read (and with `--follow`, tail) a console capture file directly from disk.
@@ -1037,6 +1044,20 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launcher_note_counts_only_for_a_capture_of_our_own() {
+        let page = json!({"launcher_gone": {"note": "killed"}});
+        assert_eq!(launcher_gone_note(&page, None), None);
+        assert_eq!(
+            launcher_gone_note(&page, Some(Path::new("c.jsonl"))),
+            Some("killed")
+        );
+        assert_eq!(
+            launcher_gone_note(&json!({}), Some(Path::new("c.jsonl"))),
+            None
+        );
+    }
 
     /// A launcher writes its exit record and is gone: read before asking, that moment reported a
     /// kill and lost the real exit. Whatever it wrote before it was seen dead is in the read.

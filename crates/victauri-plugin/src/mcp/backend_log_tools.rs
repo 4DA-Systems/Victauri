@@ -334,8 +334,11 @@ impl VictauriMcpHandler {
                     "path": path.to_string_lossy(),
                 });
                 if !(total > limit || read.more)
-                    && let Some(pid) =
-                        backend_logs::launcher_gone(&path, backend_logs::process_is_dead)
+                    && let Some(pid) = backend_logs::launcher_gone(
+                        &path,
+                        backend_logs::console_launcher_pid(),
+                        backend_logs::process_is_dead,
+                    )
                 {
                     out["launcher_gone"] = serde_json::json!({
                         "pid": pid,

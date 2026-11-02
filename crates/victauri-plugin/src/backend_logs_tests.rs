@@ -1032,21 +1032,28 @@ fn a_capture_says_when_its_launcher_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("4242-1730000000000.jsonl");
     std::fs::write(&path, capture_record(0, "line")).unwrap();
-    assert_eq!(launcher_gone(&path, |pid| pid == 4242), Some(4242));
     assert_eq!(
-        launcher_gone(&path, |_| false),
+        launcher_gone(&path, Some(4242), |pid| pid == 4242),
+        Some(4242)
+    );
+    assert_eq!(
+        launcher_gone(&path, Some(4242), |_| false),
         None,
         "the launcher is alive"
     );
 
     let exit = "{\"t\":9,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n";
     std::fs::write(&path, format!("{}{exit}", capture_record(0, "line"))).unwrap();
-    assert_eq!(launcher_gone(&path, |_| true), None, "it said how it ended");
+    assert_eq!(
+        launcher_gone(&path, Some(4242), |_| true),
+        None,
+        "it said how it ended"
+    );
 
-    // A `--capture` file has no pid in its name.
-    let named = dir.path().join("my-capture.jsonl");
+    // A `--capture` file's launcher does not say: a name that looks like a pid is not one.
+    let named = dir.path().join("20261102-120000.jsonl");
     std::fs::write(&named, capture_record(0, "line")).unwrap();
-    assert_eq!(launcher_gone(&named, |_| true), None);
+    assert_eq!(launcher_gone(&named, None, |_| true), None);
 }
 
 /// An exit record carries up to 12 stderr lines of 64 KiB: the tail read must hold all of it.
@@ -1057,7 +1064,7 @@ fn a_long_exit_record_is_seen_as_one() {
     let tail: Vec<String> = (0..12).map(|_| "x".repeat(64 * 1024)).collect();
     let exit = serde_json::json!({"t": 9, "s": "exit", "l": "crashed", "tail": tail});
     std::fs::write(&path, format!("{}{exit}\n", capture_record(0, "line"))).unwrap();
-    assert_eq!(launcher_gone(&path, |_| true), None);
+    assert_eq!(launcher_gone(&path, Some(4242), |_| true), None);
 }
 
 /// On Linux, a real process: a zombie its parent has not reaped is gone too.

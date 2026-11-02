@@ -1884,6 +1884,16 @@ pub fn trim_backtrace(raw: &str) -> String {
 /// the app's stdout/stderr lines to.
 pub const CONSOLE_CAPTURE_ENV: &str = "VICTAURI_CONSOLE_LOG";
 
+/// Environment variable `victauri run` sets on the app when it named the capture itself: its own
+/// pid. A `--capture` file gets none: nothing in its name is ours to read.
+pub const CONSOLE_LAUNCHER_ENV: &str = "VICTAURI_CONSOLE_LAUNCHER";
+
+/// The pid of the `victauri run` this app was started under, when it said.
+#[must_use]
+pub fn console_launcher_pid() -> Option<u32> {
+    std::env::var(CONSOLE_LAUNCHER_ENV).ok()?.parse().ok()
+}
+
 /// Path of the out-of-process console capture, when the app runs under `victauri run`.
 #[must_use]
 pub fn console_capture_path() -> Option<std::path::PathBuf> {
@@ -1925,14 +1935,15 @@ const EXIT_RECORD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The pid of the `victauri run` that wrote the capture at `path`, when that process is gone and
 /// the capture does not say how the app ended: it was killed outright. Then nothing more will reach
-/// the capture, though this app lives on. The pid comes from the capture's name (`<pid>-<ms>.jsonl`);
-/// a `--capture` file's name holds none.
+/// the capture, though this app lives on. `launcher` is [`console_launcher_pid`].
 #[must_use]
-pub fn launcher_gone(path: &std::path::Path, is_dead: impl Fn(u32) -> bool) -> Option<u32> {
-    let name = path.file_name()?.to_str()?;
-    let (pid, ms) = name.strip_suffix(".jsonl")?.split_once('-')?;
-    let pid: u32 = pid.parse().ok()?;
-    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) || !is_dead(pid) {
+pub fn launcher_gone(
+    path: &std::path::Path,
+    launcher: Option<u32>,
+    is_dead: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let pid = launcher?;
+    if !is_dead(pid) {
         return None;
     }
     let (lines, _, _) =
