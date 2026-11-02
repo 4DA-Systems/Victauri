@@ -19,8 +19,8 @@
 
 const fs = require("fs");
 const { JSDOM } = require("jsdom");
-const { fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
-const { implForWrapper } = require("jsdom/lib/jsdom/living/generated/utils.js");
+const { createAnEvent, fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
+const { implForWrapper, wrapperForImpl } = require("jsdom/lib/jsdom/living/generated/utils.js");
 const MouseEventIface = require("jsdom/lib/jsdom/living/generated/MouseEvent.js");
 const EventIface = require("jsdom/lib/jsdom/living/generated/Event.js");
 const { fireAPageTransitionEvent } = require("jsdom/lib/jsdom/living/helpers/page-transition-event.js");
@@ -330,8 +330,13 @@ async function run() {
     };
 
     // Dispatch a TRUSTED bubbling event, as the browser does for an animation event.
-    window.__vtestTrustedEvent = function (el, type) {
-      fireAnEvent(type, implForWrapper(el), EventIface, { bubbles: true });
+    // `props`: fields of the event's real interface jsdom does not have (AnimationEvent's
+    // animationName, TransitionEvent's propertyName, pseudoElement).
+    window.__vtestTrustedEvent = function (el, type, props) {
+      const target = implForWrapper(el);
+      const event = createAnEvent(type, target._globalObject, EventIface, { bubbles: true });
+      if (props) Object.assign(wrapperForImpl(event), props);
+      target._dispatch(event);
     };
 
     // Dispatch a TRUSTED pagehide / pageshow on the window, as the browser does on a real

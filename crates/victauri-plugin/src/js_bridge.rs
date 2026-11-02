@@ -790,17 +790,38 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // A regex that can hang the page, told apart before it runs. JavaScript has no regex timeout,
     // and a rule's regex runs on the main thread against every request URL. What backtracks
-    // exponentially is a repetition with more than one way to divide the same text between its
-    // iterations: `(a+)+`, `(a|aa)+`, `(a+b*)+`. So the pattern is parsed down to its atoms, and
-    // each repeated group is refused if two neighbouring atoms, one of them of variable length, can
-    // take the same character (the last and first atoms of an iteration are neighbours too), or if
-    // two of its branches can start alike. `(/\w+)+` is not: `/` cannot be taken by `\w+`.
+    // exponentially is a repetition with two different ways to take the same text from one state
+    // back to itself (`(a+)+`, `(a|aa)+`, `(x(a|a)y)+`, `(a+b*)+`). That is a property of the
+    // pattern's automaton, so it is asked of the automaton. Each outermost repeated group is parsed
+    // to its positions (the atoms, each with the characters it takes) and the steps between them,
+    // counting the ways a step can be made. It is refused if a step between two positions can be
+    // made in two ways, or if two positions reached from one position on the same character can
+    // arrive at one position on the same text: every position of a repeated group can reach every
+    // other, so that is a loop with two paths. Everything else takes each text one way only:
+    // `(/\w+(-\w+)*)+`, `(api|app)+`, `(a|ab)+`.
     //
-    // This is star height, not a proof. It does not catch what is polynomial rather than exponential
-    // outside a repeated group (`.*.*.*.*x`), and it refuses a few patterns that are harmless
-    // (`(ab|ac)+`, whose branches start alike).
+    // It errs one way. A counted group counts as repeating without limit, `\b` and lookaround as
+    // always passing, a backreference as any text, and a repeated group that can match nothing is
+    // refused outright, so `(a+){2}`, `(\w+\b)+` and `(a|)+` are refused though they are not
+    // exponential. It says nothing about what is slow without a repeated group (`.*.*.*.*x`,
+    // `a?a?a?...aaa`). A pattern too large to analyse in the step budget is refused.
     function parseRegexShape(src) {
         var i = 0, n = src.length;
+        // `\k<` is a reference only in a pattern with named groups; otherwise it is the letter k.
+        var named = false;
+        for (var s = 0; s < n && !named; s++) {
+            if (src[s] === '\\') s++;
+            else if (src[s] === '[') {
+                for (s++; s < n && src[s] !== ']'; s++) { if (src[s] === '\\') s++; }
+            } else if (src[s] === '(' && src[s + 1] === '?' && src[s + 2] === '<' && src[s + 3] !== '=' && src[s + 3] !== '!') named = true;
+        }
+        function hexAt(at, len) {
+            for (var k = 0; k < len; k++) {
+                var h = src[at + k];
+                if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) return false;
+            }
+            return true;
+        }
         function skipTo(c) { while (i < n && src[i] !== c) i++; i++; }
         function quantifier(atom) {
             var c = src[i], min, max;
@@ -822,17 +843,36 @@ const INIT_SCRIPT_BODY: &str = r#"
             atom.min = min;
             atom.max = max;
         }
-        function atom() {
-            var start = i, c = src[i++], made = { min: 1, max: 1, start: start };
+        // A rule's regex is compiled with no flags, so what changes how an atom matches is an
+        // inline modifier: `(?i:a)` takes A too, `(?s:.)` takes a newline.
+        function withModifiers(flags, mods) {
+            var on = true, out = flags;
+            for (var k = 0; k < mods.length; k++) {
+                var f = mods[k];
+                if (f === '-') { on = false; continue; }
+                if (f !== 'i' && f !== 's') continue;
+                var has = REFLECT_APPLY(STR_INDEXOF, out, [f]) !== -1;
+                if (on && !has) out += f;
+                else if (!on && has) out = out === f ? '' : (f === 'i' ? 's' : 'i');
+            }
+            return out;
+        }
+        function atom(flags) {
+            var start = i, c = src[i++], made = { min: 1, max: 1, start: start, flags: flags };
             if (c === '(') {
+                var inner = flags;
                 if (src[i] === '?') {
                     var d = src[i + 1];
                     if (d === '=' || d === '!') { made.zero = true; i += 2; }
                     else if (d === '<' && (src[i + 2] === '=' || src[i + 2] === '!')) { made.zero = true; i += 3; }
                     else if (d === '<') skipTo('>');
-                    else skipTo(':');
+                    else {
+                        var from = ++i;
+                        skipTo(':');
+                        inner = withModifiers(flags, REFLECT_APPLY(STR_SUBSTRING, src, [from, i - 1]));
+                    }
                 }
-                made.alts = alternatives();
+                made.alts = alternatives(inner);
                 i++; // the `)`
                 return made;
             }
@@ -842,24 +882,36 @@ const INIT_SCRIPT_BODY: &str = r#"
             } else if (c === '^' || c === '$') {
                 made.zero = true;
             } else if (c === '\\') {
+                // An escape that is not well formed is the character itself, and whatever follows
+                // it is still pattern: `\x(a+)+` is an x and then a repeated group.
                 var e = src[i++];
                 if (e === 'b' || e === 'B') made.zero = true;
                 else if (e >= '1' && e <= '9') {
                     while (src[i] >= '0' && src[i] <= '9') i++;
                     made.any = true; // a backreference: any text, of any length
-                } else if (e === 'k' && src[i] === '<') { skipTo('>'); made.any = true; }
-                else if (e === 'x') i += 2;
-                else if (e === 'u') { if (src[i] === '{') skipTo('}'); else i += 4; }
-                else if (e === 'c') i += 1;
+                } else if (e === '0') {
+                    // A legacy octal escape is one character: `\012` is a newline.
+                    for (var o = 0; o < 2 && src[i] >= '0' && src[i] <= '7'; o++) i++;
+                } else if (e === 'k') {
+                    if (named && src[i] === '<') { skipTo('>'); made.any = true; }
+                } else if (e === 'x') {
+                    if (hexAt(i, 2)) i += 2;
+                } else if (e === 'u') {
+                    if (hexAt(i, 4)) i += 4; // `\u{` is `u` and a brace: there is no `u` flag here
+                } else if (e === 'c') {
+                    var l = src[i];
+                    if ((l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z')) i++;
+                    else { i--; made.text = '\\\\'; return made; } // a backslash, and `c` is the next atom
+                }
             }
             made.text = REFLECT_APPLY(STR_SUBSTRING, src, [start, i]);
             return made;
         }
-        function alternatives() {
+        function alternatives(flags) {
             var alts = [[]];
             while (i < n && src[i] !== ')') {
                 if (src[i] === '|') { i++; alts[alts.length] = []; continue; }
-                var made = atom();
+                var made = atom(flags);
                 quantifier(made);
                 made.end = i;
                 var seq = alts[alts.length - 1];
@@ -867,110 +919,216 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
             return alts;
         }
-        return alternatives();
+        return alternatives('');
     }
     function regexHangRisk(src) {
         var alts = parseRegexShape(src);
-        // The characters tried: ASCII, and every other character the pattern names.
-        var probes = [];
-        for (var c = 0; c < 128; c++) probes[probes.length] = String.fromCharCode(c);
-        for (var u = 0; u < src.length; u++) { if (src.charCodeAt(u) > 127) probes[probes.length] = src[u]; }
-        probes[probes.length] = '\u00e9';
-        probes[probes.length] = '\u2028';
+        var budget = 4000000;
+        var REFUSE = {};
+        function spend(cost) { budget -= cost; if (budget < 0) throw REFUSE; }
+        // The characters tried: Latin-1, a few that sit outside any class a pattern is likely to
+        // name, and every character the pattern names (literally or as an escape, also inside a
+        // class) with its neighbours and case: two ranges that overlap share an endpoint, and
+        // two negated ones share what is just outside.
+        var probes = [], seen = Object.create(null);
+        function probe(code) {
+            if (code < 0 || code > 65535 || seen[code]) return;
+            seen[code] = true;
+            probes[probes.length] = String.fromCharCode(code);
+        }
+        function named(code) {
+            probe(code - 1); probe(code); probe(code + 1);
+            var ch = String.fromCharCode(code), up = ch.toUpperCase(), low = ch.toLowerCase();
+            if (up.length === 1) probe(up.charCodeAt(0));
+            if (low.length === 1) probe(low.charCodeAt(0));
+        }
+        for (var c = 0; c < 256; c++) probe(c);
+        var outside = [0x2028, 0x2029, 0x3000, 0xfeff, 0x4e2d, 0xd83d, 0xffff];
+        for (var w = 0; w < outside.length; w++) probe(outside[w]);
+        for (var u = 0; u < src.length; u++) {
+            var code = src.charCodeAt(u);
+            if (code > 127) named(code);
+            else if (code === 92) {
+                var len = src[u + 1] === 'x' ? 2 : (src[u + 1] === 'u' ? 4 : 0);
+                if (len) {
+                    var hex = REFLECT_APPLY(STR_SUBSTRING, src, [u + 2, u + 2 + len]), val = parseInt(hex, 16);
+                    if (hex.length === len && val === val) named(val);
+                }
+                u++;
+            }
+        }
+        var charsMemo = Object.create(null), overlapMemo = Object.create(null), charsCount = 0;
         function chars(a) {
-            if (a.chars) return a.chars;
-            var out = [], k;
-            if (a.alts) {
-                for (k = 0; k < probes.length; k++) out[k] = false;
-                a.alts.forEach(function(seq) { seq.forEach(function(sub) {
-                    if (sub.zero) return;
-                    var inner = chars(sub);
-                    for (var m = 0; m < probes.length; m++) out[m] = out[m] || inner[m];
-                }); });
-            } else if (a.any) {
-                for (k = 0; k < probes.length; k++) out[k] = true;
+            var whole = a.any ? 'any' : (a.flags + '/' + a.text);
+            var known = charsMemo[whole];
+            if (known) return known;
+            spend(probes.length);
+            var out = { id: charsCount++, on: [], live: false }, k;
+            if (a.any) {
+                for (k = 0; k < probes.length; k++) out.on[k] = true;
             } else {
                 try {
-                    var re = new REGEXP_CTOR('^(?:' + a.text + ')$');
-                    for (k = 0; k < probes.length; k++) out[k] = REFLECT_APPLY(REGEXP_TEST, re, [probes[k]]);
+                    var re = new REGEXP_CTOR('^(?:' + a.text + ')$', a.flags);
+                    for (k = 0; k < probes.length; k++) out.on[k] = REFLECT_APPLY(REGEXP_TEST, re, [probes[k]]);
                 } catch (e) {
-                    for (k = 0; k < probes.length; k++) out[k] = true;
+                    for (k = 0; k < probes.length; k++) out.on[k] = true;
                 }
             }
-            a.chars = out;
+            for (k = 0; k < probes.length; k++) { if (out.on[k]) { out.live = true; break; } }
+            charsMemo[whole] = out;
             return out;
         }
-        function overlap(a, b) {
-            var x = chars(a), y = chars(b);
-            for (var k = 0; k < x.length; k++) { if (x[k] && y[k]) return true; }
-            return false;
+        function overlap(x, y) {
+            if (x === y) return x.live;
+            var key = x.id < y.id ? x.id + ':' + y.id : y.id + ':' + x.id;
+            var known = overlapMemo[key];
+            if (known !== undefined) return known;
+            spend(probes.length);
+            var hit = false;
+            for (var k = 0; k < probes.length; k++) { if (x.on[k] && y.on[k]) { hit = true; break; } }
+            overlapMemo[key] = hit;
+            return hit;
         }
-        // An iteration's real atoms: no zero-width ones, and a plain group is its contents.
-        function flat(seq) {
-            var out = [];
-            seq.forEach(function(a) {
-                if (a.zero) return;
-                if (a.alts && a.alts.length === 1 && a.min === 1 && a.max === 1) out = out.concat(flat(a.alts[0]));
-                else out[out.length] = a;
-            });
+        // Weighted sets of positions; a weight is the ways to get there, and 2 means "several".
+        function newSet() { return { keys: [], ways: Object.create(null) }; }
+        function add(set, position, ways) {
+            if (ways === 0) return;
+            var had = set.ways[position];
+            if (had === undefined) { set.keys[set.keys.length] = position; had = 0; }
+            set.ways[position] = had + ways > 2 ? 2 : had + ways;
+        }
+        function addAll(set, from, times) {
+            spend(from.keys.length + 1);
+            for (var k = 0; k < from.keys.length; k++) add(set, from.keys[k], from.ways[from.keys[k]] * times);
+        }
+        function union(a, b, times) {
+            var out = newSet();
+            addAll(out, a, 1);
+            addAll(out, b, times);
             return out;
         }
-        function varies(a) {
-            if (a.any || a.min !== a.max) return true;
-            if (!a.alts) return false;
-            return a.alts.some(function(seq) {
-                var f = flat(seq);
-                return (a.alts.length > 1 && f.length !== 1) || f.some(varies);
-            });
-        }
-        function nullable(a) {
-            if (a.any || a.min === 0) return true;
-            return !!a.alts && a.alts.some(function(seq) { return flat(seq).every(nullable); });
-        }
-        // What can start (or, reversed, end) an iteration: up to the first atom it cannot skip.
-        function reach(seq) {
-            var out = [];
-            for (var k = 0; k < seq.length; k++) {
-                out[out.length] = seq[k];
-                if (!nullable(seq[k])) break;
-            }
-            return out;
-        }
-        function clash(a, b) { return (varies(a) || varies(b)) && overlap(a, b); }
-        function ambiguous(group) {
-            var branches = group.alts.map(flat);
-            var heads = branches.map(reach);
-            var tails = branches.map(function(seq) { return reach(seq.slice().reverse()); });
-            for (var b = 0; b < branches.length; b++) {
-                if (branches[b].every(nullable)) return true;
-                for (var other = b + 1; other < branches.length; other++) {
-                    if (heads[b].some(function(x) { return heads[other].some(function(y) { return overlap(x, y); }); })) return true;
-                }
-                for (var k = 0; k < branches[b].length; k++) {
-                    for (var l = k + 1; l < branches[b].length; l++) {
-                        if (clash(branches[b][k], branches[b][l])) return true;
-                        if (!nullable(branches[b][l])) break;
+        function ambiguousLoop(group) {
+            var positions = [], follow = [];
+            function link(last, first) {
+                spend(last.keys.length * first.keys.length + 1);
+                for (var p = 0; p < last.keys.length; p++) {
+                    var from = last.keys[p];
+                    for (var f = 0; f < first.keys.length; f++) {
+                        var to = first.keys[f];
+                        add(follow[from], to, last.ways[from] * first.ways[to]);
                     }
                 }
-                for (var next = 0; next < branches.length; next++) {
-                    if (tails[b].some(function(x) { return heads[next].some(function(y) { return clash(x, y); }); })) return true;
+            }
+            function capped(ways) { return ways > 2 ? 2 : ways; }
+            function buildAtom(a) {
+                if (a.zero || a.max === 0) return null;
+                if (a.alts) {
+                    var body = build(a.alts);
+                    if (a.max >= 2) {
+                        // An iteration that can match nothing: refused as it stands.
+                        if (body.nulls > 0) throw REFUSE;
+                        link(body.last, body.first);
+                    }
+                    return { nulls: capped(body.nulls + (a.min === 0 ? 1 : 0)), first: body.first, last: body.last };
+                }
+                var at = positions.length;
+                spend(1);
+                positions[at] = chars(a);
+                follow[at] = newSet();
+                var only = newSet();
+                add(only, at, 1);
+                // `a{2}` has one way through it; `a{1,3}` has as many as `a+`, for this purpose.
+                if (a.any || (a.min !== a.max && a.max >= 2)) add(follow[at], at, 1);
+                return { nulls: (a.any || a.min === 0) ? 1 : 0, first: only, last: only };
+            }
+            function build(list) {
+                var all = { nulls: 0, first: newSet(), last: newSet() };
+                for (var b = 0; b < list.length; b++) {
+                    var cur = { nulls: 1, first: newSet(), last: newSet() };
+                    for (var k = 0; k < list[b].length; k++) {
+                        var x = buildAtom(list[b][k]);
+                        if (!x) continue;
+                        link(cur.last, x.first);
+                        var first = cur.nulls ? union(cur.first, x.first, cur.nulls) : cur.first;
+                        var last = x.nulls ? union(x.last, cur.last, x.nulls) : x.last;
+                        cur = { nulls: capped(cur.nulls * x.nulls), first: first, last: last };
+                    }
+                    all.nulls = capped(all.nulls + cur.nulls);
+                    addAll(all.first, cur.first, 1);
+                    addAll(all.last, cur.last, 1);
+                }
+                return all;
+            }
+            if (!buildAtom(group)) return false;
+            // One step, two ways.
+            var next = [], q, k, l;
+            for (q = 0; q < positions.length; q++) {
+                next[q] = [];
+                if (!positions[q].live) continue;
+                var keys = follow[q].keys;
+                for (k = 0; k < keys.length; k++) {
+                    if (!positions[keys[k]].live) continue;
+                    if (follow[q].ways[keys[k]] > 1) return true;
+                    next[q][next[q].length] = keys[k];
+                }
+            }
+            // Two positions that one position steps to on the same character, followed on the same
+            // text until they meet (ambiguous) or cannot both go on.
+            var pending = [], done = Object.create(null), width = positions.length;
+            function pair(a, b) {
+                var key = a < b ? a * width + b : b * width + a;
+                if (done[key]) return;
+                done[key] = true;
+                pending[pending.length] = a;
+                pending[pending.length] = b;
+            }
+            for (q = 0; q < positions.length; q++) {
+                spend(next[q].length * next[q].length + 1);
+                for (k = 0; k < next[q].length; k++) {
+                    for (l = k + 1; l < next[q].length; l++) {
+                        if (overlap(positions[next[q][k]], positions[next[q][l]])) pair(next[q][k], next[q][l]);
+                    }
+                }
+            }
+            for (var head = 0; head < pending.length; head += 2) {
+                var from = next[pending[head]], to = next[pending[head + 1]];
+                spend(from.length * to.length + 1);
+                for (k = 0; k < from.length; k++) {
+                    for (l = 0; l < to.length; l++) {
+                        if (!overlap(positions[from[k]], positions[to[l]])) continue;
+                        if (from[k] === to[l]) return true;
+                        pair(from[k], to[l]);
+                    }
                 }
             }
             return false;
         }
-        function visit(list) {
+        function refused(group) {
+            try { return ambiguousLoop(group); } catch (e) {
+                if (e === REFUSE) return true;
+                throw e;
+            }
+        }
+        function visit(list, inRepeat) {
             for (var q = 0; q < list.length; q++) {
                 for (var r = 0; r < list[q].length; r++) {
-                    var a = list[q][r];
+                    var a = list[q][r], inner;
                     if (!a.alts) continue;
-                    if (!a.zero && a.max >= 2 && ambiguous(a)) return REFLECT_APPLY(STR_SUBSTRING, src, [a.start, a.end]);
-                    var inner = visit(a.alts);
+                    if (a.zero) {
+                        // Backtracking never enters a lookaround again, so it stands alone.
+                        inner = visit(a.alts, false);
+                    } else if (!inRepeat && a.max >= 2) {
+                        if (refused(a)) return REFLECT_APPLY(STR_SUBSTRING, src, [a.start, a.end]);
+                        inner = visit(a.alts, true);
+                    } else {
+                        inner = visit(a.alts, inRepeat);
+                    }
                     if (inner) return inner;
                 }
             }
             return null;
         }
-        return visit(alts);
+        return visit(alts, false);
     }
 
     function matchRoute(url, method) {
@@ -1145,6 +1303,32 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         return false;
     }
+    // The stack at the point is known and `el` is not in it: it is clipped there, not overlaid.
+    function stackOmits(el, x, y) {
+        var root = typeof el.getRootNode === 'function' ? el.getRootNode() : null;
+        return !!root && typeof root.elementsFromPoint === 'function' && !stackHolds(el, x, y);
+    }
+    // An OS click lands on a whole device pixel: the native side truncates x * devicePixelRatio, and
+    // the engine hit-tests the event at exactly that coordinate. So a strict point is moved to it
+    // BEFORE it is tested, or a 1 px stroke tests true at 70.8 and the click lands on 70, in empty
+    // space. A point inside the pixel will not do: SVG geometry is hit-tested to the fraction, and
+    // 213.25 was on a stroke that 213 missed. A hair above it only where the division would not
+    // survive the native multiply. A frame's fractional offset can still move it: the probe adds it.
+    function snapAxis(v, r) {
+        var px = Math.floor(v * r), at = px / r;
+        return Math.trunc(at * r) === px ? at : (px + 0.001) / r;
+    }
+    function snapToPixel(win, p) {
+        var r = win.devicePixelRatio > 0 ? win.devicePixelRatio : 1;
+        return { x: snapAxis(p.x, r), y: snapAxis(p.y, r) };
+    }
+    // The nearest control around `el`, across shadow boundaries.
+    function operableAncestor(el) {
+        for (var n = el.assignedSlot || el.parentNode || el.host, g = 0; n && g < 64; n = n.assignedSlot || n.parentNode || n.host, g++) {
+            if (n.nodeType === 1 && isOperableControl(n)) return n;
+        }
+        return null;
+    }
     // Would a real click at the point reach `el`? Only the browser can say: `elementFromPoint`
     // honours clipping, `clip-path`, pseudo-elements and z-order. `strict` is for an OS click,
     // which lands on what is hit: it must be `el` or inside it.
@@ -1188,8 +1372,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         return found;
     }
+    function visibleCentre(rect, vw, vh) {
+        var left = Math.max(rect.left, 0), top = Math.max(rect.top, 0);
+        return { x: (left + Math.min(rect.right, vw)) / 2, y: (top + Math.min(rect.bottom, vh)) / 2 };
+    }
     // The first real point of `el` that a click would reach: along its outline, the centre of every
-    // line box, a 5x5 grid over its box, then what its descendants paint outside it.
+    // line box, a 5x5 grid over its box, what its descendants paint outside it, then the middle of
+    // what is inside the viewport (a sliver of a box hanging off the edge falls between the grid).
     function sampledPoint(doc, win, el, rect, strict) {
         var vw = win.innerWidth || doc.documentElement.clientWidth;
         var vh = win.innerHeight || doc.documentElement.clientHeight;
@@ -1208,8 +1397,9 @@ const INIT_SCRIPT_BODY: &str = r#"
             var b = kids[k].getBoundingClientRect();
             at[at.length] = { x: b.left + b.width / 2, y: b.top + b.height / 2 };
         }
+        at[at.length] = visibleCentre(rect, vw, vh);
         for (var i = 0; i < at.length; i++) {
-            var p = at[i];
+            var p = strict ? snapToPixel(win, at[i]) : at[i];
             if (p.x >= 0 && p.y >= 0 && p.x < vw && p.y < vh && pointReaches(doc, el, p.x, p.y, strict)) return p;
         }
         return null;
@@ -1234,7 +1424,14 @@ const INIT_SCRIPT_BODY: &str = r#"
         var rect = el.getBoundingClientRect();
         // An empty `<a>` around an absolute or floated child has no box of its own, and is clickable.
         if (rect.width === 0 && rect.height === 0 && !boxedDescendants(el).length) return { error: 'element has zero size', hint: 'RETRY_LATER' };
-        if (cs.pointerEvents === 'none') return { error: 'element has pointer-events: none', hint: 'RETRY_LATER' };
+        if (cs.pointerEvents === 'none') {
+            // An icon or label inside a button is commonly `pointer-events: none`, so clicks go to
+            // the button. A user clicking it operates the button, so the button is what must be
+            // reachable. An OS click lands on the button, never on `el`: strict stays refused.
+            var control = strict ? null : operableAncestor(el);
+            if (control && win.getComputedStyle(control).pointerEvents !== 'none') return hitPoint(control, false);
+            return { error: 'element has pointer-events: none', hint: 'RETRY_LATER' };
+        }
         var vw = win.innerWidth || doc.documentElement.clientWidth;
         var vh = win.innerHeight || doc.documentElement.clientHeight;
         if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
@@ -1251,25 +1448,41 @@ const INIT_SCRIPT_BODY: &str = r#"
         // element in a web component (Lit, Shoelace, Ionic, ...) read as "covered by <host>".
         var topEl = deepElementFromPoint(doc, cx, cy);
         // An ancestor at the point is either really on top, or `el` is scrolled out of a scroll
-        // container (the container is then what is hit). Scroll once before calling it covered.
-        if (hitCovers(topEl, el) && composedContains(topEl, el) && typeof el.scrollIntoView === 'function') {
+        // container (the container is then what is hit). Something else on top, with `el` absent
+        // from the whole stack there, means `el` is clipped by a container and what is hit is what
+        // lies below that container. Scroll once before calling either covered. Present in the
+        // stack, it is overlaid, and scrolling would not help.
+        if (hitCovers(topEl, el) && typeof el.scrollIntoView === 'function'
+            && (composedContains(topEl, el) || stackOmits(el, cx, cy))) {
             el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
             rect = el.getBoundingClientRect();
             cx = rect.left + rect.width / 2;
             cy = rect.top + rect.height / 2;
             topEl = deepElementFromPoint(doc, cx, cy);
         }
-        // Nothing at all at the centre: it is outside the viewport.
-        if (strict ? pointReaches(doc, el, cx, cy, true) : (!topEl || pointReaches(doc, el, cx, cy, false))) {
-            return { x: cx, y: cy };
+        // Nothing at all at a centre outside the viewport says nothing about what is inside it.
+        // Inside it, nothing at all means the engine has no layout to ask.
+        var outside = cx < 0 || cy < 0 || cx >= vw || cy >= vh;
+        var centre = strict ? snapToPixel(win, { x: cx, y: cy }) : { x: cx, y: cy };
+        if (strict ? pointReaches(doc, el, centre.x, centre.y, true) : ((!topEl && !outside) || pointReaches(doc, el, cx, cy, false))) {
+            return centre;
         }
         // The centre is not on `el`. Ask the browser about points that are. An ancestor at the
         // centre says nothing (`el` may have a hole there, or be clipped to a corner), and neither
         // does anything at the centre of a shape that does not paint it. A sibling at the centre of
         // anything else is cover.
-        if (!topEl || composedContains(topEl, el) || paintsOffCentre(el, rect)) {
+        if (!topEl || composedContains(topEl, el) || paintsOffCentre(el, rect)
+            || (strict && pointReaches(doc, el, cx, cy, true))) {
             var found = sampledPoint(doc, win, el, rect, strict);
             if (found) return found;
+        }
+        // Name what is on the part a user can see, not a point outside the window.
+        if (!topEl && outside) {
+            var seen = visibleCentre(rect, vw, vh);
+            topEl = deepElementFromPoint(doc, seen.x, seen.y);
+            if (!topEl) return { error: 'element has no visible part a click can reach: its centre is outside the viewport', hint: 'RETRY_LATER' };
+            cx = seen.x;
+            cy = seen.y;
         }
         var tag = topEl && topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
         var info = tag;
@@ -3197,28 +3410,57 @@ const INIT_SCRIPT_BODY: &str = r#"
     // Seeking a paused animation through its delay, its iterations or its end fires the page's own
     // animation events (a toast removes itself, a route transition completes) for what is only a
     // scrub. This capture listener is the bridge's, so it runs before any the page adds, and stops
-    // those events for the scrubbed target until two frames after the restore: events are dispatched
-    // in the frame after the seek. Synthetic events and other elements are the page's business.
+    // those events until two frames after the restore: events are dispatched in the frame after the
+    // seek. Only the events of the animations being held: the same name or property on the target,
+    // not on a pseudo-element. An end when one has really finished passes: a seek stops short of the
+    // end and leaves it paused, so that is its natural end, unless the restore finished it again
+    // because it had already ended for the page. So does a cancel, which a seek cannot cause.
+    //
+    // What this cannot tell apart: an animation added in the same task as the prepare loses its
+    // `animationstart`, an iteration or start crossed in the two frames after a resume is stopped
+    // with the rest, and an end queued just before the prepare reads as already ended.
     var SCRUB_EVENTS = ['animationstart', 'animationend', 'animationiteration', 'animationcancel',
         'transitionrun', 'transitionstart', 'transitionend', 'transitioncancel'];
     var scrubQuiet = [];
+    function scrubCaused(hold, e) {
+        if (e.pseudoElement) return false;
+        var transition = REFLECT_APPLY(STR_INDEXOF, e.type, ['transition']) === 0;
+        var ended = e.type === 'animationend' || e.type === 'transitionend';
+        var cancelled = e.type === 'animationcancel' || e.type === 'transitioncancel';
+        for (var i = 0; i < hold.anims.length; i++) {
+            var a = hold.anims[i];
+            if (transition ? a.transitionProperty !== e.propertyName : a.animationName !== e.animationName) continue;
+            if (ended && a.playState === 'finished' && hold.saved[i].state !== 'finished') return false;
+            if (cancelled && a.playState === 'idle') return false;
+            return true;
+        }
+        return false;
+    }
     function quietScrubEvent(e) {
         if (!scrubQuiet.length || e.isTrusted !== true) return;
         for (var i = 0; i < scrubQuiet.length; i++) {
-            if (scrubQuiet[i].el === e.target) { e.stopImmediatePropagation(); return; }
+            if (scrubQuiet[i].el === e.target && scrubCaused(scrubQuiet[i], e)) { e.stopImmediatePropagation(); return; }
         }
     }
     function listenForScrubEvents(target) {
         for (var i = 0; i < SCRUB_EVENTS.length; i++) target.addEventListener(SCRUB_EVENTS[i], quietScrubEvent, true);
     }
     listenForScrubEvents(window);
-    // These events are not composed: from inside a shadow tree they never reach the window.
-    function holdScrubEvents(el) {
-        var hold = { el: el, root: null };
+    // These events are not composed: from inside a shadow tree they never reach the window. Two
+    // holds can share a root (the next scrub starts inside the last one's release), so it is counted.
+    var scrubRoots = [];
+    function holdScrubEvents(el, anims, saved) {
+        var hold = { el: el, root: null, anims: anims, saved: saved, finish_handlers: [] };
         var root = typeof el.getRootNode === 'function' ? el.getRootNode() : null;
         if (root && root !== el.ownerDocument && root.host) {
             hold.root = root;
-            listenForScrubEvents(root);
+            var known = null;
+            for (var i = 0; i < scrubRoots.length; i++) { if (scrubRoots[i].root === root) known = scrubRoots[i]; }
+            if (known) known.holds++;
+            else {
+                scrubRoots[scrubRoots.length] = { root: root, holds: 1 };
+                listenForScrubEvents(root);
+            }
         }
         scrubQuiet[scrubQuiet.length] = hold;
         return hold;
@@ -3231,8 +3473,16 @@ const INIT_SCRIPT_BODY: &str = r#"
             for (var i = 0; i < scrubQuiet.length; i++) {
                 if (scrubQuiet[i] === hold) { removeAt(scrubQuiet, i); break; }
             }
-            if (hold.root) {
+            for (var h = 0; h < hold.finish_handlers.length; h++) {
+                var quiet = hold.finish_handlers[h];
+                if (quiet.anim.onfinish === null) quiet.anim.onfinish = quiet.handler;
+            }
+            if (!hold.root) return;
+            for (var r = 0; r < scrubRoots.length; r++) {
+                if (scrubRoots[r].root !== hold.root || --scrubRoots[r].holds > 0) continue;
+                removeAt(scrubRoots, r);
                 for (var k = 0; k < SCRUB_EVENTS.length; k++) hold.root.removeEventListener(SCRUB_EVENTS[k], quietScrubEvent, true);
+                break;
             }
         }
         requestAnimationFrame(function() { requestAnimationFrame(release); });
@@ -3363,6 +3613,30 @@ const INIT_SCRIPT_BODY: &str = r#"
     // `installSweepRecorder` superseded the agent's armed recorder, `readSweep(true)` erased what
     // it had recorded, and `scrubPrepare` / `scrubSeek` / `scrubRestore` paused, moved and
     // resumed the page's animations under the agent. `listAnimations` stays public (read-only).
+    //
+    // Back to the recorded time and state. A bare `play()` after seeking to the end rewinds and
+    // REPLAYS the animation, and starts one the app had paused. Finishing one again queues its
+    // `finish` event once more, and there is no way to finish it without: `onfinish` is kept off
+    // until the event has gone, but a listener added with `addEventListener('finish')` hears it.
+    function restoreScrub(S, resume) {
+        if (resume) {
+            S.anims.forEach(function(a, i) {
+                try {
+                    var was = S.saved[i];
+                    if (was.time !== null) a.currentTime = was.time;
+                    if (was.state === 'running') a.play();
+                    else if (was.state === 'finished') {
+                        if (a.onfinish) {
+                            S.hold.finish_handlers[S.hold.finish_handlers.length] = { anim: a, handler: a.onfinish };
+                            a.onfinish = null;
+                        }
+                        a.finish();
+                    }
+                } catch (e) {}
+            });
+        }
+        releaseScrubEvents(S.hold);
+    }
     ASSIGN(AGENT_OPS, {
         // ── Deterministic animation scrubbing ────────────────────────────────
         // Pause the target's WAAPI animations and hold state across calls so the
@@ -3394,11 +3668,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
             var ends = anims.map(function(a) { return a.effect.getComputedTiming().endTime; });
             var duration = Math.max.apply(null, ends);
+            // A scrub replaced without a restore gets one: its target goes back to the page, as it
+            // was. First, or a second prepare of one target records the first one's pause as the
+            // state to put back.
+            if (scrubState) { restoreScrub(scrubState, true); scrubState = null; }
             // What restore must put back. Read before pausing, or every animation reads paused.
             var saved = anims.map(function(a) { return { time: a.currentTime, state: a.playState }; });
-            // A scrub replaced without a restore leaves that target to the page again.
-            if (scrubState) releaseScrubEvents(scrubState.hold);
-            var hold = holdScrubEvents(el);
+            var hold = holdScrubEvents(el, anims, saved);
             anims.forEach(function(a) { try { a.pause(); } catch (e) {} });
             scrubState = { el: el, anims: anims, ends: ends, saved: saved, duration: duration, hold: hold };
             return Promise.all(anims.map(function(a) { return a.ready.catch(function(){}); }))
@@ -3452,19 +3728,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         scrubRestore: function(resume) {
             var S = scrubState;
             if (!S) return { restored: false };
-            // Back to the recorded time and state. A bare `play()` after seeking to the end rewinds
-            // and REPLAYS the animation, and starts one the app had paused.
-            if (resume) {
-                S.anims.forEach(function(a, i) {
-                    try {
-                        var was = S.saved[i];
-                        if (was.time !== null) a.currentTime = was.time;
-                        if (was.state === 'running') a.play();
-                        else if (was.state === 'finished') a.finish();
-                    } catch (e) {}
-                });
-            }
-            releaseScrubEvents(S.hold);
+            restoreScrub(S, resume);
             scrubState = null;
             return { restored: true, resumed: !!resume };
         },
@@ -4691,6 +4955,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         // reads about the response comes from the mock instead: the prototype's accessors and
         // header methods ask this per-XHR state first, so nothing shows on the instance, and an XHR
         // with no mock (or a `this` that is not an XHR) still gets the native behaviour and errors.
+        //
+        // Measured against a real server and left as they are: `setRequestHeader`, `withCredentials`
+        // and friends do not throw once a mock is sent (the native object is still OPENED); events
+        // are `isTrusted: false`; the accessors are not the native functions, as a page comparing
+        // them can see; `responseXML.URL` is the page's; `lengthComputable` follows the mock, which
+        // knows its size; `getAllResponseHeaders` has only the mock's headers; Chromium also fires
+        // `upload` abort and timeout on a request with no body, and the mock follows the spec.
         var XHR_PROTO = XMLHttpRequest.prototype;
         var TEXT_ENCODER = null;
         try { TEXT_ENCODER = new window.TextEncoder(); } catch (e) { TEXT_ENCODER = null; }
@@ -4712,21 +4983,43 @@ const INIT_SCRIPT_BODY: &str = r#"
             var bytes = mockBytes(m);
             return bytes ? bytes.length : m.body.length;
         }
+        // The body as text: decoding takes a byte order mark off, and the bytes keep it.
+        function mockText(m) {
+            return m.body.charCodeAt(0) === 0xfeff ? REFLECT_APPLY(STR_SUBSTRING, m.body, [1]) : m.body;
+        }
+        // The type the page sees: its `overrideMimeType`, else the header, without parameters.
+        function mockMime(m, xhr) {
+            var st = XHR_NET_GET(xhrNet, xhr);
+            var mime = st.mime || m.headers['content-type'] || '';
+            var semi = REFLECT_APPLY(STR_INDEXOF, mime, [';']);
+            return REFLECT_APPLY(STR_TO_LOWER, semi < 0 ? mime : REFLECT_APPLY(STR_SUBSTRING, mime, [0, semi]), []).trim();
+        }
+        // What `send` reports as the upload's total, in bytes. A form's size is the engine's own
+        // to work out (its boundary), so that one reads as unknown.
+        function xhrBodySize(body) {
+            if (body === null || body === undefined) return 0;
+            if (typeof body === 'object') {
+                try {
+                    if (BLOB_CTOR && body instanceof BLOB_CTOR) return body.size;
+                    if (typeof body.byteLength === 'number') return body.byteLength;
+                    if (typeof URLSearchParams !== 'function' || !(body instanceof URLSearchParams)) return 0;
+                } catch (e) { return 0; }
+            }
+            var text = toStringExact(body);
+            return TEXT_ENCODER ? REFLECT_APPLY(TEXT_ENCODE, TEXT_ENCODER, [text]).length : text.length;
+        }
         // Parsed as a real response is: HTML only when the page asked for a document, a document
         // that is not well-formed or of another type is null.
         function mockDocument(m, xhr, htmlAllowed) {
             if (m.document !== undefined) return m.document;
-            var st = XHR_NET_GET(xhrNet, xhr);
-            var mime = st.mime || m.headers['content-type'] || '';
-            var semi = REFLECT_APPLY(STR_INDEXOF, mime, [';']);
-            mime = REFLECT_APPLY(STR_TO_LOWER, semi < 0 ? mime : REFLECT_APPLY(STR_SUBSTRING, mime, [0, semi]), []).trim();
+            var mime = mockMime(m, xhr);
             var isHtml = mime === 'text/html';
             var isXml = mime === 'text/xml' || mime === 'application/xml'
                 || (mime.length > 4 && REFLECT_APPLY(STR_SUBSTRING, mime, [mime.length - 4]) === '+xml');
             var doc = null;
             if (DOM_PARSER && ((isHtml && htmlAllowed) || isXml)) {
                 try {
-                    doc = REFLECT_APPLY(DOM_PARSE, new DOM_PARSER(), [m.body, isHtml ? 'text/html' : 'application/xml']);
+                    doc = REFLECT_APPLY(DOM_PARSE, new DOM_PARSER(), [mockText(m), isHtml ? 'text/html' : 'application/xml']);
                     if (isXml && doc.getElementsByTagName('parsererror').length) doc = null;
                 } catch (e) { doc = null; }
             }
@@ -4739,12 +5032,12 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (m.value !== undefined) return m.value;
             var value = null;
             if (type === 'json') {
-                try { value = PRISTINE_PARSE(m.body); } catch (e) { value = null; }
+                try { value = PRISTINE_PARSE(mockText(m)); } catch (e) { value = null; }
             } else if (type === 'arraybuffer') {
                 var bytes = mockBytes(m);
                 value = bytes ? REFLECT_APPLY(ARRAY_BUFFER_SLICE, bytes.buffer, [bytes.byteOffset, bytes.byteOffset + bytes.length]) : null;
             } else if (type === 'blob') {
-                value = BLOB_CTOR ? new BLOB_CTOR(mockBytes(m) ? [mockBytes(m)] : [m.body], { type: m.headers['content-type'] || '' }) : null;
+                value = BLOB_CTOR ? new BLOB_CTOR(mockBytes(m) ? [mockBytes(m)] : [m.body], { type: mockMime(m, xhr) }) : null;
             } else if (type === 'document') {
                 return mockDocument(m, xhr, true);
             }
@@ -4774,11 +5067,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             var type = xhrType(xhr);
             // The native getter throws this engine's own InvalidStateError for another type.
             if (type !== '' && type !== 'text') return REFLECT_APPLY(native, xhr, []);
-            return (m.state >= 3 && !m.failed) ? m.body : '';
+            return (m.state >= 3 && !m.failed) ? mockText(m) : '';
         });
         xhrAccessor('response', function(m, xhr) {
             var type = xhrType(xhr);
-            if (type === '' || type === 'text') return (m.state >= 3 && !m.failed) ? m.body : '';
+            if (type === '' || type === 'text') return (m.state >= 3 && !m.failed) ? mockText(m) : '';
             return mockResponse(m, xhr, type);
         });
         xhrAccessor('responseXML', function(m, xhr, native) {
@@ -4787,6 +5080,18 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (m.state !== 4 || m.failed) return null;
             return mockDocument(m, xhr, type === 'document');
         });
+        // A `timeout` set while the mock is held back counts from `send`, as on a real request.
+        var XHR_TIMEOUT = Object.getOwnPropertyDescriptor(XHR_PROTO, 'timeout');
+        if (XHR_TIMEOUT && XHR_TIMEOUT.set) {
+            Object.defineProperty(XHR_PROTO, 'timeout', {
+                configurable: XHR_TIMEOUT.configurable, enumerable: XHR_TIMEOUT.enumerable, get: XHR_TIMEOUT.get,
+                set: function(value) {
+                    REFLECT_APPLY(XHR_TIMEOUT.set, this, [value]);
+                    var m = xhrMockOf(this);
+                    if (m && m.timer !== null && m.arm) m.arm();
+                },
+            });
+        }
         var origGetAll = XHR_PROTO.getAllResponseHeaders;
         var origOverrideMime = XHR_PROTO.overrideMimeType;
         XHR_PROTO.getResponseHeader = function(name) {
@@ -4837,7 +5142,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         // transitions come in one later task, stopping as soon as a handler moved the XHR on.
         function xhrFulfill(xhr, st, entry, route, net, body) {
             var m = {
-                state: 1, failed: false, timer: null,
+                state: 1, failed: false, timer: null, arm: null, uploading: null,
                 status: route.status, status_text: route.status_text,
                 headers: mockHeaders(route),
                 body: mockBody(route) || '',
@@ -4854,20 +5159,28 @@ const INIT_SCRIPT_BODY: &str = r#"
                 xhrMockEnd(entry, m, net.url);
                 m.state = 4;
                 xhrFire(xhr, new Event('readystatechange'));
-                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('load', size, size));
-                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('loadend', size, size));
+                // Once `load` has fired `loadend` follows, whatever a handler did to the XHR.
+                if (st.mock === m && m.state === 4) {
+                    xhrFire(xhr, xhrEvent('load', size, size));
+                    xhrFire(xhr, st.mock === m && m.state === 4 ? xhrEvent('loadend', size, size) : xhrEvent('loadend', 0, 0));
+                }
                 return;
             }
-            var hasBody = body !== null && body !== undefined && net.method !== 'GET' && net.method !== 'HEAD';
-            var sent = typeof body === 'string' ? body.length : 0;
+            var verb = REFLECT_APPLY(STR_TO_LOWER, net.method, []);
+            var hasBody = body !== null && body !== undefined && verb !== 'get' && verb !== 'head';
+            var sent = hasBody ? xhrBodySize(body) : 0;
             xhrFire(xhr, xhrEvent('loadstart', 0, 0));
-            if (hasBody) xhrFire(xhr.upload, xhrEvent('loadstart', 0, sent));
+            if (hasBody) {
+                m.uploading = xhr.upload;
+                xhrFire(xhr.upload, xhrEvent('loadstart', 0, sent));
+            }
             if (st.mock !== m || m.state !== 1) return;
             function moved(state) { return st.mock !== m || m.state !== state; }
             function answer() {
                 m.timer = null;
                 if (moved(1)) return;
                 if (hasBody) {
+                    m.uploading = null;
                     xhrFire(xhr.upload, xhrEvent('progress', sent, sent));
                     xhrFire(xhr.upload, xhrEvent('load', sent, sent));
                     xhrFire(xhr.upload, xhrEvent('loadend', sent, sent));
@@ -4888,28 +5201,41 @@ const INIT_SCRIPT_BODY: &str = r#"
                 m.state = 4;
                 xhrFire(xhr, new Event('readystatechange'));
                 if (moved(4)) return;
+                // Once `load` has fired `loadend` follows, whatever a handler did to the XHR.
                 xhrFire(xhr, xhrEvent('load', size, size));
+                xhrFire(xhr, moved(4) ? xhrEvent('loadend', 0, 0) : xhrEvent('loadend', size, size));
+            }
+            function timedOut() {
+                m.timer = null;
+                if (moved(1)) return;
+                m.failed = true;
+                m.state = 4;
+                xhrFinish(entry, 'timeout');
+                xhrFire(xhr, new Event('readystatechange'));
                 if (moved(4)) return;
-                xhrFire(xhr, xhrEvent('loadend', size, size));
+                xhrEndUpload(m, 'timeout');
+                if (moved(4)) return;
+                xhrFire(xhr, xhrEvent('timeout', 0, 0));
+                if (moved(4)) return;
+                xhrFire(xhr, xhrEvent('loadend', 0, 0));
             }
             // A `timeout` the mock's delay runs past ends it as it would end a slow request.
-            var limit = xhr.timeout;
-            if (limit > 0 && route.delay_ms >= limit) {
-                m.timer = SET_TIMEOUT(function() {
-                    m.timer = null;
-                    if (moved(1)) return;
-                    m.failed = true;
-                    m.state = 4;
-                    xhrFinish(entry, 'timeout');
-                    xhrFire(xhr, new Event('readystatechange'));
-                    if (moved(4)) return;
-                    xhrFire(xhr, xhrEvent('timeout', 0, 0));
-                    if (moved(4)) return;
-                    xhrFire(xhr, xhrEvent('loadend', 0, 0));
-                }, limit);
-            } else {
-                m.timer = SET_TIMEOUT(answer, route.delay_ms);
-            }
+            var sentAt = Date.now();
+            m.arm = function() {
+                if (m.timer !== null) CLEAR_TIMEOUT(m.timer);
+                var limit = xhr.timeout, gone = Date.now() - sentAt;
+                if (limit > 0 && route.delay_ms >= limit) m.timer = SET_TIMEOUT(timedOut, Math.max(0, limit - gone));
+                else m.timer = SET_TIMEOUT(answer, Math.max(0, route.delay_ms - gone));
+            };
+            m.arm();
+        }
+        // An upload still under way ends with the request: before the request's own event.
+        function xhrEndUpload(m, type) {
+            var upload = m.uploading;
+            if (!upload) return;
+            m.uploading = null;
+            xhrFire(upload, xhrEvent(type, 0, 0));
+            xhrFire(upload, xhrEvent('loadend', 0, 0));
         }
         // As on a real request: in flight it ends with `readystatechange`, `abort`, `loadend`; once
         // it has ended there are no events. Either way it reads as UNSENT afterwards.
@@ -4920,6 +5246,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 m.state = 4;
                 if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
                 xhrFire(xhr, new Event('readystatechange'));
+                if (st.mock === m && m.state === 4) xhrEndUpload(m, 'abort');
                 if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('abort', 0, 0));
                 if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('loadend', 0, 0));
             }

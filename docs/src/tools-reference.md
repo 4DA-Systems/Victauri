@@ -479,7 +479,10 @@ real OS mouse event (`isTrusted: true`) at the element's center, instead of a
 synthetic DOM event — for app handlers that gate on `event.isTrusted` or browser
 features needing user activation. Implemented on Windows (Win32 `SendInput`);
 on macOS/Linux it returns a clear "not implemented" error so you fall back to the
-default synthetic click. The window is brought to the foreground first.
+default synthetic click. The window is brought to the foreground first. An OS click
+lands wherever the point is on screen, so it is refused, naming the synthetic click,
+when the point cannot be worked out: inside a frame that is scaled, rotated or zoomed
+(on the frame or an ancestor of it; a pure translation is fine), or on a pinch-zoomed page.
 
 **Example:**
 ```json
@@ -776,11 +779,14 @@ page-scoped (cleared on reload).
 >
 > **A regex that can hang the page is refused at `add`.** JavaScript has no regex
 > timeout, and a rule's regex runs on the page's main thread against every request
-> URL. A repeated group that can match the same text in more than one way is
-> refused: `(a+)+`, `(a*)*`, `(a|aa)+`, `(.*)*`, `(\d+)*`. `^/api/(users|items)/\d+$`,
-> `.*\.png$` and `(/\w+)+` are fine. This is a check on nesting, not a proof: slow
-> patterns with no repeated group (`.*.*.*.*x`) still get through, and a few harmless
-> ones are refused (`(ab|ac)+`, whose branches start alike).
+> URL. A repeated group that can take the same text in more than one way is refused,
+> also when the ambiguity sits in a subgroup: `(a+)+`, `(a*)*`, `(a|aa)+`, `(.*)*`,
+> `(x(a|a)y)+`. `^/api/(users|items)/\d+$`, `.*\.png$`, `(/\w+)+`, `(api|app)+` and
+> `([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$` are fine. The check is on the repetition only:
+> slow patterns with no repeated group (`.*.*.*.*x`) still get through. It errs towards
+> refusing: a counted group is treated as unbounded and `\b` as always passing, so
+> `(a+){2}` and `(\w+\b)+` are refused, as is a repeated group that can match nothing,
+> such as `(a|)+`.
 >
 > **Rules on Tauri IPC change what the app's real `invoke` gets.** On the fetch
 > transport (`http://ipc.localhost/<cmd>` on Windows — `https://ipc.localhost/<cmd>` with `useHttpsScheme` — `ipc://localhost/<cmd>` on

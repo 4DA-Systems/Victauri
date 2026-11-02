@@ -623,6 +623,12 @@ pub fn trusted_focus_probe_js(ref_id: &str) -> String {
 /// adding each frame's content offset and requiring the point to stay inside every
 /// viewport on the way and the frame itself to be the element hit there. Layout is page
 /// data, so the native side clamps the point to the window's client area as well.
+///
+/// The walk can only add offsets. A frame that is scaled, rotated or zoomed, on itself or on an
+/// ancestor, or a pinch-zoomed page, moves its content somewhere those offsets do not reach, and
+/// the click lands on whatever is there (another control, measured): those are refused, naming
+/// the synthetic click that works. A pure translation is in the offsets, and a transform around
+/// the element inside its own document is in the point the browser found.
 #[must_use]
 pub fn trusted_click_probe_js(ref_id: &str) -> String {
     format!(
@@ -633,6 +639,20 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
          function __hit(d,x,y){{var h=d.elementFromPoint(x,y),g=0; \
            while(h&&h.shadowRoot&&g++<32){{var i=h.shadowRoot.elementFromPoint(x,y); \
              if(!i||i===h)break; h=i;}} return h;}} \
+         var __warped='an OS click cannot be placed inside a frame that is scaled, rotated or zoomed \
+(on the frame or an ancestor of it): use a synthetic click (trusted: false)'; \
+         function __one(v,n){{var p=(v||'').split(' '); for(var i=0;i<p.length;i++) \
+           if(p[i]!==''&&p[i]!=='none'&&parseFloat(p[i])!==n) return false; return true;}} \
+         function __plain(t){{if(!t||t==='none') return true; \
+           var o=t.indexOf('('), v=t.slice(o+1,t.length-1).split(','), d=t.indexOf('matrix3d(')===0, \
+             want=d?[1,0,0,0,0,1,0,0,0,0,1,0]:[1,0,0,1]; \
+           if(!d&&t.indexOf('matrix(')!==0) return false; \
+           for(var i=0;i<want.length;i++) if(parseFloat(v[i])!==want[i]) return false; \
+           return !d||(parseFloat(v[14])===0&&parseFloat(v[15])===1);}} \
+         function __warps(w,el){{for(var n=el,g=0;n&&g<512;n=n.assignedSlot||n.parentNode||n.host,g++){{ \
+           if(n.nodeType!==1) continue; var c=w.getComputedStyle(n); \
+           if(!__plain(c.transform)||!__one(c.scale,1)||!__one(c.rotate,0)||!__one(c.zoom,1)|| \
+              (c.offsetPath&&c.offsetPath!=='none')) return true;}} return false;}} \
          if(!__e.isConnected) return __no('element is detached from the DOM'); \
          __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
          var __d=__e.ownerDocument||document, __w=__d.defaultView||window; \
@@ -651,6 +671,8 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
            var __fe=null; try{{__fe=__f.frameElement;}}catch(__x2){{__fe=null;}} \
            if(!__fe) return __no('element is inside a cross-origin frame'); \
            var __p=__f.parent, __r=__fe.getBoundingClientRect(), __c=__p.getComputedStyle(__fe); \
+           if(__warps(__p,__fe)||(__fe.offsetWidth>0&&Math.abs(__r.width-__fe.offsetWidth)>1.5)|| \
+              (__fe.offsetHeight>0&&Math.abs(__r.height-__fe.offsetHeight)>1.5)) return __no(__warped); \
            __x+=__r.left+(__fe.clientLeft||0)+(parseFloat(__c.paddingLeft)||0); \
            __y+=__r.top+(__fe.clientTop||0)+(parseFloat(__c.paddingTop)||0); \
            if(!__in(__p,__x,__y)) return __no('element center is outside the viewport (clipped by its frame)'); \
@@ -658,6 +680,8 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
              return __no('the frame holding the element is covered at the click point'); \
            __f=__p; \
          }} \
+         var __vv=__f.visualViewport; if(__vv&&__vv.scale!==undefined&&Math.abs(__vv.scale-1)>0.000001) \
+           return __no('an OS click cannot be placed on a pinch-zoomed page: use a synthetic click (trusted: false)'); \
          return {{x:__x, y:__y, dpr:window.devicePixelRatio}}",
         js_string(ref_id)
     )

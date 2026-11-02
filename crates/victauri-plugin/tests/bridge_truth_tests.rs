@@ -1160,7 +1160,7 @@ fn the_browser_decides_which_point_of_an_element_a_click_reaches() {
         r"{HELP} var l = $('#l'); box(l, 0, 0, 100, 60);
         lines(l, [[80, 0, 20, 16], [0, 22, 100, 16], [0, 44, 30, 16]]);
         var n = 0; l.addEventListener('click', function(e) {{ e.preventDefault(); n++; }});
-        document.elementFromPoint = function(x, y) {{ return (x === 15 && y === 52) ? l : $('#p'); }};
+        document.elementFromPoint = function(x, y) {{ return (Math.floor(x) === 15 && Math.floor(y) === 52) ? l : $('#p'); }};
         var r = await B.click(refOf('#l'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);
         var p = B.hitPoint(l, true); T(p.x === 15 && p.y === 52, J(p));"
     );
@@ -1244,7 +1244,7 @@ fn the_browser_decides_which_point_of_an_element_a_click_reaches() {
     );
     let empty_link_around_a_float = format!(
         r"{HELP} var a = $('#e'), c = $('#c'); box(a, 10, 10, 0, 0); box(c, 300, 10, 40, 40);
-        document.elementFromPoint = function(x, y) {{ return (x === 320 && y === 30) ? c : $('#w'); }};
+        document.elementFromPoint = function(x, y) {{ return (Math.floor(x) === 320 && Math.floor(y) === 30) ? c : $('#w'); }};
         var r = await B.click(refOf('#e'), 150); T(r.ok, J(r));
         var p = B.hitPoint(a, true); T(p.x === 320 && p.y === 30, J(p));"
     );
