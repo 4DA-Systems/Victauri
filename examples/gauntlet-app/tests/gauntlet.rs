@@ -654,6 +654,73 @@ gauntlet!(click_reaches_only_what_a_user_can_reach, base, {
     assert_eq!(row("hf_wrapped")["point_hits"], json!(true));
 });
 
+gauntlet!(
+    a_strict_point_is_on_a_thin_stroke_in_the_delivered_pixel,
+    base,
+    {
+        let r = call(
+            &base,
+            "eval_js",
+            json!({ "code": "return window.__hitFixtures.thin()" }),
+        )
+        .await;
+        let got = result(&r);
+        assert_eq!(got["missed"], json!(0), "{got}");
+        // A refusal is honest, but not as an answer to most of them.
+        assert!(got["ok"].as_u64().unwrap_or(0) >= 100, "{got}");
+    }
+);
+
+gauntlet!(
+    a_trusted_click_is_refused_in_a_frame_it_cannot_reach,
+    base,
+    {
+        let zoom = call(
+            &base,
+            "eval_js",
+            json!({ "code": "return window.__hitFixtures.supportsZoom()" }),
+        )
+        .await;
+        let mut cases = vec![
+            ("transform:scale(2);transform-origin:0 0", "", true),
+            ("transform:rotate(90deg)", "", true),
+            ("", "transform:scale(1.5);transform-origin:0 0", true),
+            ("", "", false),
+            ("transform:translate(30px,20px)", "", false),
+            ("", "transform:translate(10px,5px)", false),
+        ];
+        if result(&zoom) == &json!(true) {
+            cases.push(("zoom:2", "", true));
+            cases.push(("", "zoom:1.5", true));
+        }
+        for (frame_style, wrapper_style, refused) in cases {
+            let setup = format!(
+                "return window.__hitFixtures.frame({}, {})",
+                json!(frame_style),
+                json!(wrapper_style)
+            );
+            let made = call(&base, "eval_js", json!({ "code": setup })).await;
+            let reference = result(&made).as_str().expect("a ref").to_string();
+            let probe = victauri_plugin::mcp::trusted_click_probe_js(&reference);
+            let r = call(&base, "eval_js", json!({ "code": probe })).await;
+            let got = result(&r).clone();
+            call(
+                &base,
+                "eval_js",
+                json!({ "code": "return window.__hitFixtures.frameClean()" }),
+            )
+            .await;
+            let what = format!("frame {frame_style:?}, wrapper {wrapper_style:?}: {got}");
+            if refused {
+                let why = got["error"].as_str().unwrap_or_default();
+                assert!(why.contains("synthetic click"), "{what}");
+            } else {
+                assert!(got["x"].is_number(), "{what}");
+            }
+        }
+    }
+);
+
 // ── 20. `navigate go_back` recovers a page that stopped answering ────────────
 
 gauntlet!(go_back_recovers_a_stopped_page, base, {
