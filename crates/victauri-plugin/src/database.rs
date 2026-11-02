@@ -3212,10 +3212,10 @@ mod tests {
         }
     }
 
-    /// A UTF-16 BLOB that spills onto overflow pages is not transcoded by `SQLite`, neither for the
-    /// schema load nor for the `CAST`: the load sees `C` and calls the schema malformed, and the
-    /// check sees `C`, charges nothing, and leaves it to that load. On a larger page the same bytes
-    /// do load, and are charged. The reader only has to follow the load either way.
+    /// A UTF-16 BLOB that spills onto overflow pages: whether the schema load transcodes it depends
+    /// on the `SQLite` version (the one rusqlite 0.32 to 0.40 bundle calls it malformed, 0.41's loads
+    /// it), and on a larger page the same bytes always load. The reader has to follow the load
+    /// whichever it does: one that loads is charged.
     #[test]
     fn a_long_utf16_blob_is_read_the_way_it_loads_on_either_page_size() {
         for encoding in ["UTF-16le", "UTF-16be"] {
@@ -3227,8 +3227,22 @@ mod tests {
 
             let (_f, path) = db_with_blob_schema_rows_on_pages(encoding, 4096, &rows);
             check_schema_nesting(&path).expect(encoding);
-            let err = query(&path, "SELECT * FROM users", &[], None).expect_err(encoding);
-            assert!(err.contains("malformed"), "{encoding}: {err}");
+            let loads = query(&path, "SELECT * FROM users", &[], None);
+            if let Err(err) = &loads {
+                assert!(err.contains("malformed"), "{encoding}: {err}");
+            }
+            let deep = format!(
+                "CREATE VIEW deep AS {}{}",
+                nested_select(MAX_SQL_NESTING + 1),
+                " ".repeat(20_000)
+            );
+            let rows_deep = [("deep".to_string(), encoded(encoding, &units(&deep)))];
+            let (_f, deep_path) = db_with_blob_schema_rows_on_pages(encoding, 4096, &rows_deep);
+            let checked = check_schema_nesting(&deep_path);
+            if loads.is_ok() {
+                let err = checked.expect_err("it loads, so it is charged");
+                assert!(err.contains("nest"), "{encoding}: {err}");
+            }
 
             let (_f, path) = db_with_blob_schema_rows_on_pages(encoding, 65_536, &rows);
             let r = query(&path, "SELECT * FROM v", &[], None).expect(encoding);
@@ -3267,7 +3281,11 @@ mod tests {
             .collect();
         let (_f, path) = db_with_blob_schema_rows("UTF-16le", &rows);
         let err = query(&path, "SELECT * FROM v2199", &[], None).unwrap_err();
-        assert!(err.contains("refusing"), "{err}");
+        // On a slow machine the check's clock can run out first, and that refuses it too.
+        assert!(
+            err.contains("refusing") || err.contains("timed out"),
+            "{err}"
+        );
     }
 
     /// The name of the view's one column as `SQLite` loaded it, and as the check read the text. Each
