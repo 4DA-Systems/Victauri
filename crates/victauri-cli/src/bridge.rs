@@ -1110,7 +1110,8 @@ async fn scan_once(app: Option<&str>) -> Selection {
     // are reused. `/health` returns a static `ok` and carries no token, so it proves *something*
     // is bound but does not authenticate the listener as the real app. A stale `<pid>` dir whose
     // recorded PID has been recycled onto another of our live processes, combined with an attacker
-    // binding the freed port, could still pass liveness+health and receive the token.
+    // binding the freed port, could still pass liveness+health and receive the token. (Two live
+    // entries on ONE port are told apart through `/info`, see `settle_port_claims`.)
     // Re-resolving on every forward (audit #1) shrinks this to a per-call coincidence rather than
     // a cache-lifetime one. With `--app`, the identity the SERVER reports on `/info` must also
     // match (R5B-BR6) — which stops a different (e.g. auth-disabled) Victauri app that took the
@@ -1134,6 +1135,7 @@ async fn scan_once(app: Option<&str>) -> Selection {
             live.push(s);
         }
     }
+    let live = settle_port_claims(live).await;
     match (select(&live, app), app) {
         (Selection::One(info), Some(app)) => {
             match confirm_identity(&info, app, verified_backend()).await {
@@ -1147,6 +1149,38 @@ async fn scan_once(app: Option<&str>) -> Selection {
         }
         (selection, _) => selection,
     }
+}
+
+/// Drop the entries that are not the server on their port, when several live entries claim one
+/// (see [`victauri_test::real_port_claims`]): a hard-killed app's entry whose PID was
+/// reused. One claim per port, the normal case, sends nothing.
+async fn settle_port_claims(mut live: Vec<ServerInfo>) -> Vec<ServerInfo> {
+    let mut ports: Vec<u16> = live.iter().map(|s| s.port).collect();
+    ports.sort_unstable();
+    let mut contested = ports.clone();
+    contested.dedup();
+    if contested.len() == ports.len() {
+        return live;
+    }
+    for port in contested {
+        let claims: Vec<(u32, Option<String>)> = live
+            .iter()
+            .filter(|s| s.port == port)
+            .filter_map(|s| Some((s.pid?, s.token.clone())))
+            .collect();
+        if claims.len() < 2 {
+            continue;
+        }
+        let asked = claims.clone();
+        let Ok(real) =
+            tokio::task::spawn_blocking(move || victauri_test::real_port_claims(port, &asked))
+                .await
+        else {
+            continue;
+        };
+        live.retain(|s| s.port != port || s.pid.is_some_and(|pid| real.contains(&pid)));
+    }
+    live
 }
 
 /// A backend whose `/info` identity was confirmed for an app selector, so a later forward to
@@ -1235,7 +1269,7 @@ async fn confirm_identity(
 /// bridge drove whatever app held that port: first by the discovery metadata of the one live
 /// entry on that port (if any), then by the identity the server itself reports on `/info`.
 async fn port_override(port: u16, app: Option<&str>) -> Selection {
-    let live = discover_live_servers();
+    let live = settle_port_claims(discover_live_servers()).await;
     let entry = unique_entry_on_port(&live, port);
     let refuse = |why: &str| {
         Selection::Refused(format!(

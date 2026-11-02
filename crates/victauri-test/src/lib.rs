@@ -64,6 +64,7 @@ pub use client::{
     assert_json_eq, assert_json_truthy, assert_no_a11y_violations, assert_performance_budget,
     assert_state_matches,
 };
+pub use discovery::real_port_claims;
 pub use error::TestError;
 pub use locator::{Bounds, Locator, LocatorExpect, LocatorMatch};
 pub use smoke::{SmokeCheckResult, SmokeConfig, SmokeReport};

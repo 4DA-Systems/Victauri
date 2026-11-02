@@ -218,6 +218,19 @@ async fn mcp_arguments_that_are_not_an_object_are_named_as_the_problem() {
     }
 }
 
+/// Discovery tells a stale entry from the live one on a port by this (`real_port_claims`).
+#[tokio::test]
+async fn info_reports_the_servers_pid() {
+    let base = start_test_server(test_state(), &["main"]).await;
+    let info: serde_json::Value = reqwest::get(format!("{base}/info"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(info["pid"], std::process::id());
+}
+
 /// The same mistake on the REST route.
 #[tokio::test]
 async fn rest_arguments_that_are_not_an_object_are_named_as_the_problem() {

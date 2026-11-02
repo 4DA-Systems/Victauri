@@ -217,6 +217,8 @@ fn build_app_full_inner(
                         "commands_registered": s.registry.count(),
                         "events_captured": s.event_log.len(),
                         "port": s.port.load(Ordering::Relaxed),
+                        // Tells a discovery entry for this process from a stale one on this port.
+                        "pid": std::process::id(),
                         "auth_required": info_auth,
                         "privacy_mode": privacy_enabled,
                     }))

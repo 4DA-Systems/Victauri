@@ -27,7 +27,10 @@ impl IsolatedTemp {
     }
 
     fn write_entry(&self, port: u16, identifier: &str) {
-        let pid = std::process::id();
+        self.write_entry_of(std::process::id(), TOKEN, port, identifier);
+    }
+
+    fn write_entry_of(&self, pid: u32, token: &str, port: u16, identifier: &str) {
         let dir = self.0.path().join("victauri").join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
@@ -38,7 +41,7 @@ impl IsolatedTemp {
             }
         }
         std::fs::write(dir.join("port"), port.to_string()).unwrap();
-        std::fs::write(dir.join("token"), TOKEN).unwrap();
+        std::fs::write(dir.join("token"), token).unwrap();
         std::fs::write(
             dir.join("metadata.json"),
             json!({"pid": pid, "port": port, "identifier": identifier, "product_name": "Mock"})
@@ -234,6 +237,69 @@ fn assert_no_token(out: &Output) {
         "the auth token reached the terminal:\n{}\n{}",
         stdout(out),
         stderr(out)
+    );
+}
+
+/// A hard-killed app's entry whose PID was reused, naming the port the current app holds: `--app`
+/// refused with "several apps" through both discovery paths (`call`, and the bridge's behind
+/// `logs`). The stale entry's process is really alive and its token really refused here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_entry_on_the_apps_port_does_not_make_it_ambiguous() {
+    const APP: &str = "com.test.stale";
+    let real = std::process::id();
+    let info = move |headers: HeaderMap| async move {
+        let auth = headers.get("authorization").and_then(|h| h.to_str().ok());
+        if auth == Some(format!("Bearer {TOKEN}").as_str()) {
+            Json(json!({"name": "victauri", "app_identifier": APP, "pid": real})).into_response()
+        } else {
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+        }
+    };
+    let logs = post(|| async {
+        Json(json!({"result": {"entries": [], "next_seq": 0, "sources": {"tracing": true}}}))
+    });
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/info", get(info))
+        .route("/api/tools/logs", logs)
+        .route("/mcp", post(mcp))
+        .with_state(Mock {
+            identifier: APP.to_string(),
+            plugin_version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // A live process of ours, as a reused PID is.
+    let mut reused = Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+        .args(if cfg!(windows) {
+            &["/C", "ping -n 60 127.0.0.1 >nul"][..]
+        } else {
+            &["60"][..]
+        })
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let iso = IsolatedTemp::new();
+    iso.write_entry(port, APP);
+    iso.write_entry_of(reused.id(), "the-dead-apps-token", port, APP);
+
+    let call = run(iso.victauri(&["call", "--app", APP, "echo", "a=b"])).await;
+    let logs = run(iso.victauri(&["logs", "--app", APP, "-n", "1"])).await;
+    let _ = reused.kill();
+    let _ = reused.wait();
+    assert!(call.status.success(), "{}", stderr(&call));
+    assert_eq!(json_stdout(&call)["received"], json!({"a": "b"}));
+    assert!(logs.status.success(), "{}", stderr(&logs));
+    assert!(
+        stderr(&logs).contains(&format!("pid {real}")),
+        "{}",
+        stderr(&logs)
     );
 }
 
