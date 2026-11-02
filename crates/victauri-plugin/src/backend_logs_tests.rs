@@ -538,8 +538,8 @@ fn backtraces_are_symbolised_when_read_not_when_panicking() {
         }),
     );
     let mut out = serde_json::json!({
-        "entries": [{"message": "boom", "fields": {"backtrace_id": id, "backtrace": "(symbolised when read)"}}],
-        "other": {"backtrace_id": 999_999_999_u64}
+        "entries": [{"source": "panic", "message": "boom", "fields": {"backtrace_id": id, "backtrace": "(symbolised when read)"}}],
+        "other": {"source": "panic", "fields": {"backtrace_id": 999_999_999_u64}}
     });
     super::resolve_backtraces(&mut out);
     let fields = &out["entries"][0]["fields"];
@@ -547,7 +547,331 @@ fn backtraces_are_symbolised_when_read_not_when_panicking() {
     let bt = fields["backtrace"].as_str().unwrap();
     assert!(!bt.is_empty() && bt != "(symbolised when read)", "{bt}");
     // An unknown id is dropped, not left dangling.
-    assert!(out["other"].get("backtrace_id").is_none(), "{out}");
+    assert!(
+        out["other"]["fields"].get("backtrace_id").is_none(),
+        "{out}"
+    );
+}
+
+/// Set in the child process of [`child_case`].
+const CHILD_CASE: &str = "VICTAURI_TEST_CHILD_CASE";
+
+/// Re-run the test `name` of this binary in its own process with `CHILD_CASE=case`. For state
+/// that is process-wide once set: the global max level, `capture_level`.
+fn child_case(name: &str, case: &str, envs: &[(&str, &str)]) {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!("backend_logs::tests::{name}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_CASE, case)
+        .envs(envs.iter().copied())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "case {case} failed: {}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A layer with no level hint and no filter, like a profiler or telemetry layer.
+struct CountAll(&'static std::sync::atomic::AtomicUsize);
+
+impl<S: Subscriber> Layer<S> for CountAll {
+    fn on_event(&self, _: &Event<'_>, _: Context<'_, S>) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Adding `log_layer()` must not take events away from the app's own layers: `Layered` takes
+/// the max of the hints, and "no hint" (everything) loses to any `Some`.
+#[test]
+fn the_capture_layer_never_lowers_what_other_layers_receive() {
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    static SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Ok(case) = std::env::var(CHILD_CASE) else {
+        let name = "the_capture_layer_never_lowers_what_other_layers_receive";
+        child_case(name, "plain_outer", &[]);
+        child_case(name, "plain_outer", &[("VICTAURI_LOG_LEVEL", "error")]);
+        child_case(name, "plain_inner", &[]);
+        child_case(name, "per_layer_filter", &[]);
+        return;
+    };
+    let capture = BackendLogLayer::with_buffer(Arc::new(LogBuffer::default()));
+    match case.as_str() {
+        "plain_outer" => tracing_subscriber::registry()
+            .with(CountAll(&SEEN))
+            .with(capture)
+            .init(),
+        "plain_inner" => tracing_subscriber::registry()
+            .with(capture)
+            .with(CountAll(&SEEN))
+            .init(),
+        // Every other layer is filtered per layer: the case the hint exists for. Trace-level
+        // callsites stay off, so dependencies do not build events for this layer alone.
+        "per_layer_filter" => {
+            tracing_subscriber::registry()
+                .with(CountAll(&SEEN).with_filter(LevelFilter::INFO))
+                .with(capture)
+                .init();
+            assert_eq!(LevelFilter::current(), LevelFilter::DEBUG);
+            return;
+        }
+        other => panic!("unknown case {other}"),
+    }
+    assert_eq!(LevelFilter::current(), LevelFilter::TRACE);
+    tracing::trace!("a");
+    tracing::debug!("b");
+    tracing::info!("c");
+    assert_eq!(SEEN.load(Ordering::Relaxed), 3);
+}
+
+/// Writes through `f` and unwraps every write: harmless against a `String`, as app code expects.
+struct UnwrapsWrites(usize);
+
+impl UnwrapsWrites {
+    fn write(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for _ in 0..self.0 / 100 {
+            f.write_str(&"x".repeat(100)).unwrap();
+        }
+        Ok(())
+    }
+}
+
+impl std::fmt::Debug for UnwrapsWrites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write(f)
+    }
+}
+
+impl std::fmt::Display for UnwrapsWrites {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.write(f)
+    }
+}
+
+/// A `Display` that fails, as a broken app type might.
+#[derive(Debug)]
+struct DisplayFails;
+
+impl std::fmt::Display for DisplayFails {
+    fn fmt(&self, _: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Err(std::fmt::Error)
+    }
+}
+
+impl std::error::Error for DisplayFails {}
+
+/// Past a capture budget the bounded writer must not hand an app's `Debug`/`Display` an error it
+/// never sees against a `String`: an impl that unwraps its writes would panic in the app's log
+/// call, on whatever thread made it.
+#[test]
+#[allow(clippy::items_after_statements)]
+fn a_log_call_does_not_panic_in_the_capture_path() {
+    let buf = Arc::new(LogBuffer::default());
+    with_capture(&buf, || {
+        tracing::info!(target: "app", value = ?UnwrapsWrites(MAX_FIELD_BYTES + 1000), "over the field budget");
+        tracing::info!(target: "app", "{}", UnwrapsWrites(MAX_MESSAGE_BYTES + 1000));
+        let err: &(dyn std::error::Error + 'static) = &DisplayFails;
+        tracing::info!(target: "app", cause = err, "an error field whose Display fails");
+    });
+    let page = buf.query(&LogQuery::default());
+    assert_eq!(page.entries.len(), 3);
+    let cut = page.entries[0].fields["value"].as_str().unwrap();
+    assert!(cut.ends_with("…[truncated]"), "{cut}");
+    assert!(page.entries[1].message.contains("…["));
+
+    // The `log` path, including a record the wrapped logger would have dropped.
+    struct DropsAll;
+    impl log::Log for DropsAll {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            false
+        }
+        fn log(&self, _: &log::Record<'_>) {}
+        fn flush(&self) {}
+    }
+    let logger = VictauriLogger::with_buffer(Arc::clone(&buf), Some(Box::new(DropsAll)));
+    let send = |args: std::fmt::Arguments<'_>| {
+        log::Log::log(
+            &logger,
+            &log::Record::builder()
+                .args(args)
+                .level(log::Level::Info)
+                .target("app")
+                .build(),
+        );
+    };
+    send(format_args!("{}", UnwrapsWrites(MAX_MESSAGE_BYTES + 1000)));
+    send(format_args!("{DisplayFails}"));
+    assert_eq!(buf.query(&LogQuery::default()).entries.len(), 5);
+}
+
+/// A value far beyond the budget still stops early, so a multi-megabyte `Debug` on every event
+/// costs a bounded amount and not its whole size.
+#[test]
+fn a_huge_debug_value_stops_being_formatted() {
+    struct Counts<'a>(&'a std::cell::Cell<usize>);
+    impl std::fmt::Debug for Counts<'_> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            for _ in 0..1_000_000 {
+                self.0.set(self.0.get() + 1);
+                f.write_str(&"x".repeat(100))?;
+            }
+            Ok(())
+        }
+    }
+    let writes = std::cell::Cell::new(0);
+    let text = super::debug_bounded(&Counts(&writes), MAX_FIELD_BYTES);
+    assert!(text.ends_with("…[truncated]"));
+    assert!(writes.get() < 10_000, "{} writes", writes.get());
+}
+
+/// A recorded value whose `Debug` logs inside the span used to deadlock against the span's
+/// extensions lock, which `on_record` held across formatting.
+#[test]
+fn recording_a_value_that_logs_does_not_deadlock() {
+    struct LogsWhileFormatting;
+    impl std::fmt::Debug for LogsWhileFormatting {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            tracing::info!(target: "app", "logged while formatting");
+            f.write_str("value")
+        }
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    let buf = Arc::new(LogBuffer::default());
+    let in_thread = Arc::clone(&buf);
+    std::thread::spawn(move || {
+        with_capture(&in_thread, || {
+            let span = tracing::info_span!("s", v = tracing::field::Empty);
+            let _in_span = span.enter();
+            span.record("v", tracing::field::debug(LogsWhileFormatting));
+            tracing::info!(target: "app", "after");
+        });
+        let _ = done.send(());
+    });
+    finished
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("the thread deadlocked inside on_record");
+    let page = buf.query(&LogQuery {
+        contains: Some("after".into()),
+        ..LogQuery::default()
+    });
+    assert_eq!(page.entries[0].spans, ["s{v=value}"]);
+}
+
+/// A duplicated `log_layer()` line: a harmless duplicate entry, never a panic in every new span.
+#[test]
+fn two_capture_layers_in_one_subscriber_do_not_panic() {
+    let buf = Arc::new(LogBuffer::default());
+    let subscriber = tracing_subscriber::registry()
+        .with(BackendLogLayer::with_buffer(Arc::clone(&buf)))
+        .with(BackendLogLayer::with_buffer(Arc::clone(&buf)));
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("s", v = 1_u64);
+        let _in_span = span.enter();
+        span.record("v", 2_u64);
+        tracing::info!(target: "app", "inside");
+    });
+    assert_eq!(buf.query(&LogQuery::default()).entries.len(), 2);
+}
+
+/// `backtrace_id` is only meaningful in a captured panic: an app's own field of that name, and
+/// anything else that merely looks like one, is data and comes back untouched.
+#[test]
+fn resolving_backtraces_leaves_app_data_alone() {
+    let id = 4_000_000_001_u32;
+    super::pending_backtraces().lock().unwrap().insert(
+        id,
+        Arc::new(super::PendingBacktrace {
+            backtrace: std::backtrace::Backtrace::disabled(),
+            resolved: OnceLock::new(),
+        }),
+    );
+    let mut out = serde_json::json!({
+        "result": {"backtrace_id": id, "user": "kept"},
+        "backend_logs": [
+            {"source": "tracing", "message": "hi", "fields": {"backtrace_id": id, "job": 1}},
+            {"source": "panic", "message": "boom", "fields": {"backtrace_id": id}},
+        ],
+    });
+    super::resolve_backtraces(&mut out);
+    assert_eq!(out["result"]["backtrace_id"], id, "{out}");
+    let logs = &out["backend_logs"];
+    assert_eq!(logs[0]["fields"]["backtrace_id"], id, "{out}");
+    assert!(logs[1]["fields"].get("backtrace_id").is_none(), "{out}");
+    assert!(logs[1]["fields"]["backtrace"].is_string(), "{out}");
+}
+
+/// Logging threads (the UI thread among them) need the ring lock on every event, so a read must
+/// copy under it and work after releasing it. Measured at the maximum capacity, where `digest`
+/// held the lock for a second.
+#[test]
+fn reading_the_log_does_not_hold_up_logging_threads() {
+    use std::sync::atomic::AtomicBool;
+    use std::time::{Duration, Instant};
+
+    let buf = Arc::new(LogBuffer::new(100_000, usize::MAX));
+    let message = "m".repeat(500);
+    for i in 0..100_000 {
+        buf.push(entry(LogLevel::Warn, "t", &format!("{i} {message}")));
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let logger = {
+        let (buf, stop) = (Arc::clone(&buf), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut worst = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let line = entry(LogLevel::Info, "t", "x");
+                let started = Instant::now();
+                buf.push(line);
+                worst = worst.max(started.elapsed());
+                std::thread::yield_now();
+            }
+            worst
+        })
+    };
+    std::thread::sleep(Duration::from_millis(20));
+    let started = Instant::now();
+    let _digest = buf.digest(10, 10);
+    let _matches = buf.query(&LogQuery {
+        contains: Some("nothing has this".into()),
+        ..LogQuery::default()
+    });
+    let reading = started.elapsed();
+    stop.store(true, Ordering::Relaxed);
+    let worst = logger.join().unwrap();
+    assert!(
+        worst < reading / 2,
+        "a log call stalled {worst:?} during reads taking {reading:?}"
+    );
+}
+
+/// A wait's predicate runs off the lock too: it may redact, and it must not stall the app.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wait_predicate_does_not_run_under_the_lock() {
+    let buf = Arc::new(LogBuffer::default());
+    buf.push(entry(LogLevel::Info, "t", "first"));
+    let pushed_inside = Arc::clone(&buf);
+    let (hit, _) = buf
+        .wait_for(0, std::time::Duration::from_secs(20), move |e| {
+            let other = Arc::clone(&pushed_inside);
+            let (pushed, done) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                other.push(entry(LogLevel::Info, "t", "second"));
+                let _ = pushed.send(());
+            });
+            done.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("a logging thread stalled behind the predicate");
+            e.message == "first"
+        })
+        .await;
+    assert_eq!(hit.unwrap().message, "first");
 }
 
 /// A huge `Debug` value costs at most the field budget, not its whole size.
@@ -658,6 +982,243 @@ fn console_capture_reader_resumes_from_offsets_and_skips_partial_records() {
     assert_eq!(more.len(), 1);
     assert_eq!(more[0].text, "partial");
     assert_eq!(more[0].offset, next);
+}
+
+/// Review of the CLI follower's rotation gap: a cursor is a byte offset, and once `victauri run`
+/// rotated the capture it pointed into the middle of a different file. The unread tail of the
+/// rotated file was lost and the new file's start skipped, with nothing said.
+#[test]
+fn a_cursor_read_survives_a_rotation() {
+    fn record(n: usize, text: &str) -> String {
+        format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"{text}{n}\"}}\n")
+    }
+    /// All a follower reads from `cursor` on, as it would: on while `more`, then one more poll.
+    fn follow(path: &std::path::Path, mut cursor: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        for _ in 0..8 {
+            let (lines, next, _) =
+                read_console_capture_window(path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+            out.extend(lines.into_iter().map(|l| l.text));
+            cursor = next;
+        }
+        out
+    }
+    for new_file_lines in [1usize, 50] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        let old: String = (0..4).map(|n| record(n, "old")).collect();
+        std::fs::write(&path, &old).unwrap();
+        let (_, cursor) = read_console_capture(&path, Some(0), 0).unwrap();
+        let cursor = cursor - (2 * record(0, "old").len()) as u64;
+
+        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+        // Short: the cursor is past its end. Long: the cursor lands inside a record.
+        let new: String = (0..new_file_lines)
+            .map(|n| record(n, "a-new-line-of-another-length-"))
+            .collect();
+        std::fs::write(&path, &new).unwrap();
+
+        let got = follow(&path, cursor);
+        let mut want = vec!["old2".to_string(), "old3".to_string()];
+        want.extend((0..new_file_lines).map(|n| format!("a-new-line-of-another-length-{n}")));
+        assert_eq!(got, want, "new file of {new_file_lines} line(s)");
+    }
+}
+
+/// A `victauri run` that was killed writes no exit record. The app can outlive it (SIGKILL on
+/// Unix), and then `logs stdout` read on as if all were well, with nothing more ever to come.
+#[test]
+fn a_capture_says_when_its_launcher_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("4242-1730000000000.jsonl");
+    std::fs::write(&path, capture_record(0, "line")).unwrap();
+    assert_eq!(
+        launcher_gone(&path, Some(4242), |pid| pid == 4242),
+        Some(4242)
+    );
+    assert_eq!(
+        launcher_gone(&path, Some(4242), |_| false),
+        None,
+        "the launcher is alive"
+    );
+
+    let exit = "{\"t\":9,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n";
+    std::fs::write(&path, format!("{}{exit}", capture_record(0, "line"))).unwrap();
+    assert_eq!(
+        launcher_gone(&path, Some(4242), |_| true),
+        None,
+        "it said how it ended"
+    );
+
+    // A `--capture` file's launcher does not say: a name that looks like a pid is not one.
+    let named = dir.path().join("20261102-120000.jsonl");
+    std::fs::write(&named, capture_record(0, "line")).unwrap();
+    assert_eq!(launcher_gone(&named, None, |_| true), None);
+}
+
+/// An exit record carries up to 12 stderr lines of 64 KiB: the tail read must hold all of it.
+#[test]
+fn a_long_exit_record_is_seen_as_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("4242-1730000000000.jsonl");
+    // A control character takes six bytes in the record, so this is the longest one can be.
+    for fill in ["x", "\u{1}"] {
+        let tail: Vec<String> = (0..12).map(|_| fill.repeat(64 * 1024)).collect();
+        let exit = serde_json::json!({"t": 9, "s": "exit", "l": "crashed", "tail": tail});
+        std::fs::write(&path, format!("{}{exit}\n", capture_record(0, "line"))).unwrap();
+        assert_eq!(launcher_gone(&path, Some(4242), |_| true), None, "{fill:?}");
+    }
+}
+
+/// On Linux, a real process: a zombie its parent has not reaped is gone too.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dead_process_is_seen_as_dead() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    assert!(!process_is_dead(child.id()));
+    assert!(!process_is_dead_by_shell(child.id()));
+    child.kill().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(process_is_dead(child.id()), "unreaped");
+    assert!(process_is_dead_by_shell(child.id()), "unreaped, by ps");
+    child.wait().unwrap();
+    assert!(process_is_dead(child.id()), "reaped");
+    assert!(process_is_dead_by_shell(child.id()), "reaped, by kill");
+    assert!(!process_is_dead(std::process::id()));
+    assert!(!process_is_dead_by_shell(std::process::id()));
+}
+
+/// A bare offset cannot see a rotation whose new file has a record boundary exactly there: the
+/// rotated file's tail and the new file's start went unread, with nothing said.
+#[test]
+fn a_cursor_on_a_record_boundary_of_the_new_file_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let record = capture_record;
+    let old: String = (0..4).map(|n| record(n, "old")).collect();
+    std::fs::write(&path, &old).unwrap();
+    // The first two read.
+    let cursor = (2 * record(0, "old").len()) as u64;
+    let read = read_console_cursor(&path, Some(0), 0, cursor).unwrap();
+    assert_eq!(read.lines.len(), 2);
+    let cursor = read.cursor(read.next);
+
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    let new: String = (0..4).map(|n| record(n, "new")).collect();
+    std::fs::write(&path, &new).unwrap();
+
+    let (got, at, lost) = follow_cursor(&path, cursor);
+    assert_eq!(got, ["old2", "old3", "new0", "new1", "new2", "new3"]);
+    assert!(!lost);
+    // And on from there: the new file grew, nothing again from before.
+    let mut more = new.clone();
+    more.push_str(&record(4, "new"));
+    std::fs::write(&path, &more).unwrap();
+    assert_eq!(follow_cursor(&path, at).0, ["new4"]);
+}
+
+/// All a follower reads from `cursor` on, as it would, with where it ended and whether it was told
+/// that lines were lost.
+fn follow_cursor(path: &std::path::Path, mut cursor: u64) -> (Vec<String>, u64, bool) {
+    let (mut got, mut lost) = (Vec::new(), false);
+    for _ in 0..8 {
+        let read = read_console_cursor(path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+        lost |= read.lost;
+        cursor = read.cursor(read.next);
+        got.extend(read.lines.into_iter().map(|l| l.text));
+    }
+    (got, cursor, lost)
+}
+
+fn capture_record(n: usize, text: &str) -> String {
+    format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"{text}{n}\"}}\n")
+}
+
+/// Two rotations between reads: the file the cursor was in is gone, and that is said.
+#[test]
+fn a_cursor_whose_file_rotated_away_says_lines_were_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    std::fs::write(&path, capture_record(0, "first")).unwrap();
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    let cursor = read.cursor(read.next);
+
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(&path, capture_record(0, "second")).unwrap();
+    std::fs::remove_file(path.with_extension("jsonl.1")).unwrap();
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(&path, capture_record(0, "third")).unwrap();
+
+    let first_read = read_console_cursor(&path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(first_read.lost);
+    let at = first_read.cursor(first_read.next);
+    assert_eq!(first_read.lines[0].text, "third0");
+    let (got, _, lost) = follow_cursor(&path, at);
+    assert!(got.is_empty() && !lost, "said once: {got:?}");
+}
+
+/// A cursor from before tags, or a line's `offset`, reads as it always did.
+#[test]
+fn a_bare_offset_is_still_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let body: String = (0..3).map(|n| capture_record(n, "line")).collect();
+    std::fs::write(&path, &body).unwrap();
+    let offset = capture_record(0, "line").len() as u64;
+    let (got, at, lost) = follow_cursor(&path, offset);
+    assert_eq!(got, ["line1", "line2"]);
+    assert!(!lost);
+    assert!(
+        at > body.len() as u64,
+        "what it returns carries the tag: {at}"
+    );
+    let line_offset = read_console_cursor(&path, Some(at), 0, CONSOLE_READ_WINDOW)
+        .unwrap()
+        .next;
+    assert_eq!(line_offset, body.len() as u64);
+
+    // Past a rotation, by where it lands.
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(
+        &path,
+        capture_record(0, "new-and-longer-than-the-old-file-was"),
+    )
+    .unwrap();
+    let (got, _, lost) = follow_cursor(&path, offset);
+    assert_eq!(
+        got,
+        ["line1", "line2", "new-and-longer-than-the-old-file-was0"]
+    );
+    assert!(!lost);
+}
+
+/// JavaScript clients read a cursor as a double, and a file with no complete record has no tag.
+#[test]
+fn a_cursor_is_exact_in_a_double_and_needs_a_first_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    std::fs::write(&path, "{\"t\":1,\"s\":\"out\",\"l\":\"partial").unwrap();
+    assert_eq!(capture_tag(&path), None);
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert_eq!(read.cursor(read.next), 0);
+
+    std::fs::write(&path, capture_record(0, "line")).unwrap();
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(capture_tag(&path).is_some_and(|tag| tag > 0 && tag < 1 << CURSOR_TAG_BITS));
+    let cursor = read.cursor((1 << CURSOR_OFFSET_BITS) - 1);
+    assert!(cursor < 1 << 53);
+    assert_eq!(
+        cursor & ((1 << CURSOR_OFFSET_BITS) - 1),
+        (1 << CURSOR_OFFSET_BITS) - 1
+    );
+    assert_eq!(
+        read.cursor(1 << CURSOR_OFFSET_BITS),
+        1 << CURSOR_OFFSET_BITS,
+        "no room: bare"
+    );
 }
 
 /// Release review: a cursor read stops at its byte window (16 MiB), and `logs stdout` reported
@@ -814,6 +1375,47 @@ fn registry_recipe_captures_what_the_global_filter_allows() {
     assert_eq!(page.entries[0].message, "kept");
 }
 
+/// Documented limit: the capture leaves the embedded MCP SDK's lines out, the app's console does
+/// not, and the filter the page gives hides them (`rmcp::service` logs at INFO during MCP calls).
+#[test]
+fn the_documented_filter_hides_the_sdks_lines_from_the_console() {
+    #[derive(Clone, Default)]
+    struct Console(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Console {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let run = |filter: &str| {
+        let console = Console::default();
+        let writer = console.clone();
+        let buf = Arc::new(LogBuffer::default());
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_subscriber::EnvFilter::new(filter))
+            .with(tracing_subscriber::fmt::layer().with_writer(move || writer.clone()))
+            .with(Some(BackendLogLayer::with_buffer(Arc::clone(&buf))));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "rmcp::service", "Service initialized as server");
+            tracing::info!(target: "app", "kept");
+        });
+        let page = buf.query(&LogQuery::default());
+        assert_eq!(page.entries.len(), 1, "{:?}", page.entries);
+        assert_eq!(page.entries[0].message, "kept");
+        let printed = console.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&printed).into_owned()
+    };
+    let plain = run("info");
+    assert!(plain.contains("Service initialized"), "{plain}");
+    assert!(plain.contains("kept"), "{plain}");
+    let quiet = run("info,rmcp=warn");
+    assert!(!quiet.contains("Service initialized"), "{quiet}");
+    assert!(quiet.contains("kept"), "{quiet}");
+}
+
 /// Documented recipe for `fmt().init()` apps: `fmt()...finish().with(log_layer())`.
 #[test]
 fn fmt_builder_recipe_captures() {
@@ -843,4 +1445,83 @@ fn fmt_builder_recipe_captures() {
 fn a_none_layer_is_inert() {
     let subscriber = tracing_subscriber::registry().with(None::<BackendLogLayer>);
     tracing::subscriber::with_default(subscriber, || tracing::info!(target: "app", "fine"));
+}
+
+/// A reader racing a writer that rotates as `victauri run` does: every line arrives once or is
+/// reported lost. The tag and the bytes used to come from two opens, so a rotation between them read
+/// the new file from an offset meant for the old one, and the lines before it went unsaid.
+#[test]
+fn a_reader_racing_rotations_loses_no_line_silently() {
+    use std::io::Write as _;
+    const TOTAL: u64 = 150_000;
+    const ROTATE_AT: u64 = 80_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let write_line = |file: &mut std::fs::File, i: u64| {
+        let line = format!(
+            "{{\"t\":{i},\"s\":\"out\",\"l\":\"{i} {}\"}}\n",
+            "x".repeat(60)
+        );
+        file.write_all(line.as_bytes()).unwrap();
+        line.len() as u64
+    };
+    let mut first = std::fs::File::create(&path).unwrap();
+    let mut written = write_line(&mut first, 0);
+    let writer = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let mut file = first;
+            let mut rotations = 0u32;
+            for i in 1..TOTAL {
+                written += write_line(&mut file, i);
+                if written >= ROTATE_AT {
+                    drop(file);
+                    // A reader may hold either file open: renaming has to work regardless.
+                    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+                    file = std::fs::File::create(&path).unwrap();
+                    written = 0;
+                    rotations += 1;
+                }
+                if i % 200 == 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            }
+            rotations
+        })
+    };
+    let mut cursor = 0;
+    let mut expected = 0u64;
+    let (mut silent, mut reported, mut duplicates) = (0u64, 0u64, 0u64);
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while expected < TOTAL && std::time::Instant::now() < give_up {
+        // The instant between the rename and the new file has no file: the tool says so, and the
+        // next call reads on.
+        let Ok(read) = read_console_cursor(&path, Some(cursor), 1 << 20, 1 << 24) else {
+            continue;
+        };
+        for line in &read.lines {
+            let i: u64 = line.text.split(' ').next().unwrap().parse().unwrap();
+            if i < expected {
+                duplicates += 1;
+                continue;
+            }
+            if i > expected {
+                if read.lost {
+                    reported += i - expected;
+                } else {
+                    silent += i - expected;
+                }
+            }
+            expected = i + 1;
+        }
+        cursor = read.cursor(read.next);
+    }
+    let rotations = writer.join().unwrap();
+    assert!(rotations > 100, "{rotations} rotations");
+    assert_eq!(
+        (silent, duplicates),
+        (0, 0),
+        "silently lost, duplicated; reported lost {reported}, over {rotations} rotations"
+    );
+    assert_eq!(expected, TOTAL, "reported lost {reported}");
 }

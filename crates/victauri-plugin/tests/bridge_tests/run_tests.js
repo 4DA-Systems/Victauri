@@ -19,9 +19,10 @@
 
 const fs = require("fs");
 const { JSDOM } = require("jsdom");
-const { fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
-const { implForWrapper } = require("jsdom/lib/jsdom/living/generated/utils.js");
+const { createAnEvent, fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
+const { implForWrapper, wrapperForImpl } = require("jsdom/lib/jsdom/living/generated/utils.js");
 const MouseEventIface = require("jsdom/lib/jsdom/living/generated/MouseEvent.js");
+const EventIface = require("jsdom/lib/jsdom/living/generated/Event.js");
 const { fireAPageTransitionEvent } = require("jsdom/lib/jsdom/living/helpers/page-transition-event.js");
 
 const testDefPath = process.argv[2];
@@ -136,6 +137,10 @@ async function run() {
         },
       };
     };
+
+    // The bridge's walkers read Element.prototype's method (a form's named controls can shadow
+    // the one on the instance), so the stub lives there too; covers SVG as well.
+    window.Element.prototype.getBoundingClientRect = window.HTMLElement.prototype.getBoundingClientRect;
 
     // Stub getComputedStyle to return basic visible values.
     const origGCS = window.getComputedStyle;
@@ -324,6 +329,16 @@ async function run() {
       });
     };
 
+    // Dispatch a TRUSTED bubbling event, as the browser does for an animation event.
+    // `props`: fields of the event's real interface jsdom does not have (AnimationEvent's
+    // animationName, TransitionEvent's propertyName, pseudoElement).
+    window.__vtestTrustedEvent = function (el, type, props) {
+      const target = implForWrapper(el);
+      const event = createAnEvent(type, target._globalObject, EventIface, { bubbles: true });
+      if (props) Object.assign(wrapperForImpl(event), props);
+      target._dispatch(event);
+    };
+
     // Dispatch a TRUSTED pagehide / pageshow on the window, as the browser does on a real
     // unload or back/forward-cache restore (page script can only dispatch untrusted ones).
     window.__vtestTrustedPageTransition = function (type, persisted) {
@@ -336,6 +351,7 @@ async function run() {
       window.Request = Request;
       window.Response = Response;
       window.Headers = Headers;
+      window.TextEncoder = TextEncoder;
     }
 
     // Optional script run BEFORE the bridge — as Tauri's own init scripts (core.js,

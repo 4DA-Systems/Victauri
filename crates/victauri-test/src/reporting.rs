@@ -31,10 +31,14 @@ pub struct JunitTestCase {
     pub failure: Option<JunitFailure>,
 }
 
+/// The [`JunitFailure::failure_type`] of a skipped check.
+pub const SKIPPED_TYPE: &str = "skipped";
+
 /// Failure details for a `JUnit` test case.
 #[derive(Debug)]
 pub struct JunitFailure {
-    /// Failure type label.
+    /// Failure type label. [`SKIPPED_TYPE`] marks a skipped check rather than a failure: a report
+    /// writes it as `<skipped>` and does not count it in `failures`.
     pub failure_type: String,
     /// Human-readable failure message.
     pub message: String,
@@ -67,18 +71,25 @@ impl JunitReport {
     #[must_use]
     pub fn to_xml(&self) -> String {
         let tests = self.test_cases.len();
+        let is_skipped = |t: &&JunitTestCase| {
+            t.failure
+                .as_ref()
+                .is_some_and(|f| f.failure_type == SKIPPED_TYPE)
+        };
+        let skipped = self.test_cases.iter().filter(is_skipped).count();
         let failures = self
             .test_cases
             .iter()
             .filter(|t| t.failure.is_some())
-            .count();
+            .count()
+            - skipped;
         let time = format_duration(self.duration);
         let name = xml_escape(&self.name);
 
         let mut xml = String::with_capacity(1024);
         xml.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
         xml.push_str(&format!(
-            "<testsuite name=\"{name}\" tests=\"{tests}\" failures=\"{failures}\" errors=\"0\" time=\"{time}\">\n"
+            "<testsuite name=\"{name}\" tests=\"{tests}\" failures=\"{failures}\" errors=\"0\" skipped=\"{skipped}\" time=\"{time}\">\n"
         ));
 
         for tc in &self.test_cases {
@@ -92,9 +103,13 @@ impl JunitReport {
                 xml.push_str(&format!(
                     "  <testcase name=\"{tc_name}\" classname=\"{classname}\" time=\"{tc_time}\">\n"
                 ));
-                xml.push_str(&format!(
-                    "    <failure type=\"{ftype}\" message=\"{msg}\" />\n"
-                ));
+                if failure.failure_type == SKIPPED_TYPE {
+                    xml.push_str(&format!("    <skipped message=\"{msg}\" />\n"));
+                } else {
+                    xml.push_str(&format!(
+                        "    <failure type=\"{ftype}\" message=\"{msg}\" />\n"
+                    ));
+                }
                 xml.push_str("  </testcase>\n");
             } else {
                 xml.push_str(&format!(
@@ -112,7 +127,12 @@ impl JunitTestCase {
     /// Creates a test case from a [`CheckResult`].
     #[must_use]
     pub fn from_check_result(result: &CheckResult, classname: &str, duration: Duration) -> Self {
-        let failure = if result.passed {
+        let failure = if result.skipped {
+            Some(JunitFailure {
+                failure_type: SKIPPED_TYPE.to_string(),
+                message: result.detail.clone(),
+            })
+        } else if result.passed {
             None
         } else {
             Some(JunitFailure {
@@ -134,8 +154,15 @@ impl JunitTestCase {
 ///
 /// # Errors
 ///
-/// Returns an IO error if the file cannot be written.
+/// Returns an IO error if the file cannot be written, or if `path` is a symlink: `--junit` paths
+/// are often inside a project, whose checkout can plant a link to a file outside it.
 pub fn write_junit_report(report: &JunitReport, path: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(std::io::Error::other(format!(
+            "refusing to write the JUnit report through a symlink: {}",
+            path.display()
+        )));
+    }
     std::fs::write(path, report.to_xml())
 }
 
@@ -178,6 +205,7 @@ mod tests {
             description: desc.to_string(),
             passed: true,
             detail: String::new(),
+            skipped: false,
         }
     }
 
@@ -186,7 +214,49 @@ mod tests {
             description: desc.to_string(),
             passed: false,
             detail: detail.to_string(),
+            skipped: false,
         }
+    }
+
+    #[test]
+    fn a_skipped_check_is_written_as_skipped() {
+        let mut skipped = pass_result("recording lifecycle");
+        skipped.skipped = true;
+        skipped.detail = "skipped: a recording is already in progress".to_string();
+        let report = VerifyReport {
+            results: vec![pass_result("ok"), skipped, fail_result("bad", "broke")],
+        };
+        let xml =
+            JunitReport::from_verify_report(&report, "smoke", Duration::from_millis(30)).to_xml();
+        assert!(xml.contains("tests=\"3\""), "{xml}");
+        assert!(xml.contains("failures=\"1\""), "{xml}");
+        assert!(xml.contains("skipped=\"1\""), "{xml}");
+        assert!(
+            xml.contains("<skipped message=\"skipped: a recording is already in progress\""),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn the_report_is_not_written_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "PRECIOUS").unwrap();
+        let link = dir.path().join("report.xml");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&victim, &link);
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&victim, &link);
+        if let Err(e) = linked {
+            eprintln!("skipping: cannot create a symlink here ({e})");
+            return;
+        }
+        let report =
+            JunitReport::from_verify_report(&VerifyReport { results: vec![] }, "s", Duration::ZERO);
+        assert!(write_junit_report(&report, &link).is_err());
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "PRECIOUS");
+        // An ordinary path still works.
+        write_junit_report(&report, &dir.path().join("plain.xml")).unwrap();
     }
 
     #[test]

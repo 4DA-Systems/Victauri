@@ -217,6 +217,28 @@ async fn list_app_dir_reports_a_complete_listing_as_not_truncated() {
     assert_eq!(r["entries"][0]["name"], "a.db");
 }
 
+/// `[` and `]` are ordinary characters in a file name, and match themselves.
+#[tokio::test]
+async fn list_app_dir_pattern_brackets_match_literally() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("log[1].txt"), "x").unwrap();
+    std::fs::write(root.path().join("log1.txt"), "x").unwrap();
+    let h = handler(TestBridge {
+        data: Some(root.path().to_path_buf()),
+        ..TestBridge::default()
+    });
+    let r = json(
+        &call(
+            &h,
+            "list_app_dir",
+            serde_json::json!({"pattern": "log[?].txt"}),
+        )
+        .await,
+    );
+    assert_eq!(r["count"], 1, "{r}");
+    assert_eq!(r["entries"][0]["name"], "log[1].txt", "{r}");
+}
+
 // ── F5: truncating mid-character keeps the text a text ──────────────────────────────────
 
 #[tokio::test]
@@ -376,7 +398,8 @@ async fn huge_look_back_windows_do_not_panic() {
             serde_json::json!({"action": action, "seconds": 10_000_000_000_000_u64}),
         )
         .await;
-        assert_ne!(r.is_error, Some(true), "{action}: {}", text(&r));
+        // This bridge has no page, so the honest answer is "cannot read": never a panic.
+        assert!(text(&r).contains("cannot read"), "{action}: {}", text(&r));
     }
     let r = call(
         &h,

@@ -174,7 +174,7 @@ pub fn generate_test(session: &RecordedSession, options: &CodegenOptions) -> Str
     // Emit IPC assertions at the end if enabled
     if options.emit_ipc_assert_calls && !ipc_commands_seen.is_empty() {
         out.push_str("\n    // Verify IPC calls\n");
-        out.push_str("    let log = client.get_ipc_log(None).await.unwrap();\n");
+        out.push_str("    let log = client.get_ipc_log(Some(1000)).await.unwrap();\n");
         for cmd in &ipc_commands_seen {
             let escaped = escape_rust_str(cmd);
             out.push_str(&format!("    assert_ipc_called(&log, \"{escaped}\");\n"));
@@ -221,7 +221,8 @@ fn sanitize_rust_identifier(s: &str) -> String {
             identifier.push('_');
         }
     }
-    if identifier.is_empty() {
+    // `_` alone is a reserved token, not an identifier (it is what `-` or `!` sanitize to).
+    if identifier.is_empty() || identifier == "_" {
         return "recorded_flow".to_string();
     }
     if RUST_KEYWORDS.contains(&identifier.as_str()) {
@@ -234,7 +235,7 @@ const RUST_KEYWORDS: &[&str] = &[
     "Self", "abstract", "as", "async", "await", "become", "box", "break", "const", "continue",
     "crate", "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "gen", "if",
     "impl", "in", "let", "loop", "macro", "match", "mod", "move", "mut", "override", "priv", "pub",
-    "ref", "return", "static", "struct", "super", "trait", "true", "try", "type", "typeof",
+    "ref", "return", "self", "static", "struct", "super", "trait", "true", "try", "type", "typeof",
     "union", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
 ];
 
@@ -311,7 +312,21 @@ fn selector_to_locator(selector: &str) -> String {
     let (factory, arg) = match parse_recorded_selector(selector) {
         RecordedSelector::TestId(id) => ("test_id", id),
         RecordedSelector::Role(role) => ("role", role),
-        RecordedSelector::Text(text) => ("text", text),
+        // Keep the recorded role/tag: bare text matches the deepest element holding it, which
+        // for `<button><span>Save</span></button>` is the span rather than the recorded button.
+        RecordedSelector::Text { scope, text } => {
+            let text = escape_rust_str(&text);
+            return match scope {
+                TextScope::Role(role) => format!(
+                    "Locator::role(\"{}\").and_text(\"{text}\")",
+                    escape_rust_str(&role)
+                ),
+                TextScope::Tag(tag) => format!(
+                    "Locator::text(\"{text}\").and_tag(\"{}\")",
+                    escape_rust_str(&tag)
+                ),
+            };
+        }
         // `#id` stays CSS: it is valid CSS as recorded (the bridge CSS-escapes it).
         RecordedSelector::Id(_) | RecordedSelector::Css => ("css", selector.to_string()),
     };
@@ -329,10 +344,22 @@ enum RecordedSelector {
     Id(String),
     /// `[role="…"]`
     Role(String),
-    /// `[role="…"]:has-text("…")` or `tag:has-text("…")` — the text.
-    Text(String),
+    /// `[role="…"]:has-text("…")` or `tag:has-text("…")`.
+    Text {
+        /// What the text was recorded on.
+        scope: TextScope,
+        /// The text.
+        text: String,
+    },
     /// Anything else: plain CSS, passed through unchanged.
     Css,
+}
+
+/// The element a recorded `:has-text` selector names.
+#[derive(Debug, PartialEq, Eq)]
+enum TextScope {
+    Role(String),
+    Tag(String),
 }
 
 fn parse_recorded_selector(selector: &str) -> RecordedSelector {
@@ -355,7 +382,10 @@ fn parse_recorded_selector(selector: &str) -> RecordedSelector {
             return RecordedSelector::Role(role);
         }
         if let Some(text) = has_text_suffix(rest) {
-            return RecordedSelector::Text(text);
+            return RecordedSelector::Text {
+                scope: TextScope::Role(role),
+                text,
+            };
         }
         return RecordedSelector::Css;
     }
@@ -365,7 +395,10 @@ fn parse_recorded_selector(selector: &str) -> RecordedSelector {
     if tag_len > 0
         && let Some(text) = has_text_suffix(&selector[tag_len..])
     {
-        return RecordedSelector::Text(text);
+        return RecordedSelector::Text {
+            scope: TextScope::Tag(selector[..tag_len].to_string()),
+            text,
+        };
     }
     RecordedSelector::Css
 }
@@ -459,7 +492,7 @@ enum ResolvedSelector {
 fn resolve_selector(selector: &str) -> ResolvedSelector {
     match parse_recorded_selector(selector) {
         RecordedSelector::Id(id) => ResolvedSelector::ById(id),
-        RecordedSelector::Text(text) => ResolvedSelector::ByText(text),
+        RecordedSelector::Text { text, .. } => ResolvedSelector::ByText(text),
         RecordedSelector::TestId(_) | RecordedSelector::Role(_) | RecordedSelector::Css => {
             ResolvedSelector::Raw(selector.to_string())
         }
@@ -1259,8 +1292,10 @@ mod tests {
         let code = generate_test(&session, &opts);
 
         assert!(
-            code.contains("Locator::text(\"Save\").click(&mut client).await.unwrap();"),
-            "expected Locator::text for has-text, got:\n{code}"
+            code.contains(
+                "Locator::text(\"Save\").and_tag(\"button\").click(&mut client).await.unwrap();"
+            ),
+            "expected Locator::text + tag for has-text, got:\n{code}"
         );
     }
 
@@ -1338,7 +1373,7 @@ mod tests {
             "expected assert_ipc_called, got:\n{code}"
         );
         assert!(code.contains("use victauri_test::assert_ipc_called;"));
-        assert!(code.contains("let log = client.get_ipc_log(None).await.unwrap();"));
+        assert!(code.contains("let log = client.get_ipc_log(Some(1000)).await.unwrap();"));
     }
 
     #[test]
@@ -1346,7 +1381,7 @@ mod tests {
         assert_eq!(selector_to_locator("#btn"), "Locator::css(\"#btn\")");
         assert_eq!(
             selector_to_locator("button:has-text(\"OK\")"),
-            "Locator::text(\"OK\")"
+            "Locator::text(\"OK\").and_tag(\"button\")"
         );
         assert_eq!(
             selector_to_locator("[data-testid=\"foo\"]"),

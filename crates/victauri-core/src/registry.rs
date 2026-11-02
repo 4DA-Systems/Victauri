@@ -338,11 +338,14 @@ impl CommandRegistry {
         if query_words.is_empty() {
             return Vec::new();
         }
+        // Whitespace is not part of the query: the exact name/intent/example comparisons must not
+        // lose their bonus to a leading space or a double space.
+        let query_normalized = query_words.join(" ");
 
         let mut scored: Vec<ScoredCommand> = crate::acquire_read(&self.commands, "CommandRegistry")
             .values()
             .filter_map(|cmd| {
-                let score = score_command(cmd, &query_lower, &query_words);
+                let score = score_command(cmd, &query_normalized, &query_words);
                 if score > 0.0 {
                     Some(ScoredCommand {
                         command: cmd.clone(),

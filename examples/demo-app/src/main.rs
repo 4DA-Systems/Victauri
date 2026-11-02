@@ -545,20 +545,13 @@ fn unread_count(state: tauri::State<'_, AppState>) -> u32 {
 
 // ── Window management ──────────────────────────────────────────────────────
 
-#[tauri::command]
-#[inspectable(
-    description = "Show or create the notification panel window",
-    intent = "open notification window",
-    category = "windows",
-    example = "show notifications"
-)]
-fn show_notification_window(app: tauri::AppHandle) -> Result<(), String> {
+fn open_notification_window(app: &tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("notifications") {
         window.show().map_err(|e| e.to_string())?;
         window.set_focus().map_err(|e| e.to_string())?;
     } else {
         WebviewWindow::builder(
-            &app,
+            app,
             "notifications",
             tauri::WebviewUrl::App("notification.html".into()),
         )
@@ -569,6 +562,33 @@ fn show_notification_window(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Async, because a sync command runs inside the webview's IPC handler, where building a webview
+/// deadlocks on Windows and wedges the calling page. The work itself is posted to the main thread
+/// so no Tauri handle is cloned or dropped on a tokio worker (see `APP`).
+#[tauri::command]
+#[inspectable(
+    description = "Show or create the notification panel window",
+    intent = "open notification window",
+    category = "windows",
+    example = "show notifications"
+)]
+async fn show_notification_window() -> Result<(), String> {
+    let app = APP.get().ok_or("the app has not finished starting")?;
+    let (done, mut result) = tauri::async_runtime::channel(1);
+    app.run_on_main_thread(move || {
+        let outcome = APP
+            .get()
+            .ok_or_else(|| "the app has not finished starting".to_string())
+            .and_then(open_notification_window);
+        let _ = done.try_send(outcome);
+    })
+    .map_err(|e| e.to_string())?;
+    result
+        .recv()
+        .await
+        .unwrap_or_else(|| Err("the main thread dropped the request".to_string()))
 }
 
 // ── Debug ──────────────────────────────────────────────────────────────────
@@ -625,10 +645,18 @@ fn main() {
     #[cfg(victauri_tauri3)]
     let builder = builder.runtime(tauri_runtime_wry::Wry::default());
 
+    // Auth off keeps the demo easy to poke with curl. VICTAURI_DEMO_AUTH=1 keeps the default every
+    // real consumer gets, so CI can drive the app through token discovery.
+    let victauri = victauri_plugin::VictauriBuilder::new();
+    let victauri = if std::env::var("VICTAURI_DEMO_AUTH").is_ok_and(|v| v == "1") {
+        victauri
+    } else {
+        victauri.auth_disabled()
+    };
+
     builder
         .plugin(
-            victauri_plugin::VictauriBuilder::new()
-                .auth_disabled()
+            victauri
                 .commands(&[
                     greet__schema(),
                     get_counter__schema(),

@@ -18,7 +18,7 @@ Get application configuration, directory paths, environment, discovered database
 
 **Parameters:** None required.
 
-**Returns:** `{config, paths, databases, process, environment}`
+**Returns:** `{config, paths, databases, process, env}`
 
 ---
 
@@ -31,10 +31,10 @@ Browse files in app backend directories (data, config, log, local_data).
 |------|------|----------|-------------|
 | `directory` | string | no | One of: `data`, `config`, `log`, `local_data` (default: `data`) |
 | `path` | string | no | Subdirectory to list within the chosen directory |
-| `pattern` | string | no | Glob to filter entries (e.g. `*.db`) |
+| `pattern` | string | no | Glob to filter entries (e.g. `*.db`): `*` any run of characters, `?` one character, anything else (`[` and `]` included) itself |
 | `max_depth` | number | no | Recursion depth (default: 1) |
 
-**Returns:** `{root, entries: [{name, path, is_dir, size, modified}]}`
+**Returns:** `{base, path, exists, count, truncated, entries: [{name, path, is_dir, size, modified}]}`
 
 A listing stops (and reports `truncated`) at 10,000 returned entries, 100,000 examined entries, or
 5 s — whichever comes first — so a pattern that matches nothing in a huge tree still returns.
@@ -119,8 +119,8 @@ Evaluate JavaScript in the webview and return the result.
 **Auto-`return`:** a single bare expression is auto-wrapped with `return`
 (`document.title` → `return document.title`). **Multi-statement code must include
 an explicit `return`** — e.g. `localStorage.setItem('k','v'); return localStorage.getItem('k')` —
-or be wrapped in an IIFE; otherwise only the first statement runs. async/await is
-supported.
+or be wrapped in an IIFE. Without one every statement still runs, but the result is `undefined`.
+async/await is supported.
 
 JavaScript errors (thrown exceptions) return an MCP error with `isError: true`.
 `undefined` returns `"undefined"`, `null` returns `null`. A **syntax error** is
@@ -188,6 +188,7 @@ Invoke a Tauri command from the backend.
 | `command` | string | yes | Command name |
 | `args` | object | no | Arguments to pass |
 | `timeout_ms` | integer | no | Time budget for the whole call — sending the command and waiting for its result (default: the plugin eval timeout, 30 s; max 300000). Raise it for legitimately slow commands. `victauri-test`: `invoke_command_with_timeout` |
+| `with_logs` | boolean | no | The result becomes `{"result": …, "backend_logs": […]}`: every backend log entry (debug and above) captured while the command ran, including concurrent background activity in that window. Needs backend capture |
 
 **Example:**
 ```json
@@ -206,7 +207,9 @@ Capture a PNG screenshot of the application window.
 |------|------|----------|-------------|
 | `window_label` | string | no | Target window (defaults to main) |
 
-**Returns:** Base64-encoded PNG image data.
+**Returns:** Base64-encoded PNG image data, and a text block naming the window captured
+(`note: captured window "main"`; over REST, a `note` beside the image), since with no label
+`screenshot` picks the window itself.
 
 > **Linux:** capture requires X11 or XWayland (the common case, including CI under `xvfb`). A
 > pure-Wayland session exposes no safe per-window capture path, so `screenshot` returns a clear
@@ -229,10 +232,13 @@ Compare frontend and backend state to detect drift.
 **Example:**
 ```json
 {
-  "frontend_expr": "document.title",
+  "frontend_expr": "({title: document.title})",
   "backend_state": {"title": "My App"}
 }
 ```
+
+The expression must produce the same shape as the backend state: `document.title` on its own is a
+string, which diverges from `{"title": "My App"}` at `$` even when the title is right.
 
 ---
 
@@ -271,7 +277,7 @@ of guessing with a fixed sleep.
 **Parameters:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle`, `expression`, `event`, `log` |
+| `condition` | string | yes | One of: `selector`, `selector_gone`, `text`, `text_gone`, `url`, `ipc_idle`, `network_idle`, `expression`, `event`, `log`. `text`, `text_gone` and `selector_gone` are not met while the page has no body (mid navigation). An invalid selector is a tool error. `ipc_idle` returns `ok: false` at once, with `ipc_capture: "none"`, when the IPC log is blind to the page's traffic |
 | `value` | string | no | Selector/text/URL to match; the JS expression (`expression`); the Tauri event name (`event`); or the text a backend log line must contain (`log`). Not needed for `ipc_idle`/`network_idle` |
 | `expected` | any | no | For `expression`: the JSON value the expression must equal. Omit to wait for the expression to become truthy |
 | `since_ms` | number | no | For `event` and `log`: how far back (ms) to accept an already-fired event or line when the wait begins (default: 2000) |
@@ -459,8 +465,12 @@ may still settle) or `[hint: CHECK_INPUT]` (wrong target). The same applies to
 | `hover` | `ref_id` | Hover over an element |
 | `focus` | `ref_id` | Focus an element |
 | `scroll_into_view` | `ref_id` | Scroll element into viewport |
-| `select_option` | `ref_id`, `value` or `values` | Select option(s) in a `<select>` |
-| `trusted` | boolean | no | `click`: deliver a real OS mouse click (`isTrusted: true`) at the element's centre. Refused if the point is outside the window's client area. Windows only; the app window must be in the foreground |
+| `select_option` | `ref_id`, `value` or `values` | Select option(s) in a `<select>`; `values: []` clears a `<select multiple>` |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `trusted` | boolean | no | `click`: deliver a real OS mouse click (`isTrusted: true`) at a point of the element that a click reaches, usually its centre. Refused if the point is outside the window's client area or cannot be worked out (a scaled, rotated or zoomed frame, a pinch-zoomed page). Windows only; the app window must be in the foreground |
 | `x` | number | no | `scroll_into_view` without `ref_id`: horizontal scroll position in px |
 | `y` | number | no | `scroll_into_view` without `ref_id`: vertical scroll position in px |
 
@@ -469,13 +479,16 @@ real OS mouse event (`isTrusted: true`) at the element's center, instead of a
 synthetic DOM event — for app handlers that gate on `event.isTrusted` or browser
 features needing user activation. Implemented on Windows (Win32 `SendInput`);
 on macOS/Linux it returns a clear "not implemented" error so you fall back to the
-default synthetic click. The window is brought to the foreground first.
+default synthetic click. The window is brought to the foreground first. An OS click
+lands wherever the point is on screen, so it is refused, naming the synthetic click,
+when the point cannot be worked out: inside a frame that is scaled, rotated or zoomed
+(on the frame or an ancestor of it; a pure translation is fine), or on a pinch-zoomed page.
 
 **Example:**
 ```json
-{"action": "click", "ref_id": "e3"}
-{"action": "click", "ref_id": "e3", "trusted": true}
-{"action": "select_option", "ref_id": "e9", "value": "us"}
+{"action": "click", "ref_id": "k3f9e3"}
+{"action": "click", "ref_id": "k3f9e3", "trusted": true}
+{"action": "select_option", "ref_id": "k3f9e9", "value": "us"}
 ```
 
 ---
@@ -489,6 +502,10 @@ Text input and keyboard operations.
 | `fill` | `ref_id`, `value` | Set input value directly |
 | `type_text` | `ref_id`, `text` | Type character-by-character |
 | `press_key` | `key` | Press a keyboard key |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
 | `trusted` | boolean | no | `type_text`/`press_key`: deliver real OS keyboard input (`isTrusted: true`). The element is focused first and the call is refused if focus does not land on it. Windows only; the app window must be in the foreground |
 
 **Trusted (OS-level) input:** add `"trusted": true` to `type_text` or `press_key` to
@@ -499,9 +516,9 @@ input with a clear error.
 
 **Example:**
 ```json
-{"action": "fill", "ref_id": "e5", "value": "hello@example.com"}
-{"action": "type_text", "ref_id": "e5", "text": "Hello"}
-{"action": "type_text", "ref_id": "e5", "text": "Hello", "trusted": true}
+{"action": "fill", "ref_id": "k3f9e5", "value": "hello@example.com"}
+{"action": "type_text", "ref_id": "k3f9e5", "text": "Hello"}
+{"action": "type_text", "ref_id": "k3f9e5", "text": "Hello", "trusted": true}
 {"action": "press_key", "key": "Enter"}
 ```
 
@@ -518,8 +535,8 @@ Window management operations.
 | `get_state` | `label` | Get window state (position, size, visibility) |
 | `list` | — | List all window labels |
 | `manage` | `label`, `manage_action` | `minimize`, `unminimize`, `maximize`, `unmaximize`, `close`, `focus`, `show`, `hide`, `fullscreen`, `unfullscreen`, `always_on_top`, `not_always_on_top` |
-| `resize` | `label`, `width`, `height` | Resize a window |
-| `move_to` | `label`, `x`, `y` | Move a window |
+| `resize` | `label`, `width`, `height` | Resize a window. Reports the size read back (physical pixels) next to `requested`; `settled: false` if the window did not change within about 500 ms (Linux and macOS apply it asynchronously, and a window manager may ignore it) |
+| `move_to` | `label`, `x`, `y` | Move a window. Reports the position read back, with `settled: false` likewise |
 | `set_title` | `label`, `title` | Change window title |
 | `introspectability` | — | Probe every window's JS bridge and report which are introspectable vs. blind |
 
@@ -561,7 +578,7 @@ Navigation and history operations.
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `go_to` | `url` | Navigate to a URL (http/https only) |
-| `go_back` | — | Go back in history |
+| `go_back` | — | Go back in history. On a page that stopped answering (a page without the bridge, or one stuck in a loop) it navigates natively to the last URL inside the app, reports `recovered` only once the page answers there, and errors if it does not. WebView2 and WebKitGTK get off a page spinning in a loop: on Linux by ending the one web process whose main thread spun throughout, which takes about 15 s, and the result says `ended_web_process: <pid>`. On macOS the navigation waits for the script to end |
 | `get_history` | — | Get navigation history log |
 | `set_dialog_response` | `dialog_type`, `dialog_action`, `text` | Auto-respond to future `alert`/`confirm`/`prompt` dialogs (`accept` / `dismiss`) |
 | `get_dialog_log` | — | Get dialog log (alerts, confirms, prompts) |
@@ -631,12 +648,16 @@ CSS inspection, accessibility, and performance profiling.
 | `clear_highlights` | — | Remove all debug overlays |
 | `audit_accessibility` | — | Run WCAG accessibility audit |
 | `get_performance` | — | Get performance metrics |
-| `label` | string | no | `highlight`: text shown above the overlay |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `highlight_label` | string | no | `highlight`: text shown above the overlay |
 
 **Example:**
 ```json
-{"action": "get_styles", "ref_id": "e3", "properties": ["color", "font-size"]}
-{"action": "get_bounding_boxes", "ref_ids": ["e1", "e2", "e3"]}
+{"action": "get_styles", "ref_id": "k3f9e3", "properties": ["color", "font-size"]}
+{"action": "get_bounding_boxes", "ref_ids": ["k3f9e1", "k3f9e2", "k3f9e3"]}
 {"action": "audit_accessibility"}
 {"action": "get_performance"}
 ```
@@ -655,6 +676,10 @@ CSS injection for debugging and prototyping.
 |--------|-----------|-------------|
 | `inject` | `css` | Inject custom CSS (replaces previous) |
 | `remove` | — | Remove injected CSS |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
 | `allow_remote` | boolean | no | Allow `@import` and remote `url(...)` in injected CSS (default false: blocked, because remote references turn `css inject` into an exfiltration channel) |
 
 **Example:**
@@ -671,18 +696,24 @@ Access all captured logs from the application.
 
 | Action | Parameters | Description |
 |--------|-----------|-------------|
-| `console` | `since`, `level` | Console log entries |
-| `network` | `since` | Network request log |
-| `ipc` | `since`, `limit` | IPC command log (calls captured on Tauri's postMessage fallback carry `transport: "post_message"`) |
-| `navigation` | — | Navigation history |
-| `dialogs` | — | Dialog interactions |
-| `events` | `since` | Event stream |
+| `console` | `since`, `limit` | Console log entries |
+| `network` | `filter`, `limit`, `bodies` | Network request log |
+| `ipc` | `limit`, `bodies`, `wait_for_capture` | IPC command log (calls captured on Tauri's postMessage fallback carry `transport: "post_message"`; `args_truncated: true` when `args` is not what was sent: cut, over the capture cap, or not captured) |
+| `navigation` | `limit` | Navigation history |
+| `dialogs` | `limit` | Dialog interactions |
+| `events` | `since`, `limit` | Event stream |
 | `slow_ipc` | `threshold_ms` | IPC calls slower than threshold |
 | `clear` | — | Clear the IPC + network logs (per-test isolation) |
 | `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Without `since_seq` the newest `limit` entries; with it the oldest after the cursor, and `next_seq` continues after them (read on while `truncated`) |
 | `backend_digest` | `limit` (top N per list, default 10) | Start here: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic |
-| `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited. `since_seq` pages forward like `backend` |
+| `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited. `since_seq` pages forward like `backend`; `next_seq` is opaque (it also says which file of a rotated capture it is for), and `gap: true` says the capture rotated past it |
+
+**Options:**
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
 | `filter` | string | no | `network`: URL substring filter; `backend`/`stdout`: case-insensitive text match |
+| `limit` | integer | no | Most entries to return, keeping the newest; 0 returns none. Default 100 (`slow_ipc`: 20) |
+| `bodies` | boolean | no | `ipc`/`network`: `false` leaves out args and request/response bodies, so reading up to 1000 entries stays small (default true) |
 | `wait_for_capture` | boolean | no | `ipc`: wait up to 500 ms for the newest entry's response body to be captured |
 
 **Example:**
@@ -696,8 +727,9 @@ Access all captured logs from the application.
 
 The `backend*` and `stdout` actions need a capture source — see [Backend Logs](./backend-logs.md).
 
-> `ipc`/`network`/`slow_ipc` return at most 100 entries by default and truncate
-> large per-entry bodies (4 KB) — pass an explicit `limit` for more.
+> `console`/`network`/`ipc`/`navigation`/`dialogs`/`events` return the newest 100 entries by
+> default (`slow_ipc`: 20) as a bare array, with nothing to say more exist; large per-entry fields
+> are cut at 4 KB. Pass an explicit `limit` for more.
 
 ---
 
@@ -740,9 +772,21 @@ page-scoped (cleared on reload).
 {"action": "matches"}
 ```
 
-> **Scope:** fetch supports all behaviors; XHR supports `block`/`delay`
-> (`fulfill` is fetch-only). Top-level navigation, sub-resources (img/css), and
-> WebSocket frames are not intercepted.
+> **Scope:** fetch and XHR support all behaviors: a fulfilled XHR never reaches
+> the network, and reports the rule's status, headers and body through its
+> `responseType`, with its usual events. Top-level navigation, sub-resources
+> (img/css), and WebSocket frames are not intercepted.
+>
+> **A regex that can hang the page is refused at `add`.** JavaScript has no regex
+> timeout, and a rule's regex runs on the page's main thread against every request
+> URL. A repeated group that can take the same text in more than one way is refused,
+> also when the ambiguity sits in a subgroup: `(a+)+`, `(a*)*`, `(a|aa)+`, `(.*)*`,
+> `(x(a|a)y)+`. `^/api/(users|items)/\d+$`, `.*\.png$`, `(/\w+)+`, `(api|app)+` and
+> `([a-z0-9]+(-[a-z0-9]+)*\.)+[a-z]{2,}$` are fine. The check is on the repetition only:
+> slow patterns with no repeated group (`.*.*.*.*x`) still get through. It errs towards
+> refusing: a counted group is treated as unbounded and `\b` as always passing, so
+> `(a+){2}` and `(\w+\b)+` are refused, as is a repeated group that can match nothing,
+> such as `(a|)+`.
 >
 > **Rules on Tauri IPC change what the app's real `invoke` gets.** On the fetch
 > transport (`http://ipc.localhost/<cmd>` on Windows — `https://ipc.localhost/<cmd>` with `useHttpsScheme` — `ipc://localhost/<cmd>` on
@@ -959,9 +1003,6 @@ Quantitative, deterministic, cross-platform access to the webview's animation en
 | `list` | `webview_label` | `getAnimations()` introspection: declared timing (duration/delay/easing/iterations), computed progress, keyframes, play state, and the animating target. An animation only appears while running/pending — trigger it first. |
 | `scrub` | `selector`, `points`, `capture`, `webview_label` | Pauses the target's animation and seeks it to N evenly-spaced points (`await animation.ready` + double-rAF freezes each frame), returning the exact geometry curve (rect + transform + opacity per point). With `capture: true`, also returns a single contact-sheet **filmstrip PNG** of the whole arc plus a manifest. **CSS-driven animations only** (JS/rAF animations are not seekable — errors clearly and suggests `sample`). |
 | `sample` | `record`, `selector`, `webview_label` | Real-time `requestAnimationFrame` recorder, decoupled from the blocking eval so event-triggered sweeps are catchable: `record: true` arms a watcher, trigger the animation, then `record: false` reads the measured per-frame curve, jank stats (dropped frames, max frame gap), and declared-vs-measured duration. Works for **any** animation including JS/rAF-driven ones. |
-| `restore` | boolean | no | `scrub`: resume the animation afterwards (default true); false leaves it paused at the last point |
-| `cols` | integer | no | `scrub` with `capture`: filmstrip grid columns (default ≈ √points) |
-| `clear` | boolean | no | `sample` read: clear the recorded sessions after returning them |
 
 **Parameters:**
 | Name | Type | Required | Description |
@@ -971,9 +1012,12 @@ Quantitative, deterministic, cross-platform access to the webview's animation en
 | `points` | integer | no | Number of evenly-spaced seek points for `scrub` (default: 6) |
 | `capture` | boolean | no | For `scrub`: also return a filmstrip PNG of the arc |
 | `record` | boolean | for `sample` | `true` to arm the recorder, `false` to read results |
+| `restore` | boolean | no | `scrub`: resume the animation afterwards (default true); false leaves it paused at the last point |
+| `cols` | integer | no | `scrub` with `capture`: filmstrip grid columns (default ≈ √points) |
+| `clear` | boolean | no | `sample` read: clear the recorded sessions after returning them |
 | `webview_label` | string | no | Target webview window |
 
-> **Filmstrip + transparent windows:** `scrub`'s filmstrip uses native window capture, which cannot see transparent / GPU-composited windows (no DWM redirection surface). On such a window the capture now **fails with an actionable error** rather than returning a blank frame — use an opaque window, or `list` / `sample` / `scrub` without `capture`.
+> **Filmstrip + transparent windows:** `scrub`'s filmstrip uses native window capture. On Windows that is Windows.Graphics.Capture, which sees transparent / GPU-composited windows. Only its GDI fallback cannot (no DWM redirection surface), and there the capture **fails with an actionable error** rather than returning a blank frame — use an opaque window, or `list` / `sample` / `scrub` without `capture`.
 
 **Examples:**
 ```json

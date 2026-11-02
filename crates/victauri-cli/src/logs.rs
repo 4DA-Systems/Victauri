@@ -232,7 +232,7 @@ fn emit(line: &str, json: bool, raw: &Value) {
 /// `serde_json` escapes C0 controls but writes C1 controls (U+0080–U+009F, which some
 /// terminals act on) and bidi controls raw. They can only occur inside JSON strings, so a
 /// `\uXXXX` escape keeps the JSON valid and equal while making it inert in a terminal.
-fn json_terminal_safe(json: &str) -> String {
+pub fn json_terminal_safe(json: &str) -> String {
     let mut out = String::with_capacity(json.len());
     for c in json.chars() {
         let bidi = matches!(
@@ -246,6 +246,16 @@ fn json_terminal_safe(json: &str) -> String {
         }
     }
     out
+}
+
+/// Whether the user asked for one particular app: `--app`, `VICTAURI_APP` or `VICTAURI_PORT`,
+/// by the rules the backend resolver itself applies (blank selector and port 0 are unset).
+fn selects_an_app(app: Option<&str>, env: impl Fn(&str) -> Option<String>) -> bool {
+    app.is_some()
+        || env("VICTAURI_APP").is_some_and(|s| !s.trim().is_empty())
+        || env("VICTAURI_PORT")
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .is_some_and(|p| p != 0)
 }
 
 /// Entry point for `victauri logs`.
@@ -268,8 +278,11 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         Err(why) => {
             // App down: the console capture (if the app ran under `victauri run`) still
             // holds its output — including how it died. A capture does not record which app it
-            // belongs to, so with `--app` the newest one could be another app's: say so instead.
-            if opts.app.is_some() && crate::run::latest_capture().is_some() {
+            // belongs to, so with a selector or a pinned port, wherever it was set, the newest
+            // one could be another app's: say so instead.
+            if selects_an_app(opts.app.as_deref(), |var| std::env::var(var).ok())
+                && crate::run::latest_capture().is_some()
+            {
                 bail!(
                     "{} — `victauri logs --stdout` shows the newest `victauri run` capture (of \
                      whichever app ran last), or pass `--capture <file>`",
@@ -379,6 +392,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             label: l,
             page,
             restarted,
+            asked_ms,
         }) = reattach(&opts, &args, cursor, &label, pid, Duration::from_secs(20)).await
         else {
             eprintln!("victauri logs: app went away (crashed, closed or rebuilding)");
@@ -409,7 +423,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         print_page(&page, &opts);
         cursor = page["next_seq"].as_u64().unwrap_or(0);
         behind = page["truncated"] == true;
-        last_ok_ms = now_ms();
+        last_ok_ms = asked_ms;
         pid = page_pid(&page);
         backend = b;
         label = l;
@@ -471,17 +485,71 @@ fn final_moments<'a>(lines: &'a [Value], since_ts_ms: u64, opts: &LogsOptions) -
 }
 
 fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
-    let Ok((lines, _)) = read_capture(path, None) else {
+    let Ok(CaptureEnd { lines, unknown, .. }) =
+        read_capture_and_end(path, crate::run::dead_launcher)
+    else {
         return;
     };
     let picked = final_moments(&lines, since_ts_ms, opts);
-    if picked.is_empty() {
+    if picked.is_empty() && unknown.is_none() {
         return;
     }
     eprintln!("victauri logs: how the previous process ended (from its `victauri run` capture):");
-    for l in picked {
+    for l in picked.into_iter().chain(&unknown) {
         emit(&render_console(l), opts.json, l);
     }
+}
+
+/// What a reader can say that a killed launcher could not: a capture whose `victauri run` is dead
+/// and which holds no exit record never will (a launcher writes one whenever it can, so it was
+/// killed outright). A record in the shape of the launcher's own, so a monitor reading stdout sees
+/// it too; `unknown` tells it from one the launcher wrote. It is not written to the capture. `lines`
+/// are the capture's newest records, where an exit record would be.
+fn unknown_exit(pid: u32, lines: &[Value]) -> Option<Value> {
+    if lines.iter().any(|l| l["s"] == "exit") {
+        return None;
+    }
+    let at = lines
+        .last()
+        .and_then(|l| l["t"].as_u64())
+        .unwrap_or_else(now_ms);
+    Some(json!({
+        "t": at,
+        "s": "exit",
+        "l": format!(
+            "exit unknown: `victauri run` (pid {pid}) was killed, so how the app ended was not \
+             recorded"
+        ),
+        "tail": [],
+        "unknown": true,
+    }))
+}
+
+/// What [`read_capture_and_end`] found.
+struct CaptureEnd {
+    lines: Vec<Value>,
+    /// Where to read on from, in the file `head` came from: one open, as the names can move on.
+    cursor: CaptureCursor,
+    unknown: Option<Value>,
+}
+
+/// A capture's newest records, where they end, and [`unknown_exit`]'s record if it has one.
+fn read_capture_and_end(
+    path: &Path,
+    dead_launcher: impl Fn(&Path) -> Option<u32>,
+) -> Result<CaptureEnd> {
+    // Dead first, then read: what it wrote before it was gone is then in the read.
+    let gone = dead_launcher(path);
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    let head = open_capture_head(&mut file).unwrap_or_default();
+    let (lines, offset) = read_open_capture(&mut file, None)?;
+    let unknown = gone.and_then(|pid| unknown_exit(pid, &lines));
+    Ok(CaptureEnd {
+        lines,
+        cursor: CaptureCursor { offset, head },
+        unknown,
+    })
 }
 
 /// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
@@ -499,6 +567,8 @@ struct Reattached {
     label: String,
     page: Value,
     restarted: bool,
+    /// When the request for `page` went out (see `last_ok_ms` in [`cmd_logs`]).
+    asked_ms: u64,
 }
 
 /// Re-resolve the app through discovery until `max` passes, and read the log from `cursor`.
@@ -520,28 +590,42 @@ async fn reattach(
         let Ok((backend, label)) = Backend::connect(opts.app.as_deref()).await else {
             continue;
         };
-        let Ok(page) = backend.logs(args.clone()).await else {
+        let Ok((page, restarted, asked_ms)) =
+            read_reattached(&backend, args, cursor, label != old_label, known_pid).await
+        else {
             continue;
-        };
-        let restarted = label != old_label || is_new_process(&page, cursor, known_pid);
-        let page = if restarted {
-            let mut from_start = args.clone();
-            from_start["since_seq"] = 0.into();
-            match backend.logs(from_start).await {
-                Ok(p) => p,
-                Err(_) => continue,
-            }
-        } else {
-            page
         };
         return Some(Reattached {
             backend,
             label,
             page,
             restarted,
+            asked_ms,
         });
     }
     None
+}
+
+/// The first page after re-attaching, whether it came from a new process, and when the request
+/// for it went out. From a new process it is read from the start, by a second request.
+async fn read_reattached(
+    backend: &Backend,
+    args: &Value,
+    cursor: u64,
+    relabelled: bool,
+    known_pid: Option<u64>,
+) -> Result<(Value, bool, u64)> {
+    let asked_ms = now_ms();
+    let page = backend.logs(args.clone()).await?;
+    let restarted = relabelled || is_new_process(&page, cursor, known_pid);
+    if !restarted {
+        return Ok((page, false, asked_ms));
+    }
+    let mut from_start = args.clone();
+    from_start["since_seq"] = 0.into();
+    let asked_ms = now_ms();
+    let page = backend.logs(from_start).await?;
+    Ok((page, true, asked_ms))
 }
 
 /// The app is gone: show what it printed in its final moments, then how it exited, from its
@@ -670,10 +754,16 @@ async fn follow_stdout_via_app(
             }
             Err(e) => return Err(e),
         };
+        warn_gap(&page);
         if let Some(lines) = page["lines"].as_array() {
             for l in lines {
                 emit(&render_console(l), opts.json, l);
             }
+        }
+        // The app outlived its launcher: nothing more reaches the capture.
+        if let Some(note) = launcher_gone_note(&page, capture_path.as_deref()) {
+            eprintln!("victauri logs: {}", clean(note));
+            return Ok(());
         }
         if !opts.follow {
             return Ok(());
@@ -690,6 +780,13 @@ async fn follow_stdout_via_app(
             tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
         }
     }
+}
+
+/// What the app says of a killed launcher, believed only of a capture `victauri run` named itself:
+/// one elsewhere is a `--capture` file, which has no launcher to speak of, and a follow ends on this.
+fn launcher_gone_note<'a>(page: &'a Value, capture_path: Option<&Path>) -> Option<&'a str> {
+    capture_path?;
+    page["launcher_gone"]["note"].as_str()
 }
 
 /// Read (and with `--follow`, tail) a console capture file directly from disk.
@@ -711,7 +808,11 @@ async fn follow_capture(
         "victauri logs: console capture {}",
         clean(&path.display().to_string())
     );
-    let (lines, mut cursor) = read_capture(&path, None)?;
+    let CaptureEnd {
+        lines,
+        mut cursor,
+        unknown,
+    } = read_capture_and_end(&path, crate::run::dead_launcher)?;
     let recent: Vec<&Value> = if let Some(ts) = since_ts_ms {
         lines
             .iter()
@@ -728,17 +829,43 @@ async fn follow_capture(
         }
         saw_exit |= l["s"] == "exit";
     }
+    // Nothing more will come from a launcher that is gone, so there is nothing to follow.
+    if let Some(unknown) = unknown {
+        emit(&render_console(&unknown), opts.json, &unknown);
+        return Ok(());
+    }
     if !opts.follow || (saw_exit && stop_after_idle.is_some()) {
         return Ok(());
     }
     let mut idle = Duration::ZERO;
+    let mut launcher_checked = std::time::Instant::now();
     loop {
         tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
-        let (lines, next) = read_capture(&path, Some(cursor))?;
+        let mut lines = read_followed(&path, &mut cursor)?;
         if lines.is_empty() {
             idle += Duration::from_millis(opts.interval_ms);
             if stop_after_idle.is_some_and(|max| idle >= max) {
                 return Ok(());
+            }
+            // Not every poll: on Unix asking costs a process. Dead first, then read: a launcher
+            // that exited normally has written its exit record by the time it is gone.
+            if launcher_checked.elapsed() >= LAUNCHER_CHECK_EVERY {
+                launcher_checked = std::time::Instant::now();
+                if let Some(pid) = crate::run::dead_launcher(&path) {
+                    lines = read_followed(&path, &mut cursor)?;
+                    let seen_exit = lines.iter().any(|l| l["s"] == "exit");
+                    for l in &lines {
+                        if console_line_passes(l, opts) {
+                            emit(&render_console(l), opts.json, l);
+                        }
+                    }
+                    if !seen_exit
+                        && let Some(unknown) = unknown_exit(pid, &read_capture(&path, None)?.0)
+                    {
+                        emit(&render_console(&unknown), opts.json, &unknown);
+                    }
+                    return Ok(());
+                }
             }
         } else {
             idle = Duration::ZERO;
@@ -751,16 +878,123 @@ async fn follow_capture(
                 return Ok(());
             }
         }
-        cursor = next;
     }
+}
+
+/// How often a follower with nothing to read asks whether the capture's launcher is still there.
+const LAUNCHER_CHECK_EVERY: Duration = Duration::from_secs(2);
+
+/// How much of a capture's first bytes tells one file from the next.
+const CAPTURE_HEAD_BYTES: u64 = 256;
+
+/// Where a follower is in a capture: the offset, and the start of the file it applies to.
+struct CaptureCursor {
+    offset: u64,
+    head: Vec<u8>,
+}
+
+/// The first bytes of a capture; `None` when it cannot be read (between the launcher's rename
+/// and its new file, for one).
+#[cfg(test)]
+fn capture_head(path: &Path) -> Option<Vec<u8>> {
+    open_capture_head(&mut std::fs::File::open(path).ok()?)
+}
+
+/// The first bytes of this open capture. It leaves the position wherever the read ended.
+fn open_capture_head(file: &mut std::fs::File) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut head = Vec::new();
+    file.take(CAPTURE_HEAD_BYTES).read_to_end(&mut head).ok()?;
+    Some(head)
+}
+
+/// Whether `now` is still the file whose head was `seen`. One file can have grown since, so only
+/// the common length is compared. Nothing seen yet fits any file; but a file does not shrink, so
+/// an empty one after a non-empty head is a new file, whose first record is still to come.
+fn same_capture(seen: &[u8], now: &[u8]) -> bool {
+    if seen.is_empty() {
+        return true;
+    }
+    let n = seen.len().min(now.len());
+    n > 0 && seen[..n] == now[..n]
+}
+
+/// The next records of a followed capture, across a rotation. The launcher renames a full file
+/// to `.jsonl.1` and starts a new one, so the unread tail is in the rotated file. A length check
+/// cannot see a rotation whose new file has already grown past the cursor; the first record has
+/// a timestamp and differs. If the rotated file is not the one being read either (a second
+/// rotation between two polls), those lines are gone, and that is said. A file's head and its bytes
+/// come from one open, as the names can move on between two.
+fn read_followed(path: &Path, cursor: &mut CaptureCursor) -> Result<Vec<Value>> {
+    let (lines, lost) = read_followed_noting_loss(path, cursor)?;
+    if lost {
+        eprintln!(
+            "victauri logs: [the capture rotated more than once between two reads; some lines \
+             were lost]"
+        );
+    }
+    Ok(lines)
+}
+
+/// [`read_followed`], saying whether lines were lost rather than printing it.
+fn read_followed_noting_loss(
+    path: &Path,
+    cursor: &mut CaptureCursor,
+) -> Result<(Vec<Value>, bool)> {
+    let mut lost = false;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok((Vec::new(), false));
+    };
+    let Some(head) = open_capture_head(&mut file) else {
+        return Ok((Vec::new(), false));
+    };
+    if !same_capture(&cursor.head, &head) {
+        let rotated = std::fs::File::open(path.with_extension("jsonl.1"));
+        let same_file = rotated.ok().and_then(|mut rotated| {
+            let seen = open_capture_head(&mut rotated)?;
+            same_capture(&cursor.head, &seen).then_some(rotated)
+        });
+        if let Some(mut rotated) = same_file {
+            let (lines, next) = read_open_capture(&mut rotated, Some(cursor.offset))?;
+            let advanced = next != cursor.offset;
+            cursor.offset = next;
+            // Larger than one read: stay on it until it is drained.
+            if advanced {
+                return Ok((lines, false));
+            }
+        } else {
+            lost = true;
+        }
+        // A new file with no head yet could not tell the next rotation from itself: wait here,
+        // where a rotation still shows, and say any loss when the file can be named.
+        if head.is_empty() {
+            return Ok((Vec::new(), false));
+        }
+        *cursor = CaptureCursor {
+            offset: 0,
+            head: head.clone(),
+        };
+    }
+    if head.len() > cursor.head.len() {
+        cursor.head = head;
+    }
+    let (lines, next) = read_open_capture(&mut file, Some(cursor.offset))?;
+    cursor.offset = next;
+    Ok((lines, lost))
 }
 
 /// Read JSONL capture records from `from` (or the whole file). Tolerates a
 /// partially written last line and a file rotated under us.
 fn read_capture(path: &Path, from: Option<u64>) -> Result<(Vec<Value>, u64)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f =
+    let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    read_open_capture(&mut file, from)
+}
+
+/// [`read_capture`] of a file already open.
+fn read_open_capture(f: &mut std::fs::File, from: Option<u64>) -> Result<(Vec<Value>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
     let len = f.metadata()?.len();
     // Without a cursor, read the newest `MAX_READ` bytes: a capture grows to 64 MB before it
     // rotates, and reading from the start showed lines from the middle of a long session —
@@ -830,6 +1064,231 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launcher_note_counts_only_for_a_capture_of_our_own() {
+        let page = json!({"launcher_gone": {"note": "killed"}});
+        assert_eq!(launcher_gone_note(&page, None), None);
+        assert_eq!(
+            launcher_gone_note(&page, Some(Path::new("c.jsonl"))),
+            Some("killed")
+        );
+        assert_eq!(
+            launcher_gone_note(&json!({}), Some(Path::new("c.jsonl"))),
+            None
+        );
+    }
+
+    /// A launcher writes its exit record and is gone: read before asking, that moment reported a
+    /// kill and lost the real exit. Whatever it wrote before it was seen dead is in the read.
+    #[test]
+    fn a_launcher_ending_between_the_read_and_the_check_is_not_reported_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        std::fs::write(&path, "{\"t\":1,\"s\":\"out\",\"l\":\"line\"}\n").unwrap();
+        let CaptureEnd { lines, unknown, .. } = read_capture_and_end(&path, |path| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b"{\"t\":2,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n")
+                .unwrap();
+            Some(4242)
+        })
+        .unwrap();
+        assert!(unknown.is_none(), "{unknown:?}");
+        assert_eq!(lines.last().unwrap()["s"], "exit");
+    }
+
+    /// A follower racing a writer that rotates as `victauri run` does: every line arrives once or
+    /// its loss is said. The head and the bytes came from two opens, so a rotation between them read
+    /// the new file at an offset meant for the old one.
+    #[test]
+    fn a_follower_racing_rotations_loses_no_line_silently() {
+        use std::io::Write as _;
+        const TOTAL: u64 = 150_000;
+        const ROTATE_AT: u64 = 80_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        let write_line = |file: &mut std::fs::File, i: u64| {
+            let line = format!(
+                "{{\"t\":{i},\"s\":\"out\",\"l\":\"{i} {}\"}}\n",
+                "x".repeat(60)
+            );
+            file.write_all(line.as_bytes()).unwrap();
+            line.len() as u64
+        };
+        let mut first = std::fs::File::create(&path).unwrap();
+        let mut written = write_line(&mut first, 0);
+        let head = capture_head(&path).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut file = first;
+                let mut rotations = 0u32;
+                for i in 1..TOTAL {
+                    written += write_line(&mut file, i);
+                    if written >= ROTATE_AT {
+                        drop(file);
+                        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+                        file = std::fs::File::create(&path).unwrap();
+                        written = 0;
+                        rotations += 1;
+                    }
+                    if i % 200 == 0 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+                rotations
+            })
+        };
+        let mut cursor = CaptureCursor { offset: 0, head };
+        let mut expected = 0u64;
+        let (mut silent, mut reported, mut duplicates) = (0u64, 0u64, 0u64);
+        let give_up = std::time::Instant::now() + Duration::from_secs(60);
+        while expected < TOTAL && std::time::Instant::now() < give_up {
+            let (lines, lost) = read_followed_noting_loss(&path, &mut cursor).unwrap();
+            for (at, line) in lines.iter().enumerate() {
+                let i = line["t"].as_u64().unwrap();
+                if i < expected {
+                    duplicates += 1;
+                    continue;
+                }
+                if i > expected {
+                    if lost && at == 0 {
+                        reported += i - expected;
+                    } else {
+                        silent += i - expected;
+                    }
+                }
+                expected = i + 1;
+            }
+        }
+        let rotations = writer.join().unwrap();
+        assert!(rotations > 100, "{rotations} rotations");
+        assert_eq!(
+            (silent, duplicates),
+            (0, 0),
+            "silently lost, duplicated; reported lost {reported}, over {rotations} rotations"
+        );
+        assert_eq!(expected, TOTAL, "reported lost {reported}");
+    }
+
+    fn record(n: u64) -> String {
+        format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"line {n}\"}}\n")
+    }
+
+    fn texts(lines: &[Value]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|l| l["l"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Review: a poll that landed between the launcher's new (still empty) file and its first
+    /// record took an empty head for "the same capture" and reset the offset. The next poll then
+    /// saw a rotation with the offset at 0 and printed the whole rotated capture again.
+    #[test]
+    fn a_rotation_seen_while_the_new_file_is_empty_reprints_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        std::fs::write(&path, format!("{}{}", record(1), record(2))).unwrap();
+        let head = capture_head(&path).unwrap();
+        let (seen, offset) = read_capture(&path, None).unwrap();
+        assert_eq!(seen.len(), 2);
+        let mut cursor = CaptureCursor { offset, head };
+
+        // One unread line, then the rotation, then nothing yet in the new file.
+        let mut old = std::fs::read_to_string(&path).unwrap();
+        old.push_str(&record(3));
+        std::fs::write(&path, &old).unwrap();
+        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+        std::fs::write(&path, "").unwrap();
+
+        let mut got = texts(&read_followed(&path, &mut cursor).unwrap());
+        std::fs::write(&path, record(4)).unwrap();
+        got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
+        got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
+        assert_eq!(got, ["line 3", "line 4"]);
+    }
+
+    /// A mock of `/api/tools/logs`: answers `pid` late, and records when each request arrived.
+    async fn slow_logs_backend(pid: u64) -> (Backend, std::sync::Arc<std::sync::Mutex<Vec<u64>>>) {
+        let arrived = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&arrived);
+        let app = axum::Router::new().route(
+            "/api/tools/logs",
+            axum::routing::post(move || {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    seen.lock().unwrap().push(now_ms());
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    axum::Json(json!({"result": {"next_seq": 500, "sources": {"pid": pid}}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = Backend {
+            http: reqwest::Client::new(),
+            base: format!("http://127.0.0.1:{port}"),
+            token: None,
+        };
+        (backend, arrived)
+    }
+
+    /// After a re-attach the "last answered" moment was taken once the response was in. A line
+    /// printed while the server was answering is in no page, and it then fell before that moment,
+    /// so the previous process's final moments left it out. As for an ordinary poll, the moment is
+    /// when the request went out.
+    #[tokio::test]
+    async fn the_moment_after_a_reattach_is_when_the_request_went_out() {
+        let args = json!({"action": "backend"});
+        let (backend, arrived) = slow_logs_backend(1).await;
+        let (_, restarted, asked_ms) = read_reattached(&backend, &args, 100, false, Some(1))
+            .await
+            .unwrap();
+        assert!(!restarted);
+        let read = arrived.lock().unwrap()[0];
+        assert!(
+            asked_ms <= read,
+            "stamped {}ms after the read",
+            asked_ms - read
+        );
+
+        // A new process: the page that counts is the second request's.
+        let (backend, arrived) = slow_logs_backend(2).await;
+        let (_, restarted, asked_ms) = read_reattached(&backend, &args, 100, false, Some(1))
+            .await
+            .unwrap();
+        assert!(restarted);
+        let arrived = arrived.lock().unwrap().clone();
+        assert_eq!(arrived.len(), 2);
+        assert!(
+            asked_ms <= arrived[1],
+            "stamped {}ms after the read",
+            asked_ms - arrived[1]
+        );
+        assert!(
+            asked_ms >= arrived[0],
+            "before the first request even arrived"
+        );
+    }
+
+    /// A capture that was empty when the follower attached is the ordinary start of a run.
+    #[test]
+    fn a_capture_empty_at_attach_is_read_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let mut cursor = CaptureCursor {
+            offset: 0,
+            head: capture_head(&path).unwrap(),
+        };
+        assert!(read_followed(&path, &mut cursor).unwrap().is_empty());
+        std::fs::write(&path, record(1)).unwrap();
+        let got = texts(&read_followed(&path, &mut cursor).unwrap());
+        assert_eq!(got, ["line 1"]);
+    }
 
     /// Release verification: the 0.10.2 CLI against 4DA's 0.10.1 plugin printed only the
     /// plugin's deserializer error for `victauri logs`.

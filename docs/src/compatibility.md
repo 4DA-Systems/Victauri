@@ -13,7 +13,7 @@ Victauri is a **development-time dependency** (a normal `[dependencies]` entry �
 | 3 | **Debug build** | The server is `#[cfg(debug_assertions)]`-gated; `init()` is a no-op and nothing listens in release. A dev/test-time tool by design. |
 | 4 | **Per-window `victauri:default` capability** | Tauri's per-window permission ACL silently blocks the bridge's callback IPC without it — the window comes up blind (`introspectable:false`). The `window introspectability` tool detects this and names the exact fix. This is the #1 adoption footgun. |
 
-**Not constraints:** the frontend framework (React 18/19, Vue/Nuxt, Svelte, vanilla) and the OS/webview engine (WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux) are all supported and cross-checked.
+**Not constraints:** the frontend framework (React 18/19, Vue/Nuxt, Svelte, vanilla) and the OS/webview engine (WebView2 on Windows, WKWebView on macOS, WebKitGTK on Linux) are all supported. The bridge works at DOM level, so no framework is special-cased; see [what was actually run](#apps-victauri-has-actually-run-on).
 
 | ✅ Works on | ❌ Won't work on |
 |---|---|
@@ -22,7 +22,7 @@ Victauri is a **development-time dependency** (a normal `[dependencies]` entry �
 | Any frontend framework, any of the three OSes | A binary you didn't build (no source to add a dev dep) |
 | | Non-Tauri apps — Electron, native, plain web |
 
-> Tauri-1 example: the `surrealist`/`lettura` entries pinned in `scripts/compat/apps.json` are Tauri **1.4** at those refs and therefore cannot host Victauri — a reminder to target Tauri-2 refs/apps, not a Victauri defect.
+> Check the Tauri major of the exact ref you build: Lettura's newest release tag (v0.1.22) is still Tauri 1, which cannot host Victauri, so `scripts/compat/apps.json` pins a Tauri-2 commit from its `master` instead.
 
 ## Content Security Policy (CSP)
 
@@ -56,11 +56,15 @@ Victauri traverses **open** shadow roots automatically (`element.shadowRoot` ret
 
 ### iframes
 
-Tauri's `js_init_script` does **not** run inside iframes ([tauri-apps/tauri#13577](https://github.com/tauri-apps/tauri/issues/13577)). The Victauri bridge will be absent inside any `<iframe>` element. Tools like `dom_snapshot` will show the `<iframe>` element but not its contents.
+Tauri's `js_init_script` does **not** run inside iframes ([tauri-apps/tauri#13577](https://github.com/tauri-apps/tauri/issues/13577)). The Victauri bridge runs only in the main frame, and what it reaches depends on the frame's origin:
+
+- **Same-origin frames** are traversed from the main frame: `dom_snapshot`, `find_elements`, `interact` and `input` see and act on their contents.
+- **Cross-origin frames** are marked in the snapshot and skipped. The browser's security boundary leaves no way in.
+- **In either kind**, a frame's own console output and its IPC and network calls are not captured, because no bridge runs there.
 
 **Detection:** `get_diagnostics` reports iframe count and sources.
 
-**Workaround:** None — this is a Tauri limitation. Tauri recommends using multi-webview (`WebviewWindow`) instead of iframes for security.
+**Workaround for cross-origin content:** None — Tauri recommends using multi-webview (`WebviewWindow`) instead of iframes for security.
 
 ### Service Workers
 
@@ -162,6 +166,14 @@ Victauri's own example apps (`examples/demo-app`, `examples/gauntlet-app`) use t
 `#[tauri::command]`s are a separate, upstream case: Tauri extracts their arguments and drops their
 resolver on a tokio worker, whatever the command body does.
 
+### A command that opens a window must not be sync
+
+A sync `#[tauri::command]` runs on the main thread inside the webview's IPC handler. Building a webview
+there deadlocks on Windows: the window never appears, and the calling page stays wedged until the app
+restarts, so every Victauri call to that window then times out. Make the command `async`, and to keep
+the Linux rule above, hand the build to the main thread (`show_notification_window` in
+`examples/demo-app/src/main.rs` does this).
+
 ### Tauri Version Compatibility
 
 Victauri's CI builds and runs it on Tauri 2.11 (the workspace lockfile) and on Tauri 3.0.0-alpha.5 (the `tauri3` canary job); it compiles against Tauri 2.0.0 and 2.12 (checked in the 0.10.0 pre-audit). The `tauri-v3` feature needs Tauri 3.0.0-alpha.4 or newer (its permission build step is `tauri-plugin` 3.0.0-alpha.4, which requires a matching `tauri-utils`). Key compatibility facts:
@@ -206,35 +218,35 @@ What Tauri 3 changed that touches a plugin like Victauri, so far:
 Call `get_diagnostics` (MCP or REST) to check for all known edge cases at runtime:
 
 ```bash
-curl -X POST http://127.0.0.1:7373/api/tools/get_diagnostics -d '{}'
+victauri call get_diagnostics
 ```
 
 Returns:
 ```json
 {
-  "result": {
-    "warnings": [
-      {
-        "id": "closed-shadow-dom",
-        "severity": "medium",
-        "message": "3 custom element(s) may use closed shadow DOM",
-        "details": { "count": 3 }
-      }
-    ],
-    "info": {
-      "bridge_version": "0.10.2",
-      "dom_elements": 847,
-      "open_shadow_roots": 12,
-      "event_listeners": 234,
-      "protocol": "tauri:",
-      "url": "tauri://localhost/",
-      "user_agent": "..."
+  "warnings": [
+    {
+      "id": "closed-shadow-dom",
+      "severity": "medium",
+      "message": "3 custom element(s) may use closed shadow DOM",
+      "details": { "count": 3 }
     }
+  ],
+  "info": {
+    "bridge_version": "0.10.3",
+    "dom_elements": 847,
+    "open_shadow_roots": 12,
+    "event_listeners": 234,
+    "protocol": "tauri:",
+    "url": "tauri://localhost/",
+    "user_agent": "..."
   }
 }
 ```
 
-Warning IDs: `service-worker-active`, `closed-shadow-dom`, `iframes-present`, `large-dom`.
+Over REST the same object sits under `result`, and the request needs the auth token.
+
+Warning IDs: `service-worker-active`, `closed-shadow-dom`, `iframes-present`, `large-dom`, `ipc-postmessage-fallback`.
 
 ## Multi-Window Apps
 
@@ -253,13 +265,12 @@ Apps with many dynamic windows (Spacedrive's 15+ types, Seelen-UI's desktop envi
 
 ## Reproducible Retest Harness
 
-The numbers in the next section were measured manually against app versions current
-at the time. To keep compatibility claims honest against the **current** Victauri,
-the repo ships a reproducible harness:
+To keep compatibility claims honest against the **current** Victauri, the repo ships a
+reproducible harness:
 
 ```bash
-scripts/compat/retest-app.sh duckling   # one app
-scripts/compat/retest-all.sh            # all five, with a results table
+scripts/compat/retest-app.sh kanri      # one app
+scripts/compat/retest-all.sh            # all three, with a results table
 ```
 
 For each app it clones a **pinned release tag**, injects the current `victauri-plugin`
@@ -271,11 +282,21 @@ demo-app). The **Compatibility Retest** GitHub workflow (`.github/workflows/comp
 runs it on demand and weekly. See [`scripts/compat/README.md`](https://github.com/4DA-Systems/victauri/blob/main/scripts/compat/README.md).
 
 Note: these third-party apps move fast — pinned tags and per-app build recipes
-(three different package managers; pnpm-version-sensitive workspaces) are maintained
+(two package managers; pnpm-version-sensitive workspaces) are maintained
 in `scripts/compat/apps.json`. A `frontend`-stage failure is the app's own toolchain,
 not Victauri; the clone → inject → build → smoke pipeline is what proves compatibility.
 
-## Tested Apps
+## Apps Victauri has actually run on
+
+- **In the retest harness (weekly and on demand; not a release gate):** Kanri (Nuxt / Vue 3), En Croissant (React), Lettura (React).
+- **One-time evaluation, May 2026:** those three plus Surrealist (React 19) and Duckling (React 19).
+- **In this repo's CI:** the demo app and the gauntlet app (plain HTML/JS), on Windows, macOS and Linux.
+- **Its maintainer's own app:** 4DA (React).
+
+## Researched fit
+
+None of these has been run with Victauri. The table comes from reading each project's source and
+says how well it should fit.
 
 | App | Stars | Tauri | Frontend | Windows | Commands | Victauri Fit |
 |---|---|---|---|---|---|---|
@@ -291,9 +312,11 @@ not Victauri; the clone → inject → build → smoke pipeline is what proves c
 
 ## Framework Coverage
 
-Victauri's DOM snapshot uses the accessible tree (ARIA roles and names), which is framework-agnostic. Confirmed working with:
+Victauri's DOM snapshot uses the accessible tree (ARIA roles and names), which is framework-agnostic. Run against:
 
-- React (demo-app, 4DA)
-- Vue (Hoppscotch web client)
-- Svelte (Whispering, Seelen-UI)
-- Vanilla HTML/JS
+- React 18 and 19 (4DA, En Croissant, Lettura, Surrealist, Duckling)
+- Vue 3 / Nuxt (Kanri)
+- Vanilla HTML/JS (demo app, gauntlet app)
+
+Svelte has not been run. Nothing in the bridge depends on the framework, so it should work, but that
+is reasoning and not a test.

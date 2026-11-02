@@ -47,7 +47,13 @@ const SENSITIVE_JSON_KEYS: &[&str] = &[
     "ssn",
     "credit_card",
     "card_number",
+    "passphrase",
+    "jwt",
 ];
+
+/// Credential names too short to match as a substring (`auth` is in `author` and `oauth_provider`):
+/// these count only as a whole `_` / `-` / `.` separated part of a key.
+const SENSITIVE_KEY_PARTS: &[&str] = &["auth", "pwd"];
 
 /// URL query/fragment parameters whose value is a credential. Matched only as a whole parameter
 /// name right after `?`, `&` or `#`, so `?keyboard=` or `&tokens_used=` are left alone.
@@ -100,8 +106,9 @@ static TEXT_KEY_VALUE_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync:
         words.sort();
         words.dedup();
         compile_builtin(&format!(
-            r#"(?i)("[^"\\\n]{{0,64}}?(?:{})[^"\\\n]{{0,64}}?"\s*:\s*)("(?:[^"\\]|\\.)*(?:"|\z)|-?\d[\d.eE+-]*)"#,
-            words.join("|")
+            r#"(?i)("(?:[^"\\\n]{{0,64}}?(?:{})[^"\\\n]{{0,64}}?|(?:[^"\\\n]{{0,64}}?[_.-])?(?:{})(?:[_.-][^"\\\n]{{0,64}}?)?)"\s*:\s*)("(?:[^"\\]|\\.)*(?:"|\z)|-?\d[\d.eE+-]*)"#,
+            words.join("|"),
+            SENSITIVE_KEY_PARTS.join("|")
         ))
     },
 );
@@ -117,6 +124,7 @@ static TEXT_KEY_EQ_RE: std::sync::LazyLock<Option<regex::Regex>> = std::sync::La
         .iter()
         .map(|k| regex::escape(&k.to_lowercase()))
         .collect();
+    words.extend(SENSITIVE_KEY_PARTS.iter().map(|k| (*k).to_string()));
     words.sort();
     words.dedup();
     compile_builtin(&format!(
@@ -216,9 +224,20 @@ impl Redactor {
         let (custom_set, custom_compiled) = if custom_patterns.is_empty() {
             (None, Vec::new())
         } else {
-            match RegexSet::new(custom_patterns) {
+            // One by one: `RegexSet::new` fails as a whole, which dropped the valid ones too.
+            let valid: Vec<&String> = custom_patterns
+                .iter()
+                .filter(|p| match regex::Regex::new(p) {
+                    Ok(_) => true,
+                    Err(e) => {
+                        tracing::warn!("Skipping invalid custom redaction pattern: {e}");
+                        false
+                    }
+                })
+                .collect();
+            match RegexSet::new(&valid) {
                 Ok(set) => {
-                    let compiled: Vec<regex::Regex> = custom_patterns
+                    let compiled: Vec<regex::Regex> = valid
                         .iter()
                         .filter_map(|p| regex::Regex::new(p).ok())
                         .collect();
@@ -241,21 +260,48 @@ impl Redactor {
 
     /// Scrub sensitive data from `input` using regex patterns and JSON-key matching.
     ///
-    /// Passes, in order: the value patterns (API keys, bearer tokens, JWTs, emails, … plus any
-    /// custom patterns); credential parameters in URLs (`?access_token=…`, `&sig=…`); then keys.
-    /// Key-based redaction applies to the whole output when it is JSON — including JSON carried
-    /// inside its string values (IPC/network bodies are JSON-encoded strings) — and otherwise to
-    /// `"key": value` pairs found in the text. Best effort: see the limits in `docs/src/security.md`.
+    /// Output that is JSON is walked as JSON, including JSON carried inside its string values
+    /// (IPC/network bodies are JSON-encoded strings): sensitive keys lose their value, and the
+    /// value patterns (API keys, bearer tokens, JWTs, emails, … plus any custom patterns) and
+    /// credential URL parameters (`?access_token=…`, `&sig=…`) apply to every leaf and key. The
+    /// patterns must not run over the raw JSON text first: a card-shaped number would become a
+    /// bare `[REDACTED]`, the text would stop being JSON, and key redaction would be lost with it.
+    /// Other output gets the patterns, then `"key": value` pairs found in the text. Best effort:
+    /// see the limits in `docs/src/security.md`.
     #[must_use]
     pub fn redact(&self, input: &str) -> String {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(input) else {
+            return self.redact_text(input);
+        };
+        let output = match self.redact_json_value(&value, 0) {
+            Some(redacted) => {
+                serde_json::to_string(&redacted).unwrap_or_else(|_| self.redact_text(input))
+            }
+            None => input.to_string(),
+        };
+        // A custom pattern may be written against the JSON text itself (`"internal":\s*"\w+"`).
+        // Leaves cannot match that, and a redacted result beats a valid one.
+        match &self.custom_set {
+            Some(set) if set.is_match(&output) => {
+                let mut output = output;
+                for re in &self.custom_compiled {
+                    output = re.replace_all(&output, "[REDACTED]").into_owned();
+                }
+                output
+            }
+            _ => output,
+        }
+    }
+
+    /// Value patterns, URL parameters and `key: value` pairs over text that is not JSON.
+    fn redact_text(&self, input: &str) -> String {
         let mut output = self.redact_regex(input);
         if let Some(re) = URL_SECRET_PARAM_RE.as_ref()
             && re.is_match(&output)
         {
             output = re.replace_all(&output, "${1}[REDACTED]").into_owned();
         }
-        output = self.redact_json_keys(&output);
-        output
+        redact_text_key_values(&output).into_owned()
     }
 
     fn redact_regex(&self, input: &str) -> String {
@@ -283,83 +329,111 @@ impl Redactor {
         output
     }
 
-    fn redact_json_keys(&self, input: &str) -> String {
-        match serde_json::from_str::<serde_json::Value>(input) {
-            Ok(value) => match redact_json_value(&value, 0) {
-                Some(redacted) => {
-                    serde_json::to_string(&redacted).unwrap_or_else(|_| input.to_string())
+    /// `value` with every sensitive key's value redacted and the patterns applied to its leaves
+    /// and keys, or `None` if nothing needed redacting. A string that holds JSON is redacted
+    /// inside (and re-encoded); any other string goes through [`Self::redact_text`] (which
+    /// covers a truncated JSON body, say).
+    fn redact_json_value(
+        &self,
+        value: &serde_json::Value,
+        depth: usize,
+    ) -> Option<serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => {
+                // `{name|key: <sensitive>, value: …}` (cookies, key/value lists): the sensitive
+                // word is in the sibling field.
+                let named_secret = ["name", "key"].iter().any(|field| {
+                    map.get(*field)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(is_sensitive_key)
+                });
+                let mut changed = false;
+                let mut new_map = serde_json::Map::new();
+                let mut last_suffix: std::collections::HashMap<String, usize> =
+                    std::collections::HashMap::new();
+                for (key, val) in map {
+                    let secret = is_sensitive_key(key) || (named_secret && key == "value");
+                    let new_val = if secret && !val.is_boolean() {
+                        // Booleans like `has_api_key: true` only indicate presence — kept.
+                        Some(serde_json::Value::String("[REDACTED]".into()))
+                    } else {
+                        self.redact_json_value(val, depth)
+                    };
+                    changed |= new_val.is_some();
+                    let new_key = self.redact_regex(key);
+                    changed |= new_key != *key;
+                    // Keys that redact to the same text must not overwrite each other's values.
+                    // The search resumes where the last one stopped: from `#2` every time, an
+                    // object of many such keys cost quadratic time on every result.
+                    let mut unique = new_key.clone();
+                    if new_map.contains_key(&unique) {
+                        let n = last_suffix.entry(new_key.clone()).or_insert(1);
+                        loop {
+                            *n += 1;
+                            unique = format!("{new_key}#{n}");
+                            if !new_map.contains_key(&unique) {
+                                break;
+                            }
+                        }
+                    }
+                    new_map.insert(unique, new_val.unwrap_or_else(|| val.clone()));
                 }
-                None => input.to_string(),
-            },
-            // Not JSON as a whole: redact the `"key": value` pairs of any JSON inside the text.
-            Err(_) => redact_text_key_values(input).into_owned(),
+                changed.then_some(serde_json::Value::Object(new_map))
+            }
+            serde_json::Value::Array(arr) => {
+                let redacted: Vec<Option<serde_json::Value>> = arr
+                    .iter()
+                    .map(|v| self.redact_json_value(v, depth))
+                    .collect();
+                redacted.iter().any(Option::is_some).then(|| {
+                    serde_json::Value::Array(
+                        redacted
+                            .into_iter()
+                            .zip(arr)
+                            .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
+                            .collect(),
+                    )
+                })
+            }
+            serde_json::Value::String(text) => self.redact_json_string(text, depth),
+            // A card-shaped number is replaced by a string, which keeps the output JSON.
+            serde_json::Value::Number(number) => {
+                let text = number.to_string();
+                (self.redact_regex(&text) != text)
+                    .then(|| serde_json::Value::String("[REDACTED]".into()))
+            }
+            _ => None,
         }
+    }
+
+    fn redact_json_string(&self, text: &str, depth: usize) -> Option<serde_json::Value> {
+        let trimmed = text.trim_start();
+        if depth < MAX_NESTED_JSON_DEPTH
+            && (trimmed.starts_with('{') || trimmed.starts_with('['))
+            && let Ok(inner) = serde_json::from_str::<serde_json::Value>(text)
+        {
+            let redacted = self.redact_json_value(&inner, depth + 1)?;
+            return serde_json::to_string(&redacted)
+                .ok()
+                .map(serde_json::Value::String);
+        }
+        let redacted = self.redact_text(text);
+        (redacted != text).then_some(serde_json::Value::String(redacted))
     }
 }
 
 /// How deep JSON nested inside JSON strings is followed.
 const MAX_NESTED_JSON_DEPTH: usize = 4;
 
-fn is_sensitive_key(key: &str) -> bool {
+/// Whether a JSON key or storage key names a credential.
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
     let lower_key = key.to_lowercase();
     SENSITIVE_JSON_KEYS
         .iter()
         .any(|k| lower_key.contains(&k.to_lowercase()))
-}
-
-/// `value` with every sensitive key's value redacted, or `None` if nothing needed redacting.
-/// A string value that holds JSON is redacted inside (and re-encoded); any other string has the
-/// `"key": value` pairs in its text redacted (a truncated JSON body, say).
-fn redact_json_value(value: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut changed = false;
-            let mut new_map = serde_json::Map::new();
-            for (key, val) in map {
-                let new_val = if is_sensitive_key(key) && !val.is_boolean() {
-                    // Booleans like `has_api_key: true` only indicate presence — kept.
-                    Some(serde_json::Value::String("[REDACTED]".into()))
-                } else {
-                    redact_json_value(val, depth)
-                };
-                changed |= new_val.is_some();
-                new_map.insert(key.clone(), new_val.unwrap_or_else(|| val.clone()));
-            }
-            changed.then_some(serde_json::Value::Object(new_map))
-        }
-        serde_json::Value::Array(arr) => {
-            let redacted: Vec<Option<serde_json::Value>> =
-                arr.iter().map(|v| redact_json_value(v, depth)).collect();
-            redacted.iter().any(Option::is_some).then(|| {
-                serde_json::Value::Array(
-                    redacted
-                        .into_iter()
-                        .zip(arr)
-                        .map(|(new, old)| new.unwrap_or_else(|| old.clone()))
-                        .collect(),
-                )
-            })
-        }
-        serde_json::Value::String(text) => redact_json_string(text, depth),
-        _ => None,
-    }
-}
-
-fn redact_json_string(text: &str, depth: usize) -> Option<serde_json::Value> {
-    let trimmed = text.trim_start();
-    if depth < MAX_NESTED_JSON_DEPTH
-        && (trimmed.starts_with('{') || trimmed.starts_with('['))
-        && let Ok(inner) = serde_json::from_str::<serde_json::Value>(text)
-    {
-        let redacted = redact_json_value(&inner, depth + 1)?;
-        return serde_json::to_string(&redacted)
-            .ok()
-            .map(serde_json::Value::String);
-    }
-    match redact_text_key_values(text) {
-        std::borrow::Cow::Owned(redacted) => Some(serde_json::Value::String(redacted)),
-        std::borrow::Cow::Borrowed(_) => None,
-    }
+        || lower_key
+            .split(['_', '-', '.'])
+            .any(|part| SENSITIVE_KEY_PARTS.contains(&part))
 }
 
 impl Default for Redactor {
@@ -569,6 +643,165 @@ mod tests {
             r.redact("sk_test_ABCDEFGHIJKLMNOPQRSTUVWXYZab")
                 .contains("[REDACTED]")
         );
+    }
+
+    /// A 16-digit integer (a microsecond timestamp) matches the card pattern. Run over the raw
+    /// text, that wrote a bare `[REDACTED]` into the JSON: the output no longer parsed, so key
+    /// redaction fell back to the text path and an object under a sensitive key leaked.
+    #[test]
+    fn a_sixteen_digit_integer_keeps_the_output_valid_and_key_redaction_on() {
+        let r = Redactor::default();
+        let out = r.redact(
+            r#"{"created_us":1730000000000000,"credentials":{"user":"a","pw":"hunter2"},"n":1}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v["credentials"], "[REDACTED]", "{out}");
+        assert_eq!(v["created_us"], "[REDACTED]", "{out}");
+        assert_eq!(v["n"], 1, "{out}");
+        let out = r.redact(r#"{"created_us":1730000000000000,"secret":["hunter2"]}"#);
+        assert!(!out.contains("hunter2"), "{out}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+            "{out}"
+        );
+        // Nested in a string (an IPC body).
+        let inner = r#"{"ts":1730000000000000,"password":{"v":"hunter2"}}"#;
+        let out = r.redact(&serde_json::json!({ "response": inner }).to_string());
+        assert!(!out.contains("hunter2"), "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(v["response"].as_str().unwrap()).is_ok(),
+            "{out}"
+        );
+        // A bare number result.
+        assert_eq!(r.redact("1730000000000000"), r#""[REDACTED]""#);
+        // Below the pattern, and clean JSON comes back byte for byte.
+        let clean = r#"{"created_us": 173000000000000, "n": 1}"#;
+        assert_eq!(r.redact(clean), clean);
+    }
+
+    /// Value patterns still reach everything the raw-text pass reached.
+    #[test]
+    fn value_patterns_cover_strings_keys_and_custom_patterns_across_structure() {
+        let r = Redactor::default();
+        let out = r.redact(r#"{"note":"mail ann@example.com","ann@example.com":1,"a":["sk-abc123def456ghi789jkl012mno"]}"#);
+        assert!(!out.contains("ann@example.com"), "{out}");
+        assert!(!out.contains("sk-abc123"), "{out}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&out).is_ok(),
+            "{out}"
+        );
+        // A custom pattern written against the JSON text keeps working (fails closed).
+        let r = Redactor::new(&[r#""internal":\s*"\w+""#.to_string()]);
+        let out = r.redact(r#"{"internal":"abc","x":1}"#);
+        assert!(!out.contains("abc"), "{out}");
+        // A custom pattern matching a number leaf keeps the JSON valid.
+        let r = Redactor::new(&[r"\b4242\b".to_string()]);
+        let out = r.redact(r#"{"pin":4242}"#);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out).expect("valid JSON")["pin"],
+            "[REDACTED]"
+        );
+    }
+
+    /// `[{name, value}]` (cookies) and `{key, value}` carry the sensitive word in a sibling field.
+    #[test]
+    fn name_value_pairs_are_redacted_by_their_name() {
+        let r = Redactor::default();
+        let out = r.redact(r#"[{"name":"session_token","value":"abc123opaque"},{"name":"theme","value":"dark"},{"key":"api_key","value":"k1"}]"#);
+        assert!(
+            !out.contains("abc123opaque") && !out.contains("k1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("dark") && out.contains("session_token"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn short_credential_names_match_as_whole_words_only() {
+        let r = Redactor::default();
+        for (input, secret) in [
+            (r#"{"pwd":"s3cr3t"}"#, "s3cr3t"),
+            (r#"{"db_pwd":"s3cr3t"}"#, "s3cr3t"),
+            (r#"{"passphrase":"s3cr3t"}"#, "s3cr3t"),
+            (r#"{"jwt":"s3cr3t"}"#, "s3cr3t"),
+            (r#"{"auth":"s3cr3t"}"#, "s3cr3t"),
+            (r#"{"x-auth":"s3cr3t"}"#, "s3cr3t"),
+            (r#"{"auth_header":"s3cr3t"}"#, "s3cr3t"),
+            (r#"text {"pwd":"s3cr3t"} more"#, "s3cr3t"),
+            (r#"text {"auth":"s3cr3t"} more"#, "s3cr3t"),
+            ("connect pwd=s3cr3t now", "s3cr3t"),
+            ("connect auth=s3cr3t now", "s3cr3t"),
+        ] {
+            let out = r.redact(input);
+            assert!(!out.contains(secret), "{input} -> {out}");
+        }
+        for clean in [
+            r#"{"author":"Ann","authority":"x","oauth_provider":"y"}"#,
+            "author=Ann",
+        ] {
+            let out = r.redact(clean);
+            assert!(out.contains("Ann"), "{clean} -> {out}");
+        }
+    }
+
+    /// Two keys that redact to the same text used to collapse into one, losing a value.
+    #[test]
+    fn keys_redacted_to_the_same_text_keep_their_values() {
+        let r = Redactor::default();
+        let out = r.redact(r#"{"ann@example.com":1,"bob@example.com":2,"n":3}"#);
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert!(!out.contains("example.com"), "{out}");
+        let map = v.as_object().unwrap();
+        assert_eq!(map.len(), 3, "{out}");
+        let mut values: Vec<i64> = map.values().map(|n| n.as_i64().unwrap()).collect();
+        values.sort_unstable();
+        assert_eq!(values, [1, 2, 3], "{out}");
+    }
+
+    /// Finding the next free suffix started from `#2` for every key, so this took minutes: an app
+    /// (or a page) could stall every tool result behind one object with many e-mail shaped keys.
+    #[test]
+    fn many_keys_redacted_to_the_same_text_stay_cheap() {
+        let n = 50_000;
+        let input = serde_json::Value::Object(
+            (0..n)
+                .map(|i| (format!("u{i}@example.com"), serde_json::Value::from(i)))
+                .collect(),
+        )
+        .to_string();
+        let (done, finished) = std::sync::mpsc::channel();
+        // A thread, so a regression fails here instead of holding the suite for minutes.
+        std::thread::spawn(move || {
+            let _ = done.send(Redactor::default().redact(&input));
+        });
+        let out = finished
+            .recv_timeout(std::time::Duration::from_secs(90))
+            .expect("redacting colliding keys must stay close to linear");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v.as_object().unwrap().len(), n);
+        assert!(!out.contains("example.com"));
+    }
+
+    /// A key already spelled like a generated suffix is not overwritten.
+    #[test]
+    fn a_generated_suffix_does_not_overwrite_a_real_key() {
+        let r = Redactor::default();
+        let out = r.redact(
+            r#"{"[REDACTED]#2":"real","ann@example.com":1,"bob@example.com":2,"cy@example.com":3}"#,
+        );
+        let v: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(v.as_object().unwrap().len(), 4, "{out}");
+        assert_eq!(v["[REDACTED]#2"], "real", "{out}");
+    }
+
+    /// `RegexSet::new` fails as a whole, so one bad pattern used to drop the good ones too.
+    #[test]
+    fn new_keeps_the_valid_custom_patterns_when_one_is_invalid() {
+        let r = Redactor::new(&["ACME_\\w+".to_string(), "[invalid".to_string()]);
+        assert_eq!(r.redact("found ACME_SECRET here"), "found [REDACTED] here");
     }
 
     #[test]

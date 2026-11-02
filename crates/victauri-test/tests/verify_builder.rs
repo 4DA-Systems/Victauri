@@ -74,7 +74,11 @@ async fn verify_builder_reports_failures_without_panic() {
 
     assert!(!report.all_passed());
     assert_eq!(report.failures().len(), 1);
-    assert!(report.failures()[0].detail.contains("not found in DOM"));
+    assert!(
+        report.failures()[0]
+            .detail
+            .contains("not found on the page")
+    );
 }
 
 #[tokio::test]
@@ -106,7 +110,7 @@ async fn standalone_ipc_assertions() {
     client.click_by_id("greet-btn").await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-    let log = client.get_ipc_log(None).await.unwrap();
+    let log = client.get_ipc_log(Some(1000)).await.unwrap();
     assert_ipc_called(&log, "greet");
     assert_ipc_not_called(&log, "nonexistent_command_xyz");
 }

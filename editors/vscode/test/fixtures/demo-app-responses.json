@@ -1,0 +1,1167 @@
+{
+ "_note": "Recorded from a real demo app by record.js; do not edit by hand.",
+ "info": {
+  "app_identifier": "com.example.victauri-demo",
+  "app_product_name": "victauri-demo",
+  "auth_required": false,
+  "capabilities": [
+   "webview",
+   "ipc",
+   "backend",
+   "database",
+   "filesystem"
+  ],
+  "commands_registered": 25,
+  "description": "Full-stack Tauri app inspection: webview + IPC + Rust backend + SQLite",
+  "events_captured": 0,
+  "name": "victauri",
+  "pid": 4304,
+  "port": 17650,
+  "privacy_mode": false,
+  "protocol": "mcp",
+  "version": "0.10.3"
+ },
+ "click_unknown_ref": {
+  "status": 200,
+  "body": {
+   "error": "ref not found: e999999\n\n[hint: CHECK_INPUT]"
+  }
+ },
+ "tools": {
+  "window/list": {
+   "status": 200,
+   "body": {
+    "result": [
+     "main"
+    ]
+   }
+  },
+  "window/get_state": {
+   "status": 200,
+   "body": {
+    "result": [
+     {
+      "focused": false,
+      "fullscreen": false,
+      "label": "main",
+      "maximized": false,
+      "minimized": false,
+      "position": [
+       182,
+       182
+      ],
+      "size": [
+       900,
+       600
+      ],
+      "title": "Victauri Demo",
+      "url": "http://tauri.localhost/",
+      "visible": true
+     }
+    ]
+   }
+  },
+  "logs/ipc": {
+   "status": 200,
+   "body": {
+    "result": [
+     {
+      "args": {},
+      "command": "get_counter",
+      "duration_ms": 32,
+      "error": null,
+      "id": 2,
+      "result": 0,
+      "status": "ok",
+      "timestamp": 1793613788224
+     },
+     {
+      "args": {},
+      "command": "list_todos",
+      "duration_ms": 31,
+      "error": null,
+      "id": 3,
+      "result": [],
+      "status": "ok",
+      "timestamp": 1793613788225
+     },
+     {
+      "args": {},
+      "command": "get_settings",
+      "duration_ms": 32,
+      "error": null,
+      "id": 4,
+      "result": {
+       "language": "en",
+       "notifications_enabled": true,
+       "theme": "dark"
+      },
+      "status": "ok",
+      "timestamp": 1793613788225
+     },
+     {
+      "args": {},
+      "command": "list_notifications",
+      "duration_ms": 31,
+      "error": null,
+      "id": 5,
+      "result": [],
+      "status": "ok",
+      "timestamp": 1793613788226
+     },
+     {
+      "args": {
+       "name": "fixture"
+      },
+      "command": "greet",
+      "duration_ms": 2,
+      "error": null,
+      "id": 7,
+      "result": "Hello, fixture! This response came from Rust.",
+      "status": "ok",
+      "timestamp": 1793613793610
+     },
+     {
+      "args": {},
+      "command": "no_such_command_fixture",
+      "duration_ms": 2,
+      "error": "Command no_such_command_fixture not found",
+      "id": 12,
+      "result": "Command no_such_command_fixture not found",
+      "status": "error",
+      "timestamp": 1793613793620
+     }
+    ]
+   }
+  },
+  "get_memory_stats": {
+   "status": 200,
+   "body": {
+    "result": {
+     "page_fault_count": 15262,
+     "page_file_bytes": 11509760,
+     "peak_page_file_bytes": 12578816,
+     "peak_working_set_bytes": 50929664,
+     "working_set_bytes": 50925568
+    }
+   }
+  },
+  "get_plugin_info": {
+   "status": 200,
+   "body": {
+    "result": {
+     "app": {
+      "identifier": "com.example.victauri-demo",
+      "product_name": "victauri-demo"
+     },
+     "bridge_version": "0.10.3",
+     "capacities": {
+      "eval_timeout_secs": 30,
+      "event_log": 10000
+     },
+     "commands": {
+      "allowlist": null,
+      "blocklist": []
+     },
+     "port": 17650,
+     "privacy": {
+      "profile": "full_control",
+      "redaction_enabled": false
+     },
+     "registered_commands": 25,
+     "tool_invocations": 8,
+     "tools": {
+      "disabled_list": [],
+      "enabled": 35,
+      "enabled_list": [
+       "animation",
+       "app_info",
+       "app_state",
+       "assert_semantic",
+       "check_ipc_integrity",
+       "css",
+       "detect_ghost_commands",
+       "dom_snapshot",
+       "eval_js",
+       "explain",
+       "fault",
+       "find_elements",
+       "get_diagnostics",
+       "get_memory_stats",
+       "get_plugin_info",
+       "get_registry",
+       "input",
+       "inspect",
+       "interact",
+       "introspect",
+       "invoke_command",
+       "list_app_dir",
+       "logs",
+       "navigate",
+       "query_db",
+       "read_app_file",
+       "recording",
+       "resolve_command",
+       "route",
+       "screenshot",
+       "storage",
+       "trace",
+       "verify_state",
+       "wait_for",
+       "window"
+      ],
+      "total": 35
+     },
+     "uptime_secs": 6,
+     "version": "0.10.3"
+    }
+   }
+  },
+  "get_diagnostics": {
+   "status": 200,
+   "body": {
+    "result": {
+     "info": {
+      "bridge_version": "0.10.3",
+      "dom_elements": 97,
+      "event_listeners": 34,
+      "ipc_capture": {
+       "capture": "full",
+       "fallback_at": null,
+       "fallback_detected_via": null,
+       "fetch_calls": 6,
+       "note": "IPC runs over Tauri's custom-protocol fetch: command, args, status, duration and response body are captured.",
+       "post_message_calls": 0,
+       "post_message_hook": "installed",
+       "post_message_responses": 0,
+       "transport": "fetch"
+      },
+      "open_shadow_roots": 0,
+      "protocol": "http:",
+      "url": "http://tauri.localhost/",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
+     },
+     "warnings": []
+    }
+   }
+  },
+  "inspect/get_performance": {
+   "status": 200,
+   "body": {
+    "result": {
+     "dom": {
+      "elements": 97,
+      "event_listeners": 34,
+      "max_depth": 5
+     },
+     "engine": {
+      "js_heap_supported": true,
+      "long_task_supported": true,
+      "paint_timing_supported": true,
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0"
+     },
+     "js_heap": {
+      "limit_mb": 4192,
+      "total_mb": 3.81,
+      "used_mb": 2.65
+     },
+     "long_tasks": {
+      "count": 0,
+      "total_ms": 0,
+      "worst_ms": 0
+     },
+     "navigation": {
+      "connect_ms": 0,
+      "decoded_body_size": 23621,
+      "dns_ms": 0,
+      "dom_complete_ms": 198,
+      "dom_interactive_ms": 196,
+      "encoded_body_size": 23621,
+      "load_event_ms": 198,
+      "response_ms": 0,
+      "transfer_size": 23921,
+      "ttfb_ms": 145
+     },
+     "paint": {
+      "first-contentful-paint": 208,
+      "first-paint": 208
+     },
+     "resources": {
+      "by_type": {
+       "fetch": {
+        "count": 19,
+        "total_bytes": 0,
+        "total_ms": 44.19999998807907
+       },
+       "other": {
+        "count": 1,
+        "total_bytes": 23921,
+        "total_ms": 1.800000011920929
+       }
+      },
+      "slowest": [
+       {
+        "duration_ms": 7,
+        "name": "plugin%3Avictauri%7Cvictauri_eval_callback",
+        "size": 0,
+        "type": "fetch"
+       },
+       {
+        "duration_ms": 5,
+        "name": "list_todos",
+        "size": 0,
+        "type": "fetch"
+       },
+       {
+        "duration_ms": 5,
+        "name": "get_settings",
+        "size": 0,
+        "type": "fetch"
+       },
+       {
+        "duration_ms": 5,
+        "name": "get_counter",
+        "size": 0,
+        "type": "fetch"
+       },
+       {
+        "duration_ms": 5,
+        "name": "list_notifications",
+        "size": 0,
+        "type": "fetch"
+       }
+      ],
+      "total_count": 20,
+      "total_transfer_bytes": 23921
+     }
+    }
+   }
+  },
+  "inspect/audit_accessibility": {
+   "status": 200,
+   "body": {
+    "result": {
+     "summary": {
+      "critical": 0,
+      "minor": 0,
+      "moderate": 0,
+      "serious": 0,
+      "total": 0
+     },
+     "violations": [],
+     "warnings": []
+    }
+   }
+  },
+  "inspect/highlight": {
+   "status": 200,
+   "body": {
+    "result": {
+     "ok": true,
+     "ref_id": "uxu0e5"
+    }
+   }
+  },
+  "inspect/clear_highlights": {
+   "status": 200,
+   "body": {
+    "result": {
+     "ok": true,
+     "removed": 1
+    }
+   }
+  },
+  "inspect/get_styles": {
+   "status": 200,
+   "body": {
+    "result": {
+     "ref_id": "uxu0e5",
+     "styles": {
+      "border-radius": "8px",
+      "color": "rgb(139, 92, 246)",
+      "cursor": "pointer",
+      "display": "block",
+      "flex-direction": "row",
+      "font-family": "Arial",
+      "font-size": "14.4px",
+      "font-weight": "400",
+      "height": "38px",
+      "opacity": "1",
+      "overflow": "visible",
+      "padding": "10px 18px",
+      "pointer-events": "auto",
+      "position": "static",
+      "text-align": "center",
+      "text-overflow": "clip",
+      "transition": "0.2s",
+      "visibility": "visible",
+      "width": "74.4219px"
+     },
+     "tag": "button"
+    }
+   }
+  },
+  "dom_snapshot": {
+   "status": 200,
+   "body": {
+    "result": {
+     "format": "json",
+     "stale_refs": [],
+     "tree": {
+      "attributes": {},
+      "bounds": {
+       "height": 1069,
+       "width": 885,
+       "x": 0,
+       "y": 0
+      },
+      "children": [
+       {
+        "attributes": {},
+        "bounds": {
+         "height": 989,
+         "width": 640,
+         "x": 122.5,
+         "y": 40
+        },
+        "children": [
+         {
+          "attributes": {},
+          "bounds": {
+           "height": 38,
+           "width": 640,
+           "x": 122.5,
+           "y": 40
+          },
+          "children": [],
+          "enabled": true,
+          "focusable": false,
+          "name": "Victauri Demo",
+          "ref_id": "uxu0e2",
+          "role": "heading",
+          "tag": "h1",
+          "text": "Victauri Demo",
+          "value": null,
+          "visible": true
+         },
+         {
+          "attributes": {},
+          "bounds": {
+           "height": 20,
+           "width": 640,
+           "x": 122.5,
+           "y": 82
+          },
+          "children": [],
+          "enabled": true,
+          "focusable": false,
+          "name": null,
+          "ref_id": "uxu0e3",
+          "role": null,
+          "tag": "p",
+          "text": "25 instrumented commands — connect an MCP client to introspect everything",
+          "value": null,
+          "visible": true
+         },
+         {
+          "attributes": {},
+          "bounds": {
+           "height": 39,
+           "width": 640,
+           "x": 122.5,
+           "y": 126
+          },
+          "children": [
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 38,
+             "width": 74.421875,
+             "x": 122.5,
+             "y": 126
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": true,
+            "name": "Home",
+            "ref_id": "uxu0e5",
+            "role": "tab",
+            "tag": "button",
+            "text": "Home",
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 38,
+             "width": 74.4375,
+             "x": 200.921875,
+             "y": 126
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": true,
+            "name": "Todos",
+            "ref_id": "uxu0e6",
+            "role": "tab",
+            "tag": "button",
+            "text": "Todos",
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 38,
+             "width": 85.640625,
+             "x": 279.359375,
+             "y": 126
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": true,
+            "name": "Contact",
+            "ref_id": "uxu0e7",
+            "role": "tab",
+            "tag": "button",
+            "text": "Contact",
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 38,
+             "width": 88.03125,
+             "x": 369,
+             "y": 126
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": true,
+            "name": "Settings",
+            "ref_id": "uxu0e8",
+            "role": "tab",
+            "tag": "button",
+            "text": "Settings",
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 38,
+             "width": 114.4375,
+             "x": 461.03125,
+             "y": 126
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": true,
+            "name": "Notifications 0",
+            "ref_id": "uxu0e9",
+            "role": "tab",
+            "tag": "button",
+            "text": "Notifications",
+            "value": null,
+            "visible": true
+           }
+          ],
+          "enabled": true,
+          "focusable": false,
+          "name": "Main navigation",
+          "ref_id": "uxu0e4",
+          "role": "tablist",
+          "tag": "nav",
+          "text": null,
+          "value": null,
+          "visible": true
+         },
+         {
+          "attributes": {
+           "id": "panel-home"
+          },
+          "bounds": {
+           "height": 466,
+           "width": 640,
+           "x": 122.5,
+           "y": 185
+          },
+          "children": [
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 240,
+             "width": 640,
+             "x": 122.5,
+             "y": 185
+            },
+            "children": [
+             {
+              "attributes": {},
+              "bounds": {
+               "height": 23,
+               "width": 590,
+               "x": 147.5,
+               "y": 210
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": false,
+              "name": "Greet",
+              "ref_id": "uxu0e12",
+              "role": "heading",
+              "tag": "h2",
+              "text": "Greet",
+              "value": null,
+              "visible": true
+             },
+             {
+              "attributes": {},
+              "bounds": {
+               "height": 18,
+               "width": 590,
+               "x": 147.5,
+               "y": 249
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": false,
+              "name": null,
+              "ref_id": "uxu0e13",
+              "role": null,
+              "tag": "label",
+              "text": "Your name",
+              "value": null,
+              "visible": true
+             },
+             {
+              "attributes": {
+               "data-testid": "name-input",
+               "id": "name-input",
+               "type": "text"
+              },
+              "bounds": {
+               "height": 42,
+               "width": 590,
+               "x": 147.5,
+               "y": 273
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": true,
+              "name": "Your name",
+              "ref_id": "uxu0e14",
+              "role": "textbox",
+              "tag": "input",
+              "text": null,
+              "value": null,
+              "visible": true
+             },
+             {
+              "attributes": {
+               "data-testid": "greet-btn",
+               "id": "greet-btn"
+              },
+              "bounds": {
+               "height": 37,
+               "width": 78.015625,
+               "x": 147.5,
+               "y": 327
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": true,
+              "name": "Greet",
+              "ref_id": "uxu0e15",
+              "role": "button",
+              "tag": "button",
+              "text": "Greet",
+              "value": null,
+              "visible": true
+             },
+             {
+              "attributes": {
+               "data-testid": "greet-result",
+               "id": "greet-result"
+              },
+              "bounds": {
+               "height": 24,
+               "width": 590,
+               "x": 147.5,
+               "y": 376
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": false,
+              "name": null,
+              "ref_id": "uxu0e16",
+              "role": null,
+              "tag": "div",
+              "text": null,
+              "value": null,
+              "visible": true
+             }
+            ],
+            "enabled": true,
+            "focusable": false,
+            "name": null,
+            "ref_id": "uxu0e11",
+            "role": null,
+            "tag": "div",
+            "text": null,
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 206,
+             "width": 640,
+             "x": 122.5,
+             "y": 445
+            },
+            "children": [
+             {
+              "attributes": {},
+              "bounds": {
+               "height": 23,
+               "width": 590,
+               "x": 147.5,
+               "y": 470
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": false,
+              "name": "Counter",
+              "ref_id": "uxu0e18",
+              "role": "heading",
+              "tag": "h2",
+              "text": "Counter",
+              "value": null,
+              "visible": true
+             },
+             {
+              "attributes": {
+               "data-testid": "counter-value",
+               "id": "counter-value"
+              },
+              "bounds": {
+               "height": 64,
+               "width": 590,
+               "x": 147.5,
+               "y": 509
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": false,
+              "name": null,
+              "ref_id": "uxu0e19",
+              "role": "status",
+              "tag": "div",
+              "text": "0",
+              "value": null,
+              "visible": true
+             },
+             {
+              "attributes": {},
+              "bounds": {
+               "height": 37,
+               "width": 590,
+               "x": 147.5,
+               "y": 589
+              },
+              "children": [
+               {
+                "attributes": {
+                 "data-testid": "decrement-btn",
+                 "id": "decrement-btn"
+                },
+                "bounds": {
+                 "height": 37,
+                 "width": 48.890625,
+                 "x": 341.75,
+                 "y": 589
+                },
+                "children": [],
+                "enabled": true,
+                "focusable": true,
+                "name": "Decrement counter",
+                "ref_id": "uxu0e21",
+                "role": "button",
+                "tag": "button",
+                "text": "−",
+                "value": null,
+                "visible": true
+               },
+               {
+                "attributes": {
+                 "data-testid": "increment-btn",
+                 "id": "increment-btn"
+                },
+                "bounds": {
+                 "height": 37,
+                 "width": 48.890625,
+                 "x": 402.640625,
+                 "y": 589
+                },
+                "children": [],
+                "enabled": true,
+                "focusable": true,
+                "name": "Increment counter",
+                "ref_id": "uxu0e22",
+                "role": "button",
+                "tag": "button",
+                "text": "+",
+                "value": null,
+                "visible": true
+               },
+               {
+                "attributes": {
+                 "data-testid": "reset-btn",
+                 "id": "reset-btn"
+                },
+                "bounds": {
+                 "height": 37,
+                 "width": 79.71875,
+                 "x": 463.53125,
+                 "y": 589
+                },
+                "children": [],
+                "enabled": true,
+                "focusable": true,
+                "name": "Reset counter",
+                "ref_id": "uxu0e23",
+                "role": "button",
+                "tag": "button",
+                "text": "Reset",
+                "value": null,
+                "visible": true
+               }
+              ],
+              "enabled": true,
+              "focusable": false,
+              "name": null,
+              "ref_id": "uxu0e20",
+              "role": null,
+              "tag": "div",
+              "text": null,
+              "value": null,
+              "visible": true
+             }
+            ],
+            "enabled": true,
+            "focusable": false,
+            "name": null,
+            "ref_id": "uxu0e17",
+            "role": null,
+            "tag": "div",
+            "text": null,
+            "value": null,
+            "visible": true
+           }
+          ],
+          "enabled": true,
+          "focusable": false,
+          "name": null,
+          "ref_id": "uxu0e10",
+          "role": "tabpanel",
+          "tag": "div",
+          "text": null,
+          "value": null,
+          "visible": true
+         },
+         {
+          "attributes": {},
+          "bounds": {
+           "height": 234,
+           "width": 640,
+           "x": 122.5,
+           "y": 671
+          },
+          "children": [
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 23,
+             "width": 590,
+             "x": 147.5,
+             "y": 696
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": false,
+            "name": "Sweep Animation",
+            "ref_id": "uxu0e25",
+            "role": "heading",
+            "tag": "h2",
+            "text": "Sweep Animation",
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 20,
+             "width": 590,
+             "x": 147.5,
+             "y": 735
+            },
+            "children": [
+             {
+              "attributes": {},
+              "bounds": {
+               "height": 14,
+               "width": 61.125,
+               "x": 366.390625,
+               "y": 740
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": false,
+              "name": null,
+              "ref_id": "uxu0e27",
+              "role": null,
+              "tag": "code",
+              "text": "animation",
+              "value": null,
+              "visible": true
+             }
+            ],
+            "enabled": true,
+            "focusable": false,
+            "name": null,
+            "ref_id": "uxu0e26",
+            "role": null,
+            "tag": "p",
+            "text": "A miscalibrated slide-in. Use the\n         tool to measure and fix it.",
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 64,
+             "width": 590,
+             "x": 147.5,
+             "y": 767
+            },
+            "children": [
+             {
+              "attributes": {
+               "data-testid": "sweep-toast",
+               "id": "sweep-toast"
+              },
+              "bounds": {
+               "height": 40,
+               "width": 220,
+               "x": 580.5,
+               "y": 780
+              },
+              "children": [],
+              "enabled": true,
+              "focusable": false,
+              "name": null,
+              "ref_id": "uxu0e29",
+              "role": null,
+              "tag": "div",
+              "text": "Notification",
+              "value": null,
+              "visible": true
+             }
+            ],
+            "enabled": true,
+            "focusable": false,
+            "name": null,
+            "ref_id": "uxu0e28",
+            "role": null,
+            "tag": "div",
+            "text": null,
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {
+             "data-testid": "sweep-btn",
+             "id": "sweep-btn"
+            },
+            "bounds": {
+             "height": 37,
+             "width": 117.734375,
+             "x": 147.5,
+             "y": 843
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": true,
+            "name": "Play sweep",
+            "ref_id": "uxu0e30",
+            "role": "button",
+            "tag": "button",
+            "text": "Play sweep",
+            "value": null,
+            "visible": true
+           }
+          ],
+          "enabled": true,
+          "focusable": false,
+          "name": null,
+          "ref_id": "uxu0e24",
+          "role": null,
+          "tag": "div",
+          "text": null,
+          "value": null,
+          "visible": true
+         },
+         {
+          "attributes": {},
+          "bounds": {
+           "height": 92,
+           "width": 640,
+           "x": 122.5,
+           "y": 937
+          },
+          "children": [
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 8,
+             "width": 8,
+             "x": 139.5,
+             "y": 961
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": false,
+            "name": null,
+            "ref_id": "uxu0e32",
+            "role": null,
+            "tag": "span",
+            "text": null,
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 18,
+             "width": 92.96875,
+             "x": 349.828125,
+             "y": 954
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": false,
+            "name": null,
+            "ref_id": "uxu0e33",
+            "role": null,
+            "tag": "strong",
+            "text": "127.0.0.1:7373",
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {},
+            "bounds": {
+             "height": 18,
+             "width": 0,
+             "x": 442.796875,
+             "y": 954
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": false,
+            "name": null,
+            "ref_id": "uxu0e34",
+            "role": null,
+            "tag": "br",
+            "text": null,
+            "value": null,
+            "visible": true
+           },
+           {
+            "attributes": {
+             "data-testid": "debug-btn",
+             "id": "debug-btn"
+            },
+            "bounds": {
+             "height": 28,
+             "width": 106.90625,
+             "x": 139.5,
+             "y": 984
+            },
+            "children": [],
+            "enabled": true,
+            "focusable": true,
+            "name": "get_app_state()",
+            "ref_id": "uxu0e35",
+            "role": "button",
+            "tag": "button",
+            "text": "get_app_state()",
+            "value": null,
+            "visible": true
+           }
+          ],
+          "enabled": true,
+          "focusable": false,
+          "name": null,
+          "ref_id": "uxu0e31",
+          "role": null,
+          "tag": "div",
+          "text": "Victauri MCP server running on",
+          "value": null,
+          "visible": true
+         }
+        ],
+        "enabled": true,
+        "focusable": false,
+        "name": null,
+        "ref_id": "uxu0e1",
+        "role": null,
+        "tag": "div",
+        "text": null,
+        "value": null,
+        "visible": true
+       }
+      ],
+      "enabled": true,
+      "focusable": false,
+      "name": null,
+      "ref_id": "uxu0e0",
+      "role": null,
+      "tag": "body",
+      "text": null,
+      "value": null,
+      "visible": true
+     }
+    }
+   }
+  },
+  "screenshot": {
+   "status": 200,
+   "body": {
+    "note": "note: captured window \"main\"",
+    "result": {
+     "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M/AAAMBAQAY3Y2wAAAAAElFTkSuQmCC",
+     "mimeType": "image/png",
+     "type": "image"
+    }
+   }
+  },
+  "eval_js": {
+   "status": 200,
+   "body": {
+    "result": "Victauri Demo"
+   }
+  },
+  "interact/click": {
+   "status": 200,
+   "body": {
+    "result": {
+     "ok": true
+    }
+   }
+  }
+ }
+}

@@ -36,7 +36,10 @@ impl MaskRegion {
     }
 
     fn contains(&self, px: u32, py: u32) -> bool {
-        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+        px >= self.x
+            && px < self.x.saturating_add(self.width)
+            && py >= self.y
+            && py < self.y.saturating_add(self.height)
     }
 }
 
@@ -88,6 +91,9 @@ pub struct VisualDiff {
     pub masked_pixels: usize,
     /// Path to the diff image, if one was generated.
     pub diff_image_path: Option<PathBuf>,
+    /// This run wrote a new baseline, so NOTHING was compared and `match_percentage` is not a
+    /// result.
+    pub baseline_created: bool,
 }
 
 impl VisualDiff {
@@ -161,19 +167,50 @@ impl VisualOptions {
 
 /// Compares a screenshot (base64 PNG) against a stored baseline.
 ///
-/// On first run (no baseline exists), saves the screenshot as the new baseline
-/// and returns a perfect match. On subsequent runs, decodes both PNGs and
-/// compares pixel-by-pixel.
+/// On first run (no baseline exists), saves the screenshot as the new baseline and returns with
+/// [`VisualDiff::baseline_created`] set: nothing was compared. On subsequent runs, decodes both
+/// PNGs and compares pixel-by-pixel.
+///
+/// In CI (the `CI` environment variable is set) a missing baseline writes the file, so that it can
+/// be collected as an artifact, and FAILS unless `update_baselines` is on. Otherwise a test whose
+/// baselines were never committed for this OS passes on every fresh checkout and can never fail.
 ///
 /// # Errors
 ///
-/// Returns [`TestError::VisualRegression`] if the diff exceeds the threshold,
-/// or [`TestError::Other`] for IO/decode failures.
+/// Returns [`TestError::VisualRegression`] if the diff exceeds the threshold, or
+/// [`TestError::Other`] for IO/decode failures, a `name` that is not a plain file name, a screenshot
+/// that is not a PNG, or a missing baseline in CI.
 pub fn compare_screenshot(
     name: &str,
     screenshot_base64: &str,
     options: &VisualOptions,
 ) -> Result<VisualDiff, TestError> {
+    let ci = std::env::var_os("CI").is_some_and(|value| !value.is_empty() && value != "false");
+    compare_in(name, screenshot_base64, options, ci)
+}
+
+/// A baseline name becomes a file name inside the snapshot directory, and must stay there.
+fn check_baseline_name(name: &str) -> Result<(), TestError> {
+    let plain = !name.is_empty()
+        && name != ".."
+        && !name.contains(['/', '\\', ':'])
+        && !Path::new(name).is_absolute();
+    if plain {
+        Ok(())
+    } else {
+        Err(TestError::Other(format!(
+            "invalid baseline name {name:?}: it must be a plain file name, not a path"
+        )))
+    }
+}
+
+fn compare_in(
+    name: &str,
+    screenshot_base64: &str,
+    options: &VisualOptions,
+    ci: bool,
+) -> Result<VisualDiff, TestError> {
+    check_baseline_name(name)?;
     let screenshot_bytes = base64::engine::general_purpose::STANDARD
         .decode(screenshot_base64)
         .map_err(|e| TestError::Other(format!("failed to decode base64 screenshot: {e}")))?;
@@ -185,15 +222,27 @@ pub fn compare_screenshot(
     let baseline_path = snap_dir.join(format!("{name}.png"));
 
     if options.update_baselines || !baseline_path.exists() {
+        // Decoded first: an empty or garbage capture must not become the baseline that every later
+        // run is then measured against (or fails to decode).
+        let decoded = decode_png(&screenshot_bytes)?;
         std::fs::write(&baseline_path, &screenshot_bytes)
             .map_err(|e| TestError::Other(format!("failed to write baseline: {e}")))?;
+
+        if ci && !options.update_baselines {
+            return Err(TestError::Other(format!(
+                "no baseline for '{name}' at {}: wrote this run's screenshot there, but nothing \
+                 was compared. Commit a baseline for this OS, or set update_baselines.",
+                baseline_path.display()
+            )));
+        }
 
         return Ok(VisualDiff {
             match_percentage: 100.0,
             diff_pixel_count: 0,
-            total_pixels: 0,
+            total_pixels: (u64::from(decoded.width) * u64::from(decoded.height)) as usize,
             masked_pixels: 0,
             diff_image_path: None,
+            baseline_created: true,
         });
     }
 
@@ -237,6 +286,7 @@ pub fn compare_screenshot(
         total_pixels,
         masked_pixels: masked,
         diff_image_path,
+        baseline_created: false,
     };
 
     if !result.is_match(options.threshold_percent) {
@@ -385,6 +435,93 @@ fn write_diff_image(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As the public function, whatever `CI` says on the machine running these tests.
+    fn compare_screenshot(
+        name: &str,
+        screenshot_base64: &str,
+        options: &VisualOptions,
+    ) -> Result<VisualDiff, TestError> {
+        compare_in(name, screenshot_base64, options, false)
+    }
+
+    fn options_in(dir: &tempfile::TempDir) -> VisualOptions {
+        VisualOptions {
+            snapshot_dir: dir.path().join("snaps"),
+            platform_baselines: false,
+            ..VisualOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_screenshot_that_is_not_a_png_never_becomes_a_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options_in(&dir);
+        assert!(compare_screenshot("garbage", &to_base64(b"not a png"), &opts).is_err());
+        assert!(compare_screenshot("empty", "", &opts).is_err());
+        assert!(!opts.snapshot_dir.join("garbage.png").exists());
+        assert!(!opts.snapshot_dir.join("empty.png").exists());
+    }
+
+    #[test]
+    fn a_new_baseline_says_nothing_was_compared() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options_in(&dir);
+        let png = to_base64(&make_solid_png(4, 4, 1, 2, 3));
+        assert!(
+            compare_screenshot("a", &png, &opts)
+                .unwrap()
+                .baseline_created
+        );
+        assert!(
+            !compare_screenshot("a", &png, &opts)
+                .unwrap()
+                .baseline_created
+        );
+    }
+
+    #[test]
+    fn a_missing_baseline_fails_in_ci_but_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut opts = options_in(&dir);
+        let png = to_base64(&make_solid_png(4, 4, 1, 2, 3));
+        let err = compare_in("a", &png, &opts, true).unwrap_err();
+        assert!(err.to_string().contains("no baseline"), "{err}");
+        assert!(opts.snapshot_dir.join("a.png").exists());
+        // Now it exists, so CI compares.
+        assert!(!compare_in("a", &png, &opts, true).unwrap().baseline_created);
+        opts.update_baselines = true;
+        assert!(compare_in("b", &png, &opts, true).unwrap().baseline_created);
+    }
+
+    #[test]
+    fn a_baseline_name_stays_inside_the_snapshot_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = options_in(&dir);
+        let png = to_base64(&make_solid_png(4, 4, 1, 2, 3));
+        for name in [
+            "../escaped",
+            "sub/dir",
+            "..\\up",
+            "C:\\abs",
+            "/abs",
+            "",
+            "..",
+        ] {
+            let err = compare_screenshot(name, &png, &opts).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid baseline name"),
+                "{name}: {err}"
+            );
+        }
+        assert!(!dir.path().join("escaped.png").exists());
+    }
+
+    #[test]
+    fn a_huge_mask_does_not_overflow() {
+        assert!(MaskRegion::new(1, 0, u32::MAX, 2).contains(5, 1));
+        assert!(!MaskRegion::new(1, 0, u32::MAX, 2).contains(0, 1));
+    }
 
     fn make_solid_png(width: u32, height: u32, r: u8, g: u8, b: u8) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -659,6 +796,7 @@ mod tests {
             total_pixels: 1000,
             masked_pixels: 0,
             diff_image_path: None,
+            baseline_created: false,
         };
         // threshold 1.0 → needs >= 99.0 → 99.5 passes
         assert!(diff.is_match(1.0));

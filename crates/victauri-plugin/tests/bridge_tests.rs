@@ -76,6 +76,19 @@ fn run_tests(def: &TestDef) -> Option<Vec<TestResult>> {
     let json = serde_json::to_string(def)
         .expect("serialize test def")
         .replace("__AGENT_KEY__", agent_key());
+    // `addRoute` is agent-only: every spelling the page code here uses goes through the key.
+    let agent_add = format!(
+        "window.__VICTAURI__._agent('{}').addRoute(",
+        victauri_plugin::js_bridge::agent_key()
+    );
+    let json = [
+        "window.__VICTAURI__.addRoute(",
+        "V.addRoute(",
+        "v.addRoute(",
+        "b.addRoute(",
+    ]
+    .iter()
+    .fold(json, |j, spelling| j.replace(spelling, &agent_add));
     tmp.write_all(json.as_bytes()).expect("write test def");
     tmp.flush().expect("flush temp file");
 
@@ -243,7 +256,7 @@ fn snapshot_compact_format() {
                 name: "compact snapshot returns string tree".into(),
                 code: r"
                     var result = window.__VICTAURI__.snapshot('compact');
-                    return { format: result.format, is_string: typeof result.tree === 'string', has_refs: result.tree.indexOf('[e') !== -1 };
+                    return { format: result.format, is_string: typeof result.tree === 'string', has_refs: /\[[a-z][0-9a-z]{3}e\d+\]/.test(result.tree) };
                 ".into(),
                 setup_html: None,
                 setup_js: None,
@@ -1364,8 +1377,10 @@ fn css_inspection() {
     assert_eq!(results[3].result.as_ref().unwrap()["has_margin"], true);
     assert_eq!(results[3].result.as_ref().unwrap()["has_padding"], true);
     assert_eq!(
-        results[4].result.as_ref().unwrap()["error"],
-        "ref not found"
+        results[4].result.as_ref().unwrap()["error"]
+            .as_str()
+            .map(|e| e.starts_with("ref not found")),
+        Some(true)
     );
 }
 
@@ -2480,7 +2495,8 @@ fn snapshot_hidden_elements_excluded() {
     assert_eq!(results[0].result.as_ref().unwrap()["visible_found"], true);
     assert_eq!(results[0].result.as_ref().unwrap()["hidden_found"], false);
     assert_eq!(results[1].result.as_ref().unwrap()["hidden_found"], false);
-    assert_eq!(results[2].result.as_ref().unwrap()["hidden_found"], false);
+    // `opacity:0` stays listed (tagged `transparent`): it can still be what a click hits.
+    assert_eq!(results[2].result.as_ref().unwrap()["hidden_found"], true);
     assert_eq!(results[3].result.as_ref().unwrap()["has_visible"], true);
     assert_eq!(results[3].result.as_ref().unwrap()["has_hidden"], false);
 }
@@ -3005,7 +3021,7 @@ fn find_elements_result_structure() {
                     var results = window.__VICTAURI__.findElements({ tag: 'button', enabled: false });
                     var r = results[0];
                     return {
-                        has_ref_id: typeof r.ref_id === 'string' && r.ref_id.charAt(0) === 'e',
+                        has_ref_id: typeof r.ref_id === 'string' && /^[a-z][0-9a-z]{3}e\d+$/.test(r.ref_id),
                         has_tag: r.tag === 'button',
                         has_role: r.role === 'button',
                         has_name: r.name === 'Save file',
@@ -3135,7 +3151,7 @@ fn actionability_opacity_zero() {
             .to_string(),
         setup_js: None,
         tests: vec![TestCase {
-            name: "click fails on opacity:0 element".into(),
+            name: "opacity:0 is not refused: hit testing decides".into(),
             code: r"
                     var snap = window.__VICTAURI__.snapshot('json');
                     function findById(node, id) {
@@ -3161,10 +3177,10 @@ fn actionability_opacity_zero() {
         return;
     };
     assert_all_pass(&results);
-    assert_eq!(results[0].result.as_ref().unwrap()["ok"], false);
+    assert_eq!(results[0].result.as_ref().unwrap()["ok"], true);
     assert_eq!(
         results[0].result.as_ref().unwrap()["error_has_opacity"],
-        true
+        false
     );
 }
 
@@ -5300,12 +5316,12 @@ fn compact_snapshot_lines_cannot_be_forged_by_markup() {
             var TOK = /[A-Za-z0-9_\-.:\/#?&=%+~,]+/.source;
             var VAL = '(?:' + TOK + '|' + STR + ')';
             var WORD = '(?:[a-z][a-z0-9-]*|' + STR + ')';
-            var LINE = new RegExp('^(?:  )*\\[e\\d+\\] ' + WORD + '(?: role=' + STR + ')?(?: ' + STR
+            var LINE = new RegExp('^(?:  )*\\[[a-z][0-9a-z]{3}e\\d+\\] ' + WORD + '(?: role=' + STR + ')?(?: ' + STR
                 + ')?(?: \\[disabled\\])?(?: value=' + STR + ')?(?: @' + VAL + ')?(?: type=' + VAL
                 + ')?(?: href=' + VAL + ')?$');
             var lines = tree.split('\n').filter(function(l) { return l.length; });
             var bad = lines.filter(function(l) { return !LINE.test(l); });
-            var refs = lines.map(function(l) { return (l.match(/\[(e\d+)\]/) || [])[1]; });
+            var refs = lines.map(function(l) { return (l.match(/\[([a-z][0-9a-z]{3}e\d+)\]/) || [])[1]; });
             var stripped = lines.map(function(l) { return l.replace(new RegExp(STR, 'g'), '""'); }).join('\n');
             function count(s, sub) { return s.split(sub).length - 1; }
             var docsLine = lines.filter(function(l) { return l.indexOf('"Docs"') !== -1; })[0] || '';

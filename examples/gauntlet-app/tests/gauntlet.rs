@@ -114,6 +114,83 @@ macro_rules! gauntlet {
     };
 }
 
+// ── 0. Native window read-back ───────────────────────────────────────────────
+
+gauntlet!(window_resize_and_move_report_the_settled_geometry, base, {
+    // Linux and macOS apply a resize or move after the call returns. A result without
+    // `settled:false` promises the value it reports is what the window has: an immediate read-back
+    // reported the old one.
+    async fn state(base: &str) -> Value {
+        let r = call(
+            base,
+            "window",
+            json!({"action": "get_state", "label": "main"}),
+        )
+        .await;
+        first_array(result(&r))
+            .first()
+            .cloned()
+            .unwrap_or_else(|| result(&r).clone())
+    }
+    let before = state(&base).await;
+    let (w, h) = (
+        before["size"][0].as_u64().unwrap(),
+        before["size"][1].as_u64().unwrap(),
+    );
+    let (x, y) = (
+        before["position"][0].as_i64().unwrap(),
+        before["position"][1].as_i64().unwrap(),
+    );
+
+    let r = call(
+        &base,
+        "window",
+        json!({"action": "resize", "label": "main", "width": w / 2 + 37, "height": h / 2 + 23}),
+    )
+    .await;
+    let resized = result(&r).clone();
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let now = state(&base).await;
+    if resized.get("settled").is_none() {
+        assert_ne!(
+            (resized["width"].as_u64(), resized["height"].as_u64()),
+            (Some(w), Some(h)),
+            "{resized}"
+        );
+        assert_eq!(resized["width"], now["size"][0], "{resized} vs {now}");
+        assert_eq!(resized["height"], now["size"][1], "{resized} vs {now}");
+    }
+
+    let r = call(
+        &base,
+        "window",
+        json!({"action": "move_to", "label": "main", "x": x + 31, "y": y + 17}),
+    )
+    .await;
+    let moved = result(&r).clone();
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    let now = state(&base).await;
+    if moved.get("settled").is_none() {
+        assert_eq!(moved["x"], now["position"][0], "{moved} vs {now}");
+        assert_eq!(moved["y"], now["position"][1], "{moved} vs {now}");
+    }
+
+    // Leave it as it was for the rest of the battery. (`resize` takes logical pixels, so this is
+    // exact only at scale 1, which is enough.)
+    let _ = call(
+        &base,
+        "window",
+        json!({"action": "resize", "label": "main", "width": w, "height": h}),
+    )
+    .await;
+    let _ = call(
+        &base,
+        "window",
+        json!({"action": "move_to", "label": "main", "x": x, "y": y}),
+    )
+    .await;
+});
+
 // ── 1. Registry scale ────────────────────────────────────────────────────────
 
 gauntlet!(registry_scale_not_truncated, base, {
@@ -546,7 +623,281 @@ gauntlet!(animation_lists_and_scrubs_the_sweep, base, {
     );
 });
 
-// ── 19-21. DISPLAY-GATED: screenshot + filmstrip + trusted input ─────────────
+// ── 19. Hit testing, on this engine ──────────────────────────────────────────
+
+gauntlet!(click_reaches_only_what_a_user_can_reach, base, {
+    // What a click can reach is the engine's answer (`elementFromPoint` / `elementsFromPoint`
+    // honouring clipping, clip-path, ::after, z-order), so this is proven per engine, not in one.
+    // The fixtures show, run and remove themselves inside this one call.
+    let r = call(
+        &base,
+        "eval_js",
+        json!({ "code": "return await window.__hitFixtures.run()" }),
+    )
+    .await;
+    let rows = first_array(result(&r));
+    assert!(rows.len() > 30, "no fixtures ran: {r}");
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter(|row| row["want"] != row["got"])
+        .map(ToString::to_string)
+        .collect();
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+    // The point a trusted click would use is on the element: not the empty middle of a ring, or
+    // the hole in a control.
+    let row = |id: &str| rows.iter().find(|row| row["id"] == id).unwrap().clone();
+    for id in ["hf_stroke", "hf_donut", "hf_ring_with_dot"] {
+        let found = row(id);
+        assert_eq!(found["point_hits"], json!(true), "{found}");
+        assert_eq!(found["at_centre"], json!(false), "{found}");
+    }
+    assert_eq!(row("hf_wrapped")["point_hits"], json!(true));
+});
+
+gauntlet!(
+    a_strict_point_is_on_a_thin_stroke_in_the_delivered_pixel,
+    base,
+    {
+        let r = call(
+            &base,
+            "eval_js",
+            json!({ "code": "return window.__hitFixtures.thin()" }),
+        )
+        .await;
+        let got = result(&r);
+        assert_eq!(got["missed"], json!(0), "{got}");
+        // A refusal is honest, but not as an answer to most of them.
+        assert!(got["ok"].as_u64().unwrap_or(0) >= 100, "{got}");
+    }
+);
+
+gauntlet!(
+    a_trusted_click_is_refused_in_a_frame_it_cannot_reach,
+    base,
+    {
+        let zoom = call(
+            &base,
+            "eval_js",
+            json!({ "code": "return window.__hitFixtures.supportsZoom()" }),
+        )
+        .await;
+        let mut cases = vec![
+            ("transform:scale(2);transform-origin:0 0", "", true),
+            ("transform:rotate(90deg)", "", true),
+            ("", "transform:scale(1.5);transform-origin:0 0", true),
+            ("", "", false),
+            ("transform:translate(30px,20px)", "", false),
+            ("", "transform:translate(10px,5px)", false),
+        ];
+        if result(&zoom) == &json!(true) {
+            cases.push(("zoom:2", "", true));
+            cases.push(("", "zoom:1.5", true));
+        }
+        for (frame_style, wrapper_style, refused) in cases {
+            let setup = format!(
+                "return window.__hitFixtures.frame({}, {})",
+                json!(frame_style),
+                json!(wrapper_style)
+            );
+            let made = call(&base, "eval_js", json!({ "code": setup })).await;
+            let reference = result(&made).as_str().expect("a ref").to_string();
+            let probe = victauri_plugin::mcp::trusted_click_probe_js(&reference);
+            let r = call(&base, "eval_js", json!({ "code": probe })).await;
+            let got = result(&r).clone();
+            call(
+                &base,
+                "eval_js",
+                json!({ "code": "return window.__hitFixtures.frameClean()" }),
+            )
+            .await;
+            let what = format!("frame {frame_style:?}, wrapper {wrapper_style:?}: {got}");
+            if refused {
+                let why = got["error"].as_str().unwrap_or_default();
+                assert!(why.contains("synthetic click"), "{what}");
+            } else {
+                assert!(got["x"].is_number(), "{what}");
+            }
+        }
+    }
+);
+
+// ── 20. `navigate go_back` recovers a page that stopped answering ────────────
+
+gauntlet!(go_back_recovers_a_stopped_page, base, {
+    // The stop is bounded so the shared page comes back on its own even if the recovery does not,
+    // and the battery waits for the page to be ready again before the next test.
+    const STOP_MS: u64 = 60_000;
+    let stop = format!(
+        "setTimeout(function() {{ var end = Date.now() + {STOP_MS}; while (Date.now() < end) {{}} }}, 0); return 1"
+    );
+    let r = call(&base, "eval_js", json!({ "code": stop })).await;
+    assert_eq!(result(&r), &json!(1), "{r}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let started = std::time::Instant::now();
+    let back = call(&base, "navigate", json!({ "action": "go_back" })).await;
+    // WKWebView queues a navigation behind the stopped script, and its page processes are not the
+    // app's children: there it must say so, and the page returns when the stop ends.
+    let queued = cfg!(target_os = "macos") && back.get("error").is_some();
+    if queued {
+        assert!(
+            back["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("still does not answer"),
+            "{back}"
+        );
+    } else {
+        let back = result(&back).clone();
+        assert_eq!(back["recovered"], json!(true), "{back}");
+    }
+
+    let ready = "return document.body && document.body.getAttribute('data-gauntlet-ready')";
+    let limit = if queued { STOP_MS + 30_000 } else { 45_000 };
+    let mut answered = Value::Null;
+    while started.elapsed() < std::time::Duration::from_millis(limit) {
+        answered = call(&base, "eval_js", json!({ "code": ready })).await;
+        if answered["result"] == json!("1") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    assert_eq!(
+        answered["result"],
+        json!("1"),
+        "the page never answered again after go_back, {:?} in: {answered}",
+        started.elapsed()
+    );
+    assert!(
+        queued || started.elapsed() < std::time::Duration::from_millis(STOP_MS - 10_000),
+        "it answered only because the stop ended: {:?}",
+        started.elapsed()
+    );
+});
+
+// ── 21. XHR `fulfill`: the engine's own XMLHttpRequest reports the mock ───────
+
+gauntlet!(xhr_route_fulfill_reports_the_mock, base, {
+    // The page CSP's `connect-src` would refuse this URL: a request that reached the network errors.
+    let add = call(
+        &base,
+        "route",
+        json!({ "action": "add", "pattern": "gauntlet-xhr-mock", "behavior": "fulfill", "status": 201,
+                "status_text": "Made", "headers": { "X-One": "1" }, "body": "{\"a\":[1]}" }),
+    )
+    .await;
+    assert!(result(&add).get("xhr_note").is_none(), "{}", result(&add));
+    let code = r"
+        function one(type) { return new Promise(function(done) {
+            var x = new XMLHttpRequest(), seen = [];
+            ['readystatechange','progress','load','error','abort','loadend'].forEach(function(t) {
+                x.addEventListener(t, function() { seen.push(t === 'readystatechange' ? 'rs' + x.readyState : t); });
+            });
+            x.onloadend = function() {
+                var r = x.response;
+                done({ type: type, seen: seen.join(), rs: x.readyState, status: x.status, text: x.statusText,
+                    header: x.getResponseHeader('x-one'), all: x.getAllResponseHeaders(),
+                    url: x.responseURL.indexOf('gauntlet-xhr-mock') !== -1,
+                    value: type === 'json' ? r.a[0]
+                        : type === 'arraybuffer' ? new Uint8Array(r).length
+                        : type === 'blob' ? r.size + ' ' + r.type
+                        : type === 'document' ? r
+                        : r });
+            };
+            x.open('GET', 'https://example.invalid/gauntlet-xhr-mock'); x.responseType = type; seen.length = 0; x.send();
+        }); }
+        var out = [];
+        for (var t of ['', 'text', 'json', 'arraybuffer', 'blob', 'document']) out.push(await one(t));
+        return out;";
+    let r = call(&base, "eval_js", json!({ "code": code })).await;
+    let _ = call(&base, "route", json!({ "action": "clear_all" })).await;
+    let rows = result(&r).as_array().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 6, "{r}");
+    for row in &rows {
+        assert_eq!(
+            row["seen"],
+            json!("rs2,rs3,progress,rs4,load,loadend"),
+            "{row}"
+        );
+        assert_eq!(row["rs"], json!(4), "{row}");
+        assert_eq!(row["status"], json!(201), "{row}");
+        assert_eq!(row["text"], json!("Made"), "{row}");
+        assert_eq!(row["header"], json!("1"), "{row}");
+        assert_eq!(
+            row["all"],
+            json!("content-type: application/json\r\nx-one: 1\r\n"),
+            "{row}"
+        );
+        assert_eq!(row["url"], json!(true), "{row}");
+    }
+    assert_eq!(rows[0]["value"], json!("{\"a\":[1]}"), "{}", rows[0]);
+    assert_eq!(rows[1]["value"], json!("{\"a\":[1]}"), "{}", rows[1]);
+    assert_eq!(rows[2]["value"], json!(1), "{}", rows[2]);
+    assert_eq!(rows[3]["value"], json!(9), "{}", rows[3]);
+    assert_eq!(rows[4]["value"], json!("9 application/json"), "{}", rows[4]);
+    assert_eq!(rows[5]["value"], Value::Null, "{}", rows[5]);
+});
+
+// ── 22. A scrub keeps its seeks' animation events from the page ──────────────
+
+gauntlet!(scrub_events_do_not_reach_the_page, base, {
+    let setup = r"
+        window.__heard = [];
+        [['scrub-t', '300ms linear 4000ms 3 both'], ['scrub-u', '100ms linear infinite']].forEach(function(f) {
+            var id = f[0], el = document.createElement('div'); el.id = id; document.body.appendChild(el);
+            // The CSSOM: the page's CSP refuses inline styles.
+            el.style.cssText = 'width: 10px; height: 10px; animation: sweepBroken ' + f[1];
+            ['animationstart', 'animationend', 'animationiteration'].forEach(function(t) {
+                el.addEventListener(t, function() { window.__heard.push(id + ':' + t); });
+            });
+        });
+        return 1";
+    let r = call(&base, "eval_js", json!({ "code": setup })).await;
+    assert_eq!(result(&r), &json!(1), "{r}");
+    // Its delay phase, every iteration and back: each crossing would fire an event.
+    let scrub = call(
+        &base,
+        "animation",
+        json!({ "action": "scrub", "selector": "#scrub-t", "points": 12, "capture": false }),
+    )
+    .await;
+    assert!(scrub.get("error").is_none(), "{scrub}");
+    let read =
+        "return window.__heard.filter(function(h) { return h.indexOf('scrub-t') === 0; }).length";
+    let during = call(&base, "eval_js", json!({ "code": read })).await;
+    let other = call(
+        &base,
+        "eval_js",
+        json!({ "code": "return window.__heard.filter(function(h) { return h.indexOf('scrub-u') === 0; }).length" }),
+    )
+    .await;
+    // The animation, restored, then runs for real: its own events do reach the page.
+    let mut natural = Value::Null;
+    for _ in 0..40 {
+        natural = call(&base, "eval_js", json!({ "code": read })).await;
+        if natural["result"].as_u64().unwrap_or(0) >= 4 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    let _ = call(
+        &base,
+        "eval_js",
+        json!({ "code": "document.getElementById('scrub-t').remove(); document.getElementById('scrub-u').remove(); return 1" }),
+    )
+    .await;
+    assert_eq!(result(&during), &json!(0), "reached the page: {during}");
+    assert!(
+        result(&other).as_u64().unwrap_or(0) > 0,
+        "another element lost its events: {other}"
+    );
+    assert!(
+        natural["result"].as_u64().unwrap_or(0) >= 4,
+        "the real run's events never reached the page: {natural}"
+    );
+});
+
+// ── 23-25. DISPLAY-GATED: screenshot + filmstrip + trusted input ─────────────
 // These need a real window server (Screen Recording on macOS); they run on the
 // macOS validation box and local Windows (VICTAURI_GAUNTLET_DISPLAY=1) and skip
 // on headless Linux CI.

@@ -2,7 +2,8 @@
 //! agent client (MCP config + agent instructions) in one command.
 //!
 //! Every client gets the same server: `victauri bridge --app <identifier>`, the stdio proxy that
-//! discovers the running app by identity. Config files are MERGED, never clobbered: JSON/JSONC is
+//! discovers the running app by identity (a user-level config serves every project, so it has no
+//! `--app`, and the bridge uses the sole running app). Config files are MERGED, never clobbered: JSON/JSONC is
 //! edited by inserting one entry as text (see [`crate::jsonc`]), TOML through `toml_edit`, and
 //! an existing `victauri` entry is always left exactly as the user has it. Project files are
 //! written only inside the project (no symlinked components); user-level files are written only
@@ -325,6 +326,26 @@ fn redirecting_keys(obj: &serde_json::Map<String, Value>) -> Vec<String> {
         keys.push("type".to_string());
     }
     keys
+}
+
+/// The app an existing bridge `entry` is pinned to (`--app <id>` or `--app=<id>`; JSON shape as
+/// in [`unexpected_command`]).
+fn pinned_app(entry: &Value) -> Option<String> {
+    let args = match entry.get("command") {
+        Some(Value::Object(nested)) => nested.get("args"),
+        _ => entry.get("args"),
+    }?
+    .as_array()?;
+    let mut args = args.iter().filter_map(Value::as_str);
+    while let Some(arg) = args.next() {
+        if arg == "--app" {
+            return args.next().map(str::to_string);
+        }
+        if let Some(id) = arg.strip_prefix("--app=") {
+            return Some(id.to_string());
+        }
+    }
+    None
 }
 
 /// `None` when an existing server `entry` (JSON shape: `command` + `args`, or Zed's older
@@ -714,6 +735,10 @@ fn apply_config(
     } else {
         ensure_inside_project(root, &target.path)?;
     }
+    // A user-level config serves every project on the machine, so it cannot name one: the bridge
+    // then uses the sole running app, or reports ambiguity by name.
+    let current_app = app;
+    let app = if target.user_level { None } else { app };
     let existing = read_existing(&target.path)?;
     let merge = match target.format {
         Format::Json { key, typed } => jsonc::insert_server(
@@ -736,17 +761,32 @@ fn apply_config(
             }
         }
         JsonMerge::AlreadyPresent => {
-            let unexpected = existing
+            let entry = existing
                 .as_deref()
-                .and_then(|text| existing_entry(target.format, text))
-                .and_then(|entry| unexpected_command(&entry));
-            report.status = match unexpected {
-                Some(runs) => Status::Unexpected(format!(
+                .and_then(|text| existing_entry(target.format, text));
+            let unexpected = entry.as_ref().and_then(unexpected_command);
+            let other_pin = entry.as_ref().and_then(pinned_app).filter(|pin| {
+                current_app.is_some_and(|id| id != pin)
+                    && crate::read_app_product_name(root).as_deref() != Some(pin)
+            });
+            report.status = match (unexpected, other_pin, current_app) {
+                (Some(runs), ..) => Status::Unexpected(format!(
                     "has a \"victauri\" server that does NOT run the Victauri bridge — it runs: \
                      {runs} (kept as is; make sure it is yours, or replace it with `victauri \
                      bridge`)"
                 )),
-                None => Status::Unchanged("already has a \"victauri\" server (kept as is)".into()),
+                (None, Some(pin), Some(id)) => Status::Unexpected(format!(
+                    "has a \"victauri\" server pinned to app '{}', but this project's app is \
+                     '{}': the bridge would not reach it (kept as is; {})",
+                    victauri_test::terminal::single_line(&pin),
+                    victauri_test::terminal::single_line(id),
+                    if target.user_level {
+                        "remove `--app` from it: a user-level config serves every project"
+                    } else {
+                        "update its `--app`"
+                    }
+                )),
+                _ => Status::Unchanged("already has a \"victauri\" server (kept as is)".into()),
             };
         }
         JsonMerge::Refused(why) => {
@@ -941,6 +981,7 @@ pub fn setup(
             Ok(targets) => {
                 for t in targets {
                     let mut r = apply_config(root, &t, app, opts.dry_run).unwrap_or_else(|e| {
+                        let app = if t.user_level { None } else { app };
                         failed(
                             &t.path,
                             String::new(),
@@ -962,7 +1003,7 @@ pub fn setup(
                         key: "mcpServers",
                         typed: false,
                     },
-                    app,
+                    None,
                 )),
                 user_level: true,
             }),
@@ -1089,7 +1130,7 @@ pub fn configured_project_clients(root: &Path) -> Vec<ConfiguredClient> {
         .filter_map(|c| {
             let targets = config_targets(c, root, &dirs, false).ok()?;
             let t = targets.into_iter().next()?;
-            let text = std::fs::read_to_string(&t.path).ok()?;
+            let text = crate::read_regular_file(&t.path).ok()?;
             let entry = existing_entry(t.format, &text)?;
             Some(ConfiguredClient {
                 label: c.label(),
@@ -1189,7 +1230,7 @@ Exit code 0 = success, 1 = the tool reported an error or the app rejected the ca
 tool may have run, so check its effect before retrying. `victauri call screenshot --out
 shot.png` saves images instead of printing base64. Add `--app <bundle-identifier>` when several apps run. Examples:
 `victauri call query_db query="SELECT count(*) FROM items"`,
-`victauri call invoke_command command=get_settings`, `victauri call interact action=click ref_id=e12`.
+`victauri call invoke_command command=get_settings`, `victauri call interact action=click ref_id=k3f9e12`.
 
 ### Awaiting async backend work (don't guess with sleeps)
 
@@ -1652,6 +1693,88 @@ mod tests {
         root()
     }
 
+    /// A user-level config serves every project. Pinned to the first, a second project's agent
+    /// got "no running app" or silently drove the first project's app, while setup said `[=]`.
+    #[test]
+    fn user_level_configs_are_not_pinned_to_one_project() {
+        let (_h, home) = root_home();
+        let dirs = UserDirs {
+            home: Some(home.clone()),
+            appdata: Some(home.join("AppData")),
+            xdg_config: None,
+            codex_home: None,
+        };
+        let mut o = opts(&[Client::Windsurf, Client::Codex]);
+        o.user_config = true;
+        o.instructions = false;
+        let (_a, project_a) = root();
+        let (_b, project_b) = root();
+        let reports = setup(&project_a, Some("com.project.a"), &o, &dirs).unwrap();
+        assert!(
+            reports.iter().all(|r| r.status == Status::Created),
+            "{reports:#?}"
+        );
+        let reports = setup(&project_b, Some("com.project.b"), &o, &dirs).unwrap();
+        assert!(
+            reports
+                .iter()
+                .all(|r| matches!(r.status, Status::Unchanged(_))),
+            "{reports:#?}"
+        );
+        let ws = if cfg!(windows) {
+            home.join("AppData/devin/mcp_config.json")
+        } else {
+            home.join(".config/devin/mcp_config.json")
+        };
+        assert_eq!(
+            json(&ws)["mcpServers"]["victauri"]["args"],
+            serde_json::json!(["bridge"])
+        );
+        let codex = std::fs::read_to_string(home.join(".codex/config.toml")).unwrap();
+        assert!(!codex.contains("com.project"), "{codex}");
+    }
+
+    /// A user-level entry written by an older CLI still carries a project's pin: every other
+    /// project is told, not silently handed to that app.
+    #[test]
+    fn an_existing_pin_for_another_app_is_flagged() {
+        let (_d, root) = root();
+        let entry = |pin: &str| {
+            format!(
+                r#"{{"mcpServers": {{"victauri": {{"command": "victauri", "args": ["bridge", {pin}]}}}}}}"#
+            )
+        };
+        let mut o = opts(&[Client::Claude]);
+        o.instructions = false;
+        let status = |pin: &str, app: Option<&str>| {
+            std::fs::write(root.join(".mcp.json"), entry(pin)).unwrap();
+            let r = setup(&root, app, &o, &UserDirs::default()).unwrap();
+            r[0].status.clone()
+        };
+        let two = r#""--app", "com.old""#;
+        let one = r#""--app=com.old""#;
+        for pin in [two, one] {
+            assert!(
+                matches!(status(pin, Some("com.new")), Status::Unexpected(w) if w.contains("com.old") && w.contains("com.new")),
+                "{pin}"
+            );
+            assert!(
+                matches!(status(pin, Some("com.old")), Status::Unchanged(_)),
+                "{pin}"
+            );
+            // No identifier to compare with: nothing to say.
+            assert!(matches!(status(pin, None), Status::Unchanged(_)), "{pin}");
+        }
+        // Unpinned: uses the sole running app, whichever project this is.
+        std::fs::write(
+            root.join(".mcp.json"),
+            r#"{"mcpServers": {"victauri": {"command": "victauri", "args": ["bridge"]}}}"#,
+        )
+        .unwrap();
+        let r = setup(&root, Some("com.new"), &o, &UserDirs::default()).unwrap();
+        assert!(matches!(r[0].status, Status::Unchanged(_)));
+    }
+
     #[test]
     fn legacy_windsurf_config_is_updated_only_if_present() {
         let (_h, home) = root_home();
@@ -2047,10 +2170,16 @@ mod tests {
         perms.set_readonly(false);
         std::fs::set_permissions(&cursor, perms).unwrap();
 
-        for label in ["Cursor", "Codex"] {
+        // The entry to add by hand is pinned like the one that would have been written: a
+        // project config names the app, a user-level one serves every project.
+        for (label, pinned) in [("Cursor", true), ("Codex", false)] {
             let r = reports.iter().find(|r| r.what.starts_with(label)).unwrap();
             assert!(matches!(r.status, Status::Skipped(_)), "{r:#?}");
-            assert!(r.manual.as_deref().unwrap().contains("com.x.app"), "{r:#?}");
+            assert_eq!(
+                r.manual.as_deref().unwrap().contains("com.x.app"),
+                pinned,
+                "{r:#?}"
+            );
         }
         assert_eq!(std::fs::read_to_string(&cursor).unwrap(), "{}");
         // Files after the failures were still written.

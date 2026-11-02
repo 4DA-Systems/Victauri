@@ -534,3 +534,124 @@ async fn readers_find_an_app_registered_under_the_home_state_root() {
         stdout(&out)
     );
 }
+
+/// `setup` failed only for a foreign entry, whose reason was "so a script or CI step cannot read
+/// it as success" — but a refused or unwritable config leaves the client just as unwired.
+#[test]
+fn setup_fails_when_a_config_could_not_be_written() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    std::fs::create_dir_all(project.join(".cursor")).unwrap();
+    let config = project.join(".cursor").join("mcp.json");
+    std::fs::write(&config, "{ this is not json").unwrap();
+    let mut cmd = iso.victauri(&["setup", "cursor", "--no-instructions"]);
+    cmd.arg("--path").arg(&project);
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&config).unwrap(),
+        "{ this is not json"
+    );
+
+    // Expected under `setup all`: a client that has no project-level config is not a failure.
+    let mut cmd = iso.victauri(&["setup", "windsurf", "--no-instructions"]);
+    cmd.arg("--path").arg(&project);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// A pinned entry from another project (or from before the identifier changed) is not "all is
+/// well": the bridge would refuse this project's app, or drive the other one.
+#[test]
+fn setup_flags_a_pin_that_names_another_app() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("tauri.conf.json"),
+        r#"{"identifier": "com.new.id"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers": {"victauri": {"command": "victauri", "args": ["bridge", "--app", "com.old.id"]}}}"#,
+    )
+    .unwrap();
+    let mut cmd = iso.victauri(&["setup", "claude", "--no-instructions"]);
+    cmd.arg("--path").arg(&project);
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(
+        err.contains("com.old.id") && err.contains("com.new.id"),
+        "{err}"
+    );
+}
+
+/// A pin to the app's product name is valid (`--app` matches either), so it is not flagged.
+#[test]
+fn setup_accepts_a_pin_to_the_product_name() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(
+        project.join("tauri.conf.json"),
+        r#"{"identifier": "com.new.id", "productName": "My App"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.join(".mcp.json"),
+        r#"{"mcpServers": {"victauri": {"command": "victauri", "args": ["bridge", "--app", "My App"]}}}"#,
+    )
+    .unwrap();
+    let mut cmd = iso.victauri(&["setup", "claude", "--no-instructions"]);
+    cmd.arg("--path").arg(&project);
+    let out = cmd.output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+}
+
+/// `record` checked its `--output` only when the recording ended, so a bad path lost the session.
+#[test]
+fn record_refuses_a_bad_output_before_recording() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    std::fs::create_dir_all(project.join("tests")).unwrap();
+    let mut cmd = iso.victauri(&["record", "--output", "tests"]);
+    cmd.current_dir(&project);
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("is a directory"), "{err}");
+}
+
+/// A repository can plant a FIFO under any project file name: reading one hangs `doctor`.
+#[cfg(unix)]
+#[test]
+fn doctor_does_not_hang_on_a_fifo_in_the_project() {
+    let iso = IsolatedTemp::new();
+    let project = iso.0.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    for name in ["Cargo.toml", ".mcp.json", "tauri.conf.json"] {
+        let status = Command::new("mkfifo")
+            .arg(project.join(name))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    let mut cmd = iso.victauri(&["doctor"]);
+    cmd.current_dir(&project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    panic!("`victauri doctor` hung on a FIFO");
+}

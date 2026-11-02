@@ -244,19 +244,56 @@ const INIT_SCRIPT_BODY: &str = r#"
     var refMap = new Map();
     var refCounter = 0;
     var weakRefMap = new Map();
+    // Ref ids carry a tag unique to this page load (and window), so a ref noted before a reload,
+    // HMR or in another window can never resolve here: with bare counters the same `e1` meant a
+    // different element after any reload, and clicking it reported ok on the wrong element.
+    // Grammar: 4 chars [a-z][0-9a-z]{3}, then `e`, then the counter (`k3f9e12`).
+    var PAGE_TAG = (function() {
+        var alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
+        var b = null;
+        try { b = new Uint32Array(4); window.crypto.getRandomValues(b); } catch (e) { b = null; }
+        function pick(i, n) { return alphabet.charAt((b ? b[i] : Math.floor(Math.random() * 4294967296)) % n); }
+        return pick(0, 26) + pick(1, 36) + pick(2, 36) + pick(3, 36);
+    })();
+    var REF_PREFIX = PAGE_TAG + 'e';
+    // A bare `e12` is this page's counter 12. No plugin since the tag was added issues one, so it
+    // can only be a test or script written against the older form, never a stale ref held across
+    // a reload.
+    function isBareCounter(refId) {
+        if (typeof refId !== 'string' || refId.length < 2 || refId.charAt(0) !== 'e') return false;
+        for (var i = 1; i < refId.length; i++) {
+            var c = refId.charCodeAt(i);
+            if (c < 48 || c > 57) return false;
+        }
+        return true;
+    }
+    function isForeignRef(refId) {
+        return typeof refId !== 'string'
+            || (REFLECT_APPLY(STR_INDEXOF, refId, [REF_PREFIX]) !== 0 && !isBareCounter(refId));
+    }
+    function foreignRefError(refId) {
+        return isForeignRef(refId)
+            ? 'ref not found: ' + refId + ' (this ref is from a previous page load or another window; this page\'s refs start with '
+                + REF_PREFIX + ' — take a new dom_snapshot or find_elements)'
+            : null;
+    }
+    function refNotFound(refId) {
+        return foreignRefError(refId) || 'ref not found: ' + refId;
+    }
 
     function resolveRef(refId) {
-        var direct = refMap.get(refId);
+        if (isBareCounter(refId)) refId = REF_PREFIX + refId.slice(1);
+        var direct = REFLECT_APPLY(MAP_GET, refMap, [refId]);
         if (direct) {
             if (direct.isConnected) return direct;
-            refMap.delete(refId);
+            REFLECT_APPLY(MAP_DELETE, refMap, [refId]);
             return null;
         }
-        var weak = weakRefMap.get(refId);
+        var weak = REFLECT_APPLY(MAP_GET, weakRefMap, [refId]);
         if (weak) {
-            var el = weak.deref();
+            var el = REFLECT_APPLY(WEAKREF_DEREF, weak, []);
             if (el && el.isConnected) return el;
-            weakRefMap.delete(refId);
+            REFLECT_APPLY(MAP_DELETE, weakRefMap, [refId]);
             return null;
         }
         return null;
@@ -272,41 +309,41 @@ const INIT_SCRIPT_BODY: &str = r#"
     var buildingRefs = null;
 
     function registerRef(node) {
-        var ref_id = nodeIds.get(node);
+        var ref_id = REFLECT_APPLY(WEAKMAP_GET, nodeIds, [node]);
         if (ref_id === undefined) {
-            ref_id = 'e' + (refCounter++);
-            nodeIds.set(node, ref_id);
+            ref_id = REF_PREFIX + (refCounter++);
+            REFLECT_APPLY(WEAKMAP_SET, nodeIds, [node, ref_id]);
         }
-        if (refMap.has(ref_id)) refMap.delete(ref_id); // re-insert as newest
-        if (refMap.size >= REF_MAP_LIMIT) {
+        REFLECT_APPLY(MAP_DELETE, refMap, [ref_id]); // re-insert as newest
+        if (REFLECT_APPLY(MAP_SIZE_GET, refMap, []) >= REF_MAP_LIMIT) {
             // Drop the oldest STRONG reference only. With WeakRef support the ref
             // stays resolvable through weakRefMap while its node is alive, so a
             // snapshot larger than the limit never invalidates its own early refs.
-            var oldest = refMap.keys().next().value;
-            refMap.delete(oldest);
-            if (!HAS_WEAKREF) weakRefMap.delete(oldest);
+            var oldest = REFLECT_APPLY(MAP_KEYS, refMap, []).next().value;
+            REFLECT_APPLY(MAP_DELETE, refMap, [oldest]);
+            if (!HAS_WEAKREF) REFLECT_APPLY(MAP_DELETE, weakRefMap, [oldest]);
         }
-        refMap.set(ref_id, node);
+        REFLECT_APPLY(MAP_SET, refMap, [ref_id, node]);
         if (HAS_WEAKREF) {
-            var existing = weakRefMap.get(ref_id);
-            if (!existing || existing.deref() !== node) {
-                weakRefMap.set(ref_id, new WeakRef(node));
+            var existing = REFLECT_APPLY(MAP_GET, weakRefMap, [ref_id]);
+            if (!existing || REFLECT_APPLY(WEAKREF_DEREF, existing, []) !== node) {
+                REFLECT_APPLY(MAP_SET, weakRefMap, [ref_id, new WEAKREF_CTOR(node)]);
             }
         }
-        if (buildingRefs) buildingRefs.add(ref_id);
+        if (buildingRefs) buildingRefs[ref_id] = true;
         return ref_id;
     }
 
     function getStaleRefs() {
         var stale = [];
-        weakRefMap.forEach(function(weak, refId) {
-            var el = weak.deref();
+        REFLECT_APPLY(MAP_FOREACH, weakRefMap, [function(weak, refId) {
+            var el = REFLECT_APPLY(WEAKREF_DEREF, weak, []);
             if (!el || !el.isConnected) {
-                stale.push(refId);
-                weakRefMap.delete(refId);
-                refMap.delete(refId);
+                stale[stale.length] = refId;
+                REFLECT_APPLY(MAP_DELETE, weakRefMap, [refId]);
+                REFLECT_APPLY(MAP_DELETE, refMap, [refId]);
             }
-        });
+        }]);
         return stale;
     }
     var consoleLogs = [];
@@ -361,8 +398,8 @@ const INIT_SCRIPT_BODY: &str = r#"
     function isVictauriInternalUrl(url) {
         var p = ipcCommandPath(url);
         if (p === null) return false;
-        try { p = decodeURIComponent(p); } catch (e) {}
-        return p.indexOf('plugin:victauri|') === 0;
+        try { p = DECODE_URI_COMPONENT(p); } catch (e) {}
+        return REFLECT_APPLY(STR_INDEXOF, p, ['plugin:victauri|']) === 0;
     }
 
     // ── IPC transport ────────────────────────────────────────────────────────
@@ -551,11 +588,11 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (cmd.indexOf('plugin:victauri|') === 0) return; // Victauri's own plumbing
 
         var path = ENCODE_URI_COMPONENT(cmd);
-        var entry = {
+        var entry = nullProto({
             id: ++networkCounter, method: 'POST', url: POST_MESSAGE_IPC_PREFIX + path,
             timestamp: Date.now(), status: 'pending', duration_ms: null,
             transport: 'post_message', ipc_path: path, ipc_callback: cb,
-        };
+        });
         // Args, from the message as serialized (Tauri's replacer applied). Parsed only when
         // small; the parsed message (which holds the invoke key) is dropped right here.
         var payloadJson;
@@ -653,12 +690,24 @@ const INIT_SCRIPT_BODY: &str = r#"
     var routeMatchLog = [];
     var CAP_ROUTE_MATCHES = 200;
 
-    // Convert a glob to a RegExp. `*` (any run of characters) is the only wildcard; every other
-    // character matches itself — including `?`, which used to slip through unescaped as a regex
-    // quantifier, so `*/api/search?q=*` matched nothing (R5-JS4).
-    function globToRegExp(glob) {
-        var re = glob.replace(/[.+?^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-        return new RegExp('^' + re + '$');
+    // Glob match: `*` (any run of characters) is the only wildcard; every other character matches
+    // itself (R5-JS4). A greedy scan, linear in the URL: the regex it replaces took quadratic time
+    // on a long URL, about two minutes of frozen main thread per 1 MB `data:` fetch.
+    function globHits(glob, url) {
+        var parts = glob.split('*');
+        if (parts.length === 1) return url === glob;
+        var first = parts[0], last = parts[parts.length - 1];
+        var end = url.length - last.length;
+        if (end < first.length) return false;
+        if (REFLECT_APPLY(STR_SUBSTRING, url, [0, first.length]) !== first) return false;
+        if (REFLECT_APPLY(STR_SUBSTRING, url, [end]) !== last) return false;
+        var pos = first.length;
+        for (var i = 1; i < parts.length - 1; i++) {
+            var at = REFLECT_APPLY(STR_INDEXOF, url, [parts[i], pos]);
+            if (at === -1 || at + parts[i].length > end) return false;
+            pos = at + parts[i].length;
+        }
+        return true;
     }
 
     // The element actually hit at (x, y), descending into open shadow roots (which
@@ -728,10 +777,375 @@ const INIT_SCRIPT_BODY: &str = r#"
     function routeRuleHits(r, url) {
         try {
             if (r.match_type === 'exact') return url === r.pattern;
-            if (r.match_type === 'regex') return new RegExp(r.pattern).test(url);
-            if (r.match_type === 'glob') return globToRegExp(r.pattern).test(url);
-            return url.indexOf(r.pattern) !== -1; // substring (default)
+            if (r.match_type === 'regex') {
+                // A backtracking pattern over a huge opaque URL can freeze the page; such a URL is
+                // not what a regex rule is written for (substring and glob still see it).
+                if (url.length > ROUTE_RESOLVE_MAX && OPAQUE_URL_RE.test(url)) return false;
+                return REFLECT_APPLY(REGEXP_TEST, new REGEXP_CTOR(r.pattern), [url]);
+            }
+            if (r.match_type === 'glob') return globHits(r.pattern, url);
+            return REFLECT_APPLY(STR_INDEXOF, url, [r.pattern]) !== -1; // substring (default)
         } catch (e) { return false; }
+    }
+
+    // A regex that can hang the page, told apart before it runs. JavaScript has no regex timeout,
+    // and a rule's regex runs on the main thread against every request URL. What backtracks
+    // exponentially is a repetition with two different ways to take the same text from one state
+    // back to itself (`(a+)+`, `(a|aa)+`, `(x(a|a)y)+`, `(a+b*)+`). That is a property of the
+    // pattern's automaton, so it is asked of the automaton. Each outermost repeated group is parsed
+    // to its positions (the atoms, each with the characters it takes) and the steps between them,
+    // counting the ways a step can be made. It is refused if a step between two positions can be
+    // made in two ways, or if two positions reached from one position on the same character can
+    // arrive at one position on the same text: every position of a repeated group can reach every
+    // other, so that is a loop with two paths. Everything else takes each text one way only:
+    // `(/\w+(-\w+)*)+`, `(api|app)+`, `(a|ab)+`.
+    //
+    // It errs one way. A counted group counts as repeating without limit, `\b` and lookaround as
+    // always passing, a backreference as any text, and a repeated group that can match nothing is
+    // refused outright, so `(a+){2}`, `(\w+\b)+` and `(a|)+` are refused though they are not
+    // exponential. It says nothing about what is slow without a repeated group (`.*.*.*.*x`,
+    // `a?a?a?...aaa`). A pattern too large to analyse in the step budget is refused.
+    function parseRegexShape(src) {
+        var i = 0, n = src.length;
+        // `\k<` is a reference only in a pattern with named groups; otherwise it is the letter k.
+        var named = false;
+        for (var s = 0; s < n && !named; s++) {
+            if (src[s] === '\\') s++;
+            else if (src[s] === '[') {
+                for (s++; s < n && src[s] !== ']'; s++) { if (src[s] === '\\') s++; }
+            } else if (src[s] === '(' && src[s + 1] === '?' && src[s + 2] === '<' && src[s + 3] !== '=' && src[s + 3] !== '!') named = true;
+        }
+        function hexAt(at, len) {
+            for (var k = 0; k < len; k++) {
+                var h = src[at + k];
+                if (!((h >= '0' && h <= '9') || (h >= 'a' && h <= 'f') || (h >= 'A' && h <= 'F'))) return false;
+            }
+            return true;
+        }
+        function skipTo(c) { while (i < n && src[i] !== c) i++; i++; }
+        function quantifier(atom) {
+            var c = src[i], min, max;
+            if (c === '*') { min = 0; max = Infinity; i++; }
+            else if (c === '+') { min = 1; max = Infinity; i++; }
+            else if (c === '?') { min = 0; max = 1; i++; }
+            else if (c === '{') {
+                // Anything but `{n}`, `{n,}`, `{n,m}` is a literal brace, already taken as an atom.
+                var j = i + 1, a = '', b = '', comma = false;
+                while (src[j] >= '0' && src[j] <= '9') a += src[j++];
+                if (src[j] === ',') { comma = true; j++; }
+                while (src[j] >= '0' && src[j] <= '9') b += src[j++];
+                if (a === '' || src[j] !== '}') return;
+                min = +a;
+                max = !comma ? min : (b === '' ? Infinity : +b);
+                i = j + 1;
+            } else return;
+            if (src[i] === '?') i++; // lazy
+            atom.min = min;
+            atom.max = max;
+        }
+        // A rule's regex is compiled with no flags, so what changes how an atom matches is an
+        // inline modifier: `(?i:a)` takes A too, `(?s:.)` takes a newline.
+        function withModifiers(flags, mods) {
+            var on = true, out = flags;
+            for (var k = 0; k < mods.length; k++) {
+                var f = mods[k];
+                if (f === '-') { on = false; continue; }
+                if (f !== 'i' && f !== 's') continue;
+                var has = REFLECT_APPLY(STR_INDEXOF, out, [f]) !== -1;
+                if (on && !has) out += f;
+                else if (!on && has) out = out === f ? '' : (f === 'i' ? 's' : 'i');
+            }
+            return out;
+        }
+        function atom(flags) {
+            var start = i, c = src[i++], made = { min: 1, max: 1, start: start, flags: flags };
+            if (c === '(') {
+                var inner = flags;
+                if (src[i] === '?') {
+                    var d = src[i + 1];
+                    if (d === '=' || d === '!') { made.zero = true; i += 2; }
+                    else if (d === '<' && (src[i + 2] === '=' || src[i + 2] === '!')) { made.zero = true; i += 3; }
+                    else if (d === '<') skipTo('>');
+                    else {
+                        var from = ++i;
+                        skipTo(':');
+                        inner = withModifiers(flags, REFLECT_APPLY(STR_SUBSTRING, src, [from, i - 1]));
+                    }
+                }
+                made.alts = alternatives(inner);
+                i++; // the `)`
+                return made;
+            }
+            if (c === '[') {
+                while (i < n && src[i] !== ']') { if (src[i] === '\\') i++; i++; }
+                i++;
+            } else if (c === '^' || c === '$') {
+                made.zero = true;
+            } else if (c === '\\') {
+                // An escape that is not well formed is the character itself, and whatever follows
+                // it is still pattern: `\x(a+)+` is an x and then a repeated group.
+                var e = src[i++];
+                if (e === 'b' || e === 'B') made.zero = true;
+                else if (e >= '1' && e <= '9') {
+                    while (src[i] >= '0' && src[i] <= '9') i++;
+                    made.any = true; // a backreference: any text, of any length
+                } else if (e === '0') {
+                    // A legacy octal escape is one character: `\012` is a newline.
+                    for (var o = 0; o < 2 && src[i] >= '0' && src[i] <= '7'; o++) i++;
+                } else if (e === 'k') {
+                    if (named && src[i] === '<') { skipTo('>'); made.any = true; }
+                } else if (e === 'x') {
+                    if (hexAt(i, 2)) i += 2;
+                } else if (e === 'u') {
+                    if (hexAt(i, 4)) i += 4; // `\u{` is `u` and a brace: there is no `u` flag here
+                } else if (e === 'c') {
+                    var l = src[i];
+                    if ((l >= 'a' && l <= 'z') || (l >= 'A' && l <= 'Z')) i++;
+                    else { i--; made.text = '\\\\'; return made; } // a backslash, and `c` is the next atom
+                }
+            }
+            made.text = REFLECT_APPLY(STR_SUBSTRING, src, [start, i]);
+            return made;
+        }
+        function alternatives(flags) {
+            var alts = [[]];
+            while (i < n && src[i] !== ')') {
+                if (src[i] === '|') { i++; alts[alts.length] = []; continue; }
+                var made = atom(flags);
+                quantifier(made);
+                made.end = i;
+                var seq = alts[alts.length - 1];
+                seq[seq.length] = made;
+            }
+            return alts;
+        }
+        return alternatives('');
+    }
+    function regexHangRisk(src) {
+        var alts = parseRegexShape(src);
+        var budget = 4000000;
+        var REFUSE = {};
+        function spend(cost) { budget -= cost; if (budget < 0) throw REFUSE; }
+        // The characters tried: Latin-1, a few that sit outside any class a pattern is likely to
+        // name, and every character the pattern names (literally or as an escape, also inside a
+        // class) with its neighbours and case: two ranges that overlap share an endpoint, and
+        // two negated ones share what is just outside.
+        var probes = [], seen = Object.create(null);
+        function probe(code) {
+            if (code < 0 || code > 65535 || seen[code]) return;
+            seen[code] = true;
+            probes[probes.length] = String.fromCharCode(code);
+        }
+        function named(code) {
+            probe(code - 1); probe(code); probe(code + 1);
+            var ch = String.fromCharCode(code), up = ch.toUpperCase(), low = ch.toLowerCase();
+            if (up.length === 1) probe(up.charCodeAt(0));
+            if (low.length === 1) probe(low.charCodeAt(0));
+        }
+        for (var c = 0; c < 256; c++) probe(c);
+        // Every `\s` is here, as a range can hold one with nothing else naming it, and what folds
+        // into ASCII under `i`.
+        var outside = [0x1680, 0x2000, 0x2001, 0x2002, 0x2003, 0x2004, 0x2005, 0x2006, 0x2007, 0x2008,
+            0x2009, 0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff, 0x17f, 0x212a, 0x4e2d,
+            0xd83d, 0xffff];
+        for (var w = 0; w < outside.length; w++) probe(outside[w]);
+        for (var u = 0; u < src.length; u++) {
+            var code = src.charCodeAt(u);
+            if (code > 127) named(code);
+            else if (code === 92) {
+                var len = src[u + 1] === 'x' ? 2 : (src[u + 1] === 'u' ? 4 : 0);
+                if (len) {
+                    var hex = REFLECT_APPLY(STR_SUBSTRING, src, [u + 2, u + 2 + len]), val = parseInt(hex, 16);
+                    if (hex.length === len && val === val) named(val);
+                }
+                u++;
+            }
+        }
+        var charsMemo = Object.create(null), overlapMemo = Object.create(null), charsCount = 0;
+        function chars(a) {
+            var whole = a.any ? 'any' : (a.flags + '/' + a.text);
+            var known = charsMemo[whole];
+            if (known) return known;
+            spend(probes.length);
+            var out = { id: charsCount++, on: [], live: false }, k;
+            if (a.any) {
+                for (k = 0; k < probes.length; k++) out.on[k] = true;
+            } else {
+                try {
+                    var re = new REGEXP_CTOR('^(?:' + a.text + ')$', a.flags);
+                    for (k = 0; k < probes.length; k++) out.on[k] = REFLECT_APPLY(REGEXP_TEST, re, [probes[k]]);
+                } catch (e) {
+                    for (k = 0; k < probes.length; k++) out.on[k] = true;
+                }
+            }
+            for (k = 0; k < probes.length; k++) { if (out.on[k]) { out.live = true; break; } }
+            charsMemo[whole] = out;
+            return out;
+        }
+        function overlap(x, y) {
+            if (x === y) return x.live;
+            var key = x.id < y.id ? x.id + ':' + y.id : y.id + ':' + x.id;
+            var known = overlapMemo[key];
+            if (known !== undefined) return known;
+            spend(probes.length);
+            var hit = false;
+            for (var k = 0; k < probes.length; k++) { if (x.on[k] && y.on[k]) { hit = true; break; } }
+            overlapMemo[key] = hit;
+            return hit;
+        }
+        // Weighted sets of positions; a weight is the ways to get there, and 2 means "several".
+        function newSet() { return { keys: [], ways: Object.create(null) }; }
+        function add(set, position, ways) {
+            if (ways === 0) return;
+            var had = set.ways[position];
+            if (had === undefined) { set.keys[set.keys.length] = position; had = 0; }
+            set.ways[position] = had + ways > 2 ? 2 : had + ways;
+        }
+        function addAll(set, from, times) {
+            spend(from.keys.length + 1);
+            for (var k = 0; k < from.keys.length; k++) add(set, from.keys[k], from.ways[from.keys[k]] * times);
+        }
+        function union(a, b, times) {
+            var out = newSet();
+            addAll(out, a, 1);
+            addAll(out, b, times);
+            return out;
+        }
+        function ambiguousLoop(group) {
+            var positions = [], follow = [];
+            function link(last, first) {
+                spend(last.keys.length * first.keys.length + 1);
+                for (var p = 0; p < last.keys.length; p++) {
+                    var from = last.keys[p];
+                    for (var f = 0; f < first.keys.length; f++) {
+                        var to = first.keys[f];
+                        add(follow[from], to, last.ways[from] * first.ways[to]);
+                    }
+                }
+            }
+            function capped(ways) { return ways > 2 ? 2 : ways; }
+            function buildAtom(a) {
+                if (a.zero || a.max === 0) return null;
+                if (a.alts) {
+                    var body = build(a.alts);
+                    if (a.max >= 2) {
+                        // An iteration that can match nothing: refused as it stands.
+                        if (body.nulls > 0) throw REFUSE;
+                        link(body.last, body.first);
+                    }
+                    return { nulls: capped(body.nulls + (a.min === 0 ? 1 : 0)), first: body.first, last: body.last };
+                }
+                var at = positions.length;
+                spend(1);
+                positions[at] = chars(a);
+                follow[at] = newSet();
+                var only = newSet();
+                add(only, at, 1);
+                // `a{2}` is two characters, and `aa` the same text: a position for each.
+                if (!a.any && a.min === a.max && a.max >= 2) {
+                    spend(a.max * 50);
+                    for (var n = 1; n < a.max; n++) {
+                        var step = positions.length;
+                        positions[step] = positions[at];
+                        follow[step] = newSet();
+                        add(follow[step - 1], step, 1);
+                    }
+                    var end = newSet();
+                    add(end, positions.length - 1, 1);
+                    return { nulls: 0, first: only, last: end };
+                }
+                // `a{1,3}` has as many ways through it as `a+`, for this purpose.
+                if (a.any || (a.min !== a.max && a.max >= 2)) add(follow[at], at, 1);
+                return { nulls: (a.any || a.min === 0) ? 1 : 0, first: only, last: only };
+            }
+            function build(list) {
+                var all = { nulls: 0, first: newSet(), last: newSet() };
+                for (var b = 0; b < list.length; b++) {
+                    var cur = { nulls: 1, first: newSet(), last: newSet() };
+                    for (var k = 0; k < list[b].length; k++) {
+                        var x = buildAtom(list[b][k]);
+                        if (!x) continue;
+                        link(cur.last, x.first);
+                        var first = cur.nulls ? union(cur.first, x.first, cur.nulls) : cur.first;
+                        var last = x.nulls ? union(x.last, cur.last, x.nulls) : x.last;
+                        cur = { nulls: capped(cur.nulls * x.nulls), first: first, last: last };
+                    }
+                    all.nulls = capped(all.nulls + cur.nulls);
+                    addAll(all.first, cur.first, 1);
+                    addAll(all.last, cur.last, 1);
+                }
+                return all;
+            }
+            if (!buildAtom(group)) return false;
+            // One step, two ways.
+            var next = [], q, k, l;
+            for (q = 0; q < positions.length; q++) {
+                next[q] = [];
+                if (!positions[q].live) continue;
+                var keys = follow[q].keys;
+                for (k = 0; k < keys.length; k++) {
+                    if (!positions[keys[k]].live) continue;
+                    if (follow[q].ways[keys[k]] > 1) return true;
+                    next[q][next[q].length] = keys[k];
+                }
+            }
+            // Two positions that one position steps to on the same character, followed on the same
+            // text until they meet (ambiguous) or cannot both go on.
+            var pending = [], done = Object.create(null), width = positions.length;
+            function pair(a, b) {
+                var key = a < b ? a * width + b : b * width + a;
+                if (done[key]) return;
+                done[key] = true;
+                pending[pending.length] = a;
+                pending[pending.length] = b;
+            }
+            for (q = 0; q < positions.length; q++) {
+                spend(next[q].length * next[q].length + 1);
+                for (k = 0; k < next[q].length; k++) {
+                    for (l = k + 1; l < next[q].length; l++) {
+                        if (overlap(positions[next[q][k]], positions[next[q][l]])) pair(next[q][k], next[q][l]);
+                    }
+                }
+            }
+            for (var head = 0; head < pending.length; head += 2) {
+                var from = next[pending[head]], to = next[pending[head + 1]];
+                spend(from.length * to.length + 1);
+                for (k = 0; k < from.length; k++) {
+                    for (l = 0; l < to.length; l++) {
+                        if (!overlap(positions[from[k]], positions[to[l]])) continue;
+                        if (from[k] === to[l]) return true;
+                        pair(from[k], to[l]);
+                    }
+                }
+            }
+            return false;
+        }
+        function refused(group) {
+            try { return ambiguousLoop(group); } catch (e) {
+                if (e === REFUSE) return true;
+                throw e;
+            }
+        }
+        function visit(list, inRepeat) {
+            for (var q = 0; q < list.length; q++) {
+                for (var r = 0; r < list[q].length; r++) {
+                    var a = list[q][r], inner;
+                    if (!a.alts) continue;
+                    if (a.zero) {
+                        // Backtracking never enters a lookaround again, so it stands alone.
+                        inner = visit(a.alts, false);
+                    } else if (!inRepeat && a.max >= 2) {
+                        if (refused(a)) return REFLECT_APPLY(STR_SUBSTRING, src, [a.start, a.end]);
+                        inner = visit(a.alts, true);
+                    } else {
+                        inner = visit(a.alts, inRepeat);
+                    }
+                    if (inner) return inner;
+                }
+            }
+            return null;
+        }
+        return visit(alts, false);
     }
 
     function matchRoute(url, method) {
@@ -778,14 +1192,22 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (typeof status !== 'number' || status !== Math.floor(status) || status < 200 || status > 599) {
             throw new RangeError('victauri: route #' + route.id + ' fulfill status must be an integer in 200-599, got ' + status);
         }
-        // The Response constructor throws if a null-body status carries a body.
-        var nullBody = status === 204 || status === 205 || status === 304;
-        var bodyStr = nullBody ? null
-            : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
-        var hdrs = { 'content-type': route.content_type };
-        for (var k in route.headers) { if (hasOwn(route.headers, k)) hdrs[k] = route.headers[k]; }
+        var bodyStr = mockBody(route);
         var Ctor = RESPONSE_CTOR || Response;
-        return { resp: new Ctor(bodyStr, { status: status, statusText: route.status_text, headers: hdrs }), body: bodyStr };
+        return { resp: new Ctor(bodyStr, { status: status, statusText: route.status_text, headers: mockHeaders(route) }), body: bodyStr };
+    }
+    // A mock's body text, null for a null-body status (the Response constructor throws if one
+    // carries a body).
+    function mockBody(route) {
+        var nullBody = route.status === 204 || route.status === 205 || route.status === 304;
+        return nullBody ? null : ((typeof route.body === 'string') ? route.body : PRISTINE_STRINGIFY(route.body));
+    }
+    function mockHeaders(route) {
+        var hdrs = OBJ_CREATE(null);
+        hdrs['content-type'] = route.content_type;
+        // Lower-cased: `Content-Type` next to the default `content-type` became a joined, doubled header.
+        for (var k in route.headers) { if (hasOwn(route.headers, k)) hdrs[REFLECT_APPLY(STR_TO_LOWER, k, [])] = route.headers[k]; }
+        return hdrs;
     }
     // The part of a response's Content-Type that Tauri's ipc-protocol.js switches on: the
     // header as `Headers` gives it (trimmed, repeated names joined with ", "), up to the first comma.
@@ -833,17 +1255,178 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     function recordRouteMatch(rule, url, method) {
         rule.triggered = (rule.triggered || 0) + 1;
-        appendCapped(routeMatchLog, {
+        var m = {
             rule_id: rule.id, action: rule.action, url: loggedUrl(url),
             method: (method || 'GET').toUpperCase(), timestamp: Date.now(),
             trigger_count: rule.triggered,
-        }, CAP_ROUTE_MATCHES);
+        };
+        appendCapped(routeMatchLog, m, CAP_ROUTE_MATCHES);
     }
 
-    function checkActionable(el) {
+    // `:disabled` covers a control inside `<fieldset disabled>`, which `el.disabled` does not (click
+    // is then a spec no-op that reported ok). `=== true` because a form's `disabled` can be a
+    // clobbering named control.
+    function isDisabledControl(el) {
+        if (el.disabled === true) return true;
+        try {
+            if (REFLECT_APPLY(EL_MATCHES, el, [':disabled'])) return true;
+            // A text query returns the deepest match, often a span inside the control. A fieldset
+            // is left out: plain content in a disabled fieldset is not a control.
+            return !!REFLECT_APPLY(EL_CLOSEST, el, ['button:disabled, select:disabled, optgroup:disabled, option:disabled']);
+        } catch (e) { return false; }
+    }
+    function isAriaDisabled(el) {
+        // aria-disabled applies to the element's descendants too.
+        try { return !!REFLECT_APPLY(EL_CLOSEST, el, ['[aria-disabled="true"]']); } catch (e) { return false; }
+    }
+    function isElEnabled(el) { return !isDisabledControl(el) && !isAriaDisabled(el); }
+    // A `<label>` (or something inside one) for `el`: clicking it operates `el`, as a user clicking
+    // a styled checkbox's label does.
+    function labelOperates(hit, el) {
+        for (var n = hit, g = 0; n && g < 16; n = n.parentNode, g++) {
+            if (n.tagName === 'LABEL') {
+                try { return n.control === el; } catch (e) { return false; }
+            }
+        }
+        return false;
+    }
+    function hitCovers(hit, el) {
+        return !!hit && hit !== el && !composedContains(el, hit) && !labelOperates(hit, el);
+    }
+    // Shapes whose box says nothing about what they paint at its centre: SVG, an inline element
+    // wrapped over several lines, and a box with no area around content laid out outside it.
+    function paintsOffCentre(el, rect) {
+        if (el.namespaceURI === 'http://www.w3.org/2000/svg') return true;
+        if (rect.width === 0 || rect.height === 0) return true;
+        var lines = typeof el.getClientRects === 'function' ? el.getClientRects() : null;
+        return !!lines && lines.length > 1;
+    }
+    // A control that a click on its content operates, whatever paints on top inside it (a
+    // `.stretched-link` or ripple `::after` is hit as the control).
+    function isOperableControl(el) {
+        var tag = el.tagName;
+        if (tag === 'BUTTON' || tag === 'SUMMARY' || (tag === 'A' && elAttr(el, 'href') !== null)) return true;
+        var role = elAttr(el, 'role');
+        return role === 'button' || role === 'link';
+    }
+    // `el` (or something inside it) is in the stack at the point, under whatever is on top. Hit
+    // testing honours clipping, so content clipped away below a control is not.
+    function stackHolds(el, x, y) {
+        var root = typeof el.getRootNode === 'function' ? el.getRootNode() : null;
+        if (!root || typeof root.elementsFromPoint !== 'function') return false;
+        var stack = root.elementsFromPoint(x, y);
+        for (var i = 0; i < stack.length; i++) {
+            if (composedContains(el, stack[i])) return true;
+        }
+        return false;
+    }
+    // The stack at the point is known and `el` is not in it: it is clipped there, not overlaid.
+    function stackOmits(el, x, y) {
+        var root = typeof el.getRootNode === 'function' ? el.getRootNode() : null;
+        return !!root && typeof root.elementsFromPoint === 'function' && !stackHolds(el, x, y);
+    }
+    // An OS click lands on a whole device pixel: the native side truncates x * devicePixelRatio, and
+    // the engine hit-tests the event at exactly that coordinate. So a strict point is moved to it
+    // BEFORE it is tested, or a 1 px stroke tests true at 70.8 and the click lands on 70, in empty
+    // space. A point inside the pixel will not do: SVG geometry is hit-tested to the fraction, and
+    // 213.25 was on a stroke that 213 missed. A hair above it only where the division would not
+    // survive the native multiply. A frame's fractional offset can still move it: the probe adds it.
+    function snapAxis(v, r) {
+        var px = Math.floor(v * r), at = px / r;
+        return Math.trunc(at * r) === px ? at : (px + 0.001) / r;
+    }
+    function snapToPixel(win, p) {
+        var r = win.devicePixelRatio > 0 ? win.devicePixelRatio : 1;
+        return { x: snapAxis(p.x, r), y: snapAxis(p.y, r) };
+    }
+    // The nearest control around `el`, across shadow boundaries.
+    function operableAncestor(el) {
+        for (var n = el.assignedSlot || el.parentNode || el.host, g = 0; n && g < 64; n = n.assignedSlot || n.parentNode || n.host, g++) {
+            if (n.nodeType === 1 && isOperableControl(n)) return n;
+        }
+        return null;
+    }
+    // Would a real click at the point reach `el`? Only the browser can say: `elementFromPoint`
+    // honours clipping, `clip-path`, pseudo-elements and z-order. `strict` is for an OS click,
+    // which lands on what is hit: it must be `el` or inside it.
+    function pointReaches(doc, el, x, y, strict) {
+        var hit = deepElementFromPoint(doc, x, y);
+        if (!hit) return false;
+        if (strict) return composedContains(el, hit);
+        if (!hitCovers(hit, el)) return true;
+        return composedContains(hit, el) && isOperableControl(hit) && stackHolds(el, x, y);
+    }
+    // Points along an SVG shape's outline in viewport coordinates (a stroke-only circle paints
+    // nothing else). `getScreenCTM` maps to the viewport of the element's own frame.
+    function outlinePoints(el, out) {
+        if (typeof el.getPointAtLength !== 'function' || typeof el.getScreenCTM !== 'function') return;
+        try {
+            var m = el.getScreenCTM(), len = el.getTotalLength();
+            if (!m || !(len > 0)) return;
+            for (var i = 0; i < 16; i++) {
+                var p = el.getPointAtLength(len * (i + 0.5) / 16);
+                out[out.length] = { x: m.a * p.x + m.c * p.y + m.e, y: m.b * p.x + m.d * p.y + m.f };
+            }
+        } catch (e) {}
+    }
+    function lineCentres(el, out) {
+        var lines = typeof el.getClientRects === 'function' ? el.getClientRects() : null;
+        if (!lines || lines.length < 2) return;
+        for (var i = 0; i < lines.length; i++) {
+            out[out.length] = { x: lines[i].left + lines[i].width / 2, y: lines[i].top + lines[i].height / 2 };
+        }
+    }
+    // Up to 32 descendants with a box, nearest first: what an empty inline box or a `<g>` paints.
+    function boxedDescendants(el) {
+        var found = [], queue = [el];
+        for (var q = 0; q < queue.length && found.length < 32 && queue.length < 512; q++) {
+            var kids = queue[q].children;
+            for (var k = 0; kids && k < kids.length; k++) {
+                var b = kids[k].getBoundingClientRect();
+                if (b.width > 0 || b.height > 0) found[found.length] = kids[k];
+                queue[queue.length] = kids[k];
+            }
+        }
+        return found;
+    }
+    function visibleCentre(rect, vw, vh) {
+        var left = Math.max(rect.left, 0), top = Math.max(rect.top, 0);
+        return { x: (left + Math.min(rect.right, vw)) / 2, y: (top + Math.min(rect.bottom, vh)) / 2 };
+    }
+    // The first real point of `el` that a click would reach: along its outline, the centre of every
+    // line box, a 5x5 grid over its box, what its descendants paint outside it, then the middle of
+    // what is inside the viewport (a sliver of a box hanging off the edge falls between the grid).
+    function sampledPoint(doc, win, el, rect, strict) {
+        var vw = win.innerWidth || doc.documentElement.clientWidth;
+        var vh = win.innerHeight || doc.documentElement.clientHeight;
+        var at = [];
+        outlinePoints(el, at);
+        lineCentres(el, at);
+        for (var row = 0; row < 5; row++) {
+            for (var col = 0; col < 5; col++) {
+                at[at.length] = { x: rect.left + rect.width * (col + 0.5) / 5, y: rect.top + rect.height * (row + 0.5) / 5 };
+            }
+        }
+        var kids = boxedDescendants(el);
+        for (var k = 0; k < kids.length; k++) {
+            outlinePoints(kids[k], at);
+            lineCentres(kids[k], at);
+            var b = kids[k].getBoundingClientRect();
+            at[at.length] = { x: b.left + b.width / 2, y: b.top + b.height / 2 };
+        }
+        at[at.length] = visibleCentre(rect, vw, vh);
+        for (var i = 0; i < at.length; i++) {
+            var p = strict ? snapToPixel(win, at[i]) : at[i];
+            if (p.x >= 0 && p.y >= 0 && p.x < vw && p.y < vh && pointReaches(doc, el, p.x, p.y, strict)) return p;
+        }
+        return null;
+    }
+    // Where a real click on `el` would reach it: `{x, y}` in its own frame's viewport (its centre
+    // when that works), or `{error, hint}`. `strict`: see `pointReaches`.
+    function hitPoint(el, strict) {
         if (!el || !el.isConnected) return { error: 'element is detached from DOM', hint: 'RETRY_LATER' };
-        if (el.disabled) return { error: 'element is disabled (disabled attribute)', hint: 'RETRY_LATER' };
-        if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return { error: 'element is disabled (aria-disabled)', hint: 'RETRY_LATER' };
+        if (isDisabledControl(el)) return { error: 'element is disabled (disabled attribute)', hint: 'RETRY_LATER' };
+        if (isAriaDisabled(el)) return { error: 'element is disabled (aria-disabled)', hint: 'RETRY_LATER' };
         // Use the element's OWN document/window so the viewport and occlusion
         // (elementFromPoint) checks are correct for elements inside same-origin
         // iframes — getBoundingClientRect() is relative to the element's own
@@ -853,10 +1436,19 @@ const INIT_SCRIPT_BODY: &str = r#"
         var cs = win.getComputedStyle(el);
         if (cs.display === 'none') return { error: 'element is not visible (display: none)', hint: 'RETRY_LATER' };
         if (cs.visibility === 'hidden') return { error: 'element is not visible (visibility: hidden)', hint: 'RETRY_LATER' };
-        if (parseFloat(cs.opacity) < 0.01) return { error: 'element is not visible (opacity: ' + cs.opacity + ')', hint: 'RETRY_LATER' };
+        // No opacity test: hit testing decides. An `opacity:0` input over a styled box is what a
+        // user clicks (the MUI / Ant / Chakra checkbox pattern).
         var rect = el.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return { error: 'element has zero size', hint: 'RETRY_LATER' };
-        if (cs.pointerEvents === 'none') return { error: 'element has pointer-events: none', hint: 'RETRY_LATER' };
+        // An empty `<a>` around an absolute or floated child has no box of its own, and is clickable.
+        if (rect.width === 0 && rect.height === 0 && !boxedDescendants(el).length) return { error: 'element has zero size', hint: 'RETRY_LATER' };
+        if (cs.pointerEvents === 'none') {
+            // An icon or label inside a button is commonly `pointer-events: none`, so clicks go to
+            // the button. A user clicking it operates the button, so the button is what must be
+            // reachable. An OS click lands on the button, never on `el`: strict stays refused.
+            var control = strict ? null : operableAncestor(el);
+            if (control && win.getComputedStyle(control).pointerEvents !== 'none') return hitPoint(control, false);
+            return { error: 'element has pointer-events: none', hint: 'RETRY_LATER' };
+        }
         var vw = win.innerWidth || doc.documentElement.clientWidth;
         var vh = win.innerHeight || doc.documentElement.clientHeight;
         if (rect.bottom < 0 || rect.top > vh || rect.right < 0 || rect.left > vw) {
@@ -872,17 +1464,55 @@ const INIT_SCRIPT_BODY: &str = r#"
         // shadow tree as its host, and `Node.contains` never crosses a shadow boundary, so every
         // element in a web component (Lit, Shoelace, Ionic, ...) read as "covered by <host>".
         var topEl = deepElementFromPoint(doc, cx, cy);
-        if (topEl && topEl !== el && !composedContains(el, topEl) && !composedContains(topEl, el)) {
-            var tag = topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
-            var info = tag;
-            if (topEl.id) info += '#' + topEl.id;
-            else if (topEl.className && typeof topEl.className === 'string') {
-                var cls = topEl.className.trim().split(/\s+/)[0];
-                if (cls) info += '.' + cls;
-            }
-            return { error: 'element is covered by ' + info + ' at (' + Math.round(cx) + ',' + Math.round(cy) + ')', hint: 'RETRY_LATER' };
+        // An ancestor at the point is either really on top, or `el` is scrolled out of a scroll
+        // container (the container is then what is hit). Something else on top, with `el` absent
+        // from the whole stack there, means `el` is clipped by a container and what is hit is what
+        // lies below that container. Scroll once before calling either covered. Present in the
+        // stack, it is overlaid, and scrolling would not help.
+        if (hitCovers(topEl, el) && typeof el.scrollIntoView === 'function'
+            && (composedContains(topEl, el) || stackOmits(el, cx, cy))) {
+            el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+            rect = el.getBoundingClientRect();
+            cx = rect.left + rect.width / 2;
+            cy = rect.top + rect.height / 2;
+            topEl = deepElementFromPoint(doc, cx, cy);
         }
-        return null;
+        // Nothing at all at a centre outside the viewport says nothing about what is inside it.
+        // Inside it, nothing at all means the engine has no layout to ask.
+        var outside = cx < 0 || cy < 0 || cx >= vw || cy >= vh;
+        var centre = strict ? snapToPixel(win, { x: cx, y: cy }) : { x: cx, y: cy };
+        if (strict ? pointReaches(doc, el, centre.x, centre.y, true) : ((!topEl && !outside) || pointReaches(doc, el, cx, cy, false))) {
+            return centre;
+        }
+        // The centre is not on `el`. Ask the browser about points that are. An ancestor at the
+        // centre says nothing (`el` may have a hole there, or be clipped to a corner), and neither
+        // does anything at the centre of a shape that does not paint it. A sibling at the centre of
+        // anything else is cover.
+        if (!topEl || composedContains(topEl, el) || paintsOffCentre(el, rect)
+            || (strict && pointReaches(doc, el, cx, cy, true))) {
+            var found = sampledPoint(doc, win, el, rect, strict);
+            if (found) return found;
+        }
+        // Name what is on the part a user can see, not a point outside the window.
+        if (!topEl && outside) {
+            var seen = visibleCentre(rect, vw, vh);
+            topEl = deepElementFromPoint(doc, seen.x, seen.y);
+            if (!topEl) return { error: 'element has no visible part a click can reach: its centre is outside the viewport', hint: 'RETRY_LATER' };
+            cx = seen.x;
+            cy = seen.y;
+        }
+        var tag = topEl && topEl.tagName ? topEl.tagName.toLowerCase() : 'unknown';
+        var info = tag;
+        if (topEl && topEl.id) info += '#' + topEl.id;
+        else if (topEl && topEl.className && typeof topEl.className === 'string') {
+            var cls = topEl.className.trim().split(/\s+/)[0];
+            if (cls) info += '.' + cls;
+        }
+        return { error: 'element is covered by ' + info + ' at (' + Math.round(cx) + ',' + Math.round(cy) + ')', hint: 'RETRY_LATER' };
+    }
+    function checkActionable(el) {
+        var point = hitPoint(el, false);
+        return point.error ? point : null;
     }
 
     function withAutoWait(refId, timeoutMs, actionFn) {
@@ -899,7 +1529,8 @@ const INIT_SCRIPT_BODY: &str = r#"
             function attemptInner() {
                 var el = resolveRef(refId);
                 if (!el) {
-                    if (Date.now() >= deadline) { resolve({ ok: false, error: 'ref not found: ' + refId, hint: 'CHECK_INPUT' }); return; }
+                    // A ref of another page load can never appear here: no point waiting.
+                    if (Date.now() >= deadline || isForeignRef(refId)) { resolve({ ok: false, error: refNotFound(refId), hint: 'CHECK_INPUT' }); return; }
                     setTimeout(attempt, 50); return;
                 }
                 var check = checkActionable(el);
@@ -930,7 +1561,17 @@ const INIT_SCRIPT_BODY: &str = r#"
     var OBJECT_PROTO = Object.prototype;
     var ARRAY_PROTO = Array.prototype;
     var hasOwn = Function.prototype.call.bind(Object.prototype.hasOwnProperty);
+    var ASSIGN = Object.assign;
+    // A prototype-less copy of an object's own fields. Log entries, rule specs and query objects
+    // are read field by field; on a plain object every ABSENT field falls through to
+    // `Object.prototype`, where page script can plant `mocked`, `transport`, `role`, ...
+    function nullProto(o) { return ASSIGN(OBJ_CREATE(null), o); }
+    function ownCopy(o) { return (o !== null && typeof o === 'object') ? nullProto(o) : OBJ_CREATE(null); }
     var SET_TIMEOUT = window.setTimeout.bind(window);
+    var CLEAR_TIMEOUT = window.clearTimeout.bind(window);
+    var DECODE_URI_COMPONENT = decodeURIComponent;
+    var REGEXP_CTOR = RegExp;
+    var REGEXP_TEST = RegExp.prototype.test;
     var REFLECT_APPLY = Reflect.apply;
     // The bridge's own logs (network/IPC, route rules, route matches) are appended, trimmed and
     // walked without calling an `Array.prototype` method page script can replace: a hook there
@@ -946,6 +1587,8 @@ const INIT_SCRIPT_BODY: &str = r#"
     var STR_INDEXOF = String.prototype.indexOf;
     var STR_SUBSTRING = String.prototype.substring;
     var STR_TO_LOWER = String.prototype.toLowerCase;
+    var STR_TRIM = String.prototype.trim;
+    var ARRAY_BUFFER_SLICE = ArrayBuffer.prototype.slice;
     // Native `Request` getters. They brand-check (throw for anything but a genuine Request), so
     // they tell a real Request apart from a look-alike object and read what fetch really uses —
     // an own `url` property planted on a Request instance cannot shadow them.
@@ -982,6 +1625,37 @@ const INIT_SCRIPT_BODY: &str = r#"
     var MAP_GET = Map.prototype.get;
     var MAP_SET = Map.prototype.set;
     var MAP_HAS = Map.prototype.has;
+    var MAP_DELETE = Map.prototype.delete;
+    var MAP_CLEAR = Map.prototype.clear;
+    var MAP_KEYS = Map.prototype.keys;
+    var MAP_FOREACH = Map.prototype.forEach;
+    var MAP_SIZE_GET = protoGetter(Map.prototype, 'size');
+    var WEAKMAP_GET = WeakMap.prototype.get;
+    var WEAKMAP_SET = WeakMap.prototype.set;
+    var WEAKREF_CTOR = typeof WeakRef === 'function' ? WeakRef : null;
+    var WEAKREF_DEREF = WEAKREF_CTOR ? WeakRef.prototype.deref : null;
+    // A form's named controls shadow its DOM API (`<input name=children>`, `name=getAttribute`), so
+    // the walkers read elements through the prototypes. Same-realm getters work on frame elements.
+    var EL_PROTO = typeof Element === 'function' ? Element.prototype : null;
+    var NODE_PROTO = typeof Node === 'function' ? Node.prototype : null;
+    var EL_GET_ATTR = EL_PROTO && EL_PROTO.getAttribute;
+    var EL_HAS_ATTR = EL_PROTO && EL_PROTO.hasAttribute;
+    var EL_MATCHES = EL_PROTO && EL_PROTO.matches;
+    var EL_CLOSEST = EL_PROTO && EL_PROTO.closest;
+    var EL_RECT = EL_PROTO && EL_PROTO.getBoundingClientRect;
+    var EL_CHILDREN_GET = EL_PROTO && protoGetter(EL_PROTO, 'children');
+    var EL_TAG_GET = EL_PROTO && protoGetter(EL_PROTO, 'tagName');
+    var EL_SHADOW_GET = EL_PROTO && protoGetter(EL_PROTO, 'shadowRoot');
+    var NODE_TYPE_GET = NODE_PROTO && protoGetter(NODE_PROTO, 'nodeType');
+    var NODE_CHILDNODES_GET = NODE_PROTO && protoGetter(NODE_PROTO, 'childNodes');
+    function elAttr(el, n) { return EL_GET_ATTR ? REFLECT_APPLY(EL_GET_ATTR, el, [n]) : el.getAttribute(n); }
+    function elHasAttr(el, n) { return EL_HAS_ATTR ? REFLECT_APPLY(EL_HAS_ATTR, el, [n]) : el.hasAttribute(n); }
+    function elRect(el) { return EL_RECT ? REFLECT_APPLY(EL_RECT, el, []) : el.getBoundingClientRect(); }
+    function elKids(el) { return EL_CHILDREN_GET ? REFLECT_APPLY(EL_CHILDREN_GET, el, []) : el.children; }
+    function elTag(el) { return EL_TAG_GET ? REFLECT_APPLY(EL_TAG_GET, el, []) : el.tagName; }
+    function elShadow(el) { return EL_SHADOW_GET ? REFLECT_APPLY(EL_SHADOW_GET, el, []) : el.shadowRoot; }
+    function nodeKind(n) { return NODE_TYPE_GET ? REFLECT_APPLY(NODE_TYPE_GET, n, []) : n.nodeType; }
+    function nodeKids(n) { return NODE_CHILDNODES_GET ? REFLECT_APPLY(NODE_CHILDNODES_GET, n, []) : n.childNodes; }
     var ARRAY_BUFFER_CTOR = typeof ArrayBuffer === 'function' ? ArrayBuffer : null;
     var IS_ARRAY_BUFFER_VIEW = (ARRAY_BUFFER_CTOR && typeof ArrayBuffer.isView === 'function') ? ArrayBuffer.isView : null;
     var HEADERS_GET = null;
@@ -1038,7 +1712,12 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (raw !== value && raw !== null && typeof raw === 'object' && hasUniversalToJSON(raw)) return raw;
         return value;
     }
-    function PRISTINE_STRINGIFY(v) { return NATIVE_STRINGIFY(v, neutralReplacer); }
+    // The replacer re-reads every property (`this[key]`), which ran each getter twice, so it is
+    // used only when one of the two prototypes actually owns a `toJSON`.
+    function PRISTINE_STRINGIFY(v) {
+        return (hasOwn(OBJECT_PROTO, 'toJSON') || hasOwn(ARRAY_PROTO, 'toJSON'))
+            ? NATIVE_STRINGIFY(v, neutralReplacer) : NATIVE_STRINGIFY(v);
+    }
 
     // A deep, detached copy of a JSON-shaped value (IPC args/results): the logs hand out copies
     // so page script cannot rewrite what was captured through a returned reference.
@@ -1064,11 +1743,12 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // ── Eval bookkeeping (closure-private) ──────────────────────────────────
     //
-    // The per-eval state used to live on a page-visible global (`window.__VIC_EVAL__`), so page
-    // script could enumerate pending eval ids and forge their results via the callback command,
-    // or suppress every result. It now lives in this closure, reachable only through the frozen,
-    // non-configurable `__VICTAURI__` methods below, which never reveal an id. Serialization uses
-    // `JSON.stringify` captured here, at init, before any page script can replace it.
+    // The per-eval state lives in this closure, reachable only through the frozen `__VICTAURI__`
+    // methods below, which never reveal an id, and serialization uses the `JSON.stringify`
+    // captured here at init. That keeps a buggy page from disturbing results. It does NOT stop a
+    // hostile page: eval code runs in the page's realm, and results leave through Tauri's `invoke`
+    // and so the page's `fetch` / `Headers`, which page script can wrap to read, rewrite or drop a
+    // result. Results and logs are evidence against a buggy page, not a hostile one.
     // Identity of THIS page load, reported with the ready signal and the liveness probe. An eval
     // is armed in one page; only a ready signal carrying a DIFFERENT nonce can be a reload that
     // killed it (a late ready from the same page, or one forged by page script, cannot).
@@ -1141,11 +1821,14 @@ const INIT_SCRIPT_BODY: &str = r#"
     // object — a page that breaks object serialization cannot also break the error report.
     function evalOutcomeBody(payload) {
         'use strict';
-        var type = payload && payload.__victauri_type;
+        // Own fields only: the error envelope has neither, and a planted
+        // `Object.prototype.__victauri_type` turned a thrown eval into a forged success.
+        var isObj = payload !== null && typeof payload === 'object';
+        var type = isObj && hasOwn(payload, '__victauri_type') ? payload.__victauri_type : undefined;
         if (type === 'value') {
             // The code RAN; a result JSON cannot carry (circular, BigInt, a function, a
             // throwing toJSON) is reported as exactly that, never as a JavaScript error.
-            var value = payload.__victauri_ok;
+            var value = hasOwn(payload, '__victauri_ok') ? payload.__victauri_ok : null;
             var json;
             try { json = PRISTINE_STRINGIFY(value); }
             catch (e) { return '{"__victauri_unserializable":' + jsonStringLiteral(errorText(e)) + '}'; }
@@ -1157,7 +1840,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (type === 'null' || type === 'undefined') {
             return '{"__victauri_ok":null,"__victauri_type":"' + type + '"}';
         }
-        if (payload && hasOwn(payload, '__victauri_err')) {
+        if (isObj && hasOwn(payload, '__victauri_err')) {
             return '{"__victauri_err":' + jsonStringLiteral(payload.__victauri_err) + '}';
         }
         return PRISTINE_STRINGIFY(payload);
@@ -1170,13 +1853,20 @@ const INIT_SCRIPT_BODY: &str = r#"
     // The copies are DEEP: an entry's nested objects (IPC request args, response bodies, route
     // headers) are cloned too, else page script rewrote a logged call's arguments or result
     // through the returned reference.
-    var ASSIGN = Object.assign;
+    // A plain array of the entries at or after `since`, picked by index (see appendCapped).
+    function entriesSince(arr, since) {
+        var out = [];
+        for (var i = 0; i < arr.length; i++) {
+            if (!since || arr[i].timestamp >= since) out[out.length] = arr[i];
+        }
+        return out;
+    }
     function copyEntries(arr) {
         var out = new Array(arr.length);
         for (var i = 0; i < arr.length; i++) {
             var e = arr[i];
             if (e && typeof e === 'object') {
-                var c = ASSIGN({}, e);
+                var c = nullProto(e);
                 for (var k in c) {
                     if (hasOwn(c, k) && c[k] !== null && typeof c[k] === 'object') c[k] = cloneJson(c[k]);
                 }
@@ -1192,12 +1882,12 @@ const INIT_SCRIPT_BODY: &str = r#"
     // (plain network traffic, or Victauri's own `plugin:victauri|*` plumbing).
     var IPC_LOG_VICTAURI_PREFIX = 'plugin%3Avictauri%7C';
     function safeDecode(raw) {
-        try { return decodeURIComponent(raw); } catch (e) { return raw; }
+        try { return DECODE_URI_COMPONENT(raw); } catch (e) { return raw; }
     }
     function ipcCallCommand(n) {
         var raw = ipcEntryPath(n);
-        if (raw === null || raw.indexOf(IPC_LOG_VICTAURI_PREFIX) === 0) return null;
-        try { return decodeURIComponent(raw); } catch (e) { return raw; }
+        if (raw === null || REFLECT_APPLY(STR_INDEXOF, raw, [IPC_LOG_VICTAURI_PREFIX]) === 0) return null;
+        return safeDecode(raw);
     }
     // The newest app IPC call in the network log (the live entry — never hand it out).
     function newestIpcCall() {
@@ -1206,6 +1896,18 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         return null;
     }
+    // Whether a call's `args` are not what was sent: a marker in their place (over the capture
+    // cap, encrypted), or a call that carried arguments which were not captured at all (a binary
+    // body, capture off), which would otherwise read as a call with no arguments.
+    function ipcArgsIncomplete(n) {
+        var a = n.request_args;
+        if (typeof a === 'string') {
+            return REFLECT_APPLY(STR_INDEXOF, a, ['[body omitted:']) === 0
+                || REFLECT_APPLY(STR_INDEXOF, a, ['[encrypted:']) === 0;
+        }
+        return (a === undefined || a === null) && n.arg_size_bytes > 0;
+    }
+
     // The `getIpcLog` view of one IPC network entry: a fresh object whose nested values are
     // deep copies, so the page cannot rewrite a logged call through it. Without `bodies`, the
     // request args and result are left out and the error text is capped.
@@ -1239,14 +1941,14 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
             if (!bodies && typeof errText === 'string') errText = truncText(errText, MAX_IPC_ERROR_TEXT);
         }
-        var e = {
+        var e = nullProto({
             id: n.id,
             command: ipcCallCommand(n),
             timestamp: n.timestamp,
             status: st,
             duration_ms: n.duration_ms,
             error: errText,
-        };
+        });
         // Only non-default transports are tagged (fetch is the default; no field = fetch).
         if (n.transport === 'post_message') e.transport = 'post_message';
         // Two different commands were serialized under this call's callback ids: page script
@@ -1264,6 +1966,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         if (typeof n.route_rule === 'number') e.route_rule = n.route_rule;
         if (bodies) {
             e.args = cloneJson(n.request_args) || {};
+            if (ipcArgsIncomplete(n)) e.args_truncated = true;
             // Nullish, not falsy: a command returning 0 / false / '' is a real result.
             e.result = (n.response_body === undefined || n.response_body === null) ? null : cloneJson(n.response_body);
         }
@@ -1291,14 +1994,16 @@ const INIT_SCRIPT_BODY: &str = r#"
     var drainSeqs = new WeakMap();
     var IPC_VICTAURI_PREFIX = 'plugin%3Avictauri%7C';
     function forEachStreamEvent(skipPending, emit) {
-        consoleLogs.forEach(function(l) {
+        // Indexed, not `.forEach`: a page hook on Array.prototype.forEach would get the live log
+        // (see appendCapped).
+        for (var ci = 0; ci < consoleLogs.length; ci++) {
+            var l = consoleLogs[ci];
             emit({ type: 'console', level: l.level, message: l.message, timestamp: l.timestamp }, l.timestamp, l);
-        });
-        mutationLog.forEach(function(m) {
-            emit({ type: 'dom_mutation', count: m.count, timestamp: m.timestamp }, m.timestamp, m);
-        });
-        // Indexed, not `networkLog.forEach`: a page hook on Array.prototype.forEach would get
-        // the live log (see appendCapped).
+        }
+        for (var mi = 0; mi < mutationLog.length; mi++) {
+            var mu = mutationLog[mi];
+            emit({ type: 'dom_mutation', count: mu.count, timestamp: mu.timestamp }, mu.timestamp, mu);
+        }
         for (var ni = 0; ni < networkLog.length; ni++) {
             var n = networkLog[ni];
             var isPending = n.status === 'pending';
@@ -1321,12 +2026,14 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (n.transport === 'post_message') iev.transport = 'post_message';
             emit(iev, key, n);
         }
-        navigationLog.forEach(function(n) {
-            emit({ type: 'navigation', url: n.url, nav_type: n.type, timestamp: n.timestamp }, n.timestamp, n);
-        });
-        interactionLog.forEach(function(i) {
-            emit({ type: 'dom_interaction', action: i.action, selector: i.selector, value: i.value, timestamp: i.timestamp }, i.timestamp, i);
-        });
+        for (var vi = 0; vi < navigationLog.length; vi++) {
+            var nv = navigationLog[vi];
+            emit({ type: 'navigation', url: nv.url, nav_type: nv.type, timestamp: nv.timestamp }, nv.timestamp, nv);
+        }
+        for (var ii = 0; ii < interactionLog.length; ii++) {
+            var ia = interactionLog[ii];
+            emit({ type: 'dom_interaction', action: ia.action, selector: ia.selector, value: ia.value, timestamp: ia.timestamp }, ia.timestamp, ia);
+        }
     }
 
     // ── Public API ───────────────────────────────────────────────────────────
@@ -1392,51 +2099,53 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── DOM ──────────────────────────────────────────────────────────────
 
         snapshot: function(format) {
-            var previousRefs = new Set(refMap.keys());
-            refMap.clear();
+            var previousRefs = [];
+            REFLECT_APPLY(MAP_FOREACH, refMap, [function(v, k) { previousRefs[previousRefs.length] = k; }]);
+            REFLECT_APPLY(MAP_CLEAR, refMap, []);
             var fmt = format || 'compact';
             var tree;
-            var currentRefs = new Set();
+            var currentRefs = OBJ_CREATE(null);
             buildingRefs = currentRefs;
             try {
                 if (fmt === 'json') {
-                    tree = walkDom(document.body);
+                    tree = walkDom(document.body, true);
                 } else {
-                    tree = walkDomCompact(document.body, 0);
+                    tree = walkDomCompact(document.body, 0, true);
                 }
             } finally {
                 buildingRefs = null;
             }
             var stale = [];
-            var staleSet = new Set();
+            var staleSet = OBJ_CREATE(null);
             function markStale(rid) {
-                if (!staleSet.has(rid)) { staleSet.add(rid); stale.push(rid); }
+                if (!staleSet[rid]) { staleSet[rid] = true; stale[stale.length] = rid; }
             }
-            previousRefs.forEach(function(refId) {
-                if (!currentRefs.has(refId)) {
-                    var weak = weakRefMap.get(refId);
+            for (var pi = 0; pi < previousRefs.length; pi++) {
+                var refId = previousRefs[pi];
+                if (!currentRefs[refId]) {
+                    var weak = REFLECT_APPLY(MAP_GET, weakRefMap, [refId]);
                     if (weak) {
-                        var el = weak.deref();
+                        var el = REFLECT_APPLY(WEAKREF_DEREF, weak, []);
                         if (!el || !el.isConnected) {
                             markStale(refId);
-                            weakRefMap.delete(refId);
+                            REFLECT_APPLY(MAP_DELETE, weakRefMap, [refId]);
                         }
                     } else {
                         markStale(refId);
                     }
                 }
-            });
+            }
             // Prune dead or detached entries so weakRefMap stays bounded by the
             // live DOM (refs of the snapshot just built are never pruned).
-            weakRefMap.forEach(function(weak, rid) {
-                if (currentRefs.has(rid)) return;
-                var el = weak.deref();
-                if (!el || !el.isConnected) {
-                    weakRefMap.delete(rid);
-                    refMap.delete(rid);
+            REFLECT_APPLY(MAP_FOREACH, weakRefMap, [function(w, rid) {
+                if (currentRefs[rid]) return;
+                var e2 = REFLECT_APPLY(WEAKREF_DEREF, w, []);
+                if (!e2 || !e2.isConnected) {
+                    REFLECT_APPLY(MAP_DELETE, weakRefMap, [rid]);
+                    REFLECT_APPLY(MAP_DELETE, refMap, [rid]);
                     markStale(rid);
                 }
-            });
+            }]);
             return { tree: tree, stale_refs: stale, format: fmt };
         },
 
@@ -1448,91 +2157,118 @@ const INIT_SCRIPT_BODY: &str = r#"
             return getStaleRefs();
         },
 
-        findElements: function(query) {
-            var results = [];
-            var maxResults = query.max_results || 10;
+        // The "from another page load" error for `refId`, or null when it is this page's ref.
+        foreignRefError: function(refId) {
+            return foreignRefError(refId);
+        },
 
-            if (query.css) {
+        // The page's text as a user reads it: rendered text (`innerText`) plus open shadow roots
+        // and same-origin frames; '' while the page has no body. What `wait_for text` searches.
+        getPageText: function() {
+            return pageText(document.body);
+        },
+
+        // Query keys (all optional): css, role, test_id, tag, name (accessible name), text
+        // (substring, case-insensitive), text_exact, exact, placeholder, alt, title_attr, label,
+        // attribute + attribute_value, enabled, include_hidden, max_results (default 10, 0-5000).
+        // Filters apply before the cap. Text matches the normalised full text and returns only the
+        // DEEPEST matches, so ancestors neither shadow the element nor consume `max_results`.
+        findElements: function(query) {
+            var q = ownCopy(query);
+            var results = [];
+            var maxResults = typeof q.max_results === 'number' ? Math.max(0, Math.min(q.max_results, 5000)) : 10;
+            var includeHidden = q.include_hidden === true;
+            // `exact` is the older spelling of text_exact.
+            var legacyExact = !!q.text && q.exact === true;
+            // Normalised like the text it is compared with (a blank needle stays as given: it must
+            // not become '', which every element contains).
+            var textNeedle = q.text && !legacyExact ? (normText('' + q.text) || ('' + q.text)).toLowerCase() : null;
+            var textExact = typeof q.text_exact === 'string' ? normText(q.text_exact)
+                : (legacyExact ? normText('' + q.text) : null);
+            var byText = textNeedle !== null || textExact !== null;
+
+            if (q.css) {
                 // Validate against a detached fragment, not document.body: while the page is
                 // reloading `body` is null, and the resulting TypeError used to be reported as
                 // "invalid CSS selector" for a perfectly valid selector.
-                try { document.createDocumentFragment().querySelector(query.css); } catch(e) {
-                    return { error: 'invalid CSS selector: ' + query.css + ' — ' + e.message };
+                try { document.createDocumentFragment().querySelector(q.css); } catch(e) {
+                    return { error: 'invalid CSS selector: ' + q.css + ' — ' + e.message };
                 }
+            }
+            if (q.attribute_value !== undefined && q.attribute_value !== null && !q.attribute) {
+                return { error: 'attribute_value needs attribute (the attribute name to compare)' };
             }
             if (!document.body) {
                 return { error: 'page not ready: the document has no body yet (it may be loading or reloading) — retry shortly' };
             }
+            if (maxResults === 0) return results;
 
             function matches(el) {
-                if (query.text) {
-                    var txt = (el.textContent || '').trim();
-                    if (query.exact) {
-                        if (txt !== query.text) return false;
-                    } else {
-                        if (txt.toLowerCase().indexOf(query.text.toLowerCase()) === -1) return false;
-                    }
+                var tag = elTag(el);
+                if (byText) {
+                    if (TEXTLESS_TAGS[tag] === true) return false;
+                    var txt = normText(nodeFullText(el));
+                    if (textExact !== null && txt !== textExact) return false;
+                    if (textNeedle !== null && txt.toLowerCase().indexOf(textNeedle) === -1) return false;
                 }
-                if (query.role) {
-                    var role = el.getAttribute('role') || inferRole(el);
-                    if (role !== query.role) return false;
+                if (q.role) {
+                    if ((elAttr(el, 'role') || inferRole(el)) !== q.role) return false;
                 }
-                if (query.test_id) {
-                    if (el.getAttribute('data-testid') !== query.test_id) return false;
+                if (q.test_id) {
+                    if (elAttr(el, 'data-testid') !== q.test_id) return false;
                 }
-                if (query.css) {
-                    if (!el.matches(query.css)) return false;
+                if (q.css) {
+                    if (!REFLECT_APPLY(EL_MATCHES, el, [q.css])) return false;
                 }
-                if (query.name) {
-                    var name = el.getAttribute('aria-label')
-                        || el.getAttribute('title')
-                        || el.getAttribute('placeholder') || '';
-                    if (name.toLowerCase().indexOf(query.name.toLowerCase()) === -1) return false;
+                if (q.attribute) {
+                    if (!elHasAttr(el, q.attribute)) return false;
+                    if (q.attribute_value !== undefined && q.attribute_value !== null
+                        && elAttr(el, q.attribute) !== '' + q.attribute_value) return false;
                 }
-                if (query.tag) {
-                    if (el.tagName.toLowerCase() !== query.tag.toLowerCase()) return false;
+                if (q.name) {
+                    if ((accessibleName(el) || '').toLowerCase().indexOf(q.name.toLowerCase()) === -1) return false;
                 }
-                if (query.placeholder) {
-                    if ((el.getAttribute('placeholder') || '').toLowerCase().indexOf(query.placeholder.toLowerCase()) === -1) return false;
+                if (q.tag) {
+                    if (tag.toLowerCase() !== q.tag.toLowerCase()) return false;
                 }
-                if (query.alt) {
-                    if ((el.getAttribute('alt') || '').toLowerCase().indexOf(query.alt.toLowerCase()) === -1) return false;
+                if (q.placeholder) {
+                    if ((elAttr(el, 'placeholder') || '').toLowerCase().indexOf(q.placeholder.toLowerCase()) === -1) return false;
                 }
-                if (query.title_attr) {
-                    if ((el.getAttribute('title') || '').toLowerCase().indexOf(query.title_attr.toLowerCase()) === -1) return false;
+                if (q.alt) {
+                    if ((elAttr(el, 'alt') || '').toLowerCase().indexOf(q.alt.toLowerCase()) === -1) return false;
                 }
-                if (query.enabled === true && el.disabled) return false;
-                if (query.enabled === false && !el.disabled) return false;
+                if (q.title_attr) {
+                    if ((elAttr(el, 'title') || '').toLowerCase().indexOf(q.title_attr.toLowerCase()) === -1) return false;
+                }
+                if (q.enabled === true && !isElEnabled(el)) return false;
+                if (q.enabled === false && isElEnabled(el)) return false;
                 return true;
             }
 
-            function buildResult(node, style) {
+            function buildResult(node, cssVisible) {
                 // registerRef reuses the node's existing id (if any).
                 var ref_id = registerRef(node);
-                var role = node.getAttribute('role') || inferRole(node);
-                var rect = node.getBoundingClientRect();
-                var vis = true;
-                if (style) {
-                    vis = style.display !== 'none' && style.visibility !== 'hidden';
-                }
+                var rect = elRect(node);
                 return {
                     ref_id: ref_id,
-                    tag: node.tagName.toLowerCase(),
-                    role: role,
-                    name: node.getAttribute('aria-label') || node.getAttribute('title') || null,
-                    text: truncText((node.textContent || '').trim(), 100),
+                    tag: elTag(node).toLowerCase(),
+                    role: elAttr(node, 'role') || inferRole(node),
+                    name: accessibleName(node),
+                    text: truncText(normText(nodeFullText(node)), 100),
                     bounds: { x: Math.round(rect.x), y: Math.round(rect.y), width: Math.round(rect.width), height: Math.round(rect.height) },
-                    visible: vis,
-                    enabled: !node.disabled,
+                    visible: cssVisible && (rect.width > 0 && rect.height > 0),
+                    enabled: isElEnabled(node),
                     value: isPasswordInput(node) ? '[REDACTED]' : safeValue(node)
                 };
             }
 
-            if (query.label) {
+            if (q.label) {
                 var labels = document.querySelectorAll('label');
+                var needle = ('' + q.label).toLowerCase();
+                var seen = [];
                 for (var li = 0; li < labels.length && results.length < maxResults; li++) {
                     var lbl = labels[li];
-                    if ((lbl.textContent || '').toLowerCase().indexOf(query.label.toLowerCase()) === -1) continue;
+                    if ((lbl.textContent || '').toLowerCase().indexOf(needle) === -1) continue;
                     var target = null;
                     var forAttr = lbl.getAttribute('for');
                     if (forAttr) {
@@ -1541,42 +2277,62 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (!target) {
                         target = lbl.querySelector('input, textarea, select');
                     }
-                    if (target) {
-                        var ts = window.getComputedStyle(target);
-                        results.push(buildResult(target, ts));
-                    }
+                    if (!target || !matches(target)) continue;
+                    // Two labels can name one control, and a hidden control is no match unless
+                    // asked for, as in every other query.
+                    var dup = false;
+                    for (var si = 0; si < seen.length; si++) { if (seen[si] === target) dup = true; }
+                    if (dup) continue;
+                    seen[seen.length] = target;
+                    var labelledShown = cssVisibleDeep(target);
+                    if (labelledShown || includeHidden) results[results.length] = buildResult(target, labelledShown);
                 }
                 return results;
             }
 
-            function search(node) {
-                if (results.length >= maxResults) return;
-                if (!node || node.nodeType !== 1) return;
+            // Returns whether this subtree holds a match. Text queries decide a node AFTER its
+            // subtree: a node containing a match is not itself one. Results stay in document order
+            // (deepest matches are disjoint, so post-order among them is document order).
+            function search(node, hiddenAbove) {
+                if (results.length >= maxResults) return true;
+                if (!node || nodeKind(node) !== 1) return false;
                 var style = window.getComputedStyle(node);
-                if (style.display === 'none' || style.visibility === 'hidden') return;
+                var noneHere = hiddenAbove || style.display === 'none';
+                if (noneHere && !includeHidden) return false;
+                var hiddenHere = style.visibility === 'hidden' || style.visibility === 'collapse';
+                var shown = !noneHere && !hiddenHere;
+                var eligible = shown || includeHidden;
 
-                if (matches(node)) {
-                    results.push(buildResult(node, style));
+                if (!byText && eligible && matches(node)) {
+                    results[results.length] = buildResult(node, shown);
                 }
-
-                for (var c = 0; c < node.children.length; c++) {
-                    search(node.children[c]);
+                var found = false;
+                var kids = elKids(node);
+                for (var c = 0; c < kids.length; c++) {
+                    if (search(kids[c], noneHere)) found = true;
                 }
-                if (node.shadowRoot) {
-                    for (var s = 0; s < node.shadowRoot.children.length; s++) {
-                        search(node.shadowRoot.children[s]);
+                var sr = elShadow(node);
+                if (sr) {
+                    for (var s = 0; s < sr.children.length; s++) {
+                        if (search(sr.children[s], noneHere)) found = true;
                     }
                 }
                 // Same-origin iframe traversal.
-                if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+                var tn = elTag(node);
+                if (tn === 'IFRAME' || tn === 'FRAME') {
                     try {
                         var idoc = node.contentDocument;
-                        if (idoc && idoc.body) search(idoc.body);
+                        if (idoc && idoc.body && search(idoc.body, noneHere)) found = true;
                     } catch (e) { /* cross-origin: skip */ }
                 }
+                if (byText && !found && eligible && results.length < maxResults && matches(node)) {
+                    results[results.length] = buildResult(node, shown);
+                    found = true;
+                }
+                return found;
             }
 
-            search(document.body);
+            search(document.body, false);
             return results;
         },
 
@@ -1584,89 +2340,118 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         click: function(refId, timeoutMs) {
             return withAutoWait(refId, timeoutMs, function(el) {
-                el.click();
+                // A click at a point lands on what is hit there. On a wrapper over an `opacity:0`
+                // input the hit is the input, and `wrapper.click()` would report ok and toggle nothing.
+                activate(hitDescendant(el) || el);
                 return { ok: true };
             });
         },
 
         doubleClick: function(refId, timeoutMs) {
             return withAutoWait(refId, timeoutMs, function(el) {
-                el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, composed: true }));
                 return { ok: true };
             });
         },
 
         hover: function(refId, timeoutMs) {
             return withAutoWait(refId, timeoutMs, function(el) {
-                el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
-                el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+                el.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, composed: true }));
+                el.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, composed: true }));
                 return { ok: true };
             });
         },
 
         fill: function(refId, value, timeoutMs) {
             return withAutoWait(refId, timeoutMs, function(el) {
-                if (!el.matches('input, textarea, [contenteditable="true"]')) {
-                    return { ok: false, error: 'element is not fillable (not input, textarea, or contenteditable): ' + (el.tagName || '').toLowerCase(), hint: 'CHECK_INPUT' };
-                }
-                if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') {
-                    // contenteditable: there is no `value` — the HTMLInputElement
-                    // value setter would throw "Illegal invocation" here.
-                    el.textContent = value;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                var refused = refuseEdit(el);
+                if (refused) return refused;
+                var text = '' + value;
+                var win = el.ownerDocument.defaultView || window;
+                if (editKind(el) === 'contenteditable') {
+                    el.textContent = text;
+                    el.dispatchEvent(new win.Event('input', { bubbles: true, composed: true }));
                     return { ok: true };
                 }
-                var proto = el instanceof HTMLTextAreaElement
-                    ? HTMLTextAreaElement.prototype
-                    : HTMLInputElement.prototype;
-                var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                if (desc && desc.set) {
-                    desc.set.call(el, value);
-                } else {
-                    el.value = value;
-                }
-                el.dispatchEvent(new Event('input', { bubbles: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true }));
+                var set = valueSetter(el);
+                var before = el.value;
+                set(text);
+                var rejected = sanitizerRejection(el, text);
+                if (rejected) { set(before); return rejected; }
+                el.dispatchEvent(new win.Event('input', { bubbles: true, composed: true }));
+                el.dispatchEvent(new win.Event('change', { bubbles: true }));
                 return { ok: true };
             });
         },
 
         type: function(refId, text, timeoutMs) {
+            text = '' + text;
+            // Each character re-sets the whole value and runs the page's handlers, so the cost is
+            // quadratic: 100 KB froze the page for 7 s, 1 MB for over 10 minutes.
+            if (text.length > MAX_TYPE_CHARS) {
+                return Promise.resolve({ ok: false, error: 'text too long for type (' + text.length + ' chars, limit ' + MAX_TYPE_CHARS + '): use fill', hint: 'CHECK_INPUT' });
+            }
             return withAutoWait(refId, timeoutMs, function(el) {
+                var refused = refuseEdit(el);
+                if (refused) return refused;
+                var win = el.ownerDocument.defaultView || window;
+                var kind = editKind(el);
                 el.focus();
-                var proto = el instanceof HTMLTextAreaElement
-                    ? HTMLTextAreaElement.prototype
-                    : HTMLInputElement.prototype;
-                var desc = Object.getOwnPropertyDescriptor(proto, 'value');
-                for (var i = 0; i < text.length; i++) {
-                    var ch = text[i];
-                    el.dispatchEvent(new KeyboardEvent('keydown', { key: ch, bubbles: true }));
-                    el.dispatchEvent(new KeyboardEvent('keypress', { key: ch, bubbles: true }));
-                    var current = el.value || '';
-                    if (desc && desc.set) {
-                        desc.set.call(el, current + ch);
-                    } else {
-                        el.value = current + ch;
+                function keys(ch, type) { el.dispatchEvent(new win.KeyboardEvent(type, keyInit(ch, null))); }
+                function inputEvent(data) { el.dispatchEvent(new win.InputEvent('input', { bubbles: true, composed: true, data: data, inputType: 'insertText' })); }
+                var i, ch;
+                if (kind === 'sanitized') {
+                    // The browser clears a value that is invalid so far (`-`, `2026-`), so these
+                    // types get their whole value once. Only a number extends what is there.
+                    var before = el.value;
+                    for (i = 0; i < text.length; i += ch.length) {
+                        ch = charAtPoint(text, i);
+                        keys(ch, 'keydown'); keys(ch, 'keypress'); keys(ch, 'keyup');
                     }
-                    el.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
-                    el.dispatchEvent(new KeyboardEvent('keyup', { key: ch, bubbles: true }));
+                    var set = valueSetter(el);
+                    var full = (inputType(el) === 'number' ? before : '') + text;
+                    set(full);
+                    var rejected = sanitizerRejection(el, full);
+                    if (rejected) { set(before); return rejected; }
+                    inputEvent(text);
+                } else if (kind === 'contenteditable') {
+                    var tn = el.ownerDocument.createTextNode('');
+                    el.appendChild(tn);
+                    for (i = 0; i < text.length; i += ch.length) {
+                        ch = charAtPoint(text, i);
+                        keys(ch, 'keydown'); keys(ch, 'keypress');
+                        tn.data += ch;
+                        inputEvent(ch);
+                        keys(ch, 'keyup');
+                    }
+                    return { ok: true };
+                } else {
+                    var setText = valueSetter(el);
+                    for (i = 0; i < text.length; i += ch.length) {
+                        ch = charAtPoint(text, i);
+                        keys(ch, 'keydown'); keys(ch, 'keypress');
+                        // Reads the live value, as real typing extends what the app left there.
+                        setText((el.value || '') + ch);
+                        inputEvent(ch);
+                        keys(ch, 'keyup');
+                    }
                 }
-                el.dispatchEvent(new Event('change', { bubbles: true }));
+                el.dispatchEvent(new win.Event('change', { bubbles: true }));
                 return { ok: true };
             });
         },
 
         pressKey: function(key) {
-            var target = document.activeElement || document.body;
-            var parts = key.split('+');
-            if (parts.length === 1 || (parts.length === 2 && parts[0] === '' && parts[1] === '')) {
-                var k = parts.length === 1 ? key : '+';
-                target.dispatchEvent(new KeyboardEvent('keydown', { key: k, bubbles: true }));
-                target.dispatchEvent(new KeyboardEvent('keyup', { key: k, bubbles: true }));
-                return { ok: true };
-            }
-            var finalKey = parts.pop();
+            var target = deepActiveElement();
             var mods = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
+            var finalKey = key;
+            if (key.length > 1 && key.charAt(key.length - 1) === '+') {
+                // `Control++`: the key is `+`, and splitting on `+` would lose it.
+                finalKey = '+';
+                key = key.substring(0, key.length - 2);
+            }
+            var parts = key === '+' ? [] : key.split('+');
+            if (finalKey !== '+') finalKey = parts.pop();
             for (var m = 0; m < parts.length; m++) {
                 var mod = parts[m];
                 if (mod === 'Control' || mod === 'Ctrl') mods.ctrlKey = true;
@@ -1675,17 +2460,17 @@ const INIT_SCRIPT_BODY: &str = r#"
                 else if (mod === 'Meta' || mod === 'Command' || mod === 'Cmd') mods.metaKey = true;
             }
             var modKeys = [];
-            if (mods.ctrlKey) modKeys.push('Control');
-            if (mods.shiftKey) modKeys.push('Shift');
-            if (mods.altKey) modKeys.push('Alt');
-            if (mods.metaKey) modKeys.push('Meta');
+            if (mods.ctrlKey) modKeys[modKeys.length] = 'Control';
+            if (mods.shiftKey) modKeys[modKeys.length] = 'Shift';
+            if (mods.altKey) modKeys[modKeys.length] = 'Alt';
+            if (mods.metaKey) modKeys[modKeys.length] = 'Meta';
             for (var i = 0; i < modKeys.length; i++) {
-                target.dispatchEvent(new KeyboardEvent('keydown', { key: modKeys[i], bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
+                target.dispatchEvent(new KeyboardEvent('keydown', keyInit(modKeys[i], mods)));
             }
-            target.dispatchEvent(new KeyboardEvent('keydown', { key: finalKey, bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
-            target.dispatchEvent(new KeyboardEvent('keyup', { key: finalKey, bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
+            target.dispatchEvent(new KeyboardEvent('keydown', keyInit(finalKey, mods)));
+            target.dispatchEvent(new KeyboardEvent('keyup', keyInit(finalKey, mods)));
             for (var j = modKeys.length - 1; j >= 0; j--) {
-                target.dispatchEvent(new KeyboardEvent('keyup', { key: modKeys[j], bubbles: true, ctrlKey: mods.ctrlKey, shiftKey: mods.shiftKey, altKey: mods.altKey, metaKey: mods.metaKey }));
+                target.dispatchEvent(new KeyboardEvent('keyup', keyInit(modKeys[j], mods)));
             }
             return { ok: true };
         },
@@ -1695,11 +2480,37 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (el.tagName !== 'SELECT') {
                     return { ok: false, error: 'element is not a <select>', hint: 'CHECK_INPUT' };
                 }
-                var valSet = new Set(values);
-                for (var i = 0; i < el.options.length; i++) {
-                    el.options[i].selected = valSet.has(el.options[i].value);
+                // No values is how a `<select multiple>` is cleared; a single select always has one.
+                if ((!values || !values.length) && !el.multiple) {
+                    return { ok: false, error: 'select_option needs at least one value', hint: 'CHECK_INPUT' };
                 }
-                el.dispatchEvent(new Event('change', { bubbles: true }));
+                values = values || [];
+                // Checked before anything changes: assigning a value no option has resets the
+                // select to its first option, and a disabled option is not one a user can choose.
+                var wanted = OBJ_CREATE(null);
+                var v;
+                for (v = 0; v < values.length; v++) wanted['' + values[v]] = false;
+                var i, opt;
+                for (i = 0; i < el.options.length; i++) {
+                    opt = el.options[i];
+                    if (!(opt.value in wanted)) continue;
+                    wanted[opt.value] = true;
+                    if (opt.disabled || (opt.parentNode && opt.parentNode.tagName === 'OPTGROUP' && opt.parentNode.disabled)) {
+                        return { ok: false, error: 'option is disabled: ' + opt.value, hint: 'CHECK_INPUT' };
+                    }
+                }
+                for (v = 0; v < values.length; v++) {
+                    if (wanted['' + values[v]] !== true) {
+                        return { ok: false, error: 'no option with value: ' + values[v], hint: 'CHECK_INPUT' };
+                    }
+                }
+                for (i = 0; i < el.options.length; i++) {
+                    opt = el.options[i];
+                    opt.selected = (opt.value in wanted);
+                }
+                var win = el.ownerDocument.defaultView || window;
+                el.dispatchEvent(new win.Event('input', { bubbles: true, composed: true }));
+                el.dispatchEvent(new win.Event('change', { bubbles: true }));
                 return { ok: true };
             });
         },
@@ -1732,15 +2543,16 @@ const INIT_SCRIPT_BODY: &str = r#"
         // copying every retained body (up to 1000 x 64 KB) and then discarding most of it
         // froze the UI thread for ~1 s on every read (R5-JS1).
         getIpcLog: function(limit, opts) {
-            var bodies = !(opts && opts.bodies === false);
+            opts = ownCopy(opts);
+            var bodies = opts.bodies !== false;
             // `backend_only`: leave out calls a `route` rule answered or blocked in the page —
             // the backend never saw them, so they are no evidence about its handlers.
             // `unrouted`: also leave out calls a `route` rule delayed (their duration includes
             // the injected delay). Analysis (ghosts, catalog, coverage, timings) uses these.
-            var unrouted = !!(opts && opts.unrouted === true);
-            var backendOnly = unrouted || !!(opts && opts.backend_only === true);
+            var unrouted = opts.unrouted === true;
+            var backendOnly = unrouted || opts.backend_only === true;
             var idSet = null;
-            if (opts && opts.ids) {
+            if (opts.ids) {
                 idSet = OBJ_CREATE(null);
                 for (var j = 0; j < opts.ids.length; j++) idSet['' + opts.ids[j]] = true;
             }
@@ -1789,13 +2601,13 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── Console ──────────────────────────────────────────────────────────
 
         getConsoleLogs: function(since) {
-            return copyEntries(since ? consoleLogs.filter(function(l) { return l.timestamp >= since; }) : consoleLogs);
+            return copyEntries(entriesSince(consoleLogs, since));
         },
 
         // ── Mutations ────────────────────────────────────────────────────────
 
         getMutationLog: function(since) {
-            return copyEntries(since ? mutationLog.filter(function(m) { return m.timestamp >= since; }) : mutationLog);
+            return copyEntries(entriesSince(mutationLog, since));
         },
 
         // ── Network ──────────────────────────────────────────────────────────
@@ -1814,10 +2626,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                 for (var ti = log.length - limit; ti < log.length; ti++) tail[tail.length] = log[ti];
                 log = tail;
             }
-            var noBodies = !!(opts && opts.bodies === false);
+            var noBodies = ownCopy(opts).bodies === false;
             var out = new Array(log.length);
             for (var i = 0; i < log.length; i++) {
-                var c = ASSIGN({}, log[i]);
+                var c = nullProto(log[i]);
                 // Tauri's callback ids stay internal: handing them to page script let it
                 // re-plant a completed call's ids (red team F1).
                 delete c.ipc_callback;
@@ -1830,67 +2642,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             return copyEntries(out);
         },
 
-        // ── Network routing (interception / mock / block / delay) ──────────────
-        // Add a route rule. `rule` is an object: { pattern, match_type, method,
-        // action ('block'|'fulfill'|'delay'), status, status_text, headers,
-        // body, content_type, delay_ms, times }. Returns the assigned id.
-        addRoute: function(rule) {
-            // The captured parse, not the page's: page script could rewrite every rule the agent adds.
-            if (typeof rule === 'string') { try { rule = PRISTINE_PARSE(rule); } catch (e) { return { ok: false, error: 'invalid rule JSON' }; } }
-            if (!rule || !rule.pattern) return { ok: false, error: 'route rule requires a pattern' };
-            if ((rule.action || 'fulfill') === 'fulfill' && typeof rule.status === 'number'
-                && (rule.status !== Math.floor(rule.status) || rule.status < 200 || rule.status > 599)) {
-                return { ok: false, error: 'fulfill status must be an integer in 200-599 (a Response cannot carry ' + rule.status + ')' };
-            }
-            var r = {
-                id: ++routeCounter,
-                pattern: String(rule.pattern),
-                match_type: rule.match_type || 'substring',
-                method: rule.method || null,
-                action: rule.action || 'fulfill',
-                status: typeof rule.status === 'number' ? rule.status : 200,
-                status_text: rule.status_text || '',
-                headers: rule.headers || {},
-                body: (rule.body === undefined || rule.body === null) ? '' : rule.body,
-                content_type: rule.content_type || 'application/json',
-                delay_ms: clampTimerDelay(rule.delay_ms),
-                times: typeof rule.times === 'number' ? rule.times : 0,
-                triggered: 0,
-            };
-            if (r.action === 'fulfill' && canBuildResponses()) {
-                // Build the mock once now: one the Response constructor rejects (an invalid
-                // header name or value, a status text that is not a ByteString) would make every
-                // matching fetch reject — and an IPC fetch that rejects is retried FOR REAL.
-                try { buildMockResponse(r); } catch (e) {
-                    --routeCounter;
-                    return { ok: false, error: 'this fulfill rule\'s mock response cannot be built: ' + e };
-                }
-            }
-            var hitsIpc = routeMatchesIpc(r);
-            var unparsable = r.action === 'fulfill' ? ipcMockUnparsable(r) : null;
-            if (unparsable && hitsIpc) {
-                --routeCounter;
-                return { ok: false, error: 'this fulfill rule matches Tauri IPC URLs, but ' + unparsable
-                    + ' Tauri would then treat the IPC fetch as failed, run the REAL command over'
-                    + ' postMessage, and keep the page on postMessage IPC until it reloads. Give a JSON'
-                    + ' body (e.g. "\\"text\\"" or an object), use content_type "text/plain", or narrow'
-                    + ' the pattern so it does not match Tauri IPC URLs (http(s)://ipc.localhost, ipc://localhost).' };
-            }
-            routeRules[routeRules.length] = r; // not .push (see appendCapped)
-            // A copy: the stored rule was validated, and page script must not edit it afterwards.
-            var out = { ok: true, id: r.id, rule: cloneJson(r) };
-            if (hitsIpc) out.ipc_note = routeIpcNote(r);
-            // A command-specific pattern that does not name the IPC host (`greet`, `*/greet`)
-            // can still match a Tauri IPC URL. Such a call never gets this mock (Tauri would run
-            // the real command over postMessage): it gets an error from Victauri instead.
-            else if (unparsable) {
-                out.ipc_warning = 'If this rule matches a Tauri IPC call, Tauri could not read the mock: '
-                    + unparsable + ' Such a call is answered with a Tauri error from Victauri instead'
-                    + ' (logged `mock_unreadable`), so the real command does not run.';
-            }
-            return out;
-        },
-
+        // ── Network routing (rules are added through the agent-only `addRoute`) ──
         getRouteRules: function() { return copyEntries(routeRules); },
 
         getRouteMatches: function(limit) {
@@ -1900,8 +2652,8 @@ const INIT_SCRIPT_BODY: &str = r#"
             return copyEntries(picked);
         },
 
-        // Agent-only operations (clear logs / route rules, dialog auto-responses, animation
-        // scrub / sweep recorder) are NOT on
+        // Agent-only operations (add / clear route rules, clear logs, dialog auto-responses,
+        // animation scrub / sweep recorder) are NOT on
         // this page-visible object: page script could otherwise silently remove the agent's
         // block/mock rules, erase captured evidence, or flip dialog auto-answers. They are
         // handed out only for the per-process key Victauri embeds in its own injected scripts.
@@ -1989,6 +2741,11 @@ const INIT_SCRIPT_BODY: &str = r#"
             return { ok: true };
         },
 
+        // Where a real click on this element would land (the trusted click probe's point).
+        hitPoint: function(el, strict) {
+            return hitPoint(el, strict === true);
+        },
+
         // ── Dialogs ──────────────────────────────────────────────────────────
 
         getDialogLog: function() {
@@ -2029,10 +2786,10 @@ const INIT_SCRIPT_BODY: &str = r#"
             var floor = (after === 0 && typeof floorMs === 'number') ? floorMs : 0;
             var events = [];
             forEachStreamEvent(true, function(ev, key, entry) {
-                var seq = drainSeqs.get(entry);
+                var seq = REFLECT_APPLY(WEAKMAP_GET, drainSeqs, [entry]);
                 if (seq === undefined) {
                     seq = ++drainSeq;
-                    drainSeqs.set(entry, seq);
+                    REFLECT_APPLY(WEAKMAP_SET, drainSeqs, [entry, seq]);
                 }
                 if (seq <= after) return;
                 if (floor > 0 && !(key > floor)) return;
@@ -2045,34 +2802,42 @@ const INIT_SCRIPT_BODY: &str = r#"
         // ── Wait ─────────────────────────────────────────────────────────────
 
         waitFor: function(opts) {
+            opts = ownCopy(opts);
             return new Promise(function(resolve) {
                 // 0 is a real timeout (a single immediate check), not "use the default".
                 var timeout = typeof opts.timeout_ms === 'number' && opts.timeout_ms >= 0 ? opts.timeout_ms : 10000;
                 var poll = opts.poll_ms || 200;
                 var start = Date.now();
 
-                function check() {
-                    function getFullText(root) {
-                        // ShadowRoot has no innerText — fall back to textContent.
-                        var text = (typeof root.innerText === 'string' ? root.innerText : root.textContent) || '';
-                        var els = root.querySelectorAll('*');
-                        for (var j = 0; j < els.length; j++) {
-                            if (els[j].shadowRoot) text += ' ' + getFullText(els[j].shadowRoot);
-                        }
-                        return text;
+                // A selector that can never match is a mistake in the call, not a wait to sit out.
+                if ((opts.condition === 'selector' || opts.condition === 'selector_gone') && opts.value) {
+                    try { document.createDocumentFragment().querySelector(opts.value); } catch (e) {
+                        resolve({ ok: false, error: 'invalid CSS selector: ' + opts.value + ' — ' + e.message, hint: 'CHECK_INPUT', elapsed_ms: 0 });
+                        return;
                     }
+                }
+
+                function checkInner() {
                     var met = false;
+                    // A page with no body yet (mid navigation) has not lost the text or the
+                    // element: nothing can be said until it has one.
                     if (opts.condition === 'text' && opts.value) {
-                        met = getFullText(document.body).indexOf(opts.value) !== -1;
+                        met = !!document.body && pageText(document.body).indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'text_gone' && opts.value) {
-                        met = getFullText(document.body).indexOf(opts.value) === -1;
+                        met = !!document.body && pageText(document.body).indexOf(opts.value) === -1;
                     } else if (opts.condition === 'selector' && opts.value) {
                         met = !!document.querySelector(opts.value);
                     } else if (opts.condition === 'selector_gone' && opts.value) {
-                        met = !document.querySelector(opts.value);
+                        met = !!document.body && !document.querySelector(opts.value);
                     } else if (opts.condition === 'url' && opts.value) {
                         met = window.location.href.indexOf(opts.value) !== -1;
                     } else if (opts.condition === 'ipc_idle') {
+                        // Blind to the traffic, "no call is pending" would be true of anything.
+                        var capture = ipcCaptureStatus();
+                        if (capture.capture === 'none') {
+                            resolve({ ok: false, error: 'ipc_idle cannot be judged: ' + capture.note, ipc_capture: 'none', elapsed_ms: Date.now() - start });
+                            return;
+                        }
                         met = true;
                         for (var wi = 0; wi < networkLog.length; wi++) {
                             if (isIpcEntry(networkLog[wi]) && networkLog[wi].status === 'pending') { met = false; break; }
@@ -2095,6 +2860,12 @@ const INIT_SCRIPT_BODY: &str = r#"
                         setTimeout(check, Math.min(poll, timeout - elapsed));
                     }
                 }
+                // Later checks run in a bare timer: a throw there (an invalid selector) would leave
+                // the promise unsettled until the eval timeout.
+                function check() {
+                    try { checkInner(); }
+                    catch (e) { resolve({ ok: false, error: 'wait_for check failed: ' + (e && e.message), elapsed_ms: Date.now() - start }); }
+                }
                 check();
             });
         },
@@ -2102,7 +2873,7 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         getStyles: function(refId, properties) {
             var el = resolveRef(refId);
-            if (!el) return { error: 'ref not found: ' + refId };
+            if (!el) return { error: refNotFound(refId) };
             var computed = window.getComputedStyle(el);
             var result = {};
             if (properties && properties.length > 0) {
@@ -2140,7 +2911,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             var results = [];
             for (var i = 0; i < refIds.length; i++) {
                 var el = resolveRef(refIds[i]);
-                if (!el) { results.push({ ref_id: refIds[i], error: 'ref not found' }); continue; }
+                if (!el) { results.push({ ref_id: refIds[i], error: foreignRefError(refIds[i]) || 'ref not found' }); continue; }
                 var rect = el.getBoundingClientRect();
                 var computed = window.getComputedStyle(el);
                 results.push({
@@ -2177,7 +2948,7 @@ const INIT_SCRIPT_BODY: &str = r#"
 
         highlightElement: function(refId, color, label) {
             var el = resolveRef(refId);
-            if (!el) return { error: 'ref not found: ' + refId };
+            if (!el) return { error: refNotFound(refId) };
             var c = color || 'rgba(255, 0, 0, 0.3)';
             var overlay = document.createElement('div');
             overlay.className = '__victauri_highlight__';
@@ -2247,8 +3018,12 @@ const INIT_SCRIPT_BODY: &str = r#"
             for (var i = 0; i < inputs.length; i++) {
                 var inp = inputs[i];
                 if (inp.type === 'hidden') continue;
-                var hasLabel = false;
-                if (inp.id) {
+                // A button-like input is named by its value (an image button by its alt).
+                if ((inp.type === 'submit' || inp.type === 'button' || inp.type === 'reset') && inp.value) continue;
+                if (inp.type === 'image' && inp.getAttribute('alt')) continue;
+                // `labels` covers a wrapping <label> as well as `for`.
+                var hasLabel = !!inp.labels && inp.labels.length > 0;
+                if (!hasLabel && inp.id) {
                     try { hasLabel = !!document.querySelector('label[for=\"' + CSS.escape(inp.id) + '\"]'); }
                     catch(e) { /* malformed id — skip */ }
                 }
@@ -2283,7 +3058,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var link = links[i];
                 var text = (link.textContent || '').trim();
                 var ariaLabel = link.getAttribute('aria-label');
-                if (!text && !ariaLabel && !link.title) {
+                if (!text && !ariaLabel && !link.title && !link.querySelector('img[alt], svg[aria-label]')) {
                     violations.push({ rule: 'link-name', severity: 'serious', element: describeEl(link),
                         message: 'Link has no accessible text' });
                 }
@@ -2477,7 +3252,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             // DOM stats
             result.dom = {
                 elements: document.querySelectorAll('*').length,
-                max_depth: (function() { var d = 0; var walk = function(el, depth) { if (depth > d) d = depth; for (var i = 0; i < el.children.length && i < 5; i++) walk(el.children[i], depth + 1); }; walk(document.body, 0); return d; })(),
+                max_depth: (function() { var d = 0; var walk = function(el, depth) { if (depth > d) d = depth; for (var i = 0; i < el.children.length && i < 5; i++) walk(el.children[i], depth + 1); }; if (document.body) walk(document.body, 0); return d; })(),
                 event_listeners: listenerCount,
             };
 
@@ -2650,6 +3425,89 @@ const INIT_SCRIPT_BODY: &str = r#"
     var scrubState = null;
     var sweepState = null;
 
+    // Seeking a paused animation through its delay, its iterations or its end fires the page's own
+    // animation events (a toast removes itself, a route transition completes) for what is only a
+    // scrub. This capture listener is the bridge's, so it runs before any the page adds, and stops
+    // those events until two frames after the restore: events are dispatched in the frame after the
+    // seek. Only the events of the animations being held: the same name or property on the target,
+    // not on a pseudo-element. An end when one has really finished passes: a seek stops short of the
+    // end and leaves it paused, so that is its natural end, unless the restore finished it again
+    // because it had already ended for the page. So does a cancel, which a seek cannot cause.
+    //
+    // What this cannot tell apart: an animation added in the same task as the prepare loses its
+    // `animationstart`, an iteration or start crossed in the two frames after a resume is stopped
+    // with the rest, and an end queued just before the prepare reads as already ended.
+    var SCRUB_EVENTS = ['animationstart', 'animationend', 'animationiteration', 'animationcancel',
+        'transitionrun', 'transitionstart', 'transitionend', 'transitioncancel'];
+    var scrubQuiet = [];
+    function scrubCaused(hold, e) {
+        if (e.pseudoElement) return false;
+        var transition = REFLECT_APPLY(STR_INDEXOF, e.type, ['transition']) === 0;
+        var ended = e.type === 'animationend' || e.type === 'transitionend';
+        var cancelled = e.type === 'animationcancel' || e.type === 'transitioncancel';
+        for (var i = 0; i < hold.anims.length; i++) {
+            var a = hold.anims[i];
+            if (transition ? a.transitionProperty !== e.propertyName : a.animationName !== e.animationName) continue;
+            if (ended && a.playState === 'finished' && hold.saved[i].state !== 'finished') return false;
+            if (cancelled && a.playState === 'idle') return false;
+            return true;
+        }
+        return false;
+    }
+    function quietScrubEvent(e) {
+        if (!scrubQuiet.length || e.isTrusted !== true) return;
+        for (var i = 0; i < scrubQuiet.length; i++) {
+            if (scrubQuiet[i].el === e.target && scrubCaused(scrubQuiet[i], e)) { e.stopImmediatePropagation(); return; }
+        }
+    }
+    function listenForScrubEvents(target) {
+        for (var i = 0; i < SCRUB_EVENTS.length; i++) target.addEventListener(SCRUB_EVENTS[i], quietScrubEvent, true);
+    }
+    listenForScrubEvents(window);
+    // These events are not composed: from inside a shadow tree they never reach the window. Two
+    // holds can share a root (the next scrub starts inside the last one's release), so it is counted.
+    var scrubRoots = [];
+    function holdScrubEvents(el, anims, saved) {
+        var hold = { el: el, root: null, anims: anims, saved: saved, finish_handlers: [] };
+        var root = typeof el.getRootNode === 'function' ? el.getRootNode() : null;
+        if (root && root !== el.ownerDocument && root.host) {
+            hold.root = root;
+            var known = null;
+            for (var i = 0; i < scrubRoots.length; i++) { if (scrubRoots[i].root === root) known = scrubRoots[i]; }
+            if (known) known.holds++;
+            else {
+                scrubRoots[scrubRoots.length] = { root: root, holds: 1 };
+                listenForScrubEvents(root);
+            }
+        }
+        scrubQuiet[scrubQuiet.length] = hold;
+        return hold;
+    }
+    function releaseScrubEvents(hold) {
+        var released = false;
+        function release() {
+            if (released) return;
+            released = true;
+            for (var i = 0; i < scrubQuiet.length; i++) {
+                if (scrubQuiet[i] === hold) { removeAt(scrubQuiet, i); break; }
+            }
+            for (var h = 0; h < hold.finish_handlers.length; h++) {
+                var quiet = hold.finish_handlers[h];
+                if (quiet.anim.onfinish === null) quiet.anim.onfinish = quiet.handler;
+            }
+            if (!hold.root) return;
+            for (var r = 0; r < scrubRoots.length; r++) {
+                if (scrubRoots[r].root !== hold.root || --scrubRoots[r].holds > 0) continue;
+                removeAt(scrubRoots, r);
+                for (var k = 0; k < SCRUB_EVENTS.length; k++) hold.root.removeEventListener(SCRUB_EVENTS[k], quietScrubEvent, true);
+                break;
+            }
+        }
+        requestAnimationFrame(function() { requestAnimationFrame(release); });
+        // rAF does not fire in a hidden or minimized window.
+        SET_TIMEOUT(release, 1000);
+    }
+
     // See `_agent`: reachable only with the per-process agent key. Built in a STRICT function so
     // every op — and every callback an op creates — is strict: a page hook on a built-in an op
     // calls then cannot reach the op through `.caller` (and call it without the key), nor the
@@ -2667,6 +3525,92 @@ const INIT_SCRIPT_BODY: &str = r#"
     AGENT_OPS.clearConsoleLogs = function() { consoleLogs.length = 0; return { ok: true }; };
     AGENT_OPS.clearMutationLog = function() { mutationLog.length = 0; return { ok: true }; };
     AGENT_OPS.clearDialogLog = function() { dialogLog.length = 0; return { ok: true }; };
+    // Add a route rule. `rule` is an object: { pattern, match_type, method,
+    // action ('block'|'fulfill'|'delay'), status, status_text, headers,
+    // body, content_type, delay_ms, times }. Returns the assigned id.
+    AGENT_OPS.addRoute = function(rule) {
+        // The captured parse, not the page's: page script could rewrite every rule the agent adds.
+        if (typeof rule === 'string') { try { rule = PRISTINE_PARSE(rule); } catch (e) { return { ok: false, error: 'invalid rule JSON' }; } }
+        rule = ownCopy(rule);
+        if (!rule.pattern) return { ok: false, error: 'route rule requires a pattern' };
+        var matchType = rule.match_type || 'substring';
+        if (matchType !== 'substring' && matchType !== 'exact' && matchType !== 'regex' && matchType !== 'glob') {
+            return { ok: false, error: 'unknown match_type: ' + matchType };
+        }
+        var action = rule.action || 'fulfill';
+        if (action !== 'fulfill' && action !== 'block' && action !== 'delay') {
+            return { ok: false, error: 'unknown route action: ' + action };
+        }
+        // An invalid regex would otherwise be stored and silently never match.
+        if (matchType === 'regex') {
+            try { new REGEXP_CTOR('' + rule.pattern); } catch (e) {
+                return { ok: false, error: 'invalid regex pattern: ' + e.message };
+            }
+            var hangs;
+            try { hangs = regexHangRisk('' + rule.pattern); } catch (e) { hangs = 'this pattern'; }
+            if (hangs) {
+                return { ok: false, error: 'regex pattern can hang the page: ' + hangs + ' repeats a group'
+                    + ' that can match the same text in more than one way, and JavaScript has no regex timeout.'
+                    + ' Make each repetition match in one way only (a separator it cannot take itself, as in'
+                    + ' (/\\w+)+, or no inner quantifier), or use match_type glob or substring.' };
+            }
+        }
+        if (rule.headers !== undefined && rule.headers !== null
+            && (typeof rule.headers !== 'object' || Array.isArray(rule.headers))) {
+            return { ok: false, error: 'route rule headers must be an object' };
+        }
+        if ((rule.action || 'fulfill') === 'fulfill' && typeof rule.status === 'number'
+            && (rule.status !== Math.floor(rule.status) || rule.status < 200 || rule.status > 599)) {
+            return { ok: false, error: 'fulfill status must be an integer in 200-599 (a Response cannot carry ' + rule.status + ')' };
+        }
+        var r = {
+            id: ++routeCounter,
+            pattern: '' + rule.pattern,
+            match_type: rule.match_type || 'substring',
+            method: rule.method || null,
+            action: rule.action || 'fulfill',
+            status: typeof rule.status === 'number' ? rule.status : 200,
+            status_text: rule.status_text || '',
+            headers: rule.headers || {},
+            body: (rule.body === undefined || rule.body === null) ? '' : rule.body,
+            content_type: rule.content_type || 'application/json',
+            delay_ms: clampTimerDelay(rule.delay_ms),
+            times: typeof rule.times === 'number' ? rule.times : 0,
+            triggered: 0,
+        };
+        if (r.action === 'fulfill' && canBuildResponses()) {
+            // Build the mock once now: one the Response constructor rejects (an invalid
+            // header name or value, a status text that is not a ByteString) would make every
+            // matching fetch reject — and an IPC fetch that rejects is retried FOR REAL.
+            try { buildMockResponse(r); } catch (e) {
+                --routeCounter;
+                return { ok: false, error: 'this fulfill rule\'s mock response cannot be built: ' + e };
+            }
+        }
+        var hitsIpc = routeMatchesIpc(r);
+        var unparsable = r.action === 'fulfill' ? ipcMockUnparsable(r) : null;
+        if (unparsable && hitsIpc) {
+            --routeCounter;
+            return { ok: false, error: 'this fulfill rule matches Tauri IPC URLs, but ' + unparsable
+                + ' Tauri would then treat the IPC fetch as failed, run the REAL command over'
+                + ' postMessage, and keep the page on postMessage IPC until it reloads. Give a JSON'
+                + ' body (e.g. "\\"text\\"" or an object), use content_type "text/plain", or narrow'
+                + ' the pattern so it does not match Tauri IPC URLs (http(s)://ipc.localhost, ipc://localhost).' };
+        }
+        routeRules[routeRules.length] = r; // not .push (see appendCapped)
+        // A copy: the stored rule was validated, and page script must not edit it afterwards.
+        var out = { ok: true, id: r.id, rule: cloneJson(r) };
+        if (hitsIpc) out.ipc_note = routeIpcNote(r);
+        // A command-specific pattern that does not name the IPC host (`greet`, `*/greet`)
+        // can still match a Tauri IPC URL. Such a call never gets this mock (Tauri would run
+        // the real command over postMessage): it gets an error from Victauri instead.
+        else if (unparsable) {
+            out.ipc_warning = 'If this rule matches a Tauri IPC call, Tauri could not read the mock: '
+                + unparsable + ' Such a call is answered with a Tauri error from Victauri instead'
+                + ' (logged `mock_unreadable`), so the real command does not run.';
+        }
+        return out;
+    };
     AGENT_OPS.clearRoute = function(id) {
         var before = routeRules.length;
         var kept = [];
@@ -2687,6 +3631,30 @@ const INIT_SCRIPT_BODY: &str = r#"
     // `installSweepRecorder` superseded the agent's armed recorder, `readSweep(true)` erased what
     // it had recorded, and `scrubPrepare` / `scrubSeek` / `scrubRestore` paused, moved and
     // resumed the page's animations under the agent. `listAnimations` stays public (read-only).
+    //
+    // Back to the recorded time and state. A bare `play()` after seeking to the end rewinds and
+    // REPLAYS the animation, and starts one the app had paused. Finishing one again queues its
+    // `finish` event once more, and there is no way to finish it without: `onfinish` is kept off
+    // until the event has gone, but a listener added with `addEventListener('finish')` hears it.
+    function restoreScrub(S, resume) {
+        if (resume) {
+            S.anims.forEach(function(a, i) {
+                try {
+                    var was = S.saved[i];
+                    if (was.time !== null) a.currentTime = was.time;
+                    if (was.state === 'running') a.play();
+                    else if (was.state === 'finished') {
+                        if (a.onfinish) {
+                            S.hold.finish_handlers[S.hold.finish_handlers.length] = { anim: a, handler: a.onfinish };
+                            a.onfinish = null;
+                        }
+                        a.finish();
+                    }
+                } catch (e) {}
+            });
+        }
+        releaseScrubEvents(S.hold);
+    }
     ASSIGN(AGENT_OPS, {
         // ── Deterministic animation scrubbing ────────────────────────────────
         // Pause the target's WAAPI animations and hold state across calls so the
@@ -2718,8 +3686,15 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
             var ends = anims.map(function(a) { return a.effect.getComputedTiming().endTime; });
             var duration = Math.max.apply(null, ends);
+            // A scrub replaced without a restore gets one: its target goes back to the page, as it
+            // was. First, or a second prepare of one target records the first one's pause as the
+            // state to put back.
+            if (scrubState) { restoreScrub(scrubState, true); scrubState = null; }
+            // What restore must put back. Read before pausing, or every animation reads paused.
+            var saved = anims.map(function(a) { return { time: a.currentTime, state: a.playState }; });
+            var hold = holdScrubEvents(el, anims, saved);
             anims.forEach(function(a) { try { a.pause(); } catch (e) {} });
-            scrubState = { el: el, anims: anims, ends: ends, duration: duration };
+            scrubState = { el: el, anims: anims, ends: ends, saved: saved, duration: duration, hold: hold };
             return Promise.all(anims.map(function(a) { return a.ready.catch(function(){}); }))
                 .then(function() {
                     var b = el.getBoundingClientRect();
@@ -2735,12 +3710,16 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (!S) return Promise.resolve({ error: 'not prepared — scrubPrepare first' });
             var t = progress * S.duration;
             for (var i = 0; i < S.anims.length; i++) {
-                try { S.anims[i].currentTime = Math.max(0, Math.min(t, S.ends[i])); } catch (e) {}
+                // Just short of the end: reaching it enters the "after" phase, which fires the app's
+                // `animationend` (toast removal, route transitions) for a scrub.
+                try { S.anims[i].currentTime = Math.max(0, Math.min(t, S.ends[i] - 0.01)); } catch (e) {}
             }
             return Promise.all(S.anims.map(function(a) { return a.ready.catch(function(){}); }))
                 .then(function() {
                     return new Promise(function(res) {
                         requestAnimationFrame(function() { requestAnimationFrame(res); });
+                        // rAF does not fire in a hidden or minimized window.
+                        SET_TIMEOUT(res, 250);
                     });
                 })
                 .then(function() {
@@ -2767,7 +3746,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         scrubRestore: function(resume) {
             var S = scrubState;
             if (!S) return { restored: false };
-            S.anims.forEach(function(a) { try { if (resume) a.play(); } catch (e) {} });
+            restoreScrub(S, resume);
             scrubState = null;
             return { restored: true, resumed: !!resume };
         },
@@ -2782,6 +3761,13 @@ const INIT_SCRIPT_BODY: &str = r#"
             // for SWEEP_IDLE_STOP_MS, so an armed-and-forgotten recorder does not
             // run getComputedStyle every frame for the life of the page.
             var SWEEP_IDLE_STOP_MS = 60000;
+            // A bad selector would throw in every frame: the first throw killed the loop, reported
+            // as an app `[uncaught]` error, with the recorder still claiming to be armed.
+            if (selector) {
+                try { document.querySelector(selector); } catch (e) {
+                    return { error: 'invalid selector: ' + selector + ' — ' + (e && e.message) };
+                }
+            }
             var R = (sweepState = { sel: selector || null,
                 sessions: [], cur: null, touched: performance.now(), stopped: false,
                 idle_stop_ms: SWEEP_IDLE_STOP_MS });
@@ -2806,7 +3792,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             };
             var tick = function() {
                 // Stop if a newer recorder superseded this one.
-                if (sweepState !== R) return;
+                if (sweepState !== R || R.disarmed) return;
                 if (performance.now() - R.touched > SWEEP_IDLE_STOP_MS) {
                     if (R.cur) {
                         R.sessions.push(R.cur);
@@ -2847,6 +3833,20 @@ const INIT_SCRIPT_BODY: &str = r#"
             return { installed: true, selector: R.sel };
         },
 
+        // Stop an armed recorder; what it captured stays readable.
+        disarmSweep: function() {
+            var R = sweepState;
+            if (!R || R.stopped) return { disarmed: false };
+            if (R.cur) {
+                R.sessions.push(R.cur);
+                if (R.sessions.length > 10) R.sessions.shift();
+                R.cur = null;
+            }
+            R.stopped = true;
+            R.disarmed = true;
+            return { disarmed: true };
+        },
+
         readSweep: function(clear) {
             var R = sweepState;
             if (!R) {
@@ -2879,7 +3879,9 @@ const INIT_SCRIPT_BODY: &str = r#"
             if (clear) R.sessions = [];
             var res = { armed: !R.stopped, selector: R.sel, recording_active: active,
                      session_count: out.length, sessions: out };
-            if (R.stopped) {
+            if (R.disarmed) {
+                res.note = 'recorder disarmed; re-arm with record=true to record again';
+            } else if (R.stopped) {
                 res.note = 'recorder stopped after ' + (R.idle_stop_ms / 1000) + 's with no arm/read — '
                     + 'sessions captured before that are above; re-arm with record=true to record again';
             }
@@ -2929,8 +3931,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         var ltObserver = new PerformanceObserver(function(list) {
             var entries = list.getEntries();
             for (var i = 0; i < entries.length; i++) {
-                longTasks.push({ duration: entries[i].duration, startTime: entries[i].startTime });
-                if (longTasks.length > CAP_LONG_TASKS) longTasks.shift();
+                appendCapped(longTasks, { duration: entries[i].duration, startTime: entries[i].startTime }, CAP_LONG_TASKS);
             }
         });
         ltObserver.observe({ type: 'longtask', buffered: true });
@@ -2953,67 +3954,73 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     // ── DOM Walking ──────────────────────────────────────────────────────────
 
-    function walkDom(node) {
-        if (!node || node.nodeType !== 1) return null;
-
+    function walkDom(node, isRoot) {
+        var out = [];
+        walkDomInto(node, out, isRoot === true);
+        return out.length ? out[0] : null;
+    }
+    // Appends the element for `node` to `out`. A `visibility:hidden` element is skipped but its
+    // children are not: CSS lets them be `visibility:visible`, and they are then what a user sees.
+    // How many `opacity:0` elements enclose the node being walked: opacity does not inherit, so a
+    // child's own computed style reads 1 while nothing of it is rendered.
+    var transparentDepth = 0;
+    function walkDomInto(node, out, isRoot) {
+        if (!node || nodeKind(node) !== 1) return;
         var style = window.getComputedStyle(node);
-        var visible = style.display !== 'none'
-            && style.visibility !== 'hidden'
-            && style.opacity !== '0';
+        var zero = style.opacity === '0';
+        if (zero) transparentDepth++;
+        try { walkStyledInto(node, out, isRoot, style); }
+        finally { if (zero) transparentDepth--; }
+    }
+    function walkStyledInto(node, out, isRoot, style) {
+        if (style.display === 'none') return;
+        var hidden = style.visibility === 'hidden';
 
-        if (!visible) return null;
+        if (hidden && !isRoot) {
+            walkChildrenInto(node, out);
+            return;
+        }
 
         var ref_id = registerRef(node);
 
-        var rect = node.getBoundingClientRect();
-        var role = node.getAttribute('role') || inferRole(node);
-        var name = node.getAttribute('aria-label')
-            || node.getAttribute('title')
-            || node.getAttribute('placeholder')
-            || (node.tagName === 'BUTTON' ? truncText(node.textContent.trim(), 80) : null)
-            || (node.tagName === 'A' ? truncText(node.textContent.trim(), 80) : null);
+        var rect = elRect(node);
+        var tagName = elTag(node);
+        var role = elAttr(node, 'role') || inferRole(node);
+        var name = accessibleName(node);
 
         var element = {
             ref_id: ref_id,
-            tag: node.tagName.toLowerCase(),
+            tag: tagName.toLowerCase(),
             role: role,
             name: name,
             text: getDirectText(node),
             value: isPasswordInput(node) ? '[REDACTED]' : safeValue(node),
-            enabled: !node.disabled,
-            visible: true,
-            focusable: node.tabIndex >= 0 || ['INPUT','BUTTON','SELECT','TEXTAREA','A'].indexOf(node.tagName) !== -1,
+            enabled: isElEnabled(node),
+            visible: !hidden,
+            focusable: node.tabIndex >= 0 || ['INPUT','BUTTON','SELECT','TEXTAREA','A'].indexOf(tagName) !== -1,
             bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
             children: [],
             attributes: {}
         };
+        // Rendered fully transparent, but still what a click at that point hits.
+        if (transparentDepth > 0) element.transparent = true;
 
         var interestingAttrs = ['data-testid', 'id', 'type', 'href', 'src', 'checked', 'selected'];
         for (var a = 0; a < interestingAttrs.length; a++) {
-            if (node.hasAttribute(interestingAttrs[a])) {
-                element.attributes[interestingAttrs[a]] = node.getAttribute(interestingAttrs[a]);
+            if (elHasAttr(node, interestingAttrs[a])) {
+                element.attributes[interestingAttrs[a]] = elAttr(node, interestingAttrs[a]);
             }
         }
 
-        for (var c = 0; c < node.children.length; c++) {
-            var childEl = walkDom(node.children[c]);
-            if (childEl) element.children.push(childEl);
-        }
-
-        if (node.shadowRoot) {
-            for (var s = 0; s < node.shadowRoot.children.length; s++) {
-                var shadowChild = walkDom(node.shadowRoot.children[s]);
-                if (shadowChild) element.children.push(shadowChild);
-            }
-        }
+        walkChildrenInto(node, element.children);
 
         // Same-origin iframe traversal: descend into accessible frame documents.
         // Cross-origin frames throw on contentDocument access — mark and skip.
-        if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+        if (tagName === 'IFRAME' || tagName === 'FRAME') {
             try {
                 var idoc = node.contentDocument;
                 if (idoc && idoc.body) {
-                    var frameChild = walkDom(idoc.body);
+                    var frameChild = walkDom(idoc.body, true);
                     if (frameChild) {
                         frameChild.frame = true;
                         element.children.push(frameChild);
@@ -3026,7 +4033,15 @@ const INIT_SCRIPT_BODY: &str = r#"
             }
         }
 
-        return element;
+        out.push(element);
+    }
+    function walkChildrenInto(node, out) {
+        var kids = elKids(node);
+        for (var c = 0; c < kids.length; c++) walkDomInto(kids[c], out, false);
+        var sr = elShadow(node);
+        if (sr) {
+            for (var s = 0; s < sr.children.length; s++) walkDomInto(sr.children[s], out, false);
+        }
     }
 
     // An element's `.value` for a snapshot: a string (or null). `.value` is not always a string
@@ -3042,12 +4057,12 @@ const INIT_SCRIPT_BODY: &str = r#"
     }
 
     function isPasswordInput(node) {
-        return node.tagName === 'INPUT' && (node.getAttribute('type') || '').toLowerCase() === 'password';
+        return elTag(node) === 'INPUT' && (elAttr(node, 'type') || '').toLowerCase() === 'password';
     }
 
     // A page-derived string for the compact tree, always as a quoted JSON string. U+2028 /
     // U+2029 / U+0085 are escaped too: JSON leaves them raw, and a reader may treat them as a
-    // line break (and so as the start of a forged `[eN] …` line).
+    // line break (and so as the start of a forged `[<ref>] …` line).
     function compactStr(v) {
         return PRISTINE_STRINGIFY('' + v)
             .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029').replace(/\u0085/g, '\\u0085');
@@ -3066,31 +4081,31 @@ const INIT_SCRIPT_BODY: &str = r#"
     // attribute is free text) would let page markup inject a forged line or fields.
     var COMPACT_WORD_RE = /^[a-z][a-z0-9-]*$/;
 
-    function walkDomCompact(node, depth) {
-        if (!node || node.nodeType !== 1) return '';
-
+    function walkDomCompact(node, depth, isRoot) {
+        if (!node || nodeKind(node) !== 1) return '';
         var style = window.getComputedStyle(node);
-        var visible = style.display !== 'none'
-            && style.visibility !== 'hidden'
-            && style.opacity !== '0';
-
-        if (!visible) return '';
+        var zero = style.opacity === '0';
+        if (zero) transparentDepth++;
+        try { return walkStyledCompact(node, depth, isRoot, style); }
+        finally { if (zero) transparentDepth--; }
+    }
+    function walkStyledCompact(node, depth, isRoot, style) {
+        if (style.display === 'none') return '';
+        // See walkDomInto: a hidden element is not listed, its visible children are.
+        if (style.visibility === 'hidden' && isRoot !== true) return compactChildren(node, depth);
 
         var ref_id = registerRef(node);
         var indent = '';
         for (var d = 0; d < depth; d++) indent += '  ';
 
-        var role = node.getAttribute('role') || inferRole(node);
-        var name = node.getAttribute('aria-label')
-            || node.getAttribute('title')
-            || node.getAttribute('placeholder')
-            || '';
+        var role = elAttr(node, 'role') || inferRole(node);
+        var name = accessibleName(node) || '';
         var text = getDirectText(node) || '';
-        var tag = node.tagName.toLowerCase();
+        var tag = elTag(node).toLowerCase();
 
         // Grammar, one line per element (every page-derived field is a bare plain token or a
         // JSON string, so markup cannot forge a line or a field):
-        //   [eN] <head> [role=<json>] [<json name/text>] [[disabled]] [value=<json>]
+        //   [<ref>] <head> [role=<json>] [<json name/text>] [[disabled]] [[transparent]] [value=<json>]
         //        [@<attr>] [type=<attr>] [href=<attr>]
         var line = indent + '[' + ref_id + '] ';
 
@@ -3106,7 +4121,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
 
         // Page-derived strings are JSON-encoded: written raw, a newline in rendered text (an
-        // RSS title, a chat message) forged whole `[eN] button "…"` lines in this tree and could
+        // RSS title, a chat message) forged whole `[<ref>] button "…"` lines in this tree and could
         // steer an agent's click onto a different element.
         if (name) {
             line += ' ' + compactStr(truncText(name, 60));
@@ -3116,40 +4131,33 @@ const INIT_SCRIPT_BODY: &str = r#"
             line += ' ' + compactStr(truncText(text, 57) + '...');
         }
 
-        if (node.disabled) line += ' [disabled]';
+        if (!isElEnabled(node)) line += ' [disabled]';
+        if (transparentDepth > 0) line += ' [transparent]';
         var value = safeValue(node);
         if (value !== null) {
             line += ' value=' + compactStr(isPasswordInput(node) ? '[REDACTED]' : truncText(value, 40));
         }
 
-        var testId = node.getAttribute('data-testid');
+        var testId = elAttr(node, 'data-testid');
         if (testId) line += ' @' + compactAttr(testId);
 
-        var type = node.getAttribute('type');
+        var type = elAttr(node, 'type');
         if (type && tag === 'input') line += ' type=' + compactAttr(type);
 
-        var href = node.getAttribute('href');
+        var href = elAttr(node, 'href');
         if (href && tag === 'a') line += ' href=' + compactAttr(truncText(href, 60));
 
         var result = line + '\n';
 
-        for (var c = 0; c < node.children.length; c++) {
-            result += walkDomCompact(node.children[c], depth + 1);
-        }
-
-        if (node.shadowRoot) {
-            for (var s = 0; s < node.shadowRoot.children.length; s++) {
-                result += walkDomCompact(node.shadowRoot.children[s], depth + 1);
-            }
-        }
+        result += compactChildren(node, depth + 1);
 
         // Same-origin iframe traversal (see walkDom for rationale).
-        if (node.tagName === 'IFRAME' || node.tagName === 'FRAME') {
+        if (tag === 'iframe' || tag === 'frame') {
             try {
                 var idoc = node.contentDocument;
                 if (idoc && idoc.body) {
                     result += indent + '  ⤷ iframe content:\n';
-                    result += walkDomCompact(idoc.body, depth + 2);
+                    result += walkDomCompact(idoc.body, depth + 2, true);
                 } else {
                     result += indent + '  ⤷ [cross-origin iframe]\n';
                 }
@@ -3161,8 +4169,19 @@ const INIT_SCRIPT_BODY: &str = r#"
         return result;
     }
 
+    function compactChildren(node, depth) {
+        var result = '';
+        var kids = elKids(node);
+        for (var c = 0; c < kids.length; c++) result += walkDomCompact(kids[c], depth);
+        var sr = elShadow(node);
+        if (sr) {
+            for (var s = 0; s < sr.children.length; s++) result += walkDomCompact(sr.children[s], depth);
+        }
+        return result;
+    }
+
     function inferRole(node) {
-        var tag = node.tagName;
+        var tag = elTag(node);
         var roles = {
             'BUTTON': 'button', 'A': 'link', 'INPUT': 'textbox',
             'SELECT': 'combobox', 'TEXTAREA': 'textbox', 'IMG': 'img',
@@ -3174,7 +4193,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             'TABLE': 'table', 'FORM': 'form', 'DIALOG': 'dialog',
         };
         if (tag === 'INPUT') {
-            var type = node.getAttribute('type');
+            var type = elAttr(node, 'type');
             if (type === 'checkbox') return 'checkbox';
             if (type === 'radio') return 'radio';
             if (type === 'range') return 'slider';
@@ -3185,11 +4204,212 @@ const INIT_SCRIPT_BODY: &str = r#"
 
     function getDirectText(node) {
         var text = '';
-        for (var i = 0; i < node.childNodes.length; i++) {
-            if (node.childNodes[i].nodeType === 3) text += node.childNodes[i].textContent;
+        var kids = nodeKids(node);
+        for (var i = 0; i < kids.length; i++) {
+            if (kids[i].nodeType === 3) text += kids[i].nodeValue;
         }
         text = text.trim();
         return text.length > 0 ? truncText(text, 200) : null;
+    }
+
+    // ── Element text and accessible name ─────────────────────────────────────
+
+    var TEXTLESS_TAGS = { SCRIPT: true, STYLE: true, NOSCRIPT: true, TEMPLATE: true };
+    function normText(s) { return s.replace(/\s+/g, ' ').trim(); }
+    // The text under `node` (`textContent`, minus script and style source).
+    function nodeFullText(node) {
+        var out = '';
+        var kids = nodeKids(node);
+        for (var i = 0; i < kids.length; i++) {
+            var k = kids[i];
+            var kind = nodeKind(k);
+            if (kind === 3) out += k.nodeValue;
+            else if (kind === 1 && TEXTLESS_TAGS[elTag(k)] !== true) out += nodeFullText(k);
+        }
+        return out;
+    }
+    function pageText(root) {
+        if (!root) return '';
+        // A ShadowRoot has no innerText.
+        var text = typeof root.innerText === 'string' ? root.innerText : nodeFullText(root);
+        var els = root.querySelectorAll('*');
+        for (var j = 0; j < els.length; j++) {
+            var sr = elShadow(els[j]);
+            if (sr) text += ' ' + pageText(sr);
+            var t = elTag(els[j]);
+            if (t === 'IFRAME' || t === 'FRAME') {
+                try {
+                    var d = els[j].contentDocument;
+                    if (d && d.body) text += ' ' + pageText(d.body);
+                } catch (e) { /* cross-origin */ }
+            }
+        }
+        return text;
+    }
+    function cssVisibleDeep(el) {
+        var view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+        var cs = view.getComputedStyle(el);
+        if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return false;
+        for (var n = el; n && nodeKind(n) === 1; n = n.parentNode) {
+            if (view.getComputedStyle(n).display === 'none') return false;
+        }
+        return true;
+    }
+    // Roles named from their content (ARIA "name from content").
+    var NAME_FROM_TEXT_ROLES = { button: 1, link: 1, tab: 1, menuitem: 1, menuitemcheckbox: 1, menuitemradio: 1,
+        option: 1, radio: 1, checkbox: 1, switch: 1, treeitem: 1, heading: 1, cell: 1, columnheader: 1, rowheader: 1,
+        tooltip: 1 };
+    // The accessible name: aria-label, aria-labelledby, an associated <label>, the text of a
+    // button / link / summary-like element, then title and placeholder. One computation for the
+    // `name` result field, the `name` filter and both snapshots. Null when there is none.
+    function accessibleName(el) {
+        var aria = normText(elAttr(el, 'aria-label') || '');
+        if (aria) return aria;
+        var by = elAttr(el, 'aria-labelledby');
+        if (by) {
+            var root = el.getRootNode ? el.getRootNode() : document;
+            var ids = normText(by).split(' ');
+            var parts = [];
+            for (var i = 0; i < ids.length; i++) {
+                var ref = root.getElementById ? root.getElementById(ids[i]) : null;
+                if (ref) parts[parts.length] = normText(nodeFullText(ref));
+            }
+            var joined = normText(parts.join(' '));
+            if (joined) return joined;
+        }
+        var tag = elTag(el);
+        var labels = null;
+        try { labels = el.labels; } catch (e) { labels = null; }
+        if (labels && labels.length) {
+            var lt = [];
+            for (var l = 0; l < labels.length; l++) lt[lt.length] = normText(nodeFullText(labels[l]));
+            var lj = normText(lt.join(' '));
+            if (lj) return lj;
+        }
+        if (tag === 'INPUT') {
+            var ty = (elAttr(el, 'type') || '').toLowerCase();
+            if (ty === 'submit' || ty === 'button' || ty === 'reset') {
+                var iv = normText(elAttr(el, 'value') || '');
+                if (iv) return iv;
+            }
+            if (ty === 'image' && elAttr(el, 'alt')) return elAttr(el, 'alt');
+        }
+        if (tag === 'IMG' && elAttr(el, 'alt')) return elAttr(el, 'alt');
+        var role = elAttr(el, 'role');
+        if (tag === 'BUTTON' || tag === 'A' || tag === 'SUMMARY' || (tag.length === 2 && tag.charAt(0) === 'H' && tag.charAt(1) >= '1' && tag.charAt(1) <= '6')
+            || (role && NAME_FROM_TEXT_ROLES[role] === 1)) {
+            var t = truncText(normText(nodeFullText(el)), 200);
+            if (t) return t;
+        }
+        return elAttr(el, 'title') || elAttr(el, 'placeholder') || null;
+    }
+
+    // ── Input editing ────────────────────────────────────────────────────────
+
+    var MAX_TYPE_CHARS = 20000;
+    // The browser's value sanitization clears or clamps what these types cannot hold.
+    var SANITIZED_INPUT_TYPES = { number: 1, date: 1, time: 1, 'datetime-local': 1, month: 1, week: 1, color: 1, range: 1 };
+    var UNEDITABLE_INPUT_TYPES = { checkbox: 'click', radio: 'click', file: 'a file dialog', button: 'click', submit: 'click',
+        reset: 'click', image: 'click', hidden: 'nothing: it is hidden' };
+    function inputType(el) { return ('' + (el.type || 'text')).toLowerCase(); }
+    function editKind(el) {
+        var tag = elTag(el);
+        if (tag === 'TEXTAREA') return 'text';
+        if (tag === 'INPUT') return hasOwn(SANITIZED_INPUT_TYPES, inputType(el)) ? 'sanitized' : 'text';
+        // jsdom has no isContentEditable; the attribute is what it reflects.
+        if (typeof el.isContentEditable === 'boolean') return el.isContentEditable ? 'contenteditable' : null;
+        var ce = elAttr(el, 'contenteditable');
+        return ce !== null && ce.toLowerCase() !== 'false' ? 'contenteditable' : null;
+    }
+    function refuseEdit(el) {
+        if (editKind(el) === null) {
+            return { ok: false, error: 'element is not fillable (not input, textarea, or contenteditable): ' + elTag(el).toLowerCase(), hint: 'CHECK_INPUT' };
+        }
+        if (elTag(el) === 'INPUT' && hasOwn(UNEDITABLE_INPUT_TYPES, inputType(el))) {
+            return { ok: false, error: 'element is not fillable: input type=' + inputType(el) + ' (use ' + UNEDITABLE_INPUT_TYPES[inputType(el)] + ')', hint: 'CHECK_INPUT' };
+        }
+        if (el.readOnly === true) return { ok: false, error: 'element is readonly: a user cannot edit it', hint: 'CHECK_INPUT' };
+        return null;
+    }
+    // The native value setter of the element's OWN realm (a frame's textarea fails the top
+    // realm's `instanceof`): React and friends shadow `value` on the instance.
+    function valueSetter(el) {
+        var win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+        var proto = elTag(el) === 'TEXTAREA' ? win.HTMLTextAreaElement.prototype : win.HTMLInputElement.prototype;
+        var desc = Object.getOwnPropertyDescriptor(proto, 'value');
+        return function(v) {
+            if (desc && desc.set) REFLECT_APPLY(desc.set, el, [v]);
+            else el.value = v;
+        };
+    }
+    // Did the browser refuse `asked` on a sanitizing input type? Only those are judged: a text
+    // field's page handlers may legitimately reformat what is typed.
+    function sanitizerRejection(el, asked) {
+        if (elTag(el) !== 'INPUT' || !hasOwn(SANITIZED_INPUT_TYPES, inputType(el))) return null;
+        var type = inputType(el), got = el.value, bad;
+        if (type === 'color') bad = got.toLowerCase() !== asked.toLowerCase();
+        else if (type === 'range') bad = Number(got) !== Number(asked);
+        else bad = got === '' && asked !== '';
+        if (!bad) return null;
+        return { ok: false, error: 'value rejected by input type=' + type + ': ' + jsonStringLiteral(truncText(asked, 80)) + ' (the field is unchanged)', hint: 'CHECK_INPUT' };
+    }
+    // One user-perceived key: a surrogate pair is one character, not two key events.
+    function charAtPoint(s, i) {
+        var c = s.charCodeAt(i);
+        if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+            var d = s.charCodeAt(i + 1);
+            if (d >= 0xDC00 && d <= 0xDFFF) return s.substring(i, i + 2);
+        }
+        return s.charAt(i);
+    }
+    var KEY_CODES = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39,
+        ArrowDown: 40, Home: 36, End: 35, PageUp: 33, PageDown: 34, Insert: 45 };
+    var MOD_CODES = { Control: ['ControlLeft', 17], Shift: ['ShiftLeft', 16], Alt: ['AltLeft', 18], Meta: ['MetaLeft', 91] };
+    var PUNCT_CODES = { '-': 'Minus', '_': 'Minus', '=': 'Equal', '+': 'Equal', '[': 'BracketLeft', ']': 'BracketRight',
+        ';': 'Semicolon', ':': 'Semicolon', ',': 'Comma', '.': 'Period', '/': 'Slash', '?': 'Slash', '\\': 'Backslash', "'": 'Quote', '`': 'Backquote' };
+    // `code` and `keyCode` too: hotkey handlers commonly read those, and an empty `code` never fired them.
+    function keyInit(key, mods) {
+        var code = '', keyCode = 0;
+        if (key === ' ') { code = 'Space'; keyCode = 32; }
+        else if (key.length === 1) {
+            var up = key.toUpperCase(), c = up.charCodeAt(0);
+            if (c >= 65 && c <= 90) { code = 'Key' + up; keyCode = c; }
+            else if (c >= 48 && c <= 57) { code = 'Digit' + up; keyCode = c; }
+            else if (hasOwn(PUNCT_CODES, key)) { code = PUNCT_CODES[key]; }
+        } else if (hasOwn(KEY_CODES, key)) { code = key; keyCode = KEY_CODES[key]; }
+        else if (hasOwn(MOD_CODES, key)) { code = MOD_CODES[key][0]; keyCode = MOD_CODES[key][1]; }
+        else if (key.charAt(0) === 'F' && +key.substring(1) >= 1 && +key.substring(1) <= 12) { code = key; keyCode = 111 + (+key.substring(1)); }
+        return { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true,
+            ctrlKey: !!(mods && mods.ctrlKey), shiftKey: !!(mods && mods.shiftKey), altKey: !!(mods && mods.altKey), metaKey: !!(mods && mods.metaKey) };
+    }
+    // `document.activeElement` retargets to a shadow host or a frame element; keys go to what
+    // actually has focus.
+    function deepActiveElement() {
+        var a = document.activeElement || document.body;
+        for (var g = 0; g < 32 && a; g++) {
+            var inner = null;
+            var sr = elShadow(a);
+            if (sr && sr.activeElement) inner = sr.activeElement;
+            else if (elTag(a) === 'IFRAME' || elTag(a) === 'FRAME') {
+                try { inner = a.contentDocument && a.contentDocument.activeElement; } catch (e) { inner = null; }
+            }
+            if (!inner || inner === a) break;
+            a = inner;
+        }
+        return a;
+    }
+    // The descendant of `el` that a click at its center actually hits, or null.
+    function hitDescendant(el) {
+        var doc = el.ownerDocument || document;
+        var r = el.getBoundingClientRect();
+        var hit = deepElementFromPoint(doc, r.left + r.width / 2, r.top + r.height / 2);
+        return hit && hit !== el && composedContains(el, hit) ? hit : null;
+    }
+    // SVG and MathML elements have no `click()`.
+    function activate(el) {
+        if (typeof el.click === 'function') { el.click(); return; }
+        var view = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+        el.dispatchEvent(new view.MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: view }));
     }
 
     // ── Console Hooking ──────────────────────────────────────────────────────
@@ -3243,8 +4463,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                     if (i) msg += ' ';
                     msg += safeArgString(arguments[i]);
                 }
-                consoleLogs.push({ level: level, message: capConsoleMessage(msg, skippedArgs), timestamp: Date.now() });
-                if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+                appendCapped(consoleLogs, { level: level, message: capConsoleMessage(msg, skippedArgs), timestamp: Date.now() }, CAP_CONSOLE);
             } catch (e) {}
             // Always forward to the original method, whatever capture did.
             return originalConsole[level].apply(console, arguments);
@@ -3263,8 +4482,7 @@ const INIT_SCRIPT_BODY: &str = r#"
         try {
             var msg = safeArgString(e.message || 'Unknown error');
             if (e.filename) msg += ' at ' + safeArgString(e.filename) + ':' + e.lineno + ':' + e.colno;
-            consoleLogs.push({ level: 'error', message: capConsoleMessage('[uncaught] ' + msg, 0), timestamp: Date.now() });
-            if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+            appendCapped(consoleLogs, { level: 'error', message: capConsoleMessage('[uncaught] ' + msg, 0), timestamp: Date.now() }, CAP_CONSOLE);
         } catch (x) {}
     });
 
@@ -3276,8 +4494,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var m; try { m = r.message; } catch (x) { m = undefined; }
                 msg = safeArgString(m || r);
             }
-            consoleLogs.push({ level: 'error', message: capConsoleMessage('[unhandled rejection] ' + msg, 0), timestamp: Date.now() });
-            if (consoleLogs.length > CAP_CONSOLE) consoleLogs.shift();
+            appendCapped(consoleLogs, { level: 'error', message: capConsoleMessage('[unhandled rejection] ' + msg, 0), timestamp: Date.now() }, CAP_CONSOLE);
         } catch (x) {}
     });
 
@@ -3342,14 +4559,13 @@ const INIT_SCRIPT_BODY: &str = r#"
     }
 
     function pushInteraction(action, el, value) {
-        interactionLog.push({
+        appendCapped(interactionLog, {
             type: 'dom_interaction',
             action: action,
             selector: bestSelector(el),
-            value: value || null,
+            value: value ? truncText(value, MAX_CONSOLE_MSG) : null,
             timestamp: Date.now()
-        });
-        if (interactionLog.length > CAP_INTERACTION) interactionLog.shift();
+        }, CAP_INTERACTION);
     }
 
     document.addEventListener('click', function(e) {
@@ -3391,8 +4607,7 @@ const INIT_SCRIPT_BODY: &str = r#"
             mutationBatchCount += mutations.length;
             if (!mutationBatchTimer) {
                 mutationBatchTimer = setTimeout(function() {
-                    mutationLog.push({ count: mutationBatchCount, timestamp: Date.now() });
-                    if (mutationLog.length > CAP_MUTATION) mutationLog.shift();
+                    appendCapped(mutationLog, { count: mutationBatchCount, timestamp: Date.now() }, CAP_MUTATION);
                     mutationBatchCount = 0;
                     mutationBatchTimer = null;
                 }, 100);
@@ -3481,7 +4696,7 @@ const INIT_SCRIPT_BODY: &str = r#"
                 var id = ++networkCounter;
                 var isIpc = isIpcUrl(url);
                 var isVictauriInternal = isVictauriInternalUrl(url);
-                var entry = { id: id, method: method.toUpperCase(), url: loggedUrl(url), timestamp: Date.now(), status: 'pending', duration_ms: null };
+                var entry = nullProto({ id: id, method: method.toUpperCase(), url: loggedUrl(url), timestamp: Date.now(), status: 'pending', duration_ms: null });
 
                 if (isIpc) ipcCapture.fetch_seen = true;
                 if (isIpc && !isVictauriInternal) {
@@ -3576,9 +4791,10 @@ const INIT_SCRIPT_BODY: &str = r#"
                         // error becomes a rejection (as a real fetch failure would), never
                         // a synchronous throw out of fetch().
                         var waitP = route.delay_ms > 0
-                            ? new Promise(function(res) { setTimeout(res, route.delay_ms); })
+                            ? routeDelay(route.delay_ms)
                             : Promise.resolve();
                         return waitP.then(makeResp).catch(function(err) {
+                            if (entry.status === 'aborted') throw err;
                             entry.status = 'error';
                             entry.error = String(err);
                             entry.duration_ms = Date.now() - entry.timestamp;
@@ -3588,12 +4804,38 @@ const INIT_SCRIPT_BODY: &str = r#"
                     }
                     if (route.action === 'delay' && route.delay_ms > 0) {
                         entry.route_delay_ms = route.delay_ms;
-                        return new Promise(function(resolve, reject) {
-                            setTimeout(function() { doRealFetch().then(resolve, reject); }, route.delay_ms);
-                        });
+                        return routeDelay(route.delay_ms).then(doRealFetch);
                     }
                 }
                 return doRealFetch();
+
+                // A route delay stands in for time on the network, so the request's AbortSignal
+                // ends it as it would end a real request (cancelling a slow request is what delay
+                // rules are for). Native fetch checks the signal itself once it starts.
+                function routeDelay(ms) {
+                    var signal = null;
+                    try {
+                        signal = (init && init.signal) || (fetchInput && typeof fetchInput === 'object' ? fetchInput.signal : null) || null;
+                    } catch (e) { signal = null; }
+                    return new Promise(function(resolve, reject) {
+                        function aborted() {
+                            CLEAR_TIMEOUT(timer);
+                            entry.status = 'aborted';
+                            entry.duration_ms = Date.now() - entry.timestamp;
+                            if (isIpc) flushIpcWaiters();
+                            reject((signal && signal.reason) || new DOMException('The operation was aborted.', 'AbortError'));
+                        }
+                        // Once the delay is over the signal is the real request's business: an abort
+                        // after a finished request must not rewrite its entry.
+                        var timer = SET_TIMEOUT(function() {
+                            if (signal) { try { REFLECT_APPLY(REMOVE_LISTENER, signal, ['abort', aborted]); } catch (e) {} }
+                            resolve();
+                        }, ms);
+                        if (!signal) return;
+                        if (signal.aborted) { aborted(); return; }
+                        try { REFLECT_APPLY(ADD_LISTENER, signal, ['abort', aborted]); } catch (e) {}
+                    });
+                }
 
                 function doRealFetch() {
                     return REFLECT_APPLY(origFetch, self, fetchArgs(fetchInput)).then(function(response) {
@@ -3648,7 +4890,9 @@ const INIT_SCRIPT_BODY: &str = r#"
         // XMLHttpRequest
         var origOpen = XMLHttpRequest.prototype.open;
         var origSend = XMLHttpRequest.prototype.send;
+        var origAbort = XMLHttpRequest.prototype.abort;
         var ADD_LISTENER = EventTarget.prototype.addEventListener;
+        var REMOVE_LISTENER = EventTarget.prototype.removeEventListener;
         var DISPATCH_EVENT = EventTarget.prototype.dispatchEvent;
         // Per-XHR state in a closure WeakMap — not an expando on the XHR, which page script
         // could overwrite to forge the entry `send()` logs (R4-JS3): the {method, url} `open()`
@@ -3666,13 +4910,14 @@ const INIT_SCRIPT_BODY: &str = r#"
         function xhrState(xhr) {
             var st = XHR_NET_GET(xhrNet, xhr);
             if (!st) {
-                st = { net: null, entry: null, hooked: false };
+                st = { net: null, entry: null, hooked: false, mock: null, mime: null };
                 XHR_NET_SET(xhrNet, xhr, st);
             }
             return st;
         }
-        function xhrEvent(type) {
-            return typeof ProgressEvent === 'function' ? new ProgressEvent(type) : new Event(type);
+        function xhrEvent(type, loaded, total) {
+            if (typeof ProgressEvent !== 'function') return new Event(type);
+            return new ProgressEvent(type, { lengthComputable: total > 0, loaded: loaded || 0, total: total || 0 });
         }
         function xhrFinish(entry, status) {
             entry.status = status;
@@ -3721,6 +4966,319 @@ const INIT_SCRIPT_BODY: &str = r#"
                 if (e && e.status === 'pending') xhrFinish(e, 'error');
             });
         }
+
+        // ── `fulfill` ──
+        //
+        // A mocked request never reaches the native XHR, which stays OPENED. Everything the page
+        // reads about the response comes from the mock instead: the prototype's accessors and
+        // header methods ask this per-XHR state first, so nothing shows on the instance, and an XHR
+        // with no mock (or a `this` that is not an XHR) still gets the native behaviour and errors.
+        //
+        // Measured against a real server and left as they are: `setRequestHeader`, `withCredentials`
+        // and friends do not throw once a mock is sent (the native object is still OPENED); events
+        // are `isTrusted: false`; the accessors are not the native functions, as a page comparing
+        // them can see; `responseXML.URL` is the page's; `lengthComputable` follows the mock, which
+        // knows its size; `getAllResponseHeaders` has only the mock's headers; Chromium also fires
+        // `upload` abort and timeout on a request with no body, and the mock follows the spec; an
+        // `upload` listener added after `send` still hears (it cannot be told a listener was added);
+        // a `Content-Type` that is not a valid type is passed on, not replaced as an engine would;
+        // `responseXML.contentType` is `application/xml` for any XML type; the upload total of a
+        // form or a document is 0.
+        var XHR_PROTO = XMLHttpRequest.prototype;
+        var TEXT_ENCODER = null;
+        try { TEXT_ENCODER = new window.TextEncoder(); } catch (e) { TEXT_ENCODER = null; }
+        var TEXT_ENCODE = TEXT_ENCODER ? window.TextEncoder.prototype.encode : null;
+        var BLOB_CTOR = typeof window.Blob === 'function' ? window.Blob : null;
+        var DOM_PARSER = typeof window.DOMParser === 'function' ? window.DOMParser : null;
+        var DOM_PARSE = DOM_PARSER ? window.DOMParser.prototype.parseFromString : null;
+        function xhrMockOf(xhr) {
+            var st = XHR_NET_GET(xhrNet, xhr);
+            return st ? st.mock : null;
+        }
+        function mockBytes(m) {
+            if (m.bytes === undefined) {
+                m.bytes = TEXT_ENCODER ? REFLECT_APPLY(TEXT_ENCODE, TEXT_ENCODER, [m.body]) : null;
+            }
+            return m.bytes;
+        }
+        function mockByteLength(m) {
+            var bytes = mockBytes(m);
+            return bytes ? bytes.length : m.body.length;
+        }
+        // The body as text: decoding takes a byte order mark off, and the bytes keep it.
+        function mockText(m) {
+            return m.body.charCodeAt(0) === 0xfeff ? REFLECT_APPLY(STR_SUBSTRING, m.body, [1]) : m.body;
+        }
+        // The type the page sees: its `overrideMimeType`, else the header, without parameters.
+        function mockMime(m, xhr) {
+            var st = XHR_NET_GET(xhrNet, xhr);
+            var mime = st.mime || m.headers['content-type'] || '';
+            var semi = REFLECT_APPLY(STR_INDEXOF, mime, [';']);
+            return REFLECT_APPLY(STR_TRIM, REFLECT_APPLY(STR_TO_LOWER, semi < 0 ? mime : REFLECT_APPLY(STR_SUBSTRING, mime, [0, semi]), []), []);
+        }
+        // What `send` reports as the upload's total, in bytes. A form's or a document's is the
+        // engine's own to work out, so those read as unknown (null). Anything else is sent as its
+        // string, and a conversion that throws throws out of `send`, as on a real request.
+        function xhrBodySize(body) {
+            if (body === null || body === undefined) return 0;
+            if (typeof body === 'object') {
+                try {
+                    if (BLOB_CTOR && body instanceof BLOB_CTOR) return body.size;
+                    if (typeof body.byteLength === 'number') return body.byteLength;
+                    if (typeof FormData === 'function' && body instanceof FormData) return null;
+                    if (typeof Document === 'function' && body instanceof Document) return null;
+                } catch (e) { return null; }
+            }
+            var text = toStringExact(body);
+            return TEXT_ENCODER ? REFLECT_APPLY(TEXT_ENCODE, TEXT_ENCODER, [text]).length : text.length;
+        }
+        // Parsed as a real response is: HTML only when the page asked for a document, a document
+        // that is not well-formed or of another type is null.
+        function mockDocument(m, xhr, htmlAllowed) {
+            if (m.document !== undefined) return m.document;
+            var mime = mockMime(m, xhr);
+            var isHtml = mime === 'text/html';
+            var isXml = mime === 'text/xml' || mime === 'application/xml'
+                || (mime.length > 4 && REFLECT_APPLY(STR_SUBSTRING, mime, [mime.length - 4]) === '+xml');
+            var doc = null;
+            if (DOM_PARSER && ((isHtml && htmlAllowed) || isXml)) {
+                try {
+                    doc = REFLECT_APPLY(DOM_PARSE, new DOM_PARSER(), [mockText(m), isHtml ? 'text/html' : 'application/xml']);
+                    if (isXml && doc.getElementsByTagName('parsererror').length) doc = null;
+                } catch (e) { doc = null; }
+            }
+            if (isHtml && !htmlAllowed) return null; // not cached: `responseType` can still change
+            m.document = doc;
+            return doc;
+        }
+        function mockResponse(m, xhr, type) {
+            if (m.state !== 4 || m.failed) return null;
+            if (m.value !== undefined) return m.value;
+            var value = null;
+            if (type === 'json') {
+                try { value = PRISTINE_PARSE(mockText(m)); } catch (e) { value = null; }
+            } else if (type === 'arraybuffer') {
+                var bytes = mockBytes(m);
+                value = bytes ? REFLECT_APPLY(ARRAY_BUFFER_SLICE, bytes.buffer, [bytes.byteOffset, bytes.byteOffset + bytes.length]) : null;
+            } else if (type === 'blob') {
+                value = BLOB_CTOR ? new BLOB_CTOR(mockBytes(m) ? [mockBytes(m)] : [m.body], { type: mockMime(m, xhr) }) : null;
+            } else if (type === 'document') {
+                return mockDocument(m, xhr, true);
+            }
+            m.value = value;
+            return value;
+        }
+        function hasHeaders(m) { return m.state >= 2 && !m.failed; }
+        function xhrAccessor(name, read) {
+            var d = Object.getOwnPropertyDescriptor(XHR_PROTO, name);
+            if (!d || !d.get) return;
+            var native = d.get;
+            Object.defineProperty(XHR_PROTO, name, {
+                configurable: d.configurable, enumerable: d.enumerable, set: d.set,
+                get: function() {
+                    var m = xhrMockOf(this);
+                    return m ? read(m, this, native) : REFLECT_APPLY(native, this, []);
+                },
+            });
+        }
+        var XHR_TYPE_GET = (Object.getOwnPropertyDescriptor(XHR_PROTO, 'responseType') || {}).get;
+        function xhrType(xhr) { return XHR_TYPE_GET ? REFLECT_APPLY(XHR_TYPE_GET, xhr, []) : ''; }
+        xhrAccessor('readyState', function(m) { return m.state; });
+        xhrAccessor('status', function(m) { return hasHeaders(m) ? m.status : 0; });
+        xhrAccessor('statusText', function(m) { return hasHeaders(m) ? m.status_text : ''; });
+        xhrAccessor('responseURL', function(m) { return hasHeaders(m) ? m.url : ''; });
+        xhrAccessor('responseText', function(m, xhr, native) {
+            var type = xhrType(xhr);
+            // The native getter throws this engine's own InvalidStateError for another type.
+            if (type !== '' && type !== 'text') return REFLECT_APPLY(native, xhr, []);
+            return (m.state >= 3 && !m.failed) ? mockText(m) : '';
+        });
+        xhrAccessor('response', function(m, xhr) {
+            var type = xhrType(xhr);
+            if (type === '' || type === 'text') return (m.state >= 3 && !m.failed) ? mockText(m) : '';
+            return mockResponse(m, xhr, type);
+        });
+        xhrAccessor('responseXML', function(m, xhr, native) {
+            var type = xhrType(xhr);
+            if (type !== '' && type !== 'document') return REFLECT_APPLY(native, xhr, []);
+            if (m.state !== 4 || m.failed) return null;
+            return mockDocument(m, xhr, type === 'document');
+        });
+        // A `timeout` set while the mock is held back counts from `send`, as on a real request.
+        var XHR_TIMEOUT = Object.getOwnPropertyDescriptor(XHR_PROTO, 'timeout');
+        if (XHR_TIMEOUT && XHR_TIMEOUT.set) {
+            Object.defineProperty(XHR_PROTO, 'timeout', {
+                configurable: XHR_TIMEOUT.configurable, enumerable: XHR_TIMEOUT.enumerable, get: XHR_TIMEOUT.get,
+                set: function(value) {
+                    REFLECT_APPLY(XHR_TIMEOUT.set, this, [value]);
+                    var m = xhrMockOf(this);
+                    if (m && m.timer !== null && m.arm) m.arm();
+                },
+            });
+        }
+        var origGetAll = XHR_PROTO.getAllResponseHeaders;
+        var origOverrideMime = XHR_PROTO.overrideMimeType;
+        XHR_PROTO.getResponseHeader = function(name) {
+            var m = xhrMockOf(this);
+            if (!m || arguments.length < 1) return REFLECT_APPLY(XHR_GET_HEADER, this, arguments);
+            if (!hasHeaders(m)) return null;
+            var key = REFLECT_APPLY(STR_TO_LOWER, toStringExact(name), []);
+            // Never readable from a response, as for a real one.
+            if (key === 'set-cookie' || key === 'set-cookie2') return null;
+            return m.headers[key] === undefined ? null : '' + m.headers[key];
+        };
+        XHR_PROTO.getAllResponseHeaders = function() {
+            var m = xhrMockOf(this);
+            if (!m) return REFLECT_APPLY(origGetAll, this, arguments);
+            if (!hasHeaders(m)) return '';
+            var names = [];
+            for (var k in m.headers) { if (k !== 'set-cookie' && k !== 'set-cookie2') names[names.length] = k; }
+            names.sort();
+            var out = '';
+            for (var i = 0; i < names.length; i++) out += names[i] + ': ' + m.headers[names[i]] + '\r\n';
+            return out;
+        };
+        XHR_PROTO.overrideMimeType = function(mime) {
+            var ret = REFLECT_APPLY(origOverrideMime, this, arguments);
+            var st = xhrState(this);
+            st.mime = toStringExact(mime);
+            return ret;
+        };
+        function xhrFire(xhr, event) {
+            try { REFLECT_APPLY(DISPATCH_EVENT, xhr, [event]); } catch (e) {}
+        }
+        // The native object's url, as `responseURL` gives it: absolute, no fragment.
+        function xhrResponseUrl(url) {
+            var abs = url;
+            try {
+                var base = BASE_URI_GET ? REFLECT_APPLY(BASE_URI_GET, document, []) : window.location.href;
+                abs = REFLECT_APPLY(URL_HREF_GET, new URL_CTOR(url, base), []);
+            } catch (e) {}
+            var hash = REFLECT_APPLY(STR_INDEXOF, abs, ['#']);
+            return hash < 0 ? abs : REFLECT_APPLY(STR_SUBSTRING, abs, [0, hash]);
+        }
+        function xhrMockEnd(entry, m, url) {
+            entry.status_text = m.status_text;
+            if (isIpcUrl(url)) entry.ipc_response = m.headers['tauri-response'] === 'ok' ? 'ok' : 'error';
+            xhrFinish(entry, m.status);
+        }
+        // Answer a matching request with the rule's mock: `send` does not reach the network. The
+        // transitions come in one later task, stopping as soon as a handler moved the XHR on.
+        function xhrFulfill(xhr, st, entry, route, net, body) {
+            var verb = REFLECT_APPLY(STR_TO_LOWER, net.method, []);
+            var hasBody = body !== null && body !== undefined && verb !== 'get' && verb !== 'head';
+            // First: a body that cannot be converted throws, and no request has started.
+            var sent = hasBody ? xhrBodySize(body) : 0;
+            var m = {
+                state: 1, failed: false, timer: null, arm: null, uploading: null,
+                status: route.status, status_text: route.status_text,
+                headers: mockHeaders(route),
+                body: verb === 'head' ? '' : (mockBody(route) || ''),
+                url: xhrResponseUrl(net.url),
+            };
+            st.mock = m;
+            st.entry = entry;
+            entry.mocked = true;
+            if (route.delay_ms > 0) entry.route_delay_ms = route.delay_ms;
+            xhrLog(entry);
+            var size = mockByteLength(m);
+            if (!net.async) {
+                // Nothing can wait inside a synchronous send().
+                xhrMockEnd(entry, m, net.url);
+                m.state = 4;
+                xhrFire(xhr, new Event('readystatechange'));
+                // Once `load` has fired `loadend` follows, whatever a handler did to the XHR.
+                if (st.mock === m && m.state === 4) {
+                    xhrFire(xhr, xhrEvent('load', size, size));
+                    xhrFire(xhr, st.mock === m && m.state === 4 ? xhrEvent('loadend', size, size) : xhrEvent('loadend', 0, 0));
+                }
+                return;
+            }
+            xhrFire(xhr, xhrEvent('loadstart', 0, 0));
+            if (hasBody) {
+                m.uploading = xhr.upload;
+                xhrFire(xhr.upload, xhrEvent('loadstart', 0, sent || 0));
+            }
+            if (st.mock !== m || m.state !== 1) return;
+            function moved(state) { return st.mock !== m || m.state !== state; }
+            function answer() {
+                m.timer = null;
+                if (moved(1)) return;
+                if (hasBody) {
+                    m.uploading = null;
+                    // An empty body has nothing to report past its `loadstart`.
+                    if (sent !== 0) {
+                        xhrFire(xhr.upload, xhrEvent('progress', sent || 0, sent || 0));
+                        xhrFire(xhr.upload, xhrEvent('load', sent || 0, sent || 0));
+                        xhrFire(xhr.upload, xhrEvent('loadend', sent || 0, sent || 0));
+                        if (moved(1)) return;
+                    }
+                }
+                m.state = 2;
+                xhrFire(xhr, new Event('readystatechange'));
+                if (moved(2)) return;
+                // With no body there is no LOADING state and no progress.
+                if (size > 0) {
+                    m.state = 3;
+                    xhrFire(xhr, new Event('readystatechange'));
+                    if (moved(3)) return;
+                    xhrFire(xhr, xhrEvent('progress', size, size));
+                    if (moved(3)) return;
+                }
+                xhrMockEnd(entry, m, net.url);
+                m.state = 4;
+                xhrFire(xhr, new Event('readystatechange'));
+                if (moved(4)) return;
+                // Once `load` has fired `loadend` follows, whatever a handler did to the XHR.
+                xhrFire(xhr, xhrEvent('load', size, size));
+                xhrFire(xhr, moved(4) ? xhrEvent('loadend', 0, 0) : xhrEvent('loadend', size, size));
+            }
+            function timedOut() {
+                m.timer = null;
+                if (moved(1)) return;
+                m.failed = true;
+                m.state = 4;
+                xhrFinish(entry, 'timeout');
+                // It has timed out: these fire whatever a handler did to the XHR.
+                xhrFire(xhr, new Event('readystatechange'));
+                xhrEndUpload(m, 'timeout');
+                xhrFire(xhr, xhrEvent('timeout', 0, 0));
+                xhrFire(xhr, xhrEvent('loadend', 0, 0));
+            }
+            // A `timeout` the mock's delay runs past ends it as it would end a slow request.
+            var sentAt = Date.now();
+            m.arm = function() {
+                if (m.timer !== null) CLEAR_TIMEOUT(m.timer);
+                var limit = xhr.timeout, gone = Date.now() - sentAt;
+                if (limit > 0 && route.delay_ms >= limit) m.timer = SET_TIMEOUT(timedOut, Math.max(0, limit - gone));
+                else m.timer = SET_TIMEOUT(answer, Math.max(0, route.delay_ms - gone));
+            };
+            m.arm();
+        }
+        // An upload still under way ends with the request: before the request's own event.
+        function xhrEndUpload(m, type) {
+            var upload = m.uploading;
+            if (!upload) return;
+            m.uploading = null;
+            xhrFire(upload, xhrEvent(type, 0, 0));
+            xhrFire(upload, xhrEvent('loadend', 0, 0));
+        }
+        // As on a real request: in flight it ends with `readystatechange`, `abort`, `loadend`; once
+        // it has ended there are no events. Either way it reads as UNSENT afterwards.
+        function xhrMockAbort(xhr, st, m) {
+            if (m.timer !== null) { CLEAR_TIMEOUT(m.timer); m.timer = null; }
+            if (m.state < 4 && m.state > 0) {
+                m.failed = true;
+                m.state = 4;
+                if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+                xhrFire(xhr, new Event('readystatechange'));
+                if (st.mock === m && m.state === 4) xhrEndUpload(m, 'abort');
+                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('abort', 0, 0));
+                if (st.mock === m && m.state === 4) xhrFire(xhr, xhrEvent('loadend', 0, 0));
+            }
+            if (st.mock === m) { m.failed = true; m.state = 0; }
+        }
+
         XMLHttpRequest.prototype.open = function(method, url) {
             // No early delete: an open() that throws leaves the previous request intact (spec),
             // and a successful one replaces this entry below.
@@ -3735,63 +5293,108 @@ const INIT_SCRIPT_BODY: &str = r#"
             for (var i = 2; i < arguments.length; i++) args[i] = arguments[i];
             var ret = REFLECT_APPLY(origOpen, this, args);
             var st = xhrState(this);
+            // A new request: nothing of a mocked one is left. The native object never left OPENED,
+            // so it did not announce the state change a page sees.
+            var announce = false;
+            if (st.mock) {
+                if (st.mock.timer !== null) CLEAR_TIMEOUT(st.mock.timer);
+                announce = st.mock.state !== 1;
+                st.mock = null;
+            }
             // open() on a request in flight terminates it without firing any event: close its
             // entry here, or it would stay 'pending' forever.
             if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+            // ... and a request still in its route delay is gone with it.
+            if (st.delay_timer !== null && st.delay_timer !== undefined) {
+                CLEAR_TIMEOUT(st.delay_timer);
+                st.delay_timer = null;
+            }
             st.entry = null;
-            st.net = { method: m, url: u };
+            // An explicit third argument is converted even when undefined (false), as open() does.
+            st.net = { method: m, url: u, async: arguments.length < 3 || !!arguments[2] };
+            if (announce) xhrFire(this, new Event('readystatechange'));
+            return ret;
+        };
+        // abort() during a route delay: the real send has not happened, so the native abort is a
+        // no-op and the request would still go out after the delay.
+        XMLHttpRequest.prototype.abort = function() {
+            var st = XHR_NET_GET(xhrNet, this);
+            if (st && st.mock) return xhrMockAbort(this, st, st.mock);
+            if (st && st.delay_timer !== null && st.delay_timer !== undefined) {
+                CLEAR_TIMEOUT(st.delay_timer);
+                st.delay_timer = null;
+                if (st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+                try {
+                    REFLECT_APPLY(DISPATCH_EVENT, this, [xhrEvent('abort')]);
+                    REFLECT_APPLY(DISPATCH_EVENT, this, [xhrEvent('loadend')]);
+                } catch (e) {}
+                return undefined;
+            }
+            var ret = REFLECT_APPLY(origAbort, this, arguments);
+            // Called from `readystatechange` at DONE it fires no `load`, `abort` or `loadend`, so
+            // nothing else closes the entry, and it would hold `network_idle` off for good.
+            if (st && st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
             return ret;
         };
         XMLHttpRequest.prototype.send = function() {
             var st = XHR_NET_GET(xhrNet, this);
+            // The native object is still OPENED and would really send: this one has been sent.
+            if (st && st.mock) throw new DOMException('The object\'s state must be OPENED.', 'InvalidStateError');
             var net = st && st.net;
             if (!net || isVictauriInternalUrl(net.url)) {
                 return REFLECT_APPLY(origSend, this, arguments);
             }
             // Each send() is its own request with its own log entry.
-            var entry = {
+            var entry = nullProto({
                 id: ++networkCounter,
                 method: net.method.toUpperCase(),
                 url: loggedUrl(net.url),
                 timestamp: Date.now(),
                 status: 'pending',
                 duration_ms: null,
-            };
+            });
             xhrHook(this, st);
             var self = this;
 
-            // Phase 1 routing for XHR: block + delay are supported here.
-            // `fulfill` (synthetic response) is fetch-only — faking the full
-            // XHR response surface is unreliable; document as a limitation.
+            // Phase 1 routing for XHR: block, delay, and fulfill (see `xhrFulfill`).
             var xroute = matchRoute(net.url, net.method);
             if (xroute) {
                 recordRouteMatch(xroute, net.url, net.method);
+                entry.route_rule = xroute.id;
+                if (xroute.action === 'fulfill') {
+                    xhrFulfill(this, st, entry, xroute, net, arguments[0]);
+                    return undefined;
+                }
                 if (xroute.action === 'block') {
                     st.entry = entry;
                     entry.blocked = true;
                     xhrFinish(entry, 'blocked');
                     xhrLog(entry);
-                    // End it like a network failure — `error`, then `loadend` — unless the app
-                    // has moved this XHR on to another request meanwhile.
+                    // End it like a network failure — `readystatechange`, `error`, `loadend` —
+                    // unless the app has moved this XHR on to another request meanwhile. (`readyState`
+                    // stays 1: only a request that was really sent can reach 4.)
                     SET_TIMEOUT(function() {
                         if (st.entry !== entry) return;
                         try {
+                            REFLECT_APPLY(DISPATCH_EVENT, self, [new Event('readystatechange')]);
                             REFLECT_APPLY(DISPATCH_EVENT, self, [xhrEvent('error')]);
                             REFLECT_APPLY(DISPATCH_EVENT, self, [xhrEvent('loadend')]);
                         } catch (e) {}
                     }, 0);
                     return; // do not send
                 }
-                if ((xroute.action === 'delay' || xroute.action === 'fulfill') && xroute.delay_ms > 0) {
+                if (xroute.action === 'delay' && xroute.delay_ms > 0) {
                     st.entry = entry;
                     xhrLog(entry);
                     var dArgs = arguments;
-                    SET_TIMEOUT(function() {
+                    var delayTimer = SET_TIMEOUT(function() {
+                        if (st.delay_timer === delayTimer) st.delay_timer = null;
                         // Re-opened meanwhile: this request no longer exists.
                         if (st.entry !== entry || entry.status !== 'pending') return;
                         try { REFLECT_APPLY(origSend, self, dArgs); }
                         catch (e) { entry.error = String(e); xhrFinish(entry, 'error'); }
                     }, xroute.delay_ms);
+                    st.delay_timer = delayTimer;
                     return;
                 }
             }
@@ -3840,30 +5443,28 @@ const INIT_SCRIPT_BODY: &str = r#"
     // ── Navigation Tracking ──────────────────────────────────────────────────
 
     (function trackNavigation() {
-        navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'initial' });
+        // URLs can be huge (a state in the hash): stored cut, as the network log stores them.
+        function logNav(type, oldUrl) {
+            var e = { url: loggedUrl(window.location.href), timestamp: Date.now(), type: type };
+            if (oldUrl !== undefined) e.old_url = loggedUrl(oldUrl);
+            appendCapped(navigationLog, e, CAP_NAVIGATION);
+        }
+        logNav('initial');
 
         var origPushState = history.pushState;
         var origReplaceState = history.replaceState;
         history.pushState = function() {
             var result = origPushState.apply(this, arguments);
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'pushState' });
-            if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
+            logNav('pushState');
             return result;
         };
         history.replaceState = function() {
             var result = origReplaceState.apply(this, arguments);
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'replaceState' });
-            if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
+            logNav('replaceState');
             return result;
         };
-        window.addEventListener('popstate', function() {
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'popstate' });
-            if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
-        });
-        window.addEventListener('hashchange', function(e) {
-            navigationLog.push({ url: window.location.href, timestamp: Date.now(), type: 'hashchange', old_url: e.oldURL });
-            if (navigationLog.length > CAP_NAVIGATION) navigationLog.shift();
-        });
+        window.addEventListener('popstate', function() { logNav('popstate'); });
+        window.addEventListener('hashchange', function(e) { logNav('hashchange', e.oldURL); });
     })();
 
     // ── Dialog Capture ───────────────────────────────────────────────────────
@@ -3911,29 +5512,31 @@ const INIT_SCRIPT_BODY: &str = r#"
         navigationLog.length = 0;
         dialogLog.length = 0;
         interactionLog.length = 0;
-        refMap.clear();
-        weakRefMap.clear();
+        REFLECT_APPLY(MAP_CLEAR, refMap, []);
+        REFLECT_APPLY(MAP_CLEAR, weakRefMap, []);
         nodeIds = new WeakMap();
-        refCounter = 0;
     });
 
     (function captureDialogs() {
+        // `alert(0)` shows "0" and `alert()` nothing. Bounded: a log entry is kept for good.
+        function dialogText(msg) { return msg === undefined ? '' : truncText(safeArgString(msg), MAX_CONSOLE_MSG); }
+        function logDialog(e) { appendCapped(dialogLog, e, CAP_DIALOG); }
         window.alert = function(msg) {
-            dialogLog.push({ type: 'alert', message: String(msg || ''), timestamp: Date.now() });
-            if (dialogLog.length > CAP_DIALOG) dialogLog.shift();
+            logDialog({ type: 'alert', message: dialogText(msg), timestamp: Date.now() });
         };
         window.confirm = function(msg) {
             var resp = dialogAutoResponses.confirm;
             var result = resp.action === 'accept';
-            dialogLog.push({ type: 'confirm', message: String(msg || ''), timestamp: Date.now(), result: result });
-            if (dialogLog.length > CAP_DIALOG) dialogLog.shift();
+            logDialog({ type: 'confirm', message: dialogText(msg), timestamp: Date.now(), result: result });
             return result;
         };
         window.prompt = function(msg, defaultValue) {
             var resp = dialogAutoResponses.prompt;
-            var result = resp.action === 'accept' ? (resp.text || defaultValue || '') : null;
-            dialogLog.push({ type: 'prompt', message: String(msg || ''), timestamp: Date.now(), result: result });
-            if (dialogLog.length > CAP_DIALOG) dialogLog.shift();
+            // An explicit '' is an answer; only an absent one falls back to the default.
+            var answer = (resp.text !== undefined && resp.text !== null) ? resp.text
+                : (defaultValue !== undefined && defaultValue !== null ? defaultValue : '');
+            var result = resp.action === 'accept' ? answer : null;
+            logDialog({ type: 'prompt', message: dialogText(msg), timestamp: Date.now(), result: result });
             return result;
         };
     })();

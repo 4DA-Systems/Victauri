@@ -97,6 +97,16 @@ impl RecordedEvent {
     }
 }
 
+/// The events between two checkpoints, from [`EventRecorder::checkpoint_window`].
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CheckpointWindow {
+    /// The events still retained, oldest first.
+    pub events: Vec<RecordedEvent>,
+    /// How many events of the window the ring buffer has evicted (0 for a complete window).
+    pub dropped: usize,
+}
+
 /// Thread-safe session recorder for time-travel debugging. Records events and
 /// state checkpoints during a recording session. Only one session can be active at a time.
 #[derive(Debug, Clone)]
@@ -286,7 +296,10 @@ impl EventRecorder {
     ///
     /// # Errors
     ///
-    /// Returns [`VictauriError::NoActiveRecording`] if no session is in progress.
+    /// Returns [`VictauriError::NoActiveRecording`] if no session is in progress, and
+    /// [`VictauriError::InvalidInput`] if this recording already has a checkpoint with this id:
+    /// lookups by id could only ever find one of the two, so a repeated id silently returned the
+    /// wrong window.
     pub fn checkpoint(
         &self,
         id: String,
@@ -295,6 +308,11 @@ impl EventRecorder {
     ) -> crate::error::Result<()> {
         let mut rec = crate::acquire_lock(&self.recording, "EventRecorder");
         if let Some(ref mut active) = *rec {
+            if active.checkpoints.iter().any(|c| c.id == id) {
+                return Err(VictauriError::invalid_input(format!(
+                    "checkpoint id '{id}' already exists in this recording"
+                )));
+            }
             let event_index = active.event_counter;
             if active.checkpoints.len() >= active.max_checkpoints {
                 active.checkpoints.pop_front();
@@ -465,6 +483,22 @@ impl EventRecorder {
         from_checkpoint_id: &str,
         to_checkpoint_id: &str,
     ) -> crate::error::Result<Vec<RecordedEvent>> {
+        self.checkpoint_window(from_checkpoint_id, to_checkpoint_id)
+            .map(|window| window.events)
+    }
+
+    /// [`events_between_checkpoints`](Self::events_between_checkpoints), also saying how many
+    /// events of the window the ring buffer has already evicted, so that a partial window can be
+    /// told from a complete one.
+    ///
+    /// # Errors
+    ///
+    /// As [`events_between_checkpoints`](Self::events_between_checkpoints).
+    pub fn checkpoint_window(
+        &self,
+        from_checkpoint_id: &str,
+        to_checkpoint_id: &str,
+    ) -> crate::error::Result<CheckpointWindow> {
         let rec = crate::acquire_lock(&self.recording, "EventRecorder");
         let source_checkpoints;
         let source_events;
@@ -500,11 +534,13 @@ impl EventRecorder {
             (to_idx, from_idx)
         };
 
-        Ok(source_events
+        let events: Vec<RecordedEvent> = source_events
             .iter()
             .filter(|e| e.index >= start && e.index < end)
             .cloned()
-            .collect())
+            .collect();
+        let dropped = (end - start).saturating_sub(events.len());
+        Ok(CheckpointWindow { events, dropped })
     }
 
     /// Snapshot the current recording as a session WITHOUT stopping it.
@@ -569,7 +605,14 @@ impl EventRecorder {
             checkpoints.pop_front();
         }
 
-        let event_counter = events.back().map_or(0, |e| e.index.saturating_add(1));
+        // Past every index the session used, in events AND checkpoints: an imported session need
+        // not be in order, and a new event must not reuse an index or land before a checkpoint.
+        let event_counter = events
+            .iter()
+            .map(|e| e.index.saturating_add(1))
+            .chain(checkpoints.iter().map(|c| c.event_index))
+            .max()
+            .unwrap_or(0);
 
         ActiveRecording {
             session_id: session.id,

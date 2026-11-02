@@ -2,50 +2,11 @@
 // owns, and its poller must never overlap itself.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import * as http from "node:http";
-import type { AddressInfo } from "node:net";
 
 import { VictauriClient } from "../src/client";
 import type { DiscoveredServer } from "../src/discovery";
+import { fakeServer } from "./fakeServer";
 import { stubConfig } from "./vscode-stub";
-
-interface Seen {
-  path: string;
-  auth: string | undefined;
-}
-
-/** A fake Victauri server. `infoDelayMs` slows `/info` to simulate a busy app. */
-async function fakeServer(
-  appIdentifier: string,
-  infoDelayMs = 0
-): Promise<{ port: number; seen: Seen[]; close: () => Promise<void> }> {
-  const seen: Seen[] = [];
-  const server = http.createServer((req, res) => {
-    seen.push({ path: req.url ?? "", auth: req.headers.authorization });
-    const reply = (body: unknown) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify(body));
-    };
-    if (req.url === "/health") return reply("ok");
-    if (req.url === "/info") {
-      setTimeout(() => reply({ app_identifier: appIdentifier }), infoDelayMs);
-      return;
-    }
-    req.resume();
-    req.on("end", () => reply({ result: {} }));
-  });
-  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
-  const port = (server.address() as AddressInfo).port;
-  return {
-    port,
-    seen,
-    close: () =>
-      new Promise<void>((r) => {
-        server.closeAllConnections();
-        server.close(() => r());
-      }),
-  };
-}
 
 const entry = (port: number, token: string, identifier: string): DiscoveredServer => ({
   port,
@@ -128,10 +89,10 @@ test("a re-resolved endpoint that reports another app is refused", async () => {
 });
 
 test("the poller never overlaps a slow refresh", async () => {
-  const app = await fakeServer("com.slow.app", 400);
+  const app = await fakeServer("com.slow.app", { infoDelayMs: 700 });
   const client = new VictauriClient();
   try {
-    stubConfig.pollInterval = 30;
+    stubConfig.pollInterval = 500; // the minimum
     await client.connect(app.port, "tok");
     const start = app.seen.length;
     let inFlight = 0;
@@ -146,9 +107,84 @@ test("the poller never overlaps a slow refresh", async () => {
         inFlight--;
       }
     };
-    await new Promise((r) => setTimeout(r, 1_000));
+    await new Promise((r) => setTimeout(r, 2_500));
     assert.equal(maxInFlight, 1, "refreshAll ran concurrently with itself");
     assert.ok(app.seen.length > start, "polling still happens");
+  } finally {
+    client.dispose();
+    await app.close();
+  }
+});
+
+test("/health is unauthenticated, so the token never goes to it", async () => {
+  const app = await fakeServer("com.real.app");
+  const client = new VictauriClient();
+  try {
+    stubConfig.pollInterval = 60_000;
+    // Discovery vouches for nothing: the connect must fail without the token going anywhere.
+    await assert.rejects(
+      client.connect(app.port, "SECRET", { identifier: "com.real.app", discover: async () => [] }),
+      /no longer/i
+    );
+    assert.deepEqual(
+      app.seen.map((s) => [s.path, s.auth]),
+      [["/health", undefined]]
+    );
+  } finally {
+    client.dispose();
+    await app.close();
+  }
+});
+
+test("after a disconnect nothing is sent, and the token is gone", async () => {
+  const app = await fakeServer("com.real.app");
+  const client = new VictauriClient();
+  try {
+    stubConfig.pollInterval = 60_000;
+    await client.connect(app.port, "tok");
+    client.disconnect();
+    const before = app.seen.length;
+    await assert.rejects(client.callTool("screenshot"), /not connected/i);
+    assert.equal(app.seen.length, before, "no request reached the server");
+    assert.equal(await client.screenshot().catch(() => "rejected"), "rejected");
+    assert.equal(app.seen.length, before);
+  } finally {
+    client.dispose();
+    await app.close();
+  }
+});
+
+test("a disconnect during the connect's probe is not overwritten", async () => {
+  const app = await fakeServer("com.real.app", { infoDelayMs: 300 });
+  const client = new VictauriClient();
+  try {
+    stubConfig.pollInterval = 60_000;
+    const connecting = client.connect(app.port, "tok", { identifier: "com.real.app" });
+    while (!app.seen.some((s) => s.path === "/info")) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    client.disconnect();
+    await connecting;
+    assert.equal(client.connectionState, "disconnected");
+    const before = app.seen.length;
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(app.seen.length, before, "no refresh and no poll started");
+  } finally {
+    client.dispose();
+    await app.close();
+  }
+});
+
+test("a connect after a disconnect works again", async () => {
+  const app = await fakeServer("com.real.app");
+  const client = new VictauriClient();
+  try {
+    stubConfig.pollInterval = 60_000;
+    await client.connect(app.port, "tok");
+    client.disconnect();
+    await client.connect(app.port, "tok");
+    await client.callTool("screenshot");
+    assert.equal(app.seen.at(-1)?.auth, "Bearer tok");
   } finally {
     client.dispose();
     await app.close();

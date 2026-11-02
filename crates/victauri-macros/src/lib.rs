@@ -77,6 +77,9 @@ fn expand(input: ItemFn, attrs: InspectableAttrs) -> proc_macro2::TokenStream {
     let command_options = tauri_command_options(&input.attrs);
 
     let fn_name = &input.sig.ident;
+    // The companion is as visible as its command, so `commands::greet__schema()` can be named
+    // wherever `commands::greet` can.
+    let vis = input.vis.clone();
     let schema_fn_name = syn::Ident::new(&format!("{fn_name}__schema"), fn_name.span());
     // The name the frontend invokes: Tauri's `rename`, else the bare identifier
     // (`r#type` is invoked as `type`).
@@ -125,8 +128,10 @@ fn expand(input: ItemFn, attrs: InspectableAttrs) -> proc_macro2::TokenStream {
     let expanded = quote! {
         #input
 
+        // Hidden: generated, so a consumer with `#![deny(missing_docs)]` cannot document it.
+        #[doc(hidden)]
         #[allow(dead_code, non_snake_case)]
-        fn #schema_fn_name() -> victauri_core::registry::CommandInfo {
+        #vis fn #schema_fn_name() -> victauri_core::registry::CommandInfo {
             // Built via constructors, not a struct literal: `CommandInfo` and
             // `CommandArg` are `#[non_exhaustive]`, and this code expands in the
             // user's crate.
@@ -265,14 +270,9 @@ fn extract_args(sig: &syn::Signature) -> Vec<(String, String, bool)> {
                 if is_tauri_framework_type(ty) {
                     return None;
                 }
-                let type_str = quote!(#ty).to_string();
+                let type_name = quote!(#ty).to_string();
 
-                let is_option = type_str.starts_with("Option")
-                    || type_str.starts_with("Option <")
-                    || type_str.contains(":: Option");
-                let type_name = type_str;
-
-                Some((name, type_name, !is_option))
+                Some((name, type_name, !is_option_type(ty)))
             } else {
                 None
             }
@@ -280,8 +280,36 @@ fn extract_args(sig: &syn::Signature) -> Vec<(String, String, bool)> {
         .collect()
 }
 
+/// Strips the wrappers that do not change what a type names.
+fn peel_type(ty: &syn::Type) -> &syn::Type {
+    match ty {
+        syn::Type::Reference(r) => peel_type(&r.elem),
+        syn::Type::Paren(p) => peel_type(&p.elem),
+        syn::Type::Group(g) => peel_type(&g.elem),
+        other => other,
+    }
+}
+
+/// Whether the argument's OUTERMOST type is `Option<...>`, the only form Tauri treats as
+/// optional. Judged on the parsed type: `Options`, `OptionalThing` and `Vec<Option<u8>>` are all
+/// required.
+fn is_option_type(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = peel_type(ty) else {
+        return false;
+    };
+    path.path.segments.last().is_some_and(|seg| {
+        seg.ident == "Option" && matches!(seg.arguments, syn::PathArguments::AngleBracketed(_))
+    })
+}
+
 /// Whether Tauri injects this argument itself (the `CommandArg` impls that do not
 /// read the invoke payload), so it never appears in the frontend's arguments.
+///
+/// A name alone is not enough: an app's own `api::Request` or `api::State` is a real argument.
+/// So a framework type must be bare, rooted at `tauri`, or generic like Tauri's own (which covers
+/// a re-export such as `my::State<'_, Db>`); and `State`/`Request`, the two names apps commonly
+/// reuse, must have those generics in any case. A bare `AppHandle` etc. is assumed to be Tauri's,
+/// as it is under the usual `use tauri::...`.
 fn is_tauri_framework_type(ty: &syn::Type) -> bool {
     const FRAMEWORK_TYPES: &[&str] = &[
         "AppHandle",
@@ -293,21 +321,22 @@ fn is_tauri_framework_type(ty: &syn::Type) -> bool {
         "CommandScope",
         "GlobalScope",
     ];
-    let ty = match ty {
-        syn::Type::Reference(r) => &*r.elem,
-        syn::Type::Paren(p) => &*p.elem,
-        syn::Type::Group(g) => &*g.elem,
-        other => other,
-    };
-    // Judge by the path's LAST segment, never by splitting its tokens as a string:
-    // `State<'_, my::Pool>` has a `::` inside its generics.
-    let syn::Type::Path(path) = ty else {
+    let syn::Type::Path(path) = peel_type(ty) else {
         return false;
     };
-    path.path
-        .segments
-        .last()
-        .is_some_and(|seg| FRAMEWORK_TYPES.iter().any(|t| seg.ident == t))
+    let segments = &path.path.segments;
+    let tauri_rooted =
+        segments.len() == 1 || segments.first().is_some_and(|seg| seg.ident == "tauri");
+    // Judge by the path's LAST segment, never by splitting its tokens as a string:
+    // `State<'_, my::Pool>` has a `::` inside its generics.
+    let Some(last) = segments.last() else {
+        return false;
+    };
+    let generic = matches!(last.arguments, syn::PathArguments::AngleBracketed(_));
+    let needs_generics = last.ident == "State" || last.ident == "Request";
+    FRAMEWORK_TYPES.iter().any(|t| last.ident == t)
+        && (tauri_rooted || generic)
+        && (!needs_generics || generic)
 }
 
 fn extract_return_type(sig: &syn::Signature) -> String {

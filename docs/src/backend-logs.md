@@ -144,7 +144,9 @@ registry.init();
   app's own file logging for that.
 - **Victauri's own lines are excluded** (`victauri_*`, the embedded `rmcp` SDK): every agent
   request produces some, so capturing them would let reading the log generate log noise. Set
-  `VICTAURI_LOG_INTERNAL=1` to keep them. Tokio's own runtime instrumentation (`tokio::*`,
+  `VICTAURI_LOG_INTERNAL=1` to keep them. That is the capture only: with an `info` filter the
+  SDK's `rmcp::service` INFO lines still reach the app's console during MCP calls, and
+  `EnvFilter::new("info,rmcp=warn")` hides them. Tokio's own runtime instrumentation (`tokio::*`,
   `runtime::*` — what `tokio_unstable` emits for tokio-console) is always excluded: part of it is
   emitted while Tokio holds internal locks.
 - **Panics.** The hook is installed when the plugin builds (debug builds) and chains the hook
@@ -174,8 +176,12 @@ registry.init();
   they are formatted, so a multi-megabyte argument costs a few kilobytes). For a very chatty
   app, raise the level with `VICTAURI_LOG_LEVEL=info`.
 - **Keep the launcher alive.** `victauri run` owns the app's stdout/stderr pipes. Ctrl+C reaches
-  both; but if the launcher alone is killed, the app's next console write fails (on Unix a
-  `println!` then panics on the broken pipe).
+  both. A launcher killed outright takes the app with it (on Windows a job object, the whole
+  tree; on Unix a small helper process, the direct child only, so what `npm` started may stay and
+  its next console write fails: a `println!` then panics on the broken pipe). It records nothing,
+  so `victauri logs` ends such a capture with an `EXIT` line saying the exit is unknown, and `logs
+  stdout` reports `launcher_gone` while the app lives on. Only a capture `victauri run` named itself
+  has a launcher they can ask about, so neither can say so for a `--capture` file.
 
 ## A server that stays up when the app hangs
 

@@ -7,6 +7,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-02
+
+From a nine-lens adversarial audit. **Assertions that reported success without checking now tell the
+truth, so a green test suite can go red.** See MIGRATION.md for every behaviour change.
+
+### Fixed: assertions and tools that lied
+
+- `assert_accessible` and `assert_no_a11y_violations` read a key the audit never produced and could not
+  fail. A failed lookup could read as a met condition in locator matchers; negative matchers passed on a
+  missing element; `no_ghost_commands` failed on the wrong list; `has_text` searched snapshot JSON;
+  `ipc_was_not_called` passed on a log window that could not see the call.
+- `wait_for expected` and `assert_semantic` disagreed on equality; both now share one rule, which no
+  longer calls `null` and `"null"` equal.
+- `explain` and `introspect coverage` turned an unreadable page into a clean "nothing happened".
+- `recording events_between` hid events the ring buffer had evicted, and `checkpoint` missed what the page
+  captured just before it.
+- `window` ignored its target and acted on the default window. `resize` and `move_to` reported the request,
+  not the outcome.
+- `query_db` silently changed big numbers, `1.10` and duplicate keys in JSON text, and returned infinities
+  as NULL. `select_option`, `fill` and `type_text` reported success for values that never applied.
+
+### Fixed: crashes and hangs in the host app
+
+- Deeply nested SQL or a crafted database schema could overflow the stack and kill the app. Both now return
+  a clean error (64 MiB reserved stack, nesting and view-chain budgets, which read SQL the way SQLite tokenizes it
+  and each schema entry the way SQLite loads it, so a UTF-16 BLOB counts). A check that runs out of time refuses.
+- Windows process-memory reads leaked a handle per call. The event bus could retain hundreds of MiB.
+- Logging: reading the log no longer stalls logging threads; a panic in a `Debug` impl, a value that logs
+  while being recorded and two capture layers in one subscriber no longer panic or deadlock; symbolising a
+  panic no longer blocks workers or another panic; `log_layer()` no longer lowers the global max level.
+- `navigate go_to` out of the app left a dead page with no way back; a page stopped by `while(true)` now
+  recovers through a detour on WebView2, and on Linux by ending the one web process whose main thread spun throughout,
+  only while every other window that has answered still answers; the result names it (`ended_web_process`).
+  `recovered` and `ok` mean the page answers at the
+  new URL, where they used to mean a navigation was sent: WebKit's URL reads the new address while the old
+  script still runs. The demo's sync window-building command deadlocked.
+- A route regex that can hang the page is refused at `add`, by what a repeated group can match. Polynomial
+  patterns with no repeated group (`.*.*.*.*x`) still get through.
+
+### Fixed: JS bridge
+
+- Refs carry a per-page-load tag, so a ref from another page or window can never resolve to the wrong element.
+- A page could pollute prototypes or hook built-ins to forge or hide bridge results and logs, and could add
+  route rules: closed. Bridge comments that overclaimed are corrected. Results and logs are evidence against
+  a buggy page, not a hostile one (docs/src/security.md).
+- `find_elements` computes accessible names and honest `visible`/`enabled`, returns deepest text matches, and
+  gains `attribute`, `attribute_value`, `text_exact` and `include_hidden`.
+- Actionability: SVG, `opacity:0` styled controls, MUI wrappers, labels, disabled fieldsets, shadow DOM events,
+  contenteditable and same-origin iframes. Whether a click reaches an element is now the browser's answer at real
+  points of it (centre, SVG outline, line boxes, a grid, descendants), not geometry: closed accordions, `.sr-only` and
+  `::after` overlays are covered, and a control with a hole, a stroke-only circle and a link with no box of its own
+  are clickable. A trusted click uses the point found, on a whole device pixel, and is refused where its point cannot
+  be worked out: inside a scaled, rotated or zoomed frame, or on a pinch-zoomed page. Checked in real Edge and on WebKitGTK.
+- `route` `fulfill` works on XMLHttpRequest, compared event for event with a real server in 21 scenarios. It used
+  to send the request and say so.
+- `animation scrub` no longer fires the page's own animation and transition events for its seeks: a toast
+  removing itself on `animationend` survives a scrub.
+- A bridge call or log read on a page with no bridge is a tool error; it used to answer `undefined` or an empty list
+  as a success.
+- `type_text` no longer corrupts number and date inputs. Log entries are bounded. Scrubbing restores the
+  animation's time and state.
+
+### Fixed: privacy
+
+- Invalid custom redaction patterns fail `build()`. Redaction covers numbers, name/value pairs, `storage get` and
+  short credential names. `wait_for event` omits the payload where the event bus is not allowed. Legacy
+  `disabled_tools` names block their actions. The Test profile's allowlist promise now works. Refused requests
+  cannot flood or write into the log.
+
+### Fixed: CLI and watchdog
+
+- `victauri run`: output reaches the terminal as it arrives, killing the launcher takes the app with it, on Unix
+  even by SIGKILL (a small helper), and a closed stderr no longer changes the exit code. Old captures are pruned.
+  A launcher killed outright is now said, by `logs stdout` (`launcher_gone`) and `victauri logs`.
+- A stale discovery entry whose PID was reused, naming the current app's port, no longer makes `--app` refuse with
+  "several apps": the server says which entry is real (`/info` now reports `pid`). In the CLI, bridge, test client
+  and VS Code extension. A server refusing every token settles nothing, and asking is bounded to about 2 s a scan.
+- `logs stdout` cursors hold the file's tag, so a rotation landing on a record boundary is seen and two rotations
+  are reported as a gap. A reader racing a rotation could lose thousands of lines silently (19,413 to 32,808 of
+  150,000 in a stress test): a file's tag and bytes now come from one open, here and in `victauri logs --follow`.
+- `victauri test` first-launch default is 20 s: a cold webview measured 12.5 s against the old 10 s budget.
+- Bridge: a `VICTAURI_PORT` pin that is down never reaches another app. Invalid UTF-8 no longer shuts it down.
+- `victauri logs --follow` loses nothing across rotation. `setup` no longer pins user-level configs to one project
+  and reports failures in its exit code. Output from a hostile plugin cannot drive the terminal.
+- Watchdog: quoted recovery paths with spaces work, and a slow recovery command is no longer killed.
+- With nothing discovered, tools no longer send requests to whatever holds port 7373.
+
+### Fixed: other
+
+- Screenshots of decorated windows keep their edges (Windows.Graphics.Capture crop). Trusted clicks respect page zoom.
+- Database discovery skips non-SQLite files and finds `.db3`. The view-chain budget reads only places that name a
+  table, so a column named like a view no longer refuses a healthy database.
+- `/mcp` names the problem when `arguments` is not an object, where it said the method does not exist.
+  `find_elements` in the test client takes a string as CSS. `screenshot` names the window it captured.
+- rmcp's per-request INFO lines no longer reach an app's console by default (`info,rmcp=warn`).
+- A bare `e0` ref means that counter on the current page: a real consumer's suite hardcoded one. Performance metrics
+  survive a reload's moment with no body.
+
+### Changed: release and CI
+
+- `rusqlite` range extended to `<0.42`; lockfile updates move CI onto rmcp 3.8, tauri 2.12, wry 0.57, tao 0.37 and
+  tokio 1.54.1, which consumers without a lockfile already resolve.
+- Release workflows use no caches (new guard `scripts/check-release-no-cache.sh`). The crate-exists check no longer
+  misreads a published crate. `release-vscode.yml` requires green CI, including the Windows job.
+  `mcp-registry.yml` refuses an unpublished version. `surface-audit.yml` covers the registry and GitHub Release.
+- A new CI leg runs the demo with auth on, and a new test opens a second window.
+
 ## [0.10.2] - 2026-10-31
 
 ### Added — backend (Rust) log capture: the app's debug console, for agents
@@ -2615,7 +2722,8 @@ Initial public release.
 - Security headers (X-Frame-Options, X-Content-Type-Options, Cache-Control)
 - Screenshot error handling: `GetDIBits()` return value checked on Windows
 
-[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/4DA-Systems/victauri/compare/v0.10.3...HEAD
+[0.10.3]: https://github.com/4DA-Systems/victauri/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/4DA-Systems/victauri/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/4DA-Systems/victauri/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/4DA-Systems/victauri/compare/v0.9.0...v0.10.0

@@ -1,7 +1,8 @@
 //! `victauri run -- <command>` — launch an app (or its dev command) with its
 //! stdout/stderr captured **out of process**.
 //!
-//! The launcher passes every byte through to this terminal unchanged, and also
+//! The launcher passes every byte through to this terminal unchanged, as it arrives (a
+//! prompt has no newline to wait for), and also
 //! appends each line to a JSONL capture file whose path it hands the app in
 //! `VICTAURI_CONSOLE_LOG`. The embedded plugin serves that file as
 //! `logs {action:"stdout"}`, and `victauri logs --stdout` reads it — even after
@@ -15,8 +16,14 @@
 //! `tauri-plugin-log`'s Stdout target, C libraries) with zero code changes, and
 //! wraps whole dev commands (`npm run tauri dev`), so `cargo` build errors are
 //! captured too.
+//!
+//! Stopping the launcher stops the app: otherwise an agent harness or `timeout` leaves it holding
+//! its port and single-instance lock. On Windows a job object takes the whole tree when the
+//! launcher dies, however it dies. On Unix SIGTERM/SIGHUP are forwarded and the exit is recorded;
+//! SIGKILL cannot be seen, so a small helper does it (see `DeathWatch`). A launcher killed outright
+//! records nothing, and `victauri logs` says so when it reads the capture.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
@@ -25,6 +32,9 @@ use anyhow::{Context, Result, bail};
 
 /// Environment variable carrying the capture-file path to the app (read by the plugin).
 pub const CONSOLE_CAPTURE_ENV: &str = "VICTAURI_CONSOLE_LOG";
+/// Environment variable carrying this launcher's pid to the app, when it named the capture itself:
+/// `logs stdout` says so when the launcher is killed. A `--capture` file's name is the user's.
+pub const CONSOLE_LAUNCHER_ENV: &str = "VICTAURI_CONSOLE_LAUNCHER";
 /// Rotate the capture file past this size (the previous file is kept as `.1`).
 const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 /// Longest line stored in the capture (the terminal still gets all of it).
@@ -32,6 +42,25 @@ const MAX_LINE_BYTES: usize = 64 * 1024;
 /// stderr lines carried on the final `exit` record, so a crash's last words stay
 /// attached to the crash even under a level filter.
 const EXIT_TAIL_LINES: usize = 12;
+/// Captures hold whatever the app printed, secrets included, up to 128 MB per run. Dead apps'
+/// captures past this age go, and at most this many are kept however recent they are. Long
+/// enough for a crash's output to be read; `--capture <file>` paths are never touched.
+const CAPTURE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+const CAPTURE_KEEP: usize = 20;
+/// On Unix: how long a stop signal waits before being forwarded (see [`on_stop_signal`]).
+#[cfg(unix)]
+const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+/// [`STOP_GRACE`] with a terminal attached, where the signal is probably Ctrl+C: the child has it
+/// too, and may be cleaning up with a handler for SIGINT and none for SIGTERM.
+#[cfg(unix)]
+const STOP_GRACE_TERMINAL: std::time::Duration = std::time::Duration::from_secs(10);
+/// On Unix: a further stop signal this soon after the first is the same stop, see
+/// [`on_stop_signal`].
+#[cfg(unix)]
+const STOP_ECHO: std::time::Duration = std::time::Duration::from_secs(1);
+/// On Unix: how long a child gets to act on SIGTERM before SIGKILL.
+#[cfg(unix)]
+const STOP_KILL_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Directory holding console captures: `console` under the per-user discovery root, created
 /// owner-only and trust-checked (see [`crate::bridge::private_subdir`]). Captures hold whatever
@@ -69,6 +98,81 @@ pub fn latest_capture() -> Option<PathBuf> {
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .max_by_key(|(t, _)| *t)
         .map(|(_, p)| p)
+}
+
+/// The pid and the run in a capture's own name: `<pid>-<ms>.jsonl`, rotated as `.jsonl.<n>`.
+/// `None` for anything else in the directory, which is not ours to delete.
+fn capture_group(file_name: &str) -> Option<(u32, &str)> {
+    let (base, rotated) = match file_name.split_once(".jsonl") {
+        Some((base, "")) => (base, None),
+        Some((base, rest)) => (base, Some(rest.strip_prefix('.')?)),
+        None => return None,
+    };
+    if rotated.is_some_and(|r| r.is_empty() || !r.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+    let (pid, ms) = base.split_once('-')?;
+    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    Some((pid.parse().ok()?, base))
+}
+
+/// The pid of the `victauri run` that wrote the capture at `path`, when it named the file itself
+/// (one in the private directory: a `--capture` file's name is the user's, and may only look like
+/// a pid) and that process is definitely gone. A reused pid just looks alive.
+#[must_use]
+pub fn dead_launcher(path: &Path) -> Option<u32> {
+    if !is_own_capture(path) {
+        return None;
+    }
+    let (pid, _) = capture_group(path.file_name()?.to_str()?)?;
+    victauri_test::process::is_gone(pid).then_some(pid)
+}
+
+/// Delete old captures of apps that are gone: those past [`CAPTURE_MAX_AGE`], then all but the
+/// newest [`CAPTURE_KEEP`]. A capture whose launcher might still be alive is never deleted (only
+/// a definitely-dead pid counts; a reused pid just keeps a capture longer). Best effort: a file
+/// a reader holds open simply stays until the next run.
+fn prune_captures(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut groups: std::collections::BTreeMap<String, (u32, std::time::SystemTime, Vec<PathBuf>)> =
+        std::collections::BTreeMap::new();
+    for entry in entries.filter_map(Result::ok) {
+        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some((pid, base)) = name.to_str().and_then(capture_group) else {
+            continue;
+        };
+        let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok()) else {
+            continue;
+        };
+        let group = groups
+            .entry(base.to_string())
+            .or_insert((pid, modified, Vec::new()));
+        group.1 = group.1.max(modified);
+        group.2.push(entry.path());
+    }
+    let mut dead: Vec<_> = groups
+        .into_values()
+        .filter(|(pid, ..)| victauri_test::process::liveness(*pid).is_dead())
+        .collect();
+    dead.sort_by_key(|(_, modified, _)| std::cmp::Reverse(*modified));
+    let now = std::time::SystemTime::now();
+    for (i, (_, modified, files)) in dead.iter().enumerate() {
+        let too_old = now
+            .duration_since(*modified)
+            .is_ok_and(|age| age > CAPTURE_MAX_AGE);
+        if too_old || i >= CAPTURE_KEEP {
+            for file in files {
+                let _ = std::fs::remove_file(file);
+            }
+        }
+    }
 }
 
 /// Remove ANSI escape sequences (CSI `ESC[...X`, OSC `ESC]...BEL`) and a trailing `\r`.
@@ -126,6 +230,8 @@ struct Capture {
     file: std::fs::File,
     written: u64,
     recent_err: std::collections::VecDeque<String>,
+    /// Bytes of the line each stream (out, err) is still in the middle of.
+    pending: [Vec<u8>; 2],
     /// Set when the file could not be rotated: line capture stops (the size bound holds) and
     /// only the exit record is still written.
     stopped: bool,
@@ -151,8 +257,41 @@ impl Capture {
             file,
             written,
             recent_err: std::collections::VecDeque::with_capacity(EXIT_TAIL_LINES),
+            pending: [Vec::new(), Vec::new()],
             stopped: false,
         })
+    }
+
+    /// Take raw bytes as they arrived and record each line they complete. A line longer than
+    /// one stored record is split into several, so a child that writes megabytes without a
+    /// newline neither grows this buffer without bound nor loses anything.
+    fn feed(&mut self, stream: &'static str, mut bytes: &[u8]) {
+        let slot = usize::from(stream == "err");
+        while let Some(newline) = bytes.iter().position(|b| *b == b'\n') {
+            let mut line = std::mem::take(&mut self.pending[slot]);
+            line.extend_from_slice(&bytes[..newline]);
+            bytes = &bytes[newline + 1..];
+            while line.len() > MAX_LINE_BYTES {
+                let rest = line.split_off(MAX_LINE_BYTES);
+                self.record(stream, &String::from_utf8_lossy(&line));
+                line = rest;
+            }
+            self.record(stream, &String::from_utf8_lossy(&line));
+        }
+        self.pending[slot].extend_from_slice(bytes);
+        while self.pending[slot].len() >= MAX_LINE_BYTES {
+            let rest = self.pending[slot].split_off(MAX_LINE_BYTES);
+            let line = std::mem::replace(&mut self.pending[slot], rest);
+            self.record(stream, &String::from_utf8_lossy(&line));
+        }
+    }
+
+    /// Record a line the stream never finished (EOF, or the exit record is about to be written).
+    fn flush_partial(&mut self, stream: &'static str) {
+        let line = std::mem::take(&mut self.pending[usize::from(stream == "err")]);
+        if !line.is_empty() {
+            self.record(stream, &String::from_utf8_lossy(&line));
+        }
     }
 
     fn record(&mut self, stream: &str, line: &str) {
@@ -180,6 +319,9 @@ impl Capture {
 
     /// The final record: how the app ended, plus its last stderr lines.
     fn record_exit(&mut self, summary: &str) {
+        // A process the app started may hold the pipes open, so a pump can still be mid-line.
+        self.flush_partial("out");
+        self.flush_partial("err");
         let rec = serde_json::json!({
             "t": now_ms(),
             "s": "exit",
@@ -253,39 +395,160 @@ fn open_private(path: &Path) -> Result<std::fs::File> {
         .with_context(|| format!("cannot open capture file {}", path.display()))
 }
 
-/// Copy `src` to `dst` byte-for-byte while recording each complete line.
+/// Copy `src` to `dst` byte-for-byte as it arrives, and hand it to the capture, which assembles
+/// lines. The terminal never waits for a line: a prompt (`Terminate batch job (Y/N)? `, a
+/// password request) or a `\r` progress bar has no newline to wait for.
 fn pump<R: Read, W: Write>(
-    src: R,
+    mut src: R,
     mut dst: W,
     stream: &'static str,
     capture: &Arc<Mutex<Capture>>,
 ) {
-    let mut reader = BufReader::with_capacity(64 * 1024, src);
-    let mut buf = Vec::with_capacity(4096);
+    let mut buf = vec![0u8; 64 * 1024];
     loop {
-        buf.clear();
-        // At most one stored line's worth per read: a child that writes megabytes without a
-        // newline must neither grow this buffer without bound nor hold its output back from the
-        // terminal until the newline finally arrives.
-        match std::io::Read::take(&mut reader, MAX_LINE_BYTES as u64).read_until(b'\n', &mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {
-                // A Windows console stdout rejects bytes that are not UTF-8 (`InvalidData`) —
-                // OEM-codepage output from cmd builtins or localised linker errors — and would
-                // drop the whole chunk: pass those through lossily instead.
-                if let Err(e) = dst.write_all(&buf)
-                    && e.kind() == std::io::ErrorKind::InvalidData
-                {
-                    let _ = dst.write_all(String::from_utf8_lossy(&buf).as_bytes());
-                }
-                let _ = dst.flush();
-                let line = String::from_utf8_lossy(&buf);
-                let line = line.trim_end_matches('\n');
-                if let Ok(mut c) = capture.lock() {
-                    c.record(stream, line);
-                }
-            }
+        let n = match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        pass_through(&mut dst, &buf[..n]);
+        let _ = dst.flush();
+        if let Ok(mut c) = capture.lock() {
+            c.feed(stream, &buf[..n]);
         }
+    }
+    if let Ok(mut c) = capture.lock() {
+        c.flush_partial(stream);
+    }
+}
+
+/// Write `bytes` to the terminal, ignoring a reader that went away. A Windows console stdout
+/// writes the valid UTF-8 prefix, then rejects the rest (`InvalidData`) — OEM-codepage output from
+/// cmd builtins or localised linker errors: pass what is left through lossily, not all of it
+/// again.
+fn pass_through<W: Write>(dst: &mut W, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        match dst.write(bytes) {
+            Ok(0) => return,
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                let _ = dst.write_all(String::from_utf8_lossy(bytes).as_bytes());
+                return;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+/// The stop-signal handler. `ctrlc` does not say which signal arrived, and Ctrl+C already reached
+/// the child through the terminal's process group: forwarding at once would hit a child that is
+/// shutting down gracefully on SIGINT with a SIGTERM too. So it waits a moment, forwards only to a
+/// child still running, and ends with SIGKILL, since `victauri run` waits for the child and a child
+/// that ignores SIGTERM would hold it forever. A later signal asks for that at once, but not one
+/// within [`STOP_ECHO`] of the first: `timeout`, `npm` and `concurrently` signal this process and
+/// its group, so one stop can arrive twice with the child already shutting down on its own copy.
+/// It runs on its own thread because `ctrlc` delivers signals one handler call at a time, so a
+/// handler that slept could not hear the second. Only the direct child: its own group would need
+/// `setpgid`, which takes it out of the terminal's foreground group and so breaks Ctrl+C.
+#[cfg(unix)]
+fn on_stop_signal(
+    child_pid: &Arc<std::sync::atomic::AtomicU32>,
+    first_signal: &std::sync::OnceLock<std::time::Instant>,
+) {
+    if first_signal.set(std::time::Instant::now()).is_err() {
+        if first_signal
+            .get()
+            .is_some_and(|first| first.elapsed() >= STOP_ECHO)
+        {
+            signal_child(child_pid, "KILL");
+        }
+        return;
+    }
+    let child_pid = Arc::clone(child_pid);
+    std::thread::spawn(move || {
+        use std::io::IsTerminal;
+        std::thread::sleep(if std::io::stdin().is_terminal() {
+            STOP_GRACE_TERMINAL
+        } else {
+            STOP_GRACE
+        });
+        signal_child(&child_pid, "TERM");
+        std::thread::sleep(STOP_KILL_AFTER);
+        signal_child(&child_pid, "KILL");
+    });
+}
+
+/// On Unix: stops the child when this process dies, even by SIGKILL. `PR_SET_PDEATHSIG` would need
+/// `unsafe` (`pre_exec`) and only exists on Linux. This is a shell holding the read end of a pipe:
+/// the write end is here and nowhere else (Rust opens pipes close-on-exec), so its `read` returns
+/// when this process is gone, however it went. It stops the child as [`on_stop_signal`] does, and
+/// like it, only the direct child. It ignores what a terminal or `timeout` sends the whole group: it
+/// must outlive a stop that this process is handling, and the disarming line ends it.
+#[cfg(unix)]
+struct DeathWatch(std::process::Child);
+
+/// See [`DeathWatch`]. `$1` is the child, `$2` how long it gets after SIGTERM.
+#[cfg(unix)]
+const DEATH_WATCH_SCRIPT: &str = "trap '' INT HUP TERM\n\
+     read -r disarmed\n\
+     [ -n \"$disarmed\" ] && exit 0\n\
+     kill -s TERM \"$1\" 2>/dev/null || exit 0\n\
+     i=0\n\
+     while [ \"$i\" -lt \"$2\" ] && kill -0 \"$1\" 2>/dev/null; do\n\
+     sleep 1\n\
+     i=$((i + 1))\n\
+     done\n\
+     kill -0 \"$1\" 2>/dev/null && kill -s KILL \"$1\"\n";
+
+#[cfg(unix)]
+impl DeathWatch {
+    /// `None` when no shell can be started: the app still runs, unguarded as it always was.
+    fn start(child_pid: u32) -> Option<Self> {
+        Command::new("sh")
+            .args([
+                "-c",
+                DEATH_WATCH_SCRIPT,
+                "victauri-run-watch",
+                &child_pid.to_string(),
+                &STOP_KILL_AFTER.as_secs().to_string(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()
+            .map(Self)
+    }
+
+    /// The child is done: the helper must never signal its pid, which may be reused.
+    fn disarm(mut self) {
+        if let Some(mut stdin) = self.0.stdin.take() {
+            let _ = stdin.write_all(b"disarmed\n");
+        }
+        let _ = self.0.wait();
+    }
+}
+
+/// Signal the child, if it is still running.
+#[cfg(unix)]
+fn signal_child(child_pid: &std::sync::atomic::AtomicU32, signal: &str) {
+    let pid = child_pid.load(std::sync::atomic::Ordering::Acquire);
+    if pid != 0 {
+        // The shell builtin: `kill` is not a binary everywhere (NixOS, Guix, minimal containers).
+        let _ = Command::new("sh")
+            .args([
+                "-c",
+                "kill -s \"$1\" \"$2\"",
+                "victauri-run",
+                signal,
+                &pid.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -383,6 +646,16 @@ pub fn describe_exit(status: ExitStatus) -> String {
     }
 }
 
+/// Hand the app this launcher's pid when it named the capture. Otherwise clear it: an outer `victauri
+/// run` may have set it, for a capture this is not.
+fn say_who_launched(command: &mut Command, names_its_capture: bool) {
+    if names_its_capture {
+        command.env(CONSOLE_LAUNCHER_ENV, std::process::id().to_string());
+    } else {
+        command.env_remove(CONSOLE_LAUNCHER_ENV);
+    }
+}
+
 /// Run `argv` under capture, returning the child's exit code.
 ///
 /// # Errors
@@ -394,6 +667,7 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
             "usage: victauri run -- <command> [args...]   e.g. victauri run -- npm run tauri dev"
         );
     };
+    let names_its_capture = capture_file.is_none();
     let path = match capture_file {
         // Absolute: the path is handed to the app, which may run from another directory
         // (`tauri dev` starts it in src-tauri), and a relative one would then name another file.
@@ -403,11 +677,15 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
             .context(
                 "no private per-user directory for the capture (the Victauri discovery root is \
                  missing, shared or not owned by you) — pass --capture <file>",
-            )?
+            )
+            .inspect(|dir| prune_captures(dir))?
             .join(format!("{}-{}.jsonl", std::process::id(), now_ms())),
     };
     let capture = Arc::new(Mutex::new(Capture::create(&path)?));
-    eprintln!(
+    // Not `eprintln!`: it panics on a closed stderr (`… 2>&1 | head`), and the panic would
+    // replace the child's exit code.
+    let _ = writeln!(
+        std::io::stderr(),
         "victauri run: capturing stdout/stderr -> {}\n\
          victauri run: agents read it with `logs {{action:\"stdout\"}}` (app up) or \
          `victauri logs --stdout` (any time, even after a crash)",
@@ -416,12 +694,22 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
 
     // Ctrl+C reaches the child directly (same console / process group); the
     // launcher must survive it so it can record how the child ended.
+    #[cfg(unix)]
+    let child_pid = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    #[cfg(unix)]
+    let _ = {
+        let child_pid = Arc::clone(&child_pid);
+        let first_signal = std::sync::OnceLock::new();
+        ctrlc::set_handler(move || on_stop_signal(&child_pid, &first_signal))
+    };
+    #[cfg(not(unix))]
     let _ = ctrlc::set_handler(|| {});
 
     let resolved = resolve_program(program);
-    let child = Command::new(&resolved)
-        .args(args)
-        .env(CONSOLE_CAPTURE_ENV, &path)
+    let mut command = Command::new(&resolved);
+    command.args(args).env(CONSOLE_CAPTURE_ENV, &path);
+    say_who_launched(&mut command, names_its_capture);
+    let child = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -439,6 +727,14 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
         }
     };
 
+    #[cfg(unix)]
+    child_pid.store(child.id(), std::sync::atomic::Ordering::Release);
+    // Dies with this process, however it dies. Best effort: without these the app still runs.
+    #[cfg(unix)]
+    let watch = DeathWatch::start(child.id());
+    #[cfg(windows)]
+    let job = victauri_test::process::KillOnCloseJob::assign(&child);
+
     let out = child.stdout.take().context("child stdout")?;
     let err = child.stderr.take().context("child stderr")?;
     let c1 = Arc::clone(&capture);
@@ -446,7 +742,20 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     let t_out = std::thread::spawn(move || pump(out, std::io::stdout(), "out", &c1));
     let t_err = std::thread::spawn(move || pump(err, std::io::stderr(), "err", &c2));
 
-    let status = child.wait().context("waiting for the app")?;
+    let status = child.wait();
+    // The app is done. Before anything else: what it deliberately left running (a dev server, a
+    // daemon) is not ours to kill, and a pid that has been reaped must never be signalled.
+    #[cfg(unix)]
+    child_pid.store(0, std::sync::atomic::Ordering::Release);
+    #[cfg(unix)]
+    if let Some(watch) = watch {
+        watch.disarm();
+    }
+    #[cfg(windows)]
+    if let Some(job) = job {
+        job.disarm();
+    }
+    let status = status.context("waiting for the app")?;
     // Drain whatever the child wrote before it died — this is where crash output lives. A
     // process the app started can inherit its stdout/stderr and keep them open after the app
     // exits; waiting for EOF then never ends and the exit record is never written. Give the
@@ -468,7 +777,7 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     if let Ok(mut c) = capture.lock() {
         c.record_exit(&summary);
     }
-    eprintln!("victauri run: app {summary}");
+    let _ = writeln!(std::io::stderr(), "victauri run: app {summary}");
     Ok(status.code().unwrap_or(1))
 }
 
@@ -528,6 +837,188 @@ mod tests {
             let s = ExitStatus::from_raw(6); // raw wait status: killed by signal 6
             assert!(describe_exit(s).contains("SIGABRT"));
         }
+    }
+
+    /// What a Windows console does with bytes that are not UTF-8: writes the valid prefix, then
+    /// fails on the rest. The prefix used to be written twice.
+    #[test]
+    fn pass_through_writes_a_console_rejected_chunk_once() {
+        struct Console(Vec<u8>);
+        impl Write for Console {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                match std::str::from_utf8(bytes) {
+                    Ok(_) => {
+                        self.0.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    Err(e) if e.valid_up_to() > 0 => {
+                        self.0.extend_from_slice(&bytes[..e.valid_up_to()]);
+                        Ok(e.valid_up_to())
+                    }
+                    Err(_) => Err(std::io::ErrorKind::InvalidData.into()),
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut console = Console(Vec::new());
+        pass_through(&mut console, b"ok \xff end");
+        assert_eq!(String::from_utf8(console.0).unwrap(), "ok \u{fffd} end");
+    }
+
+    /// A line longer than one record is split, none of it lost, whichever way the chunks fall.
+    #[test]
+    fn feed_assembles_lines_across_chunks_and_splits_long_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        let mut c = Capture::create(&path).unwrap();
+        c.feed("out", b"hel");
+        c.feed("err", b"E1\n");
+        c.feed("out", b"lo\nwor");
+        c.flush_partial("out");
+        let long = vec![b'x'; MAX_LINE_BYTES * 2 + 5];
+        c.feed("out", &long);
+        c.feed("out", b"\n");
+        let recs: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let line = |i: usize| recs[i]["l"].as_str().unwrap();
+        assert_eq!(line(0), "E1");
+        assert_eq!(recs[0]["s"], "err");
+        assert_eq!(line(1), "hello");
+        assert_eq!(line(2), "wor");
+        assert_eq!(
+            recs[3..]
+                .iter()
+                .map(|r| r["l"].as_str().unwrap().len())
+                .sum::<usize>(),
+            long.len()
+        );
+        assert!(
+            recs[3..]
+                .iter()
+                .all(|r| !r["l"].as_str().unwrap().contains('…'))
+        );
+    }
+
+    #[test]
+    fn capture_names_parse_and_nothing_else_does() {
+        assert_eq!(capture_group("12-34.jsonl"), Some((12, "12-34")));
+        assert_eq!(capture_group("12-34.jsonl.1"), Some((12, "12-34")));
+        assert_eq!(
+            capture_group("12-34.jsonl.1730000000000"),
+            Some((12, "12-34"))
+        );
+        for other in [
+            "notes.jsonl",
+            "12.jsonl",
+            "a-34.jsonl",
+            "12-34.txt",
+            "12-34.jsonl.x",
+            "12-.jsonl",
+            "12-34.jsonl.",
+        ] {
+            assert_eq!(capture_group(other), None, "{other}");
+        }
+    }
+
+    /// The app learns the launcher's pid only from a launcher that named the capture, and a
+    /// `--capture` run under another `victauri run` must not pass on the outer one's.
+    #[test]
+    fn only_a_capture_run_named_tells_the_app_its_pid() {
+        let told = |names_its_capture| {
+            let mut command = Command::new("x");
+            say_who_launched(&mut command, names_its_capture);
+            command
+                .get_envs()
+                .find(|(name, _)| *name == CONSOLE_LAUNCHER_ENV)
+                .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        };
+        assert_eq!(
+            told(true),
+            Some(Some(std::process::id().to_string().into()))
+        );
+        assert_eq!(told(false), Some(None), "removed from what it inherits");
+    }
+
+    /// The helper's last word goes to a child still there: after the wait it may have exited, and
+    /// its pid may be another process's by now.
+    #[cfg(unix)]
+    #[test]
+    fn the_helper_sends_no_kill_to_a_child_that_already_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kill.log");
+        // `kill` as the helper's shell sees it: SIGTERM lands, and then the child is gone.
+        let script = format!(
+            "kill() {{ echo \"$*\" >> '{}'; [ \"$1\" != -0 ]; }}\n{DEATH_WATCH_SCRIPT}",
+            log.display()
+        );
+        let status = Command::new("sh")
+            .args(["-c", &script, "victauri-run-watch", "4242", "10"])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        let _ = status;
+        let log = std::fs::read_to_string(&log).unwrap();
+        assert!(log.contains("-s TERM 4242"), "{log}");
+        assert!(!log.contains("-s KILL"), "{log}");
+    }
+
+    /// `victauri logs --stdout --follow` waits on this: a killed launcher its parent has not reaped
+    /// is gone too, and `kill -0` said alive, so the follow never ended.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_launcher_is_a_dead_one() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let own = capture_dir()
+            .unwrap()
+            .join(format!("{pid}-{}.jsonl", now_ms()));
+        std::fs::write(&own, "").unwrap();
+        let found = dead_launcher(&own);
+        let _ = std::fs::remove_file(&own);
+        child.wait().unwrap();
+        assert_eq!(found, Some(pid));
+    }
+
+    /// A pid that is certainly gone: a reaped child's, its handle still held by no one.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/C", "exit"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A `--capture` file's name is the user's: `20261102-120000.jsonl` holds no pid, however much
+    /// it looks like one, and calling that launcher dead ended a live follow. Only a capture in the
+    /// private directory is named by `victauri run`.
+    #[test]
+    fn only_a_capture_run_named_itself_has_a_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join(format!("{}-120000.jsonl", dead_pid()));
+        std::fs::write(&elsewhere, "").unwrap();
+        assert_eq!(dead_launcher(&elsewhere), None);
+
+        let pid = dead_pid();
+        let own = capture_dir()
+            .unwrap()
+            .join(format!("{pid}-{}.jsonl", now_ms()));
+        std::fs::write(&own, "").unwrap();
+        let found = dead_launcher(&own);
+        let _ = std::fs::remove_file(&own);
+        assert_eq!(found, Some(pid));
     }
 
     /// A shell one-liner that prints to both streams and exits 3.

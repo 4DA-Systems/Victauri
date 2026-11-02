@@ -45,6 +45,11 @@ pub fn json_truthy(value: &serde_json::Value) -> bool {
     }
 }
 
+/// First statement of every log projection: `window.__VICTAURI__?.x() || []` alone reads a page
+/// with no bridge as "nothing happened", which a health check then reports as healthy.
+pub(super) const NO_BRIDGE_GUARD: &str =
+    "if (!window.__VICTAURI__) throw new Error('the page has no Victauri bridge');";
+
 /// Build the JS that projects the webview IPC log down to just command names for
 /// `detect_ghost_commands`.
 ///
@@ -64,7 +69,7 @@ pub fn ghost_ipc_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter}\
+        "{NO_BRIDGE_GUARD} return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) || null; }})\
          .filter(function(x){{ return x; }})"
     )
@@ -88,7 +93,7 @@ pub fn ghost_ipc_outcomes_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (function() {{\
+        "{NO_BRIDGE_GUARD} return (function() {{\
          \n  var log = (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, backend_only: true }}) || []){filter};\
          \n  var byCmd = {{}};\
          \n  for (var i = 0; i < log.length; i++) {{\
@@ -306,7 +311,7 @@ pub fn ipc_timing_projection_js(since_ms: Option<i64>) -> String {
         _ => String::new(),
     };
     format!(
-        "return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, unrouted: true }}) || []){filter}\
+        "{NO_BRIDGE_GUARD} return (window.__VICTAURI__?.getIpcLog(0, {{ bodies: false, unrouted: true }}) || []){filter}\
          .map(function(c){{ return (c && c.command) ? {{ command: c.command, \
          duration_ms: (typeof c.duration_ms === 'number' ? c.duration_ms : null) }} : null; }})\
          .filter(function(x){{ return x; }})"
@@ -394,7 +399,8 @@ pub fn ipc_timing_stats(entries: &[serde_json::Value]) -> Vec<serde_json::Value>
 #[must_use]
 pub fn ipc_catalog_projection_js() -> String {
     // NB: kept as one returned expression so `eval_with_return` wraps it correctly.
-    "return (function(){\
+    "if (!window.__VICTAURI__) throw new Error('the page has no Victauri bridge');\
+     return (function(){\
         var MAXD = 5, MAXK = 60;\
         function shape(v, d){\
             if (v === null) return 'null';\
@@ -607,46 +613,66 @@ pub fn trusted_focus_probe_js(ref_id: &str) -> String {
 /// A real OS click lands on whatever is on screen at the point, so the point must be one
 /// where the element is actually hit: it runs the same checks as the bridge's
 /// actionability check for synthetic clicks (connected, enabled, visible, non-zero size,
-/// `pointer-events`, not covered at its center — the covering test is stricter: the hit
-/// element must be the element or inside it in the flat tree — slotted light-DOM content
-/// counts as inside the `<slot>` it renders in; the hit test descends into open shadow roots,
-/// whose content `elementFromPoint` otherwise reports as the shadow host) and then walks up
+/// `pointer-events`, not covered), and takes the point the bridge's `hitPoint` found: the
+/// element's center, or a real point of it when the center is not on it (a stroke-only circle,
+/// a control with a hole, a wrapped link). The covering test is stricter than a synthetic
+/// click's: the hit element must be the element or inside it in the flat tree (slotted light-DOM
+/// content counts as inside the `<slot>` it renders in; the hit test descends into open shadow
+/// roots, whose content `elementFromPoint` otherwise reports as the shadow host). It then walks up
 /// through same-origin frames,
 /// adding each frame's content offset and requiring the point to stay inside every
 /// viewport on the way and the frame itself to be the element hit there. Layout is page
 /// data, so the native side clamps the point to the window's client area as well.
+///
+/// The walk can only add offsets. A frame that is scaled, rotated or zoomed, on itself or on an
+/// ancestor, or a pinch-zoomed page, moves its content somewhere those offsets do not reach, and
+/// the click lands on whatever is there (another control, measured): those are refused, naming
+/// the synthetic click that works. A pure translation is in the offsets, and a transform around
+/// the element inside its own document is in the point the browser found.
 #[must_use]
 pub fn trusted_click_probe_js(ref_id: &str) -> String {
     format!(
-        "var __e=window.__VICTAURI__&&window.__VICTAURI__.getRef({}); \
-         if(!__e) return null; \
+        "var __v=window.__VICTAURI__,__id={}, __e=__v&&__v.getRef(__id); \
+         if(!__e){{var __m=__v&&__v.foreignRefError(__id);return __m?{{error:__m}}:null;}} \
          function __no(m){{return {{error:m}};}} \
          function __in(w,x,y){{return x>=0&&y>=0&&x<w.innerWidth&&y<w.innerHeight;}} \
          function __hit(d,x,y){{var h=d.elementFromPoint(x,y),g=0; \
            while(h&&h.shadowRoot&&g++<32){{var i=h.shadowRoot.elementFromPoint(x,y); \
              if(!i||i===h)break; h=i;}} return h;}} \
-         function __within(a,b){{for(var n=b;n;n=n.assignedSlot||n.parentNode||n.host){{if(n===a)return true;}} \
-           return false;}} \
+         var __warped='an OS click cannot be placed inside a frame that is scaled, rotated or zoomed \
+(on the frame or an ancestor of it): use a synthetic click (trusted: false)'; \
+         function __one(v,n){{var p=(v||'').split(' '); for(var i=0;i<p.length;i++) \
+           if(p[i]!==''&&p[i]!=='none'&&parseFloat(p[i])!==n) return false; return true;}} \
+         function __plain(t){{if(!t||t==='none') return true; \
+           var o=t.indexOf('('), v=t.slice(o+1,t.length-1).split(','), d=t.indexOf('matrix3d(')===0, \
+             want=d?[1,0,0,0,0,1,0,0,0,0,1,0]:[1,0,0,1]; \
+           if(!d&&t.indexOf('matrix(')!==0) return false; \
+           for(var i=0;i<want.length;i++) if(parseFloat(v[i])!==want[i]) return false; \
+           return !d||(parseFloat(v[14])===0&&parseFloat(v[15])===1);}} \
+         function __warps(w,el){{for(var n=el,g=0;n&&g<512;n=n.assignedSlot||n.parentNode||n.host,g++){{ \
+           if(n.nodeType!==1) continue; var c=w.getComputedStyle(n); \
+           if(!__plain(c.transform)||!__one(c.scale,1)||!__one(c.rotate,0)||!__one(c.zoom,1)|| \
+              (c.offsetPath&&c.offsetPath!=='none')) return true;}} return false;}} \
          if(!__e.isConnected) return __no('element is detached from the DOM'); \
          __e.scrollIntoView({{block:'center',inline:'center',behavior:'instant'}}); \
          var __d=__e.ownerDocument||document, __w=__d.defaultView||window; \
-         if(__e.disabled||(__e.getAttribute&&__e.getAttribute('aria-disabled')==='true')) \
+         if(__e.disabled===true||(__e.matches&&__e.matches(':disabled'))|| \
+            (__e.getAttribute&&__e.getAttribute('aria-disabled')==='true')) \
            return __no('element is disabled'); \
          var __s=__w.getComputedStyle(__e); \
-         if(__s.display==='none'||__s.visibility==='hidden'||parseFloat(__s.opacity)<0.01) \
+         if(__s.display==='none'||__s.visibility==='hidden') \
            return __no('element is not visible'); \
          if(__s.pointerEvents==='none') return __no('element has pointer-events: none'); \
-         var __b=__e.getBoundingClientRect(); \
-         if(!(__b.width>0&&__b.height>0)) return __no('element has zero size'); \
-         var __x=__b.left+__b.width/2, __y=__b.top+__b.height/2; \
+         var __pt=__v.hitPoint(__e,true); \
+         if(__pt.error) return __no(__pt.error); \
+         var __x=__pt.x, __y=__pt.y; \
          if(!__in(__w,__x,__y)) return __no('element center is outside the viewport'); \
-         var __t=__hit(__d,__x,__y); \
-         if(!__t||!__within(__e,__t)) \
-           return __no('element is covered at its center point'+(__t&&__t.tagName?' by <'+__t.tagName.toLowerCase()+'>':'')); \
          for(var __f=__w,__i=0;__f!==__f.top&&__i<32;__i++){{ \
            var __fe=null; try{{__fe=__f.frameElement;}}catch(__x2){{__fe=null;}} \
            if(!__fe) return __no('element is inside a cross-origin frame'); \
            var __p=__f.parent, __r=__fe.getBoundingClientRect(), __c=__p.getComputedStyle(__fe); \
+           if(__warps(__p,__fe)||(__fe.offsetWidth>0&&Math.abs(__r.width-__fe.offsetWidth)>1.5)|| \
+              (__fe.offsetHeight>0&&Math.abs(__r.height-__fe.offsetHeight)>1.5)) return __no(__warped); \
            __x+=__r.left+(__fe.clientLeft||0)+(parseFloat(__c.paddingLeft)||0); \
            __y+=__r.top+(__fe.clientTop||0)+(parseFloat(__c.paddingTop)||0); \
            if(!__in(__p,__x,__y)) return __no('element center is outside the viewport (clipped by its frame)'); \
@@ -654,7 +680,9 @@ pub fn trusted_click_probe_js(ref_id: &str) -> String {
              return __no('the frame holding the element is covered at the click point'); \
            __f=__p; \
          }} \
-         return {{x:__x, y:__y}}",
+         var __vv=__f.visualViewport; if(__vv&&__vv.scale!==undefined&&Math.abs(__vv.scale-1)>0.000001) \
+           return __no('an OS click cannot be placed on a pinch-zoomed page: use a synthetic click (trusted: false)'); \
+         return {{x:__x, y:__y, dpr:window.devicePixelRatio}}",
         js_string(ref_id)
     )
 }

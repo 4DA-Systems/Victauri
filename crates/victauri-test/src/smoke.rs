@@ -40,7 +40,8 @@ pub struct SmokeCheckResult {
     pub name: String,
     /// Whether the check passed.
     pub passed: bool,
-    /// Failure detail (empty when passed), or the reason a skipped check did not run.
+    /// Failure detail, the reason a skipped check did not run, or a note on a passing check (the
+    /// accessibility audit's non-critical counts). Usually empty when passed.
     pub detail: String,
     /// Wall-clock duration of this check.
     pub duration: Duration,
@@ -138,6 +139,7 @@ impl SmokeReport {
                     description: c.name.clone(),
                     passed: c.passed,
                     detail: c.detail.clone(),
+                    skipped: c.skipped,
                 })
                 .collect(),
         }
@@ -169,7 +171,7 @@ impl SmokeReport {
                 crate::terminal::single_line(&check.name),
                 check.duration.as_millis(),
             ));
-            if (!check.passed || check.skipped) && !check.detail.is_empty() {
+            if !check.detail.is_empty() {
                 out.push_str(&format!(
                     "         {}\n",
                     crate::terminal::single_line(&check.detail)
@@ -184,11 +186,13 @@ impl SmokeReport {
 ///
 /// ```
 /// let config = victauri_test::smoke::SmokeConfig::default();
-/// assert_eq!(config.max_dom_complete_ms, 10_000);
+/// assert_eq!(config.max_dom_complete_ms, 20_000);
 /// ```
 #[derive(Debug, Clone)]
 pub struct SmokeConfig {
-    /// Maximum acceptable DOM complete time in milliseconds (default: 10 000).
+    /// Maximum acceptable DOM complete time in milliseconds (default: 20 000). The default is a
+    /// sanity check, not a performance gate: the first launch of an app measures a cold webview
+    /// starting (12.5 s seen on a desktop, 11.1 s on a CI runner). Set your own to gate on it.
     pub max_dom_complete_ms: u64,
     /// Maximum acceptable JS heap usage in megabytes (default: 512).
     pub max_heap_mb: f64,
@@ -197,7 +201,7 @@ pub struct SmokeConfig {
 impl Default for SmokeConfig {
     fn default() -> Self {
         Self {
-            max_dom_complete_ms: 10_000,
+            max_dom_complete_ms: 20_000,
             max_heap_mb: 512.0,
         }
     }
@@ -224,17 +228,25 @@ impl VictauriClient {
         Ok(())
     }
 
-    /// Assert that DOM snapshot returns a valid tree with elements.
+    /// Assert that DOM snapshot returns a tree with at least one element.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::Assertion`] if the snapshot is empty or malformed.
     pub async fn assert_dom_snapshot_valid(&mut self) -> Result<(), TestError> {
         let snap = self.dom_snapshot().await?;
-        if snap.get("tree").is_none() && snap.get("ref_id").is_none() {
-            return Err(TestError::Assertion(
-                "DOM snapshot has no tree or ref_id".to_string(),
-            ));
+        let has_elements = match snap.get("tree") {
+            // The compact format, one line per element.
+            Some(Value::String(tree)) => !tree.trim().is_empty(),
+            Some(Value::Object(root)) => root.contains_key("ref_id"),
+            Some(_) => false,
+            None => snap.get("ref_id").is_some(),
+        };
+        if !has_elements {
+            return Err(TestError::Assertion(format!(
+                "DOM snapshot has no elements: {}",
+                crate::terminal::single_line(&snap.to_string())
+            )));
         }
         Ok(())
     }
@@ -243,18 +255,33 @@ impl VictauriClient {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Assertion`] if no image data in the response.
+    /// Returns [`TestError::Assertion`] if there is no image data in the response.
     pub async fn assert_screenshot_ok(&mut self) -> Result<(), TestError> {
-        // The tool responding is sufficient. Headless CI (Xvfb / no display
-        // session) has no native window handle to capture — which, now that the
-        // SDK honors MCP `isError` (0.7.6), surfaces as a tool-level error instead
-        // of being silently swallowed. That is an environment limitation, not a
-        // Victauri failure, so tolerate the "no window handle" case while still
-        // failing on transport/connection errors.
+        // Headless CI (Xvfb / no display session) has no native window to capture. That is an
+        // environment limit rather than a Victauri failure, so those exact errors are tolerated:
+        // matching "handle" alone also passed a real capture failure ("failed to handle ...").
+        const NO_WINDOW_TO_CAPTURE: &[&str] = &[
+            "the underlying handle is not available",
+            "unsupported window handle type",
+            "not available on pure Wayland",
+        ];
         match self.screenshot().await {
-            Ok(_) => Ok(()),
+            Ok(shot) => {
+                let is_image = shot.get("type").and_then(Value::as_str) == Some("image")
+                    && shot
+                        .get("data")
+                        .and_then(Value::as_str)
+                        .is_some_and(|data| !data.is_empty());
+                if is_image {
+                    Ok(())
+                } else {
+                    Err(TestError::Assertion(
+                        "screenshot returned no image data".to_string(),
+                    ))
+                }
+            }
             Err(TestError::ToolError(msg))
-                if msg.contains("handle") || msg.contains("not available") =>
+                if NO_WINDOW_TO_CAPTURE.iter().any(|known| msg.contains(known)) =>
             {
                 Ok(())
             }
@@ -280,15 +307,13 @@ impl VictauriClient {
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Assertion`] if the IPC integrity check reports
-    /// stale or errored calls.
+    /// Returns [`TestError::Assertion`] if the IPC integrity check reports stale calls (ones that
+    /// never got a response), or that Victauri cannot observe this page's IPC at all, which makes
+    /// "healthy" meaningless. A command that returned an error is a sound round trip and does not
+    /// fail this check.
     pub async fn assert_ipc_integrity_ok(&mut self) -> Result<(), TestError> {
         let integrity = self.check_ipc_integrity().await?;
-        let healthy = integrity
-            .get("healthy")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !healthy {
+        if !crate::client::ipc_integrity_is_healthy(&integrity) {
             return Err(TestError::Assertion(format!(
                 "IPC integrity unhealthy: {}",
                 serde_json::to_string(&integrity).unwrap_or_default()
@@ -297,79 +322,156 @@ impl VictauriClient {
         Ok(())
     }
 
-    /// Assert that the accessibility audit has zero violations.
+    /// Assert that the accessibility audit has zero violations, of any severity.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Assertion`] if any a11y violations are found.
+    /// Returns [`TestError::Assertion`] if any a11y violations are found, or if the audit has no
+    /// `violations` list to count.
     pub async fn assert_accessible(&mut self) -> Result<(), TestError> {
         let audit = self.audit_accessibility().await?;
-        let violations = audit
-            .pointer("/summary/violations")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        if violations > 0 {
-            let details = audit.get("violations").cloned().unwrap_or(Value::Null);
+        let Some(violations) = audit.get("violations").and_then(Value::as_array) else {
             return Err(TestError::Assertion(format!(
-                "{violations} a11y violation(s): {}",
-                serde_json::to_string(&details).unwrap_or_default()
+                "accessibility audit has no `violations` list: {}",
+                crate::terminal::single_line(&audit.to_string())
+            )));
+        };
+        if !violations.is_empty() {
+            return Err(TestError::Assertion(format!(
+                "{} a11y violation(s): {}",
+                violations.len(),
+                crate::terminal::single_line(&Value::Array(violations.clone()).to_string())
             )));
         }
         Ok(())
     }
 
+    /// The smoke suite's accessibility check, deliberately looser than
+    /// [`Self::assert_accessible`]: real apps routinely have a few non-critical findings, so only
+    /// critical ones fail. Returns a note naming the rest.
+    async fn smoke_accessibility(&mut self) -> Result<String, TestError> {
+        let audit = self.audit_accessibility().await?;
+        let count = |severity: &str| audit.pointer(&format!("/summary/{severity}"))?.as_u64();
+        let Some(critical) = count("critical") else {
+            return Err(TestError::Assertion(format!(
+                "accessibility audit has no `summary.critical` count: {}",
+                crate::terminal::single_line(&audit.to_string())
+            )));
+        };
+        if critical > 0 {
+            let details = audit.get("violations").cloned().unwrap_or(Value::Null);
+            return Err(TestError::Assertion(format!(
+                "{critical} critical a11y violation(s): {}",
+                crate::terminal::single_line(&details.to_string())
+            )));
+        }
+        let (serious, moderate, minor) = (
+            count("serious").unwrap_or(0),
+            count("moderate").unwrap_or(0),
+            count("minor").unwrap_or(0),
+        );
+        Ok(if serious + moderate + minor == 0 {
+            String::new()
+        } else {
+            format!(
+                "0 critical; {serious} serious, {moderate} moderate, {minor} minor \
+                 (violations and warnings; assert_accessible fails on any violation)"
+            )
+        })
+    }
+
     /// Assert DOM complete time is under the given duration.
     ///
-    /// Passes silently if the browser does not expose navigation timing.
+    /// Passes silently if there is nothing to measure: the browser does not expose navigation
+    /// timing, or the page has not finished loading. [`Self::smoke_test`] reports that as skipped.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::Assertion`] if load time exceeds the budget.
     pub async fn assert_dom_complete_under(&mut self, max: Duration) -> Result<(), TestError> {
+        self.dom_complete_check(max).await.map(|_| ())
+    }
+
+    /// [`Self::assert_dom_complete_under`]: `Ok(Ok(ms))` is what it measured, `Ok(Err(reason))`
+    /// why it measured nothing.
+    async fn dom_complete_check(
+        &mut self,
+        max: Duration,
+    ) -> Result<Result<f64, String>, TestError> {
         let metrics = self.get_performance_metrics().await?;
-        if let Some(ms) = metrics
+        let ms = metrics
             .pointer("/navigation/dom_complete_ms")
-            .and_then(Value::as_f64)
-        {
-            let max_ms = max.as_millis() as f64;
-            if ms > max_ms {
-                return Err(TestError::Assertion(format!(
-                    "DOM complete took {ms:.0}ms, budget is {max_ms:.0}ms"
-                )));
-            }
+            .and_then(Value::as_f64);
+        // `domComplete` is 0 until the document completes, whatever the page's real load time.
+        let Some(ms) = ms.filter(|ms| *ms > 0.0) else {
+            return Ok(Err(
+                "skipped: no DOM complete time to judge (the page has not finished loading, or \
+                 this webview has no navigation timing)"
+                    .to_string(),
+            ));
+        };
+        let max_ms = max.as_millis() as f64;
+        if ms > max_ms {
+            return Err(TestError::Assertion(format!(
+                "DOM complete took {ms:.0}ms, budget is {max_ms:.0}ms"
+            )));
         }
-        Ok(())
+        Ok(Ok(ms))
     }
 
     /// Assert JS heap usage is under the given megabyte limit.
     ///
-    /// Passes silently if the browser does not expose heap metrics.
+    /// Passes silently if the browser does not expose heap metrics (`WebKit` does not).
+    /// [`Self::smoke_test`] reports that as skipped.
     ///
     /// # Errors
     ///
     /// Returns [`TestError::Assertion`] if heap exceeds the budget.
     pub async fn assert_heap_under_mb(&mut self, max_mb: f64) -> Result<(), TestError> {
+        self.heap_check(max_mb).await.map(|_| ())
+    }
+
+    /// [`Self::assert_heap_under_mb`]; `Ok(Some(reason))` when it measured nothing.
+    async fn heap_check(&mut self, max_mb: f64) -> Result<Option<String>, TestError> {
         let metrics = self.get_performance_metrics().await?;
-        if let Some(used) = metrics.pointer("/js_heap/used_mb").and_then(Value::as_f64)
-            && used > max_mb
-        {
+        let Some(used) = metrics.pointer("/js_heap/used_mb").and_then(Value::as_f64) else {
+            let why = metrics
+                .pointer("/js_heap/reason")
+                .and_then(Value::as_str)
+                .unwrap_or("this webview reports no JS heap size");
+            return Ok(Some(format!("skipped: {why}")));
+        };
+        if used > max_mb {
             return Err(TestError::Assertion(format!(
                 "JS heap is {used:.1}MB, budget is {max_mb:.1}MB"
             )));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Assert there are no uncaught errors in the console log.
     ///
-    /// Checks for entries with `[uncaught]` prefix (from the JS bridge's
-    /// `window.onerror` and `unhandledrejection` handlers).
+    /// Checks for entries the JS bridge's `window.onerror` (`[uncaught]`) and
+    /// `unhandledrejection` (`[unhandled rejection]`) handlers logged, among the newest 1000 console
+    /// entries.
     ///
     /// # Errors
     ///
-    /// Returns [`TestError::Assertion`] if uncaught errors are found.
+    /// Returns [`TestError::Assertion`] if uncaught errors are found, or if the console log is full
+    /// and shows none: an older one may have rolled off. [`Self::smoke_test`] reports that as skipped,
+    /// since a chatty app has not failed anything.
     pub async fn assert_no_uncaught_errors(&mut self) -> Result<(), TestError> {
-        let log = self.logs("console", None).await?;
+        match self.uncaught_errors_check().await? {
+            Some(reason) => Err(TestError::Assertion(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::assert_no_uncaught_errors`]; `Ok(Some(reason))` when the log cannot say.
+    async fn uncaught_errors_check(&mut self) -> Result<Option<String>, TestError> {
+        let log = self
+            .logs("console", Some(crate::assertions::LOG_WINDOW))
+            .await?;
         let entries = log
             .as_array()
             .or_else(|| log.get("entries").and_then(Value::as_array));
@@ -378,7 +480,7 @@ impl VictauriClient {
                 .iter()
                 .filter_map(|e| {
                     let msg = e.get("message").and_then(Value::as_str)?;
-                    if msg.starts_with("[uncaught]") {
+                    if msg.starts_with("[uncaught]") || msg.starts_with("[unhandled rejection]") {
                         Some(msg)
                     } else {
                         None
@@ -398,8 +500,11 @@ impl VictauriClient {
                         .join("; ")
                 )));
             }
+            if entries.len() >= crate::assertions::LOG_WINDOW {
+                return Ok(Some(crate::assertions::console_log_full_detail()));
+            }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Assert that the recording lifecycle works end-to-end.
@@ -553,6 +658,24 @@ impl VictauriClient {
             }};
         }
 
+        // A check that may pass with a note: its expression yields the note (or "").
+        macro_rules! noted_check {
+            ($name:expr, $expr:expr) => {{
+                let start = Instant::now();
+                let outcome: Result<String, TestError> = $expr;
+                checks.push(SmokeCheckResult {
+                    name: $name.to_string(),
+                    passed: outcome.is_ok(),
+                    skipped: false,
+                    detail: match outcome {
+                        Ok(note) => note,
+                        Err(e) => e.to_string(),
+                    },
+                    duration: start.elapsed(),
+                });
+            }};
+        }
+
         // A check that may be SKIPPED: its expression yields `Ok(Some(reason))` when it chose not
         // to run (the reason becomes the detail), `Ok(None)` when it passed.
         macro_rules! skippable_check {
@@ -583,16 +706,27 @@ impl VictauriClient {
             "IPC integrity healthy",
             self.assert_ipc_integrity_ok().await
         );
-        check!("no uncaught errors", self.assert_no_uncaught_errors().await);
-        check!("accessibility audit", self.assert_accessible().await);
-        check!(
-            format!("DOM complete < {}ms", config.max_dom_complete_ms),
-            self.assert_dom_complete_under(Duration::from_millis(config.max_dom_complete_ms))
-                .await
-        );
-        check!(
+        // Skippable, like the two budgets below: a check that could not judge anything says so.
+        skippable_check!("no uncaught errors", self.uncaught_errors_check().await);
+        noted_check!("accessibility audit", self.smoke_accessibility().await);
+        let start = Instant::now();
+        let outcome = self
+            .dom_complete_check(Duration::from_millis(config.max_dom_complete_ms))
+            .await;
+        checks.push(SmokeCheckResult {
+            name: format!("DOM complete < {}ms", config.max_dom_complete_ms),
+            passed: outcome.is_ok(),
+            skipped: matches!(outcome, Ok(Err(_))),
+            detail: match outcome {
+                Ok(Ok(ms)) => format!("took {ms:.0}ms"),
+                Ok(Err(reason)) => reason,
+                Err(e) => e.to_string(),
+            },
+            duration: start.elapsed(),
+        });
+        skippable_check!(
             format!("heap < {:.0}MB", config.max_heap_mb),
-            self.assert_heap_under_mb(config.max_heap_mb).await
+            self.heap_check(config.max_heap_mb).await
         );
         // Skippable: never ends a recording another client has in progress (R5B-SMOKE1).
         skippable_check!(
@@ -709,7 +843,7 @@ mod tests {
     #[test]
     fn smoke_config_defaults() {
         let config = SmokeConfig::default();
-        assert_eq!(config.max_dom_complete_ms, 10_000);
+        assert_eq!(config.max_dom_complete_ms, 20_000);
         assert!((config.max_heap_mb - 512.0).abs() < f64::EPSILON);
     }
 

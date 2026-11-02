@@ -247,6 +247,239 @@ mod trusted_probe_js {
         assert_eq!(results[4]["y"], 226.0, "{}", results[4]);
     }
 
+    /// A real click into a scaled, rotated or zoomed frame lands elsewhere: the walk adds the
+    /// frame's offset and nothing can invert the rest, so it hit another live control. Refused.
+    /// jsdom computes no style, so each case states what an engine computes (`matrix(...)`).
+    #[test]
+    fn click_probe_refuses_a_frame_it_cannot_place_a_click_in() {
+        let probe = trusted_click_probe_js("__VREF__");
+        let frame = |frame_style: &str, ancestor_style: &str| {
+            format!(
+                "var host = document.getElementById('frame-host'); \
+                 var f = document.createElement('iframe'); host.appendChild(f); \
+                 var fw = f.contentWindow, fd = f.contentDocument; \
+                 fd.body.innerHTML = '<button id=\"inner\">In frame</button>'; \
+                 var baseRect = window.HTMLElement.prototype.getBoundingClientRect; \
+                 fw.HTMLElement.prototype.getBoundingClientRect = baseRect; \
+                 fw.HTMLElement.prototype.scrollIntoView = function () {{}}; \
+                 window.HTMLElement.prototype.getBoundingClientRect = function () {{ \
+                   if (this.tagName === 'IFRAME') return {{left: 100, top: 200, width: 300, \
+                     height: 150, right: 400, bottom: 350, x: 100, y: 200}}; \
+                   return baseRect.call(this); }}; \
+                 fd.elementFromPoint = function () {{ return fd.getElementById('inner'); }}; \
+                 document.elementFromPoint = function () {{ return f; }}; \
+                 var cs = window.getComputedStyle; \
+                 window.getComputedStyle = function (el) {{ var o = cs.call(window, el), add = \
+                   el === f ? {frame_style} : (el === host ? {ancestor_style} : {{}}); \
+                   return new Proxy(o, {{ get: function (t, k) {{ return k in add ? add[k] : t[k]; }} }}); }};"
+            )
+        };
+        let find = "{tag:'button', text:'In frame'}";
+        let refused: Vec<(&str, String)> = vec![
+            (
+                "scale",
+                frame("{transform:'matrix(2, 0, 0, 2, 0, 0)'}", "{}"),
+            ),
+            (
+                "rotate",
+                frame("{transform:'matrix(0, 1, -1, 0, 0, 0)'}", "{}"),
+            ),
+            (
+                "3d scale",
+                frame(
+                    "{transform:'matrix3d(2,0,0,0,0,2,0,0,0,0,1,0,0,0,0,1)'}",
+                    "{}",
+                ),
+            ),
+            ("scale property", frame("{scale:'2'}", "{}")),
+            ("rotate property", frame("{rotate:'45deg'}", "{}")),
+            ("zoom", frame("{zoom:'2'}", "{}")),
+            (
+                "ancestor scale",
+                frame("{}", "{transform:'matrix(1.5, 0, 0, 1.5, 0, 0)'}"),
+            ),
+            ("ancestor zoom", frame("{}", "{zoom:'1.5'}")),
+        ];
+        let allowed: Vec<(&str, String)> = vec![
+            ("no transform", frame("{}", "{}")),
+            (
+                "identity",
+                frame(
+                    "{transform:'matrix(1, 0, 0, 1, 0, 0)',scale:'none',rotate:'none',translate:'none',zoom:'1'}",
+                    "{}",
+                ),
+            ),
+            (
+                "translation",
+                frame("{transform:'matrix(1, 0, 0, 1, 30, 20)'}", "{}"),
+            ),
+            (
+                "3d translation",
+                frame(
+                    "{transform:'matrix3d(1,0,0,0,0,1,0,0,0,0,1,0,30,20,0,1)'}",
+                    "{}",
+                ),
+            ),
+            ("translate property", frame("{translate:'30px 20px'}", "{}")),
+            (
+                "ancestor translation",
+                frame("{}", "{transform:'matrix(1, 0, 0, 1, 5, 5)'}"),
+            ),
+        ];
+        let no_frame = "var host = document.getElementById('frame-host'); host.appendChild(document.getElementById('btn')); \
+             var cs = window.getComputedStyle; \
+             window.getComputedStyle = function (el) { var o = cs.call(window, el); \
+               return new Proxy(o, { get: function (t, k) { return (el === host && k === 'transform') ? 'matrix(2, 0, 0, 2, 0, 0)' : t[k]; } }); };".to_string();
+        let no_frame = format!("{HIT_TEST} {no_frame}");
+        let pinch = format!(
+            "{HIT_TEST} window.visualViewport = {{scale: 2, offsetLeft: 0, offsetTop: 0}};"
+        );
+        let no_pinch = format!(
+            "{HIT_TEST} window.visualViewport = {{scale: 1, offsetLeft: 0, offsetTop: 0}};"
+        );
+        let mut cases: Vec<(&str, &str, &str, &str, String)> = Vec::new();
+        for (name, setup) in refused.iter().chain(allowed.iter()) {
+            cases.push((name, PAGE, setup.as_str(), find, probe.clone()));
+        }
+        cases.push((
+            "a scaled ancestor with no frame",
+            PAGE,
+            no_frame.as_str(),
+            "{css:'#btn'}",
+            probe.clone(),
+        ));
+        cases.push((
+            "pinch zoom",
+            PAGE,
+            pinch.as_str(),
+            "{css:'#btn'}",
+            probe.clone(),
+        ));
+        cases.push((
+            "no pinch zoom",
+            PAGE,
+            no_pinch.as_str(),
+            "{css:'#btn'}",
+            probe.clone(),
+        ));
+        let Some(results) = run(&cases) else {
+            return;
+        };
+        for (i, (name, _)) in refused.iter().enumerate() {
+            let why = results[i]["error"].as_str().unwrap_or_default();
+            assert!(why.contains("synthetic"), "{name}: {}", results[i]);
+        }
+        for (i, (name, _)) in allowed.iter().enumerate() {
+            let at = refused.len() + i;
+            assert!(results[at]["x"].is_number(), "{name}: {}", results[at]);
+        }
+        let at = refused.len() + allowed.len();
+        assert!(results[at]["x"].is_number(), "no frame: {}", results[at]);
+        let why = results[at + 1]["error"].as_str().unwrap_or_default();
+        assert!(why.contains("synthetic"), "pinch: {}", results[at + 1]);
+        assert!(
+            results[at + 2]["x"].is_number(),
+            "no pinch: {}",
+            results[at + 2]
+        );
+    }
+
+    /// The trusted coordinates are the point the bridge found, not the box's centre: a real OS
+    /// click at the centre of a stroke-only circle lands in empty space.
+    #[test]
+    fn click_probe_returns_the_point_that_was_found() {
+        let probe = trusted_click_probe_js("__VREF__");
+        // A circle of radius 40 around (100, 100), placed at (20, 10) by its screen CTM.
+        let stroke = "window.Element.prototype.scrollIntoView = function () {}; \
+             var c = document.getElementById('c'); \
+             c.getBoundingClientRect = function () { return {left: 80, top: 70, width: 80, height: 80, \
+               right: 160, bottom: 150, x: 80, y: 70}; }; \
+             c.getTotalLength = function () { return 2 * Math.PI * 40; }; \
+             c.getPointAtLength = function (s) { var t = s / 40; \
+               return {x: 100 + 40 * Math.cos(t), y: 100 + 40 * Math.sin(t)}; }; \
+             c.getScreenCTM = function () { return {a: 1, b: 0, c: 0, d: 1, e: 20, f: 10}; }; \
+             window.__onStroke = function (x, y) { return Math.abs(Math.hypot(x - 120, y - 110) - 40) < 1; }; \
+             document.elementFromPoint = function (x, y) { \
+               return window.__onStroke(x, y) ? c : document.body; };";
+        let stroke_html = r#"<html><body><svg width="200" height="200"><circle id="c" r="40"></circle></svg></body></html>"#;
+        let stroke_framed = "var f = document.createElement('iframe'); document.body.appendChild(f); \
+             var fw = f.contentWindow, fd = f.contentDocument; \
+             fd.body.innerHTML = '<svg width=\"200\" height=\"200\"><circle id=\"c\" r=\"40\"></circle></svg>'; \
+             fw.Element.prototype.scrollIntoView = function () {}; \
+             var c = fd.getElementById('c'); \
+             c.getBoundingClientRect = function () { return {left: 80, top: 70, width: 80, height: 80, \
+               right: 160, bottom: 150, x: 80, y: 70}; }; \
+             c.getTotalLength = function () { return 2 * Math.PI * 40; }; \
+             c.getPointAtLength = function (s) { var t = s / 40; \
+               return {x: 100 + 40 * Math.cos(t), y: 100 + 40 * Math.sin(t)}; }; \
+             c.getScreenCTM = function () { return {a: 1, b: 0, c: 0, d: 1, e: 20, f: 10}; }; \
+             fd.elementFromPoint = function (x, y) { \
+               return Math.abs(Math.hypot(x - 120, y - 110) - 40) < 1 ? c : fd.body; }; \
+             f.getBoundingClientRect = function () { return {left: 1000, top: 2000, width: 300, height: 300, \
+               right: 1300, bottom: 2300, x: 1000, y: 2000}; }; \
+             window.innerWidth = 5000; window.innerHeight = 5000; \
+             document.elementFromPoint = function () { return f; };";
+        let wrapped = "var l = document.getElementById('l'); \
+             l.getBoundingClientRect = function () { return {left: 0, top: 0, width: 100, height: 60, \
+               right: 100, bottom: 60, x: 0, y: 0}; }; \
+             l.getClientRects = function () { return [ \
+               {left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16}, \
+               {left: 0, top: 44, right: 30, bottom: 60, width: 30, height: 16}]; }; \
+             document.elementFromPoint = function (x, y) { \
+               return (Math.floor(x) === 15 && Math.floor(y) === 52) ? l : document.body; };";
+        let wrapped_html = r#"<html><body><a id="l" href="x">wrapped</a></body></html>"#;
+        let clipped_away = "window.Element.prototype.scrollIntoView = function () {}; \
+             document.getElementById('c').getBoundingClientRect = function () { \
+               return {left: 80, top: 70, width: 80, height: 80, right: 160, bottom: 150, x: 80, y: 70}; }; \
+             document.elementFromPoint = function () { return document.body; };";
+        let Some(results) = run(&[
+            (
+                "stroke-only circle",
+                stroke_html,
+                stroke,
+                "{css:'#c'}",
+                probe.clone(),
+            ),
+            (
+                "stroke-only circle in a frame",
+                "<html><body></body></html>",
+                stroke_framed,
+                "{css:'#c'}",
+                probe.clone(),
+            ),
+            (
+                "second line of a wrapped link",
+                wrapped_html,
+                wrapped,
+                "{css:'#l'}",
+                probe.clone(),
+            ),
+            (
+                "nothing of it can be hit",
+                stroke_html,
+                clipped_away,
+                "{css:'#c'}",
+                probe,
+            ),
+        ]) else {
+            return;
+        };
+        let on_stroke = |v: &serde_json::Value, ox: f64, oy: f64| {
+            let (x, y) = (v["x"].as_f64().unwrap(), v["y"].as_f64().unwrap());
+            ((x - ox - 120.0).hypot(y - oy - 110.0) - 40.0).abs() < 1.0
+        };
+        assert!(on_stroke(&results[0], 0.0, 0.0), "{}", results[0]);
+        assert!(on_stroke(&results[1], 1000.0, 2000.0), "{}", results[1]);
+        assert_eq!(results[2]["x"], 15.0, "{}", results[2]);
+        assert_eq!(results[2]["y"], 52.0, "{}", results[2]);
+        assert!(
+            results[3]["error"].as_str().unwrap().contains("covered")
+                && results[3].get("x").is_none(),
+            "{}",
+            results[3]
+        );
+    }
+
     /// A button inside an OPEN shadow root, hit-tested the way a browser does:
     /// `document.elementFromPoint` reports the shadow HOST (retargeting); only the shadow root's
     /// own `elementFromPoint` sees the button. `cover_inner` makes something else inside the

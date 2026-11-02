@@ -15,9 +15,9 @@ const DEFAULT_INTERVAL_SECS: u64 = 5;
 const MIN_MAX_FAILURES: u32 = 1;
 /// Default consecutive-failure threshold when unset or unparseable.
 const DEFAULT_MAX_FAILURES: u32 = 3;
-/// Hard timeout for a recovery command. A hung recovery (e.g. a command that
-/// blocks forever) must not wedge the watchdog itself, so the child is killed
-/// after this many seconds and the failure is reported.
+/// How long the watchdog waits for a recovery command. One that is still running
+/// after this (a foreground restart, or a hang) must not wedge the watchdog, so
+/// it stops waiting and leaves it running (see `run_recovery`).
 const RECOVERY_TIMEOUT_SECS: u64 = 60;
 
 /// Port polled when none is configured and discovery finds no single live app.
@@ -42,10 +42,7 @@ impl Config {
     fn from_env() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let (arg_port, arg_app) = parse_args(&args);
-        let explicit_port = std::env::var("VICTAURI_PORT")
-            .ok()
-            .and_then(|s| s.trim().parse().ok())
-            .or(arg_port);
+        let explicit_port = explicit_port(std::env::var("VICTAURI_PORT").ok().as_deref(), arg_port);
         Self {
             port: explicit_port.unwrap_or(DEFAULT_PORT),
             port_explicit: explicit_port.is_some(),
@@ -62,6 +59,15 @@ impl Config {
             on_failure_cmd: std::env::var("VICTAURI_ON_FAILURE").ok(),
         }
     }
+}
+
+/// The explicitly configured port: `VICTAURI_PORT`, else the positional argument.
+fn explicit_port(env: Option<&str>, arg: Option<u16>) -> Option<u16> {
+    // 0 is no port (victauri-test filters it too). As an "explicit" port it skipped discovery,
+    // polled nothing, and so fired recovery against a healthy app.
+    env.and_then(|s| s.trim().parse().ok())
+        .filter(|p: &u16| *p != 0)
+        .or(arg.filter(|p| *p != 0))
 }
 
 /// Parse CLI args: an optional positional `PORT` and `--app <id>` / `--app=<id>`.
@@ -721,9 +727,16 @@ async fn main() -> anyhow::Result<()> {
                     "Executing recovery action"
                 );
                 tracing::debug!(command = cmd, "Full recovery command line");
-                match run_recovery(cmd).await {
-                    Ok(status) => {
+                match run_recovery(cmd, Duration::from_secs(RECOVERY_TIMEOUT_SECS)).await {
+                    Ok(Some(status)) => {
                         tracing::info!(exit_code = ?status.code(), "Recovery action completed");
+                    }
+                    Ok(None) => {
+                        tracing::warn!(
+                            waited_secs = RECOVERY_TIMEOUT_SECS,
+                            "Recovery action is still running (a restart command that stays in \
+                             the foreground, or one that hung); left running, monitoring resumes"
+                        );
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "Recovery action failed to execute");
@@ -790,28 +803,30 @@ fn recovery_program_name(cmd: &str) -> &str {
     cmd.split_whitespace().next().unwrap_or("(empty)")
 }
 
-async fn run_recovery(cmd: &str) -> anyhow::Result<std::process::ExitStatus> {
-    // Spawn (not `.status()`) so we can enforce a timeout and kill a hung child —
-    // a recovery command that never returns must not block the watchdog forever.
-    let mut child = if cfg!(windows) {
-        tokio::process::Command::new("cmd")
-            .args(["/C", cmd])
-            .spawn()?
-    } else {
-        tokio::process::Command::new("sh")
-            .args(["-c", cmd])
-            .spawn()?
-    };
-    match tokio::time::timeout(Duration::from_secs(RECOVERY_TIMEOUT_SECS), child.wait()).await {
-        Ok(status) => Ok(status?),
-        Err(_elapsed) => {
-            // Kill the wrapping shell so the watchdog loop is freed. (A grandchild
-            // the shell spawned may outlive it; the watchdog's job is to not wedge.)
-            let _ = child.kill().await;
-            anyhow::bail!(
-                "recovery command timed out after {RECOVERY_TIMEOUT_SECS}s and was killed"
-            );
-        }
+/// Run the recovery command through the shell. `Ok(None)`: it is still running after `wait`.
+///
+/// It is never killed. A restart command commonly stays in the foreground, and `sh -c ./myapp`
+/// commonly execs in place, so the "shell" is the restarted app: killing it took the app down
+/// again, while the watchdog (already fired for this outage) stayed silent. A recovery command
+/// that hung costs one idle process per outage; the watchdog itself is freed either way.
+async fn run_recovery(
+    cmd: &str,
+    wait: Duration,
+) -> anyhow::Result<Option<std::process::ExitStatus>> {
+    #[cfg(windows)]
+    let mut child = tokio::process::Command::new("cmd")
+        // Raw, as cmd.exe parses it: std's argv escaping turns an inner `"` into `\"`, which cmd
+        // does not understand, so any quoted path (`"C:\Program Files\..."`) failed to run.
+        // `/s` strips exactly the outer quotes; `/d` skips the machine's AutoRun commands.
+        .raw_arg(format!("/d /s /c \"{cmd}\""))
+        .spawn()?;
+    #[cfg(not(windows))]
+    let mut child = tokio::process::Command::new("sh")
+        .args(["-c", cmd])
+        .spawn()?;
+    match tokio::time::timeout(wait, child.wait()).await {
+        Ok(status) => Ok(Some(status?)),
+        Err(_elapsed) => Ok(None),
     }
 }
 
@@ -822,6 +837,8 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+    /// Far longer than any of these commands take.
+    const WAIT: Duration = Duration::from_secs(30);
 
     fn clear_env() {
         // SAFETY: test-only — ENV_LOCK serializes all env access in this module.
@@ -832,6 +849,17 @@ mod tests {
             std::env::remove_var("VICTAURI_ON_FAILURE");
             std::env::remove_var("VICTAURI_APP");
         }
+    }
+
+    /// `VICTAURI_PORT=0` says "no port from the environment", which must not discard the one
+    /// given on the command line.
+    #[test]
+    fn a_zero_port_in_the_environment_keeps_the_argument() {
+        assert_eq!(explicit_port(Some("0"), Some(7380)), Some(7380));
+        assert_eq!(explicit_port(Some("0"), None), None);
+        assert_eq!(explicit_port(None, Some(0)), None);
+        assert_eq!(explicit_port(Some("9999"), Some(7380)), Some(9999));
+        assert_eq!(explicit_port(Some("junk"), Some(7380)), Some(7380));
     }
 
     #[test]
@@ -1460,17 +1488,80 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    /// A quoted path is the normal form for `C:\Program Files\...`: std's MSVCRT escaping turned
+    /// the inner `"` into `\"`, which cmd.exe does not understand, so recovery never ran.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn recovery_runs_a_quoted_path_with_spaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("Program Files");
+        std::fs::create_dir_all(&sub).unwrap();
+        let script = sub.join("restart app.cmd");
+        let marker = dir.path().join("marker.txt");
+        std::fs::write(
+            &script,
+            format!("@echo ran %1> \"{}\"\r\n", marker.display()),
+        )
+        .unwrap();
+        let cmd = format!("\"{}\" --flag", script.display());
+        let status = run_recovery(&cmd, WAIT).await.unwrap().unwrap();
+        assert!(status.success(), "{status:?}");
+        assert!(
+            std::fs::read_to_string(&marker).unwrap().contains("--flag"),
+            "the recovery command did not run"
+        );
+    }
+
+    /// `VICTAURI_PORT=0` is no port (`victauri-test` filters it too). As an "explicit" port it
+    /// skipped discovery, polled nothing and fired recovery against a healthy app.
+    #[test]
+    fn victauri_port_zero_is_not_explicit() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        clear_env();
+        // SAFETY: ENV_LOCK serializes all env access in this module.
+        unsafe { std::env::set_var("VICTAURI_PORT", "0") };
+        let config = Config::from_env();
+        clear_env();
+        assert!(!config.port_explicit);
+        assert_eq!(config.port, DEFAULT_PORT);
+    }
+
     #[tokio::test]
     async fn recovery_runs_echo() {
         let cmd = "echo ok";
-        let status = run_recovery(cmd).await.unwrap();
+        let status = run_recovery(cmd, WAIT).await.unwrap().unwrap();
         assert!(status.success());
     }
 
     #[tokio::test]
     async fn recovery_bad_command_fails() {
         let cmd = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
-        let status = run_recovery(cmd).await.unwrap();
+        let status = run_recovery(cmd, WAIT).await.unwrap().unwrap();
         assert!(!status.success());
+    }
+
+    /// A foreground restart command: `sh -c` execs in place, so the shell IS the restarted app,
+    /// and the timeout's kill took it straight back down.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_recovery_command_still_running_after_the_wait_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let cmd = format!("echo $$ > '{}'; exec sleep 30", pid_file.display());
+        let outcome = run_recovery(&cmd, Duration::from_millis(800)).await;
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let pid = pid.trim();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let probe = |signal: &str| {
+            std::process::Command::new("sh")
+                .args(["-c", &format!("kill {signal} {pid}")])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let alive = probe("-0");
+        probe("-9");
+        assert!(alive, "the restarted app must survive the wait");
     }
 }

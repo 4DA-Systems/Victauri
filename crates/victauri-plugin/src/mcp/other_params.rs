@@ -126,7 +126,7 @@ pub struct WaitForParams {
     /// For the `expression` condition: the JSON value the expression must equal
     /// to satisfy the wait. When omitted, the wait is satisfied as soon as the
     /// expression evaluates to a truthy value.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "super::backend_params::present_value")]
     pub expected: Option<serde_json::Value>,
     /// For the `event` condition: how far back (in milliseconds) to look for a
     /// matching event when the wait begins, so an event that fired just before
@@ -164,8 +164,16 @@ pub struct AppStateParams {
 /// Parameters for the `find_elements` tool.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct FindElementsParams {
-    /// Text content to search for (case-insensitive substring match).
+    /// Text to search for: case-insensitive substring of the element's normalised full text. Returns only the deepest matches.
     pub text: Option<String>,
+    /// Exact text: the element's normalised full text equals this (case-sensitive). Returns only the deepest matches.
+    pub text_exact: Option<String>,
+    /// Attribute name the element must have.
+    pub attribute: Option<String>,
+    /// Exact value the `attribute` must have (needs `attribute`).
+    pub attribute_value: Option<String>,
+    /// If true, also return elements under display:none or visibility:hidden; each result's `visible` says which is which.
+    pub include_hidden: Option<bool>,
     /// ARIA role to match (exact match).
     pub role: Option<String>,
     /// data-testid attribute value to match (exact match).
@@ -174,9 +182,9 @@ pub struct FindElementsParams {
     pub css: Option<String>,
     /// Alias for `css` — CSS selector to match.
     pub selector: Option<String>,
-    /// Accessible name to search for (aria-label, title, placeholder -- case-insensitive substring).
+    /// Accessible name to search for, case-insensitive substring: aria-label, then aria-labelledby, then an associated label, then the text of a button/link/summary-like element, then title and placeholder.
     pub name: Option<String>,
-    /// Maximum number of results to return. Default: 10.
+    /// Maximum number of results to return, up to 5000; 0 returns none. Default: 10. Filters apply before the cap.
     pub max_results: Option<u32>,
     /// HTML tag name to match (e.g. "button", "input").
     pub tag: Option<String>,

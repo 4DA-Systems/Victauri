@@ -155,8 +155,9 @@ A token-bucket rate limiter prevents abuse, even from authenticated clients:
   public bucket and a local process can rate-limit the agent. Keep auth on (the default) wherever
   other local software runs.
 
-The server speaks HTTP/1.1 only, closes a connection whose request head has not arrived within
-30 s, reads each request body under a 30 s / 2 MiB deadline (after authentication — an
+The server speaks HTTP/1.1 only, closes a connection that sends nothing within 3 s or whose request
+head is not complete 10 s after its first byte (a kept-alive connection also idles out after 10 s),
+reads each request body under a 30 s / 2 MiB deadline (after authentication — an
 unauthenticated body is never buffered), and accepts at most 256 concurrent connections. A request
 the guards refuse (401 / 403 / 415 / 429) also closes its connection, so refused requests cannot
 park connection slots.
@@ -175,7 +176,7 @@ VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::Observe)
     .build().unwrap()
 
-// Testing: can interact and record, but no arbitrary code execution
+// Testing: can interact and record, but no arbitrary code execution, and no backend reads
 VictauriBuilder::new()
     .privacy_profile(PrivacyProfile::Test)
     .build().unwrap()
@@ -196,10 +197,26 @@ VictauriBuilder::new()
 - CSS injection
 - Recording (state capture)
 
-#### Test Profile Disables:
-- `eval_js` (arbitrary code execution)
-- `screenshot`
-- CSS injection
+#### Test Profile Allows (everything else is denied):
+- Read-only tools: `dom_snapshot`, `find_elements`, `get_registry`, `get_memory_stats`,
+  `get_plugin_info`, `get_diagnostics`, `detect_ghost_commands`, `check_ipc_integrity`,
+  `resolve_command`, `app_state`
+- `wait_for`, except the `expression` condition, which is eval
+- `interact`, `input` and `storage`: every action
+- `recording`, except `replay` and `flush`
+- `logs`: every action, including `clear`
+- `inspect`: every action
+- `window`: `get_state`, `list`, `introspectability`
+- `navigate`: `go_back`, `get_history`, `get_dialog_log`
+- `invoke_command`: only commands on the `command_allowlist`, so with no allowlist it is refused
+
+So `eval_js`, `verify_state`, `assert_semantic`, `screenshot`, `query_db`, `read_app_file`,
+`list_app_dir`, `app_info`, `introspect`, `route`, `trace`, `animation`, `fault`, `explain`, `css`,
+`navigate go_to`, `navigate set_dialog_response` and the window mutations are refused.
+
+The list above is `is_allowed_by_profile` in `privacy.rs`. Under `Test` and `Observe`, `wait_for`'s
+`event` condition still works but leaves out the event's `payload`, which needs the `event_bus`
+capability.
 
 ### Command Filtering
 
@@ -211,11 +228,18 @@ VictauriBuilder::new()
     .command_allowlist(&["get_settings", "get_status"])
     .build().unwrap()
 
-// Blocklist: these commands are forbidden
+// Blocklist: these commands cannot be called through invoke_command, replay or contract checks
 VictauriBuilder::new()
     .command_blocklist(&["delete_data", "admin_reset"])
     .build().unwrap()
 ```
+
+A command on both lists is refused.
+
+**These lists are a boundary only while eval is off.** Under `FullControl`, `eval_js`,
+`wait_for expression`, `assert_semantic` and `verify_state` run JavaScript in the page, and the page
+can call `window.__TAURI_INTERNALS__.invoke` itself, so a blocklisted command is still reachable. To
+make a list hold, use the `Test` or `Observe` profile, or also disable `eval_js`, which stops all four.
 
 ### Tool Disabling
 
@@ -331,11 +355,12 @@ All HTTP responses include security headers:
 | Request flooding | Token-bucket rate limiter |
 | Remote network access | Localhost-only binding |
 | Data exfiltration | Privacy profiles + output redaction |
-| Dangerous mutations | Tool disabling + command allowlists |
+| Dangerous mutations | Tool disabling + command allowlists (a boundary only while eval is off; see [Command Filtering](#command-filtering)) |
 | Cross-origin attacks | Origin header validation |
 
 ### What Is Out of Scope
 
+- **A hostile page lying about itself** — Webview tools report what the page's own realm returns. Their results and logs are evidence against a buggy page, not a hostile one: a page can forge them. See [What page script can and cannot do to the bridge](#what-page-script-can-and-cannot-do-to-the-bridge).
 - **Malicious code on the same machine with the auth token** — If an attacker has the token and localhost access, they have the same privileges as the legitimate agent. This is inherent to any localhost-based development tool.
 - **Memory inspection of the process** — A sufficiently privileged attacker on the same machine could read process memory directly. Victauri does not add encryption at rest for in-process data.
 - **Prompt injection via captured content** — Victauri cannot stop a prompt-injection payload embedded in app-sourced data (DOM, logs, DB rows) from influencing the agent it feeds. This is an operational risk you mitigate through agent configuration — see [Untrusted Content & Prompt Injection](#untrusted-content--prompt-injection) below.
@@ -404,10 +429,15 @@ embedded third-party widgets, or user-generated content rendered in the DOM.
 
 ### What page script can and cannot do to the bridge
 
+**Results and logs are evidence against a buggy page, not a hostile one. A page can forge them.**
+Use them to find out what an honest app is doing. Do not use them to decide whether a page you do not
+trust behaved.
+
 Script running in the app's own page (an XSS, or content the app renders) shares the page's
-JavaScript realm with the injected bridge, so no in-page mechanism can isolate the two. **Treat
-page script in the same webview as trusted for the integrity and confidentiality of that
-webview's eval results and probe answers.** Concretely: Tauri sends every IPC message, including
+JavaScript realm with the injected bridge. Eval code runs in that realm too, with prototypes the page
+controls, so a hostile page can lie to any read whatever the transport, and no in-page mechanism can
+isolate the two. **Treat page script in the same webview as trusted for the integrity and
+confidentiality of that webview's eval results and probe answers.** Concretely: Tauri sends every IPC message, including
 the `victauri_eval_callback` that carries an eval result or a liveness-probe answer back to Rust,
 with the bare global `fetch(...)`, looked up when each call is made. Script that wraps
 `window.fetch` after the bridge loads sees every callback body (`{"id": …, "result": …}`) and can
@@ -419,7 +449,13 @@ read it, rewrite it or drop it. That means same-window script can:
 - forge a liveness-probe answer, which makes the agent's in-flight eval abort as "the page was
   replaced/reloaded";
 - rewrite the events the recording drain reads, so a recording (and therefore `recording replay`)
-  can contain IPC calls that never happened in that window.
+  can contain IPC calls that never happened in that window;
+- learn the ids of evals in flight, from the same callback bodies, and on V8 from the source of the
+  wrapper script, then settle an eval first with a result of its choosing;
+- make IPC calls the log never sees. The bridge runs in the main frame only, so a same-origin iframe
+  gives the page an unwrapped `fetch`, and it can read Tauri's invoke key from a call it wraps. Neither
+  the IPC log nor the tools built on it (`detect_ghost_commands`, `check_ipc_integrity`,
+  `introspect coverage`) can vouch that a command was not called.
 
 What it still cannot do:
 
@@ -433,12 +469,12 @@ What it still cannot do:
 - **Reach other windows or out-of-process state.** Another window's results, and Rust-side tools
   (`query_db`, `app_state`, the registry, memory stats, window state), do not pass through that
   page, so they are unaffected.
-- **Observe pending eval ids or rewrite results through prototype hooks.** Eval bookkeeping lives
-  in closures behind null-prototype tables, ids are coerced without page-replaceable globals, and
-  results are serialized with a `JSON.stringify` captured at injection that ignores a `toJSON`
-  planted on `Object.prototype`/`Array.prototype`. (This closes the prototype-hook routes; the
-  `fetch` route above remains.)
-- **Rewrite captured logs through a returned reference.** Every log read hands out a deep copy.
+
+The bridge still hardens what it can, which keeps an ordinary page from breaking a read by accident:
+eval bookkeeping lives in closures behind null-prototype tables, ids are coerced without
+page-replaceable globals, results are serialized with a `JSON.stringify` captured at injection, and
+every log read hands out a deep copy. None of that makes a result trustworthy against a page that is
+trying to lie.
 
 **Replay.** An IPC call fulfilled or blocked by a network route (which page script can also add)
 is recorded as `mocked` and never replayed, and `recording replay` runs each call in the window

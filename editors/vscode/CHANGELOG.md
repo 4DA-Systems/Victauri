@@ -4,8 +4,38 @@ All notable changes to the Victauri VS Code extension will be documented in this
 
 ## 0.10.3
 
-An extension-only patch on top of 0.10.2 (the Victauri crates stay at 0.10.2); works with plugins
-0.9.x and 0.10.x.
+Version-synced with the Victauri 0.10.3 release; works with plugins 0.9.x and 0.10.x.
+
+### Security
+
+- Page-controlled text in error toasts could become a clickable command link that ran a command in the
+  terminal. Toast text can no longer form links.
+- A user-level `victauri.authToken` is no longer sent to a port set by workspace settings without
+  confirmation, and the token is now user-level only.
+- A junction in a parent directory no longer skips the Windows discovery owner check. `/health` no longer
+  carries the token. Nothing is sent after Disconnect. Non-base64 screenshot data is refused. Redirects are
+  refused, so a tool call's body cannot be resent to another port.
+
+### Fixed
+
+- App State was empty on every connection and raised an error toast. IPC Log marked every success as failed.
+  DOM Elements and Long Tasks rows never appeared.
+- A stalled response could hang polling for good while showing "connected". Responses are capped at 64 MiB.
+  `pollInterval` and `port` are validated.
+- A failing owner check started 9 PowerShell processes per poll; it now shares one query and backs off, and
+  its failure is reported as such, not as a 401.
+- Context-menu commands no longer appear in the palette or throw. Error page styling in the screenshot panel.
+
+### Changed
+
+- Auto-connect keeps looking while disconnected, prefers the workspace's own app, leaves other projects' apps
+  alone, and no longer connects to whatever holds port 7373 with no discovery entry. The success toast and
+  status bar name the app.
+- Generated tests find elements by role and name, and CodeLens covers `pub(crate)`, `unsafe` and raw names.
+- The Activity Bar icon is visible, the package is reduced to about 36 KB, `Tauri.toml` and `tauri.conf.json5`
+  activate the extension, and untrusted and virtual workspaces are declared unsupported.
+
+### Carried over from the unreleased extension patch
 
 - **Windows: one slow or failed ownership check no longer distrusts the app for good.** A cold
   Windows PowerShell start can take more than the old 10 s limit (measured on a CI runner), and

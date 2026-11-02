@@ -53,7 +53,7 @@ Victauri is a **development-time dependency you add to your own app's source and
 3. **A debug build.** The server is `#[cfg(debug_assertions)]`-gated, so `init()` is a no-op and nothing listens in release. It's a dev/test-time tool by design.
 4. **Each window grants `victauri:default`.** Tauri's per-window permission ACL silently blinds the bridge without it; the `window introspectability` tool detects and explains this.
 
-**Framework** (React, Vue/Nuxt, Svelte, vanilla) and **OS/webview engine** (WebView2 / WKWebView / WebKitGTK) do **not** matter — all supported and cross-checked on Windows, macOS, and Linux.
+**Framework** does **not** matter, because the bridge works at DOM level: it has been run on React, Vue/Nuxt and vanilla apps ([what was actually run](docs/src/compatibility.md#apps-victauri-has-actually-run-on)). Nor does the **OS/webview engine**: WebView2, WKWebView and WebKitGTK are all exercised in CI.
 
 | ✅ Works on | ❌ Won't work on |
 |---|---|
@@ -116,10 +116,10 @@ Start your app, then run the smoke suite:
 
 ```bash
 npm run tauri dev                                # start your app (or pnpm/yarn/bun tauri dev)
-cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke   # in a second terminal (the tests live in src-tauri/tests)
+cd src-tauri && VICTAURI_E2E=1 cargo test --test smoke -- --test-threads=1   # in a second terminal; tests share one app
 ```
 
-On Windows the running app locks its `.exe`, and `cargo test` rebuilds it, so give the test run its own target directory: `CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke`.
+On Windows the running app locks its `.exe`, and `cargo test` rebuilds it, so give the test run its own target directory: `CARGO_TARGET_DIR=target-test VICTAURI_E2E=1 cargo test --test smoke -- --test-threads=1`.
 
 Or use the CLI for instant validation:
 
@@ -186,7 +186,7 @@ Works with **Claude Code**, **Cursor**, **Windsurf**, and any MCP client. Your a
 
 ## Writing Tests
 
-The `e2e_test!` macro handles server detection and auto-connect:
+The `e2e_test!` macro connects for you, and skips the test (printing a skip line) unless `VICTAURI_E2E` is set. It does not detect a server, so set the variable where a run must count:
 
 ```rust
 use victauri_test::{e2e_test, VictauriClient};
@@ -405,7 +405,7 @@ victauri/
 │   └── victauri-watchdog/   # Health-check sidecar for crash recovery
 ├── docs/                    # mdbook documentation site
 └── examples/
-    └── demo-app/            # Multi-window Tauri app with 21 instrumented commands
+    └── demo-app/            # Multi-window Tauri app with 25 instrumented commands
 ```
 
 | Crate | Purpose | Tauri dependency? |
@@ -428,7 +428,8 @@ Victauri is designed for development, not production:
 - **Auth on by default**: auto-generated Bearer token, auto-discovered by clients (`.auth_disabled()` to opt out)
 - **Rate limited**: 1000 req/sec, token-bucket algorithm
 - **Privacy profiles**: `Observe` (read-only), `Test` (interactions), `FullControl` (everything)
-- **Output redaction**: auto-scrub API keys, tokens, emails from tool responses
+- **Output redaction**: opt-in (`.enable_redaction()`, on by default only under `Observe`); scrubs API keys, tokens, emails from tool responses
+- **Results and logs from the page are evidence against a buggy page, not a hostile one**: a page can forge them. See [what page script can do](docs/src/security.md#what-page-script-can-and-cannot-do-to-the-bridge)
 
 See the [Security Guide](docs/src/security.md) for threat model, privacy configuration, and command filtering.
 
@@ -449,7 +450,7 @@ Use the built-in composite action to run Victauri smoke tests in CI:
     xvfb-run -a ./target/debug/my-app &
     sleep 3
 
-- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.2
+- uses: 4DA-Systems/victauri/.github/actions/victauri-test@v0.10.3
   with:
     max-load-ms: 10000
     max-heap-mb: 512
@@ -460,7 +461,7 @@ The action installs `victauri-cli`, waits for the server to become healthy, and 
 | Input | Default | Description |
 |---|---|---|
 | `port` | `7373` | Victauri server port |
-| `max-load-ms` | `10000` | Maximum DOM complete time (ms) |
+| `max-load-ms` | `20000` | Maximum DOM complete time (ms) |
 | `max-heap-mb` | `512` | Maximum JS heap usage (MB) |
 | `junit-path` | | Path to write JUnit XML report |
 | `coverage` | `false` | Run IPC coverage report after tests |
@@ -486,7 +487,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - [**FAQ**](docs/src/faq.md) — Common questions and troubleshooting
 - [**Comparison**](docs/src/comparison.md) — Victauri vs other Tauri agent/test tools, where each one wins
 - [**VS Code Extension**](editors/vscode/) — Live inspection from your editor
-- [**Demo App**](examples/demo-app/) — Reference app with 21 instrumented commands
+- [**Demo App**](examples/demo-app/) — Reference app with 25 instrumented commands
 - [**Agent Session**](examples/agent-session.md) — Real AI agent transcript
 - [**Migration Guide**](MIGRATION.md) — Upgrading between versions
 - [**Contributing**](CONTRIBUTING.md) — How to contribute
@@ -501,7 +502,7 @@ victauri init    # generates .github/workflows/victauri.yml
 - **Same-origin frames only** — same-origin iframes are traversed; cross-origin frames are marked and skipped
 - **Frontend-IPC control is fetch-transport only** — `fault` injection applies to commands driven through Victauri's own `invoke_command`; to change what the app's real `invoke` gets, a `route` rule mocks or delays it on Tauri's fetch transport (the desktop default), but not over postMessage (Android, or after a fallback)
 - **Not every webview↔Rust message is in the IPC log** — command calls are captured on both of Tauri's transports (custom-protocol fetch and the `postMessage` fallback; `get_diagnostics` reports which is in use and whether capture is complete), but Rust→JS events outside `listen_events`, `Channel` messages, and isolation-pattern args are not. See [Architecture → IPC Layer](docs/src/architecture.md#ipc-layer)
-- **Pre-1.0** — API may change (semver-checked in CI)
+- **Pre-1.0** — API may change (`cargo semver-checks` runs before each release; the CI step is informational)
 
 ---
 
@@ -516,7 +517,7 @@ cargo fmt --all -- --check                            # Format
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps  # Docs (zero warnings)
 ```
 
-**Lint policy:** 20 clippy lints (pedantic + nursery) enforced at `deny` level — see `[workspace.lints.clippy]` in `Cargo.toml`.
+**Lint policy:** 20 entries enforced at `deny` level: `clippy::all`, 18 further clippy lints (pedantic + nursery), and rust's `unsafe_code` — see `[workspace.lints]` in `Cargo.toml`.
 
 ## Community & Contributing
 

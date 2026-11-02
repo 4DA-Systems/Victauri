@@ -285,6 +285,9 @@ fn tauri_conf_identifier(dir: &std::path::Path) -> Option<String> {
 }
 
 const AMBIGUOUS_PREFIX: &str = "Multiple Victauri apps are running";
+/// How the error for "no app was discovered" starts. The CLI recognises this wording (with its
+/// full stop) to fall back to its built-in tool list.
+pub const NOTHING_DISCOVERED: &str = "No Victauri app is running";
 
 /// Pure core of [`try_resolve_connection`].
 fn resolve_from(
@@ -347,12 +350,18 @@ fn resolve_from(
                 format!(" Running apps:\n  {}", labels.join("\n  "))
             };
             Err(format!(
-                "No running Victauri app matches the app selector '{app}' (VICTAURI_APP / \
-                 --app: an exact bundle identifier or product name).{running}"
+                "No running Victauri app matches the app selector '{}' (VICTAURI_APP / \
+                 --app: an exact bundle identifier or product name).{running}",
+                crate::terminal::single_line(app)
             ))
         }
-        // Nothing discovered: the legacy default endpoint, with no token.
-        ([], None) => Ok((DEFAULT_PORT, None)),
+        // Nothing discovered. Every plugin since 0.7.4 writes discovery, so whatever holds the
+        // default port is not known to be a Victauri app: sending the call there would present
+        // its answers as the app's. `VICTAURI_PORT` is how to say otherwise.
+        ([], None) => Err(format!(
+            "{NOTHING_DISCOVERED}. Start the app in a debug build, or set VICTAURI_PORT to name \
+             its endpoint explicitly."
+        )),
         (many, _) => Err(ambiguity_message(many.iter().copied())),
     }
 }
@@ -558,7 +567,13 @@ impl DiscoveredServer {
             .as_deref()
             .or(self.product_name.as_deref())
             .unwrap_or("<unknown app>");
-        format!("{name} (port {}, pid {})", self.port, self.pid)
+        // The identifier comes from a project's `tauri.conf.json`: it reaches a terminal here.
+        format!(
+            "{} (port {}, pid {})",
+            crate::terminal::single_line(name),
+            self.port,
+            self.pid
+        )
     }
 }
 
@@ -600,8 +615,169 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
             }
         }
     }
-    servers
+    settle_port_claims(servers)
 }
+
+/// Drop the entries that are not the server on their port, when several claim one: a hard-killed
+/// app's entry stays behind, and once Windows reuses its PID it looks as live as the current app's,
+/// naming the same port. Normal scans (one claim per port) send nothing.
+fn settle_port_claims(servers: Vec<DiscoveredServer>) -> Vec<DiscoveredServer> {
+    let mut contested: Vec<u16> = servers
+        .iter()
+        .map(|server| server.port)
+        .filter(|port| servers.iter().filter(|s| s.port == *port).count() > 1)
+        .collect();
+    contested.sort_unstable();
+    contested.dedup();
+    let deadline = std::time::Instant::now() + PORT_CLAIMS_BUDGET;
+    let mut dropped: Vec<u32> = Vec::new();
+    for port in contested {
+        let claims: Vec<(u32, Option<String>)> = servers
+            .iter()
+            .filter(|server| server.port == port)
+            .map(|server| (server.pid, server.token.clone()))
+            .collect();
+        let real = real_port_claims_until(port, &claims, deadline);
+        dropped.extend(
+            claims
+                .iter()
+                .map(|(pid, _)| *pid)
+                .filter(|pid| !real.contains(pid)),
+        );
+    }
+    servers
+        .into_iter()
+        .filter(|server| !dropped.contains(&server.pid))
+        .collect()
+}
+
+/// Which of several discovery entries `(pid, token)` naming `port` belong to the server that holds
+/// it, by asking it (`GET /info`, with each entry's token). The pid it reports decides; an older
+/// plugin reports none, and then accepting the token does. When it accepted none, every entry is
+/// kept: a server refusing the tokens we hold says nothing about which entry is its own, so the
+/// choice stays as ambiguous as it was and never turns into "no app".
+///
+/// The tokens go to the port their own entries name, as any connection would send them. A process
+/// on that port that lies gets what lying on `/info` always got.
+#[must_use]
+pub fn real_port_claims(port: u16, claims: &[(u32, Option<String>)]) -> Vec<u32> {
+    real_port_claims_until(port, claims, std::time::Instant::now() + PORT_CLAIMS_BUDGET)
+}
+
+/// [`real_port_claims`], asking nothing more once `deadline` has passed: what was not asked counts
+/// as no answer.
+#[doc(hidden)]
+#[must_use]
+pub fn real_port_claims_until(
+    port: u16,
+    claims: &[(u32, Option<String>)],
+    deadline: std::time::Instant,
+) -> Vec<u32> {
+    let answers: Vec<(u32, InfoAnswer)> = claims
+        .iter()
+        .map(|(pid, token)| {
+            let answer = if std::time::Instant::now() < deadline {
+                ask_info(port, token.as_deref())
+            } else {
+                InfoAnswer::Unknown
+            };
+            (*pid, answer)
+        })
+        .collect();
+    let reported = answers.iter().find_map(|(_, answer)| match answer {
+        InfoAnswer::Accepted { pid } => *pid,
+        _ => None,
+    });
+    let accepted = answers
+        .iter()
+        .any(|(_, answer)| matches!(answer, InfoAnswer::Accepted { .. }));
+    answers
+        .iter()
+        .filter(|(pid, answer)| match (reported, accepted) {
+            (Some(server), _) => *pid == server,
+            (None, true) => matches!(answer, InfoAnswer::Accepted { .. }),
+            (None, false) => true,
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// What the server on a port said to a token.
+#[cfg_attr(test, derive(Debug))]
+enum InfoAnswer {
+    /// `200`, with the pid when the plugin reports one.
+    Accepted { pid: Option<u32> },
+    /// `401` to a token: not this server's.
+    Refused,
+    /// No answer that says anything (not listening, not HTTP, rate limited, too slow).
+    Unknown,
+}
+
+/// One short `GET /info` over plain TCP. Blocking, and bounded by [`INFO_DEADLINE`].
+fn ask_info(port: u16, token: Option<&str>) -> InfoAnswer {
+    use std::io::{Read as _, Write as _};
+    // A value that would break out of its header line is not sent anywhere.
+    if token.is_some_and(|t| t.chars().any(char::is_control)) {
+        return InfoAnswer::Unknown;
+    }
+    let deadline = std::time::Instant::now() + INFO_DEADLINE;
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = std::net::TcpStream::connect_timeout(&address, INFO_DEADLINE / 2) else {
+        return InfoAnswer::Unknown;
+    };
+    if stream.set_read_timeout(Some(INFO_DEADLINE / 2)).is_err()
+        || stream.set_write_timeout(Some(INFO_DEADLINE / 2)).is_err()
+    {
+        return InfoAnswer::Unknown;
+    }
+    let authorization =
+        token.map_or_else(String::new, |t| format!("Authorization: Bearer {t}\r\n"));
+    let request = format!(
+        "GET /info HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{authorization}Connection: close\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return InfoAnswer::Unknown;
+    }
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while reply.len() < INFO_MAX_BYTES && std::time::Instant::now() < deadline {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => reply.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let reply = String::from_utf8_lossy(&reply);
+    let Some((head, body)) = reply.split_once("\r\n\r\n") else {
+        return InfoAnswer::Unknown;
+    };
+    match head.split_whitespace().nth(1) {
+        // No token sent: a 401 is about that, not about whose entry this is.
+        Some("401") if token.is_some() => InfoAnswer::Refused,
+        Some("200") => {
+            // Between the outer braces: the framing of a chunked body stays outside them.
+            let json = body
+                .find('{')
+                .zip(body.rfind('}'))
+                .and_then(|(start, end)| body.get(start..=end))
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok());
+            let Some(info) = json else {
+                return InfoAnswer::Unknown;
+            };
+            InfoAnswer::Accepted {
+                pid: info["pid"].as_u64().and_then(|pid| u32::try_from(pid).ok()),
+            }
+        }
+        _ => InfoAnswer::Unknown,
+    }
+}
+
+/// Most time one scan spends asking servers about the claims on their ports.
+#[doc(hidden)]
+pub const PORT_CLAIMS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long [`ask_info`] waits for one answer. A live `/info` takes milliseconds.
+const INFO_DEADLINE: std::time::Duration = std::time::Duration::from_millis(800);
+/// The most of an answer [`ask_info`] reads. `/info` is a few hundred bytes.
+const INFO_MAX_BYTES: usize = 64 * 1024;
 
 /// Testable core of [`find_live_servers`]: scan `base` and keep only entries whose OWNING
 /// PROCESS is alive and ours, and whose advertised port is reachable.
@@ -710,6 +886,206 @@ fn port_is_reachable(port: u16) -> bool {
 mod tests {
     use super::*;
     use crate::process::Liveness;
+
+    fn claim(pid: u32, port: u16, token: &str) -> DiscoveredServer {
+        DiscoveredServer {
+            pid,
+            port,
+            token: Some(token.to_string()),
+            identifier: Some("com.example.app".to_string()),
+            product_name: None,
+        }
+    }
+
+    /// One short HTTP server answering every request with `reply`, returning its port. Each
+    /// connection's request head goes to `seen`.
+    fn answering_server(
+        reply: impl Fn(&str) -> String + Send + 'static,
+    ) -> (u16, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+                    head.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let _ = stream.write_all(reply(&head).as_bytes());
+                let _ = tx.send(head);
+            }
+        });
+        (port, rx)
+    }
+
+    /// What the plugin's `/info` answers (`mcp/server.rs`), and what it answers without the token.
+    fn info_reply(pid: Option<u32>) -> String {
+        let mut info = serde_json::json!({
+            "name": "victauri", "version": "0.10.3", "protocol": "mcp",
+            "app_identifier": "com.example.app", "auth_required": true,
+        });
+        if let Some(pid) = pid {
+            info["pid"] = pid.into();
+        }
+        let body = info.to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+             connection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+    const UNAUTHORIZED: &str =
+        "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+
+    fn pids(servers: &[DiscoveredServer]) -> Vec<u32> {
+        servers.iter().map(|s| s.pid).collect()
+    }
+
+    /// A hard-killed app's entry, its PID reused, naming the port the current app holds: two live
+    /// entries on one port, and `--app` refused with "several apps". `/info` settles it.
+    #[test]
+    fn the_server_on_a_port_says_which_claim_is_real() {
+        // Its token, and its pid: the stale entry's token is refused.
+        let (port, seen) = answering_server(|head| {
+            if head.contains("Bearer real") {
+                info_reply(Some(222))
+            } else {
+                UNAUTHORIZED.to_string()
+            }
+        });
+        let servers = vec![claim(111, port, "stale"), claim(222, port, "real")];
+        assert_eq!(pids(&settle_port_claims(servers)), [222]);
+        let head = seen.recv().unwrap();
+        assert!(head.starts_with("GET /info HTTP/1.1\r\n"), "{head}");
+        assert!(head.contains(&format!("127.0.0.1:{port}")), "{head}");
+
+        // Auth off, or one fixed token: every token is accepted, and the pid decides.
+        let (port, _seen) = answering_server(|_| info_reply(Some(222)));
+        let servers = vec![claim(111, port, "same"), claim(222, port, "same")];
+        assert_eq!(pids(&settle_port_claims(servers)), [222]);
+
+        // An older plugin reports no pid: its accepting the token decides.
+        let (port, _seen) = answering_server(|head| {
+            if head.contains("Bearer real") {
+                info_reply(None)
+            } else {
+                UNAUTHORIZED.to_string()
+            }
+        });
+        let servers = vec![claim(111, port, "stale"), claim(222, port, "real")];
+        assert_eq!(pids(&settle_port_claims(servers)), [222]);
+    }
+
+    /// With nothing to decide on, nothing changes: the choice stays ambiguous, as it always was.
+    #[test]
+    fn claims_nothing_can_settle_stay() {
+        // An older plugin with auth off accepts both and names neither.
+        let (port, _seen) = answering_server(|_| info_reply(None));
+        let servers = vec![claim(111, port, "a"), claim(222, port, "b")];
+        assert_eq!(pids(&settle_port_claims(servers)), [111, 222]);
+
+        // Not answering, not HTTP, rate limited.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let servers = vec![claim(111, port, "a"), claim(222, port, "b")];
+        assert_eq!(pids(&settle_port_claims(servers)), [111, 222]);
+        for reply in ["garbage\r\n\r\n", "HTTP/1.1 429 Too Many Requests\r\n\r\n"] {
+            let (port, _seen) = answering_server(move |_| reply.to_string());
+            let servers = vec![claim(111, port, "a"), claim(222, port, "b")];
+            assert_eq!(pids(&settle_port_claims(servers)), [111, 222], "{reply}");
+        }
+    }
+
+    /// A server that refuses every token we hold says nothing about which entry is its own: a
+    /// stale token next to an entry whose token could not be read used to read as "no app at all".
+    #[test]
+    fn claims_a_server_refused_all_stay_ambiguous() {
+        let (port, _seen) = answering_server(|_| UNAUTHORIZED.to_string());
+        let servers = vec![claim(111, port, "a"), claim(222, port, "b")];
+        assert_eq!(pids(&settle_port_claims(servers)), [111, 222]);
+
+        let mut no_token = claim(111, port, "");
+        no_token.token = None;
+        assert!(matches!(ask_info(port, None), InfoAnswer::Unknown));
+        let servers = vec![no_token, claim(222, port, "stale")];
+        assert_eq!(pids(&settle_port_claims(servers)), [111, 222]);
+    }
+
+    /// A port that accepts and never answers costs one deadline per claim. Each claim asked once per
+    /// port, not once per claim on it (8 claims took 25.9 s), and a total budget over all of them.
+    #[test]
+    fn asking_about_claims_is_bounded() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in silent.incoming() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let servers: Vec<DiscoveredServer> = (0..8).map(|i| claim(100 + i, port, "t")).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(settle_port_claims(servers).len(), 8);
+        assert!(
+            started.elapsed() < PORT_CLAIMS_BUDGET + INFO_DEADLINE + INFO_DEADLINE,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst) <= 8);
+    }
+
+    /// One claim on a port costs nothing: no request at all. Other ports are left alone.
+    #[test]
+    fn a_port_with_one_claim_is_not_asked() {
+        let (port, seen) = answering_server(|_| info_reply(Some(9)));
+        let servers = vec![claim(111, port, "a")];
+        assert_eq!(pids(&settle_port_claims(servers)), [111]);
+        assert!(seen.try_recv().is_err());
+
+        let (contested, _seen) = answering_server(|_| info_reply(Some(2)));
+        let servers = vec![
+            claim(1, contested, "a"),
+            claim(2, contested, "b"),
+            claim(3, port, "c"),
+        ];
+        assert_eq!(pids(&settle_port_claims(servers)), [2, 3]);
+        assert!(seen.try_recv().is_err());
+    }
+
+    /// A token is one header: one that could add another is not sent.
+    #[test]
+    fn a_token_with_a_line_break_is_not_sent() {
+        let (port, seen) = answering_server(|_| info_reply(Some(1)));
+        assert!(matches!(
+            ask_info(port, Some("x\r\nHost: elsewhere")),
+            InfoAnswer::Unknown
+        ));
+        assert!(seen.try_recv().is_err());
+    }
+
+    /// The whole answer is what is read, however the server cuts it into writes and chunks.
+    #[test]
+    fn a_chunked_info_answer_is_read() {
+        let (port, _seen) = answering_server(|_| {
+            let body = r#"{"pid":7}"#;
+            format!(
+                "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n",
+                body.len()
+            )
+        });
+        assert!(matches!(
+            ask_info(port, None),
+            InfoAnswer::Accepted { pid: Some(7) }
+        ));
+    }
 
     /// Audit N6: the per-user root is scanned first; the legacy shared root is last.
     #[cfg(unix)]
@@ -1130,7 +1506,24 @@ mod tests {
             resolve_from(None, None, None, &servers[..1]),
             Ok((7373, Some("a".to_string())))
         );
-        assert_eq!(resolve_from(None, None, None, &[]), Ok((7373, None)));
+        // A label reaches a terminal, and its identifier comes from a project's tauri.conf.json.
+        let hostile = DiscoveredServer {
+            pid: 1,
+            port: 7373,
+            token: None,
+            identifier: Some("com.x\u{1b}]0;PWNED\u{7}\n::error::forged".to_string()),
+            product_name: None,
+        };
+        let label = hostile.label();
+        assert!(!label.chars().any(char::is_control), "{label:?}");
+        assert!(!label.lines().any(|l| l.starts_with("::")), "{label:?}");
+
+        // Nothing discovered: no call goes to whatever holds the default port.
+        let err = resolve_from(None, None, None, &[]).unwrap_err();
+        assert!(err.starts_with(NOTHING_DISCOVERED), "{err}");
+        assert!(err.contains("VICTAURI_PORT"), "{err}");
+        // An explicit port still reaches it.
+        assert_eq!(resolve_from(Some(7373), None, None, &[]), Ok((7373, None)));
     }
 
     /// Hand `path` to `NT AUTHORITY\SYSTEM` — the stand-in for "another user" (needs an

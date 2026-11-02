@@ -791,11 +791,21 @@ impl CapturedTauriEvent {
 }
 
 const DEFAULT_EVENT_BUS_CAPACITY: usize = 1000;
+/// Longest payload kept per captured event; longer ones are cut, with a marker.
+const MAX_EVENT_PAYLOAD_BYTES: usize = 64 * 1024;
+/// Most payload bytes retained in all; the oldest events go first.
+const MAX_EVENT_BUS_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct EventBusBuffer {
+    events: VecDeque<CapturedTauriEvent>,
+    payload_bytes: usize,
+}
 
 /// Thread-safe ring buffer for captured Tauri events.
 #[derive(Clone)]
 pub struct EventBusMonitor {
-    inner: std::sync::Arc<RwLock<VecDeque<CapturedTauriEvent>>>,
+    inner: std::sync::Arc<RwLock<EventBusBuffer>>,
     capacity: usize,
 }
 
@@ -804,21 +814,38 @@ impl EventBusMonitor {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
         Self {
-            inner: std::sync::Arc::new(RwLock::new(VecDeque::with_capacity(capacity))),
+            inner: std::sync::Arc::new(RwLock::new(EventBusBuffer::default())),
             capacity,
         }
     }
 
     /// Record a captured event.
-    pub fn push(&self, event: CapturedTauriEvent) {
+    pub fn push(&self, mut event: CapturedTauriEvent) {
+        // Before the lock: the emitter may be the main thread.
+        if event.payload.len() > MAX_EVENT_PAYLOAD_BYTES {
+            let mut cut = MAX_EVENT_PAYLOAD_BYTES;
+            while !event.payload.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let dropped = event.payload.len() - cut;
+            event.payload.truncate(cut);
+            event.payload.shrink_to_fit();
+            event
+                .payload
+                .push_str(&format!("…[truncated {dropped} bytes]"));
+        }
         let mut buf = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if buf.len() >= self.capacity {
-            buf.pop_front();
+        buf.payload_bytes += event.payload.len();
+        buf.events.push_back(event);
+        while buf.events.len() > self.capacity || buf.payload_bytes > MAX_EVENT_BUS_BYTES {
+            let Some(old) = buf.events.pop_front() else {
+                break;
+            };
+            buf.payload_bytes = buf.payload_bytes.saturating_sub(old.payload.len());
         }
-        buf.push_back(event);
     }
 
     /// Get all captured events.
@@ -827,6 +854,7 @@ impl EventBusMonitor {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
             .iter()
             .cloned()
             .collect()
@@ -838,6 +866,7 @@ impl EventBusMonitor {
         self.inner
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .events
             .len()
     }
 
@@ -853,8 +882,9 @@ impl EventBusMonitor {
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let count = buf.len();
-        buf.clear();
+        let count = buf.events.len();
+        buf.events.clear();
+        buf.payload_bytes = 0;
         count
     }
 }
@@ -1097,6 +1127,122 @@ pub fn enumerate_child_processes() -> Vec<ChildProcessInfo> {
     }
 }
 
+/// The one page process whose main thread wanted the CPU flat out between two
+/// [`web_main_thread_cpu`] readings, and either never rested or really got most of it: a page
+/// spinning in a loop. Ticks are `USER_HZ`, 100 per second on every Linux ABI. Wanting it is not
+/// enough: on an overloaded core a thread working 25% of the time waits for the rest, and read as
+/// flat out with 64 others running (102 ticks/s wanted, 1 on the CPU, 2.5 sleeps/s). A bare loop
+/// never sleeps, however little CPU it gets (0 in 5 s). A loop that allocates does, waiting for the
+/// collector's helpers (1,300/s), and it gets the CPU (over 90 ticks/s on a free core): under load
+/// that one may not qualify, and the call then reports that the page does not answer. `None` when no
+/// process qualified, or several did: nothing says which window's page each one renders.
+///
+/// [`web_main_thread_cpu`]: crate::bridge::WebviewBridge::web_main_thread_cpu
+#[must_use]
+pub(crate) fn spinning_web_process(
+    before: &[(u32, u64, u64, u64)],
+    after: &[(u32, u64, u64, u64)],
+    elapsed: std::time::Duration,
+) -> Option<u32> {
+    let seconds = elapsed.as_secs_f64();
+    let mut spinning = after.iter().filter(|(pid, wanted, on_cpu, sleeps)| {
+        before
+            .iter()
+            .find(|(earlier, _, _, _)| earlier == pid)
+            .is_some_and(|(_, wanted_was, on_cpu_was, slept)| {
+                wanted.saturating_sub(*wanted_was) as f64 >= seconds * 100.0 * 0.9
+                    && (sleeps.saturating_sub(*slept) as f64 <= seconds
+                        || on_cpu.saturating_sub(*on_cpu_was) as f64 >= seconds * 100.0 * 0.6)
+            })
+    });
+    let (pid, _, _, _) = spinning.next()?;
+    spinning.next().is_none().then_some(*pid)
+}
+
+/// Times a thread gave up the CPU of its own accord, from the contents of
+/// `/proc/<pid>/task/<tid>/status`.
+#[cfg(any(target_os = "linux", test))]
+fn voluntary_switches_from_status(status: &str) -> Option<u64> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("voluntary_ctxt_switches:"))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// User + system clock ticks from the contents of `/proc/<pid>/stat`. The command name can hold
+/// spaces and parentheses, so the fields are counted from its last `)`: `utime` and `stime` are
+/// fields 14 and 15, the 12th and 13th after it.
+#[cfg(any(target_os = "linux", test))]
+fn cpu_ticks_from_stat(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_ascii_whitespace().skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// Clock ticks a thread wanted the CPU, and of those it got, from the contents of
+/// `/proc/<pid>/task/<tid>/schedstat`: nanoseconds on it, then nanoseconds waiting for it. A loop
+/// wants it all the time, however few it gets: on 2 CPUs with 4 Workers elsewhere a stuck page's main
+/// thread measured 41 ticks/s on the CPU and 105 wanted, and a healthy one 0. `None` when the kernel
+/// keeps no such figures (all zero).
+#[cfg(any(target_os = "linux", test))]
+fn cpu_ticks_from_schedstat(schedstat: &str) -> Option<(u64, u64)> {
+    let mut fields = schedstat.split_ascii_whitespace();
+    let on_cpu: u64 = fields.next()?.parse().ok()?;
+    let waiting: u64 = fields.next()?.parse().ok()?;
+    let wanted = (on_cpu + waiting) / 10_000_000;
+    (wanted > 0).then_some((wanted, on_cpu / 10_000_000))
+}
+
+/// The kernel's process name is cut to 15 characters.
+#[cfg(target_os = "linux")]
+fn web_processes_linux() -> impl Iterator<Item = u32> {
+    enumerate_child_processes()
+        .into_iter()
+        .filter(|child| child.name == "WebKitWebProces" || child.name == "WebKitWebProcess")
+        .map(|child| child.pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn web_main_thread_cpu_linux() -> Vec<(u32, u64, u64, u64)> {
+    web_processes_linux()
+        .filter_map(|pid| {
+            // `/proc/<pid>/stat` sums every thread: a healthy page's Workers would read as flat out.
+            let thread = format!("/proc/{pid}/task/{pid}");
+            let status = std::fs::read_to_string(format!("{thread}/status")).ok()?;
+            let sleeps = voluntary_switches_from_status(&status)?;
+            let ticks = std::fs::read_to_string(format!("{thread}/schedstat"))
+                .ok()
+                .and_then(|schedstat| cpu_ticks_from_schedstat(&schedstat));
+            if let Some((wanted, on_cpu)) = ticks {
+                return Some((pid, wanted, on_cpu, sleeps));
+            }
+            let stat = std::fs::read_to_string(format!("{thread}/stat")).ok()?;
+            let on_cpu = cpu_ticks_from_stat(&stat)?;
+            Some((pid, on_cpu, on_cpu, sleeps))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn end_web_process_linux(pid: u32) -> Result<(), String> {
+    if !web_processes_linux().any(|child| child == pid) {
+        return Err(format!("{pid} is not one of this app's web processes"));
+    }
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("could not run kill: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("kill {pid} failed: {status}"))
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn enumerate_children_windows(parent_pid: u32) -> Vec<ChildProcessInfo> {
@@ -1161,8 +1307,8 @@ fn get_process_memory_windows(pid: u32) -> Option<u64> {
     };
 
     // SAFETY: `OpenProcess` with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`
-    // opens a limited handle for reading memory stats. The process handle is closed
-    // automatically when dropped (windows crate handles this).
+    // opens a limited handle for reading memory stats. It has no `Drop`: it is closed below,
+    // or it would also keep an exited child's process object alive.
     unsafe {
         let process = OpenProcess(
             PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
@@ -1174,11 +1320,9 @@ fn get_process_memory_windows(pid: u32) -> Option<u64> {
         let mut counters: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
         counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
 
-        if GetProcessMemoryInfo(process, &mut counters, counters.cb).is_ok() {
-            Some(counters.WorkingSetSize as u64)
-        } else {
-            None
-        }
+        let read = GetProcessMemoryInfo(process, &mut counters, counters.cb).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(process);
+        read.then_some(counters.WorkingSetSize as u64)
     }
 }
 
@@ -1526,6 +1670,67 @@ impl DrainWatermarks {
 }
 #[cfg(test)]
 mod tests {
+    /// `OpenProcess` returns a plain handle with no `Drop`, so each query must close it.
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn reading_a_process_memory_does_not_leak_its_handle() {
+        use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+        let count = || {
+            let mut n = 0;
+            // SAFETY: the current-process pseudo handle and a valid out pointer.
+            unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut n) }.unwrap();
+            i64::from(n)
+        };
+        let before = count();
+        for _ in 0..2000 {
+            assert!(super::get_process_memory_windows(std::process::id()).is_some());
+        }
+        // Margin for tests running alongside; the leak was one handle per call.
+        let grew = count() - before;
+        assert!(grew < 1000, "{grew} handles after 2000 calls");
+    }
+
+    /// An event carrying megabytes, emitted repeatedly, must not pile up in the host: 1000 entries
+    /// was the only cap, whatever their size.
+    #[test]
+    fn the_event_bus_bounds_what_it_retains() {
+        let bus = super::EventBusMonitor::new(1000);
+        let huge = "x".repeat(1024 * 1024);
+        for _ in 0..200 {
+            bus.push(super::CapturedTauriEvent::new("big", huge.as_str(), "t"));
+        }
+        let retained: usize = bus.events().iter().map(|e| e.payload.len()).sum();
+        assert!(retained <= 16 * 1024 * 1024, "{retained} bytes retained");
+        let newest = bus.events().pop().unwrap();
+        assert!(newest.payload.len() < 100 * 1024);
+        assert!(newest.payload.contains("[truncated"), "marks the cut");
+
+        // A small payload is stored as it came, and many of them still reach the entry cap.
+        let bus = super::EventBusMonitor::new(3);
+        for i in 0..5 {
+            bus.push(super::CapturedTauriEvent::new(
+                "e",
+                format!("{{\"n\":{i}}}"),
+                "t",
+            ));
+        }
+        assert_eq!(bus.len(), 3);
+        assert_eq!(bus.events()[2].payload, "{\"n\":4}");
+
+        // Many mid-sized ones: the byte budget drops the oldest.
+        let bus = super::EventBusMonitor::new(100_000);
+        let mid = "y".repeat(60 * 1024);
+        for _ in 0..1000 {
+            bus.push(super::CapturedTauriEvent::new("e", mid.as_str(), "t"));
+        }
+        let retained: usize = bus.events().iter().map(|e| e.payload.len()).sum();
+        assert!(retained <= 16 * 1024 * 1024, "{retained} bytes retained");
+        assert_eq!(bus.clear(), retained / mid.len());
+        bus.push(super::CapturedTauriEvent::new("e", mid.as_str(), "t"));
+        assert_eq!(bus.len(), 1);
+    }
+
     use super::*;
 
     /// G-10: expired fault rules were never evicted, and nothing bounded the number of rules.
@@ -1989,6 +2194,97 @@ mod tests {
         assert_eq!(report[0].name, "phase_1");
         assert!(report[1].cumulative_ms >= report[0].cumulative_ms);
         assert!(timeline.total_ms() > 0.0);
+    }
+
+    #[test]
+    fn cpu_ticks_are_read_past_a_command_name_with_spaces_and_parentheses() {
+        // The shape of a real /proc/<pid>/stat: pid (comm) state ppid ... utime stime ...
+        let stat =
+            "2087 (Web (Kit) Pro) R 1976 1976 1976 0 -1 4194304 19 0 0 0 512 37 0 0 20 0 9 0 100\n";
+        assert_eq!(cpu_ticks_from_stat(stat), Some(549));
+        assert_eq!(cpu_ticks_from_stat("garbage"), None);
+        assert_eq!(cpu_ticks_from_stat("1 (x) R 1"), None);
+    }
+
+    #[test]
+    fn what_a_thread_wanted_of_the_cpu_is_read_in_ticks() {
+        assert_eq!(
+            cpu_ticks_from_schedstat("1500000000 3500000000 42\n"),
+            Some((500, 150))
+        );
+        assert_eq!(cpu_ticks_from_schedstat("0 0 0\n"), None);
+        assert_eq!(cpu_ticks_from_schedstat("garbage"), None);
+        assert_eq!(cpu_ticks_from_schedstat(""), None);
+    }
+
+    #[test]
+    fn only_a_single_main_thread_at_full_speed_counts_as_spinning() {
+        let five_s = std::time::Duration::from_secs(5);
+        let before = [(1, 100, 100, 7), (2, 100, 100, 7), (3, 100, 100, 7)];
+        // 5 s at 100 ticks/s for one, a busy page's 60% for another.
+        assert_eq!(
+            spinning_web_process(
+                &before,
+                &[(1, 600, 600, 7), (2, 400, 400, 7), (3, 101, 101, 7)],
+                five_s
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            spinning_web_process(
+                &before,
+                &[(1, 400, 400, 7), (2, 400, 400, 7), (3, 101, 101, 7)],
+                five_s
+            ),
+            None,
+            "busy is not stopped"
+        );
+        assert_eq!(
+            spinning_web_process(
+                &before,
+                &[(1, 600, 600, 7), (2, 600, 600, 7), (3, 101, 101, 7)],
+                five_s
+            ),
+            None,
+            "nothing says which window's page each one renders"
+        );
+        assert_eq!(
+            spinning_web_process(&before, &[(9, 9000, 9000, 0)], five_s),
+            None,
+            "a process that started meanwhile has no earlier reading"
+        );
+        assert_eq!(spinning_web_process(&[], &[], five_s), None);
+    }
+
+    /// On an overloaded core a healthy main thread waits nearly all the time, and so reads as wanting
+    /// the CPU flat out (102 ticks/s measured, with 64 others running). It still sleeps.
+    #[test]
+    fn a_thread_that_rests_is_not_spinning_however_long_it_waits() {
+        let five_s = std::time::Duration::from_secs(5);
+        let before = [(1, 100, 100, 7)];
+        // 1 tick a second on the CPU and 2.5 sleeps, as measured there.
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 610, 105, 19)], five_s),
+            None
+        );
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 610, 105, 12)], five_s),
+            Some(1),
+            "a bare loop under load: starved, and a stray sleep or two"
+        );
+        // Measured on WebKitGTK: 1,300 sleeps a second through the collector, with the CPU to itself.
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 590, 560, 6000)], five_s),
+            Some(1),
+            "a loop that allocates"
+        );
+    }
+
+    #[test]
+    fn voluntary_switches_are_not_the_involuntary_ones() {
+        let status = "Name:\tx\nnonvoluntary_ctxt_switches:\t9\nvoluntary_ctxt_switches:\t\t42\n";
+        assert_eq!(voluntary_switches_from_status(status), Some(42));
+        assert_eq!(voluntary_switches_from_status("Name:\tx\n"), None);
     }
 
     #[test]

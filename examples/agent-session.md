@@ -43,12 +43,12 @@ Agent: What's currently rendered in the webview?
 → dom_snapshot()
 
 Result (compact accessible-text format):
-  [e0] main
-    [e1] div.todo-list
-      [e2] listitem "Buy groceries"
-      [e3] listitem "Write tests"
-      [e4] listitem "Deploy v2"
-    [e5] div.settings-panel [hidden]
+  [k3f9e0] main
+    [k3f9e1] div.todo-list
+      [k3f9e2] listitem "Buy groceries"
+      [k3f9e3] listitem "Write tests"
+      [k3f9e4] listitem "Deploy v2"
+    [k3f9e5] div.settings-panel [hidden]
 
 Note: ref handles (e0-e5) are stable across calls.
 Use format: "json" for full accessibility tree.
@@ -62,7 +62,7 @@ Agent: I need the add button without scanning the full tree.
 → find_elements(text: "Add", role: "button")
 
 Result: 1 match
-  [e12] button "Add Todo" @add-btn
+  [k3f9e12] button "Add Todo" @add-btn
 ```
 
 ### 4. Interact and Verify
@@ -70,8 +70,8 @@ Result: 1 match
 ```
 Agent: I'll add a todo item through the UI and verify it hits the backend.
 
-→ input(action: "fill", ref_id: "e10", value: "Write tests")
-→ interact(action: "click", ref_id: "e12")
+→ input(action: "fill", ref_id: "k3f9e10", value: "Write tests")
+→ interact(action: "click", ref_id: "k3f9e12")
 → logs(action: "ipc", limit: 1)
 
 Result: IPC call captured
@@ -112,9 +112,9 @@ Result: 1 ghost found
 Agent: I'll record a user flow for regression testing.
 
 → recording(action: "start", session_name: "toggle-flow")
-→ interact(action: "click", ref_id: "e2")
+→ interact(action: "click", ref_id: "k3f9e2")
 → recording(action: "checkpoint", checkpoint_id: "after-toggle")
-→ interact(action: "click", ref_id: "e15")
+→ interact(action: "click", ref_id: "k3f9e15")
 → recording(action: "checkpoint", checkpoint_id: "after-clear")
 → recording(action: "stop")
 

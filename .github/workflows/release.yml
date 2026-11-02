@@ -13,6 +13,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# NO CACHES in this workflow, in any job. A tag run reads main's cache scope, and compat.yml runs
+# third-party build scripts on a schedule in that scope with the runner's cache token within reach,
+# so a restored entry would be code feeding the binaries this workflow ships. Caching saved nothing
+# here anyway: v0.10.2's Rust caches all missed. scripts/check-release-no-cache.sh enforces this.
+#
 # Read-only by default; a job that needs more (github-release) asks for it.
 permissions:
   contents: read
@@ -32,14 +37,14 @@ jobs:
 
       - name: Install system dependencies
         uses: ./.github/actions/linux-deps
+        with:
+          cache: "false"
 
       # Action code pinned to a SHA (no semver tags exist on this repo); the Rust
       # channel stays dynamic via `toolchain: stable` so we still get latest stable.
       - uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master (2026-06)
         with:
           toolchain: stable
-
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
       - name: Install bridge test dependencies
         working-directory: crates/victauri-plugin/tests/bridge_tests
@@ -58,7 +63,8 @@ jobs:
     name: Build ${{ matrix.binary }} (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
     needs: test
-    timeout-minutes: 30
+    # Room for an uncached apt install on a slow mirror (linux-deps gives it up to 22 min).
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -129,6 +135,8 @@ jobs:
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         uses: ./.github/actions/linux-deps
+        with:
+          cache: "false"
 
       # Action code pinned to a SHA (no semver tags exist on this repo); the Rust
       # channel stays dynamic via `toolchain: stable` so we still get latest stable.
@@ -136,10 +144,6 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
-        with:
-          key: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.use-cross
@@ -247,6 +251,8 @@ jobs:
 
       - name: Install system dependencies
         uses: ./.github/actions/linux-deps
+        with:
+          cache: "false"
 
       # Action code pinned to a SHA (no semver tags exist on this repo); the Rust
       # channel stays dynamic via `toolchain: stable` so we still get latest stable.
@@ -254,7 +260,7 @@ jobs:
         with:
           toolchain: stable
 
-      # No rust-cache: verification must build from the packages, not a restored target/.
+      # Verification must build from the packages, not a restored target/.
       - name: Verify all packages
         run: cargo publish --workspace --dry-run --locked
 
@@ -311,8 +317,6 @@ jobs:
         with:
           toolchain: stable
 
-      # No rust-cache in this job: a restored target/ is code the job would then run.
-
       # Crates already published at this version (a local publish, or a re-run after a partial
       # one) need no token: when ALL are on crates.io the auth and publish steps are skipped, so
       # the GitHub Release still gets cut even if Trusted Publishing is not (yet) configured.
@@ -322,11 +326,15 @@ jobs:
           set -euo pipefail
           VER="${GITHUB_REF#refs/tags/v}"
           missing=0
+          index="$(mktemp)"
           for c in victauri-core victauri-macros victauri-plugin victauri-test victauri-cli victauri-watchdog; do
             # Sparse-index path for names of 4+ chars: first two / next two / name.
-            if curl -fsSL -A "victauri-release (github.com/4DA-Systems/Victauri)" \
+            # To a file, not `curl | grep -q`: grep exits at its first match, curl then dies with
+            # exit 23, and pipefail reads a found version as missing, unless it is the last line.
+            # A crate with no index entry yet is a 404, which `-f` turns into "not on crates.io".
+            if curl -fsSL -A "victauri-release (github.com/4DA-Systems/Victauri)" -o "$index" \
                 "https://index.crates.io/${c:0:2}/${c:2:2}/$c" \
-                | grep -q "\"vers\":\"$VER\""; then
+              && grep -qF "\"vers\":\"$VER\"" "$index"; then
               echo "$c $VER is already on crates.io"
             else
               echo "$c $VER is not on crates.io yet"
@@ -335,7 +343,8 @@ jobs:
           done
           echo "all=$([ "$missing" -eq 0 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-      # Trusted Publishing. Each crate must list this publisher on crates.io (crate Settings →
+      # Trusted Publishing, which has NEVER run for real (RELEASING.md): every release so far was
+      # published locally first, so this step and the next were skipped. Each crate must list this publisher on crates.io (crate Settings →
       # Trusted Publishing → GitHub: owner `4DA-Systems`, repository `Victauri`, workflow
       # `release.yml`, environment `release`). With NO crate configured this step fails and
       # nothing is published. The token covers only the crates whose config matches, so a crate

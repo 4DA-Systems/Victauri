@@ -27,7 +27,10 @@ impl IsolatedTemp {
     }
 
     fn write_entry(&self, port: u16, identifier: &str) {
-        let pid = std::process::id();
+        self.write_entry_of(std::process::id(), TOKEN, port, identifier);
+    }
+
+    fn write_entry_of(&self, pid: u32, token: &str, port: u16, identifier: &str) {
         let dir = self.0.path().join("victauri").join(pid.to_string());
         std::fs::create_dir_all(&dir).unwrap();
         #[cfg(unix)]
@@ -38,7 +41,7 @@ impl IsolatedTemp {
             }
         }
         std::fs::write(dir.join("port"), port.to_string()).unwrap();
-        std::fs::write(dir.join("token"), TOKEN).unwrap();
+        std::fs::write(dir.join("token"), token).unwrap();
         std::fs::write(
             dir.join("metadata.json"),
             json!({"pid": pid, "port": port, "identifier": identifier, "product_name": "Mock"})
@@ -125,6 +128,8 @@ async fn mcp(State(mock): State<Mock>, headers: HeaderMap, body: String) -> Resp
                     "app": {"identifier": mock.identifier},
                 })),
                 "echo" => text(&json!({"received": arguments})),
+                // Page text with controls some terminals act on: C1 CSI and a bidi override.
+                "hostile" => text(&json!({"title": "a\u{9b}31mb\u{202e}c"})),
                 "invoke_command" => text(&json!({"app": mock.identifier})),
                 "screenshot" => json!({"content": [{
                     "type": "image",
@@ -232,6 +237,69 @@ fn assert_no_token(out: &Output) {
         "the auth token reached the terminal:\n{}\n{}",
         stdout(out),
         stderr(out)
+    );
+}
+
+/// A hard-killed app's entry whose PID was reused, naming the port the current app holds: `--app`
+/// refused with "several apps" through both discovery paths (`call`, and the bridge's behind
+/// `logs`). The stale entry's process is really alive and its token really refused here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_entry_on_the_apps_port_does_not_make_it_ambiguous() {
+    const APP: &str = "com.test.stale";
+    let real = std::process::id();
+    let info = move |headers: HeaderMap| async move {
+        let auth = headers.get("authorization").and_then(|h| h.to_str().ok());
+        if auth == Some(format!("Bearer {TOKEN}").as_str()) {
+            Json(json!({"name": "victauri", "app_identifier": APP, "pid": real})).into_response()
+        } else {
+            (StatusCode::UNAUTHORIZED, "unauthorized").into_response()
+        }
+    };
+    let logs = post(|| async {
+        Json(json!({"result": {"entries": [], "next_seq": 0, "sources": {"tracing": true}}}))
+    });
+    let app = Router::new()
+        .route("/health", get(|| async { "ok" }))
+        .route("/info", get(info))
+        .route("/api/tools/logs", logs)
+        .route("/mcp", post(mcp))
+        .with_state(Mock {
+            identifier: APP.to_string(),
+            plugin_version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // A live process of ours, as a reused PID is.
+    let mut reused = Command::new(if cfg!(windows) { "cmd" } else { "sleep" })
+        .args(if cfg!(windows) {
+            &["/C", "ping -n 60 127.0.0.1 >nul"][..]
+        } else {
+            &["60"][..]
+        })
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let iso = IsolatedTemp::new();
+    iso.write_entry(port, APP);
+    iso.write_entry_of(reused.id(), "the-dead-apps-token", port, APP);
+
+    let call = run(iso.victauri(&["call", "--app", APP, "echo", "a=b"])).await;
+    let logs = run(iso.victauri(&["logs", "--app", APP, "-n", "1"])).await;
+    let _ = reused.kill();
+    let _ = reused.wait();
+    assert!(call.status.success(), "{}", stderr(&call));
+    assert_eq!(json_stdout(&call)["received"], json!({"a": "b"}));
+    assert!(logs.status.success(), "{}", stderr(&logs));
+    assert!(
+        stderr(&logs).contains(&format!("pid {real}")),
+        "{}",
+        stderr(&logs)
     );
 }
 
@@ -592,4 +660,129 @@ async fn a_reader_closing_the_pipe_is_a_clean_exit() {
         );
         assert_eq!(code, Some(0), "{args:?}: {err}");
     }
+}
+
+/// `call` / `invoke` stdout carries page text. `serde_json` leaves C1 and bidi controls raw, and
+/// a terminal acts on them; `logs --json` already escaped them. The JSON stays equal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn call_stdout_is_inert_in_a_terminal_and_the_json_is_unchanged() {
+    let iso = IsolatedTemp::new();
+    iso.write_entry(
+        start_mock("com.test.call", env!("CARGO_PKG_VERSION")).await,
+        "com.test.call",
+    );
+    for raw in [false, true] {
+        let mut args = vec!["call", "hostile"];
+        if raw {
+            args.push("--raw");
+        }
+        let out = run(iso.victauri(&args)).await;
+        assert!(out.status.success(), "{}", stderr(&out));
+        let text = stdout(&out);
+        assert!(
+            !text.contains('\u{9b}') && !text.contains('\u{202e}'),
+            "raw control characters on stdout: {text:?}"
+        );
+        assert_eq!(json_stdout(&out)["title"], "a\u{9b}31mb\u{202e}c");
+    }
+}
+
+/// The plugin's version string comes from the server and reaches the terminal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hostile_plugin_version_cannot_drive_the_terminal() {
+    let iso = IsolatedTemp::new();
+    let version = "0.1.0\u{1b}]0;PWNED\u{7}";
+    iso.write_entry(start_mock("com.test.call", version).await, "com.test.call");
+    let project = iso.path("project");
+    std::fs::create_dir_all(&project).unwrap();
+    // `doctor` stops early without a project to look at.
+    std::fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    for args in [&["check"][..], &["doctor"][..], &["call", "fail"][..]] {
+        let mut cmd = iso.victauri(args);
+        cmd.current_dir(&project);
+        let out = run(cmd).await;
+        let err = stderr(&out);
+        assert!(err.contains("0.1.0"), "{args:?} never showed it: {err}");
+        assert!(!err.contains('\u{1b}'), "{args:?} printed raw ESC: {err:?}");
+    }
+}
+
+/// PowerShell 5.1's `Out-File -Encoding utf8` writes a BOM, and this is the route the docs give
+/// PowerShell users. The error was `expected value at line 1 column 1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn args_file_accepts_a_bom_and_names_utf16() {
+    let iso = IsolatedTemp::new();
+    iso.write_entry(
+        start_mock("com.test.call", env!("CARGO_PKG_VERSION")).await,
+        "com.test.call",
+    );
+    let bom = iso.path("bom.json");
+    std::fs::write(&bom, b"\xef\xbb\xbf{\"a\":1}").unwrap();
+    let out = run(iso.victauri(&["call", "echo", "--args-file", bom.to_str().unwrap()])).await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(json_stdout(&out)["received"], json!({"a": 1}));
+
+    let out = run_with_stdin(
+        iso.victauri(&["call", "echo", "--args-file", "-"]),
+        Some("\u{feff}{\"b\":2}"),
+    )
+    .await;
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(json_stdout(&out)["received"], json!({"b": 2}));
+
+    // `>` in Windows PowerShell 5.1 writes UTF-16: say that, not "invalid UTF-8".
+    let utf16 = iso.path("u16.json");
+    let mut bytes = vec![0xff, 0xfe];
+    bytes.extend("{\"a\":1}".encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(&utf16, bytes).unwrap();
+    let out = run(iso.victauri(&["call", "echo", "--args-file", utf16.to_str().unwrap()])).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("UTF-16"), "{}", stderr(&out));
+}
+
+/// The generated instructions recommend `victauri call screenshot --out shot.png`, in a project
+/// directory: a repo-planted `shot.png` link overwrote the file it points to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn out_through_a_symlink_is_refused_before_the_call() {
+    let iso = IsolatedTemp::new();
+    iso.write_entry(
+        start_mock("com.test.call", env!("CARGO_PKG_VERSION")).await,
+        "com.test.call",
+    );
+    let project = iso.path("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let victim = iso.path("victim");
+    std::fs::write(&victim, "PRECIOUS").unwrap();
+    let link = project.join("shot.png");
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&victim, &link).is_ok();
+    #[cfg(not(windows))]
+    let linked = std::os::unix::fs::symlink(&victim, &link).is_ok();
+    if !linked {
+        eprintln!("skipped: cannot create a symlink here");
+        return;
+    }
+    let mut cmd = iso.victauri(&["call", "screenshot", "--out", "shot.png"]);
+    cmd.current_dir(&project);
+    let out = run(cmd).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(stderr(&out).contains("symbolic link"), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "PRECIOUS");
+
+    // Several images: the numbered names are checked as they are written.
+    let numbered = project.join("t-1.png");
+    #[cfg(windows)]
+    let linked = std::os::windows::fs::symlink_file(&victim, &numbered).is_ok();
+    #[cfg(not(windows))]
+    let linked = std::os::unix::fs::symlink(&victim, &numbered).is_ok();
+    assert!(linked);
+    let mut cmd = iso.victauri(&["call", "trace", "--out", "t.png"]);
+    cmd.current_dir(&project);
+    let out = run(cmd).await;
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "PRECIOUS");
 }

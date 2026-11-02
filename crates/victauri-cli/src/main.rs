@@ -100,7 +100,7 @@ VICTAURI:BEGIN..END block, or .claude/skills/victauri/.")]
     /// Run the built-in smoke test suite against a running Tauri app
     Test {
         /// Maximum acceptable DOM complete time in milliseconds
-        #[arg(long, default_value_t = 10_000)]
+        #[arg(long, default_value_t = 20_000)]
         max_load_ms: u64,
         /// Maximum acceptable JS heap usage in megabytes
         #[arg(long, default_value_t = 512.0)]
@@ -186,7 +186,7 @@ with --args-file - or use key=value pairs.)
 Examples:
   victauri call dom_snapshot
   victauri call query_db query=\"SELECT count(*) FROM items\"
-  victauri call interact action=click ref_id=e12
+  victauri call interact action=click ref_id=k3f9e12
   victauri call invoke_command command=get_settings
   victauri call screenshot --out shot.png
   echo '{\"action\":\"list\"}' | victauri call window --args-file -
@@ -473,6 +473,9 @@ async fn main() -> Result<()> {
             cmd_coverage(threshold, junit.as_deref(), allow_empty_registry, &target).await?;
         }
         Commands::Run { capture, command } => {
+            let capture = capture
+                .map(|c| checked_record_output(&std::env::current_dir()?, &c))
+                .transpose()?;
             let code = tokio::task::spawn_blocking(move || run::run(&command, capture))
                 .await
                 .context("launcher task failed")??;
@@ -821,6 +824,12 @@ fn cmd_setup(root: &Path, options: &agents::Options) -> Result<()> {
              found, so the bridge is not pinned (it uses the single running app)\n"
         ),
     }
+    if app_id.is_some() && options.user_config {
+        eprintln!(
+            "User-level configs are not pinned: they serve every project, so the bridge uses \
+             the single running app there.\n"
+        );
+    }
     let options = agents::Options {
         feature: options
             .feature
@@ -852,19 +861,31 @@ fn cmd_setup(root: &Path, options: &agents::Options) -> Result<()> {
         "Install the CLI on PATH if you have not: cargo install victauri-cli (the configs run \
          `victauri bridge`). Then start your app; your agent connects even before it is up."
     );
-    // A `victauri` entry that does not run the bridge is never overwritten, so the client is
-    // NOT wired: fail, so a script or CI step running `setup` cannot read it as success.
+    // A `victauri` entry that does not run the bridge, or is pinned to another app, is never
+    // overwritten, so the client is NOT wired: fail, so a script or CI step running `setup` cannot
+    // read it as success.
     let foreign = reports
         .iter()
         .filter(|r| matches!(r.status, agents::Status::Unexpected(_)))
         .count();
     if foreign > 0 && !options.dry_run {
         bail!(
-            "{foreign} existing `victauri` server entr{} not run the Victauri bridge (kept as is \
-             — see [!] above); remove or fix {} and run setup again",
+            "{foreign} existing `victauri` server entr{} not reach this app through the Victauri \
+             bridge (kept as is — see [!] above); remove or fix {} and run setup again",
             if foreign == 1 { "y does" } else { "ies do" },
             if foreign == 1 { "it" } else { "them" }
         );
+    }
+    // The same outcome for a file that was refused or could not be written. A skip with no path
+    // is "this client has no project-level config", which is expected under `setup all`.
+    let unwritten = reports
+        .iter()
+        .filter(|r| {
+            matches!(r.status, agents::Status::Skipped(_)) && !r.path.as_os_str().is_empty()
+        })
+        .count();
+    if unwritten > 0 && !options.dry_run {
+        bail!("{unwritten} file(s) could not be written (see [!] above)");
     }
     Ok(())
 }
@@ -897,7 +918,8 @@ fn warn_on_version_skew(plugin_version: &str) -> bool {
     }
     eprintln!();
     eprintln!(
-        "  ⚠ Version skew: this CLI is v{cli_version} but the running plugin is v{plugin_version}."
+        "  ⚠ Version skew: this CLI is v{cli_version} but the running plugin is v{}.",
+        victauri_test::terminal::single_line(plugin_version)
     );
     eprintln!("    A mismatched CLI can fail in cryptic ways — e.g. an old CLI aborts the MCP");
     eprintln!("    handshake with \"no mcp-session-id header\" against a newer stateless plugin.");
@@ -953,6 +975,15 @@ fn connect_failure_message(detail: &str) -> String {
          victauri-plugin wired into its builder."
     };
     format!("Could not connect to Victauri server: {detail}\n\n{hint}")
+}
+
+/// Where else a project's agent configs may live: `setup` and `init` usually run at the project
+/// root, and the docs run commands from the app crate, so from `src-tauri` also look in its parent.
+fn agent_config_root(cwd: &std::path::Path) -> &std::path::Path {
+    match cwd.parent() {
+        Some(parent) if cwd.file_name().is_some_and(|name| name == "src-tauri") => parent,
+        _ => cwd,
+    }
 }
 
 /// Names from a ghost-report list whose items are `{ "name": … }` objects (the plugin's
@@ -1084,13 +1115,14 @@ async fn cmd_check(junit_path: Option<&Path>, target: &AppTarget) -> Result<()> 
         .get("version")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    let shown_version = victauri_test::terminal::single_line(version);
     let tool_count = parse_tool_count(&info);
     let uptime = info
         .get("uptime_secs")
         .and_then(serde_json::Value::as_u64)
         .map_or("?".to_string(), |s| format!("{s}s"));
 
-    eprintln!("  Victauri v{version}");
+    eprintln!("  Victauri v{shown_version}");
     eprintln!(
         "  Endpoint: {} (app: {})",
         client.base_url(),
@@ -1163,8 +1195,7 @@ async fn cmd_check(junit_path: Option<&Path>, target: &AppTarget) -> Result<()> 
         .context("memory stats failed")?;
     let rss = mem
         .get("working_set_bytes")
-        .or_else(|| mem.get("rss_bytes"))
-        .or_else(|| mem.get("rss"))
+        .or_else(|| mem.get("resident_bytes"))
         .and_then(serde_json::Value::as_u64);
     if let Some(bytes) = rss {
         let mb = bytes as f64 / 1_048_576.0;
@@ -1234,7 +1265,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     }
 
     // Check 3: Victauri plugin dependency
-    let cargo_content = std::fs::read_to_string(&cargo_path).unwrap_or_default();
+    let cargo_content = read_regular_file(&cargo_path).unwrap_or_default();
     if manifest_has_dependency(&cargo_content, "victauri-plugin") {
         eprintln!("  [PASS] victauri-plugin dependency present");
         pass_count += 1;
@@ -1267,7 +1298,7 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
         let path = src_dir.join(filename);
         if path.exists() {
             // Code only: a commented-out `.plugin(victauri_plugin::init())` is not wiring.
-            let source = std::fs::read_to_string(&path).unwrap_or_default();
+            let source = read_regular_file(&path).unwrap_or_default();
             runtime_grant |= grants_victauri_at_runtime(&source);
             if rust_code_only(&source).contains("victauri_plugin") {
                 eprintln!("  [PASS] Plugin wired in {filename}");
@@ -1284,7 +1315,10 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
     }
 
     // Check 6: an agent client is wired (any project-level MCP config with a victauri server)
-    let configured = agents::configured_project_clients(&cwd);
+    let mut configured = agents::configured_project_clients(&cwd);
+    if configured.is_empty() {
+        configured = agents::configured_project_clients(agent_config_root(&cwd));
+    }
     if configured.is_empty() {
         eprintln!("  [WARN] No agent client configured for Victauri in this project");
         eprintln!(
@@ -1393,7 +1427,10 @@ async fn cmd_doctor(target: &AppTarget) -> Result<u32> {
                     .get("version")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("unknown");
-                eprintln!("  [PASS] Plugin responding (v{version})");
+                eprintln!(
+                    "  [PASS] Plugin responding (v{})",
+                    victauri_test::terminal::single_line(version)
+                );
                 if warn_on_version_skew(version) {
                     warn_count += 1;
                 }
@@ -1592,13 +1629,15 @@ fn local_failure(e: anyhow::Error) -> i32 {
     call::EXIT_USAGE
 }
 
-/// Print `value` as JSON on stdout: pretty, or one line with `raw`.
+/// Print `value` as JSON on stdout: pretty, or one line with `raw`. It carries page text, so it
+/// is made inert in a terminal; the JSON is unchanged.
 fn print_json(value: &serde_json::Value, raw: bool) -> Result<()> {
-    if raw {
-        emit(&serde_json::to_string(value)?)
+    let text = if raw {
+        serde_json::to_string(value)?
     } else {
-        emit(&serde_json::to_string_pretty(value)?)
-    }
+        serde_json::to_string_pretty(value)?
+    };
+    emit(&logs::json_terminal_safe(&text))
 }
 
 /// Warn on a CLI↔plugin `major.minor` skew. One extra Rust-side call, so `call` only does it
@@ -1734,24 +1773,30 @@ async fn cmd_call(
     // Every failure before the call is a usage error (exit 2) — exit 1 means the tool ran
     // and reported an error, so a local problem must never surface as anyhow's exit 1.
     let file_json = match args_file {
-        Some("-") => {
-            let mut text = String::new();
-            if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut text) {
-                eprintln!("error: failed to read --args-file - (stdin): {e}");
+        Some(source) => {
+            let mut bytes = Vec::new();
+            let read = if source == "-" {
+                std::io::Read::read_to_end(&mut std::io::stdin(), &mut bytes).map(|_| ())
+            } else {
+                std::fs::read(source).map(|b| bytes = b)
+            };
+            let shown = if source == "-" {
+                "- (stdin)".to_string()
+            } else {
+                single_line(source)
+            };
+            if let Err(e) = read {
+                eprintln!("error: failed to read --args-file {shown}: {e}");
                 return Ok(call::EXIT_USAGE);
             }
-            Some(text)
+            match call::decode_args_file(&bytes) {
+                Ok(text) => Some(text),
+                Err(why) => {
+                    eprintln!("error: --args-file {shown} {why}");
+                    return Ok(call::EXIT_USAGE);
+                }
+            }
         }
-        Some(path) => match std::fs::read_to_string(path) {
-            Ok(text) => Some(text),
-            Err(e) => {
-                eprintln!(
-                    "error: failed to read --args-file {}: {e}",
-                    single_line(path)
-                );
-                return Ok(call::EXIT_USAGE);
-            }
-        },
         None => None,
     };
     let arguments = match call::build_arguments(file_json.as_deref(), args) {
@@ -1770,6 +1815,15 @@ async fn cmd_call(
             single_line(&out.display().to_string()),
             single_line(&out.join("shot.png").display().to_string())
         );
+        return Ok(call::EXIT_USAGE);
+    }
+    // Before the call too: a cloned repo's `shot.png` link must not redirect the write (R4-FS1).
+    if let Some(out) = out
+        && let Err(e) = std::env::current_dir()
+            .map_err(Into::into)
+            .and_then(|cwd| checked_record_output(&cwd, out))
+    {
+        eprintln!("error: --out: {e:#}");
         return Ok(call::EXIT_USAGE);
     }
 
@@ -1855,10 +1909,13 @@ async fn cmd_call(
         }
         for (i, image) in rendered.images.iter().enumerate() {
             let path = call::image_path(out, i, count, &image.mime_type);
-            if let Err(e) = std::fs::write(&path, &image.bytes) {
+            // Several images get numbered names, which the check above did not see.
+            let written = refuse_symlink(&path)
+                .and_then(|()| std::fs::write(&path, &image.bytes).map_err(Into::into));
+            if let Err(e) = written {
                 // The tool already ran (its side effects happened); only saving failed.
                 eprintln!(
-                    "error: the tool ran, but its result was not saved — writing {} failed: {e}",
+                    "error: the tool ran, but its result was not saved — writing {} failed: {e:#}",
                     single_line(&path.display().to_string())
                 );
                 if !saved.is_empty() {
@@ -1961,6 +2018,13 @@ async fn cmd_record(
     assert_ipc: bool,
     target: &AppTarget,
 ) -> Result<()> {
+    // Before anything is recorded: a bad path found when the recording ends loses the session.
+    let output = checked_record_output(&std::env::current_dir()?, output)?;
+    let output = output.as_path();
+    if output.is_dir() {
+        bail!("--output {} is a directory", display_path(output));
+    }
+
     eprintln!("Connecting to running Tauri app...\n");
 
     let mut client = connect(target).await?;
@@ -2020,8 +2084,6 @@ async fn cmd_record(
     };
     let code = victauri_core::generate_test(&session, &options);
 
-    let output = checked_record_output(&std::env::current_dir()?, output)?;
-    let output = output.as_path();
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create directory {}", display_path(parent)))?;
@@ -2106,7 +2168,11 @@ fn run_tests_with_output(filter: Option<&str>, changed_file: Option<&str>) {
 
     eprintln!("\x1b[36mVictauri Watch\x1b[0m");
     if let Some(file) = changed_file {
-        eprintln!("  Triggered by: \x1b[33m{file}\x1b[0m");
+        // A file name is the repository's text: on Unix it can hold control characters.
+        eprintln!(
+            "  Triggered by: \x1b[33m{}\x1b[0m",
+            victauri_test::terminal::single_line(file)
+        );
     }
     eprintln!();
 
@@ -2501,7 +2567,7 @@ fn try_patch_tauri_builder(src_dir: &Path, feature: Option<&str>) -> Result<bool
 fn refuse_symlink(path: &Path) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => anyhow::bail!(
-            "refusing to write {}: it is a symbolic link (victauri init never writes through symlinks)",
+            "refusing to write {}: it is a symbolic link (Victauri never writes through symlinks)",
             display_path(path)
         ),
         _ => Ok(()),
@@ -2537,7 +2603,7 @@ fn display_path(path: &Path) -> String {
 fn ensure_inside_project(root: &Path, path: &Path) -> Result<()> {
     let refuse = |why: String| -> Result<()> {
         anyhow::bail!(
-            "refusing to write {}: {why} (victauri init never writes through symlinks or \
+            "refusing to write {}: {why} (Victauri never writes through symlinks or \
              outside the project)",
             display_path(path)
         )
@@ -2624,16 +2690,45 @@ fn write_new_file(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Read a project file that should be a regular file. A repository can plant a FIFO or a link to
+/// `/dev/zero` under any of these names, and reading one would hang or fill memory.
+fn read_regular_file(path: &Path) -> std::io::Result<String> {
+    if std::fs::metadata(path)?.is_file() {
+        std::fs::read_to_string(path)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ))
+    }
+}
+
 /// Read the Tauri bundle identifier from the project's `tauri.conf.json` so the generated
 /// `.mcp.json` can pin the bridge to this specific app (multi-app zero-config).
 fn read_app_identifier(root: &Path) -> Option<String> {
+    read_tauri_conf_string(root, &["identifier"])
+}
+
+/// The product name from the project's `tauri.conf.json`: `--app` matches it as well as the
+/// identifier. (Tauri 2 has it at the top level, Tauri 1 under `package`.)
+fn read_app_product_name(root: &Path) -> Option<String> {
+    read_tauri_conf_string(root, &["productName", "package/productName"])
+}
+
+fn read_tauri_conf_string(root: &Path, keys: &[&str]) -> Option<String> {
     for rel in ["src-tauri/tauri.conf.json", "tauri.conf.json"] {
         let path = root.join(rel);
-        if let Ok(content) = std::fs::read_to_string(&path)
+        if let Ok(content) = read_regular_file(&path)
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&content)
-            && let Some(id) = v.get("identifier").and_then(|i| i.as_str())
         {
-            return Some(id.to_string());
+            for key in keys {
+                if let Some(found) = v
+                    .pointer(&format!("/{key}"))
+                    .and_then(serde_json::Value::as_str)
+                {
+                    return Some(found.to_string());
+                }
+            }
         }
     }
     None
@@ -2665,7 +2760,21 @@ fn snapshot_element_count(snap: &serde_json::Value) -> u64 {
             .lines()
             .filter(|line| {
                 let t = line.trim_start();
-                t.strip_prefix("[e").is_some_and(|rest| {
+                // `[k3f9e12]` (a 4-char page tag since 0.10.3), or `[e12]` from an older plugin.
+                t.strip_prefix('[').is_some_and(|rest| {
+                    let tagged = rest.get(..5).filter(|head| {
+                        head.ends_with('e')
+                            && head[..4]
+                                .bytes()
+                                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                    });
+                    // Tagged first: a tag can start with `e` too (`[eabce12]`).
+                    let Some(rest) = tagged
+                        .and_then(|head| rest.strip_prefix(head))
+                        .or_else(|| rest.strip_prefix('e'))
+                    else {
+                        return false;
+                    };
                     let digits = rest.chars().take_while(char::is_ascii_digit).count();
                     digits > 0 && rest[digits..].starts_with(']')
                 })
@@ -2745,7 +2854,7 @@ fn scan_victauri_capability(caps_dir: &Path) -> VictauriCapabilityScan {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(text) = read_regular_file(&path) else {
             continue;
         };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -2877,7 +2986,7 @@ fn detect_project(root: &Path) -> Result<(PathBuf, bool)> {
         );
     };
 
-    let content = std::fs::read_to_string(&cargo_toml).context("failed to read Cargo.toml")?;
+    let content = read_regular_file(&cargo_toml).context("failed to read Cargo.toml")?;
     // A virtual workspace manifest (`[workspace]`, no `[package]`) cannot take dependencies:
     // adding them breaks every cargo command in the repository. The app crate is a member.
     if let Ok(doc) = content
@@ -2994,7 +3103,7 @@ fn victauri_feature(doc: &toml_edit::DocumentMut) -> Option<String> {
 /// as not gated.
 fn project_victauri_feature(root: &Path) -> Option<String> {
     let (cargo_toml, _) = detect_project(root).ok()?;
-    let content = std::fs::read_to_string(cargo_toml).ok()?;
+    let content = read_regular_file(&cargo_toml).ok()?;
     let doc = content
         .strip_prefix('\u{feff}')
         .unwrap_or(&content)
@@ -3004,7 +3113,7 @@ fn project_victauri_feature(root: &Path) -> Option<String> {
 }
 
 fn add_dependencies(cargo_toml_path: &Path, optional: bool) -> Result<DepsOutcome> {
-    let content = std::fs::read_to_string(cargo_toml_path)?;
+    let content = read_regular_file(cargo_toml_path)?;
     let mut doc = content
         .strip_prefix('\u{feff}')
         .unwrap_or(&content)
@@ -3261,7 +3370,7 @@ fn scan_tauri_commands(src_dir: &Path) -> Vec<String> {
     }
 
     for path in rs_files {
-        if let Ok(content) = std::fs::read_to_string(&path) {
+        if let Ok(content) = read_regular_file(&path) {
             // Code only: a commented-out command would get a generated test that fails.
             let content = rust_code_only(&content);
             let mut in_command_attr = false;
@@ -4378,6 +4487,17 @@ mod tests {
             "format": "compact"
         });
         assert_eq!(snapshot_element_count(&compact), 3);
+        let tagged = serde_json::json!({
+            "tree": "[k3f9e1] body\n  [k3f9e20] button \"Save\"\n  [toolong1e3] x\n  [k3f9] y\n",
+            "format": "compact"
+        });
+        assert_eq!(snapshot_element_count(&tagged), 2);
+        // A page tag may itself start with `e` (1 in 26), and may end in digits.
+        let e_tag = serde_json::json!({
+            "tree": "[eabce12] body\n  [e123e4] a\n  [e12] legacy\n  [e123e] not a ref\n",
+            "format": "compact"
+        });
+        assert_eq!(snapshot_element_count(&e_tag), 3);
         let json_tree = serde_json::json!({
             "tree": {"ref_id": "e1", "children": [
                 {"ref_id": "e2", "children": []},
@@ -4634,6 +4754,14 @@ mod tests {
         assert!(content.contains("XDG_RUNTIME_DIR"));
         assert!(content.contains("victauri-<uid>"));
         assert!(content.contains("victauri check"));
+    }
+
+    #[test]
+    fn agent_configs_are_looked_for_at_the_project_root() {
+        let project = std::path::Path::new("app");
+        assert_eq!(agent_config_root(&project.join("src-tauri")), project);
+        assert_eq!(agent_config_root(project), project);
+        assert_eq!(agent_config_root(&project.join("src")), project.join("src"));
     }
 
     #[test]

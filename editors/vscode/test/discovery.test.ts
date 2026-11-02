@@ -3,6 +3,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as http from "node:http";
+import type { AddressInfo } from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -14,8 +16,10 @@ import {
   homeStateRoot,
   ownerCheckEnv,
   pidLiveness,
+  resetOwnerCheckBackoff,
   resolveConnection,
   scanServers,
+  settlePortClaims,
 } from "../src/discovery";
 
 const app = (port: number, token: string, identifier: string, pid = port): DiscoveredServer => ({
@@ -112,6 +116,77 @@ test("scanServers never uses (or deletes) an unverified owner's entry", async ()
   }
 });
 
+// A hard-killed app's entry whose PID was reused, naming the port the current app holds: two live
+// entries on one port made the extension report "Multiple Victauri apps". As in `victauri-test`.
+async function claimsOnOnePort(
+  answer: (auth: string | undefined) => { status: number; body?: unknown }
+): Promise<{ live: DiscoveredServer[]; asked: number }> {
+  let asked = 0;
+  const server = http.createServer((req, res) => {
+    asked += 1;
+    const { status, body } = answer(req.headers.authorization);
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end(body === undefined ? "" : JSON.stringify(body));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "victauri-vsc-claims-"));
+  try {
+    for (const pid of [111, 222]) {
+      const dir = path.join(root, String(pid));
+      fs.mkdirSync(dir, { mode: 0o700 });
+      fs.writeFileSync(path.join(dir, "port"), String(port));
+      fs.writeFileSync(path.join(dir, "token"), `tok-${pid}`);
+    }
+    fs.chmodSync(root, 0o700);
+    const { live } = await scanServers(() => "own", [root]);
+    return { live, asked };
+  } finally {
+    server.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+const pids = (live: DiscoveredServer[]) => live.map((s) => s.pid).sort();
+
+test("the server on a port says which of several entries is real", async () => {
+  const real = (auth: string | undefined) =>
+    auth === "Bearer tok-222" ? { status: 200, body: { pid: 222 } } : { status: 401 };
+  assert.deepEqual(pids((await claimsOnOnePort(real)).live), [222]);
+  // Auth off, or one fixed token: the pid decides.
+  const open = () => ({ status: 200, body: { pid: 222 } });
+  assert.deepEqual(pids((await claimsOnOnePort(open)).live), [222]);
+  // An older plugin reports no pid: accepting the token decides.
+  const older = (auth: string | undefined) =>
+    auth === "Bearer tok-222" ? { status: 200, body: { name: "victauri" } } : { status: 401 };
+  assert.deepEqual(pids((await claimsOnOnePort(older)).live), [222]);
+});
+
+test("entries nothing can settle stay, and one claim per port asks nothing", async () => {
+  const silent = () => ({ status: 200, body: { name: "victauri" } });
+  assert.deepEqual(pids((await claimsOnOnePort(silent)).live), [111, 222]);
+  const limited = () => ({ status: 429 });
+  assert.deepEqual(pids((await claimsOnOnePort(limited)).live), [111, 222]);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "victauri-vsc-claims-"));
+  try {
+    for (const [pid, port] of [
+      [111, 1],
+      [222, 2],
+    ]) {
+      const dir = path.join(root, String(pid));
+      fs.mkdirSync(dir, { mode: 0o700 });
+      fs.writeFileSync(path.join(dir, "port"), String(port));
+    }
+    fs.chmodSync(root, 0o700);
+    const started = Date.now();
+    const { live } = await scanServers(() => "own", [root]);
+    assert.deepEqual(pids(live), [111, 222]);
+    assert.ok(Date.now() - started < 500, "nothing to ask");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a rate-limited /health means the server is alive", () => {
   assert.equal(healthStatusMeansAlive(200), true);
   assert.equal(healthStatusMeansAlive(429), true);
@@ -155,7 +230,7 @@ test("windows: a discovery directory owned by another account is not trusted", a
     }
     // Force the real owner check even though the test root sits inside the user profile.
     const result = await scanServers((pid) => (pid >= 201 ? "own" : "dead"), [root], {
-      profileDir: "Z:\victauri-no-such-profile",
+      profileDir: "Z:\\victauri-no-such-profile",
     });
     assert.deepEqual(
       result.live.map((s) => s.pid),
@@ -224,10 +299,11 @@ test("windows: a failed owner check fails closed but is retried, not cached", as
     } finally {
       process.env.SystemRoot = savedRoot;
     }
+    resetOwnerCheckBackoff(); // what a Connect does; otherwise a failure waits out its backoff
     assert.equal(
       await dirIsTrusted(mine, opts),
       true,
-      "the failed check must not be cached: the next scan asks again"
+      "the failed check must not be cached: a later scan asks again"
     );
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
@@ -258,4 +334,76 @@ test("unix: the home fallback root is scanned after <temp>/victauri-<uid>, befor
   const at = roots.indexOf(home!);
   assert.ok(at > 0 && at < roots.length - 1, JSON.stringify(roots));
   assert.ok(roots[at - 1].endsWith(`victauri-${process.geteuid!()}`), JSON.stringify(roots));
+});
+
+// A junction in a parent directory is not visible to a lexical comparison, so "inside the profile"
+// must be asked of the real path. SYSTEM stands in for "another user" (elevated runs only).
+test("windows: a planted directory reached through a junction inside the profile is not trusted", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("windows only");
+    return;
+  }
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "victauri-vsc-junction-"));
+  try {
+    const profile = path.join(base, "profile");
+    const shared = path.join(base, "shared");
+    const planted = path.join(shared, "victauri", "777");
+    fs.mkdirSync(profile);
+    fs.mkdirSync(planted, { recursive: true });
+    if (spawnSync("icacls", [planted, "/setowner", "*S-1-5-18", "/q"]).status !== 0) {
+      t.skip("cannot change a directory's owner (not elevated)");
+      return;
+    }
+    fs.symlinkSync(shared, path.join(profile, "Temp"), "junction");
+    const viaJunction = path.join(profile, "Temp", "victauri", "777");
+    assert.equal(await dirIsTrusted(planted, { profileDir: profile }), false, "direct path");
+    assert.equal(await dirIsTrusted(viaJunction, { profileDir: profile }), false, "via junction");
+    // A real directory inside the profile still needs no check.
+    const inside = path.join(profile, "own");
+    fs.mkdirSync(inside);
+    assert.equal(await dirIsTrusted(inside, { profileDir: profile }), true);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("claims a server refused all stay ambiguous, never 'no app'", async () => {
+  const server = http.createServer((_req, res) => {
+    res.statusCode = 401;
+    res.end();
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const stale = app(port, "stale", "com.a", 1);
+    const noToken: DiscoveredServer = { port, token: undefined, identifier: "com.a", pid: 2 };
+    assert.deepEqual(await settlePortClaims([noToken, stale]), [noToken, stale]);
+    const other = app(port, "other", "com.a", 3);
+    assert.deepEqual(await settlePortClaims([stale, other]), [stale, other]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("asking about claims has a total budget across silent ports", async () => {
+  const servers: http.Server[] = [];
+  const live: DiscoveredServer[] = [];
+  for (let i = 0; i < 6; i++) {
+    const silent = http.createServer(() => {});
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+    servers.push(silent);
+    const port = (silent.address() as AddressInfo).port;
+    live.push(app(port, "a", "com.a", 10 + 2 * i), app(port, "b", "com.a", 11 + 2 * i));
+  }
+  try {
+    const started = Date.now();
+    assert.equal((await settlePortClaims(live)).length, live.length);
+    assert.ok(Date.now() - started < 3200, `${Date.now() - started} ms`);
+  } finally {
+    for (const silent of servers) {
+      silent.closeAllConnections();
+      silent.close();
+    }
+  }
 });

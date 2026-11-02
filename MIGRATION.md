@@ -1,5 +1,203 @@
 # Migration Guide
 
+## v0.10.2 → v0.10.3
+
+A patch release with no public API removal: consumers on `"0.10"` pick it up with `cargo update`.
+But 0.10.3 comes from an adversarial audit whose main finding was that several assertions and tools
+reported success they had not checked. **They now tell the truth, so a test suite that was green
+can go red.** A new red is usually a real finding about your app, or a test that never checked what
+it said. The changes most likely to reach you come first.
+
+### Tests that may go red (`victauri-test`)
+
+- **Accessibility.** `assert_accessible` and `assert_no_a11y_violations` read a key the audit never
+  produced, so they could not fail. They now count `audit["violations"]` and fail if it is absent.
+  The smoke check fails only on `summary.critical > 0` and reports the other counts. Contrast and
+  heading findings are `warnings`, not `violations`; `summary.total` counts both.
+- **Locator negatives and matchers.** `.not().to_have_text/contain_text/value/attribute/checked/
+  unchecked/focused`, `.not().to_be_enabled()` and `to_be_disabled()` fail on a missing element after
+  waiting; they used to pass. All matchers wait for the element. A dead app or invalid selector is
+  an error, never read as the condition being met.
+- **Hidden elements.** `to_be_detached` fails for a hidden element still in the DOM. `count`, `all`,
+  `to_have_count`, `to_be_attached`, reads and state expectations include hidden elements. Actions,
+  `to_be_visible` and `to_be_hidden` stay visible-only, so `nth(1).click()` and `all()[1]` can differ.
+- **Text locators** resolve to the deepest match, so `Locator::text("Save")` on
+  `<button><span>Save</span></button>` is the span, and a heading can win over a button. Use
+  `role("button").and_text("Save")` for the control. A span in a disabled button reports disabled.
+- **`role(a).and_role(b)`** is an AND; `b` used to replace `a`. More than 1000 matches is an error.
+- **`Locator::press_key`** focuses the element first and errors if it cannot.
+- **`ipc_was_not_called` and `no_network_request`** fail as inconclusive once the log holds its 1000
+  entries, because a match may have rolled off. On a busy app take a checkpoint first
+  (`create_ipc_checkpoint`, `get_ipc_calls_since`).
+- **`verify().run()`** returns `Err` only for connection and transport failures; any other error is a
+  failed check with the reason. `ipc_was_not_called` and `no_ghost_commands` fail under `capture:"none"`.
+  `no_console_errors` and `assert_no_uncaught_errors` fail as inconclusive on a full 1000-entry console log
+  with no errors; the smoke suite skips instead, as it does for a heap or DOM budget it cannot measure.
+- **`to_have_value` and the checked matchers** return `Assertion` on an element with no such state, even
+  negated. **`is_visible`** now agrees with `to_be_visible`.
+- **`has_text` / `has_no_text`** read rendered text through `eval_js`, so they error under a profile
+  that disables it, and `has_no_text` errors when there is no body.
+- **`no_ghost_commands`** fails on `confirmed_ghosts`, no longer on `frontend_only`.
+- **`assert_no_uncaught_errors`** includes unhandled rejections and reads 1000 entries.
+- **`client.wait(..).run()`** returns `Timeout` on `ok:false`. **`client.assert_semantic`** returns
+  `Assertion` on failure; new `evaluate_semantic` returns the verdict.
+- **`assert_dom_snapshot_valid`** refuses an empty tree. **`assert_screenshot_ok`** requires image
+  data and tolerates only the exact no-window messages. IPC integrity checks fail on `capture:"none"`.
+- **`compare_screenshot`** refuses non-PNG input and path-like names. In CI a missing baseline is
+  written and the check fails.
+- **`equals` / `not_equals`** coerce only a number against its canonical text: `null != "null"`,
+  `true != "true"`, `"1.10" != "1.1"`. `wait_for expected` uses the same rule. `verify_state` treats
+  `5` and `5.0` as equal.
+- **Discovery.** With nothing discovered and no `VICTAURI_PORT`, `discover`/`connect` return an error
+  instead of trying port 7373. A plugin older than 0.7.4 needs `VICTAURI_PORT`.
+- **`VICTAURI_E2E`** of `""`, `0`, `false` or `off` counts as off.
+- **Smaller changes:** `animation_scrub(capture=true)` returns the curve object with the image under
+  `image`. `text_by_id` returns full text content. `coverage_report` excludes mocked calls.
+  `write_junit_report` refuses a symlink, and `to_xml` adds `skipped="N"`. Duplicate checkpoint ids
+  are refused. `#[inspectable]`: `required` flags change where the old check was by spelling, an
+  app's own `api::State` now appears as an argument, and `__schema` copies the command's visibility.
+
+### Refs
+
+Ref ids changed from `e12` to a page-tagged form such as `k3f9e12`. Treat them as opaque. A ref from
+before a reload or from another window now fails at once with
+`ref not found: … previous page load …`, where it could resolve to a different element. Code that
+parses refs out of a snapshot by looking for `[e` must stop: read the first `[…]` instead. A bare
+`e12` written into a test still means counter 12 on the current page.
+
+### Tools
+
+- **`query_db`:** JSON text whose re-encoding would change data (big numbers, `1.10`, `1e3`, duplicate
+  keys, escapes such as `é`) stays a string; other JSON text still decodes. Infinities are
+  `{"__real":"Infinity"}`. Invalid UTF-8 is `{"__invalid_utf8":true,"text":…,"base64":…}`. SQL past
+  256 parenthesis levels or 2,000 SELECTs is refused. A database is refused if one schema entry
+  exceeds 1 MB, 256 levels or 2,000 SELECTs, if a chain of views runs past 2,000 levels, or if view
+  text totals over 16 MiB (`db_health` too). Unrelated views do not add up. Schema entries are read as
+  SQLite loads them, a BLOB too. A schema whose check takes over 3 s is refused as timed out, which a
+  large healthy schema on a saturated machine could hit.
+- **Database discovery:** auto-selection and the `app_info` listing skip files without a SQLite
+  header, so a SQLCipher database is no longer auto-selected (an explicit `path` still works). `.db3`
+  and any-case extensions are found. `history`, `cookies` and `favicons` are app candidates.
+- **`find_elements`:** `text` returns deepest matches only and normalises whitespace; script and style
+  text no longer matches; `name` is the accessible name; `visible` and `enabled` are honest (`enabled`
+  includes a disabled fieldset, `aria-disabled` and a disabled ancestor control); `max_results` goes up
+  to 5000 and 0 returns none. New: `attribute`, `attribute_value`, `text_exact`, `include_hidden`.
+- **`input` and `interact`:** `fill`/`type_text` return errors for readonly, checkbox, radio, file and
+  button inputs and for values a number/date/time/range/color field rejects; the old value is kept.
+  `type_text` over 20,000 characters errors. `select_option` errors for unknown or disabled values and
+  fires `input` before `change`; `values:[]` clears a multi-select. `opacity:0` elements are actionable;
+  a click lands on the hit descendant. Whether a click reaches an element is now the browser's answer
+  at real points: its centre, then its SVG outline, line boxes, a 5x5 grid and its descendants. So a
+  control with a hole at its centre, a stroke-only circle and a link with no box of its own are
+  clickable, and content clipped away inside a control is covered. A sibling at the centre of an
+  ordinary element is still cover. A half off-screen element whose visible part is covered fails, where
+  it reported success. A clipped element is scrolled. A `pointer-events:none` child of a control clicks
+  through to that control. A trusted click takes the point found, moved to a whole device pixel, must hit
+  the element itself, and refuses inside an `aria-disabled` ancestor, inside a scaled, rotated or zoomed
+  frame, and on a pinch-zoomed page: use a synthetic click there.
+  Keyboard events carry `code`, `keyCode` and `which`.
+- **Snapshots** list `opacity:0` elements (`[transparent]`) and visible children of `visibility:hidden`
+  parents.
+- **`logs`:** `console`, `navigation`, `dialogs` and `events` default to the newest 100 with trimmed
+  fields. `limit:0` on `backend` and `stdout` returns nothing and keeps the cursor.
+- **`window`:** `webview_label`, `window` and `window_label` now target that window (they were ignored).
+  `resize` and `move_to` report what the OS applied, plus `requested`; they wait up to about 500 ms for
+  the change to land and add `settled:false` if it never does.
+- **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
+  `/health` first and replaces that history entry, and `go_back` returns `{ok, recovered, url, note}`.
+  Going to a page inside the app, both now report success only once the page answers there, and are
+  errors otherwise, which can take about 20 s. On Linux, if the main thread of one web process spun
+  throughout and every other window that has answered still answers, that process is
+  ended to get off the page (about 15 s, with a logged warning), and the result says `ended_web_process:
+  <pid>`. A loop that allocates sleeps through its collector, and qualifies only with most of a core to
+  itself: on a loaded machine the call may error instead. On
+  macOS the navigation lands when the script ends. `go_to` outside the app from a stopped page says in
+  its `warning` that it may not land until the script ends. An origin a
+  bridge has answered on counts as inside the app, so `go_to` no longer warns about a custom
+  `WebviewUrl::External` start page.
+- **`explain` and `introspect coverage`** on an unreadable page are tool errors, where they reported a
+  clean result. `command_timings` adds `ipc_read_error`.
+- **`recording`:** `checkpoint` drains first (up to 3 s, reports `unreachable_windows`) and refuses empty
+  or duplicate ids. `events_between` stays a bare array when complete, and becomes
+  `{events, dropped, note}` when the ring buffer evicted part of the window. `import` accepts 48 MiB
+  over REST; `/mcp` stays at 2 MiB.
+- **`wait_for`:** text, selector and url conditions without a value fail at once. Explicit
+  `expected: null` compares with null. `event` omits `payload` where `introspect.event_bus` is not
+  allowed. An invalid selector is a tool error. `text`, `text_gone` and `selector_gone` are not met
+  while the page has no body. `ipc_idle` under blind capture returns `ok:false` with `ipc_capture`.
+- **A page with no Victauri bridge** is a tool error for bridge calls and log reads; they used to
+  answer `undefined` or an empty list as a success.
+- **`logs ipc` and `logs network`** gain `bodies:false`. IPC entries carry `args_truncated:true` when
+  `args` is not what was sent.
+- **`route add`** rejects invalid regex, non-object headers and unknown actions, and a regex that can
+  hang the page: a repeated group that can match the same text in more than one way, such as `(a+)+`,
+  also when the ambiguity sits in a subgroup. It errs towards refusing: a counted group counts as
+  unbounded and `\b` as always passing, so `(a+){2}` and `(\w+\b)+` are refused, as are `(a|)+` and a
+  pattern too large to analyse. `([?&][^=&]+=[^&]*)*$` is ambiguous on `?`: use `glob` or `substring`, or
+  make each repetition match one way. **XHR `fulfill` now works**, so a
+  matching XHR that used to reach the network gets the mock, and `xhr_note` and `fulfill_not_applied` are
+  gone. **`window.__VICTAURI__.addRoute`** is gone from the page-visible API.
+- **`logs stdout`:** treat `next_seq` as opaque and pass it back. It now holds the file's tag above the
+  offset, so it is much larger than a byte offset; `lines[].offset` is still a byte offset, and a bare
+  offset still works as before. `gap:true` says the capture rotated twice and lines are gone.
+  `launcher_gone` says `victauri run` was killed: only when `victauri run` named the capture itself, so
+  not for a `--capture` file or an app started by an older CLI. A rotation drains the rotated file and
+  reports `truncated:true`.
+- **`victauri logs`** can end a capture with a synthetic EXIT line (`"unknown": true` in JSON) when the
+  launcher was killed, and `--follow` stops there.
+- **`screenshot`** adds a text block after the image over MCP, `note: captured window "main"`, and a
+  `note` beside the image over REST. `victauri call screenshot` prints it.
+- **`/mcp`** answers `-32602` for a `tools/call` whose `params` or `arguments` are not an object, where it
+  answered `-32601`. **`/info`** adds `pid`.
+- **`animation scrub`** keeps its seeks' animation and transition events from the page, and only those.
+  A scrub replaced without a restore gives its target back as it was.
+- **Discovery:** when a server accepts none of the tokens claiming its port, every entry stays, so the result
+  is "several apps", not "no app".
+- **Smoke:** the default DOM complete budget is 20 s in `SmokeConfig`, `victauri test` and the GitHub Action
+  (it was 10 s, which a first launch can miss). A budget you set is unchanged. `victauri run` on Unix keeps a
+  small `sh` helper alive, so that killing the launcher stops the app.
+- **Also:** `list_app_dir pattern` has real `*`/`?`; `[`/`]` match literally. Paths over 4096 bytes are refused.
+  `trace start` on an unknown window errors. `storage set` needs a `value`. `animation` failures are tool
+  errors. `contract_record` refuses non-object args. A fault delay counts against `timeout_ms`. MCP
+  `serverInfo` is `victauri`, and the REST tool list adds `input_schema`.
+
+### Privacy and configuration
+
+- `build()` fails on an invalid custom redaction pattern (`BuilderError::InvalidRedactionPattern`).
+- Redaction covers more keys (including `PWD`), `storage get` of a sensitive key, and numbers: a
+  matching number becomes a string.
+- The Test profile with a non-empty allowlist now lists and runs `invoke_command` for those commands.
+- `log_layer()` no longer lowers the global max level: apps with an unfiltered layer see TRACE again.
+- Event-bus payloads are cut at 64 KiB with a marker, 16 MiB in all, and keep their emitted key order.
+- Trusted clicks use the page's `devicePixelRatio`, so zoom counts. A page reporting a false ratio moves
+  the click, still clamped to the client area.
+
+### CLI and watchdog
+
+- `victauri setup` exits non-zero for a refused or unwritable config and for an entry pinned to another
+  app. User-level configs are written without `--app`.
+- `VICTAURI_PORT` set and unhealthy: the bridge and `victauri logs` no longer fall through to another
+  app. `VICTAURI_PORT=0` means unset. `victauri logs` with `VICTAURI_APP` or `VICTAURI_PORT` set and the
+  app down refuses, rather than showing the newest capture.
+- `victauri run` passes output through as it arrives. Killing it kills the app and its tree on Windows;
+  SIGTERM and SIGHUP are forwarded on Unix, followed by SIGKILL after 10 s, or at once on a further signal more than 1 s after the first (a signal
+  within 1 s counts as the same stop, since wrappers such as `timeout` and `npm` can deliver it twice).
+  Default-location captures of dead apps are deleted at the
+  next run once past 7 days or beyond the newest 20.
+- `--out` and `--capture` refuse symlinks. `record` checks `--output` before connecting. `--args-file`
+  accepts a UTF-8 BOM and names UTF-16. `call`, `invoke` and `tools --json` stdout escapes C1 and bidi
+  characters as `\uXXXX` (the JSON value is equal). Id-less `ping`/`initialize` get no reply.
+- Watchdog: a recovery command still running after 60 s is logged and left running. Windows recovery
+  runs as `cmd /d /s /c "<line>"`, so AutoRun is skipped and a line relying on the old escaping may parse
+  differently.
+
+### Dependencies
+
+`rusqlite` now accepts `>=0.32, <0.42`. The minimum Rust stays 1.88 for the crates, with Cargo's
+MSRV-aware resolver (`resolver = "3"`) picking compatible dependencies; `cargo install victauri-cli
+--locked` follows the committed lockfile and needs Rust 1.89. New Windows feature `Win32_System_JobObjects` on
+`victauri-test`; `ctrlc` gains its `termination` feature.
+
 ## v0.10.1 → v0.10.2
 
 No API change (additions only; `cargo semver-checks` reports no semver update needed); consumers

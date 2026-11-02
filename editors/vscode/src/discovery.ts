@@ -75,10 +75,11 @@ export async function discoveryRoots(): Promise<string[]> {
 // pointing at a port they control. The Rust readers compare the directory's owner SID with the
 // process token via Win32; the extension cannot call Win32 directly, so:
 //
-// - a directory inside the user's profile (`os.homedir()`, which is where the default
-//   `%LOCALAPPDATA%\Temp` lives) is trusted without a check: Windows grants only SYSTEM,
+// - a directory whose REAL path is inside the user's profile (`os.homedir()`, which is where the
+//   default `%LOCALAPPDATA%\Temp` lives) is trusted without a check: Windows grants only SYSTEM,
 //   Administrators and the user access to a profile, so no other non-admin user can plant
-//   anything there — the check would cost a PowerShell start for nothing;
+//   anything there — the check would cost a PowerShell start for nothing. The real path, because
+//   a junction relocating TEMP looks like a profile path while leading anywhere;
 // - anywhere else, the owner is read with PowerShell's `Get-Acl` (one call for a batch of
 //   directories, 30 s timeout — a cold Windows PowerShell start has been measured above 10 s on
 //   a CI runner) and must be the current user, the token's default owner, or
@@ -86,15 +87,38 @@ export async function discoveryRoots(): Promise<string[]> {
 //   definite verdict is cached per directory identity (inode + birth time), so a recreated
 //   directory is checked again. It fails CLOSED: if PowerShell cannot run, times out or answers
 //   garbage, such a directory is not trusted for that scan — and that failure is NOT cached, so
-//   the next scan asks again instead of distrusting the app's directory for as long as it lives
-//   (set `victauri.port` + `victauri.authToken` explicitly where PowerShell cannot run).
+//   a later scan asks again instead of distrusting the app's directory for as long as it lives
+//   (set `victauri.port` + `victauri.authToken` explicitly where PowerShell cannot run). Later,
+//   not the next: every token-bearing request scans, so concurrent requests share one query and
+//   a failure backs off, or a broken PowerShell costs a process start per request.
 
 export interface OwnerCheckOptions {
   /** The profile directory treated as private (default `os.homedir()`); tests override it. */
   profileDir?: string;
+  /** Replaces the PowerShell query; tests count and fail it. */
+  queryOwners?: (dirs: string[]) => Promise<boolean[] | null>;
+  /** Set when an owner check could not give an answer, so directories went untrusted for it. */
+  report?: { ownerCheckFailed: boolean };
 }
 
 const ownerVerdicts = new Map<string, { id: string; trusted: boolean }>();
+const OWNER_RETRY_BACKOFF_MS = 30_000;
+const ownerQueriesInFlight = new Map<string, Promise<boolean[] | null>>();
+/** Directories whose last owner check gave no answer, and when to ask again. */
+const ownerRetryAt = new Map<string, number>();
+
+/** Forget the backoff: the user just asked to connect, so a fresh attempt is worth its cost. */
+export function resetOwnerCheckBackoff(): void {
+  ownerRetryAt.clear();
+}
+
+async function realPathOf(p: string): Promise<string | undefined> {
+  try {
+    return await fs.realpath(p);
+  } catch {
+    return undefined;
+  }
+}
 
 function isInside(child: string, parent: string): boolean {
   const rel = path.relative(parent.toLowerCase(), child.toLowerCase());
@@ -167,16 +191,30 @@ function queryOwners(dirs: string[]): Promise<boolean[] | null> {
   });
 }
 
+/** One query at a time for one set of directories, however many requests are scanning. */
+function sharedOwnerQuery(
+  dirs: string[],
+  query: (dirs: string[]) => Promise<boolean[] | null>
+): Promise<boolean[] | null> {
+  const key = JSON.stringify(dirs);
+  const running = ownerQueriesInFlight.get(key);
+  if (running) return running;
+  const started = query(dirs).finally(() => ownerQueriesInFlight.delete(key));
+  ownerQueriesInFlight.set(key, started);
+  return started;
+}
+
 /** Windows: which of `dirs` (already known to be real directories) are owned by us. */
 async function windowsOwnedDirs(
   dirs: string[],
   opts: OwnerCheckOptions = {}
 ): Promise<Set<string>> {
-  const profile = opts.profileDir ?? os.homedir();
+  const profile = await realPathOf(opts.profileDir ?? os.homedir());
   const trusted = new Set<string>();
   const pending: { dir: string; id: string }[] = [];
   for (const dir of dirs) {
-    if (isInside(path.resolve(dir), profile)) {
+    const real = await realPathOf(dir);
+    if (profile && real && isInside(real, profile)) {
       trusted.add(dir);
       continue;
     }
@@ -192,17 +230,29 @@ async function windowsOwnedDirs(
       if (cached.trusted) trusted.add(dir);
       continue;
     }
+    if ((ownerRetryAt.get(dir) ?? 0) > Date.now()) {
+      if (opts.report) opts.report.ownerCheckFailed = true;
+      continue;
+    }
     pending.push({ dir, id });
   }
   if (pending.length > 0) {
-    const verdicts = await queryOwners(pending.map((p) => p.dir));
+    const verdicts = await sharedOwnerQuery(
+      pending.map((p) => p.dir),
+      opts.queryOwners ?? queryOwners
+    );
     // No definite answer: trust none of them now (fail closed), but cache nothing — one slow
     // or failed PowerShell start must not distrust the app's directory for as long as it lives.
     if (verdicts !== null) {
       pending.forEach(({ dir, id }, i) => {
+        ownerRetryAt.delete(dir);
         ownerVerdicts.set(dir, { id, trusted: verdicts[i] });
         if (verdicts[i]) trusted.add(dir);
       });
+    } else {
+      if (opts.report) opts.report.ownerCheckFailed = true;
+      const retryAt = Date.now() + OWNER_RETRY_BACKOFF_MS;
+      for (const { dir } of pending) ownerRetryAt.set(dir, retryAt);
     }
   }
   return trusted;
@@ -293,11 +343,64 @@ async function readServer(dir: string, pid: number): Promise<DiscoveredServer | 
   }
 }
 
+/** Most time one scan spends asking servers about the claims on their ports. */
+const PORT_CLAIMS_BUDGET_MS = 2000;
+
+/** What the server on a port said to one entry's token. */
+type InfoAnswer = { kind: "accepted"; pid?: number } | { kind: "refused" } | { kind: "unknown" };
+
+async function askInfo(port: number, token: string | undefined): Promise<InfoAnswer> {
+  try {
+    const resp = await fetch(`http://127.0.0.1:${port}/info`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+      signal: AbortSignal.timeout(800),
+    });
+    // No token sent: a 401 is about that, not about whose entry this is.
+    if (resp.status === 401) return token ? { kind: "refused" } : { kind: "unknown" };
+    if (resp.status !== 200) return { kind: "unknown" };
+    const info = (await resp.json()) as { pid?: unknown } | null;
+    const pid = info?.pid;
+    return { kind: "accepted", pid: typeof pid === "number" ? pid : undefined };
+  } catch {
+    return { kind: "unknown" };
+  }
+}
+
+// Drop the entries that are not the server on their port, when several claim one: a hard-killed
+// app's entry stays behind, and once its PID is reused it looks as live as the current app's,
+// naming the same port. Mirrors `victauri-test`'s `real_port_claims`: the pid `/info` reports
+// decides; an older plugin reports none, and then accepting the token does; when it accepted none,
+// every entry stays, as a server refusing the tokens we hold says nothing about which is its own.
+// One claim per port, the normal case, sends nothing. The asking has one total budget.
+export async function settlePortClaims(live: DiscoveredServer[]): Promise<DiscoveredServer[]> {
+  const ports = new Set(live.map((s) => s.port));
+  const dropped = new Set<DiscoveredServer>();
+  const giveUp = Date.now() + PORT_CLAIMS_BUDGET_MS;
+  for (const port of ports) {
+    const claims = live.filter((s) => s.port === port);
+    if (claims.length < 2) continue;
+    if (Date.now() >= giveUp) break;
+    const answers = await Promise.all(claims.map((s) => askInfo(port, s.token)));
+    const reported = answers.find((a) => a.kind === "accepted" && a.pid !== undefined);
+    const anyAccepted = answers.some((a) => a.kind === "accepted");
+    claims.forEach((claim, i) => {
+      const keep =
+        reported?.kind === "accepted"
+          ? claim.pid === reported.pid
+          : !anyAccepted || answers[i].kind === "accepted";
+      if (!keep) dropped.add(claim);
+    });
+  }
+  return live.filter((s) => !dropped.has(s));
+}
+
 export interface DiscoveryScan {
   /** Live, trusted entries owned by us. */
   live: DiscoveredServer[];
   /** PIDs of entries whose process exists but could not be verified as ours. */
   unverified: number[];
+  /** A directory went untrusted only because its owner could not be checked. */
+  ownerCheckFailed?: boolean;
 }
 
 // Every live, trusted app across all roots (a PID found in two roots counts once). Read-only:
@@ -309,6 +412,8 @@ export async function scanServers(
 ): Promise<DiscoveryScan> {
   const byPid = new Map<string, DiscoveredServer>();
   const unverified: number[] = [];
+  const report = { ownerCheckFailed: false };
+  opts = { ...opts, report };
   for (const root of roots ?? (await discoveryRoots())) {
     // The root owner can swap a previously checked child directory. Refuse a root's
     // whole tree unless the root itself is trusted.
@@ -342,7 +447,11 @@ export async function scanServers(
       if (server) byPid.set(name, server);
     }
   }
-  return { live: [...byPid.values()], unverified };
+  return {
+    live: await settlePortClaims([...byPid.values()]),
+    unverified,
+    ...(report.ownerCheckFailed ? { ownerCheckFailed: true } : {}),
+  };
 }
 
 export type Resolution =
@@ -357,6 +466,11 @@ export type Resolution =
        * Absent for an explicitly configured port + token, or when no token is sent.
        */
       vouchedBy?: DiscoveredServer;
+      /**
+       * The workspace names its app and this is not it: the only app running belongs to some
+       * other project. A manual connect warns; auto-connect stays away from it.
+       */
+      otherProject?: boolean;
     }
   | { ok: false; message: string };
 
@@ -371,22 +485,30 @@ function label(s: DiscoveredServer): string {
  *   the ONE live entry on that port;
  * - a configured token WITHOUT a configured port is sent only to the live app whose own
  *   discovery token equals it — never to whatever holds the default port (R4-TOK1);
- * - otherwise the single live app; several are an error naming each (never a silent pick);
- *   none falls back to the default port with no token.
+ * - otherwise the workspace's own app (`workspaceIdentifiers`, from its `tauri.conf.json`), else
+ *   the single live app; several are an error naming each (never a silent pick); none falls back
+ *   to the default port with no token, unless discovery could not be read at all: a 401 from
+ *   whatever holds the port would hide the real cause.
  */
 export function resolveConnection(
   explicit: { port?: number; token?: string },
   scan: DiscoveryScan,
-  defaultPort: number
+  defaultPort: number,
+  workspaceIdentifiers: string[] = []
 ): Resolution {
   const servers = scan.live;
+  const ownerCheckWarning = scan.ownerCheckFailed
+    ? "The owner of a Victauri discovery directory could not be checked (PowerShell did not answer), " +
+      "so it was not trusted. Retrying shortly; where PowerShell cannot run, set victauri.port and " +
+      "victauri.authToken."
+    : undefined;
   if (explicit.port !== undefined) {
     const onPort = servers.filter((s) => s.port === explicit.port);
     if (explicit.token) return { ok: true, port: explicit.port, token: explicit.token };
     if (onPort.length === 1 && onPort[0].token) {
       return { ok: true, port: explicit.port, token: onPort[0].token, vouchedBy: onPort[0] };
     }
-    return { ok: true, port: explicit.port, token: undefined };
+    return { ok: true, port: explicit.port, token: undefined, warning: ownerCheckWarning };
   }
   if (explicit.token) {
     const owners = servers.filter((s) => s.token === explicit.token);
@@ -408,11 +530,21 @@ export function resolveConnection(
       message: `Several Victauri apps carry that token: ${owners.map(label).join(", ")}. Set victauri.port to choose one.`,
     };
   }
-  if (servers.length === 1) {
-    const only = servers[0];
-    return only.token
-      ? { ok: true, port: only.port, token: only.token, vouchedBy: only }
-      : { ok: true, port: only.port, token: undefined };
+  const own = servers.filter(
+    (s) => s.identifier !== undefined && workspaceIdentifiers.includes(s.identifier)
+  );
+  if (own.length === 1 || servers.length === 1) {
+    const only = own.length === 1 ? own[0] : servers[0];
+    const otherProject =
+      own.length === 0 && workspaceIdentifiers.length > 0 && only.identifier !== undefined;
+    const warning = otherProject
+      ? `This workspace's app is ${workspaceIdentifiers.join(" / ")}, but the only one running is ` +
+        `${only.identifier}.`
+      : undefined;
+    const base = only.token
+      ? { ok: true as const, port: only.port, token: only.token, vouchedBy: only }
+      : { ok: true as const, port: only.port, token: undefined };
+    return otherProject ? { ...base, warning, otherProject } : base;
   }
   if (servers.length > 1) {
     return {
@@ -420,6 +552,7 @@ export function resolveConnection(
       message: `Multiple Victauri apps are running: ${servers.map(label).join(", ")}. Set victauri.port to the one to connect to.`,
     };
   }
+  if (ownerCheckWarning) return { ok: false, message: ownerCheckWarning };
   const warning =
     scan.unverified.length > 0
       ? `A Victauri app appears to be running (pid ${scan.unverified.join(", ")}) but its ` +

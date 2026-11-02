@@ -118,7 +118,7 @@ impl fmt::Display for InteractAction {
 pub struct InteractParams {
     /// Action to perform: click, `double_click`, hover, focus, `scroll_into_view`, `select_option`.
     pub action: InteractAction,
-    /// Ref handle ID from a DOM snapshot (e.g. "e5"). Required for click, `double_click`, hover, focus, `select_option`.
+    /// Ref handle ID from a DOM snapshot (e.g. "k3f9e5"). Required for click, `double_click`, hover, focus, `select_option`.
     pub ref_id: Option<String>,
     /// Option values for `select_option` action.
     pub values: Option<Vec<String>>,
@@ -285,7 +285,10 @@ impl fmt::Display for ManageAction {
 pub struct WindowParams {
     /// Action to perform: `get_state`, list, manage, resize, `move_to`, `set_title`.
     pub action: WindowAction,
-    /// Target window label.
+    /// Target window label. Also accepts `webview_label`, `window` and `window_label`, as every
+    /// other tool does: an unknown key would be dropped and the action would hit the default
+    /// window instead.
+    #[serde(alias = "webview_label", alias = "window", alias = "window_label")]
     pub label: Option<String>,
     /// Window management action (for manage): minimize, unminimize, maximize, unmaximize, close, focus, show, hide, fullscreen, unfullscreen, `always_on_top`, `not_always_on_top`.
     pub manage_action: Option<ManageAction>,
@@ -337,7 +340,8 @@ pub struct StorageParams {
     pub storage_type: Option<StorageType>,
     /// Key to read, write, or delete.
     pub key: Option<String>,
-    /// Value to store (for set action). Will be JSON-serialized if not a string.
+    /// Value to store (required for set). Will be JSON-serialized if not a string.
+    #[serde(default, deserialize_with = "super::backend_params::present_value")]
     pub value: Option<serde_json::Value>,
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]
@@ -626,7 +630,7 @@ impl RouteMatchType {
 pub enum RouteBehavior {
     /// Abort the request (the app sees a network failure).
     Block,
-    /// Return a synthetic mock response (fetch only; XHR falls back to delay).
+    /// Return a synthetic mock response (fetch and XHR).
     Fulfill,
     /// Let the request proceed, but after `delay_ms` (latency injection).
     Delay,
@@ -780,6 +784,8 @@ pub struct AnimationParams {
     pub record: Option<bool>,
     /// (`sample`, read) If true, clear recorded sessions after returning them.
     pub clear: Option<bool>,
+    /// (`sample`) If true, stop an armed recorder; what it captured stays readable.
+    pub disarm: Option<bool>,
     /// Target webview label.
     #[serde(alias = "window", alias = "window_label")]
     pub webview_label: Option<String>,
@@ -849,7 +855,8 @@ pub struct LogsParams {
     pub level: Option<String>,
     /// Target prefix(es) for backend, comma-separated (e.g. `"app::db,app::sync"`).
     pub target: Option<String>,
-    /// Cursor (for backend: entry sequence; for stdout: byte offset). Pass the
+    /// Cursor (for backend: entry sequence; for stdout: a position in the capture, opaque, which
+    /// a rotated capture cannot confuse). Pass the
     /// previous response's `next_seq` to get only newer entries. With a cursor the
     /// OLDEST entries after it come first (up to `limit`) and `next_seq` continues
     /// right after them: read on until `truncated` is false. Without one, the newest.
@@ -857,9 +864,12 @@ pub struct LogsParams {
     /// For backend: only entries whose structured fields equal these values
     /// (text compare, case-insensitive), e.g. `{"run_type": "foreground_fast"}`.
     pub fields: Option<std::collections::BTreeMap<String, serde_json::Value>>,
-    /// Maximum number of entries to return; 0 returns none. Defaults: 100 for ipc and
-    /// network, 20 for `slow_ipc`, everything captured for the other actions.
+    /// Maximum number of entries to return, keeping the newest; 0 returns none. Defaults to 100,
+    /// and 20 for `slow_ipc`.
     pub limit: Option<usize>,
+    /// For ipc and network: false leaves out args and request/response bodies, so a read of many
+    /// entries stays small. Default true.
+    pub bodies: Option<bool>,
     /// Threshold in milliseconds for slow IPC calls (for `slow_ipc`).
     pub threshold_ms: Option<u64>,
     /// When true (for ipc action), await up to 500ms for the latest IPC entry's

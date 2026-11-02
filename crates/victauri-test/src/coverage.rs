@@ -2,9 +2,12 @@
 //!
 //! Compares the set of registered commands (from the registry) against the set
 //! of IPC calls observed during a test session. Reports tested vs. untested
-//! commands, call counts, and coverage percentage.
+//! commands, call counts, and coverage percentage. A call a `route` rule answered in the page does
+//! not count: the handler never ran.
 
-use serde_json::Value;
+use std::collections::HashMap;
+
+use serde_json::{Value, json};
 
 use crate::client::VictauriClient;
 use crate::error::TestError;
@@ -23,6 +26,9 @@ pub struct CoverageReport {
     pub untested: Vec<String>,
     /// Commands sorted by invocation count (descending).
     pub most_called: Vec<CommandCalls>,
+    /// Anything that limits how far to trust these numbers, e.g. an older plugin or an IPC
+    /// transport Victauri cannot see.
+    pub note: Option<String>,
 }
 
 /// A command name with its invocation count.
@@ -50,18 +56,26 @@ impl CoverageReport {
             "IPC Coverage: {:.1}% ({}/{} commands tested)\n",
             self.coverage_percentage, self.tested_commands, self.total_commands
         ));
+        if let Some(note) = &self.note {
+            out.push_str(&format!("Note: {}\n", crate::terminal::single_line(note)));
+        }
 
         if !self.most_called.is_empty() {
             out.push_str("\nMost called:\n");
             for cmd in self.most_called.iter().take(10) {
-                out.push_str(&format!("  {:>4}x  {}\n", cmd.calls, cmd.name));
+                // Registry names can come from the app: they reach a terminal or CI log here.
+                out.push_str(&format!(
+                    "  {:>4}x  {}\n",
+                    cmd.calls,
+                    crate::terminal::single_line(&cmd.name)
+                ));
             }
         }
 
         if !self.untested.is_empty() {
             out.push_str(&format!("\nUntested ({}):\n", self.untested.len()));
             for name in self.untested.iter().take(20) {
-                out.push_str(&format!("  - {name}\n"));
+                out.push_str(&format!("  - {}\n", crate::terminal::single_line(name)));
             }
             if self.untested.len() > 20 {
                 out.push_str(&format!("  ... and {} more\n", self.untested.len() - 20));
@@ -74,20 +88,99 @@ impl CoverageReport {
 
 /// Builds a coverage report by comparing the command registry against IPC call logs.
 ///
-/// Queries the running app for its command registry and IPC call history,
-/// then computes which commands were exercised and which remain untested.
+/// Asks the plugin's own `introspect coverage`, which sees the whole IPC log and leaves out calls a
+/// `route` rule answered. A plugin without it gets the same answer computed here from a log read,
+/// and the report's [`note`](CoverageReport::note) says so.
 ///
 /// # Errors
 ///
 /// Returns errors from the underlying MCP tool calls.
 pub async fn coverage_report(client: &mut VictauriClient) -> Result<CoverageReport, TestError> {
     let registry = client.get_registry().await?;
-    let ipc_log = client.get_ipc_log(None).await?;
+    let registered = extract_command_names(&registry);
 
-    let registered: Vec<String> = extract_command_names(&registry);
-    let called: Vec<String> = extract_ipc_commands(&ipc_log);
+    let plugin = match client
+        .call_tool("introspect", json!({"action": "coverage"}))
+        .await
+    {
+        Ok(result) if result.get("uncovered").is_some_and(Value::is_array) => Some(result),
+        Ok(_) | Err(TestError::ToolError(_) | TestError::Mcp { .. }) => None,
+        Err(other) => return Err(other),
+    };
+    let Some(coverage) = plugin else {
+        let ipc_log = client
+            .logs_without_bodies("ipc", crate::assertions::LOG_WINDOW)
+            .await?;
+        let mut report = build_report(&registered, &extract_ipc_commands(&ipc_log))?;
+        report.note = Some(
+            "this plugin has no usable `introspect coverage`; computed from the newest 1000 IPC \
+             log entries"
+                .to_string(),
+        );
+        return Ok(report);
+    };
 
-    build_report(&registered, &called)
+    // Only the call counts come from elsewhere: `coverage` says which commands ran, not how often.
+    let counts = match client
+        .call_tool("introspect", json!({"action": "command_timings"}))
+        .await
+    {
+        Ok(timings) => call_counts(&timings),
+        Err(TestError::ToolError(_) | TestError::Mcp { .. }) => HashMap::new(),
+        Err(other) => return Err(other),
+    };
+    let uncovered = extract_strings(&coverage["uncovered"]);
+    let called: Vec<String> = registered
+        .iter()
+        .filter(|name| !uncovered.contains(name))
+        .flat_map(|name| {
+            // At least once, or `coverage` would have listed it. (`ipc_traffic` leaves out calls
+            // a `route` rule delayed, which did reach the handler.)
+            let count = counts.get(name.as_str()).copied().unwrap_or(0).max(1);
+            std::iter::repeat_n(name.clone(), count)
+        })
+        .collect();
+    let mut report = build_report(&registered, &called)?;
+    report.note = coverage_note(&coverage);
+    Ok(report)
+}
+
+fn call_counts(timings: &Value) -> HashMap<String, usize> {
+    timings["ipc_traffic"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.get("command")?.as_str()?;
+            let count = entry.get("call_count")?.as_u64()?;
+            Some((name.to_string(), usize::try_from(count).ok()?))
+        })
+        .collect()
+}
+
+fn extract_strings(list: &Value) -> Vec<String> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(String::from))
+        .collect()
+}
+
+/// What the plugin said limits its answer: IPC it cannot observe, or nothing observed at all. Its
+/// note about an empty registry is left out: the report has its own way of saying that.
+fn coverage_note(coverage: &Value) -> Option<String> {
+    let capture = coverage
+        .pointer("/ipc_capture/capture")
+        .and_then(Value::as_str);
+    if let Some(capture @ ("none" | "requests_only")) = capture {
+        return Some(format!(
+            "IPC capture on this page is `{capture}`, so calls may be missing"
+        ));
+    }
+    if coverage.get("ipc_calls_observed").and_then(Value::as_u64) == Some(0) {
+        return Some("no IPC calls were observed on the live log".to_string());
+    }
+    None
 }
 
 /// Asserts that IPC coverage meets the given threshold, panicking with a
@@ -133,6 +226,10 @@ fn extract_command_names(registry: &Value) -> Vec<String> {
 fn extract_ipc_commands(ipc_log: &Value) -> Vec<String> {
     if let Some(arr) = ipc_log.as_array() {
         arr.iter()
+            // A call a `route` rule answered or blocked in the page never reached a handler.
+            .filter(|v| {
+                v.get("mocked") != Some(&json!(true)) && v.get("blocked") != Some(&json!(true))
+            })
             .filter_map(|v| v.get("command").and_then(Value::as_str).map(String::from))
             .collect()
     } else {
@@ -141,7 +238,7 @@ fn extract_ipc_commands(ipc_log: &Value) -> Vec<String> {
 }
 
 fn build_report(registered: &[String], called: &[String]) -> Result<CoverageReport, TestError> {
-    let mut call_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut call_counts: HashMap<&str, usize> = HashMap::new();
     for cmd in called {
         let name = cmd
             .strip_prefix("plugin:")
@@ -192,6 +289,7 @@ fn build_report(registered: &[String], called: &[String]) -> Result<CoverageRepo
         coverage_percentage,
         untested,
         most_called,
+        note: None,
     })
 }
 
@@ -260,6 +358,7 @@ mod tests {
             coverage_percentage: 80.0,
             untested: vec!["a".to_string(), "b".to_string()],
             most_called: vec![],
+            note: None,
         };
         assert!(report.meets_threshold(80.0));
         assert!(!report.meets_threshold(80.1));
@@ -276,6 +375,7 @@ mod tests {
                 name: "cmd_a".to_string(),
                 calls: 5,
             }],
+            note: None,
         };
         let summary = report.to_summary();
 
@@ -316,6 +416,34 @@ mod tests {
         ]);
         let cmds = extract_ipc_commands(&log);
         assert_eq!(cmds, vec!["greet", "save"]);
+    }
+
+    #[test]
+    fn a_mocked_or_blocked_call_is_not_coverage() {
+        let log = serde_json::json!([
+            {"command": "greet", "status": "ok"},
+            {"command": "delete_todo", "status": "ok", "mocked": true, "route_rule": "r1"},
+            {"command": "save", "status": "error", "blocked": true}
+        ]);
+        assert_eq!(extract_ipc_commands(&log), vec!["greet"]);
+    }
+
+    #[test]
+    fn summary_neutralizes_names_for_terminals() {
+        let report = build_report(
+            &[
+                "a\u{1b}]0;PWNED\u{7}".to_string(),
+                "b\n::error::x".to_string(),
+            ],
+            &["a\u{1b}]0;PWNED\u{7}".to_string()],
+        )
+        .unwrap();
+        let summary = report.to_summary();
+        assert!(
+            !summary.contains('\u{1b}') && !summary.contains('\u{7}'),
+            "{summary:?}"
+        );
+        assert!(!summary.lines().any(|l| l.starts_with("::")), "{summary:?}");
     }
 
     #[test]

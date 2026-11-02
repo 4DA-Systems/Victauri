@@ -85,6 +85,42 @@ pub trait WebviewBridge: Send + Sync {
     ///
     /// Returns an error string if no matching window is found or the title change fails.
     fn set_window_title(&self, label: Option<&str>, title: &str) -> Result<(), String>;
+    /// Navigate a window's webview to `url` from the native side, so it works when the page's
+    /// JS thread is hung or the current page has no bridge. The default falls back to page
+    /// script, for bridges with no native side.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if no matching window is found or the URL cannot be loaded.
+    fn navigate_webview(&self, label: Option<&str>, url: &str) -> Result<(), String> {
+        let url = serde_json::to_string(url).map_err(|e| e.to_string())?;
+        self.eval_webview(label, &format!("window.location.href = {url}"))
+    }
+    /// The URL the app itself is served from (its dev server, or Tauri's custom protocol), if
+    /// known: what `navigate` treats as "inside the app".
+    fn app_entry_url(&self) -> Option<String> {
+        None
+    }
+    /// CPU time so far, in clock ticks, on it or waiting for it and on it alone, and how many times
+    /// it gave the CPU up of its own accord, of the main thread of each child process that renders
+    /// the app's pages, as `(pid, wanted, on_cpu, sleeps)`: where a page's script runs, and a
+    /// Worker's does not. Empty where page processes are not the app's children (macOS, Windows):
+    /// see [`end_web_process`](Self::end_web_process).
+    fn web_main_thread_cpu(&self) -> Vec<(u32, u64, u64, u64)> {
+        Vec::new()
+    }
+    /// End a process listed by [`web_main_thread_cpu`](Self::web_main_thread_cpu), the only way out of a
+    /// page spinning in a loop on Linux: `WebKit` queues even a native navigation behind its script.
+    /// The next navigation starts a new process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the process is not such a child, or could not be ended.
+    fn end_web_process(&self, pid: u32) -> Result<(), String> {
+        Err(format!(
+            "ending web process {pid} is not available on this platform"
+        ))
+    }
 
     // ── Native (OS-level, trusted) input ───────────────────────────────────
     //
@@ -118,6 +154,21 @@ pub trait WebviewBridge: Send + Sync {
              use synthetic input via the `input` tool without `trusted`"
                 .to_string(),
         )
+    }
+
+    /// [`native_click`](Self::native_click), given the page's `devicePixelRatio` when it reported
+    /// one: the only scale that includes webview zoom.
+    ///
+    /// # Errors
+    /// As [`native_click`](Self::native_click).
+    fn native_click_scaled(
+        &self,
+        label: Option<&str>,
+        x: f64,
+        y: f64,
+        _device_pixel_ratio: Option<f64>,
+    ) -> Result<(), String> {
+        self.native_click(label, x, y)
     }
 
     /// Click at logical (CSS-pixel) coordinates within the target window's
@@ -726,6 +777,27 @@ pub(crate) fn closure_may_have_run(error: &str) -> bool {
     error.contains(STARTED_OUTCOME_UNKNOWN) || error.contains(PANICKED_ON_MAIN)
 }
 
+/// Tauri's custom protocol, as each platform's webview serves it. `useHttpsScheme` moves it to
+/// `https://` where it is an `http://` origin (the `http://` one then serves nothing).
+fn custom_protocol_entry(https: bool) -> String {
+    if cfg!(any(windows, target_os = "android")) {
+        format!(
+            "{}://tauri.localhost/",
+            if https { "https" } else { "http" }
+        )
+    } else {
+        "tauri://localhost/".to_string()
+    }
+}
+
+/// Whether the app's windows set `useHttpsScheme`. Read through serde: the field does not exist on
+/// the oldest Tauri 2 this crate supports.
+fn uses_https_scheme<W: serde::Serialize>(windows: &[W]) -> bool {
+    windows.iter().any(|window| {
+        serde_json::to_value(window).is_ok_and(|v| v["useHttpsScheme"] == serde_json::json!(true))
+    })
+}
+
 impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     fn eval_webview(&self, label: Option<&str>, script: &str) -> Result<(), String> {
         let label = label.map(str::to_string);
@@ -848,7 +920,20 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
     fn native_click(&self, label: Option<&str>, x: f64, y: f64) -> Result<(), String> {
         let hwnd = self.get_native_handle(label)?;
         win_focus(hwnd)?;
-        win_click(hwnd, x, y)
+        win_click(hwnd, x, y, None)
+    }
+
+    #[cfg(windows)]
+    fn native_click_scaled(
+        &self,
+        label: Option<&str>,
+        x: f64,
+        y: f64,
+        device_pixel_ratio: Option<f64>,
+    ) -> Result<(), String> {
+        let hwnd = self.get_native_handle(label)?;
+        win_focus(hwnd)?;
+        win_click(hwnd, x, y, device_pixel_ratio)
     }
 
     fn manage_window(&self, label: Option<&str>, action: &str) -> Result<String, String> {
@@ -913,6 +998,37 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
 
             window.set_title(&title).map_err(|e| e.to_string())
         })?
+    }
+
+    fn navigate_webview(&self, label: Option<&str>, url: &str) -> Result<(), String> {
+        let label = label.map(str::to_string);
+        let url = url::Url::parse(url).map_err(|e| format!("invalid URL: {e}"))?;
+        on_main(self, "navigate_webview", move |app| {
+            let windows = app.webview_windows();
+            // `navigate` took `&mut self` in early Tauri 2 releases, so a mutable handle.
+            #[allow(unused_mut)]
+            let mut window = find_window(&windows, label.as_deref())?.clone();
+            window.navigate(url).map_err(|e| e.to_string())
+        })?
+    }
+
+    #[cfg(target_os = "linux")]
+    fn web_main_thread_cpu(&self) -> Vec<(u32, u64, u64, u64)> {
+        crate::introspection::web_main_thread_cpu_linux()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn end_web_process(&self, pid: u32) -> Result<(), String> {
+        crate::introspection::end_web_process_linux(pid)
+    }
+
+    fn app_entry_url(&self) -> Option<String> {
+        if let Some(dev_url) = &self.config().build.dev_url {
+            return Some(dev_url.to_string());
+        }
+        Some(custom_protocol_entry(uses_https_scheme(
+            &self.config().app.windows,
+        )))
     }
 
     fn app_data_dir(&self) -> Result<std::path::PathBuf, String> {
@@ -1259,11 +1375,22 @@ fn win_send_key(key: &str) -> Result<(), String> {
     }
 }
 
+/// CSS pixels to physical client pixels. The page's `devicePixelRatio` is the true scale: it
+/// includes webview zoom, which the window's DPI knows nothing about (measured on `WebView2` at
+/// zoom 0.75, 1 and 1.5: an element's painted position is its CSS position times the ratio).
+#[cfg(windows)]
+fn css_to_client_pixels(x: f64, y: f64, device_pixel_ratio: Option<f64>, dpi: u32) -> (f64, f64) {
+    let scale = device_pixel_ratio
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .unwrap_or(if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 });
+    (x * scale, y * scale)
+}
+
 /// Click at logical (CSS-pixel) coordinates within the window's content area
 /// via an absolute-positioned `SendInput` mouse sequence (move + down + up).
 #[allow(unsafe_code)]
 #[cfg(windows)]
-fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
+fn win_click(hwnd: isize, x: f64, y: f64, device_pixel_ratio: Option<f64>) -> Result<(), String> {
     use windows::Win32::Foundation::POINT;
     use windows::Win32::Foundation::RECT;
     use windows::Win32::Graphics::Gdi::ClientToScreen;
@@ -1280,9 +1407,7 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
     // SAFETY: GetDpiForWindow/GetClientRect/GetSystemMetrics/ClientToScreen are safe to call
     // with a valid HWND; GetClientRect and ClientToScreen write into our stack RECT/POINT.
     let (nx, ny) = unsafe {
-        let dpi = GetDpiForWindow(h);
-        let scale = if dpi == 0 { 1.0 } else { f64::from(dpi) / 96.0 };
-        let (px, py) = (x * scale, y * scale);
+        let (px, py) = css_to_client_pixels(x, y, device_pixel_ratio, GetDpiForWindow(h));
         // Client coordinates: the client rect's origin is always (0, 0).
         let mut client = RECT::default();
         GetClientRect(h, &mut client)
@@ -1335,6 +1460,34 @@ fn win_click(hwnd: isize, x: f64, y: f64) -> Result<(), String> {
             "SendInput delivered {sent}/{} mouse events",
             inputs.len()
         ))
+    }
+}
+
+#[cfg(test)]
+mod https_entry_tests {
+    use tauri::utils::config::WindowConfig;
+
+    use super::{custom_protocol_entry, uses_https_scheme};
+
+    /// On the real config type: the field is read by its serialized name.
+    #[test]
+    fn use_https_scheme_is_read_from_the_real_window_config() {
+        let plain: WindowConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        let https: WindowConfig =
+            serde_json::from_value(serde_json::json!({"useHttpsScheme": true})).unwrap();
+        assert!(!uses_https_scheme(std::slice::from_ref(&plain)));
+        assert!(uses_https_scheme(&[plain, https]));
+        assert!(!uses_https_scheme::<WindowConfig>(&[]));
+    }
+
+    #[test]
+    fn the_entry_url_follows_the_scheme_where_the_scheme_exists() {
+        if cfg!(windows) {
+            assert_eq!(custom_protocol_entry(true), "https://tauri.localhost/");
+            assert_eq!(custom_protocol_entry(false), "http://tauri.localhost/");
+        } else {
+            assert_eq!(custom_protocol_entry(true), "tauri://localhost/");
+        }
     }
 }
 
@@ -1654,6 +1807,23 @@ mod tests {
             0,
             "a caller that gave up ran its job"
         );
+    }
+
+    /// Zoom 1.5 at 96 DPI: scaling by the DPI alone would click at an element's CSS position.
+    #[cfg(windows)]
+    #[test]
+    fn trusted_click_scales_by_the_pages_ratio_so_zoom_counts() {
+        assert_eq!(
+            super::css_to_client_pixels(200.0, 120.0, Some(1.5), 96),
+            (300.0, 180.0)
+        );
+        // No usable ratio from the page: the window's DPI.
+        for ratio in [None, Some(0.0), Some(f64::NAN), Some(-1.0)] {
+            assert_eq!(
+                super::css_to_client_pixels(200.0, 120.0, ratio, 144),
+                (300.0, 180.0)
+            );
+        }
     }
 
     /// R4-IN2: a trusted click was only checked for landing on OUR top-level window — which

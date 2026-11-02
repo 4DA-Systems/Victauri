@@ -59,6 +59,19 @@ fn run_tests(def: &TestDef) -> Option<Vec<TestResult>> {
     }
     let mut tmp = tempfile::NamedTempFile::new().expect("create temp file");
     let json = serde_json::to_string(def).expect("serialize test def");
+    // `addRoute` is agent-only: every spelling the page code here uses goes through the key.
+    let agent_add = format!(
+        "window.__VICTAURI__._agent('{}').addRoute(",
+        victauri_plugin::js_bridge::agent_key()
+    );
+    let json = [
+        "window.__VICTAURI__.addRoute(",
+        "V.addRoute(",
+        "v.addRoute(",
+        "b.addRoute(",
+    ]
+    .iter()
+    .fold(json, |j, spelling| j.replace(spelling, &agent_add));
     tmp.write_all(json.as_bytes()).expect("write test def");
     tmp.flush().expect("flush temp file");
     let output = Command::new("node")
@@ -367,24 +380,51 @@ fn r5b_routeurl1_rules_match_relative_and_absolute_forms() {
 
 // ── R5B-XHR1: a reused XHR gets one log entry per request, listeners once ────
 
+/// A server answering every request `200 ok`, cross-origin (the page's origin is jsdom's), for as
+/// long as the test process lives. Returns its origin.
+fn local_http_server() -> String {
+    use std::io::{Read as _, Write as _};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a local server");
+    let base = format!("http://{}", listener.local_addr().expect("local address"));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            std::thread::spawn(move || {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+                    head.push(byte[0]);
+                }
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\
+                      Content-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            });
+        }
+    });
+    base
+}
+
 /// `send()` attached five fresh listeners to the XHR every time, each closing over THAT send's
 /// log entry, so a reused XHR (open/send again on the same object) piled up listeners and every
 /// later request rewrote the earlier entries' status and duration. A re-`open()` while a
 /// request was in flight left its entry 'pending' forever (wedging `network_idle`), and a
 /// delayed send then fired into the next request. A blocked XHR never fired `loadend`.
+///
+/// The requests go to a server of the test's own. They used to go to the jsdom origin, port 80 of
+/// whatever machine ran this: nothing there (a refused localhost connection takes ~2 s on Windows),
+/// or a host service, which a CI runner has and which can sit on its first request. That was the
+/// one flake seen: the first XHR still pending after 15 s (reproduced with a listener on port 80
+/// that answers its first connection late; 0 of 200 runs under load without one).
 #[test]
 fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
-    let def = def(
-        None,
-        vec![case(
-            "three requests on one XHR, a re-open mid-flight, a blocked request",
-            r"
+    let base = local_http_server();
+    let code = r"
             var V = window.__VICTAURI__;
+            var BASE = '__BASE__';
             function sleep(ms) { return new Promise(function(r) { setTimeout(r, ms); }); }
-            // Resolves true on `loadend`, false only if it never came. The requests go to the
-            // jsdom origin with no server behind it, and a refused localhost connection can
-            // take ~2 s to fail (Windows retries it) - the old 2 s fallback then fired first
-            // and the test read an entry that was genuinely still in flight.
+            function path(e) { return e.url.replace(BASE, ''); }
+            // Resolves true on `loadend`, false only if it never came.
             function loadend(x, ms) {
                 return new Promise(function(r) {
                     x.addEventListener('loadend', function() { r(true); }, { once: true });
@@ -393,19 +433,19 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
             }
             var ended = [];
             var x = new XMLHttpRequest();
-            x.open('GET', '/r5b/one'); var p = loadend(x); x.send(); ended.push(await p);
+            x.open('GET', BASE + '/r5b/one'); var p = loadend(x); x.send(); ended.push(await p);
             var first = V.getNetworkLog('/r5b/', 10)[0];
             await sleep(80);
-            x.open('GET', '/r5b/two'); p = loadend(x); x.send(); ended.push(await p);
+            x.open('GET', BASE + '/r5b/two'); p = loadend(x); x.send(); ended.push(await p);
             await sleep(80);
-            x.open('GET', '/r5b/three'); p = loadend(x); x.send(); ended.push(await p);
+            x.open('GET', BASE + '/r5b/three'); p = loadend(x); x.send(); ended.push(await p);
             var log = V.getNetworkLog('/r5b/', 10);
 
             // Re-open while a (route-delayed) request is still pending.
             V.addRoute({ pattern: '/r5c/slow', action: 'delay', delay_ms: 150 });
             var y = new XMLHttpRequest();
-            y.open('GET', '/r5c/slow'); y.send();
-            y.open('GET', '/r5c/after'); p = loadend(y); y.send(); ended.push(await p);
+            y.open('GET', BASE + '/r5c/slow'); y.send();
+            y.open('GET', BASE + '/r5c/after'); p = loadend(y); y.send(); ended.push(await p);
             await sleep(300);
             var log2 = V.getNetworkLog('/r5c/', 10);
 
@@ -419,15 +459,21 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
 
             return {
                 requests_ended: ended,
-                urls: log.map(function(e) { return e.url; }),
+                urls: log.map(path),
                 ids_distinct: new Set(log.map(function(e) { return e.id; })).size,
                 first_status: first.status, first_duration: first.duration_ms,
                 first_after: { status: log[0].status, duration: log[0].duration_ms },
                 pending: log.filter(function(e) { return e.status === 'pending'; }).length,
-                reopen: log2.map(function(e) { return e.url + '=' + e.status; }),
+                reopen: log2.map(function(e) { return path(e) + '=' + e.status; }),
                 blocked_loadend: blockedEnded, blocked_events: events,
             };
-            ",
+            "
+    .replace("__BASE__", &base);
+    let def = def(
+        None,
+        vec![case(
+            "three requests on one XHR, a re-open mid-flight, a blocked request",
+            &code,
         )],
     );
     let Some(results) = run_tests(&def) else {
@@ -453,19 +499,13 @@ fn r5b_xhr1_reused_xhr_keeps_one_entry_per_request() {
         "a later request on the same XHR rewrote the first entry: {r}"
     );
     assert_eq!(r["first_after"]["status"], r["first_status"], "{r}");
+    assert_eq!(r["first_status"], 200, "{r}");
     // Re-opening mid-flight closes the first request's entry as `aborted`; the second request
-    // gets its own entry that reaches a final state. Which final state depends on the host (no
-    // server behind the jsdom origin -> `error`; a CI runner answered `404`), so only
-    // "finished, not pending/aborted" is asserted for it.
-    let reopen = r["reopen"].as_array().expect("reopen entries");
-    assert_eq!(reopen.len(), 2, "{r}");
-    assert_eq!(reopen[0], "/r5c/slow=aborted", "{r}");
-    let after = reopen[1].as_str().unwrap_or_default();
-    assert!(
-        after.starts_with("/r5c/after=")
-            && !after.ends_with("=pending")
-            && !after.ends_with("=aborted"),
-        "the re-opened request must reach a final state: {r}"
+    // gets its own entry that reaches a final state.
+    assert_eq!(
+        r["reopen"],
+        serde_json::json!(["/r5c/slow=aborted", "/r5c/after=200"]),
+        "{r}"
     );
     assert_eq!(r["blocked_loadend"], true, "{r}");
     assert_eq!(r["blocked_events"], serde_json::json!(["error"]), "{r}");

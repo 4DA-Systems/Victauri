@@ -100,9 +100,19 @@ async fn mock_mcp_handler(State(state): State<MockState>, body: String) -> Respo
             }
 
             let content_text = match tool_name.as_str() {
-                "eval_js" => json!({"result": "evaluated"}).to_string(),
-                "dom_snapshot" => json!({"role": "document", "children": []}).to_string(),
-                "find_elements" => json!([{"ref": "e1", "role": "button"}]).to_string(),
+                // The value of the expression, as `eval_with_return` unwraps it.
+                "eval_js" => json!("evaluated").to_string(),
+                // `snapshot('compact')` in the bridge.
+                "dom_snapshot" => json!({
+                    "tree": "[e1] body\n  [e2] button \"OK\"", "stale_refs": [], "format": "compact"
+                })
+                .to_string(),
+                "find_elements" => json!([{
+                    "ref_id": "k3f9e1", "tag": "button", "role": "button", "name": null, "text": "OK",
+                    "bounds": {"x": 0, "y": 0, "width": 10, "height": 10},
+                    "visible": true, "enabled": true, "value": null
+                }])
+                .to_string(),
                 "interact" => json!({"ok": true}).to_string(),
                 "input" => json!({"ok": true}).to_string(),
                 "window" => {
@@ -113,29 +123,78 @@ async fn mock_mcp_handler(State(state): State<MockState>, body: String) -> Respo
                         _ => json!({"ok": true}).to_string(),
                     }
                 }
-                "screenshot" => json!({"image": "iVBORw0KGgo..."}).to_string(),
-                "invoke_command" => json!({"result": "invoked"}).to_string(),
+                "screenshot" => {
+                    // The real tool answers with an image block, not text.
+                    return axum::Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {"content": [
+                            {"type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png"}
+                        ]}
+                    }))
+                    .into_response();
+                }
+                // The command's own return value, unwrapped.
+                "invoke_command" => json!({"status": "ready"}).to_string(),
                 "logs" => json!([{"command": "greet"}]).to_string(),
                 "verify_state" => json!({"passed": true, "divergences": []}).to_string(),
-                "detect_ghost_commands" => {
-                    json!({"ghost_commands": [], "uncalled_commands": []}).to_string()
-                }
-                "check_ipc_integrity" => {
-                    json!({"healthy": true, "stale_calls": 0, "error_calls": 0}).to_string()
-                }
-                "wait_for" => json!({"matched": true}).to_string(),
-                "assert_semantic" => json!({"passed": true, "actual": "hello"}).to_string(),
+                "detect_ghost_commands" => json!({
+                    "confirmed_ghosts": [], "verified_handlers": 1, "frontend_only": [],
+                    "post_message_only": [], "excluded_builtins": [], "registry_only": [],
+                    "total_frontend_commands": 1, "total_registry_commands": 1,
+                    "reliability": "high", "note": ""
+                })
+                .to_string(),
+                "check_ipc_integrity" => json!({
+                    "healthy": true, "total_calls": 1, "pending_count": 0, "stale_count": 0,
+                    "error_count": 0, "stale_calls": [], "errored_calls": []
+                })
+                .to_string(),
+                "wait_for" => json!({"ok": true, "elapsed_ms": 1}).to_string(),
+                "assert_semantic" => json!({
+                    "label": "x", "passed": true, "actual": "hello", "expected": "hello",
+                    "message": null
+                })
+                .to_string(),
                 "resolve_command" => json!([{"name": "save", "score": 0.9}]).to_string(),
                 "get_registry" => json!([{"name": "greet"}]).to_string(),
-                "get_memory_stats" => json!({"working_set_bytes": 50000000}).to_string(),
-                "get_plugin_info" => json!({"version": "0.1.0", "uptime_secs": 100}).to_string(),
+                // `memory.rs` on Windows.
+                "get_memory_stats" => json!({
+                    "working_set_bytes": 50000000, "peak_working_set_bytes": 60000000,
+                    "page_file_bytes": 40000000, "peak_page_file_bytes": 45000000,
+                    "page_fault_count": 1000
+                })
+                .to_string(),
+                "get_plugin_info" => json!({
+                    "version": "0.10.3", "bridge_version": "0.10.3", "port": 7373,
+                    "app": {"identifier": "com.example.app", "product_name": "Example"},
+                    "tools": {"total": 35, "enabled": 35, "enabled_list": [], "disabled_list": []},
+                    "commands": {"allowlist": null, "blocklist": []},
+                    "privacy": {"profile": "full", "redaction_enabled": false},
+                    "capacities": {"event_log": 10000, "eval_timeout_secs": 30},
+                    "registered_commands": 1, "tool_invocations": 1, "uptime_secs": 100
+                })
+                .to_string(),
                 "storage" => json!({"ok": true}).to_string(),
                 "navigate" => json!({"ok": true}).to_string(),
-                "recording" => json!({"started": true, "session_id": "test"}).to_string(),
+                "recording" => match arguments["action"].as_str().unwrap_or("") {
+                    "start" => json!({"started": true, "session_id": "test"}).to_string(),
+                    // A `RecordedSession`.
+                    "stop" => json!({
+                        "id": "test", "started_at": "2026-11-01T00:00:00Z",
+                        "events": [], "checkpoints": []
+                    })
+                    .to_string(),
+                    _ => json!({"ok": true}).to_string(),
+                },
                 "inspect" => {
                     let action = arguments["action"].as_str().unwrap_or("");
                     match action {
-                        "audit_accessibility" => json!({"summary": {"violations": 0, "passes": 5}}).to_string(),
+                        "audit_accessibility" => json!({
+                            "violations": [], "warnings": [],
+                            "summary": {"critical": 0, "serious": 0, "moderate": 0, "minor": 0, "total": 0}
+                        })
+                        .to_string(),
                         "get_performance" => json!({"navigation": {"load_event_ms": 250.0}, "js_heap": {"used_mb": 10.0}}).to_string(),
                         _ => json!({"ok": true}).to_string(),
                     }
@@ -245,12 +304,12 @@ async fn client_click_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.click("e5").await;
+    let _ = client.click("k3f9e5").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "click");
-    assert_eq!(log[0].1["ref_id"], "e5");
+    assert_eq!(log[0].1["ref_id"], "k3f9e5");
 }
 
 // ── fill ──────────────────────────────────────────────────────────────────
@@ -260,12 +319,12 @@ async fn client_fill_sends_input() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.fill("e2", "hello world").await;
+    let _ = client.fill("k3f9e2", "hello world").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "input");
     assert_eq!(log[0].1["action"], "fill");
-    assert_eq!(log[0].1["ref_id"], "e2");
+    assert_eq!(log[0].1["ref_id"], "k3f9e2");
     assert_eq!(log[0].1["value"], "hello world");
 }
 
@@ -276,12 +335,12 @@ async fn client_type_text_sends_input() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.type_text("e3", "typing").await;
+    let _ = client.type_text("k3f9e3", "typing").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "input");
     assert_eq!(log[0].1["action"], "type_text");
-    assert_eq!(log[0].1["ref_id"], "e3");
+    assert_eq!(log[0].1["ref_id"], "k3f9e3");
     assert_eq!(log[0].1["text"], "typing");
 }
 
@@ -307,12 +366,12 @@ async fn client_hover_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.hover("e7").await;
+    let _ = client.hover("k3f9e7").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "hover");
-    assert_eq!(log[0].1["ref_id"], "e7");
+    assert_eq!(log[0].1["ref_id"], "k3f9e7");
 }
 
 // ── focus ─────────────────────────────────────────────────────────────────
@@ -322,12 +381,12 @@ async fn client_focus_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.focus("e8").await;
+    let _ = client.focus("k3f9e8").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "focus");
-    assert_eq!(log[0].1["ref_id"], "e8");
+    assert_eq!(log[0].1["ref_id"], "k3f9e8");
 }
 
 // ── scroll_to ─────────────────────────────────────────────────────────────
@@ -337,12 +396,12 @@ async fn client_scroll_to_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.scroll_to("e9").await;
+    let _ = client.scroll_to("k3f9e9").await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "scroll_into_view");
-    assert_eq!(log[0].1["ref_id"], "e9");
+    assert_eq!(log[0].1["ref_id"], "k3f9e9");
 }
 
 // ── select_option ─────────────────────────────────────────────────────────
@@ -352,12 +411,12 @@ async fn client_select_option_sends_interact() {
     let state = MockState::new();
     let port = start_mock_server(state.clone()).await;
     let mut client = VictauriClient::connect(port).await.unwrap();
-    let _ = client.select_option("e10", &["opt1", "opt2"]).await;
+    let _ = client.select_option("k3f9e10", &["opt1", "opt2"]).await;
 
     let log = state.call_log.lock().await;
     assert_eq!(log[0].0, "interact");
     assert_eq!(log[0].1["action"], "select_option");
-    assert_eq!(log[0].1["ref_id"], "e10");
+    assert_eq!(log[0].1["ref_id"], "k3f9e10");
     assert_eq!(log[0].1["values"], json!(["opt1", "opt2"]));
 }
 
@@ -784,14 +843,21 @@ fn assert_json_truthy_panics_for_empty_string() {
 
 #[test]
 fn assert_no_a11y_violations_passes() {
-    let audit = json!({"summary": {"violations": 0, "passes": 12}});
+    let audit = json!({
+        "violations": [], "warnings": [],
+        "summary": {"critical": 0, "serious": 0, "moderate": 0, "minor": 0, "total": 0}
+    });
     assert_no_a11y_violations(&audit);
 }
 
 #[test]
 #[should_panic(expected = "violations")]
 fn assert_no_a11y_violations_panics() {
-    let audit = json!({"summary": {"violations": 3, "passes": 12}});
+    let audit = json!({
+        "violations": [{"rule": "img-alt", "severity": "critical", "element": "img", "message": "m"}],
+        "warnings": [],
+        "summary": {"critical": 1, "serious": 0, "moderate": 0, "minor": 0, "total": 1}
+    });
     assert_no_a11y_violations(&audit);
 }
 
@@ -859,10 +925,7 @@ async fn response_parsed_as_json() {
     let mut client = VictauriClient::connect(port).await.unwrap();
 
     let result = client.eval_js("1+1").await.unwrap();
-    assert!(
-        result.is_object() || result.is_string(),
-        "result should be parsed JSON"
-    );
+    assert_eq!(result, json!("evaluated"));
 }
 
 #[tokio::test]

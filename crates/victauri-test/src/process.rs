@@ -51,6 +51,15 @@ pub fn liveness(pid: u32) -> Liveness {
     imp::liveness(pid)
 }
 
+/// Whether `pid` will do nothing more: gone, or (on Unix) a zombie waiting for its parent to reap
+/// it, which [`liveness`] calls alive as `kill -0` does. For a caller waiting on what the process
+/// does next. Discovery keeps [`liveness`]: an entry's token follows the entry, not this.
+#[doc(hidden)]
+#[must_use]
+pub fn is_gone(pid: u32) -> bool {
+    liveness(pid).is_dead() || imp::is_zombie(pid)
+}
+
 /// Whether `pid` is a live process owned by the current user.
 #[doc(hidden)]
 #[must_use]
@@ -82,6 +91,33 @@ pub fn restrict_dir_to_current_user(path: &std::path::Path) -> bool {
     imp::restrict_dir_to_current_user(path)
 }
 
+/// Windows: a job object that kills a process tree when this process dies, however it dies
+/// (`victauri run`'s launcher can be `TerminateProcess`ed, when no handler can run).
+///
+/// The kill is on the job's last handle closing, so it needs nothing from the dying process.
+/// [`disarm`](Self::disarm) it once the child has ended normally: what the child deliberately
+/// left running is not ours to kill.
+#[cfg(windows)]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct KillOnCloseJob(imp::Job);
+
+#[cfg(windows)]
+impl KillOnCloseJob {
+    /// Put `child` (and what it starts from now on) in a new job. `None` when that fails, for
+    /// example under a job that forbids nesting: the child then simply runs without this.
+    #[must_use]
+    pub fn assign(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+        imp::Job::assign(child.as_raw_handle()).map(Self)
+    }
+
+    /// Stop killing on close, and close.
+    pub fn disarm(self) {
+        self.0.disarm();
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod imp {
@@ -108,6 +144,65 @@ mod imp {
     struct Handle(HANDLE);
 
     impl Drop for Handle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is a handle this module opened and has not closed.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    /// See [`super::KillOnCloseJob`].
+    #[derive(Debug)]
+    pub(super) struct Job(HANDLE);
+
+    impl Job {
+        pub(super) fn assign(process: *mut c_void) -> Option<Self> {
+            use windows_sys::Win32::System::JobObjects::{
+                AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            };
+            // SAFETY: null attributes (not inheritable, so no child can keep the job alive) and
+            // no name; a null return is handled.
+            let raw = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if raw.is_null() {
+                return None;
+            }
+            let job = Self(raw);
+            // BREAKAWAY_OK: without it a program that asks for CREATE_BREAKAWAY_FROM_JOB fails to
+            // start at all. Such a process leaves the job; everything else stays in it.
+            if !job.set_limits(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK) {
+                return None;
+            }
+            // SAFETY: both are valid handles for the duration of the call.
+            (unsafe { AssignProcessToJobObject(job.0, process) } != 0).then_some(job)
+        }
+
+        pub(super) fn disarm(self) {
+            use windows_sys::Win32::System::JobObjects::JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            let _ = self.set_limits(JOB_OBJECT_LIMIT_BREAKAWAY_OK);
+        }
+
+        fn set_limits(&self, flags: u32) -> bool {
+            use windows_sys::Win32::System::JobObjects::{
+                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+                SetInformationJobObject,
+            };
+            // SAFETY: an all-zero JOBOBJECT_EXTENDED_LIMIT_INFORMATION is valid (no limits).
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+            info.BasicLimitInformation.LimitFlags = flags;
+            // SAFETY: `self.0` is a valid job; `info` is the struct this class documents, with
+            // its exact size.
+            unsafe {
+                SetInformationJobObject(
+                    self.0,
+                    JobObjectExtendedLimitInformation,
+                    (&raw const info).cast::<c_void>(),
+                    u32::try_from(std::mem::size_of_val(&info)).unwrap_or(0),
+                ) != 0
+            }
+        }
+    }
+
+    impl Drop for Job {
         fn drop(&mut self) {
             // SAFETY: `self.0` is a handle this module opened and has not closed.
             unsafe { CloseHandle(self.0) };
@@ -318,6 +413,11 @@ mod imp {
         !owner.is_null() && is_acceptable_owner(owner)
     }
 
+    /// Windows has no such state: a process that ended reads as ended.
+    pub(super) fn is_zombie(_pid: u32) -> bool {
+        false
+    }
+
     pub(super) fn liveness(pid: u32) -> Liveness {
         if pid == 0 {
             return Liveness::Dead;
@@ -391,6 +491,32 @@ mod imp {
 
     pub(super) fn liveness(pid: u32) -> Liveness {
         liveness_with(pid, KILL_CANDIDATES, SH_CANDIDATES, Path::new("/proc"))
+    }
+
+    /// The state follows the `)` of the name, which can hold anything. Could not tell: not one.
+    #[cfg(target_os = "linux")]
+    pub(super) fn is_zombie(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with(['Z', 'X']))
+        })
+    }
+
+    /// No `/proc` to read here (macOS). Could not tell: not one.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn is_zombie(pid: u32) -> bool {
+        is_zombie_by_ps(pid)
+    }
+
+    #[cfg(any(test, not(target_os = "linux")))]
+    pub(super) fn is_zombie_by_ps(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| out.stdout.trim_ascii_start().starts_with(b"Z"))
     }
 
     /// Testable core: try a `kill` binary, then a shell's builtin `kill`, then `/proc`.
@@ -485,11 +611,35 @@ mod imp {
     pub(super) fn liveness(_pid: u32) -> Liveness {
         Liveness::Unknown
     }
+
+    pub(super) fn is_zombie(_pid: u32) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `kill -0` calls a zombie alive, and a follower waiting on that launcher waits forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_is_gone_though_it_is_still_live_to_liveness() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        assert!(!is_gone(child.id()));
+        assert!(!imp::is_zombie_by_ps(child.id()));
+        child.kill().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(liveness(child.id()), Liveness::Own, "the old meaning stays");
+        assert!(is_gone(child.id()), "unreaped");
+        assert!(imp::is_zombie_by_ps(child.id()), "as macOS reads it");
+        child.wait().unwrap();
+        assert!(is_gone(child.id()), "reaped");
+        assert!(!is_gone(std::process::id()));
+    }
 
     #[test]
     fn the_current_process_is_own_and_live() {

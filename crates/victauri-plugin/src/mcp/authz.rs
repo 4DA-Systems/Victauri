@@ -192,13 +192,18 @@ const LEGACY_NAMES: &[&str] = &[
     "list_windows",
 ];
 
-/// Capability ids whose action is spelled differently: `(capability id, tool.action)`.
-/// Either spelling in `disabled_tools` disables the action (R4-NET4).
+/// Capability ids whose action is spelled differently: `(capability id, other spelling)`.
+/// Either spelling in `disabled_tools` disables the action (R4-NET4). The last four are
+/// [`LEGACY_NAMES`] no handler checks, so this is the only thing that makes them work.
 const CAPABILITY_ALIASES: &[(&str, &str)] = &[
     ("inspect.styles", "inspect.get_styles"),
     ("inspect.bounds", "inspect.get_bounding_boxes"),
     ("inspect.audit_a11y", "inspect.audit_accessibility"),
     ("inspect.performance", "inspect.get_performance"),
+    ("storage.get", "get_storage"),
+    ("storage.get_cookies", "get_cookies"),
+    ("window.get_state", "get_window_state"),
+    ("window.list", "list_windows"),
 ];
 
 /// The other spelling of a capability whose id differs from its `tool.action` name —
@@ -914,7 +919,10 @@ mod tests {
             assert_eq!(capability_alias(id), Some(*action));
             assert_eq!(capability_alias(action), Some(*id));
             // The alias really is the resolved capability of that action.
-            let (tool, act) = action.split_once('.').unwrap();
+            // (A legacy name has no `tool.action` form: the id itself is the action.)
+            let (tool, act) = if action.contains('.') { action } else { id }
+                .split_once('.')
+                .unwrap();
             assert_eq!(action_capability(tool, act).as_deref(), Some(*id));
         }
         assert_eq!(capability_alias("inspect.highlight"), None);

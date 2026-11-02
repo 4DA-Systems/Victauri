@@ -7,7 +7,8 @@ pub struct VerifyStateParams {
     /// JavaScript expression that returns the frontend state object to compare.
     pub frontend_expr: String,
     /// Backend state as a JSON object to compare against.
-    /// Either this or `backend_command` must be provided.
+    /// Either this or `backend_command` must be provided. An explicit `null` compares with null.
+    #[serde(default, deserialize_with = "super::backend_params::present_value")]
     pub backend_state: Option<serde_json::Value>,
     /// Tauri command to invoke to fetch backend state for comparison.
     /// The command result is used as the backend state. Mutually exclusive with `backend_state`.

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { VictauriClient } from "./client";
+import { showInfo } from "./toast";
 
 export class ScreenshotPanel {
   private static instance: ScreenshotPanel | undefined;
@@ -43,9 +44,9 @@ export class ScreenshotPanel {
   private async refresh(client: VictauriClient): Promise<void> {
     try {
       const data = await client.screenshot();
-      if (data) {
-        this.panel.webview.html = this.getHtml(data);
-      }
+      this.panel.webview.html = data
+        ? this.getHtml(data)
+        : this.getErrorHtml("the app's answer held no valid image");
     } catch (e) {
       this.panel.webview.html = this.getErrorHtml(String(e));
     }
@@ -59,9 +60,7 @@ export class ScreenshotPanel {
     if (uri) {
       const buf = Buffer.from(base64Data, "base64");
       await vscode.workspace.fs.writeFile(uri, buf);
-      vscode.window.showInformationMessage(
-        `Screenshot saved to ${uri.fsPath}`
-      );
+      showInfo(`Screenshot saved to ${uri.fsPath}`);
     }
   }
 
@@ -111,10 +110,14 @@ export class ScreenshotPanel {
 <html>
 <head>
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+<style nonce="${nonce}">
+  body { padding: 16px; color: var(--vscode-errorForeground); font-family: var(--vscode-font-family); }
+  button { background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; padding: 6px 14px; cursor: pointer; }
+</style>
 </head>
-<body style="padding:16px;color:var(--vscode-errorForeground);font-family:var(--vscode-font-family);">
+<body>
   <p>Screenshot failed: ${escaped}</p>
-  <button id="retryBtn" style="background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;padding:6px 14px;cursor:pointer;">Retry</button>
+  <button id="retryBtn">Retry</button>
   <script nonce="${nonce}">
     const vscode = acquireVsCodeApi();
     document.getElementById('retryBtn').addEventListener('click', () => {

@@ -12,6 +12,8 @@ struct ToolInfo {
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     description: Option<String>,
+    /// The tool's parameters as JSON Schema, for REST-only clients.
+    input_schema: serde_json::Value,
 }
 
 pub enum ToolCallError {
@@ -23,6 +25,9 @@ pub fn router(handler: VictauriMcpHandler) -> axum::Router {
     axum::Router::new()
         .route("/", axum::routing::get(list_tools))
         .route("/{tool_name}", axum::routing::post(call_tool))
+        // `read_body_with_deadline` has already enforced this path's limit (see `body_limit`),
+        // and this overrides the router-wide default that would refuse a large `recording` body.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(handler)
 }
 
@@ -34,6 +39,7 @@ async fn list_tools(State(handler): State<VictauriMcpHandler>) -> Json<Vec<ToolI
         .map(|t| ToolInfo {
             name: t.name.to_string(),
             description: t.description.as_deref().map(String::from),
+            input_schema: serde_json::Value::Object((*t.input_schema).clone()),
         })
         .collect();
     Json(tools)
@@ -87,6 +93,28 @@ fn to_rest_json(result: CallToolResult) -> serde_json::Value {
             })
             .unwrap_or_else(|| "unknown error".to_string());
         return serde_json::json!({ "error": msg });
+    }
+
+    // One result and a note about it (`eval_js`) is still one result.
+    if let [ContentBlock::Text(value), ContentBlock::Text(note)] = result.content.as_slice()
+        && note.text.starts_with("note: ")
+    {
+        let parsed = serde_json::from_str::<serde_json::Value>(&value.text)
+            .unwrap_or_else(|_| serde_json::Value::String(value.text.clone()));
+        return serde_json::json!({ "result": parsed, "note": note.text });
+    }
+    // The same for `screenshot`: the image, and which window it is.
+    if let [ContentBlock::Image(image), ContentBlock::Text(note)] = result.content.as_slice()
+        && note.text.starts_with("note: ")
+    {
+        return serde_json::json!({
+            "result": {
+                "type": "image",
+                "data": image.data,
+                "mimeType": image.mime_type,
+            },
+            "note": note.text,
+        });
     }
 
     if result.content.len() == 1 {
@@ -157,6 +185,36 @@ mod tests {
         assert!(json.get("result").is_none());
     }
 
+    /// `screenshot {}` picks a window for the caller, so its MCP result names it in a text block.
+    /// REST keeps its one image shape, with the note beside it as for `eval_js`.
+    #[test]
+    fn a_screenshot_names_its_window_and_keeps_the_rest_shape() {
+        let result = crate::mcp::screenshot_result("aWJhc2U2NA==".to_string(), "main");
+        assert!(matches!(result.content[0], ContentBlock::Image(_)));
+        let ContentBlock::Text(note) = &result.content[1] else {
+            panic!("{:?}", result.content);
+        };
+        assert_eq!(note.text, "note: captured window \"main\"");
+
+        let json = to_rest_json(result);
+        assert_eq!(json["result"]["type"], "image");
+        assert_eq!(json["result"]["data"], "aWJhc2U2NA==");
+        assert_eq!(json["result"]["mimeType"], "image/png");
+        assert_eq!(json["note"], "note: captured window \"main\"");
+    }
+
+    /// An image with other text (`animation scrub`'s manifest) is not a note about it.
+    #[test]
+    fn an_image_with_text_that_is_no_note_stays_a_list() {
+        let result = CallToolResult::success(vec![
+            ContentBlock::image("aWJhc2U2NA==", "image/png"),
+            ContentBlock::text("{\"points\":2}"),
+        ]);
+        let json = to_rest_json(result);
+        assert_eq!(json["result"][0]["type"], "image");
+        assert_eq!(json["result"][1]["type"], "text");
+    }
+
     #[test]
     fn image_result() {
         let result =
@@ -165,6 +223,22 @@ mod tests {
         assert_eq!(json["result"]["type"], "image");
         assert_eq!(json["result"]["data"], "aWJhc2U2NA==");
         assert_eq!(json["result"]["mimeType"], "image/png");
+    }
+
+    /// `eval_js` adds a note to a block's `undefined`; a REST caller still gets one result.
+    #[test]
+    fn a_result_with_a_note_keeps_the_single_result_shape() {
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("undefined"),
+            ContentBlock::text("note: code starting with `{` runs as a block"),
+        ]);
+        let json = to_rest_json(result);
+        assert_eq!(json["result"], "undefined");
+        assert_eq!(json["note"], "note: code starting with `{` runs as a block");
+        // Anything else with several blocks stays a list.
+        let result =
+            CallToolResult::success(vec![ContentBlock::text("one"), ContentBlock::text("two")]);
+        assert!(to_rest_json(result)["result"].is_array());
     }
 
     #[test]

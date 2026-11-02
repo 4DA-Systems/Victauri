@@ -86,6 +86,10 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: bash scripts/check-doc-counts.sh
 
+      - name: Release workflows restore no cache
+        if: matrix.os == 'ubuntu-latest'
+        run: bash scripts/check-release-no-cache.sh && bash scripts/test-check-release-no-cache.sh
+
       # Enforce the pre-push gate installer's security regressions in CI (not just the local hook). Runs on
       # all 3 OSes so the platform-gated cases actually execute somewhere: macOS exercises real symlinks +
       # case-insensitive folding (R6-02/R7-02, R3/R4/R5 case-fold), Linux exercises real symlinks on a
@@ -152,7 +156,8 @@ jobs:
   # CI cannot give; the same-process introspection that is the wedge needs none.
   live-app:
     name: Live-App Proof (${{ matrix.os }})
-    timeout-minutes: 30
+    # The Linux leg also installs the CLI from source for the auth-on run below.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -266,12 +271,50 @@ jobs:
 
           kill "$APP_PID" 2>/dev/null || true
 
+      # Every other live job runs the demo with `.auth_disabled()`, the one configuration no
+      # consumer has. This one keeps auth on, as every consumer gets it: the CLI below is given
+      # no token, so it can only pass by finding the app's token through discovery.
+      - name: Start demo-app with auth on (Linux)
+        if: runner.os == 'Linux'
+        env:
+          VICTAURI_DEMO_AUTH: "1"
+        run: |
+          # kill above hit xvfb-run, not necessarily the app; the port must be free or this app
+          # would fall back to 7374 while the old one keeps answering on 7373.
+          pkill -x demo-app || true
+          for i in $(seq 1 20); do pgrep -x demo-app >/dev/null || break; sleep 1; done
+          if pgrep -x demo-app >/dev/null; then echo "::error::the previous demo-app did not exit"; exit 1; fi
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a --server-args="-screen 0 1280x800x24" ./target/debug/demo-app > app-auth.log 2>&1 &
+
+      - name: victauri check + test through token discovery (Linux)
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/victauri-test
+        with:
+          check: "true"
+          cli-source-path: crates/victauri-cli
+          # This leg is about auth. Load time is the E2E job's concern, on a cold runner.
+          max-load-ms: "30000"
+
+      # Without this, an app that had silently dropped auth would pass the step above.
+      - name: The server really required that token (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          for path in /info /api/tools; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:7373$path")
+            echo "$path with no token -> HTTP $code"
+            if [ "$code" != "401" ]; then echo "::error::expected 401 from $path, got $code"; exit 1; fi
+          done
+          pkill -x demo-app || true
+
       - name: Upload app log on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: live-app-log-${{ matrix.os }}
-          path: app.log
+          path: |
+            app.log
+            app-auth.log
           if-no-files-found: ignore
 
   gauntlet:
@@ -450,13 +493,17 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
 
-      # --locked: check the committed lockfile's versions (the ones CI and a fresh
-      # `cargo install --locked` resolve), and fail if Cargo.lock is out of date instead of
-      # silently re-resolving.
+      # The committed lockfile holds what newest-toolchain consumers resolve (tauri 2.12 needs
+      # Rust 1.90), so it cannot build here. An MSRV consumer's resolver picks older compatible
+      # versions: prove the crates compile on those, the promise rust-version makes.
       - name: Check MSRV
-        run: cargo check --workspace --locked
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
+        run: |
+          cargo update
+          cargo check --workspace --locked
 
-  # victauri-plugin accepts rusqlite `>=0.32, <0.41` so cargo unifies onto the app's own
+  # victauri-plugin accepts rusqlite `>=0.32, <0.42` so cargo unifies onto the app's own
   # rusqlite (`links = "sqlite3"` allows one libsqlite3-sys per build). The lockfile pins the
   # OLD end; this job proves the NEW end: the security setters changed return type across the
   # range (`SetupOutcome` in database.rs keeps them fail-closed on every version).
@@ -478,10 +525,10 @@ jobs:
 
       - name: Move rusqlite to the newest version the range allows
         # Fails if the update did not reach the newest minor the workspace range allows
-        # (`>=0.32, <0.41` in Cargo.toml) — otherwise this job would silently keep testing 0.32.
+        # (`>=0.32, <0.42` in Cargo.toml) — otherwise this job would silently keep testing 0.32.
         # Widen NEWEST together with the range.
         env:
-          NEWEST: "0.40."
+          NEWEST: "0.41."
         run: |
           cargo update -p rusqlite
           resolved=$(grep -A1 '^name = "rusqlite"' Cargo.lock | sed -n 's/^version = "\(.*\)"/\1/p')
@@ -787,6 +834,7 @@ jobs:
         run: |
           cargo build -p demo-app
           cargo test -p demo-app --test integration --no-run
+          cargo test -p demo-app --test second_window --no-run
 
       # The app's stderr is CAPTURED, not discarded. When the host dies mid-suite, the test only
       # reports "connection refused" — the actual cause (e.g. glibc's `malloc(): unaligned tcache
@@ -830,6 +878,12 @@ jobs:
 
       - name: Run E2E tests
         run: cargo test -p demo-app --test integration -- --test-threads=1
+        env:
+          VICTAURI_E2E: "1"
+
+      # Its own step: on Windows the default shell only fails a step on the LAST command's exit code.
+      - name: Run second-window E2E test
+        run: cargo test -p demo-app --test second_window -- --test-threads=1
         env:
           VICTAURI_E2E: "1"
 
