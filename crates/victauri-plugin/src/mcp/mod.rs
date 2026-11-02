@@ -5325,8 +5325,8 @@ impl VictauriMcpHandler {
 
     /// Takes a window off a page that stopped answering, to a `target` inside the app, and says
     /// whether the page answers there: the window's URL proves nothing, it reads the new one before
-    /// the page has left. On WebView2 the detour does it. WebKit queues every navigation behind the
-    /// stopped page's script (measured on WebKitGTK 2.52: the detour never commits, and the page
+    /// the page has left. On `WebView2` the detour does it. `WebKit` queues every navigation behind
+    /// the stopped page's script (measured on `WebKitGTK` 2.52: the detour never commits, and the page
     /// answers only when its loop ends), and its way out is to end the web process. Where that
     /// process is the app's child (Linux) and the page has spun flat out all along, it is ended;
     /// the new navigation then starts a new one, and other windows are not touched.
@@ -5361,7 +5361,7 @@ impl VictauriMcpHandler {
             .await)
     }
 
-    /// WebKit drops a navigation sent before it has noticed that the web process is gone (measured:
+    /// `WebKit` drops a navigation sent before it has noticed that the web process is gone (measured:
     /// the window then stays on no URL at all), so it is sent again while the window has none.
     async fn navigate_new_web_process(
         &self,

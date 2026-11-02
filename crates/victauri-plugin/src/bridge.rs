@@ -108,7 +108,7 @@ pub trait WebviewBridge: Send + Sync {
         Vec::new()
     }
     /// End a process listed by [`web_process_cpu`](Self::web_process_cpu), the only way out of a
-    /// page spinning in a loop on Linux: WebKit queues even a native navigation behind its script.
+    /// page spinning in a loop on Linux: `WebKit` queues even a native navigation behind its script.
     /// The next navigation starts a new process.
     ///
     /// # Errors

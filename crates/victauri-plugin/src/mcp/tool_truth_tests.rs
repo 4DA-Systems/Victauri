@@ -22,13 +22,13 @@ struct AppBridge {
     respond: Responder,
     /// The page stopped answering: a loop, a blocking command, or a navigation out of the app.
     dead: Arc<AtomicBool>,
-    /// A navigation does not revive a dead page: it waits behind the stopped script (WebKit).
+    /// A navigation does not revive a dead page: it waits behind the stopped script (`WebKit`).
     stays_dead: Arc<AtomicBool>,
     /// `(pid, ticks per CPU reading)` of the page processes that are the app's children (Linux).
     web_processes: Arc<StdMutex<Vec<(u32, u64)>>>,
     cpu_readings: Arc<AtomicUsize>,
     ended: Arc<StdMutex<Vec<u32>>>,
-    /// WebKit has not noticed that the web process is gone: the next navigation is lost.
+    /// `WebKit` has not noticed that the web process is gone: the next navigation is lost.
     drop_navigation: Arc<AtomicBool>,
     /// The window never had a bridge that could call back (no `victauri:default`).
     states: Arc<StdMutex<Vec<WindowState>>>,
@@ -528,8 +528,8 @@ async fn go_back_on_a_dead_page_returns_to_the_last_url_inside_the_app() {
     );
 }
 
-/// On WebKit a navigation waits behind a stopped page's script, and the window's URL already reads
-/// the new one (measured on WebKitGTK 2.52: a "recovered" page stayed dead until its loop ended). So
+/// On `WebKit` a navigation waits behind a stopped page's script, and the window's URL already
+/// reads the new one (measured on `WebKitGTK` 2.52: a "recovered" page stayed dead until its loop ended). So
 /// `recovered` is what the page does afterwards, not that a navigation was sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn go_back_does_not_claim_a_recovery_the_page_does_not_show() {
@@ -547,7 +547,7 @@ async fn go_back_does_not_claim_a_recovery_the_page_does_not_show() {
     assert!(msg.contains("http://tauri.localhost/index.html"), "{msg}");
 }
 
-/// WebKitGTK: the only way off a page spinning in a loop is to end its web process, and the
+/// `WebKitGTK`: the only way off a page spinning in a loop is to end its web process, and the
 /// navigation after that lands. A page that does not use the CPU is not "spinning".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn go_back_ends_the_one_web_process_spinning_flat_out() {
