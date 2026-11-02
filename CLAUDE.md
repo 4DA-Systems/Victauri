@@ -184,9 +184,25 @@ Standalone binary. Monitors the MCP server health endpoint.
 - [x] Accessibility auditing (WCAG checks: alt text, labels, contrast, ARIA, headings)
 - [x] Performance profiling (navigation timing, resource loading, JS heap, long tasks, DOM stats)
 
-## Current State (2026-11-02)
+## Current State (2026-11-03)
 
-### v0.10.3 — candidate on `release/0.10.3-prep`, NOT published
+### v0.10.3 — PUBLISHED 2026-11-02
+
+PR #98 (`d3cbfd9`) + PR #99 (`fa293b6`, tree == the CI-green head `dee49c8`). All six crates published
+locally from a clean worktree at `fa293b6` with an operator token (env-only, `cargo publish --workspace
+--no-verify --locked` after a token-less `--dry-run --locked` there), verified on crates.io and the sparse
+index. `cargo install victauri-cli --version 0.10.3 --locked` from crates.io and a fresh consumer on the
+real crates with no lockfile verified live (smoke 11/11 on rusqlite 0.41.1, rmcp 3.8, tauri 2.12.5). Tag
+`v0.10.3` → release.yml run 41479300096, 13 of 13 jobs: GitHub Release with 8 binaries + `SHA256SUMS`
+(Windows checksums and `--version` verified). MCP Registry via `mcp-registry.yml`. The `release-tags`
+ruleset (id 26325204) blocks moving or deleting `v*` and `vscode-v*` tags. VS Code `.vsix` built from
+`fa293b6` and checked; the Marketplace upload is manual. 4DA lock bump not done.
+
+**Assessment after the first merge changed the outcome.** Asked for confidence before publishing, a review
+of the last fix round found recovery could end a healthy, answering window's process while the stuck page
+stayed stuck, and a cold reader found a false line in a README that ships in the crate. Both went into #99.
+Before an irreversible publish, review the round you consider finished and try to falsify the changelog
+against the code. Every review round of this release found something real, so do not read this as finished.
 
 A nine-lens adversarial audit (network, JS bridge, data/native, in-process, CLI, VS Code, library
 truth, release claims, live sweep), fixed in seven isolated lanes, merged, reviewed by three
@@ -231,7 +247,8 @@ Known, not fixed: a polynomial route regex with no repeated group (`.*.*.*.*x`) 
 on macOS a page stuck in a loop cannot be left until its script ends (the call errors), and on a loaded
 Linux machine neither can one whose loop allocates; a web process spinning in a window whose bridge
 never answered could be taken for the target's; `DeathWatch` signals only the direct child, so what `npm`
-started may stay.
+started may stay; a page that was only slow looks the same as a stuck one on Linux (the result says so); an
+app killed during recovery's roughly 2 s pause can leave its web process stopped.
 
 ## Current State (2026-10-31)
 
