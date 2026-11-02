@@ -5348,6 +5348,7 @@ impl VictauriMcpHandler {
         let after = self.bridge.web_process_cpu();
         if let Some(pid) =
             crate::introspection::spinning_web_process(&before, &after, started.elapsed())
+            && self.other_windows_answer(label).await
             && self.bridge.end_web_process(pid).is_ok()
         {
             tracing::warn!(
@@ -5359,6 +5360,24 @@ impl VictauriMcpHandler {
         Ok(self
             .page_answers_within(label, STOPPED_PAGE_LOAD_WAIT)
             .await)
+    }
+
+    /// Nothing maps a web process to its window, so the one that spun could be another window's.
+    /// One that has answered before and is silent now may well be that window. A window that never
+    /// answered cannot say, and does not count.
+    async fn other_windows_answer(&self, label: Option<&str>) -> bool {
+        let Some(target) = self.read_back_window(label).map(|window| window.label) else {
+            return false;
+        };
+        for other in self.bridge.list_window_labels() {
+            if other != target
+                && self.bridge_has_answered(&other)
+                && self.probe_bridge(Some(&other), None, None).await.is_err()
+            {
+                return false;
+            }
+        }
+        true
     }
 
     /// `WebKit` drops a navigation sent before it has noticed that the web process is gone (measured:

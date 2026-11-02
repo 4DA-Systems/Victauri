@@ -30,6 +30,8 @@ struct AppBridge {
     ended: Arc<StdMutex<Vec<u32>>>,
     /// `WebKit` has not noticed that the web process is gone: the next navigation is lost.
     drop_navigation: Arc<AtomicBool>,
+    /// The other window's page, apart from `dead`: `Some(answers)`.
+    sibling_answers: Arc<StdMutex<Option<bool>>>,
     /// The window never had a bridge that could call back (no `victauri:default`).
     states: Arc<StdMutex<Vec<WindowState>>>,
     /// The size the OS really gives a resized window (`None`: what was asked for).
@@ -54,6 +56,7 @@ impl AppBridge {
             cpu_readings: Arc::default(),
             ended: Arc::default(),
             drop_navigation: Arc::default(),
+            sibling_answers: Arc::default(),
             states: Arc::new(StdMutex::new(vec![
                 window_state("main", "http://tauri.localhost/index.html"),
                 window_state("notifications", "http://tauri.localhost/notifications.html"),
@@ -144,6 +147,14 @@ impl WebviewBridge for AppBridge {
             .lock()
             .unwrap()
             .push((label.map(str::to_string), script.to_string()));
+        if label == Some("notifications")
+            && let Some(answers) = *self.sibling_answers.lock().unwrap()
+        {
+            if answers && let Some(id) = quoted_id_after(script, "id:\"") {
+                self.answer(id, "\"probe_ok:page-1\"".to_string());
+            }
+            return Ok(());
+        }
         if script.contains("location.replace(") && !self.stays_dead.load(Ordering::SeqCst) {
             self.dead.store(false, Ordering::SeqCst);
         }
@@ -602,6 +613,37 @@ async fn no_web_process_is_ended_unless_one_alone_spun() {
         let msg = err_text(&call(&h, "navigate", json!({"action": "go_back"})).await);
         assert!(msg.contains("still does not answer"), "{msg}");
         assert!(bridge.ended.lock().unwrap().is_empty());
+    }
+}
+
+/// Nothing maps a web process to its window, so the one spinning could be another window's. A
+/// sibling that has answered before says which: silent now, the process may well be its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_web_process_is_ended_only_while_the_other_windows_answer() {
+    for sibling_answers in [false, true] {
+        let st = state();
+        let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+        *bridge.web_processes.lock().unwrap() = vec![(22, 100_000)];
+        *bridge.sibling_answers.lock().unwrap() = Some(sibling_answers);
+        let h = handler(&st, &bridge);
+        assert_ne!(
+            call(&h, "get_diagnostics", json!({})).await.is_error,
+            Some(true)
+        );
+        h.answered_windows
+            .lock()
+            .unwrap()
+            .insert("notifications".to_string());
+        bridge.dead.store(true, Ordering::SeqCst);
+        bridge.stays_dead.store(true, Ordering::SeqCst);
+        let result = call(&h, "navigate", json!({"action": "go_back"})).await;
+        if sibling_answers {
+            assert_eq!(ok_json(&result)["recovered"], true);
+            assert_eq!(*bridge.ended.lock().unwrap(), vec![22]);
+        } else {
+            assert!(err_text(&result).contains("still does not answer"));
+            assert!(bridge.ended.lock().unwrap().is_empty());
+        }
     }
 }
 
