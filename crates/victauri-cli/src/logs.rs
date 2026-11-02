@@ -392,6 +392,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
             label: l,
             page,
             restarted,
+            asked_ms,
         }) = reattach(&opts, &args, cursor, &label, pid, Duration::from_secs(20)).await
         else {
             eprintln!("victauri logs: app went away (crashed, closed or rebuilding)");
@@ -422,7 +423,7 @@ pub async fn cmd_logs(opts: LogsOptions) -> Result<()> {
         print_page(&page, &opts);
         cursor = page["next_seq"].as_u64().unwrap_or(0);
         behind = page["truncated"] == true;
-        last_ok_ms = now_ms();
+        last_ok_ms = asked_ms;
         pid = page_pid(&page);
         backend = b;
         label = l;
@@ -512,6 +513,8 @@ struct Reattached {
     label: String,
     page: Value,
     restarted: bool,
+    /// When the request for `page` went out (see `last_ok_ms` in [`cmd_logs`]).
+    asked_ms: u64,
 }
 
 /// Re-resolve the app through discovery until `max` passes, and read the log from `cursor`.
@@ -533,28 +536,42 @@ async fn reattach(
         let Ok((backend, label)) = Backend::connect(opts.app.as_deref()).await else {
             continue;
         };
-        let Ok(page) = backend.logs(args.clone()).await else {
+        let Ok((page, restarted, asked_ms)) =
+            read_reattached(&backend, args, cursor, label != old_label, known_pid).await
+        else {
             continue;
-        };
-        let restarted = label != old_label || is_new_process(&page, cursor, known_pid);
-        let page = if restarted {
-            let mut from_start = args.clone();
-            from_start["since_seq"] = 0.into();
-            match backend.logs(from_start).await {
-                Ok(p) => p,
-                Err(_) => continue,
-            }
-        } else {
-            page
         };
         return Some(Reattached {
             backend,
             label,
             page,
             restarted,
+            asked_ms,
         });
     }
     None
+}
+
+/// The first page after re-attaching, whether it came from a new process, and when the request
+/// for it went out. From a new process it is read from the start, by a second request.
+async fn read_reattached(
+    backend: &Backend,
+    args: &Value,
+    cursor: u64,
+    relabelled: bool,
+    known_pid: Option<u64>,
+) -> Result<(Value, bool, u64)> {
+    let asked_ms = now_ms();
+    let page = backend.logs(args.clone()).await?;
+    let restarted = relabelled || is_new_process(&page, cursor, known_pid);
+    if !restarted {
+        return Ok((page, false, asked_ms));
+    }
+    let mut from_start = args.clone();
+    from_start["since_seq"] = 0.into();
+    let asked_ms = now_ms();
+    let page = backend.logs(from_start).await?;
+    Ok((page, true, asked_ms))
 }
 
 /// The app is gone: show what it printed in its final moments, then how it exited, from its
@@ -952,6 +969,70 @@ mod tests {
         got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
         got.extend(texts(&read_followed(&path, &mut cursor).unwrap()));
         assert_eq!(got, ["line 3", "line 4"]);
+    }
+
+    /// A mock of `/api/tools/logs`: answers `pid` late, and records when each request arrived.
+    async fn slow_logs_backend(pid: u64) -> (Backend, std::sync::Arc<std::sync::Mutex<Vec<u64>>>) {
+        let arrived = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&arrived);
+        let app = axum::Router::new().route(
+            "/api/tools/logs",
+            axum::routing::post(move || {
+                let seen = std::sync::Arc::clone(&seen);
+                async move {
+                    seen.lock().unwrap().push(now_ms());
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    axum::Json(json!({"result": {"next_seq": 500, "sources": {"pid": pid}}}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = Backend {
+            http: reqwest::Client::new(),
+            base: format!("http://127.0.0.1:{port}"),
+            token: None,
+        };
+        (backend, arrived)
+    }
+
+    /// After a re-attach the "last answered" moment was taken once the response was in. A line
+    /// printed while the server was answering is in no page, and it then fell before that moment,
+    /// so the previous process's final moments left it out. As for an ordinary poll, the moment is
+    /// when the request went out.
+    #[tokio::test]
+    async fn the_moment_after_a_reattach_is_when_the_request_went_out() {
+        let args = json!({"action": "backend"});
+        let (backend, arrived) = slow_logs_backend(1).await;
+        let (_, restarted, asked_ms) = read_reattached(&backend, &args, 100, false, Some(1))
+            .await
+            .unwrap();
+        assert!(!restarted);
+        let read = arrived.lock().unwrap()[0];
+        assert!(
+            asked_ms <= read,
+            "stamped {}ms after the read",
+            asked_ms - read
+        );
+
+        // A new process: the page that counts is the second request's.
+        let (backend, arrived) = slow_logs_backend(2).await;
+        let (_, restarted, asked_ms) = read_reattached(&backend, &args, 100, false, Some(1))
+            .await
+            .unwrap();
+        assert!(restarted);
+        let arrived = arrived.lock().unwrap().clone();
+        assert_eq!(arrived.len(), 2);
+        assert!(
+            asked_ms <= arrived[1],
+            "stamped {}ms after the read",
+            asked_ms - arrived[1]
+        );
+        assert!(
+            asked_ms >= arrived[0],
+            "before the first request even arrived"
+        );
     }
 
     /// A capture that was empty when the follower attached is the ordinary start of a run.
