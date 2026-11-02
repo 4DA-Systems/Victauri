@@ -573,7 +573,7 @@ Navigation and history operations.
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `go_to` | `url` | Navigate to a URL (http/https only) |
-| `go_back` | — | Go back in history |
+| `go_back` | — | Go back in history. On a page that stopped answering (a page without the bridge, or one stuck in a loop) it navigates natively to the last URL inside the app, reports `recovered` only once the page answers there, and errors if it does not. WebView2 and WebKitGTK get off a page spinning in a loop: on Linux by ending the one web process that spun at full CPU throughout, which takes about 15 s. On macOS the navigation waits for the script to end |
 | `get_history` | — | Get navigation history log |
 | `set_dialog_response` | `dialog_type`, `dialog_action`, `text` | Auto-respond to future `alert`/`confirm`/`prompt` dialogs (`accept` / `dismiss`) |
 | `get_dialog_log` | — | Get dialog log (alerts, confirms, prompts) |
@@ -767,9 +767,18 @@ page-scoped (cleared on reload).
 {"action": "matches"}
 ```
 
-> **Scope:** fetch supports all behaviors; XHR supports `block`/`delay`
-> (`fulfill` is fetch-only). Top-level navigation, sub-resources (img/css), and
-> WebSocket frames are not intercepted.
+> **Scope:** fetch and XHR support all behaviors: a fulfilled XHR never reaches
+> the network, and reports the rule's status, headers and body through its
+> `responseType`, with its usual events. Top-level navigation, sub-resources
+> (img/css), and WebSocket frames are not intercepted.
+>
+> **A regex that can hang the page is refused at `add`.** JavaScript has no regex
+> timeout, and a rule's regex runs on the page's main thread against every request
+> URL. A repeated group that can match the same text in more than one way is
+> refused: `(a+)+`, `(a*)*`, `(a|aa)+`, `(.*)*`, `(\d+)*`. `^/api/(users|items)/\d+$`,
+> `.*\.png$` and `(/\w+)+` are fine. This is a check on nesting, not a proof: slow
+> patterns with no repeated group (`.*.*.*.*x`) still get through, and a few harmless
+> ones are refused (`(ab|ac)+`, whose branches start alike).
 >
 > **Rules on Tauri IPC change what the app's real `invoke` gets.** On the fetch
 > transport (`http://ipc.localhost/<cmd>` on Windows — `https://ipc.localhost/<cmd>` with `useHttpsScheme` — `ipc://localhost/<cmd>` on

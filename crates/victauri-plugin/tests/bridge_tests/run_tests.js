@@ -22,6 +22,7 @@ const { JSDOM } = require("jsdom");
 const { fireAnEvent } = require("jsdom/lib/jsdom/living/helpers/events.js");
 const { implForWrapper } = require("jsdom/lib/jsdom/living/generated/utils.js");
 const MouseEventIface = require("jsdom/lib/jsdom/living/generated/MouseEvent.js");
+const EventIface = require("jsdom/lib/jsdom/living/generated/Event.js");
 const { fireAPageTransitionEvent } = require("jsdom/lib/jsdom/living/helpers/page-transition-event.js");
 
 const testDefPath = process.argv[2];
@@ -328,6 +329,11 @@ async function run() {
       });
     };
 
+    // Dispatch a TRUSTED bubbling event, as the browser does for an animation event.
+    window.__vtestTrustedEvent = function (el, type) {
+      fireAnEvent(type, implForWrapper(el), EventIface, { bubbles: true });
+    };
+
     // Dispatch a TRUSTED pagehide / pageshow on the window, as the browser does on a real
     // unload or back/forward-cache restore (page script can only dispatch untrusted ones).
     window.__vtestTrustedPageTransition = function (type, persisted) {
@@ -340,6 +346,7 @@ async function run() {
       window.Request = Request;
       window.Response = Response;
       window.Headers = Headers;
+      window.TextEncoder = TextEncoder;
     }
 
     // Optional script run BEFORE the bridge — as Tauri's own init scripts (core.js,

@@ -630,7 +630,7 @@ impl RouteMatchType {
 pub enum RouteBehavior {
     /// Abort the request (the app sees a network failure).
     Block,
-    /// Return a synthetic mock response (fetch only; XHR falls back to delay).
+    /// Return a synthetic mock response (fetch and XHR).
     Fulfill,
     /// Let the request proceed, but after `delay_ms` (latency injection).
     Delay,

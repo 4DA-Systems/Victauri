@@ -914,14 +914,6 @@ fn route_rules_are_agent_only_and_validated() {
              var t0 = Date.now(); try { await fetch(big); } catch (e) {} T(Date.now() - t0 < 500, 'regex ran');",
         ),
         (
-            "xhr_fulfill_is_tagged_not_applied",
-            "<div></div>",
-            "var r = AGENT.addRoute({pattern:'/never', action:'fulfill', body:'{}'}); T(r.xhr_note, J(r)); \
-             var x = new XMLHttpRequest(); x.open('GET', 'http://127.0.0.1:9/never'); x.send(); x.abort(); \
-             var e = B.getNetworkLog().filter(function(n){return n.method === 'GET'})[0]; T(e.fulfill_not_applied === true, J(e)); \
-             var m = B.getRouteMatches(); T(m[0].applied === false, J(m));",
-        ),
-        (
             "xhr_delay_abort_cancels",
             "<div></div>",
             "AGENT.addRoute({pattern:'/slow', action:'delay', delay_ms: 80}); \
@@ -1129,201 +1121,206 @@ fn trusted_probe_matches_the_actionability_rules() {
 
 // ── 0.10.3 review round ──────────────────────────────────────────────────────
 
-/// What an element does not paint itself (a stroke-only circle, a `<g>` with an empty centre, a
-/// wrapped inline link with its centre in a line gap) is hit-tested as its ancestor. That is no
-/// cover unless it was clipped away. Everything else hit as its ancestor IS covered: a button in a
-/// closed accordion, under its parent's `::after` or behind its parent reported actionable, and a
-/// click then "worked" on something no user could reach.
+/// Whether a click reaches an element is the browser's answer at a real point of it, not a guess
+/// from boxes: `elementFromPoint` already honours clipping, `clip-path`, `::after` and z-order. jsdom
+/// has no layout, so each case states what the browser would answer per point. The shapes are real:
+/// SVG geometry API, line boxes, `elementsFromPoint`. Real engines: `examples/gauntlet-app`.
 #[test]
-fn an_ancestor_hit_is_cover_except_for_what_paints_off_centre() {
-    const RECTS: &str = r"
+fn the_browser_decides_which_point_of_an_element_a_click_reaches() {
+    const HELP: &str = r"
         function box(el, x, y, w, h) { el.getBoundingClientRect = function() {
-            return { left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, x: x, y: y }; };
-            Object.defineProperty(el, 'clientWidth', { value: w, configurable: true }); Object.defineProperty(el, 'clientHeight', { value: h, configurable: true }); }
+            return { left: x, top: y, right: x + w, bottom: y + h, width: w, height: h, x: x, y: y }; }; }
+        function lines(el, list) { el.getClientRects = function() { return list.map(function(l) {
+            return { left: l[0], top: l[1], right: l[0] + l[2], bottom: l[1] + l[3], width: l[2], height: l[3] }; }); }; }
+        // A circle of radius 40 around (100, 100) in its own coordinates, placed by a real CTM shape.
+        function ring(el, dx, dy) {
+            box(el, 60 + dx, 60 + dy, 80, 80);
+            el.getTotalLength = function() { return 2 * Math.PI * 40; };
+            el.getPointAtLength = function(s) { var t = s / 40; return { x: 100 + 40 * Math.cos(t), y: 100 + 40 * Math.sin(t) }; };
+            el.getScreenCTM = function() { return { a: 1, b: 0, c: 0, d: 1, e: dx, f: dy }; };
+        }
+        function onRing(x, y, dx, dy) { return Math.abs(Math.hypot(x - 100 - dx, y - 100 - dy) - 40) < 1; }
     ";
-    const LINES: &str = r"$('#l').getClientRects = function() { return [
-        { left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16 },
-        { left: 0, top: 24, right: 30, bottom: 40, width: 30, height: 16 }]; };";
-    let inside = format!(
-        r"{RECTS}
-        box($('#a'), 0, 0, 200, 200); box($('#s'), 50, 50, 20, 20);
-        var n = 0; $('#s').addEventListener('click', function() {{ n++; }});
-        document.elementFromPoint = function() {{ return $('#a'); }};
-        var r = await B.click(refOf('#s'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    let stroke_only = format!(
+        r"{HELP} var s = $('#s'); ring(s, 20, 10);
+        var n = 0; s.addEventListener('click', function() {{ n++; }});
+        document.elementFromPoint = function(x, y) {{ return onRing(x, y, 20, 10) ? s : $('#a'); }};
+        var r = await B.click(refOf('#s'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);
+        var p = B.hitPoint(s, true); T(onRing(p.x, p.y, 20, 10), 'the point is not on the stroke: ' + J(p));"
     );
-    let outside = format!(
-        r"{RECTS}
-        box($('#a'), 0, 0, 200, 200); box($('#b'), 400, 400, 20, 20);
-        var n = 0; $('#b').onclick = function() {{ n++; }};
+    let stroke_clipped_away = format!(
+        r"{HELP} var s = $('#s'); ring(s, 0, 0);
+        var n = 0; s.addEventListener('click', function() {{ n++; }});
         document.elementFromPoint = function() {{ return $('#a'); }};
-        var r = await B.click(refOf('#b'), 150);
-        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);"
+        var r = await B.click(refOf('#s'), 150);
+        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);
+        T(B.hitPoint(s, true).error, 'no point');"
     );
-    let wrapped = format!(
-        r"{RECTS}
-        box($('#l'), 0, 0, 100, 40);
-        $('#l').getClientRects = function() {{ return [{{ left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16 }},
-            {{ left: 0, top: 24, right: 30, bottom: 40, width: 30, height: 16 }}]; }};
-        var n = 0; $('#l').addEventListener('click', function(e) {{ e.preventDefault(); n++; }});
-        document.elementFromPoint = function(x) {{ return x === 90 ? $('#l') : $('#o'); }};
-        var r = await B.click(refOf('#l'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    let every_line_box = format!(
+        r"{HELP} var l = $('#l'); box(l, 0, 0, 100, 60);
+        lines(l, [[80, 0, 20, 16], [0, 22, 100, 16], [0, 44, 30, 16]]);
+        var n = 0; l.addEventListener('click', function(e) {{ e.preventDefault(); n++; }});
+        document.elementFromPoint = function(x, y) {{ return (x === 15 && y === 52) ? l : $('#p'); }};
+        var r = await B.click(refOf('#l'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);
+        var p = B.hitPoint(l, true); T(p.x === 15 && p.y === 52, J(p));"
+    );
+    let wrapped_over_a_neighbour = format!(
+        r"{HELP} var l = $('#l'); box(l, 0, 0, 100, 40);
+        lines(l, [[80, 0, 20, 16], [0, 24, 30, 16]]);
+        document.elementFromPoint = function(x) {{ return x === 90 ? l : $('#o'); }};
+        var r = await B.click(refOf('#l'), 150); T(r.ok, J(r));"
     );
     let wrapped_covered = format!(
-        r"{RECTS}
-        box($('#l'), 0, 0, 100, 40);
-        $('#l').getClientRects = function() {{ return [{{ left: 80, top: 0, right: 100, bottom: 16, width: 20, height: 16 }},
-            {{ left: 0, top: 24, right: 30, bottom: 40, width: 30, height: 16 }}]; }};
+        r"{HELP} var l = $('#l'); box(l, 0, 0, 100, 40);
+        lines(l, [[80, 0, 20, 16], [0, 24, 30, 16]]);
         document.elementFromPoint = function() {{ return $('#o'); }};
-        var r = await B.click(refOf('#l'), 150); T(r.ok === false, J(r));"
+        var r = await B.click(refOf('#l'), 150);
+        T(r.ok === false && r.error.indexOf('covered by span#o') !== -1, J(r));"
     );
-    // A button inside the box of the ancestor that is hit: the box says nothing about cover.
-    let plain_under_ancestor = format!(
-        r"{RECTS}
-        box($('#a'), 0, 0, 200, 200); box($('#b'), 50, 50, 20, 20);
+    let hole_at_the_centre = format!(
+        r"{HELP} var b = $('#b'); box(b, 0, 0, 80, 80);
+        var n = 0; b.onclick = function() {{ n++; }};
+        document.elementFromPoint = function(x, y) {{ return (x > 30 && x < 50 && y > 30 && y < 50) ? $('#a') : b; }};
+        var r = await B.click(refOf('#b'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);
+        var p = B.hitPoint(b, true); T(p.x === 8 && p.y === 8, 'the first grid point: ' + J(p));"
+    );
+    let clipped_to_a_corner = format!(
+        r"{HELP} var b = $('#b'); box(b, 0, 0, 100, 40);
+        var n = 0; b.onclick = function() {{ n++; }};
+        document.elementFromPoint = function(x) {{ return x < 40 ? b : $('#a'); }};
+        var r = await B.click(refOf('#b'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    );
+    let under_the_parents_after = format!(
+        r"{HELP} box($('#b'), 50, 50, 20, 20);
         var n = 0; $('#b').onclick = function() {{ n++; }};
         document.elementFromPoint = function() {{ return $('#a'); }};
+        document.elementsFromPoint = function() {{ return [$('#a'), $('#b')]; }};
         var r = await B.click(refOf('#b'), 150);
         T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);"
     );
-    let svg_in_closed_box = format!(
-        r"{RECTS}
-        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 0); box($('#s'), 50, 50, 20, 20);
-        var n = 0; $('#s').addEventListener('click', function() {{ n++; }});
-        document.elementFromPoint = function() {{ return $('#a'); }};
-        var r = await B.click(refOf('#s'), 150);
-        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r)); T(n === 0);"
+    let sibling_at_the_centre = format!(
+        r"{HELP} var b = $('#b'); box(b, 0, 0, 100, 40);
+        var n = 0; b.onclick = function() {{ n++; }};
+        document.elementFromPoint = function(x, y) {{ return (x === 50 && y === 20) ? $('#o') : b; }};
+        var r = await B.click(refOf('#b'), 150);
+        T(r.ok === false && r.error.indexOf('covered by span#o') !== -1, J(r)); T(n === 0);"
     );
-    // Clipping on the other axis only leaves the element in place.
-    let svg_in_one_axis_clip = format!(
-        r"{RECTS}
-        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 80); box($('#s'), 50, 50, 20, 20);
-        var n = 0; $('#s').addEventListener('click', function() {{ n++; }});
-        document.elementFromPoint = function() {{ return $('#a'); }};
-        var r = await B.click(refOf('#s'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    let sibling_at_an_svg_centre = format!(
+        r"{HELP} var s = $('#s'); ring(s, 0, 0);
+        document.elementFromPoint = function(x, y) {{ return onRing(x, y, 0, 0) ? s : $('#d'); }};
+        var r = await B.click(refOf('#s'), 150); T(r.ok, 'a dot inside a ring: ' + J(r));"
     );
-    let wrapped_gap_hits_ancestor = format!(
-        r"{RECTS} {LINES}
-        box($('#p'), 0, 0, 100, 40); box($('#l'), 0, 0, 100, 40);
-        var n = 0; $('#l').addEventListener('click', function(e) {{ e.preventDefault(); n++; }});
-        document.elementFromPoint = function() {{ return $('#p'); }};
-        var r = await B.click(refOf('#l'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    let off_screen_points_do_not_count = format!(
+        r"{HELP} var b = $('#b'); box(b, -500, 10, 100, 40);
+        var asked = 0; document.elementFromPoint = function(x, y) {{ if (x < 0) {{ asked++; return b; }} return $('#a'); }};
+        var r = await B.click(refOf('#b'), 150); T(r.ok === false, J(r));"
     );
-    let wrapped_in_closed_box = format!(
-        r"{RECTS} {LINES}
-        box($('#o'), 0, 0, 100, 100); box($('#p'), 0, 0, 100, 0); box($('#l'), 0, 0, 100, 40);
-        document.elementFromPoint = function() {{ return $('#o'); }};
-        var r = await B.click(refOf('#l'), 150);
-        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
-    );
-    // The deepest text match inside a control whose `::after` covers it.
     let content_of_a_control = format!(
-        r"{RECTS}
-        box($('#b'), 0, 0, 200, 40); box($('#s'), 50, 10, 40, 20);
+        r"{HELP} box($('#b'), 0, 0, 200, 40); box($('#s'), 50, 10, 40, 20);
         var n = 0; $('#b').onclick = function() {{ n++; }};
         document.elementFromPoint = function() {{ return $('#b'); }};
+        document.elementsFromPoint = function() {{ return [$('#b'), $('#s'), document.body]; }};
         var r = await B.click(refOf('#s'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
     );
-    let content_of_a_closed_control = format!(
-        r"{RECTS}
-        box($('#b'), 0, 0, 200, 0); box($('#s'), 50, 10, 40, 20);
+    let content_clipped_below_a_control = format!(
+        r"{HELP} box($('#b'), 0, 0, 200, 40); box($('#s'), 50, 10, 40, 20);
         document.elementFromPoint = function() {{ return $('#b'); }};
+        document.elementsFromPoint = function() {{ return [$('#b'), document.body]; }};
         var r = await B.click(refOf('#s'), 150);
         T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
     );
-    // A border is not room: only the padding box shows anything.
-    let svg_in_a_bordered_closed_box = format!(
-        r"{RECTS}
-        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 2); box($('#s'), 50, 50, 20, 20);
-        Object.defineProperty($('#c'), 'clientHeight', {{ value: 0 }});
+    let content_under_a_plain_ancestor = format!(
+        r"{HELP} box($('#a'), 0, 0, 200, 40); box($('#b'), 50, 10, 40, 20);
         document.elementFromPoint = function() {{ return $('#a'); }};
-        var r = await B.click(refOf('#s'), 150);
-        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
+        document.elementsFromPoint = function() {{ return [$('#a'), $('#b')]; }};
+        var r = await B.click(refOf('#b'), 150); T(r.ok === false, 'a div is not a control: ' + J(r));"
     );
-    let svg_under_a_clip = format!(
-        r"{RECTS}
-        box($('#a'), 0, 0, 200, 200); box($('#c'), 0, 0, 200, 200); box($('#s'), 50, 50, 20, 20);
-        document.elementFromPoint = function() {{ return $('#a'); }};
-        var r = await B.click(refOf('#s'), 150);
-        T(r.ok === false && r.error.indexOf('covered') !== -1, J(r));"
+    let a_real_click_does_not_land_on_content_below_a_control = format!(
+        r"{HELP} box($('#b'), 0, 0, 200, 40); box($('#s'), 50, 10, 40, 20);
+        document.elementFromPoint = function() {{ return $('#b'); }};
+        document.elementsFromPoint = function() {{ return [$('#b'), $('#s')]; }};
+        T(B.hitPoint($('#s'), true).error, 'strict: the OS click lands on the button');
+        T(!B.hitPoint($('#s'), false).error, 'not strict: its content');"
     );
-    // Partly visible: the visible part is what a user clicks.
-    let partly_clipped_button = format!(
-        r"{RECTS}
-        box($('#c'), 0, 0, 40, 40); box($('#b'), 0, 0, 100, 40);
-        var n = 0; $('#b').onclick = function() {{ n++; }};
-        document.elementFromPoint = function(x) {{ return x < 40 ? $('#b') : $('#c'); }};
-        var r = await B.click(refOf('#b'), 150); T(r.ok, J(r)); T(n === 1, 'n=' + n);"
+    let empty_link_around_a_float = format!(
+        r"{HELP} var a = $('#e'), c = $('#c'); box(a, 10, 10, 0, 0); box(c, 300, 10, 40, 40);
+        document.elementFromPoint = function(x, y) {{ return (x === 320 && y === 30) ? c : $('#w'); }};
+        var r = await B.click(refOf('#e'), 150); T(r.ok, J(r));
+        var p = B.hitPoint(a, true); T(p.x === 320 && p.y === 30, J(p));"
     );
+    let empty_link_with_nothing = format!(
+        r"{HELP} var a = $('#e'); box(a, 10, 10, 0, 0); box($('#c'), 0, 0, 0, 0);
+        var r = await B.click(refOf('#e'), 100);
+        T(r.ok === false && r.error.indexOf('zero size') !== -1, J(r));"
+    );
+    let group_with_an_empty_centre = format!(
+        r"{HELP} var g = $('#g'), c = $('#r2'); box(g, 0, 0, 100, 100); box($('#r1'), 0, 0, 2, 2); box(c, 90, 90, 10, 10);
+        document.elementFromPoint = function(x, y) {{ return (x === 95 && y === 95) ? c : $('#a'); }};
+        var r = await B.click(refOf('#g'), 150); T(r.ok, J(r));"
+    );
+    let ring_html = "<div id=a><svg width=9 height=9><circle id=s r=4></circle></svg></div>";
+    let lines_html = "<p id=p><a id=l href='#x'>wrapped</a><span id=o>other</span></p>";
+    let button_html = "<div id=a><button id=b>x</button><span id=o>o</span></div>";
+    let control_html = "<button id=b><span id=s>Save</span></button>";
+    let empty_html = "<div id=w><a id=e href='#x'><img id=c alt=c></a></div>";
     check(&[
+        ("stroke_only_svg_uses_its_stroke", ring_html, &stroke_only),
+        ("stroke_clipped_away", ring_html, &stroke_clipped_away),
+        ("every_line_box_is_tried", lines_html, &every_line_box),
         (
-            "content_of_a_control_hit_as_the_control",
-            "<button id=b><span id=s>Save</span></button>",
-            &content_of_a_control,
+            "wrapped_inline_over_a_neighbour",
+            lines_html,
+            &wrapped_over_a_neighbour,
+        ),
+        ("wrapped_inline_covered", lines_html, &wrapped_covered),
+        ("hole_at_the_centre", button_html, &hole_at_the_centre),
+        ("clipped_to_a_corner", button_html, &clipped_to_a_corner),
+        (
+            "under_the_parents_after",
+            button_html,
+            &under_the_parents_after,
+        ),
+        ("sibling_at_the_centre", button_html, &sibling_at_the_centre),
+        (
+            "sibling_at_an_svg_centre",
+            "<div id=a><svg width=9 height=9><circle id=s r=4></circle><circle id=d r=1></circle></svg></div>",
+            &sibling_at_an_svg_centre,
         ),
         (
-            "content_of_a_control_in_a_closed_box",
-            "<button id=b style='overflow-y:hidden'><span id=s>Save</span></button>",
-            &content_of_a_closed_control,
+            "off_screen_points_do_not_count",
+            button_html,
+            &off_screen_points_do_not_count,
+        ),
+        ("content_of_a_control", control_html, &content_of_a_control),
+        (
+            "content_clipped_below_a_control",
+            control_html,
+            &content_clipped_below_a_control,
         ),
         (
-            "svg_in_a_bordered_closed_box",
-            "<div id=a><div id=c style='overflow-y:hidden'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
-            &svg_in_a_bordered_closed_box,
+            "content_under_a_plain_ancestor",
+            button_html,
+            &content_under_a_plain_ancestor,
         ),
         (
-            "svg_under_a_clip_path",
-            "<div id=a><div id=c style='clip-path:inset(50%)'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
-            &svg_under_a_clip,
+            "an_os_click_needs_the_element_itself",
+            control_html,
+            &a_real_click_does_not_land_on_content_below_a_control,
         ),
         (
-            "partly_clipped_button",
-            "<div id=c style='overflow-x:clip'><button id=b>x</button></div>",
-            &partly_clipped_button,
+            "empty_link_around_a_float",
+            empty_html,
+            &empty_link_around_a_float,
         ),
         (
-            "plain_button_under_its_ancestor",
-            "<div id=a><button id=b>x</button></div>",
-            &plain_under_ancestor,
+            "empty_link_with_nothing",
+            empty_html,
+            &empty_link_with_nothing,
         ),
         (
-            "svg_in_a_closed_box",
-            "<div id=a><div id=c style='overflow-x:hidden;overflow-y:hidden'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
-            &svg_in_closed_box,
-        ),
-        (
-            "svg_clipped_on_one_axis_only",
-            "<div id=a><div id=c style='overflow-y:hidden'><svg width=9 height=9><circle id=s r=4></circle></svg></div></div>",
-            &svg_in_one_axis_clip,
-        ),
-        (
-            "wrapped_inline_with_its_centre_in_a_line_gap",
-            "<p id=p><a id=l href='#x'>wrapped</a></p>",
-            &wrapped_gap_hits_ancestor,
-        ),
-        (
-            "wrapped_inline_in_a_closed_box",
-            "<div id=o><p id=p style='overflow-x:hidden;overflow-y:hidden'><a id=l href='#x'>wrapped</a></p></div>",
-            &wrapped_in_closed_box,
-        ),
-        (
-            "stroke_only_svg",
-            "<div id=a><svg width=9 height=9><circle id=s r=4></circle></svg></div>",
-            &inside,
-        ),
-        (
-            "outside_the_box",
-            "<div id=a><button id=b>x</button></div>",
-            &outside,
-        ),
-        (
-            "wrapped_inline_probes_its_first_line",
-            "<p><a id=l href='#x'>wrapped</a><span id=o>other</span></p>",
-            &wrapped,
-        ),
-        (
-            "wrapped_inline_really_covered",
-            "<p><a id=l href='#x'>wrapped</a><span id=o>other</span></p>",
-            &wrapped_covered,
+            "group_with_an_empty_centre",
+            "<div id=a><svg width=9 height=9><g id=g><rect id=r1 width=1 height=1></rect><rect id=r2 width=1 height=1></rect></g></svg></div>",
+            &group_with_an_empty_centre,
         ),
     ]);
 }
