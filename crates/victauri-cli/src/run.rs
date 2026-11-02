@@ -127,9 +127,7 @@ pub fn dead_launcher(path: &Path) -> Option<u32> {
         return None;
     }
     let (pid, _) = capture_group(path.file_name()?.to_str()?)?;
-    victauri_test::process::liveness(pid)
-        .is_dead()
-        .then_some(pid)
+    victauri_test::process::is_gone(pid).then_some(pid)
 }
 
 /// Delete old captures of apps that are gone: those past [`CAPTURE_MAX_AGE`], then all but the
@@ -491,6 +489,19 @@ fn on_stop_signal(
 #[cfg(unix)]
 struct DeathWatch(std::process::Child);
 
+/// See [`DeathWatch`]. `$1` is the child, `$2` how long it gets after SIGTERM.
+#[cfg(unix)]
+const DEATH_WATCH_SCRIPT: &str = "trap '' INT HUP TERM\n\
+     read -r disarmed\n\
+     [ -n \"$disarmed\" ] && exit 0\n\
+     kill -s TERM \"$1\" 2>/dev/null || exit 0\n\
+     i=0\n\
+     while [ \"$i\" -lt \"$2\" ] && kill -0 \"$1\" 2>/dev/null; do\n\
+     sleep 1\n\
+     i=$((i + 1))\n\
+     done\n\
+     kill -0 \"$1\" 2>/dev/null && kill -s KILL \"$1\"\n";
+
 #[cfg(unix)]
 impl DeathWatch {
     /// `None` when no shell can be started: the app still runs, unguarded as it always was.
@@ -498,16 +509,7 @@ impl DeathWatch {
         Command::new("sh")
             .args([
                 "-c",
-                "trap '' INT HUP TERM\n\
-                 read -r disarmed\n\
-                 [ -n \"$disarmed\" ] && exit 0\n\
-                 kill -s TERM \"$1\" 2>/dev/null || exit 0\n\
-                 i=0\n\
-                 while [ \"$i\" -lt \"$2\" ] && kill -0 \"$1\" 2>/dev/null; do\n\
-                 sleep 1\n\
-                 i=$((i + 1))\n\
-                 done\n\
-                 kill -s KILL \"$1\" 2>/dev/null\n",
+                DEATH_WATCH_SCRIPT,
                 "victauri-run-watch",
                 &child_pid.to_string(),
                 &STOP_KILL_AFTER.as_secs().to_string(),
@@ -940,6 +942,48 @@ mod tests {
             Some(Some(std::process::id().to_string().into()))
         );
         assert_eq!(told(false), Some(None), "removed from what it inherits");
+    }
+
+    /// The helper's last word goes to a child still there: after the wait it may have exited, and
+    /// its pid may be another process's by now.
+    #[cfg(unix)]
+    #[test]
+    fn the_helper_sends_no_kill_to_a_child_that_already_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kill.log");
+        // `kill` as the helper's shell sees it: SIGTERM lands, and then the child is gone.
+        let script = format!(
+            "kill() {{ echo \"$*\" >> '{}'; [ \"$1\" != -0 ]; }}\n{DEATH_WATCH_SCRIPT}",
+            log.display()
+        );
+        let status = Command::new("sh")
+            .args(["-c", &script, "victauri-run-watch", "4242", "10"])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        let _ = status;
+        let log = std::fs::read_to_string(&log).unwrap();
+        assert!(log.contains("-s TERM 4242"), "{log}");
+        assert!(!log.contains("-s KILL"), "{log}");
+    }
+
+    /// `victauri logs --stdout --follow` waits on this: a killed launcher its parent has not reaped
+    /// is gone too, and `kill -0` said alive, so the follow never ended.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_launcher_is_a_dead_one() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let own = capture_dir()
+            .unwrap()
+            .join(format!("{pid}-{}.jsonl", now_ms()));
+        std::fs::write(&own, "").unwrap();
+        let found = dead_launcher(&own);
+        let _ = std::fs::remove_file(&own);
+        child.wait().unwrap();
+        assert_eq!(found, Some(pid));
     }
 
     /// A pid that is certainly gone: a reaped child's, its handle still held by no one.

@@ -1076,12 +1076,16 @@ fn a_dead_process_is_seen_as_dead() {
         .spawn()
         .unwrap();
     assert!(!process_is_dead(child.id()));
+    assert!(!process_is_dead_by_shell(child.id()));
     child.kill().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(process_is_dead(child.id()), "unreaped");
+    assert!(process_is_dead_by_shell(child.id()), "unreaped, by ps");
     child.wait().unwrap();
     assert!(process_is_dead(child.id()), "reaped");
+    assert!(process_is_dead_by_shell(child.id()), "reaped, by kill");
     assert!(!process_is_dead(std::process::id()));
+    assert!(!process_is_dead_by_shell(std::process::id()));
 }
 
 /// A bare offset cannot see a rotation whose new file has a record boundary exactly there: the

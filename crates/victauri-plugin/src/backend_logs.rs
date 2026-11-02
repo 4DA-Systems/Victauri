@@ -1968,20 +1968,28 @@ pub fn process_is_dead(pid: u32) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // The shell builtin, as `victauri run` signals: `kill` is not a binary everywhere.
-        std::process::Command::new("sh")
-            .args(["-c", "kill -0 \"$1\"", "victauri-plugin", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| !status.success())
+        process_is_dead_by_shell(pid)
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
         false
     }
+}
+
+/// [`process_is_dead`] where there is no `/proc`. The shell builtin, as `victauri run` signals:
+/// `kill` is not a binary everywhere. A zombie is gone too, and `kill -0` cannot tell, but `ps` can.
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn process_is_dead_by_shell(pid: u32) -> bool {
+    const IS_RUNNING: &str = "kill -0 \"$1\" 2>/dev/null || exit 1\n\
+                              case \"$(ps -o stat= -p \"$1\" 2>/dev/null)\" in Z*) exit 1 ;; esac\n";
+    std::process::Command::new("sh")
+        .args(["-c", IS_RUNNING, "victauri-plugin", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| !status.success())
 }
 
 /// Bits of a [`ConsoleRead`] cursor holding the byte offset: 8 GiB, and a capture rotates at 64 MiB.
