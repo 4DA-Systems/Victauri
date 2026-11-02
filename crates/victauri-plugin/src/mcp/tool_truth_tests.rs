@@ -251,7 +251,7 @@ impl WebviewBridge for AppBridge {
     fn app_entry_url(&self) -> Option<String> {
         Some("http://tauri.localhost/".to_string())
     }
-    fn web_process_cpu(&self) -> Vec<(u32, u64)> {
+    fn web_main_thread_cpu(&self) -> Vec<(u32, u64)> {
         let reading = self.cpu_readings.fetch_add(1, Ordering::SeqCst) as u64;
         self.web_processes
             .lock()
@@ -576,6 +576,7 @@ async fn go_back_ends_the_one_web_process_spinning_flat_out() {
     let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
     assert_eq!(out["recovered"], true, "{out}");
     assert_eq!(*bridge.ended.lock().unwrap(), vec![22]);
+    assert_eq!(out["ended_web_process"], 22, "{out}");
     let calls = bridge.native_calls();
     let after_the_detour: Vec<&str> = calls
         .iter()
@@ -647,6 +648,26 @@ async fn a_web_process_is_ended_only_while_the_other_windows_answer() {
     }
 }
 
+/// `go_to` says the same of what it ended, and neither reports a process it left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn go_to_says_which_web_process_it_ended() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    *bridge.web_processes.lock().unwrap() = vec![(22, 100_000)];
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    let target = json!({"action": "go_to", "url": "http://tauri.localhost/index.html"});
+    let out = ok_json(&call(&h, "navigate", target.clone()).await);
+    assert!(out.get("ended_web_process").is_none(), "{out}");
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.stays_dead.store(true, Ordering::SeqCst);
+    let out = ok_json(&call(&h, "navigate", target).await);
+    assert_eq!(out["ended_web_process"], 22, "{out}");
+}
+
 /// A page that answers is never helped along: no process is ended, whatever the CPU says.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_page_that_comes_back_keeps_its_process() {
@@ -662,6 +683,7 @@ async fn a_page_that_comes_back_keeps_its_process() {
     let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
     assert_eq!(out["recovered"], true, "{out}");
     assert!(bridge.ended.lock().unwrap().is_empty());
+    assert!(out.get("ended_web_process").is_none(), "{out}");
 }
 
 /// What the "bridge not responding" error tells an agent to do must not claim success either.
@@ -685,6 +707,38 @@ async fn go_to_does_not_claim_success_on_a_page_that_does_not_answer() {
         .await,
     );
     assert!(msg.contains("still does not answer"), "{msg}");
+}
+
+/// `WebKit` queues a navigation behind a stopped page's script, and the window reads the new URL
+/// meanwhile: `ok` to an outside URL must say that it may not have left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn go_to_outside_from_a_stopped_page_says_it_may_not_land() {
+    for page_stopped in [true, false] {
+        let st = state();
+        let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+        let h = handler(&st, &bridge);
+        assert_ne!(
+            call(&h, "get_diagnostics", json!({})).await.is_error,
+            Some(true)
+        );
+        bridge.dead.store(page_stopped, Ordering::SeqCst);
+        bridge.stays_dead.store(page_stopped, Ordering::SeqCst);
+        let out = ok_json(
+            &call(
+                &h,
+                "navigate",
+                json!({"action": "go_to", "url": "https://elsewhere.example/"}),
+            )
+            .await,
+        );
+        let warning = out["warning"].as_str().unwrap();
+        assert!(warning.contains("outside the app"), "{warning}");
+        assert_eq!(
+            warning.contains("was not answering"),
+            page_stopped,
+            "{warning}"
+        );
+    }
 }
 
 /// An app whose window starts on a custom `WebviewUrl::External` is neither its dev server nor

@@ -404,6 +404,51 @@ fn stopped_page_message(target: &str) -> String {
     )
 }
 
+/// How a native navigation went.
+struct NativeNavigation {
+    /// False: the page it left had stopped, and the app's page it was sent to does not answer.
+    answers: bool,
+    /// The page it left had stopped answering, so the navigation may wait behind its script.
+    left_stopped_page: bool,
+    /// The web process ended to get off that page. It may have held other pages too, so the agent
+    /// is told which.
+    ended_web_process: Option<u32>,
+}
+
+impl Default for NativeNavigation {
+    fn default() -> Self {
+        Self {
+            answers: true,
+            left_stopped_page: false,
+            ended_web_process: None,
+        }
+    }
+}
+
+impl NativeNavigation {
+    fn recovered(ended_web_process: Option<u32>) -> Self {
+        Self {
+            answers: true,
+            left_stopped_page: true,
+            ended_web_process,
+        }
+    }
+
+    fn note_ended_process(&self, result: &mut serde_json::Value) {
+        if let Some(pid) = self.ended_web_process {
+            result["ended_web_process"] = pid.into();
+        }
+    }
+
+    fn not_answering_message(&self, target: &str) -> String {
+        let message = stopped_page_message(target);
+        match self.ended_web_process {
+            Some(pid) => format!("{message} Web process {pid} was ended trying."),
+            None => message,
+        }
+    }
+}
+
 /// How long a page that stopped answering gets to answer after a navigation, before anything more
 /// is tried; and in all (see `recover_stopped_page`).
 const STOPPED_PAGE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
@@ -5345,9 +5390,12 @@ impl VictauriMcpHandler {
     }
 
     /// Navigate natively, remembering the page being left if it is inside the app, so `go_back`
-    /// can return from a page with no bridge. False: the page it left had stopped, and the app's
-    /// page it was sent to does not answer.
-    async fn navigate_natively(&self, url: &str, label: Option<&str>) -> Result<bool, String> {
+    /// can return from a page with no bridge.
+    async fn navigate_natively(
+        &self,
+        url: &str,
+        label: Option<&str>,
+    ) -> Result<NativeNavigation, String> {
         if let Some(current) = self.read_back_window(label)
             && self.is_app_url(&current.url)
         {
@@ -5358,40 +5406,46 @@ impl VictauriMcpHandler {
         }
         if self.probe_bridge(label, None, None).await.is_ok() {
             self.bridge.navigate_webview(label, url)?;
-            return Ok(true);
+            return Ok(NativeNavigation::default());
         }
-        let window = self.read_back_window(label).map(|s| s.label);
-        if self.is_app_url(url) && window.is_some_and(|w| self.bridge_has_answered(&w)) {
+        let window = self.read_back_window(label);
+        let page_stopped =
+            window.is_some_and(|w| self.bridge_has_answered(&w.label) && self.is_app_url(&w.url));
+        if self.is_app_url(url) && page_stopped {
             return self.recover_stopped_page(label, url).await;
         }
         let detour = self.detour_through_health(label).await?;
         self.navigate_from(detour, label, url).await?;
-        Ok(true)
+        Ok(NativeNavigation {
+            left_stopped_page: page_stopped,
+            ..NativeNavigation::default()
+        })
     }
 
     /// Takes a window off a page that stopped answering, to a `target` inside the app, and says
-    /// whether the page answers there: the window's URL proves nothing, it reads the new one before
+    /// how it went: the window's URL proves nothing, it reads the new one before
     /// the page has left. On `WebView2` the detour does it. `WebKit` queues every navigation behind
     /// the stopped page's script (measured on `WebKitGTK` 2.52: the detour never commits, and the page
     /// answers only when its loop ends), and its way out is to end the web process. Where that
-    /// process is the app's child (Linux) and the page has spun flat out all along, it is ended;
-    /// the new navigation then starts a new one, and other windows are not touched.
+    /// process is the app's child (Linux) and its main thread, where a page runs, has spun flat out
+    /// all along, it is ended; the new navigation then starts a new one, and other windows are not
+    /// touched. Workers do not count: a page they keep busy still answers.
     async fn recover_stopped_page(
         &self,
         label: Option<&str>,
         target: &str,
-    ) -> Result<bool, String> {
+    ) -> Result<NativeNavigation, String> {
         let started = std::time::Instant::now();
-        let before = self.bridge.web_process_cpu();
+        let before = self.bridge.web_main_thread_cpu();
         let detour = self.detour_through_health(label).await?;
         self.navigate_from(detour, label, target).await?;
         if self
             .page_answers_within(label, STOPPED_PAGE_ANSWER_WAIT)
             .await
         {
-            return Ok(true);
+            return Ok(NativeNavigation::recovered(None));
         }
-        let after = self.bridge.web_process_cpu();
+        let after = self.bridge.web_main_thread_cpu();
         if let Some(pid) =
             crate::introspection::spinning_web_process(&before, &after, started.elapsed())
             && self.other_windows_answer(label).await
@@ -5401,11 +5455,20 @@ impl VictauriMcpHandler {
                 pid,
                 "ended the web process of a page spinning in a loop, to navigate away from it"
             );
-            return self.navigate_new_web_process(label, target).await;
+            let answers = self.navigate_new_web_process(label, target).await?;
+            return Ok(NativeNavigation {
+                answers,
+                ended_web_process: Some(pid),
+                left_stopped_page: true,
+            });
         }
-        Ok(self
+        let answers = self
             .page_answers_within(label, STOPPED_PAGE_LOAD_WAIT)
-            .await)
+            .await;
+        Ok(NativeNavigation {
+            answers,
+            ..NativeNavigation::recovered(None)
+        })
     }
 
     /// Nothing maps a web process to its window, so the one that spun could be another window's.
@@ -5543,12 +5606,13 @@ impl VictauriMcpHandler {
         if !in_app && let Err(e) = validate_url(url, self.state.allow_file_navigation) {
             return tool_error(e);
         }
-        match self.navigate_natively(url, label).await {
-            Ok(true) => {}
-            Ok(false) => return tool_error(stopped_page_message(url)),
+        let navigation = match self.navigate_natively(url, label).await {
+            Ok(navigation) if navigation.answers => navigation,
+            Ok(navigation) => return tool_error(navigation.not_answering_message(url)),
             Err(e) => return tool_error(e),
-        }
+        };
         let mut result = serde_json::json!({"ok": true, "url": url});
+        navigation.note_ended_process(&mut result);
         if !in_app {
             let app = self
                 .bridge
@@ -5559,7 +5623,13 @@ impl VictauriMcpHandler {
             result["warning"] = serde_json::json!(format!(
                 "{target} is outside the app ({app}): tools that read the page will report that \
                  the bridge is not responding until it is back. Return with navigate go_back, or \
-                 go_to {app}."
+                 go_to {app}.{}",
+                if navigation.left_stopped_page {
+                    " The page was not answering, so this navigation may not land until its \
+                     script ends."
+                } else {
+                    ""
+                }
             ));
         }
         json_result(&result)
@@ -5613,20 +5683,22 @@ impl VictauriMcpHandler {
             return tool_error(error);
         };
         // The probe behind `error` already said the page is not answering.
-        match self.recover_stopped_page(label, &target).await {
-            Ok(true) => {}
-            Ok(false) => return tool_error(stopped_page_message(&target)),
+        let navigation = match self.recover_stopped_page(label, &target).await {
+            Ok(navigation) if navigation.answers => navigation,
+            Ok(navigation) => return tool_error(navigation.not_answering_message(&target)),
             Err(e) => {
                 return tool_error(format!("{error}; navigating to {target} also failed: {e}"));
             }
-        }
-        json_result(&serde_json::json!({
+        };
+        let mut result = serde_json::json!({
             "ok": true,
             "recovered": true,
             "url": target,
             "note": "the page could not run history.back(), because it was not answering or has \
                      no bridge; navigated natively to the last known URL inside the app",
-        }))
+        });
+        navigation.note_ended_process(&mut result);
+        json_result(&result)
     }
 
     /// Whether this window's bridge has ever answered: proof it has the capability (which is

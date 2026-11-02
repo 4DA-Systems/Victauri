@@ -1127,11 +1127,12 @@ pub fn enumerate_child_processes() -> Vec<ChildProcessInfo> {
     }
 }
 
-/// The one page process that used the CPU flat out between two [`web_process_cpu`] readings: a
-/// page spinning in a loop. Ticks are `USER_HZ`, 100 per second on every Linux ABI. `None` when no
-/// process did, or several did: nothing says which window's page each one renders.
+/// The one page process whose main thread used the CPU flat out between two
+/// [`web_main_thread_cpu`] readings: a page spinning in a loop. Ticks are `USER_HZ`, 100 per second
+/// on every Linux ABI. `None` when no process did, or several did: nothing says which window's page
+/// each one renders.
 ///
-/// [`web_process_cpu`]: crate::bridge::WebviewBridge::web_process_cpu
+/// [`web_main_thread_cpu`]: crate::bridge::WebviewBridge::web_main_thread_cpu
 #[must_use]
 pub(crate) fn spinning_web_process(
     before: &[(u32, u64)],
@@ -1161,6 +1162,19 @@ fn cpu_ticks_from_stat(stat: &str) -> Option<u64> {
     Some(utime + stime)
 }
 
+/// Clock ticks a thread wanted the CPU, from the contents of `/proc/<pid>/task/<tid>/schedstat`:
+/// nanoseconds on it, then nanoseconds waiting for it. A loop wants it all the time, however few it
+/// gets: on 2 CPUs with 4 Workers elsewhere a stuck page's main thread measured 41 ticks/s on the CPU
+/// and 105 wanted, and a healthy one 0. `None` when the kernel keeps no such figures (all zero).
+#[cfg(any(target_os = "linux", test))]
+fn runnable_ticks_from_schedstat(schedstat: &str) -> Option<u64> {
+    let mut fields = schedstat.split_ascii_whitespace();
+    let on_cpu: u64 = fields.next()?.parse().ok()?;
+    let waiting: u64 = fields.next()?.parse().ok()?;
+    let ticks = (on_cpu + waiting) / 10_000_000;
+    (ticks > 0).then_some(ticks)
+}
+
 /// The kernel's process name is cut to 15 characters.
 #[cfg(target_os = "linux")]
 fn web_processes_linux() -> impl Iterator<Item = u32> {
@@ -1171,10 +1185,18 @@ fn web_processes_linux() -> impl Iterator<Item = u32> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn web_process_cpu_linux() -> Vec<(u32, u64)> {
+pub(crate) fn web_main_thread_cpu_linux() -> Vec<(u32, u64)> {
     web_processes_linux()
         .filter_map(|pid| {
-            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            // `/proc/<pid>/stat` sums every thread: a healthy page's Workers would read as flat out.
+            let thread = format!("/proc/{pid}/task/{pid}");
+            let wanted = std::fs::read_to_string(format!("{thread}/schedstat"))
+                .ok()
+                .and_then(|schedstat| runnable_ticks_from_schedstat(&schedstat));
+            if wanted.is_some() {
+                return Some((pid, wanted?));
+            }
+            let stat = std::fs::read_to_string(format!("{thread}/stat")).ok()?;
             Some((pid, cpu_ticks_from_stat(&stat)?))
         })
         .collect()
@@ -2160,7 +2182,18 @@ mod tests {
     }
 
     #[test]
-    fn only_a_single_process_at_full_speed_counts_as_spinning() {
+    fn what_a_thread_wanted_of_the_cpu_is_read_in_ticks() {
+        assert_eq!(
+            runnable_ticks_from_schedstat("1500000000 3500000000 42\n"),
+            Some(500)
+        );
+        assert_eq!(runnable_ticks_from_schedstat("0 0 0\n"), None);
+        assert_eq!(runnable_ticks_from_schedstat("garbage"), None);
+        assert_eq!(runnable_ticks_from_schedstat(""), None);
+    }
+
+    #[test]
+    fn only_a_single_main_thread_at_full_speed_counts_as_spinning() {
         let five_s = std::time::Duration::from_secs(5);
         let before = [(1, 100), (2, 100), (3, 100)];
         // 5 s at 100 ticks/s for one, a busy page's 60% for another.
