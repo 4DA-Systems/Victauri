@@ -1135,7 +1135,8 @@ pub fn enumerate_child_processes() -> Vec<ChildProcessInfo> {
 /// never sleeps, however little CPU it gets (0 in 5 s). A loop that allocates does, waiting for the
 /// collector's helpers (1,300/s), and it gets the CPU (over 90 ticks/s on a free core): under load
 /// that one may not qualify, and the call then reports that the page does not answer. `None` when no
-/// process qualified, or several did: nothing says which window's page each one renders.
+/// process qualified, or several did: nothing says which window's page each one renders. This says
+/// a process spun, not whose page it renders: see `recover_stopped_page`.
 ///
 /// [`web_main_thread_cpu`]: crate::bridge::WebviewBridge::web_main_thread_cpu
 #[must_use]
@@ -1228,12 +1229,12 @@ pub(crate) fn web_main_thread_cpu_linux() -> Vec<(u32, u64, u64, u64)> {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn end_web_process_linux(pid: u32) -> Result<(), String> {
+pub(crate) fn signal_web_process_linux(pid: u32, signal: &str) -> Result<(), String> {
     if !web_processes_linux().any(|child| child == pid) {
         return Err(format!("{pid} is not one of this app's web processes"));
     }
     let status = std::process::Command::new("kill")
-        .args(["-KILL", &pid.to_string()])
+        .args([signal, &pid.to_string()])
         .status()
         .map_err(|e| format!("could not run kill: {e}"))?;
     if status.success() {

@@ -96,6 +96,21 @@ pub trait WebviewBridge: Send + Sync {
         let url = serde_json::to_string(url).map_err(|e| e.to_string())?;
         self.eval_webview(label, &format!("window.location.href = {url}"))
     }
+    /// Stops a process listed by [`web_main_thread_cpu`](Self::web_main_thread_cpu) without ending
+    /// it: what goes silent then shows whose pages it renders. Undone by
+    /// [`resume_web_process`](Self::resume_web_process).
+    ///
+    /// # Errors
+    /// Returns an error where this is not available, or the process could not be stopped.
+    #[doc(hidden)]
+    fn pause_web_process(&self, pid: u32) -> Result<(), String> {
+        Err(format!(
+            "pausing web process {pid} is not available on this platform"
+        ))
+    }
+    /// Undoes [`pause_web_process`](Self::pause_web_process).
+    #[doc(hidden)]
+    fn resume_web_process(&self, _pid: u32) {}
     /// The URL the app itself is served from (its dev server, or Tauri's custom protocol), if
     /// known: what `navigate` treats as "inside the app".
     fn app_entry_url(&self) -> Option<String> {
@@ -106,6 +121,7 @@ pub trait WebviewBridge: Send + Sync {
     /// the app's pages, as `(pid, wanted, on_cpu, sleeps)`: where a page's script runs, and a
     /// Worker's does not. Empty where page processes are not the app's children (macOS, Windows):
     /// see [`end_web_process`](Self::end_web_process).
+    #[doc(hidden)]
     fn web_main_thread_cpu(&self) -> Vec<(u32, u64, u64, u64)> {
         Vec::new()
     }
@@ -116,6 +132,7 @@ pub trait WebviewBridge: Send + Sync {
     /// # Errors
     ///
     /// Returns an error string if the process is not such a child, or could not be ended.
+    #[doc(hidden)]
     fn end_web_process(&self, pid: u32) -> Result<(), String> {
         Err(format!(
             "ending web process {pid} is not available on this platform"
@@ -1019,7 +1036,19 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
 
     #[cfg(target_os = "linux")]
     fn end_web_process(&self, pid: u32) -> Result<(), String> {
-        crate::introspection::end_web_process_linux(pid)
+        crate::introspection::signal_web_process_linux(pid, "-KILL")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pause_web_process(&self, pid: u32) -> Result<(), String> {
+        crate::introspection::signal_web_process_linux(pid, "-STOP")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn resume_web_process(&self, pid: u32) {
+        if let Err(error) = crate::introspection::signal_web_process_linux(pid, "-CONT") {
+            tracing::warn!(pid, error, "could not resume a paused web process");
+        }
     }
 
     fn app_entry_url(&self) -> Option<String> {

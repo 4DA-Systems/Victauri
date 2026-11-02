@@ -659,6 +659,7 @@ fn settle_port_claims(servers: Vec<DiscoveredServer>) -> Vec<DiscoveredServer> {
 ///
 /// The tokens go to the port their own entries name, as any connection would send them. A process
 /// on that port that lies gets what lying on `/info` always got.
+#[doc(hidden)]
 #[must_use]
 pub fn real_port_claims(port: u16, claims: &[(u32, Option<String>)]) -> Vec<u32> {
     real_port_claims_until(port, claims, std::time::Instant::now() + PORT_CLAIMS_BUDGET)

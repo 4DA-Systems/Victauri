@@ -32,6 +32,14 @@ struct AppBridge {
     drop_navigation: Arc<AtomicBool>,
     /// The other window's page, apart from `dead`: `Some(answers)`.
     sibling_answers: Arc<StdMutex<Option<bool>>>,
+    /// The process that renders the other window's page: pausing it silences that window.
+    sibling_process: Arc<StdMutex<Option<u32>>>,
+    paused: Arc<StdMutex<Vec<u32>>>,
+    resumed: Arc<StdMutex<Vec<u32>>>,
+    /// Which page answers: a navigation that lands starts another.
+    page: Arc<AtomicUsize>,
+    /// A navigation never lands: the page it should have left is the one that answers.
+    navigation_never_lands: Arc<AtomicBool>,
     /// The window never had a bridge that could call back (no `victauri:default`).
     states: Arc<StdMutex<Vec<WindowState>>>,
     /// The size the OS really gives a resized window (`None`: what was asked for).
@@ -57,6 +65,11 @@ impl AppBridge {
             ended: Arc::default(),
             drop_navigation: Arc::default(),
             sibling_answers: Arc::default(),
+            sibling_process: Arc::default(),
+            paused: Arc::default(),
+            resumed: Arc::default(),
+            page: Arc::default(),
+            navigation_never_lands: Arc::default(),
             states: Arc::new(StdMutex::new(vec![
                 window_state("main", "http://tauri.localhost/index.html"),
                 window_state("notifications", "http://tauri.localhost/notifications.html"),
@@ -118,6 +131,14 @@ impl AppBridge {
         }
     }
 
+    /// A navigation lands: the page answers, and it is another page.
+    fn land(&self) {
+        self.dead.store(false, Ordering::SeqCst);
+        if !self.navigation_never_lands.load(Ordering::SeqCst) {
+            self.page.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
     fn set_window_url(&self, label: &str, url: &str) {
         for state in self.states.lock().unwrap().iter_mut() {
             if state.label == label {
@@ -156,14 +177,15 @@ impl WebviewBridge for AppBridge {
             return Ok(());
         }
         if script.contains("location.replace(") && !self.stays_dead.load(Ordering::SeqCst) {
-            self.dead.store(false, Ordering::SeqCst);
+            self.land();
         }
         if self.dead.load(Ordering::SeqCst) {
             return Ok(());
         }
         if script.contains("probe_ok") {
             if let Some(id) = quoted_id_after(script, "id:\"") {
-                self.answer(id, "\"probe_ok:page-1\"".to_string());
+                let page = self.page.load(Ordering::SeqCst);
+                self.answer(id, format!("\"probe_ok:page-{page}\""));
             }
         } else if let Some(id) = quoted_id_after(script, "__vic = { id: \"")
             && let Some(body) = (self.respond)(script)
@@ -244,7 +266,7 @@ impl WebviewBridge for AppBridge {
             return Ok(());
         }
         if !url.ends_with("/health") && !self.stays_dead.load(Ordering::SeqCst) {
-            self.dead.store(false, Ordering::SeqCst);
+            self.land();
         }
         Ok(())
     }
@@ -259,6 +281,19 @@ impl WebviewBridge for AppBridge {
             .iter()
             .map(|(pid, ticks)| (*pid, reading * ticks, reading * ticks, 0))
             .collect()
+    }
+    fn pause_web_process(&self, pid: u32) -> Result<(), String> {
+        self.paused.lock().unwrap().push(pid);
+        if *self.sibling_process.lock().unwrap() == Some(pid) {
+            *self.sibling_answers.lock().unwrap() = Some(false);
+        }
+        Ok(())
+    }
+    fn resume_web_process(&self, pid: u32) {
+        self.resumed.lock().unwrap().push(pid);
+        if *self.sibling_process.lock().unwrap() == Some(pid) {
+            *self.sibling_answers.lock().unwrap() = Some(true);
+        }
     }
     /// A new process serves the next navigation, which the page answers.
     fn end_web_process(&self, pid: u32) -> Result<(), String> {
@@ -646,6 +681,80 @@ async fn a_web_process_is_ended_only_while_the_other_windows_answer() {
             assert!(bridge.ended.lock().unwrap().is_empty());
         }
     }
+}
+
+/// A busy page in another window answers and reads as flat out, while the page asked about is stuck
+/// in a loop that does not use the CPU. Paused, that window goes silent: the process is its own, so
+/// it is resumed and kept, and the call says the page did not answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_process_of_a_window_that_answers_is_not_ended() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    *bridge.web_processes.lock().unwrap() = vec![(22, 100_000)];
+    *bridge.sibling_answers.lock().unwrap() = Some(true);
+    *bridge.sibling_process.lock().unwrap() = Some(22);
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    h.answered_windows
+        .lock()
+        .unwrap()
+        .insert("notifications".to_string(), None);
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.stays_dead.store(true, Ordering::SeqCst);
+    let msg = err_text(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert!(msg.contains("still does not answer"), "{msg}");
+    assert!(bridge.ended.lock().unwrap().is_empty());
+    assert_eq!(*bridge.paused.lock().unwrap(), vec![22]);
+    assert_eq!(*bridge.resumed.lock().unwrap(), vec![22]);
+    assert_eq!(*bridge.sibling_answers.lock().unwrap(), Some(true));
+}
+
+/// A process ended is not resumed: it is gone, and its pid may not be its own for long.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_process_that_was_ended_is_not_resumed() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    *bridge.web_processes.lock().unwrap() = vec![(22, 100_000)];
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.stays_dead.store(true, Ordering::SeqCst);
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert_eq!(out["ended_web_process"], 22, "{out}");
+    assert!(out["ended_web_process_note"].is_string(), "{out}");
+    assert_eq!(*bridge.ended.lock().unwrap(), vec![22]);
+    assert!(bridge.resumed.lock().unwrap().is_empty());
+}
+
+/// The page that stopped comes back but the navigation never lands: the window's URL reads the new
+/// address and a page answers, and it is still the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_page_that_stopped_answering_again_is_not_success() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    bridge.navigation_never_lands.store(true, Ordering::SeqCst);
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    let result = call(
+        &h,
+        "navigate",
+        json!({"action": "go_to", "url": "http://tauri.localhost/x.html"}),
+    )
+    .await;
+    assert!(
+        err_text(&result).contains("still does not answer"),
+        "{result:?}"
+    );
 }
 
 /// `go_to` says the same of what it ended, and neither reports a process it left alone.

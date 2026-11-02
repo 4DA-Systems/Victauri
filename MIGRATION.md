@@ -105,11 +105,13 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   the change to land and add `settled:false` if it never does.
 - **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
   `/health` first and replaces that history entry, and `go_back` returns `{ok, recovered, url, note}`.
-  Going to a page inside the app, both now report success only once the page answers there, and are
-  errors otherwise, which can take about 20 s. On Linux, if the main thread of one web process spun
-  throughout and every other window that has answered still answers, that process is
-  ended to get off the page (about 15 s, with a logged warning), and the result says `ended_web_process:
-  <pid>`. A loop that allocates sleeps through its collector, and qualifies only with most of a core to
+  Going to a page inside the app, both now report success only once a new page answers there, and are
+  errors otherwise, which can take about 30 s. `go_to` from a page that answers still reports `ok` once the
+  navigation is sent. On Linux, if the main thread of one web process spun
+  throughout and every other window that has answered still answers with that process paused, that process
+  is ended to get off the page (about 15 s, with a logged warning), and the result says `ended_web_process:
+  <pid>` with a note. A page that was only slow looks the same, so its work is lost. Profiles that may not
+  `go_to` never end a process, and the `navigate` tool's `destructive` hint is now true. A loop that allocates sleeps through its collector, and qualifies only with most of a core to
   itself: on a loaded machine the call may error instead. On
   macOS the navigation lands when the script ends. `go_to` outside the app from a stopped page says in
   its `warning` that it may not land until the script ends. An origin a
@@ -133,7 +135,7 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   hang the page: a repeated group that can match the same text in more than one way, such as `(a+)+`,
   also when the ambiguity sits in a subgroup. It errs towards refusing: a counted group counts as
   unbounded and `\b` as always passing, so `(a+){2}` and `(\w+\b)+` are refused, as are `(a|)+` and a
-  pattern too large to analyse. `([?&][^=&]+=[^&]*)*$` is ambiguous on `?`: use `glob` or `substring`, or
+  pattern too large to analyse. Polynomial patterns are not refused: `.*.*.*.*x`, `(a)*(a)*(a)*(a)*y`. `([?&][^=&]+=[^&]*)*$` is ambiguous on `?`: use `glob` or `substring`, or
   make each repetition match one way. **XHR `fulfill` now works**, so a
   matching XHR that used to reach the network gets the mock, and `xhr_note` and `fulfill_not_applied` are
   gone. **`window.__VICTAURI__.addRoute`** is gone from the page-visible API.
@@ -151,6 +153,12 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   answered `-32601`. **`/info`** adds `pid`.
 - **`animation scrub`** keeps its seeks' animation and transition events from the page, and only those.
   A scrub replaced without a restore gives its target back as it was.
+- **`eval_js`:** code starting with `{` that yields `undefined` adds a second `note:` block over MCP, and
+  `{result, note}` over REST. **`animation`** gains `disarm`.
+- **Legacy `disabled_tools`:** `get_storage`, `get_cookies`, `get_window_state` and `list_windows` now take
+  effect. **Refused requests:** log lines are rate-limited and no longer include the Host or Origin value.
+- **Startup banner:** the debug-build notice also goes straight to stderr.
+- **`WebviewBridge`:** new methods all have defaults, so existing mocks compile.
 - **Discovery:** when a server accepts none of the tokens claiming its port, every entry stays, so the result
   is "several apps", not "no app".
 - **Smoke:** the default DOM complete budget is 20 s in `SmokeConfig`, `victauri test` and the GitHub Action
@@ -170,7 +178,7 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
 - `log_layer()` no longer lowers the global max level: apps with an unfiltered layer see TRACE again.
 - Event-bus payloads are cut at 64 KiB with a marker, 16 MiB in all, and keep their emitted key order.
 - Trusted clicks use the page's `devicePixelRatio`, so zoom counts. A page reporting a false ratio moves
-  the click, still clamped to the client area.
+  the click, and it is refused if it falls outside the client area.
 
 ### CLI and watchdog
 
