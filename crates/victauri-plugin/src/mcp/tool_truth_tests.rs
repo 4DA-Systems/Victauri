@@ -28,6 +28,8 @@ struct AppBridge {
     web_processes: Arc<StdMutex<Vec<(u32, u64)>>>,
     cpu_readings: Arc<AtomicUsize>,
     ended: Arc<StdMutex<Vec<u32>>>,
+    /// WebKit has not noticed that the web process is gone: the next navigation is lost.
+    drop_navigation: Arc<AtomicBool>,
     /// The window never had a bridge that could call back (no `victauri:default`).
     states: Arc<StdMutex<Vec<WindowState>>>,
     /// The size the OS really gives a resized window (`None`: what was asked for).
@@ -51,6 +53,7 @@ impl AppBridge {
             web_processes: Arc::default(),
             cpu_readings: Arc::default(),
             ended: Arc::default(),
+            drop_navigation: Arc::default(),
             states: Arc::new(StdMutex::new(vec![
                 window_state("main", "http://tauri.localhost/index.html"),
                 window_state("notifications", "http://tauri.localhost/notifications.html"),
@@ -226,6 +229,9 @@ impl WebviewBridge for AppBridge {
             .lock()
             .unwrap()
             .push((label.map(str::to_string), format!("navigate {url}")));
+        if self.drop_navigation.swap(false, Ordering::SeqCst) {
+            return Ok(());
+        }
         if !url.ends_with("/health") && !self.stays_dead.load(Ordering::SeqCst) {
             self.dead.store(false, Ordering::SeqCst);
         }
@@ -247,6 +253,8 @@ impl WebviewBridge for AppBridge {
     fn end_web_process(&self, pid: u32) -> Result<(), String> {
         self.ended.lock().unwrap().push(pid);
         self.stays_dead.store(false, Ordering::SeqCst);
+        self.drop_navigation.store(true, Ordering::SeqCst);
+        self.set_window_url("main", "");
         Ok(())
     }
 }
@@ -557,10 +565,21 @@ async fn go_back_ends_the_one_web_process_spinning_flat_out() {
     let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
     assert_eq!(out["recovered"], true, "{out}");
     assert_eq!(*bridge.ended.lock().unwrap(), vec![22]);
+    let calls = bridge.native_calls();
+    let after_the_detour: Vec<&str> = calls
+        .iter()
+        .map(|(_, c)| c.as_str())
+        .skip_while(|c| !c.ends_with("/health"))
+        .skip(1)
+        .collect();
     assert_eq!(
-        bridge.native_calls().last().map(|(_, c)| c.as_str()),
-        Some("navigate http://tauri.localhost/index.html"),
-        "the navigation after ending it is what lands"
+        after_the_detour,
+        vec![
+            "navigate http://tauri.localhost/index.html",
+            "navigate http://tauri.localhost/index.html",
+            "navigate http://tauri.localhost/index.html",
+        ],
+        "sent before the process ended, then lost, then sent again: the last one lands"
     );
 }
 

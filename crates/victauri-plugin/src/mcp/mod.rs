@@ -5354,11 +5354,39 @@ impl VictauriMcpHandler {
                 pid,
                 "ended the web process of a page spinning in a loop, to navigate away from it"
             );
-            self.bridge.navigate_webview(label, target)?;
+            return self.navigate_new_web_process(label, target).await;
         }
         Ok(self
             .page_answers_within(label, STOPPED_PAGE_LOAD_WAIT)
             .await)
+    }
+
+    /// WebKit drops a navigation sent before it has noticed that the web process is gone (measured:
+    /// the window then stays on no URL at all), so it is sent again while the window has none.
+    async fn navigate_new_web_process(
+        &self,
+        label: Option<&str>,
+        target: &str,
+    ) -> Result<bool, String> {
+        let give_up = std::time::Instant::now() + STOPPED_PAGE_LOAD_WAIT;
+        self.bridge.navigate_webview(label, target)?;
+        loop {
+            if self
+                .page_answers_within(label, std::time::Duration::from_millis(500))
+                .await
+            {
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= give_up {
+                return Ok(false);
+            }
+            if self
+                .read_back_window(label)
+                .is_some_and(|window| window.url.is_empty())
+            {
+                self.bridge.navigate_webview(label, target)?;
+            }
+        }
     }
 
     async fn page_answers_within(&self, label: Option<&str>, wait: std::time::Duration) -> bool {
