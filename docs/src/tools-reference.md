@@ -470,7 +470,7 @@ may still settle) or `[hint: CHECK_INPUT]` (wrong target). The same applies to
 **Options:**
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `trusted` | boolean | no | `click`: deliver a real OS mouse click (`isTrusted: true`) at the element's centre. Refused if the point is outside the window's client area. Windows only; the app window must be in the foreground |
+| `trusted` | boolean | no | `click`: deliver a real OS mouse click (`isTrusted: true`) at a point of the element that a click reaches, usually its centre. Refused if the point is outside the window's client area or cannot be worked out (a scaled, rotated or zoomed frame, a pinch-zoomed page). Windows only; the app window must be in the foreground |
 | `x` | number | no | `scroll_into_view` without `ref_id`: horizontal scroll position in px |
 | `y` | number | no | `scroll_into_view` without `ref_id`: vertical scroll position in px |
 
@@ -578,7 +578,7 @@ Navigation and history operations.
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `go_to` | `url` | Navigate to a URL (http/https only) |
-| `go_back` | — | Go back in history. On a page that stopped answering (a page without the bridge, or one stuck in a loop) it navigates natively to the last URL inside the app, reports `recovered` only once the page answers there, and errors if it does not. WebView2 and WebKitGTK get off a page spinning in a loop: on Linux by ending the one web process that spun at full CPU throughout, which takes about 15 s. On macOS the navigation waits for the script to end |
+| `go_back` | — | Go back in history. On a page that stopped answering (a page without the bridge, or one stuck in a loop) it navigates natively to the last URL inside the app, reports `recovered` only once the page answers there, and errors if it does not. WebView2 and WebKitGTK get off a page spinning in a loop: on Linux by ending the one web process whose main thread spun throughout without sleeping, which takes about 15 s, and the result says `ended_web_process: <pid>`. On macOS the navigation waits for the script to end |
 | `get_history` | — | Get navigation history log |
 | `set_dialog_response` | `dialog_type`, `dialog_action`, `text` | Auto-respond to future `alert`/`confirm`/`prompt` dialogs (`accept` / `dismiss`) |
 | `get_dialog_log` | — | Get dialog log (alerts, confirms, prompts) |

@@ -217,10 +217,19 @@ suite hardcodes a bare `e0` ref, which the page tag broke in a patch release (no
 the current page), and a soak of 190,175 calls with 20 reloads hit a null `document.body`. 4DA's own test
 drift is on 4DA's side: four tests against removed UI, and one parsing `[e`.
 
+Two more review rounds on those fixes each found real bugs. First: a UTF-16 BLOB schema row was never
+charged and overflowed the host's stack (schema entries are now read as SQLite loads them, by `CAST`);
+recovery killed a healthy window's process when Workers kept it busy, then spared the stuck one under
+contention (main thread only, and time waiting for the CPU counts); a reader racing a rotation lost
+thousands of lines silently (one open for a file's tag and bytes); the regex check became an automaton
+check. Second: an exact count hid ambiguity from it (`(?:a{2}b|aab)+$` hung the page), and counting wait
+time made a healthy page on an overloaded core read as spinning (a thread that sleeps does not qualify).
+
 Known, not fixed: a polynomial route regex with no repeated group (`.*.*.*.*x`) can still stall the page;
-on macOS a page stuck in a loop cannot be left until its script ends (the call errors); a web process
-spinning in a window whose bridge never answered could be taken for the target's; `DeathWatch` signals
-only the direct child, so what `npm` started may stay.
+on macOS a page stuck in a loop cannot be left until its script ends (the call errors), and on Linux
+neither can one whose loop sleeps through its collector; a web process spinning in a window whose bridge
+never answered could be taken for the target's; `DeathWatch` signals only the direct child, so what `npm`
+started may stay.
 
 ## Current State (2026-10-31)
 

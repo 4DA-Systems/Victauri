@@ -72,7 +72,9 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   `{"__real":"Infinity"}`. Invalid UTF-8 is `{"__invalid_utf8":true,"text":â€¦,"base64":â€¦}`. SQL past
   256 parenthesis levels or 2,000 SELECTs is refused. A database is refused if one schema entry
   exceeds 1 MB, 256 levels or 2,000 SELECTs, if a chain of views runs past 2,000 levels, or if view
-  text totals over 16 MiB (`db_health` too). Unrelated views do not add up.
+  text totals over 16 MiB (`db_health` too). Unrelated views do not add up. Schema entries are read as
+  SQLite loads them, a BLOB too. A schema whose check takes over 3 s is refused as timed out, which a
+  large healthy schema on a saturated machine could hit.
 - **Database discovery:** auto-selection and the `app_info` listing skip files without a SQLite
   header, so a SQLCipher database is no longer auto-selected (an explicit `path` still works). `.db3`
   and any-case extensions are found. `history`, `cookies` and `favicons` are app candidates.
@@ -88,8 +90,11 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
   at real points: its centre, then its SVG outline, line boxes, a 5x5 grid and its descendants. So a
   control with a hole at its centre, a stroke-only circle and a link with no box of its own are
   clickable, and content clipped away inside a control is covered. A sibling at the centre of an
-  ordinary element is still cover. A trusted click takes the point found, must hit the element itself,
-  and refuses inside an `aria-disabled` ancestor.
+  ordinary element is still cover. A half off-screen element whose visible part is covered fails, where
+  it reported success. A clipped element is scrolled. A `pointer-events:none` child of a control clicks
+  through to that control. A trusted click takes the point found, moved to a whole device pixel, must hit
+  the element itself, and refuses inside an `aria-disabled` ancestor, inside a scaled, rotated or zoomed
+  frame, and on a pinch-zoomed page: use a synthetic click there.
   Keyboard events carry `code`, `keyCode` and `which`.
 - **Snapshots** list `opacity:0` elements (`[transparent]`) and visible children of `visibility:hidden`
   parents.
@@ -101,9 +106,12 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
 - **`navigate`:** `go_to` is native and returns `{ok, url, warning?}`. On a stopped page it visits
   `/health` first and replaces that history entry, and `go_back` returns `{ok, recovered, url, note}`.
   Going to a page inside the app, both now report success only once the page answers there, and are
-  errors otherwise, which can take about 20 s. On Linux, if one web process spun at full CPU throughout
-  and every other window that has answered still answers, that process is ended to get off the page
-  (about 15 s, with a logged warning). On macOS the navigation lands when the script ends. An origin a
+  errors otherwise, which can take about 20 s. On Linux, if the main thread of one web process spun
+  throughout without sleeping and every other window that has answered still answers, that process is
+  ended to get off the page (about 15 s, with a logged warning), and the result says `ended_web_process:
+  <pid>`. A page looping through a collector that sleeps may not qualify, and the call then errors. On
+  macOS the navigation lands when the script ends. `go_to` outside the app from a stopped page says in
+  its `warning` that it may not land until the script ends. An origin a
   bridge has answered on counts as inside the app, so `go_to` no longer warns about a custom
   `WebviewUrl::External` start page.
 - **`explain` and `introspect coverage`** on an unreadable page are tool errors, where they reported a
@@ -121,23 +129,29 @@ parses refs out of a snapshot by looking for `[e` must stop: read the first `[â€
 - **`logs ipc` and `logs network`** gain `bodies:false`. IPC entries carry `args_truncated:true` when
   `args` is not what was sent.
 - **`route add`** rejects invalid regex, non-object headers and unknown actions, and a regex that can
-  hang the page: a repeated group that can match the same text in more than one way, such as `(a+)+`.
-  A few harmless patterns are refused too (`(foo|fab)+`), and `([?&][^=&]+=[^&]*)*$` is ambiguous on `?`:
-  use `glob` or `substring`, or make each repetition match one way. **XHR `fulfill` now works**, so a
+  hang the page: a repeated group that can match the same text in more than one way, such as `(a+)+`,
+  also when the ambiguity sits in a subgroup. It errs towards refusing: a counted group counts as
+  unbounded and `\b` as always passing, so `(a+){2}` and `(\w+\b)+` are refused, as are `(a|)+` and a
+  pattern too large to analyse. `([?&][^=&]+=[^&]*)*$` is ambiguous on `?`: use `glob` or `substring`, or
+  make each repetition match one way. **XHR `fulfill` now works**, so a
   matching XHR that used to reach the network gets the mock, and `xhr_note` and `fulfill_not_applied` are
   gone. **`window.__VICTAURI__.addRoute`** is gone from the page-visible API.
 - **`logs stdout`:** treat `next_seq` as opaque and pass it back. It now holds the file's tag above the
   offset, so it is much larger than a byte offset; `lines[].offset` is still a byte offset, and a bare
   offset still works as before. `gap:true` says the capture rotated twice and lines are gone.
-  `launcher_gone` says `victauri run` was killed. A rotation drains the rotated file and reports
-  `truncated:true`.
+  `launcher_gone` says `victauri run` was killed: only when `victauri run` named the capture itself, so
+  not for a `--capture` file or an app started by an older CLI. A rotation drains the rotated file and
+  reports `truncated:true`.
 - **`victauri logs`** can end a capture with a synthetic EXIT line (`"unknown": true` in JSON) when the
   launcher was killed, and `--follow` stops there.
 - **`screenshot`** adds a text block after the image over MCP, `note: captured window "main"`, and a
   `note` beside the image over REST. `victauri call screenshot` prints it.
 - **`/mcp`** answers `-32602` for a `tools/call` whose `params` or `arguments` are not an object, where it
   answered `-32601`. **`/info`** adds `pid`.
-- **`animation scrub`** keeps its seeks' animation and transition events from the page.
+- **`animation scrub`** keeps its seeks' animation and transition events from the page, and only those.
+  A scrub replaced without a restore gives its target back as it was.
+- **Discovery:** when a server accepts none of the tokens claiming its port, every entry stays, so the result
+  is "several apps", not "no app".
 - **Smoke:** the default DOM complete budget is 20 s in `SmokeConfig`, `victauri test` and the GitHub Action
   (it was 10 s, which a first launch can miss). A budget you set is unchanged. `victauri run` on Unix keeps a
   small `sh` helper alive, so that killing the launcher stops the app.

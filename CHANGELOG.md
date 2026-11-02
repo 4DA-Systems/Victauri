@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.3] - 2026-11-01
+## [0.10.3] - 2026-11-02
 
 From a nine-lens adversarial audit. **Assertions that reported success without checking now tell the
 truth, so a green test suite can go red.** See MIGRATION.md for every behaviour change.
@@ -31,14 +31,16 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
 ### Fixed: crashes and hangs in the host app
 
 - Deeply nested SQL or a crafted database schema could overflow the stack and kill the app. Both now return
-  a clean error (64 MiB reserved stack, nesting and view-chain budgets, which read SQL the way SQLite tokenizes it).
+  a clean error (64 MiB reserved stack, nesting and view-chain budgets, which read SQL the way SQLite tokenizes it
+  and each schema entry the way SQLite loads it, so a UTF-16 BLOB counts). A check that runs out of time refuses.
 - Windows process-memory reads leaked a handle per call. The event bus could retain hundreds of MiB.
 - Logging: reading the log no longer stalls logging threads; a panic in a `Debug` impl, a value that logs
   while being recorded and two capture layers in one subscriber no longer panic or deadlock; symbolising a
   panic no longer blocks workers or another panic; `log_layer()` no longer lowers the global max level.
 - `navigate go_to` out of the app left a dead page with no way back; a page stopped by `while(true)` now
-  recovers through a detour on WebView2, and on Linux by ending the one web process spinning at full CPU, only
-  while every other window that has answered still answers. `recovered` and `ok` mean the page answers at the
+  recovers through a detour on WebView2, and on Linux by ending the one web process whose main thread spun without
+  once sleeping, only while every other window that has answered still answers; the result names it (`ended_web_process`).
+  `recovered` and `ok` mean the page answers at the
   new URL, where they used to mean a navigation was sent: WebKit's URL reads the new address while the old
   script still runs. The demo's sync window-building command deadlocked.
 - A route regex that can hang the page is refused at `add`, by what a repeated group can match. Polynomial
@@ -56,7 +58,8 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   contenteditable and same-origin iframes. Whether a click reaches an element is now the browser's answer at real
   points of it (centre, SVG outline, line boxes, a grid, descendants), not geometry: closed accordions, `.sr-only` and
   `::after` overlays are covered, and a control with a hole, a stroke-only circle and a link with no box of its own
-  are clickable. A trusted click uses the point found. Checked in real Edge (47 fixtures) and on WebKitGTK.
+  are clickable. A trusted click uses the point found, on a whole device pixel, and is refused where its point cannot
+  be worked out: inside a scaled, rotated or zoomed frame, or on a pinch-zoomed page. Checked in real Edge and on WebKitGTK.
 - `route` `fulfill` works on XMLHttpRequest, compared event for event with a real server in 21 scenarios. It used
   to send the request and say so.
 - `animation scrub` no longer fires the page's own animation and transition events for its seeks: a toast
@@ -80,9 +83,10 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   A launcher killed outright is now said, by `logs stdout` (`launcher_gone`) and `victauri logs`.
 - A stale discovery entry whose PID was reused, naming the current app's port, no longer makes `--app` refuse with
   "several apps": the server says which entry is real (`/info` now reports `pid`). In the CLI, bridge, test client
-  and VS Code extension.
+  and VS Code extension. A server refusing every token settles nothing, and asking is bounded to about 2 s a scan.
 - `logs stdout` cursors hold the file's tag, so a rotation landing on a record boundary is seen and two rotations
-  are reported as a gap.
+  are reported as a gap. A reader racing a rotation could lose thousands of lines silently (19,413 to 32,808 of
+  150,000 in a stress test): a file's tag and bytes now come from one open, here and in `victauri logs --follow`.
 - `victauri test` first-launch default is 20 s: a cold webview measured 12.5 s against the old 10 s budget.
 - Bridge: a `VICTAURI_PORT` pin that is down never reaches another app. Invalid UTF-8 no longer shuts it down.
 - `victauri logs --follow` loses nothing across rotation. `setup` no longer pins user-level configs to one project
