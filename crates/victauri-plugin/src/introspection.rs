@@ -1127,6 +1127,75 @@ pub fn enumerate_child_processes() -> Vec<ChildProcessInfo> {
     }
 }
 
+/// The one page process that used the CPU flat out between two [`web_process_cpu`] readings: a
+/// page spinning in a loop. Ticks are `USER_HZ`, 100 per second on every Linux ABI. `None` when no
+/// process did, or several did: nothing says which window's page each one renders.
+///
+/// [`web_process_cpu`]: crate::bridge::WebviewBridge::web_process_cpu
+#[must_use]
+pub(crate) fn spinning_web_process(
+    before: &[(u32, u64)],
+    after: &[(u32, u64)],
+    elapsed: std::time::Duration,
+) -> Option<u32> {
+    let flat_out = elapsed.as_secs_f64() * 100.0 * 0.9;
+    let mut spinning = after.iter().filter(|(pid, ticks)| {
+        before
+            .iter()
+            .find(|(earlier, _)| earlier == pid)
+            .is_some_and(|(_, was)| ticks.saturating_sub(*was) as f64 >= flat_out)
+    });
+    let (pid, _) = spinning.next()?;
+    spinning.next().is_none().then_some(*pid)
+}
+
+/// User + system clock ticks from the contents of `/proc/<pid>/stat`. The command name can hold
+/// spaces and parentheses, so the fields are counted from its last `)`: `utime` and `stime` are
+/// fields 14 and 15, the 12th and 13th after it.
+#[cfg(any(target_os = "linux", test))]
+fn cpu_ticks_from_stat(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_ascii_whitespace().skip(11);
+    let utime: u64 = fields.next()?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+/// The kernel's process name is cut to 15 characters.
+#[cfg(target_os = "linux")]
+fn web_processes_linux() -> impl Iterator<Item = u32> {
+    enumerate_child_processes()
+        .into_iter()
+        .filter(|child| child.name == "WebKitWebProces" || child.name == "WebKitWebProcess")
+        .map(|child| child.pid)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn web_process_cpu_linux() -> Vec<(u32, u64)> {
+    web_processes_linux()
+        .filter_map(|pid| {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+            Some((pid, cpu_ticks_from_stat(&stat)?))
+        })
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn end_web_process_linux(pid: u32) -> Result<(), String> {
+    if !web_processes_linux().any(|child| child == pid) {
+        return Err(format!("{pid} is not one of this app's web processes"));
+    }
+    let status = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .map_err(|e| format!("could not run kill: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("kill {pid} failed: {status}"))
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn enumerate_children_windows(parent_pid: u32) -> Vec<ChildProcessInfo> {
@@ -2078,6 +2147,43 @@ mod tests {
         assert_eq!(report[0].name, "phase_1");
         assert!(report[1].cumulative_ms >= report[0].cumulative_ms);
         assert!(timeline.total_ms() > 0.0);
+    }
+
+    #[test]
+    fn cpu_ticks_are_read_past_a_command_name_with_spaces_and_parentheses() {
+        // The shape of a real /proc/<pid>/stat: pid (comm) state ppid ... utime stime ...
+        let stat =
+            "2087 (Web (Kit) Pro) R 1976 1976 1976 0 -1 4194304 19 0 0 0 512 37 0 0 20 0 9 0 100\n";
+        assert_eq!(cpu_ticks_from_stat(stat), Some(549));
+        assert_eq!(cpu_ticks_from_stat("garbage"), None);
+        assert_eq!(cpu_ticks_from_stat("1 (x) R 1"), None);
+    }
+
+    #[test]
+    fn only_a_single_process_at_full_speed_counts_as_spinning() {
+        let five_s = std::time::Duration::from_secs(5);
+        let before = [(1, 100), (2, 100), (3, 100)];
+        // 5 s at 100 ticks/s for one, a busy page's 60% for another.
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 600), (2, 400), (3, 101)], five_s),
+            Some(1)
+        );
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 400), (2, 400), (3, 101)], five_s),
+            None,
+            "busy is not stopped"
+        );
+        assert_eq!(
+            spinning_web_process(&before, &[(1, 600), (2, 600), (3, 101)], five_s),
+            None,
+            "nothing says which window's page each one renders"
+        );
+        assert_eq!(
+            spinning_web_process(&before, &[(9, 9000)], five_s),
+            None,
+            "a process that started meanwhile has no earlier reading"
+        );
+        assert_eq!(spinning_web_process(&[], &[], five_s), None);
     }
 
     #[test]

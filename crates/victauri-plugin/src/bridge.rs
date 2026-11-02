@@ -101,6 +101,24 @@ pub trait WebviewBridge: Send + Sync {
     fn app_entry_url(&self) -> Option<String> {
         None
     }
+    /// CPU time so far, in clock ticks, of each child process that renders the app's pages, as
+    /// `(pid, ticks)`. Empty where page processes are not the app's children (macOS, Windows): see
+    /// [`end_web_process`](Self::end_web_process).
+    fn web_process_cpu(&self) -> Vec<(u32, u64)> {
+        Vec::new()
+    }
+    /// End a process listed by [`web_process_cpu`](Self::web_process_cpu), the only way out of a
+    /// page spinning in a loop on Linux: WebKit queues even a native navigation behind its script.
+    /// The next navigation starts a new process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the process is not such a child, or could not be ended.
+    fn end_web_process(&self, pid: u32) -> Result<(), String> {
+        Err(format!(
+            "ending web process {pid} is not available on this platform"
+        ))
+    }
 
     // ── Native (OS-level, trusted) input ───────────────────────────────────
     //
@@ -990,6 +1008,16 @@ impl<R: Runtime> WebviewBridge for tauri::AppHandle<R> {
             let mut window = find_window(&windows, label.as_deref())?.clone();
             window.navigate(url).map_err(|e| e.to_string())
         })?
+    }
+
+    #[cfg(target_os = "linux")]
+    fn web_process_cpu(&self) -> Vec<(u32, u64)> {
+        crate::introspection::web_process_cpu_linux()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn end_web_process(&self, pid: u32) -> Result<(), String> {
+        crate::introspection::end_web_process_linux(pid)
     }
 
     fn app_entry_url(&self) -> Option<String> {

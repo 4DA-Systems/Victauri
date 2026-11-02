@@ -3,7 +3,7 @@
 //! page's side of the protocol.
 
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
@@ -22,6 +22,12 @@ struct AppBridge {
     respond: Responder,
     /// The page stopped answering: a loop, a blocking command, or a navigation out of the app.
     dead: Arc<AtomicBool>,
+    /// A navigation does not revive a dead page: it waits behind the stopped script (WebKit).
+    stays_dead: Arc<AtomicBool>,
+    /// `(pid, ticks per CPU reading)` of the page processes that are the app's children (Linux).
+    web_processes: Arc<StdMutex<Vec<(u32, u64)>>>,
+    cpu_readings: Arc<AtomicUsize>,
+    ended: Arc<StdMutex<Vec<u32>>>,
     /// The window never had a bridge that could call back (no `victauri:default`).
     states: Arc<StdMutex<Vec<WindowState>>>,
     /// The size the OS really gives a resized window (`None`: what was asked for).
@@ -41,6 +47,10 @@ impl AppBridge {
             pending: state.pending_evals.clone(),
             respond,
             dead: Arc::default(),
+            stays_dead: Arc::default(),
+            web_processes: Arc::default(),
+            cpu_readings: Arc::default(),
+            ended: Arc::default(),
             states: Arc::new(StdMutex::new(vec![
                 window_state("main", "http://tauri.localhost/index.html"),
                 window_state("notifications", "http://tauri.localhost/notifications.html"),
@@ -131,6 +141,9 @@ impl WebviewBridge for AppBridge {
             .lock()
             .unwrap()
             .push((label.map(str::to_string), script.to_string()));
+        if script.contains("location.replace(") && !self.stays_dead.load(Ordering::SeqCst) {
+            self.dead.store(false, Ordering::SeqCst);
+        }
         if self.dead.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -213,10 +226,28 @@ impl WebviewBridge for AppBridge {
             .lock()
             .unwrap()
             .push((label.map(str::to_string), format!("navigate {url}")));
+        if !url.ends_with("/health") && !self.stays_dead.load(Ordering::SeqCst) {
+            self.dead.store(false, Ordering::SeqCst);
+        }
         Ok(())
     }
     fn app_entry_url(&self) -> Option<String> {
         Some("http://tauri.localhost/".to_string())
+    }
+    fn web_process_cpu(&self) -> Vec<(u32, u64)> {
+        let reading = self.cpu_readings.fetch_add(1, Ordering::SeqCst) as u64;
+        self.web_processes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(pid, ticks)| (*pid, reading * ticks))
+            .collect()
+    }
+    /// A new process serves the next navigation, which the page answers.
+    fn end_web_process(&self, pid: u32) -> Result<(), String> {
+        self.ended.lock().unwrap().push(pid);
+        self.stays_dead.store(false, Ordering::SeqCst);
+        Ok(())
     }
 }
 
@@ -487,6 +518,112 @@ async fn go_back_on_a_dead_page_returns_to_the_last_url_inside_the_app() {
         bridge.native_calls().last().map(|(_, c)| c.as_str()),
         Some("navigate http://tauri.localhost/index.html")
     );
+}
+
+/// On WebKit a navigation waits behind a stopped page's script, and the window's URL already reads
+/// the new one (measured on WebKitGTK 2.52: a "recovered" page stayed dead until its loop ended). So
+/// `recovered` is what the page does afterwards, not that a navigation was sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn go_back_does_not_claim_a_recovery_the_page_does_not_show() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.stays_dead.store(true, Ordering::SeqCst);
+    let msg = err_text(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert!(msg.contains("still does not answer"), "{msg}");
+    assert!(msg.contains("http://tauri.localhost/index.html"), "{msg}");
+}
+
+/// WebKitGTK: the only way off a page spinning in a loop is to end its web process, and the
+/// navigation after that lands. A page that does not use the CPU is not "spinning".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn go_back_ends_the_one_web_process_spinning_flat_out() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    // Between the two readings: 100 000 ticks is flat out however long recovery took.
+    *bridge.web_processes.lock().unwrap() = vec![(11, 1), (22, 100_000), (33, 1)];
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.stays_dead.store(true, Ordering::SeqCst);
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert_eq!(out["recovered"], true, "{out}");
+    assert_eq!(*bridge.ended.lock().unwrap(), vec![22]);
+    assert_eq!(
+        bridge.native_calls().last().map(|(_, c)| c.as_str()),
+        Some("navigate http://tauri.localhost/index.html"),
+        "the navigation after ending it is what lands"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_web_process_is_ended_unless_one_alone_spun() {
+    for processes in [
+        vec![(11, 1), (33, 1)],             // a blocked page: nothing spins
+        vec![(11, 100_000), (33, 100_000)], // which window is which?
+    ] {
+        let st = state();
+        let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+        *bridge.web_processes.lock().unwrap() = processes;
+        let h = handler(&st, &bridge);
+        assert_ne!(
+            call(&h, "get_diagnostics", json!({})).await.is_error,
+            Some(true)
+        );
+        bridge.dead.store(true, Ordering::SeqCst);
+        bridge.stays_dead.store(true, Ordering::SeqCst);
+        let msg = err_text(&call(&h, "navigate", json!({"action": "go_back"})).await);
+        assert!(msg.contains("still does not answer"), "{msg}");
+        assert!(bridge.ended.lock().unwrap().is_empty());
+    }
+}
+
+/// A page that answers is never helped along: no process is ended, whatever the CPU says.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_that_comes_back_keeps_its_process() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    *bridge.web_processes.lock().unwrap() = vec![(22, 100_000)];
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    let out = ok_json(&call(&h, "navigate", json!({"action": "go_back"})).await);
+    assert_eq!(out["recovered"], true, "{out}");
+    assert!(bridge.ended.lock().unwrap().is_empty());
+}
+
+/// What the "bridge not responding" error tells an agent to do must not claim success either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn go_to_does_not_claim_success_on_a_page_that_does_not_answer() {
+    let st = state();
+    let bridge = AppBridge::answering(&st, r#"{"ok":true}"#);
+    let h = handler(&st, &bridge);
+    assert_ne!(
+        call(&h, "get_diagnostics", json!({})).await.is_error,
+        Some(true)
+    );
+    bridge.dead.store(true, Ordering::SeqCst);
+    bridge.stays_dead.store(true, Ordering::SeqCst);
+    let msg = err_text(
+        &call(
+            &h,
+            "navigate",
+            json!({"action": "go_to", "url": "http://tauri.localhost/index.html"}),
+        )
+        .await,
+    );
+    assert!(msg.contains("still does not answer"), "{msg}");
 }
 
 /// A window that never answered has no bridge at all: `go_back` must not invent a navigation.

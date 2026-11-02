@@ -394,7 +394,21 @@ fn resource_allowed(privacy: &crate::privacy::PrivacyConfig, uri: &str) -> bool 
 
 const BRIDGE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// How long a page that stopped answering gets to be replaced (see `leave_stuck_page`).
+/// What `navigate` says when a page that stopped answering did not come back.
+fn stopped_page_message(target: &str) -> String {
+    format!(
+        "the page was not answering, and it still does not answer after a navigation to {target} \
+         was sent. It may still be loading. On WebKit a navigation waits for a stopped page's \
+         script, so it lands when that script ends; only a page spinning at full CPU on Linux can \
+         be ended from here. Restart the app if the script never ends."
+    )
+}
+
+/// How long a page that stopped answering gets to answer after a navigation, before anything more
+/// is tried; and in all (see `recover_stopped_page`).
+const STOPPED_PAGE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+const STOPPED_PAGE_LOAD_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long a page that stopped answering gets to be replaced (see `detour_through_health`).
 const STUCK_PAGE_LEAVE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long `window resize` / `move_to` wait for the OS to apply the change (see `settle_window`).
@@ -5285,8 +5299,9 @@ impl VictauriMcpHandler {
     }
 
     /// Navigate natively, remembering the page being left if it is inside the app, so `go_back`
-    /// can return from a page with no bridge.
-    async fn navigate_natively(&self, url: &str, label: Option<&str>) -> Result<(), String> {
+    /// can return from a page with no bridge. False: the page it left had stopped, and the app's
+    /// page it was sent to does not answer.
+    async fn navigate_natively(&self, url: &str, label: Option<&str>) -> Result<bool, String> {
         if let Some(current) = self.read_back_window(label)
             && self.is_app_url(&current.url)
         {
@@ -5295,8 +5310,68 @@ impl VictauriMcpHandler {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .insert(current.label, current.url);
         }
-        let detour = self.leave_stuck_page(label).await?;
-        self.navigate_from(detour, label, url).await
+        if self.probe_bridge(label, None, None).await.is_ok() {
+            self.bridge.navigate_webview(label, url)?;
+            return Ok(true);
+        }
+        let window = self.read_back_window(label).map(|s| s.label);
+        if self.is_app_url(url) && window.is_some_and(|w| self.bridge_has_answered(&w)) {
+            return self.recover_stopped_page(label, url).await;
+        }
+        let detour = self.detour_through_health(label).await?;
+        self.navigate_from(detour, label, url).await?;
+        Ok(true)
+    }
+
+    /// Takes a window off a page that stopped answering, to a `target` inside the app, and says
+    /// whether the page answers there: the window's URL proves nothing, it reads the new one before
+    /// the page has left. On WebView2 the detour does it. WebKit queues every navigation behind the
+    /// stopped page's script (measured on WebKitGTK 2.52: the detour never commits, and the page
+    /// answers only when its loop ends), and its way out is to end the web process. Where that
+    /// process is the app's child (Linux) and the page has spun flat out all along, it is ended;
+    /// the new navigation then starts a new one, and other windows are not touched.
+    async fn recover_stopped_page(
+        &self,
+        label: Option<&str>,
+        target: &str,
+    ) -> Result<bool, String> {
+        let started = std::time::Instant::now();
+        let before = self.bridge.web_process_cpu();
+        let detour = self.detour_through_health(label).await?;
+        self.navigate_from(detour, label, target).await?;
+        if self
+            .page_answers_within(label, STOPPED_PAGE_ANSWER_WAIT)
+            .await
+        {
+            return Ok(true);
+        }
+        let after = self.bridge.web_process_cpu();
+        if let Some(pid) =
+            crate::introspection::spinning_web_process(&before, &after, started.elapsed())
+            && self.bridge.end_web_process(pid).is_ok()
+        {
+            tracing::warn!(
+                pid,
+                "ended the web process of a page spinning in a loop, to navigate away from it"
+            );
+            self.bridge.navigate_webview(label, target)?;
+        }
+        Ok(self
+            .page_answers_within(label, STOPPED_PAGE_LOAD_WAIT)
+            .await)
+    }
+
+    async fn page_answers_within(&self, label: Option<&str>, wait: std::time::Duration) -> bool {
+        let give_up = std::time::Instant::now() + wait;
+        loop {
+            if self.probe_bridge(label, None, None).await.is_ok() {
+                return true;
+            }
+            if std::time::Instant::now() >= give_up {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 
     /// Navigate from where a detour left the window. A native navigation adds a history entry, and
@@ -5339,13 +5414,6 @@ impl VictauriMcpHandler {
     /// help either). A cross-site one gets a fresh renderer, and this server's own `/health` is a
     /// cross-site page that is always there. Only for a page that stopped answering.
     /// The detour's URL, when the window is on it.
-    async fn leave_stuck_page(&self, label: Option<&str>) -> Result<Option<String>, String> {
-        if self.probe_bridge(label, None, None).await.is_ok() {
-            return Ok(None);
-        }
-        self.detour_through_health(label).await
-    }
-
     async fn detour_through_health(&self, label: Option<&str>) -> Result<Option<String>, String> {
         // Sites ignore the port, so the host must differ from a dev server's.
         let host = match self.bridge.app_entry_url().and_then(|u| {
@@ -5380,8 +5448,10 @@ impl VictauriMcpHandler {
         if !in_app && let Err(e) = validate_url(url, self.state.allow_file_navigation) {
             return tool_error(e);
         }
-        if let Err(e) = self.navigate_natively(url, label).await {
-            return tool_error(e);
+        match self.navigate_natively(url, label).await {
+            Ok(true) => {}
+            Ok(false) => return tool_error(stopped_page_message(url)),
+            Err(e) => return tool_error(e),
         }
         let mut result = serde_json::json!({"ok": true, "url": url});
         if !in_app {
@@ -5448,12 +5518,12 @@ impl VictauriMcpHandler {
             return tool_error(error);
         };
         // The probe behind `error` already said the page is not answering.
-        let left = match self.detour_through_health(label).await {
-            Ok(detour) => self.navigate_from(detour, label, &target).await,
-            Err(e) => Err(e),
-        };
-        if let Err(e) = left {
-            return tool_error(format!("{error}; navigating to {target} also failed: {e}"));
+        match self.recover_stopped_page(label, &target).await {
+            Ok(true) => {}
+            Ok(false) => return tool_error(stopped_page_message(&target)),
+            Err(e) => {
+                return tool_error(format!("{error}; navigating to {target} also failed: {e}"));
+            }
         }
         json_result(&serde_json::json!({
             "ok": true,
