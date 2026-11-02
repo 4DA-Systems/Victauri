@@ -1162,6 +1162,7 @@ async fn settle_port_claims(mut live: Vec<ServerInfo>) -> Vec<ServerInfo> {
     if contested.len() == ports.len() {
         return live;
     }
+    let deadline = std::time::Instant::now() + victauri_test::PORT_CLAIMS_BUDGET;
     for port in contested {
         let claims: Vec<(u32, Option<String>)> = live
             .iter()
@@ -1172,13 +1173,15 @@ async fn settle_port_claims(mut live: Vec<ServerInfo>) -> Vec<ServerInfo> {
             continue;
         }
         let asked = claims.clone();
-        let Ok(real) =
-            tokio::task::spawn_blocking(move || victauri_test::real_port_claims(port, &asked))
-                .await
+        let Ok(real) = tokio::task::spawn_blocking(move || {
+            victauri_test::real_port_claims_until(port, &asked, deadline)
+        })
+        .await
         else {
             continue;
         };
-        live.retain(|s| s.port != port || s.pid.is_some_and(|pid| real.contains(&pid)));
+        // No pid (a `VICTAURI_PORT` override) is no claim: the answer says nothing about it.
+        live.retain(|s| s.port != port || s.pid.is_none_or(|pid| real.contains(&pid)));
     }
     live
 }
@@ -1871,6 +1874,41 @@ fn dir_is_trusted(_path: &std::path::Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A `pid: None` entry has no claim to settle: the server's answer about the others says nothing
+    /// about it, so it stays.
+    #[tokio::test]
+    async fn settling_claims_keeps_an_entry_with_no_pid() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut byte = [0u8; 1];
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") && stream.read_exact(&mut byte).is_ok() {
+                    head.push(byte[0]);
+                }
+                let body = r#"{"pid":2}"#;
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let entry = |pid| super::ServerInfo {
+            pid,
+            port,
+            token: Some("t".to_string()),
+            identifier: None,
+            product_name: None,
+        };
+        let live = super::settle_port_claims(vec![entry(None), entry(Some(1)), entry(Some(2))]);
+        let kept: Vec<Option<u32>> = live.await.iter().map(|s| s.pid).collect();
+        assert_eq!(kept, [None, Some(2)]);
+    }
+
     use super::*;
 
     /// `victauri run` captures (the app's whole output, secrets included) live here, and

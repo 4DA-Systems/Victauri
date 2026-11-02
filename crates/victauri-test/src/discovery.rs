@@ -622,26 +622,22 @@ fn find_live_servers() -> Vec<DiscoveredServer> {
 /// app's entry stays behind, and once Windows reuses its PID it looks as live as the current app's,
 /// naming the same port. Normal scans (one claim per port) send nothing.
 fn settle_port_claims(servers: Vec<DiscoveredServer>) -> Vec<DiscoveredServer> {
-    let contested: Vec<u16> = servers
+    let mut contested: Vec<u16> = servers
         .iter()
         .map(|server| server.port)
         .filter(|port| servers.iter().filter(|s| s.port == *port).count() > 1)
         .collect();
+    contested.sort_unstable();
+    contested.dedup();
+    let deadline = std::time::Instant::now() + PORT_CLAIMS_BUDGET;
     let mut dropped: Vec<u32> = Vec::new();
     for port in contested {
-        if dropped.iter().any(|pid| {
-            servers
-                .iter()
-                .any(|server| server.pid == *pid && server.port == port)
-        }) {
-            continue;
-        }
         let claims: Vec<(u32, Option<String>)> = servers
             .iter()
             .filter(|server| server.port == port)
             .map(|server| (server.pid, server.token.clone()))
             .collect();
-        let real = real_port_claims(port, &claims);
+        let real = real_port_claims_until(port, &claims, deadline);
         dropped.extend(
             claims
                 .iter()
@@ -657,16 +653,36 @@ fn settle_port_claims(servers: Vec<DiscoveredServer>) -> Vec<DiscoveredServer> {
 
 /// Which of several discovery entries `(pid, token)` naming `port` belong to the server that holds
 /// it, by asking it (`GET /info`, with each entry's token). The pid it reports decides; an older
-/// plugin reports none, and then accepting the token does. Entries nothing could be learned about
-/// are kept: with no answer the choice stays as ambiguous as it was.
+/// plugin reports none, and then accepting the token does. When it accepted none, every entry is
+/// kept: a server refusing the tokens we hold says nothing about which entry is its own, so the
+/// choice stays as ambiguous as it was and never turns into "no app".
 ///
 /// The tokens go to the port their own entries name, as any connection would send them. A process
 /// on that port that lies gets what lying on `/info` always got.
 #[must_use]
 pub fn real_port_claims(port: u16, claims: &[(u32, Option<String>)]) -> Vec<u32> {
+    real_port_claims_until(port, claims, std::time::Instant::now() + PORT_CLAIMS_BUDGET)
+}
+
+/// [`real_port_claims`], asking nothing more once `deadline` has passed: what was not asked counts
+/// as no answer.
+#[doc(hidden)]
+#[must_use]
+pub fn real_port_claims_until(
+    port: u16,
+    claims: &[(u32, Option<String>)],
+    deadline: std::time::Instant,
+) -> Vec<u32> {
     let answers: Vec<(u32, InfoAnswer)> = claims
         .iter()
-        .map(|(pid, token)| (*pid, ask_info(port, token.as_deref())))
+        .map(|(pid, token)| {
+            let answer = if std::time::Instant::now() < deadline {
+                ask_info(port, token.as_deref())
+            } else {
+                InfoAnswer::Unknown
+            };
+            (*pid, answer)
+        })
         .collect();
     let reported = answers.iter().find_map(|(_, answer)| match answer {
         InfoAnswer::Accepted { pid } => *pid,
@@ -680,7 +696,7 @@ pub fn real_port_claims(port: u16, claims: &[(u32, Option<String>)]) -> Vec<u32>
         .filter(|(pid, answer)| match (reported, accepted) {
             (Some(server), _) => *pid == server,
             (None, true) => matches!(answer, InfoAnswer::Accepted { .. }),
-            (None, false) => matches!(answer, InfoAnswer::Unknown),
+            (None, false) => true,
         })
         .map(|(pid, _)| *pid)
         .collect()
@@ -691,7 +707,7 @@ pub fn real_port_claims(port: u16, claims: &[(u32, Option<String>)]) -> Vec<u32>
 enum InfoAnswer {
     /// `200`, with the pid when the plugin reports one.
     Accepted { pid: Option<u32> },
-    /// `401`: not this server's token.
+    /// `401` to a token: not this server's.
     Refused,
     /// No answer that says anything (not listening, not HTTP, rate limited, too slow).
     Unknown,
@@ -735,7 +751,8 @@ fn ask_info(port: u16, token: Option<&str>) -> InfoAnswer {
         return InfoAnswer::Unknown;
     };
     match head.split_whitespace().nth(1) {
-        Some("401") => InfoAnswer::Refused,
+        // No token sent: a 401 is about that, not about whose entry this is.
+        Some("401") if token.is_some() => InfoAnswer::Refused,
         Some("200") => {
             // Between the outer braces: the framing of a chunked body stays outside them.
             let json = body
@@ -754,6 +771,9 @@ fn ask_info(port: u16, token: Option<&str>) -> InfoAnswer {
     }
 }
 
+/// Most time one scan spends asking servers about the claims on their ports.
+#[doc(hidden)]
+pub const PORT_CLAIMS_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long [`ask_info`] waits for one answer. A live `/info` takes milliseconds.
 const INFO_DEADLINE: std::time::Duration = std::time::Duration::from_millis(800);
 /// The most of an answer [`ask_info`] reads. `/info` is a few hundred bytes.
@@ -979,6 +999,47 @@ mod tests {
             let servers = vec![claim(111, port, "a"), claim(222, port, "b")];
             assert_eq!(pids(&settle_port_claims(servers)), [111, 222], "{reply}");
         }
+    }
+
+    /// A server that refuses every token we hold says nothing about which entry is its own: a
+    /// stale token next to an entry whose token could not be read used to read as "no app at all".
+    #[test]
+    fn claims_a_server_refused_all_stay_ambiguous() {
+        let (port, _seen) = answering_server(|_| UNAUTHORIZED.to_string());
+        let servers = vec![claim(111, port, "a"), claim(222, port, "b")];
+        assert_eq!(pids(&settle_port_claims(servers)), [111, 222]);
+
+        let mut no_token = claim(111, port, "");
+        no_token.token = None;
+        assert!(matches!(ask_info(port, None), InfoAnswer::Unknown));
+        let servers = vec![no_token, claim(222, port, "stale")];
+        assert_eq!(pids(&settle_port_claims(servers)), [111, 222]);
+    }
+
+    /// A port that accepts and never answers costs one deadline per claim. Each claim asked once per
+    /// port, not once per claim on it (8 claims took 25.9 s), and a total budget over all of them.
+    #[test]
+    fn asking_about_claims_is_bounded() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = silent.local_addr().unwrap().port();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = std::sync::Arc::clone(&asked);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in silent.incoming() {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let servers: Vec<DiscoveredServer> = (0..8).map(|i| claim(100 + i, port, "t")).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(settle_port_claims(servers).len(), 8);
+        assert!(
+            started.elapsed() < PORT_CLAIMS_BUDGET + INFO_DEADLINE + INFO_DEADLINE,
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(asked.load(std::sync::atomic::Ordering::SeqCst) <= 8);
     }
 
     /// One claim on a port costs nothing: no request at all. Other ports are left alone.

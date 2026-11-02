@@ -343,6 +343,9 @@ async function readServer(dir: string, pid: number): Promise<DiscoveredServer | 
   }
 }
 
+/** Most time one scan spends asking servers about the claims on their ports. */
+const PORT_CLAIMS_BUDGET_MS = 2000;
+
 /** What the server on a port said to one entry's token. */
 type InfoAnswer = { kind: "accepted"; pid?: number } | { kind: "refused" } | { kind: "unknown" };
 
@@ -352,7 +355,8 @@ async function askInfo(port: number, token: string | undefined): Promise<InfoAns
       headers: token ? { Authorization: `Bearer ${token}` } : {},
       signal: AbortSignal.timeout(800),
     });
-    if (resp.status === 401) return { kind: "refused" };
+    // No token sent: a 401 is about that, not about whose entry this is.
+    if (resp.status === 401) return token ? { kind: "refused" } : { kind: "unknown" };
     if (resp.status !== 200) return { kind: "unknown" };
     const info = (await resp.json()) as { pid?: unknown } | null;
     const pid = info?.pid;
@@ -365,14 +369,17 @@ async function askInfo(port: number, token: string | undefined): Promise<InfoAns
 // Drop the entries that are not the server on their port, when several claim one: a hard-killed
 // app's entry stays behind, and once its PID is reused it looks as live as the current app's,
 // naming the same port. Mirrors `victauri-test`'s `real_port_claims`: the pid `/info` reports
-// decides; an older plugin reports none, and then accepting the token does; entries nothing could
-// be learned about stay. One claim per port, the normal case, sends nothing.
-async function settlePortClaims(live: DiscoveredServer[]): Promise<DiscoveredServer[]> {
+// decides; an older plugin reports none, and then accepting the token does; when it accepted none,
+// every entry stays, as a server refusing the tokens we hold says nothing about which is its own.
+// One claim per port, the normal case, sends nothing. The asking has one total budget.
+export async function settlePortClaims(live: DiscoveredServer[]): Promise<DiscoveredServer[]> {
   const ports = new Set(live.map((s) => s.port));
   const dropped = new Set<DiscoveredServer>();
+  const giveUp = Date.now() + PORT_CLAIMS_BUDGET_MS;
   for (const port of ports) {
     const claims = live.filter((s) => s.port === port);
     if (claims.length < 2) continue;
+    if (Date.now() >= giveUp) break;
     const answers = await Promise.all(claims.map((s) => askInfo(port, s.token)));
     const reported = answers.find((a) => a.kind === "accepted" && a.pid !== undefined);
     const anyAccepted = answers.some((a) => a.kind === "accepted");
@@ -380,9 +387,7 @@ async function settlePortClaims(live: DiscoveredServer[]): Promise<DiscoveredSer
       const keep =
         reported?.kind === "accepted"
           ? claim.pid === reported.pid
-          : anyAccepted
-            ? answers[i].kind === "accepted"
-            : answers[i].kind === "unknown";
+          : !anyAccepted || answers[i].kind === "accepted";
       if (!keep) dropped.add(claim);
     });
   }
