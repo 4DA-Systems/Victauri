@@ -20,7 +20,7 @@
 //! Stopping the launcher stops the app: otherwise an agent harness or `timeout` leaves it holding
 //! its port and single-instance lock. On Windows a job object takes the whole tree when the
 //! launcher dies, however it dies. On Unix SIGTERM/SIGHUP are forwarded and the exit is recorded;
-//! SIGKILL cannot be seen, so a small helper does it (see [`DeathWatch`]). A launcher killed outright
+//! SIGKILL cannot be seen, so a small helper does it (see `DeathWatch`). A launcher killed outright
 //! records nothing, and `victauri logs` says so when it reads the capture.
 
 use std::io::{Read, Write};

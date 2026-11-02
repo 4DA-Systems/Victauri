@@ -60,7 +60,8 @@ expect "plugin README 'N MCP tools across three layers'" "$tools" \
   crates/victauri-plugin/README.md
 
 # ── Smoke-suite check count (`victauri test`, `VictauriClient::smoke_test`) ───
-checks=$(count '(skippable_)?check!\(' crates/victauri-test/src/smoke.rs)
+# The DOM complete check is built by hand, as it reports what it measured.
+checks=$(count '(skippable_)?check!\(|name: format!\("DOM complete' crates/victauri-test/src/smoke.rs)
 echo "Smoke checks defined in code: $checks"
 expect "README 'all N smoke checks'" "$checks" \
   "$(grep -oE 'all [0-9]+ smoke checks' README.md | grep -oE '[0-9]+' || true)" \
