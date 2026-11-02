@@ -3246,6 +3246,30 @@ mod tests {
         }
     }
 
+    /// The file that ended the host: 2,200 views at 100 nested SELECTs, in UTF-16 BLOBs. A stack
+    /// overflow ends the test process, so this test passing is itself the proof it did not happen.
+    #[test]
+    fn the_utf16_blob_chain_that_overflowed_the_stack_is_refused() {
+        let rows: Vec<(String, Vec<u8>)> = (0..2_200)
+            .map(|i| {
+                let from = if i == 0 {
+                    "users".to_string()
+                } else {
+                    format!("v{}", i - 1)
+                };
+                let sql = format!(
+                    "CREATE VIEW v{i} AS {}SELECT id FROM {from}{}",
+                    "SELECT id FROM (".repeat(100),
+                    ")".repeat(100)
+                );
+                (format!("v{i}"), encoded("UTF-16le", &units(&sql)))
+            })
+            .collect();
+        let (_f, path) = db_with_blob_schema_rows("UTF-16le", &rows);
+        let err = query(&path, "SELECT * FROM v2199", &[], None).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+    }
+
     /// The name of the view's one column as `SQLite` loaded it, and as the check read the text. Each
     /// row's `AS [...]` is what is compared, so the two have to agree on where the name ends too.
     fn loaded_and_read_column(path: &Path) -> (Option<String>, Option<String>) {
