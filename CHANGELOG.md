@@ -39,12 +39,12 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   panic no longer blocks workers or another panic; `log_layer()` no longer lowers the global max level.
 - `navigate go_to` out of the app left a dead page with no way back; a page stopped by `while(true)` now
   recovers through a detour on WebView2, and on Linux by ending the one web process whose main thread spun throughout,
-  only while every other window that has answered still answers; the result names it (`ended_web_process`).
-  `recovered` and `ok` mean the page answers at the
-  new URL, where they used to mean a navigation was sent: WebKit's URL reads the new address while the old
+  only if every other window that has answered still answers with that process paused; the result names it
+  (`ended_web_process`). From a stopped page inside the app, `recovered` and `ok` for a page inside the app mean a new
+  page answers there, where they used to mean a navigation was sent: WebKit's URL reads the new address while the old
   script still runs. The demo's sync window-building command deadlocked.
 - A route regex that can hang the page is refused at `add`, by what a repeated group can match. Polynomial
-  patterns with no repeated group (`.*.*.*.*x`) still get through.
+  patterns still get through: no repeated group (`.*.*.*.*x`), or a chain of them (`(a)*(a)*(a)*(a)*y`).
 
 ### Fixed: JS bridge
 
@@ -92,7 +92,8 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
 - `victauri logs --follow` loses nothing across rotation. `setup` no longer pins user-level configs to one project
   and reports failures in its exit code. Output from a hostile plugin cannot drive the terminal.
 - Watchdog: quoted recovery paths with spaces work, and a slow recovery command is no longer killed.
-- With nothing discovered, tools no longer send requests to whatever holds port 7373.
+- With nothing discovered, the CLI, bridge, test client and the VS Code extension's auto-connect no longer send
+  requests to whatever holds port 7373. The watchdog still polls it by default, and an explicit VS Code connect tries it.
 
 ### Fixed: other
 
@@ -101,7 +102,8 @@ truth, so a green test suite can go red.** See MIGRATION.md for every behaviour 
   table, so a column named like a view no longer refuses a healthy database.
 - `/mcp` names the problem when `arguments` is not an object, where it said the method does not exist.
   `find_elements` in the test client takes a string as CSS. `screenshot` names the window it captured.
-- rmcp's per-request INFO lines no longer reach an app's console by default (`info,rmcp=warn`).
+- The docs name the filter that keeps rmcp's per-request INFO lines off an app's console (`info,rmcp=warn`). With a
+  plain `info` filter they still appear.
 - A bare `e0` ref means that counter on the current page: a real consumer's suite hardcoded one. Performance metrics
   survive a reload's moment with no body.
 

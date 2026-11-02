@@ -404,6 +404,41 @@ fn stopped_page_message(target: &str) -> String {
     )
 }
 
+/// A web process stopped to see what goes silent, resumed when this is dropped however the call ends
+/// (a client that hangs up cancels it): a page must not stay stopped because an agent went away.
+struct PausedWebProcess {
+    bridge: Arc<dyn WebviewBridge>,
+    pid: Option<u32>,
+}
+
+impl PausedWebProcess {
+    fn new(bridge: &Arc<dyn WebviewBridge>, pid: u32) -> Option<Self> {
+        bridge.pause_web_process(pid).ok()?;
+        Some(Self {
+            bridge: Arc::clone(bridge),
+            pid: Some(pid),
+        })
+    }
+
+    /// Ends it. Resumed all the same if that fails.
+    fn end(mut self) -> Result<(), String> {
+        let Some(pid) = self.pid else {
+            return Ok(());
+        };
+        self.bridge.end_web_process(pid)?;
+        self.pid = None;
+        Ok(())
+    }
+}
+
+impl Drop for PausedWebProcess {
+    fn drop(&mut self) {
+        if let Some(pid) = self.pid {
+            self.bridge.resume_web_process(pid);
+        }
+    }
+}
+
 /// How a native navigation went.
 struct NativeNavigation {
     /// False: the page it left had stopped, and the app's page it was sent to does not answer.
@@ -437,6 +472,11 @@ impl NativeNavigation {
     fn note_ended_process(&self, result: &mut serde_json::Value) {
         if let Some(pid) = self.ended_web_process {
             result["ended_web_process"] = pid.into();
+            result["ended_web_process_note"] = serde_json::json!(
+                "the page's main thread ran flat out while it would not answer, so its web process \
+                 was ended: nothing can tell a page stuck for good from one that was only slow, so \
+                 work it was doing is lost, and so are its Workers"
+            );
         }
     }
 
@@ -562,6 +602,13 @@ pub struct VictauriMcpHandler {
     /// Windows whose bridge has answered a probe (see `bridge_has_answered`), each with the page
     /// load it last answered from.
     answered_windows: Arc<std::sync::Mutex<HashMap<String, Option<u64>>>>,
+    /// The nonce of the page that last answered in each window: a page answering with another is
+    /// a new page, and with the same one has not left.
+    page_nonces: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// One native navigation at a time. A recovery's detour makes the window read as outside the app,
+    /// so a second call would report success on a page still stuck; and one resuming a paused process
+    /// would let its page answer the other's question, and be ended for it.
+    native_navigation: Arc<tokio::sync::Mutex<()>>,
     /// The origins a bridge has answered on (see `is_app_url`).
     answered_origins: Arc<std::sync::Mutex<HashSet<String>>>,
     /// Per window, the last URL seen inside the app before a native navigation.
@@ -2476,10 +2523,10 @@ impl VictauriMcpHandler {
     }
 
     #[tool(
-        description = "Navigation and dialog control. Actions: go_to (navigate to URL, natively, so it also recovers a hung page or one outside the app; warns when the URL is outside the app), go_back (browser back; on a page that stopped answering, returns natively to the last known URL inside the app), get_history (navigation log), set_dialog_response (auto-respond to alert/confirm/prompt), get_dialog_log (captured dialog events). Subject to privacy controls for go_to and set_dialog_response.",
+        description = "Navigation and dialog control. Actions: go_to (navigate to URL, natively, so it also recovers a hung page or one outside the app; warns when the URL is outside the app), go_back (browser back; on a page that stopped answering, returns natively to the last known URL inside the app; on Linux either action can end the web process of a page running flat out that will not answer, losing its work, and says so in ended_web_process), get_history (navigation log), set_dialog_response (auto-respond to alert/confirm/prompt), get_dialog_log (captured dialog events). Subject to privacy controls for go_to and set_dialog_response.",
         annotations(
             read_only_hint = false,
-            destructive_hint = false,
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = false
         )
@@ -3057,8 +3104,7 @@ impl VictauriMcpHandler {
             - `list`: list active rules.\n\
             - `clear` (by `id`) / `clear_all`: remove rules.\n\
             - `matches`: log of intercepted requests.\n\
-            Note: fetch and XHR support all behaviors. A regex that can hang the page (nested \
-            quantifiers such as `(a+)+`) is refused at `add`. \
+            Note: fetch and XHR support all behaviors. A regex that can hang the page (a repeated group that can take the same text in more than one way, such as `(a+)+`) is refused at `add`. \
             Top-level navigation, sub-resource (img/css), and WebSocket traffic are not intercepted. \
             Tauri IPC: on the fetch transport (desktop, until a fallback) a rule matching an IPC URL \
             (http(s)://ipc.localhost/<cmd> or ipc://localhost/<cmd>) DOES change what the app's real \
@@ -4837,6 +4883,8 @@ impl VictauriMcpHandler {
             probe_timeout: PROBE_TIMEOUT,
             file_read_timeout: READ_APP_FILE_TIMEOUT,
             answered_windows: Arc::default(),
+            page_nonces: Arc::default(),
+            native_navigation: Arc::default(),
             answered_origins: Arc::default(),
             last_app_urls: Arc::default(),
         }
@@ -5396,6 +5444,7 @@ impl VictauriMcpHandler {
         url: &str,
         label: Option<&str>,
     ) -> Result<NativeNavigation, String> {
+        let _one_at_a_time = self.native_navigation.lock().await;
         if let Some(current) = self.read_back_window(label)
             && self.is_app_url(&current.url)
         {
@@ -5428,19 +5477,22 @@ impl VictauriMcpHandler {
     /// the stopped page's script (measured on `WebKitGTK` 2.52: the detour never commits, and the page
     /// answers only when its loop ends), and its way out is to end the web process. Where that
     /// process is the app's child (Linux) and its main thread, where a page runs, has spun flat out
-    /// all along, it is ended; the new navigation then starts a new one, and other windows are not
-    /// touched. Workers do not count: a page they keep busy still answers.
+    /// all along, and it is not the process of another window that answers, it is ended; the new
+    /// navigation then starts a new one, and other windows are not touched. Workers do not count: a
+    /// page they keep busy still answers. A page that answers proves little by itself, as the one
+    /// stopped may have resumed with the navigation still queued: it has to be another page.
     async fn recover_stopped_page(
         &self,
         label: Option<&str>,
         target: &str,
     ) -> Result<NativeNavigation, String> {
         let started = std::time::Instant::now();
+        let stopped_page = self.last_page_nonce(label);
         let before = self.bridge.web_main_thread_cpu();
         let detour = self.detour_through_health(label).await?;
         self.navigate_from(detour, label, target).await?;
         if self
-            .page_answers_within(label, STOPPED_PAGE_ANSWER_WAIT)
+            .another_page_answers_within(label, stopped_page.as_deref(), STOPPED_PAGE_ANSWER_WAIT)
             .await
         {
             return Ok(NativeNavigation::recovered(None));
@@ -5448,12 +5500,20 @@ impl VictauriMcpHandler {
         let after = self.bridge.web_main_thread_cpu();
         if let Some(pid) =
             crate::introspection::spinning_web_process(&before, &after, started.elapsed())
+            // `go_back` is open to profiles that may not navigate at will: not to this.
+            && self
+                .state
+                .privacy
+                .is_call_allowed("navigate", "navigate.go_to")
             && self.other_windows_answer(label).await
-            && self.bridge.end_web_process(pid).is_ok()
+            && let Some(paused) = PausedWebProcess::new(&self.bridge, pid)
+            && self.other_windows_answer(label).await
+            && paused.end().is_ok()
         {
             tracing::warn!(
                 pid,
-                "ended the web process of a page spinning in a loop, to navigate away from it"
+                "ended a web process whose main thread ran flat out while the page would not \
+                 answer, to navigate away from it; it may only have been slow"
             );
             let answers = self.navigate_new_web_process(label, target).await?;
             return Ok(NativeNavigation {
@@ -5463,7 +5523,7 @@ impl VictauriMcpHandler {
             });
         }
         let answers = self
-            .page_answers_within(label, STOPPED_PAGE_LOAD_WAIT)
+            .another_page_answers_within(label, stopped_page.as_deref(), STOPPED_PAGE_LOAD_WAIT)
             .await;
         Ok(NativeNavigation {
             answers,
@@ -5472,8 +5532,10 @@ impl VictauriMcpHandler {
     }
 
     /// Nothing maps a web process to its window, so the one that spun could be another window's.
-    /// One that has answered before and is silent now may well be that window. A window that never
-    /// answered cannot say, and does not count.
+    /// One that has answered before and is silent now may well be that window, and answering does
+    /// not clear it (a page working in 40 ms slices answers and reads as flat out), which is why
+    /// this is asked again with the process paused. A window that never answered cannot say, and
+    /// does not count.
     async fn other_windows_answer(&self, label: Option<&str>) -> bool {
         let Some(target) = self.read_back_window(label).map(|window| window.label) else {
             return false;
@@ -5514,6 +5576,38 @@ impl VictauriMcpHandler {
             {
                 self.bridge.navigate_webview(label, target)?;
             }
+        }
+    }
+
+    /// The nonce of the page that last answered in this window.
+    fn last_page_nonce(&self, label: Option<&str>) -> Option<String> {
+        let window = self.read_back_window(label)?.label;
+        self.page_nonces
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&window)
+            .cloned()
+    }
+
+    /// [`page_answers_within`](Self::page_answers_within), by a page other than `left`: the one left
+    /// may resume with the navigation still queued, or the navigation may never have landed.
+    async fn another_page_answers_within(
+        &self,
+        label: Option<&str>,
+        left: Option<&str>,
+        wait: std::time::Duration,
+    ) -> bool {
+        let give_up = std::time::Instant::now() + wait;
+        loop {
+            if let Ok(nonce) = self.probe_bridge(label, None, None).await
+                && (left.is_none() || nonce.as_deref() != left)
+            {
+                return true;
+            }
+            if std::time::Instant::now() >= give_up {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
     }
 
@@ -5683,6 +5777,7 @@ impl VictauriMcpHandler {
             return tool_error(error);
         };
         // The probe behind `error` already said the page is not answering.
+        let _one_at_a_time = self.native_navigation.lock().await;
         let navigation = match self.recover_stopped_page(label, &target).await {
             Ok(navigation) if navigation.answers => navigation,
             Ok(navigation) => return tool_error(navigation.not_answering_message(&target)),
@@ -6037,7 +6132,14 @@ impl VictauriMcpHandler {
         });
         if let Ok(Ok(raw)) = tokio::time::timeout(wait, rx).await {
             self.note_bridge_answer(window);
-            Ok(crate::js_bridge::probe_answer_nonce(&raw))
+            let nonce = crate::js_bridge::probe_answer_nonce(&raw);
+            if let Some(nonce) = &nonce {
+                self.page_nonces
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(window.to_string(), nonce.clone());
+            }
+            Ok(nonce)
         } else if self.bridge_has_answered(window) {
             Err(format!(
                 "{BRIDGE_DOWN} on window '{window}' — it answered earlier in this session, so \

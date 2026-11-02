@@ -286,6 +286,19 @@ fn a_fulfilled_xhr_has_the_lifecycle_of_a_request() {
          T(seen.indexOf('load') === -1, J(seen)); T(b.responseText === '', 'second is real'); \
          T(B.getRouteRules()[0].triggered === 1, J(B.getRouteRules()));"
     );
+    // `send` converts its argument first: one that throws starts nothing and uses up no rule, and
+    // one that calls `send` itself makes the outer call throw, as on a real request.
+    let body_conversion = format!(
+        "AGENT.addRoute({{pattern:'/m', action:'fulfill', body:'mock', times:1}}); \
+         var x = new XMLHttpRequest(), threw = ''; x.open('POST', '{MOCK}'); \
+         try {{ x.send({{toString: function() {{ throw new RangeError('no'); }}}}); }} catch (e) {{ threw = e.name; }} \
+         T(threw === 'RangeError', threw); T(B.getRouteRules()[0].triggered === 0, J(B.getRouteRules())); \
+         T(B.getNetworkLog().length === 0, J(B.getNetworkLog())); \
+         threw = ''; \
+         try {{ x.send({{toString: function() {{ x.send(); return 'b'; }}}}); }} catch (e) {{ threw = e.name; }} \
+         T(threw === 'InvalidStateError', threw); await sleep(30); \
+         var log = B.getNetworkLog(); T(log.length === 1 && log[0].status === 200, J(log)); T(x.responseText === 'mock');"
+    );
     let reopen_clears = format!(
         "AGENT.addRoute({{pattern:'/m', action:'fulfill', status:201, body:'mock'}}); \
          var x = new XMLHttpRequest(), seen = []; record(x, seen); x.open('GET', '{MOCK}'); x.send(); await sleep(30); T(x.status === 201); \
@@ -380,6 +393,7 @@ fn a_fulfilled_xhr_has_the_lifecycle_of_a_request() {
          T(threw === 'TypeError', 'brand check ' + threw);";
     check(&[
         ("times", "<div></div>", &times),
+        ("body_conversion", "<div></div>", &body_conversion),
         ("reopen_clears_the_mock", "<div></div>", &reopen_clears),
         ("reopen_in_the_gap", "<div></div>", &reopen_in_the_gap),
         ("abort_in_the_gap", "<div></div>", &abort_in_the_gap),

@@ -192,7 +192,8 @@ victauri logs --stdout --follow
 
 Stopping the launcher stops the app: on Windows however the launcher dies (a job object takes the
 process tree), on Unix for SIGTERM and SIGHUP (forwarded to the command after 2 seconds, and the
-exit is recorded; SIGKILL cannot be seen, so it orphans the app). What the app left running when
+exit is recorded; SIGKILL cannot be seen, so a small helper stops the direct child, and what `npm`
+started may stay). What the app left running when
 it exited normally is left alone. At each run, captures of apps that are gone are deleted past 7
 days old or beyond the newest 20; a `--capture <file>` is never deleted.
 

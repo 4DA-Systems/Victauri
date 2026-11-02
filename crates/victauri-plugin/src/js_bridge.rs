@@ -3550,7 +3550,8 @@ const INIT_SCRIPT_BODY: &str = r#"
             try { hangs = regexHangRisk('' + rule.pattern); } catch (e) { hangs = 'this pattern'; }
             if (hangs) {
                 return { ok: false, error: 'regex pattern can hang the page: ' + hangs + ' repeats a group'
-                    + ' that can match the same text in more than one way, and JavaScript has no regex timeout.'
+                    + ' that can match the same text in more than one way, or is too large to check,'
+                    + ' and JavaScript has no regex timeout.'
                     + ' Make each repetition match in one way only (a separator it cannot take itself, as in'
                     + ' (/\\w+)+, or no inner quantifier), or use match_type glob or substring.' };
             }
@@ -5164,11 +5165,10 @@ const INIT_SCRIPT_BODY: &str = r#"
         }
         // Answer a matching request with the rule's mock: `send` does not reach the network. The
         // transitions come in one later task, stopping as soon as a handler moved the XHR on.
-        function xhrFulfill(xhr, st, entry, route, net, body) {
+        function xhrFulfill(xhr, st, entry, route, net, body, bodySize) {
             var verb = REFLECT_APPLY(STR_TO_LOWER, net.method, []);
             var hasBody = body !== null && body !== undefined && verb !== 'get' && verb !== 'head';
-            // First: a body that cannot be converted throws, and no request has started.
-            var sent = hasBody ? xhrBodySize(body) : 0;
+            var sent = hasBody ? bodySize : 0;
             var m = {
                 state: 1, failed: false, timer: null, arm: null, uploading: null,
                 status: route.status, status_text: route.status_text,
@@ -5330,10 +5330,12 @@ const INIT_SCRIPT_BODY: &str = r#"
                 } catch (e) {}
                 return undefined;
             }
+            // The entry from before the call: a handler it fires may have sent another request.
+            var aborted = st && st.entry;
             var ret = REFLECT_APPLY(origAbort, this, arguments);
             // Called from `readystatechange` at DONE it fires no `load`, `abort` or `loadend`, so
             // nothing else closes the entry, and it would hold `network_idle` off for good.
-            if (st && st.entry && st.entry.status === 'pending') xhrFinish(st.entry, 'aborted');
+            if (aborted && aborted.status === 'pending') xhrFinish(aborted, 'aborted');
             return ret;
         };
         XMLHttpRequest.prototype.send = function() {
@@ -5359,10 +5361,16 @@ const INIT_SCRIPT_BODY: &str = r#"
             // Phase 1 routing for XHR: block, delay, and fulfill (see `xhrFulfill`).
             var xroute = matchRoute(net.url, net.method);
             if (xroute) {
+                // First, as `send` converts its argument before anything else: one that throws
+                // starts no request and uses up no rule, and its conversion can call back in here.
+                var bodySize = xroute.action === 'fulfill' ? xhrBodySize(arguments[0]) : 0;
+                if (st.mock || st.net !== net) {
+                    throw new DOMException('The object\'s state must be OPENED.', 'InvalidStateError');
+                }
                 recordRouteMatch(xroute, net.url, net.method);
                 entry.route_rule = xroute.id;
                 if (xroute.action === 'fulfill') {
-                    xhrFulfill(this, st, entry, xroute, net, arguments[0]);
+                    xhrFulfill(this, st, entry, xroute, net, arguments[0], bodySize);
                     return undefined;
                 }
                 if (xroute.action === 'block') {

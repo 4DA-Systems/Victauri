@@ -176,7 +176,7 @@ the Linux rule above, hand the build to the main thread (`show_notification_wind
 
 ### Tauri Version Compatibility
 
-Victauri's CI builds and runs it on Tauri 2.11 (the workspace lockfile) and on Tauri 3.0.0-alpha.5 (the `tauri3` canary job); it compiles against Tauri 2.0.0 and 2.12 (checked in the 0.10.0 pre-audit). The `tauri-v3` feature needs Tauri 3.0.0-alpha.4 or newer (its permission build step is `tauri-plugin` 3.0.0-alpha.4, which requires a matching `tauri-utils`). Key compatibility facts:
+Victauri's CI builds and runs it on Tauri 2.12 (the workspace lockfile) and on Tauri 3.0.0-alpha.5 (the `tauri3` canary job); it compiles against Tauri 2.0.0 and 2.12 (checked in the 0.10.0 pre-audit). The `tauri-v3` feature needs Tauri 3.0.0-alpha.4 or newer (its permission build step is `tauri-plugin` 3.0.0-alpha.4, which requires a matching `tauri-utils`). Key compatibility facts:
 - `js_init_script()` API is stable across all 2.x releases
 - Tauri 2's IPC runs over a custom-protocol `fetch()` (`http://ipc.localhost`, `https://ipc.localhost` for apps with `useHttpsScheme`, `ipc://localhost` on macOS/Linux) with a `window.ipc.postMessage` fallback; the bridge captures both (verified against Tauri 2.11 and 2.12's `ipc-protocol.js` / `core.js`). On the postMessage path, **responses** are captured through Tauri's `__TAURI_INTERNALS__.callbacks` table, which Tauri added in **2.6**: on Tauri 2.0–2.5 only the requests are captured there (`ipc_capture.capture: "requests_only"`, outcomes logged as `unknown`). The fetch path is captured fully on every 2.x.
 - Plugin init scripts run in IIFE isolation since April 2024 — no global scope conflicts

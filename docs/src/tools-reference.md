@@ -578,7 +578,7 @@ Navigation and history operations.
 | Action | Parameters | Description |
 |--------|-----------|-------------|
 | `go_to` | `url` | Navigate to a URL (http/https only) |
-| `go_back` | — | Go back in history. On a page that stopped answering (a page without the bridge, or one stuck in a loop) it navigates natively to the last URL inside the app, reports `recovered` only once the page answers there, and errors if it does not. WebView2 and WebKitGTK get off a page spinning in a loop: on Linux by ending the one web process whose main thread spun throughout, which takes about 15 s, and the result says `ended_web_process: <pid>`. On macOS the navigation waits for the script to end |
+| `go_back` | — | Go back in history. On a page that stopped answering (a page without the bridge, or one stuck in a loop) it navigates natively to the last URL inside the app, reports `recovered` only once the page answers there, and errors if it does not. WebView2 and WebKitGTK get off a page spinning in a loop: on Linux by ending the one web process whose main thread spun throughout, if every other window that has answered still answers with it paused. That takes about 15 s, the result says `ended_web_process: <pid>`, and a page that was only slow loses its work. On macOS the navigation waits for the script to end |
 | `get_history` | — | Get navigation history log |
 | `set_dialog_response` | `dialog_type`, `dialog_action`, `text` | Auto-respond to future `alert`/`confirm`/`prompt` dialogs (`accept` / `dismiss`) |
 | `get_dialog_log` | — | Get dialog log (alerts, confirms, prompts) |
