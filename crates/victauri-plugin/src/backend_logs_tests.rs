@@ -1025,6 +1025,136 @@ fn a_cursor_read_survives_a_rotation() {
     }
 }
 
+/// A bare offset cannot see a rotation whose new file has a record boundary exactly there: the
+/// rotated file's tail and the new file's start went unread, with nothing said.
+#[test]
+fn a_cursor_on_a_record_boundary_of_the_new_file_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let record = capture_record;
+    let old: String = (0..4).map(|n| record(n, "old")).collect();
+    std::fs::write(&path, &old).unwrap();
+    // The first two read.
+    let cursor = (2 * record(0, "old").len()) as u64;
+    let read = read_console_cursor(&path, Some(0), 0, cursor).unwrap();
+    assert_eq!(read.lines.len(), 2);
+    let cursor = read.cursor(read.next);
+
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    let new: String = (0..4).map(|n| record(n, "new")).collect();
+    std::fs::write(&path, &new).unwrap();
+
+    let (got, at, lost) = follow_cursor(&path, cursor);
+    assert_eq!(got, ["old2", "old3", "new0", "new1", "new2", "new3"]);
+    assert!(!lost);
+    // And on from there: the new file grew, nothing again from before.
+    let mut more = new.clone();
+    more.push_str(&record(4, "new"));
+    std::fs::write(&path, &more).unwrap();
+    assert_eq!(follow_cursor(&path, at).0, ["new4"]);
+}
+
+/// All a follower reads from `cursor` on, as it would, with where it ended and whether it was told
+/// that lines were lost.
+fn follow_cursor(path: &std::path::Path, mut cursor: u64) -> (Vec<String>, u64, bool) {
+    let (mut got, mut lost) = (Vec::new(), false);
+    for _ in 0..8 {
+        let read = read_console_cursor(path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+        lost |= read.lost;
+        cursor = read.cursor(read.next);
+        got.extend(read.lines.into_iter().map(|l| l.text));
+    }
+    (got, cursor, lost)
+}
+
+fn capture_record(n: usize, text: &str) -> String {
+    format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"{text}{n}\"}}\n")
+}
+
+/// Two rotations between reads: the file the cursor was in is gone, and that is said.
+#[test]
+fn a_cursor_whose_file_rotated_away_says_lines_were_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    std::fs::write(&path, capture_record(0, "first")).unwrap();
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    let cursor = read.cursor(read.next);
+
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(&path, capture_record(0, "second")).unwrap();
+    std::fs::remove_file(path.with_extension("jsonl.1")).unwrap();
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(&path, capture_record(0, "third")).unwrap();
+
+    let first_read = read_console_cursor(&path, Some(cursor), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(first_read.lost);
+    let at = first_read.cursor(first_read.next);
+    assert_eq!(first_read.lines[0].text, "third0");
+    let (got, _, lost) = follow_cursor(&path, at);
+    assert!(got.is_empty() && !lost, "said once: {got:?}");
+}
+
+/// A cursor from before tags, or a line's `offset`, reads as it always did.
+#[test]
+fn a_bare_offset_is_still_a_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let body: String = (0..3).map(|n| capture_record(n, "line")).collect();
+    std::fs::write(&path, &body).unwrap();
+    let offset = capture_record(0, "line").len() as u64;
+    let (got, at, lost) = follow_cursor(&path, offset);
+    assert_eq!(got, ["line1", "line2"]);
+    assert!(!lost);
+    assert!(
+        at > body.len() as u64,
+        "what it returns carries the tag: {at}"
+    );
+    let line_offset = read_console_cursor(&path, Some(at), 0, CONSOLE_READ_WINDOW)
+        .unwrap()
+        .next;
+    assert_eq!(line_offset, body.len() as u64);
+
+    // Past a rotation, by where it lands.
+    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+    std::fs::write(
+        &path,
+        capture_record(0, "new-and-longer-than-the-old-file-was"),
+    )
+    .unwrap();
+    let (got, _, lost) = follow_cursor(&path, offset);
+    assert_eq!(
+        got,
+        ["line1", "line2", "new-and-longer-than-the-old-file-was0"]
+    );
+    assert!(!lost);
+}
+
+/// JavaScript clients read a cursor as a double, and a file with no complete record has no tag.
+#[test]
+fn a_cursor_is_exact_in_a_double_and_needs_a_first_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    std::fs::write(&path, "{\"t\":1,\"s\":\"out\",\"l\":\"partial").unwrap();
+    assert_eq!(capture_tag(&path), None);
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert_eq!(read.cursor(read.next), 0);
+
+    std::fs::write(&path, capture_record(0, "line")).unwrap();
+    let read = read_console_cursor(&path, Some(0), 0, CONSOLE_READ_WINDOW).unwrap();
+    assert!(capture_tag(&path).is_some_and(|tag| tag > 0 && tag < 1 << CURSOR_TAG_BITS));
+    let cursor = read.cursor((1 << CURSOR_OFFSET_BITS) - 1);
+    assert!(cursor < 1 << 53);
+    assert_eq!(
+        cursor & ((1 << CURSOR_OFFSET_BITS) - 1),
+        (1 << CURSOR_OFFSET_BITS) - 1
+    );
+    assert_eq!(
+        read.cursor(1 << CURSOR_OFFSET_BITS),
+        1 << CURSOR_OFFSET_BITS,
+        "no room: bare"
+    );
+}
+
 /// Release review: a cursor read stops at its byte window (16 MiB), and `logs stdout` reported
 /// `truncated: false` whenever the LINE limit was not hit — on a 40 MB capture an agent read
 /// the first window, saw nothing truncated, and never reached the panic further on. The reader

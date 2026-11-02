@@ -700,6 +700,7 @@ async fn follow_stdout_via_app(
             }
             Err(e) => return Err(e),
         };
+        warn_gap(&page);
         if let Some(lines) = page["lines"].as_array() {
             for l in lines {
                 emit(&render_console(l), opts.json, l);

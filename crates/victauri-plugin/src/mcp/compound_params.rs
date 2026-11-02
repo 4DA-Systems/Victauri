@@ -855,7 +855,8 @@ pub struct LogsParams {
     pub level: Option<String>,
     /// Target prefix(es) for backend, comma-separated (e.g. `"app::db,app::sync"`).
     pub target: Option<String>,
-    /// Cursor (for backend: entry sequence; for stdout: byte offset). Pass the
+    /// Cursor (for backend: entry sequence; for stdout: a position in the capture, opaque, which
+    /// a rotated capture cannot confuse). Pass the
     /// previous response's `next_seq` to get only newer entries. With a cursor the
     /// OLDEST entries after it come first (up to `limit`) and `next_seq` continues
     /// right after them: read on until `truncated` is false. Without one, the newest.

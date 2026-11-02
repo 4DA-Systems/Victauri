@@ -1916,12 +1916,137 @@ pub struct ConsoleLine {
     pub tail: Vec<String>,
 }
 
-/// Read console-capture records starting at byte `from` (or the last
-/// `tail_bytes` of the file when `from` is `None`). Returns the records and the
-/// offset to resume from.
+/// Most bytes of a console capture one read takes (a capture rotates at 64 MB).
+pub const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
+
+/// Bits of a [`ConsoleRead`] cursor holding the byte offset: 8 GiB, and a capture rotates at 64 MiB.
+const CURSOR_OFFSET_BITS: u32 = 33;
+/// Bits above them holding the file's tag. 53 in all: the cursor stays exact as a JSON number in a
+/// JavaScript client.
+const CURSOR_TAG_BITS: u32 = 20;
+/// How much of a capture's start tells one file from the next: its first record has a millisecond
+/// timestamp.
+const CURSOR_TAG_HEAD_BYTES: u64 = 256;
+
+/// One read of a console capture by cursor (see [`read_console_cursor`]).
+#[derive(Debug)]
+pub struct ConsoleRead {
+    pub lines: Vec<ConsoleLine>,
+    /// Byte offset to read on from, in the file this read ended in.
+    pub next: u64,
+    /// The read stopped at its `window` with more of the file left, or in a rotated file with the
+    /// new one to come: read on, even when no line limit was hit. A record still being written at
+    /// the end of the file does not count.
+    pub more: bool,
+    /// The cursor's file is gone: it rotated at least twice since, and lines were lost.
+    pub lost: bool,
+    /// The tag of the file this read ended in, if it has one yet.
+    tag: Option<u64>,
+}
+
+impl ConsoleRead {
+    /// The cursor for `offset` in the file this read ended in.
+    pub fn cursor(&self, offset: u64) -> u64 {
+        match self.tag {
+            Some(tag) if offset > 0 && offset < 1 << CURSOR_OFFSET_BITS => {
+                tag << CURSOR_OFFSET_BITS | offset
+            }
+            _ => offset,
+        }
+    }
+}
+
+/// Which capture file this is, from its first record; never 0 (a cursor without a tag). `None`
+/// until the first record is complete.
+fn capture_tag(path: &std::path::Path) -> Option<u64> {
+    use std::io::Read;
+    let mut head = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(CURSOR_TAG_HEAD_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    let first = match head.iter().position(|b| *b == b'\n') {
+        Some(end) => &head[..end],
+        None if head.len() as u64 == CURSOR_TAG_HEAD_BYTES => &head[..],
+        None => return None,
+    };
+    // FNV-1a: stable across builds and runs, as a cursor outlives neither but a test should not
+    // depend on a seed.
+    let hash = first.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+    });
+    Some((hash ^ (hash >> CURSOR_TAG_BITS)) & ((1 << CURSOR_TAG_BITS) - 1)).map(|tag| tag.max(1))
+}
+
+/// Read a console capture from a cursor [`ConsoleRead::cursor`] gave (or the last `tail_bytes`
+/// without one). `victauri run` renames a full capture to `.jsonl.1`, and the cursor holds the
+/// file's tag above the offset, so a rotation is seen wherever the offset lands: the unread tail is
+/// read from the rotated file and the new file from its start, and a second rotation is said rather
+/// than read past.
+///
+/// A bare offset (a line's `offset`, an older client's cursor) says nothing about its file, so a
+/// rotation shows only in where it lands: past the end, or not just after a line break. One landing
+/// exactly on a record boundary of the new file cannot be told apart, nor a second rotation.
 ///
 /// # Errors
 /// Returns an error when the file cannot be opened or read.
+pub fn read_console_cursor(
+    path: &std::path::Path,
+    since: Option<u64>,
+    tail_bytes: u64,
+    window: u64,
+) -> std::io::Result<ConsoleRead> {
+    let finish = |file: &std::path::Path, (lines, next, more), lost| ConsoleRead {
+        lines,
+        next,
+        more,
+        lost,
+        tag: capture_tag(file),
+    };
+    let rotated = path.with_extension("jsonl.1");
+    let Some(cursor) = since else {
+        let read = read_capture_window(path, None, tail_bytes, window)?;
+        return Ok(finish(path, read, false));
+    };
+    let tag = cursor >> CURSOR_OFFSET_BITS;
+    let offset = cursor & ((1 << CURSOR_OFFSET_BITS) - 1);
+    let (in_rotated, lost) = if tag == 0 {
+        let rotated_away =
+            offset > 0 && !at_record_boundary(path, offset) && at_record_boundary(&rotated, offset);
+        (rotated_away, false)
+    } else if capture_tag(path) == Some(tag) {
+        (false, false)
+    } else {
+        let in_rotated = capture_tag(&rotated) == Some(tag);
+        (in_rotated, !in_rotated)
+    };
+    if in_rotated {
+        let (lines, next, _) = read_capture_window(&rotated, Some(offset), 0, window)?;
+        // Read on from `next`: the new file is still to come. No progress: it is drained.
+        if next != offset {
+            return Ok(finish(&rotated, (lines, next, true), false));
+        }
+    }
+    let from = if in_rotated || lost { 0 } else { offset };
+    let read = read_capture_window(path, Some(from), tail_bytes, window)?;
+    Ok(finish(path, read, lost))
+}
+
+/// [`read_console_cursor`] as a plain offset reader, for the tests of its paging.
+#[cfg(test)]
+pub fn read_console_capture_window(
+    path: &std::path::Path,
+    from: Option<u64>,
+    tail_bytes: u64,
+    window: u64,
+) -> std::io::Result<(Vec<ConsoleLine>, u64, bool)> {
+    read_console_cursor(path, from, tail_bytes, window)
+        .map(|read| (read.lines, read.next, read.more))
+}
+
+/// [`read_console_capture_window`] with the usual window, without what it says about more.
+#[cfg(test)]
 pub fn read_console_capture(
     path: &std::path::Path,
     from: Option<u64>,
@@ -1929,42 +2054,6 @@ pub fn read_console_capture(
 ) -> std::io::Result<(Vec<ConsoleLine>, u64)> {
     read_console_capture_window(path, from, tail_bytes, CONSOLE_READ_WINDOW)
         .map(|(lines, next, _)| (lines, next))
-}
-
-/// Most bytes of a console capture one read takes (a capture rotates at 64 MB).
-pub const CONSOLE_READ_WINDOW: u64 = 16 * 1024 * 1024;
-
-/// [`read_console_capture`] that also says whether the read stopped at its `window` with more
-/// of the file left: a cursor reader must then read on from the returned offset even when no
-/// line limit was hit. A record still being written at the end of the file does not count.
-///
-/// A cursor is a byte offset and carries nothing that says which file it is for, so a rotation
-/// (`victauri run` renames a full capture to `.jsonl.1`) shows only in where the offset lands: past
-/// the end, or not just after a line break. Then the unread tail is read from the rotated file, and
-/// the new file from its start. An offset that happens to land exactly on a record boundary of the
-/// new file cannot be told apart, and neither can a second rotation between two reads.
-pub fn read_console_capture_window(
-    path: &std::path::Path,
-    from: Option<u64>,
-    tail_bytes: u64,
-    window: u64,
-) -> std::io::Result<(Vec<ConsoleLine>, u64, bool)> {
-    let mut from = from;
-    if let Some(cursor) = from
-        && cursor > 0
-        && !at_record_boundary(path, cursor)
-    {
-        let rotated = path.with_extension("jsonl.1");
-        if at_record_boundary(&rotated, cursor) {
-            let (lines, next, _) = read_capture_window(&rotated, Some(cursor), 0, window)?;
-            // Read on from `next`: the new file is still to come. No progress: it is drained.
-            if next != cursor {
-                return Ok((lines, next, true));
-            }
-            from = Some(0);
-        }
-    }
-    read_capture_window(path, from, tail_bytes, window)
 }
 
 /// Whether `offset` is inside `path` and just after a line break.

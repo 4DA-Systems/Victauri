@@ -703,7 +703,7 @@ Access all captured logs from the application.
 | `clear` | — | Clear the IPC + network logs (per-test isolation) |
 | `backend` | `level`, `target`, `filter`, `fields`, `since_seq`, `limit` | The Rust backend's own log: structured entries (typed fields, span context, thread, file:line) plus captured panics. Without `since_seq` the newest `limit` entries; with it the oldest after the cursor, and `next_seq` continues after them (read on while `truncated`) |
 | `backend_digest` | `limit` (top N per list, default 10) | Start here: counts per level, noisiest targets, repeated messages collapsed into templates, recent warnings/errors, every panic |
-| `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited. `since_seq` pages forward like `backend` |
+| `stdout` | `level`, `filter`, `since_seq`, `limit` | Raw stdout/stderr when the app was launched via `victauri run`, including how the process exited. `since_seq` pages forward like `backend`; `next_seq` is opaque (it also says which file of a rotated capture it is for), and `gap: true` says the capture rotated past it |
 
 **Options:**
 | Name | Type | Required | Description |
