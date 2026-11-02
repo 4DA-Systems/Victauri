@@ -51,6 +51,15 @@ pub fn liveness(pid: u32) -> Liveness {
     imp::liveness(pid)
 }
 
+/// Whether `pid` will do nothing more: gone, or (on Unix) a zombie waiting for its parent to reap
+/// it, which [`liveness`] calls alive as `kill -0` does. For a caller waiting on what the process
+/// does next. Discovery keeps [`liveness`]: an entry's token follows the entry, not this.
+#[doc(hidden)]
+#[must_use]
+pub fn is_gone(pid: u32) -> bool {
+    liveness(pid).is_dead() || imp::is_zombie(pid)
+}
+
 /// Whether `pid` is a live process owned by the current user.
 #[doc(hidden)]
 #[must_use]
@@ -404,6 +413,11 @@ mod imp {
         !owner.is_null() && is_acceptable_owner(owner)
     }
 
+    /// Windows has no such state: a process that ended reads as ended.
+    pub(super) fn is_zombie(_pid: u32) -> bool {
+        false
+    }
+
     pub(super) fn liveness(pid: u32) -> Liveness {
         if pid == 0 {
             return Liveness::Dead;
@@ -477,6 +491,32 @@ mod imp {
 
     pub(super) fn liveness(pid: u32) -> Liveness {
         liveness_with(pid, KILL_CANDIDATES, SH_CANDIDATES, Path::new("/proc"))
+    }
+
+    /// The state follows the `)` of the name, which can hold anything. Could not tell: not one.
+    #[cfg(target_os = "linux")]
+    pub(super) fn is_zombie(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit(')')
+                .next()
+                .is_some_and(|rest| rest.trim_start().starts_with(['Z', 'X']))
+        })
+    }
+
+    /// No `/proc` to read here (macOS). Could not tell: not one.
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn is_zombie(pid: u32) -> bool {
+        is_zombie_by_ps(pid)
+    }
+
+    #[cfg(any(test, not(target_os = "linux")))]
+    pub(super) fn is_zombie_by_ps(pid: u32) -> bool {
+        Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| out.stdout.trim_ascii_start().starts_with(b"Z"))
     }
 
     /// Testable core: try a `kill` binary, then a shell's builtin `kill`, then `/proc`.
@@ -571,11 +611,35 @@ mod imp {
     pub(super) fn liveness(_pid: u32) -> Liveness {
         Liveness::Unknown
     }
+
+    pub(super) fn is_zombie(_pid: u32) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `kill -0` calls a zombie alive, and a follower waiting on that launcher waits forever.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_is_gone_though_it_is_still_live_to_liveness() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        assert!(!is_gone(child.id()));
+        assert!(!imp::is_zombie_by_ps(child.id()));
+        child.kill().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(liveness(child.id()), Liveness::Own, "the old meaning stays");
+        assert!(is_gone(child.id()), "unreaped");
+        assert!(imp::is_zombie_by_ps(child.id()), "as macOS reads it");
+        child.wait().unwrap();
+        assert!(is_gone(child.id()), "reaped");
+        assert!(!is_gone(std::process::id()));
+    }
 
     #[test]
     fn the_current_process_is_own_and_live() {

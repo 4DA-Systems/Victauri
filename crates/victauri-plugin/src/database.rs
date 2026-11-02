@@ -890,7 +890,34 @@ fn deepest_view_chain(views: &[(String, usize)]) -> usize {
 // `unit_arg`: see `SetupOutcome`.
 #[allow(clippy::unit_arg)]
 fn check_schema_nesting(path: &Path) -> Result<(), String> {
-    const READ_SCHEMA: &str = "SELECT type, name, sql FROM sqlite_master";
+    check_schema_nesting_within(path, SCHEMA_CHECK_BUDGET)
+}
+
+/// The schema's text as `SQLite` loads it. Its load takes `sql` as text in the database's encoding
+/// whatever the stored type, so a BLOB counts, and in UTF-16 the raw bytes are not the text at all.
+/// `CAST` is that same conversion, and the text comes back as UTF-8 by the same route.
+#[cfg(feature = "sqlite")]
+const READ_SCHEMA: &str = "SELECT type, name, CAST(sql AS TEXT) FROM sqlite_master";
+
+/// A column of [`READ_SCHEMA`] as the text `SQLite` would parse. It parses a C string, so a NUL ends
+/// the text, however much the row holds past it.
+#[cfg(feature = "sqlite")]
+fn schema_entry_text(value: rusqlite::types::ValueRef<'_>) -> std::borrow::Cow<'_, str> {
+    match value {
+        rusqlite::types::ValueRef::Text(text) => {
+            String::from_utf8_lossy(text.split(|b| *b == 0).next().unwrap_or_default())
+        }
+        _ => std::borrow::Cow::Borrowed(""),
+    }
+}
+
+/// [`check_schema_nesting`] with the budget given. It passes a schema only when it read all of it
+/// in time: `SQLite` forgets an interrupt that lands while no statement runs, so the watchdog alone
+/// cannot promise that.
+#[cfg(feature = "sqlite")]
+#[allow(clippy::unit_arg)]
+fn check_schema_nesting_within(path: &Path, budget: Duration) -> Result<(), String> {
+    let started = Instant::now();
     let harden = |e: String| format!("failed to harden database connection: {e}");
     let conn = rusqlite::Connection::open_with_flags(
         path,
@@ -915,17 +942,19 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
     )
     .into_setup()
     .map_err(harden)?;
-    let _interrupt = InterruptGuard::arm(&conn, SCHEMA_CHECK_BUDGET);
-    let load_error = |e: rusqlite::Error| {
-        sqlite_query_error("failed to load database schema", e, SCHEMA_CHECK_BUDGET)
-    };
+    let _interrupt = InterruptGuard::arm(&conn, budget);
+    let load_error =
+        |e: rusqlite::Error| sqlite_query_error("failed to load database schema", e, budget);
     // The retry is for a schema entry that cannot be parsed. A lock has had its wait already, and
-    // waiting again would break the one short lock wait a query promises.
+    // waiting again would break the one short lock wait a query promises. Out of time is out of
+    // time: the watchdog fires once, so a second load would run with nothing to stop it.
     let mut stmt = conn
         .prepare(READ_SCHEMA)
         .or_else(|e| match e.sqlite_error_code() {
             Some(
-                rusqlite::ffi::ErrorCode::DatabaseBusy | rusqlite::ffi::ErrorCode::DatabaseLocked,
+                rusqlite::ffi::ErrorCode::DatabaseBusy
+                | rusqlite::ffi::ErrorCode::DatabaseLocked
+                | rusqlite::ffi::ErrorCode::OperationInterrupted,
             ) => Err(e),
             _ => conn.prepare(READ_SCHEMA),
         })
@@ -945,12 +974,7 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
             }
             Err(e) => return Err(load_error(e)),
         };
-        let Ok(text) = row.get_ref(2).map(|v| match v {
-            rusqlite::types::ValueRef::Text(t) | rusqlite::types::ValueRef::Blob(t) => {
-                String::from_utf8_lossy(t)
-            }
-            _ => std::borrow::Cow::Borrowed(""),
-        }) else {
+        let Ok(text) = row.get_ref(2).map(schema_entry_text) else {
             continue;
         };
         let (nesting, selects) = sql_nesting(&text);
@@ -991,6 +1015,12 @@ fn check_schema_nesting(path: &Path) -> Result<(), String> {
             "refusing to open this database: its views nest up to {view_nesting} levels when \
              chained (the limit is {MAX_SCHEMA_VIEW_NESTING}); expanding them could overflow the \
              stack and end the app"
+        ));
+    }
+    if started.elapsed() >= budget {
+        return Err(format!(
+            "refusing to open this database: checking its schema timed out after {} ms",
+            budget.as_millis()
         ));
     }
     Ok(())
@@ -3102,6 +3132,284 @@ mod tests {
         check_schema_nesting(&path).unwrap();
         let err = query(&path, "SELECT * FROM a", &[], None).unwrap_err();
         assert!(err.contains("circular"), "{err}");
+    }
+
+    /// A database in `encoding`, with schema rows holding exactly these bytes as a BLOB.
+    fn db_with_blob_schema_rows(
+        encoding: &str,
+        rows: &[(String, Vec<u8>)],
+    ) -> (tempfile::NamedTempFile, PathBuf) {
+        db_with_blob_schema_rows_on_pages(encoding, 4096, rows)
+    }
+
+    fn db_with_blob_schema_rows_on_pages(
+        encoding: &str,
+        page_size: usize,
+        rows: &[(String, Vec<u8>)],
+    ) -> (tempfile::NamedTempFile, PathBuf) {
+        let file = tempfile::NamedTempFile::with_suffix(".sqlite").unwrap();
+        let path = file.path().to_path_buf();
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA page_size={page_size}; PRAGMA encoding='{encoding}';
+             CREATE TABLE users(id INTEGER);
+             INSERT INTO users VALUES (1),(2),(3);
+             PRAGMA writable_schema=ON; BEGIN;"
+        ))
+        .unwrap();
+        for (name, sql) in rows {
+            conn.execute(
+                "INSERT INTO sqlite_master(type, name, tbl_name, rootpage, sql) \
+                 VALUES ('view', ?1, ?1, 0, ?2)",
+                rusqlite::params![name, sql],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+        (file, path)
+    }
+
+    /// `units` as the bytes `encoding` stores them in. Not `str`: some of these are invalid.
+    fn encoded(encoding: &str, units: &[u16]) -> Vec<u8> {
+        match encoding {
+            "UTF-16le" => units.iter().flat_map(|u| u.to_le_bytes()).collect(),
+            "UTF-16be" => units.iter().flat_map(|u| u.to_be_bytes()).collect(),
+            _ => units.iter().map(|u| *u as u8).collect(),
+        }
+    }
+
+    fn units(text: &str) -> Vec<u16> {
+        text.encode_utf16().collect()
+    }
+
+    const ENCODINGS: [&str; 3] = ["UTF-8", "UTF-16le", "UTF-16be"];
+
+    /// A schema row that is a BLOB is read as text in the database's own encoding, so in a UTF-16
+    /// database `C\0R\0E\0A\0...` loads as a view. Read as raw bytes it was never charged, and 2,200
+    /// such views at 100 nested SELECTs overflowed a 64 MiB stack.
+    #[test]
+    fn a_blob_schema_entry_is_refused_as_its_text_form_is() {
+        for encoding in ENCODINGS {
+            let rows: Vec<(String, Vec<u8>)> = view_chain(2_500)
+                .into_iter()
+                .map(|(name, sql)| (name, encoded(encoding, &units(&sql))))
+                .collect();
+            // It is a working view in that form, or none of this is the attack it claims to be.
+            let (_small, small) = db_with_blob_schema_rows(encoding, &rows[..3]);
+            let conn = rusqlite::Connection::open(&small).unwrap();
+            conn.prepare("SELECT * FROM v2").expect(encoding);
+
+            let (_f, path) = db_with_blob_schema_rows(encoding, &rows);
+            let err = check_schema_nesting(&path).expect_err(encoding);
+            assert!(err.contains("nest"), "{encoding}: {err}");
+
+            let deep = format!("CREATE VIEW deep AS {}", nested_select(MAX_SQL_NESTING + 1));
+            let rows = [("deep".to_string(), encoded(encoding, &units(&deep)))];
+            // Large pages keep it on one page: see the next test for one that spills over.
+            let (_f, path) = db_with_blob_schema_rows_on_pages(encoding, 65_536, &rows);
+            let err = check_schema_nesting(&path).expect_err(encoding);
+            assert!(err.contains("nest"), "{encoding}: {err}");
+        }
+    }
+
+    /// A UTF-16 BLOB that spills onto overflow pages is not transcoded by `SQLite`, neither for the
+    /// schema load nor for the `CAST`: the load sees `C` and calls the schema malformed, and the
+    /// check sees `C`, charges nothing, and leaves it to that load. On a larger page the same bytes
+    /// do load, and are charged. The reader only has to follow the load either way.
+    #[test]
+    fn a_long_utf16_blob_is_read_the_way_it_loads_on_either_page_size() {
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let sql = format!(
+                "CREATE VIEW v AS SELECT id {} FROM users",
+                " ".repeat(20_000)
+            );
+            let rows = [("v".to_string(), encoded(encoding, &units(&sql)))];
+
+            let (_f, path) = db_with_blob_schema_rows_on_pages(encoding, 4096, &rows);
+            check_schema_nesting(&path).expect(encoding);
+            let err = query(&path, "SELECT * FROM users", &[], None).expect_err(encoding);
+            assert!(err.contains("malformed"), "{encoding}: {err}");
+
+            let (_f, path) = db_with_blob_schema_rows_on_pages(encoding, 65_536, &rows);
+            let r = query(&path, "SELECT * FROM v", &[], None).expect(encoding);
+            assert_eq!(r["row_count"], 3, "{encoding}");
+            let (loaded, read) = {
+                let sql = format!(
+                    "CREATE VIEW v AS SELECT 1 {} AS [padded]",
+                    " ".repeat(9_000)
+                );
+                let rows = [("v".to_string(), encoded(encoding, &units(&sql)))];
+                let (_f, path) = db_with_blob_schema_rows_on_pages(encoding, 65_536, &rows);
+                loaded_and_read_column(&path)
+            };
+            assert_eq!(loaded.map(|l| l.to_ascii_lowercase()), read, "{encoding}");
+        }
+    }
+
+    /// The file that ended the host: 2,200 views at 100 nested SELECTs, in UTF-16 BLOBs. A stack
+    /// overflow ends the test process, so this test passing is itself the proof it did not happen.
+    #[test]
+    fn the_utf16_blob_chain_that_overflowed_the_stack_is_refused() {
+        let rows: Vec<(String, Vec<u8>)> = (0..2_200)
+            .map(|i| {
+                let from = if i == 0 {
+                    "users".to_string()
+                } else {
+                    format!("v{}", i - 1)
+                };
+                let sql = format!(
+                    "CREATE VIEW v{i} AS {}SELECT id FROM {from}{}",
+                    "SELECT id FROM (".repeat(100),
+                    ")".repeat(100)
+                );
+                (format!("v{i}"), encoded("UTF-16le", &units(&sql)))
+            })
+            .collect();
+        let (_f, path) = db_with_blob_schema_rows("UTF-16le", &rows);
+        let err = query(&path, "SELECT * FROM v2199", &[], None).unwrap_err();
+        assert!(err.contains("refusing"), "{err}");
+    }
+
+    /// The name of the view's one column as `SQLite` loaded it, and as the check read the text. Each
+    /// row's `AS [...]` is what is compared, so the two have to agree on where the name ends too.
+    fn loaded_and_read_column(path: &Path) -> (Option<String>, Option<String>) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let loaded = conn
+            .prepare("SELECT name FROM pragma_table_info('v')")
+            .and_then(|mut stmt| {
+                stmt.query_row([], |row| {
+                    Ok(String::from_utf8_lossy(row.get_ref(0)?.as_bytes()?).into_owned())
+                })
+            })
+            .ok();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.pragma_update(None, "writable_schema", true).unwrap();
+        let _ = conn.prepare(READ_SCHEMA);
+        let mut stmt = conn.prepare(READ_SCHEMA).unwrap();
+        let read = stmt
+            .query_map(
+                [],
+                |row| Ok(schema_entry_text(row.get_ref(2)?).into_owned()),
+            )
+            .unwrap()
+            .filter_map(Result::ok)
+            .find_map(|text| {
+                let words = sql_words(&text);
+                view_definition(&words)?;
+                words.iter().rfind(|w| w.quoted).map(|w| w.text.clone())
+            });
+        (loaded, read)
+    }
+
+    /// What the check reads is what `SQLite` loads, for a BLOB in each encoding: a high surrogate that
+    /// swallows the next character whatever it is, a character after a NUL, an odd byte at the end.
+    #[test]
+    fn the_check_reads_a_schema_entry_as_sqlite_loads_it() {
+        let view = |column: &[u16]| {
+            let mut sql = units("CREATE VIEW v AS SELECT 1 AS [");
+            sql.extend_from_slice(column);
+            sql
+        };
+        let mut cases: Vec<(&str, Vec<u16>)> = vec![
+            ("plain", view(&units("name]"))),
+            ("high surrogate eats the bracket", {
+                let mut column = units("x");
+                column.push(0xD800);
+                column.extend(units("]y]"));
+                view(&column)
+            }),
+            ("high surrogate at the very end of a name", {
+                let mut column = units("x");
+                column.push(0xD83D);
+                column.push(0xDE00);
+                column.extend(units("]"));
+                view(&column)
+            }),
+            ("lone low surrogate", {
+                let mut column = units("x");
+                column.push(0xDC00);
+                column.extend(units("]y]"));
+                view(&column)
+            }),
+            ("byte order mark inside", view(&units("a\u{feff}b]"))),
+            ("non-ASCII", view(&units("n\u{e4}me\u{4e16}]"))),
+        ];
+        let mut nul_after = view(&units("before]"));
+        nul_after.push(0);
+        nul_after.extend(units(" AS [after]"));
+        cases.push(("a NUL ends the text", nul_after));
+        for encoding in ENCODINGS {
+            for (what, sql) in &cases {
+                if encoding == "UTF-8" && sql.iter().any(|u| *u > 0x7f) {
+                    continue;
+                }
+                let rows = [("v".to_string(), encoded(encoding, sql))];
+                let (_f, path) = db_with_blob_schema_rows(encoding, &rows);
+                let (loaded, read) = loaded_and_read_column(&path);
+                let loaded = loaded.unwrap_or_else(|| panic!("{encoding} {what}: did not load"));
+                assert_eq!(Some(loaded.to_ascii_lowercase()), read, "{encoding} {what}");
+            }
+        }
+        // Invalid UTF-8, and an odd byte a UTF-16 reader has to drop.
+        let mut raw = b"CREATE VIEW v AS SELECT 1 AS [a".to_vec();
+        raw.extend([0xff, 0xc0]);
+        raw.extend(b"b]");
+        let rows = [("v".to_string(), raw)];
+        let (_f, path) = db_with_blob_schema_rows("UTF-8", &rows);
+        let (loaded, read) = loaded_and_read_column(&path);
+        assert_eq!(loaded.map(|l| l.to_ascii_lowercase()), read);
+        for encoding in ["UTF-16le", "UTF-16be"] {
+            let mut raw = encoded(encoding, &view(&units("odd]")));
+            raw.push(b'(');
+            let rows = [("v".to_string(), raw)];
+            let (_f, path) = db_with_blob_schema_rows(encoding, &rows);
+            let (loaded, read) = loaded_and_read_column(&path);
+            assert_eq!(loaded.as_deref(), Some("odd"), "{encoding}");
+            assert_eq!(read.as_deref(), Some("odd"), "{encoding}");
+        }
+    }
+
+    /// `SQLite` stops at a NUL, so what follows one costs nothing, and what comes before it is
+    /// charged in full. Text after it cannot hide or inflate the view.
+    #[test]
+    fn a_nul_in_a_schema_entry_ends_what_is_charged() {
+        for encoding in ENCODINGS {
+            let mut harmless = units("CREATE VIEW v AS SELECT id FROM users");
+            harmless.push(0);
+            harmless.extend(units(&"(".repeat(MAX_SQL_NESTING + 1)));
+            let rows = [("v".to_string(), encoded(encoding, &harmless))];
+            let (_f, path) = db_with_blob_schema_rows(encoding, &rows);
+            check_schema_nesting(&path).expect(encoding);
+            let r = query(&path, "SELECT * FROM v", &[], None).expect(encoding);
+            assert_eq!(r["row_count"], 3, "{encoding}");
+
+            let rows: Vec<(String, Vec<u8>)> = view_chain(2_500)
+                .into_iter()
+                .map(|(name, sql)| {
+                    let mut sql = units(&sql);
+                    sql.push(0);
+                    sql.extend(units("'"));
+                    (name, encoded(encoding, &sql))
+                })
+                .collect();
+            let (_f, path) = db_with_blob_schema_rows(encoding, &rows);
+            let err = check_schema_nesting(&path).expect_err(encoding);
+            assert!(err.contains("nest"), "{encoding}: {err}");
+        }
+    }
+
+    /// The check's verdict covers a schema it read in time. An interrupt that lands while nothing
+    /// runs is forgotten by `SQLite`, and one that stopped the schema load used to get a second,
+    /// unbudgeted load: both passed the file.
+    #[test]
+    fn a_schema_the_check_runs_out_of_time_on_is_refused() {
+        // Within every limit, so running out of time is the only reason to refuse it.
+        let (_f, path) = db_with_schema_rows(&view_chain(900));
+        check_schema_nesting_within(&path, Duration::from_secs(300)).unwrap();
+        for budget in [Duration::ZERO, Duration::from_millis(1)] {
+            let err = check_schema_nesting_within(&path, budget).expect_err("out of time");
+            assert!(err.contains("timed out"), "{err}");
+        }
     }
 
     /// The text of every view has to be held to work out the chains, so it is bounded.

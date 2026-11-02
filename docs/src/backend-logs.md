@@ -180,8 +180,8 @@ registry.init();
   tree; on Unix a small helper process, the direct child only, so what `npm` started may stay and
   its next console write fails: a `println!` then panics on the broken pipe). It records nothing,
   so `victauri logs` ends such a capture with an `EXIT` line saying the exit is unknown, and `logs
-  stdout` reports `launcher_gone` while the app lives on. A `--capture` file's name does not hold
-  the launcher's pid, so neither can say so for one.
+  stdout` reports `launcher_gone` while the app lives on. Only a capture `victauri run` named itself
+  has a launcher they can ask about, so neither can say so for a `--capture` file.
 
 ## A server that stays up when the app hangs
 

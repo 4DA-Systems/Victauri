@@ -32,6 +32,9 @@ use anyhow::{Context, Result, bail};
 
 /// Environment variable carrying the capture-file path to the app (read by the plugin).
 pub const CONSOLE_CAPTURE_ENV: &str = "VICTAURI_CONSOLE_LOG";
+/// Environment variable carrying this launcher's pid to the app, when it named the capture itself:
+/// `logs stdout` says so when the launcher is killed. A `--capture` file's name is the user's.
+pub const CONSOLE_LAUNCHER_ENV: &str = "VICTAURI_CONSOLE_LAUNCHER";
 /// Rotate the capture file past this size (the previous file is kept as `.1`).
 const MAX_CAPTURE_BYTES: u64 = 64 * 1024 * 1024;
 /// Longest line stored in the capture (the terminal still gets all of it).
@@ -115,14 +118,16 @@ fn capture_group(file_name: &str) -> Option<(u32, &str)> {
     Some((pid.parse().ok()?, base))
 }
 
-/// The pid of the `victauri run` that wrote the capture at `path`, when its name holds one (a
-/// `--capture` file's does not) and that process is definitely gone. A reused pid just looks alive.
+/// The pid of the `victauri run` that wrote the capture at `path`, when it named the file itself
+/// (one in the private directory: a `--capture` file's name is the user's, and may only look like
+/// a pid) and that process is definitely gone. A reused pid just looks alive.
 #[must_use]
 pub fn dead_launcher(path: &Path) -> Option<u32> {
+    if !is_own_capture(path) {
+        return None;
+    }
     let (pid, _) = capture_group(path.file_name()?.to_str()?)?;
-    victauri_test::process::liveness(pid)
-        .is_dead()
-        .then_some(pid)
+    victauri_test::process::is_gone(pid).then_some(pid)
 }
 
 /// Delete old captures of apps that are gone: those past [`CAPTURE_MAX_AGE`], then all but the
@@ -484,6 +489,19 @@ fn on_stop_signal(
 #[cfg(unix)]
 struct DeathWatch(std::process::Child);
 
+/// See [`DeathWatch`]. `$1` is the child, `$2` how long it gets after SIGTERM.
+#[cfg(unix)]
+const DEATH_WATCH_SCRIPT: &str = "trap '' INT HUP TERM\n\
+     read -r disarmed\n\
+     [ -n \"$disarmed\" ] && exit 0\n\
+     kill -s TERM \"$1\" 2>/dev/null || exit 0\n\
+     i=0\n\
+     while [ \"$i\" -lt \"$2\" ] && kill -0 \"$1\" 2>/dev/null; do\n\
+     sleep 1\n\
+     i=$((i + 1))\n\
+     done\n\
+     kill -0 \"$1\" 2>/dev/null && kill -s KILL \"$1\"\n";
+
 #[cfg(unix)]
 impl DeathWatch {
     /// `None` when no shell can be started: the app still runs, unguarded as it always was.
@@ -491,16 +509,7 @@ impl DeathWatch {
         Command::new("sh")
             .args([
                 "-c",
-                "trap '' INT HUP TERM\n\
-                 read -r disarmed\n\
-                 [ -n \"$disarmed\" ] && exit 0\n\
-                 kill -s TERM \"$1\" 2>/dev/null || exit 0\n\
-                 i=0\n\
-                 while [ \"$i\" -lt \"$2\" ] && kill -0 \"$1\" 2>/dev/null; do\n\
-                 sleep 1\n\
-                 i=$((i + 1))\n\
-                 done\n\
-                 kill -s KILL \"$1\" 2>/dev/null\n",
+                DEATH_WATCH_SCRIPT,
                 "victauri-run-watch",
                 &child_pid.to_string(),
                 &STOP_KILL_AFTER.as_secs().to_string(),
@@ -637,6 +646,16 @@ pub fn describe_exit(status: ExitStatus) -> String {
     }
 }
 
+/// Hand the app this launcher's pid when it named the capture. Otherwise clear it: an outer `victauri
+/// run` may have set it, for a capture this is not.
+fn say_who_launched(command: &mut Command, names_its_capture: bool) {
+    if names_its_capture {
+        command.env(CONSOLE_LAUNCHER_ENV, std::process::id().to_string());
+    } else {
+        command.env_remove(CONSOLE_LAUNCHER_ENV);
+    }
+}
+
 /// Run `argv` under capture, returning the child's exit code.
 ///
 /// # Errors
@@ -648,6 +667,7 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
             "usage: victauri run -- <command> [args...]   e.g. victauri run -- npm run tauri dev"
         );
     };
+    let names_its_capture = capture_file.is_none();
     let path = match capture_file {
         // Absolute: the path is handed to the app, which may run from another directory
         // (`tauri dev` starts it in src-tauri), and a relative one would then name another file.
@@ -686,9 +706,10 @@ pub fn run(argv: &[String], capture_file: Option<PathBuf>) -> Result<i32> {
     let _ = ctrlc::set_handler(|| {});
 
     let resolved = resolve_program(program);
-    let child = Command::new(&resolved)
-        .args(args)
-        .env(CONSOLE_CAPTURE_ENV, &path)
+    let mut command = Command::new(&resolved);
+    command.args(args).env(CONSOLE_CAPTURE_ENV, &path);
+    say_who_launched(&mut command, names_its_capture);
+    let child = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -902,6 +923,102 @@ mod tests {
         ] {
             assert_eq!(capture_group(other), None, "{other}");
         }
+    }
+
+    /// The app learns the launcher's pid only from a launcher that named the capture, and a
+    /// `--capture` run under another `victauri run` must not pass on the outer one's.
+    #[test]
+    fn only_a_capture_run_named_tells_the_app_its_pid() {
+        let told = |names_its_capture| {
+            let mut command = Command::new("x");
+            say_who_launched(&mut command, names_its_capture);
+            command
+                .get_envs()
+                .find(|(name, _)| *name == CONSOLE_LAUNCHER_ENV)
+                .map(|(_, value)| value.map(std::ffi::OsStr::to_os_string))
+        };
+        assert_eq!(
+            told(true),
+            Some(Some(std::process::id().to_string().into()))
+        );
+        assert_eq!(told(false), Some(None), "removed from what it inherits");
+    }
+
+    /// The helper's last word goes to a child still there: after the wait it may have exited, and
+    /// its pid may be another process's by now.
+    #[cfg(unix)]
+    #[test]
+    fn the_helper_sends_no_kill_to_a_child_that_already_went() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("kill.log");
+        // `kill` as the helper's shell sees it: SIGTERM lands, and then the child is gone.
+        let script = format!(
+            "kill() {{ echo \"$*\" >> '{}'; [ \"$1\" != -0 ]; }}\n{DEATH_WATCH_SCRIPT}",
+            log.display()
+        );
+        let status = Command::new("sh")
+            .args(["-c", &script, "victauri-run-watch", "4242", "10"])
+            .stdin(Stdio::null())
+            .status()
+            .unwrap();
+        let _ = status;
+        let log = std::fs::read_to_string(&log).unwrap();
+        assert!(log.contains("-s TERM 4242"), "{log}");
+        assert!(!log.contains("-s KILL"), "{log}");
+    }
+
+    /// `victauri logs --stdout --follow` waits on this: a killed launcher its parent has not reaped
+    /// is gone too, and `kill -0` said alive, so the follow never ended.
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_launcher_is_a_dead_one() {
+        let mut child = Command::new("sleep").arg("60").spawn().unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let own = capture_dir()
+            .unwrap()
+            .join(format!("{pid}-{}.jsonl", now_ms()));
+        std::fs::write(&own, "").unwrap();
+        let found = dead_launcher(&own);
+        let _ = std::fs::remove_file(&own);
+        child.wait().unwrap();
+        assert_eq!(found, Some(pid));
+    }
+
+    /// A pid that is certainly gone: a reaped child's, its handle still held by no one.
+    fn dead_pid() -> u32 {
+        let mut child = Command::new(if cfg!(windows) { "cmd" } else { "true" })
+            .args(if cfg!(windows) {
+                &["/C", "exit"][..]
+            } else {
+                &[][..]
+            })
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// A `--capture` file's name is the user's: `20261102-120000.jsonl` holds no pid, however much
+    /// it looks like one, and calling that launcher dead ended a live follow. Only a capture in the
+    /// private directory is named by `victauri run`.
+    #[test]
+    fn only_a_capture_run_named_itself_has_a_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join(format!("{}-120000.jsonl", dead_pid()));
+        std::fs::write(&elsewhere, "").unwrap();
+        assert_eq!(dead_launcher(&elsewhere), None);
+
+        let pid = dead_pid();
+        let own = capture_dir()
+            .unwrap()
+            .join(format!("{pid}-{}.jsonl", now_ms()));
+        std::fs::write(&own, "").unwrap();
+        let found = dead_launcher(&own);
+        let _ = std::fs::remove_file(&own);
+        assert_eq!(found, Some(pid));
     }
 
     /// A shell one-liner that prints to both streams and exits 3.

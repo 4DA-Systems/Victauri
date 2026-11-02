@@ -1032,21 +1032,28 @@ fn a_capture_says_when_its_launcher_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("4242-1730000000000.jsonl");
     std::fs::write(&path, capture_record(0, "line")).unwrap();
-    assert_eq!(launcher_gone(&path, |pid| pid == 4242), Some(4242));
     assert_eq!(
-        launcher_gone(&path, |_| false),
+        launcher_gone(&path, Some(4242), |pid| pid == 4242),
+        Some(4242)
+    );
+    assert_eq!(
+        launcher_gone(&path, Some(4242), |_| false),
         None,
         "the launcher is alive"
     );
 
     let exit = "{\"t\":9,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n";
     std::fs::write(&path, format!("{}{exit}", capture_record(0, "line"))).unwrap();
-    assert_eq!(launcher_gone(&path, |_| true), None, "it said how it ended");
+    assert_eq!(
+        launcher_gone(&path, Some(4242), |_| true),
+        None,
+        "it said how it ended"
+    );
 
-    // A `--capture` file has no pid in its name.
-    let named = dir.path().join("my-capture.jsonl");
+    // A `--capture` file's launcher does not say: a name that looks like a pid is not one.
+    let named = dir.path().join("20261102-120000.jsonl");
     std::fs::write(&named, capture_record(0, "line")).unwrap();
-    assert_eq!(launcher_gone(&named, |_| true), None);
+    assert_eq!(launcher_gone(&named, None, |_| true), None);
 }
 
 /// An exit record carries up to 12 stderr lines of 64 KiB: the tail read must hold all of it.
@@ -1057,7 +1064,7 @@ fn a_long_exit_record_is_seen_as_one() {
     let tail: Vec<String> = (0..12).map(|_| "x".repeat(64 * 1024)).collect();
     let exit = serde_json::json!({"t": 9, "s": "exit", "l": "crashed", "tail": tail});
     std::fs::write(&path, format!("{}{exit}\n", capture_record(0, "line"))).unwrap();
-    assert_eq!(launcher_gone(&path, |_| true), None);
+    assert_eq!(launcher_gone(&path, Some(4242), |_| true), None);
 }
 
 /// On Linux, a real process: a zombie its parent has not reaped is gone too.
@@ -1069,12 +1076,16 @@ fn a_dead_process_is_seen_as_dead() {
         .spawn()
         .unwrap();
     assert!(!process_is_dead(child.id()));
+    assert!(!process_is_dead_by_shell(child.id()));
     child.kill().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(process_is_dead(child.id()), "unreaped");
+    assert!(process_is_dead_by_shell(child.id()), "unreaped, by ps");
     child.wait().unwrap();
     assert!(process_is_dead(child.id()), "reaped");
+    assert!(process_is_dead_by_shell(child.id()), "reaped, by kill");
     assert!(!process_is_dead(std::process::id()));
+    assert!(!process_is_dead_by_shell(std::process::id()));
 }
 
 /// A bare offset cannot see a rotation whose new file has a record boundary exactly there: the
@@ -1431,4 +1442,83 @@ fn fmt_builder_recipe_captures() {
 fn a_none_layer_is_inert() {
     let subscriber = tracing_subscriber::registry().with(None::<BackendLogLayer>);
     tracing::subscriber::with_default(subscriber, || tracing::info!(target: "app", "fine"));
+}
+
+/// A reader racing a writer that rotates as `victauri run` does: every line arrives once or is
+/// reported lost. The tag and the bytes used to come from two opens, so a rotation between them read
+/// the new file from an offset meant for the old one, and the lines before it went unsaid.
+#[test]
+fn a_reader_racing_rotations_loses_no_line_silently() {
+    use std::io::Write as _;
+    const TOTAL: u64 = 150_000;
+    const ROTATE_AT: u64 = 80_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("c.jsonl");
+    let write_line = |file: &mut std::fs::File, i: u64| {
+        let line = format!(
+            "{{\"t\":{i},\"s\":\"out\",\"l\":\"{i} {}\"}}\n",
+            "x".repeat(60)
+        );
+        file.write_all(line.as_bytes()).unwrap();
+        line.len() as u64
+    };
+    let mut first = std::fs::File::create(&path).unwrap();
+    let mut written = write_line(&mut first, 0);
+    let writer = {
+        let path = path.clone();
+        std::thread::spawn(move || {
+            let mut file = first;
+            let mut rotations = 0u32;
+            for i in 1..TOTAL {
+                written += write_line(&mut file, i);
+                if written >= ROTATE_AT {
+                    drop(file);
+                    // A reader may hold either file open: renaming has to work regardless.
+                    std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+                    file = std::fs::File::create(&path).unwrap();
+                    written = 0;
+                    rotations += 1;
+                }
+                if i % 200 == 0 {
+                    std::thread::sleep(std::time::Duration::from_micros(200));
+                }
+            }
+            rotations
+        })
+    };
+    let mut cursor = 0;
+    let mut expected = 0u64;
+    let (mut silent, mut reported, mut duplicates) = (0u64, 0u64, 0u64);
+    let give_up = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while expected < TOTAL && std::time::Instant::now() < give_up {
+        // The instant between the rename and the new file has no file: the tool says so, and the
+        // next call reads on.
+        let Ok(read) = read_console_cursor(&path, Some(cursor), 1 << 20, 1 << 24) else {
+            continue;
+        };
+        for line in &read.lines {
+            let i: u64 = line.text.split(' ').next().unwrap().parse().unwrap();
+            if i < expected {
+                duplicates += 1;
+                continue;
+            }
+            if i > expected {
+                if read.lost {
+                    reported += i - expected;
+                } else {
+                    silent += i - expected;
+                }
+            }
+            expected = i + 1;
+        }
+        cursor = read.cursor(read.next);
+    }
+    let rotations = writer.join().unwrap();
+    assert!(rotations > 100, "{rotations} rotations");
+    assert_eq!(
+        (silent, duplicates),
+        (0, 0),
+        "silently lost, duplicated; reported lost {reported}, over {rotations} rotations"
+    );
+    assert_eq!(expected, TOTAL, "reported lost {reported}");
 }

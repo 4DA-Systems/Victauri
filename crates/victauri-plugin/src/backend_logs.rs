@@ -1884,6 +1884,16 @@ pub fn trim_backtrace(raw: &str) -> String {
 /// the app's stdout/stderr lines to.
 pub const CONSOLE_CAPTURE_ENV: &str = "VICTAURI_CONSOLE_LOG";
 
+/// Environment variable `victauri run` sets on the app when it named the capture itself: its own
+/// pid. A `--capture` file gets none: nothing in its name is ours to read.
+pub const CONSOLE_LAUNCHER_ENV: &str = "VICTAURI_CONSOLE_LAUNCHER";
+
+/// The pid of the `victauri run` this app was started under, when it said.
+#[must_use]
+pub fn console_launcher_pid() -> Option<u32> {
+    std::env::var(CONSOLE_LAUNCHER_ENV).ok()?.parse().ok()
+}
+
 /// Path of the out-of-process console capture, when the app runs under `victauri run`.
 #[must_use]
 pub fn console_capture_path() -> Option<std::path::PathBuf> {
@@ -1925,14 +1935,15 @@ const EXIT_RECORD_MAX_BYTES: u64 = 2 * 1024 * 1024;
 
 /// The pid of the `victauri run` that wrote the capture at `path`, when that process is gone and
 /// the capture does not say how the app ended: it was killed outright. Then nothing more will reach
-/// the capture, though this app lives on. The pid comes from the capture's name (`<pid>-<ms>.jsonl`);
-/// a `--capture` file's name holds none.
+/// the capture, though this app lives on. `launcher` is [`console_launcher_pid`].
 #[must_use]
-pub fn launcher_gone(path: &std::path::Path, is_dead: impl Fn(u32) -> bool) -> Option<u32> {
-    let name = path.file_name()?.to_str()?;
-    let (pid, ms) = name.strip_suffix(".jsonl")?.split_once('-')?;
-    let pid: u32 = pid.parse().ok()?;
-    if ms.is_empty() || !ms.bytes().all(|b| b.is_ascii_digit()) || !is_dead(pid) {
+pub fn launcher_gone(
+    path: &std::path::Path,
+    launcher: Option<u32>,
+    is_dead: impl Fn(u32) -> bool,
+) -> Option<u32> {
+    let pid = launcher?;
+    if !is_dead(pid) {
         return None;
     }
     let (lines, _, _) =
@@ -1957,20 +1968,28 @@ pub fn process_is_dead(pid: u32) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        // The shell builtin, as `victauri run` signals: `kill` is not a binary everywhere.
-        std::process::Command::new("sh")
-            .args(["-c", "kill -0 \"$1\"", "victauri-plugin", &pid.to_string()])
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| !status.success())
+        process_is_dead_by_shell(pid)
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
         false
     }
+}
+
+/// [`process_is_dead`] where there is no `/proc`. The shell builtin, as `victauri run` signals:
+/// `kill` is not a binary everywhere. A zombie is gone too, and `kill -0` cannot tell, but `ps` can.
+#[cfg(all(unix, any(test, not(target_os = "linux"))))]
+fn process_is_dead_by_shell(pid: u32) -> bool {
+    const IS_RUNNING: &str = "kill -0 \"$1\" 2>/dev/null || exit 1\n\
+                              case \"$(ps -o stat= -p \"$1\" 2>/dev/null)\" in Z*) exit 1 ;; esac\n";
+    std::process::Command::new("sh")
+        .args(["-c", IS_RUNNING, "victauri-plugin", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| !status.success())
 }
 
 /// Bits of a [`ConsoleRead`] cursor holding the byte offset: 8 GiB, and a capture rotates at 64 MiB.
@@ -2010,14 +2029,19 @@ impl ConsoleRead {
     }
 }
 
-/// Which capture file this is, from its first record; never 0 (a cursor without a tag). `None`
-/// until the first record is complete.
+/// Which capture file `path` is, as [`file_tag`] says.
+#[cfg(test)]
 fn capture_tag(path: &std::path::Path) -> Option<u64> {
-    use std::io::Read;
+    file_tag(&mut std::fs::File::open(path).ok()?)
+}
+
+/// Which capture file this is, from its first record; never 0 (a cursor without a tag). `None`
+/// until the first record is complete. It leaves the file's position wherever the read ended.
+fn file_tag(file: &mut std::fs::File) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).ok()?;
     let mut head = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(CURSOR_TAG_HEAD_BYTES)
+    file.take(CURSOR_TAG_HEAD_BYTES)
         .read_to_end(&mut head)
         .ok()?;
     let first = match head.iter().position(|b| *b == b'\n') {
@@ -2043,6 +2067,11 @@ fn capture_tag(path: &std::path::Path) -> Option<u64> {
 /// rotation shows only in where it lands: past the end, or not just after a line break. One landing
 /// exactly on a record boundary of the new file cannot be told apart, nor a second rotation.
 ///
+/// Which file a cursor belongs to and the bytes read from it come from one open handle, as the
+/// names can move on between two opens: a rename leaves an open file open, on Windows too, where
+/// Rust opens with `FILE_SHARE_DELETE`. `path` is opened first and `.jsonl.1` after, so the rotated
+/// file can only be newer than what `path` showed. A cursor whose file is in neither is gone.
+///
 /// # Errors
 /// Returns an error when the file cannot be opened or read.
 pub fn read_console_cursor(
@@ -2051,40 +2080,74 @@ pub fn read_console_cursor(
     tail_bytes: u64,
     window: u64,
 ) -> std::io::Result<ConsoleRead> {
-    let finish = |file: &std::path::Path, (lines, next, more), lost| ConsoleRead {
+    // Asked after reading: a record it read makes the file's tag, even one written just now.
+    let finish = |file: &mut std::fs::File, (lines, next, more), lost| ConsoleRead {
         lines,
         next,
         more,
         lost,
-        tag: capture_tag(file),
+        tag: file_tag(file),
     };
-    let rotated = path.with_extension("jsonl.1");
     let Some(cursor) = since else {
-        let read = read_capture_window(path, None, tail_bytes, window)?;
-        return Ok(finish(path, read, false));
+        let mut file = std::fs::File::open(path)?;
+        let read = read_open_capture(&mut file, None, tail_bytes, window)?;
+        return Ok(finish(&mut file, read, false));
     };
     let tag = cursor >> CURSOR_OFFSET_BITS;
     let offset = cursor & ((1 << CURSOR_OFFSET_BITS) - 1);
+    // Missing for an instant, between the launcher's rename and its new file.
+    let mut current = std::fs::File::open(path);
+    let current_tag = current.as_mut().ok().and_then(file_tag);
+    let needs_rotated = if tag == 0 {
+        offset > 0
+    } else {
+        current_tag != Some(tag)
+    };
+    let mut rotated = needs_rotated
+        .then(|| std::fs::File::open(path.with_extension("jsonl.1")).ok())
+        .flatten();
     let (in_rotated, lost) = if tag == 0 {
-        let rotated_away =
-            offset > 0 && !at_record_boundary(path, offset) && at_record_boundary(&rotated, offset);
+        let rotated_away = offset > 0
+            && !current
+                .as_mut()
+                .is_ok_and(|file| at_record_boundary(file, offset))
+            && rotated
+                .as_mut()
+                .is_some_and(|file| at_record_boundary(file, offset));
         (rotated_away, false)
-    } else if capture_tag(path) == Some(tag) {
+    } else if current_tag == Some(tag) {
         (false, false)
     } else {
-        let in_rotated = capture_tag(&rotated) == Some(tag);
+        let in_rotated = rotated.as_mut().and_then(file_tag) == Some(tag);
         (in_rotated, !in_rotated)
     };
-    if in_rotated {
-        let (lines, next, _) = read_capture_window(&rotated, Some(offset), 0, window)?;
-        // Read on from `next`: the new file is still to come. No progress: it is drained.
+    if in_rotated && let Some(old) = rotated.as_mut() {
+        let (lines, next, _) = read_open_capture(old, Some(offset), 0, window)?;
+        // Read on from `next`: the new file is still to come.
         if next != offset {
-            return Ok(finish(&rotated, (lines, next, true), false));
+            return Ok(finish(old, (lines, next, true), false));
+        }
+        // Drained. A new file with no record yet gives no tag to hold on to, and a bare 0 could
+        // not see the next rotation: wait here, where a rotation still shows.
+        if current.as_mut().ok().and_then(file_tag).is_none() {
+            return Ok(finish(old, (lines, next, false), false));
         }
     }
+    // Gone, and the new file has no record yet: the same wait, and the loss is said when there is
+    // a file to read on from.
+    if lost && current.as_mut().ok().and_then(file_tag).is_none() {
+        return Ok(ConsoleRead {
+            lines: Vec::new(),
+            next: offset,
+            more: false,
+            lost: false,
+            tag: Some(tag),
+        });
+    }
     let from = if in_rotated || lost { 0 } else { offset };
-    let read = read_capture_window(path, Some(from), tail_bytes, window)?;
-    Ok(finish(path, read, lost))
+    let mut current = current?;
+    let read = read_open_capture(&mut current, Some(from), tail_bytes, window)?;
+    Ok(finish(&mut current, read, lost))
 }
 
 /// [`read_console_cursor`] as a plain offset reader, for the tests of its paging.
@@ -2110,16 +2173,12 @@ pub fn read_console_capture(
         .map(|(lines, next, _)| (lines, next))
 }
 
-/// Whether `offset` is inside `path` and just after a line break.
-fn at_record_boundary(path: &std::path::Path, offset: u64) -> bool {
+/// Whether `offset` is inside `file` and just after a line break.
+fn at_record_boundary(file: &mut std::fs::File, offset: u64) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let mut byte = [0u8; 1];
-    std::fs::File::open(path)
-        .and_then(|mut file| {
-            file.seek(SeekFrom::Start(offset - 1))?;
-            file.read_exact(&mut byte)
-        })
-        .is_ok()
+    file.seek(SeekFrom::Start(offset - 1)).is_ok()
+        && file.read_exact(&mut byte).is_ok()
         && byte[0] == b'\n'
 }
 
@@ -2129,8 +2188,16 @@ fn read_capture_window(
     tail_bytes: u64,
     window: u64,
 ) -> std::io::Result<(Vec<ConsoleLine>, u64, bool)> {
+    read_open_capture(&mut std::fs::File::open(path)?, from, tail_bytes, window)
+}
+
+fn read_open_capture(
+    file: &mut std::fs::File,
+    from: Option<u64>,
+    tail_bytes: u64,
+    window: u64,
+) -> std::io::Result<(Vec<ConsoleLine>, u64, bool)> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let mut start = from.unwrap_or_else(|| len.saturating_sub(tail_bytes));
     if start > len {

@@ -19,6 +19,7 @@ import {
   resetOwnerCheckBackoff,
   resolveConnection,
   scanServers,
+  settlePortClaims,
 } from "../src/discovery";
 
 const app = (port: number, token: string, identifier: string, pid = port): DiscoveredServer => ({
@@ -363,5 +364,46 @@ test("windows: a planted directory reached through a junction inside the profile
     assert.equal(await dirIsTrusted(inside, { profileDir: profile }), true);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("claims a server refused all stay ambiguous, never 'no app'", async () => {
+  const server = http.createServer((_req, res) => {
+    res.statusCode = 401;
+    res.end();
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const stale = app(port, "stale", "com.a", 1);
+    const noToken: DiscoveredServer = { port, identifier: "com.a", pid: 2 };
+    assert.deepEqual(await settlePortClaims([noToken, stale]), [noToken, stale]);
+    const other = app(port, "other", "com.a", 3);
+    assert.deepEqual(await settlePortClaims([stale, other]), [stale, other]);
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test("asking about claims has a total budget across silent ports", async () => {
+  const servers: http.Server[] = [];
+  const live: DiscoveredServer[] = [];
+  for (let i = 0; i < 6; i++) {
+    const silent = http.createServer(() => {});
+    await new Promise<void>((r) => silent.listen(0, "127.0.0.1", r));
+    servers.push(silent);
+    const port = (silent.address() as AddressInfo).port;
+    live.push(app(port, "a", "com.a", 10 + 2 * i), app(port, "b", "com.a", 11 + 2 * i));
+  }
+  try {
+    const started = Date.now();
+    assert.equal((await settlePortClaims(live)).length, live.length);
+    assert.ok(Date.now() - started < 3200, `${Date.now() - started} ms`);
+  } finally {
+    for (const silent of servers) {
+      silent.closeAllConnections();
+      silent.close();
+    }
   }
 });

@@ -485,11 +485,10 @@ fn final_moments<'a>(lines: &'a [Value], since_ts_ms: u64, opts: &LogsOptions) -
 }
 
 fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
-    let Ok((lines, _)) = read_capture(path, None) else {
+    let Ok((lines, _, unknown)) = read_capture_and_end(path, crate::run::dead_launcher) else {
         return;
     };
     let picked = final_moments(&lines, since_ts_ms, opts);
-    let unknown = unknown_exit(path, &lines);
     if picked.is_empty() && unknown.is_none() {
         return;
     }
@@ -504,11 +503,10 @@ fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
 /// killed outright). A record in the shape of the launcher's own, so a monitor reading stdout sees
 /// it too; `unknown` tells it from one the launcher wrote. It is not written to the capture. `lines`
 /// are the capture's newest records, where an exit record would be.
-fn unknown_exit(path: &Path, lines: &[Value]) -> Option<Value> {
+fn unknown_exit(pid: u32, lines: &[Value]) -> Option<Value> {
     if lines.iter().any(|l| l["s"] == "exit") {
         return None;
     }
-    let pid = crate::run::dead_launcher(path)?;
     let at = lines
         .last()
         .and_then(|l| l["t"].as_u64())
@@ -523,6 +521,18 @@ fn unknown_exit(path: &Path, lines: &[Value]) -> Option<Value> {
         "tail": [],
         "unknown": true,
     }))
+}
+
+/// A capture's newest records, where they end, and [`unknown_exit`]'s record if it has one.
+fn read_capture_and_end(
+    path: &Path,
+    dead_launcher: impl Fn(&Path) -> Option<u32>,
+) -> Result<(Vec<Value>, u64, Option<Value>)> {
+    // Dead first, then read: what it wrote before it was gone is then in the read.
+    let gone = dead_launcher(path);
+    let (lines, offset) = read_capture(path, None)?;
+    let unknown = gone.and_then(|pid| unknown_exit(pid, &lines));
+    Ok((lines, offset, unknown))
 }
 
 /// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
@@ -734,7 +744,7 @@ async fn follow_stdout_via_app(
             }
         }
         // The app outlived its launcher: nothing more reaches the capture.
-        if let Some(note) = page["launcher_gone"]["note"].as_str() {
+        if let Some(note) = launcher_gone_note(&page, capture_path.as_deref()) {
             eprintln!("victauri logs: {}", clean(note));
             return Ok(());
         }
@@ -753,6 +763,13 @@ async fn follow_stdout_via_app(
             tokio::time::sleep(Duration::from_millis(opts.interval_ms)).await;
         }
     }
+}
+
+/// What the app says of a killed launcher, believed only of a capture `victauri run` named itself:
+/// one elsewhere is a `--capture` file, which has no launcher to speak of, and a follow ends on this.
+fn launcher_gone_note<'a>(page: &'a Value, capture_path: Option<&Path>) -> Option<&'a str> {
+    capture_path?;
+    page["launcher_gone"]["note"].as_str()
 }
 
 /// Read (and with `--follow`, tail) a console capture file directly from disk.
@@ -775,7 +792,7 @@ async fn follow_capture(
         clean(&path.display().to_string())
     );
     let head = capture_head(&path).unwrap_or_default();
-    let (lines, offset) = read_capture(&path, None)?;
+    let (lines, offset, unknown) = read_capture_and_end(&path, crate::run::dead_launcher)?;
     let mut cursor = CaptureCursor { offset, head };
     let recent: Vec<&Value> = if let Some(ts) = since_ts_ms {
         lines
@@ -794,7 +811,7 @@ async fn follow_capture(
         saw_exit |= l["s"] == "exit";
     }
     // Nothing more will come from a launcher that is gone, so there is nothing to follow.
-    if let Some(unknown) = unknown_exit(&path, &lines) {
+    if let Some(unknown) = unknown {
         emit(&render_console(&unknown), opts.json, &unknown);
         return Ok(());
     }
@@ -815,7 +832,7 @@ async fn follow_capture(
             // that exited normally has written its exit record by the time it is gone.
             if launcher_checked.elapsed() >= LAUNCHER_CHECK_EVERY {
                 launcher_checked = std::time::Instant::now();
-                if crate::run::dead_launcher(&path).is_some() {
+                if let Some(pid) = crate::run::dead_launcher(&path) {
                     lines = read_followed(&path, &mut cursor)?;
                     let seen_exit = lines.iter().any(|l| l["s"] == "exit");
                     for l in &lines {
@@ -824,7 +841,7 @@ async fn follow_capture(
                         }
                     }
                     if !seen_exit
-                        && let Some(unknown) = unknown_exit(&path, &read_capture(&path, None)?.0)
+                        && let Some(unknown) = unknown_exit(pid, &read_capture(&path, None)?.0)
                     {
                         emit(&render_console(&unknown), opts.json, &unknown);
                     }
@@ -860,13 +877,15 @@ struct CaptureCursor {
 /// The first bytes of a capture; `None` when it cannot be read (between the launcher's rename
 /// and its new file, for one).
 fn capture_head(path: &Path) -> Option<Vec<u8>> {
-    use std::io::Read;
+    open_capture_head(&mut std::fs::File::open(path).ok()?)
+}
+
+/// The first bytes of this open capture. It leaves the position wherever the read ended.
+fn open_capture_head(file: &mut std::fs::File) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).ok()?;
     let mut head = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(CAPTURE_HEAD_BYTES)
-        .read_to_end(&mut head)
-        .ok()?;
+    file.take(CAPTURE_HEAD_BYTES).read_to_end(&mut head).ok()?;
     Some(head)
 }
 
@@ -885,26 +904,52 @@ fn same_capture(seen: &[u8], now: &[u8]) -> bool {
 /// to `.jsonl.1` and starts a new one, so the unread tail is in the rotated file. A length check
 /// cannot see a rotation whose new file has already grown past the cursor; the first record has
 /// a timestamp and differs. If the rotated file is not the one being read either (a second
-/// rotation between two polls), those lines are gone, and that is said.
+/// rotation between two polls), those lines are gone, and that is said. A file's head and its bytes
+/// come from one open, as the names can move on between two.
 fn read_followed(path: &Path, cursor: &mut CaptureCursor) -> Result<Vec<Value>> {
-    let Some(head) = capture_head(path) else {
-        return Ok(Vec::new());
+    let (lines, lost) = read_followed_noting_loss(path, cursor)?;
+    if lost {
+        eprintln!(
+            "victauri logs: [the capture rotated more than once between two reads; some lines \
+             were lost]"
+        );
+    }
+    Ok(lines)
+}
+
+/// [`read_followed`], saying whether lines were lost rather than printing it.
+fn read_followed_noting_loss(
+    path: &Path,
+    cursor: &mut CaptureCursor,
+) -> Result<(Vec<Value>, bool)> {
+    let mut lost = false;
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Ok((Vec::new(), false));
+    };
+    let Some(head) = open_capture_head(&mut file) else {
+        return Ok((Vec::new(), false));
     };
     if !same_capture(&cursor.head, &head) {
-        let rotated = path.with_extension("jsonl.1");
-        if capture_head(&rotated).is_some_and(|h| same_capture(&cursor.head, &h)) {
-            let (lines, next) = read_capture(&rotated, Some(cursor.offset))?;
+        let rotated = std::fs::File::open(path.with_extension("jsonl.1"));
+        let same_file = rotated.ok().and_then(|mut rotated| {
+            let seen = open_capture_head(&mut rotated)?;
+            same_capture(&cursor.head, &seen).then_some(rotated)
+        });
+        if let Some(mut rotated) = same_file {
+            let (lines, next) = read_open_capture(&mut rotated, Some(cursor.offset))?;
             let advanced = next != cursor.offset;
             cursor.offset = next;
             // Larger than one read: stay on it until it is drained.
             if advanced {
-                return Ok(lines);
+                return Ok((lines, false));
             }
         } else {
-            eprintln!(
-                "victauri logs: [the capture rotated more than once between two reads; some \
-                 lines were lost]"
-            );
+            lost = true;
+        }
+        // A new file with no head yet could not tell the next rotation from itself: wait here,
+        // where a rotation still shows, and say any loss when the file can be named.
+        if head.is_empty() {
+            return Ok((Vec::new(), false));
         }
         *cursor = CaptureCursor {
             offset: 0,
@@ -914,17 +959,22 @@ fn read_followed(path: &Path, cursor: &mut CaptureCursor) -> Result<Vec<Value>> 
     if head.len() > cursor.head.len() {
         cursor.head = head;
     }
-    let (lines, next) = read_capture(path, Some(cursor.offset))?;
+    let (lines, next) = read_open_capture(&mut file, Some(cursor.offset))?;
     cursor.offset = next;
-    Ok(lines)
+    Ok((lines, lost))
 }
 
 /// Read JSONL capture records from `from` (or the whole file). Tolerates a
 /// partially written last line and a file rotated under us.
 fn read_capture(path: &Path, from: Option<u64>) -> Result<(Vec<Value>, u64)> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f =
+    let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
+    read_open_capture(&mut file, from)
+}
+
+/// [`read_capture`] of a file already open.
+fn read_open_capture(f: &mut std::fs::File, from: Option<u64>) -> Result<(Vec<Value>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
     let len = f.metadata()?.len();
     // Without a cursor, read the newest `MAX_READ` bytes: a capture grows to 64 MB before it
     // rotates, and reading from the start showed lines from the middle of a long session —
@@ -994,6 +1044,113 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_launcher_note_counts_only_for_a_capture_of_our_own() {
+        let page = json!({"launcher_gone": {"note": "killed"}});
+        assert_eq!(launcher_gone_note(&page, None), None);
+        assert_eq!(
+            launcher_gone_note(&page, Some(Path::new("c.jsonl"))),
+            Some("killed")
+        );
+        assert_eq!(
+            launcher_gone_note(&json!({}), Some(Path::new("c.jsonl"))),
+            None
+        );
+    }
+
+    /// A launcher writes its exit record and is gone: read before asking, that moment reported a
+    /// kill and lost the real exit. Whatever it wrote before it was seen dead is in the read.
+    #[test]
+    fn a_launcher_ending_between_the_read_and_the_check_is_not_reported_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        std::fs::write(&path, "{\"t\":1,\"s\":\"out\",\"l\":\"line\"}\n").unwrap();
+        let (lines, _, unknown) = read_capture_and_end(&path, |path| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b"{\"t\":2,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n")
+                .unwrap();
+            Some(4242)
+        })
+        .unwrap();
+        assert!(unknown.is_none(), "{unknown:?}");
+        assert_eq!(lines.last().unwrap()["s"], "exit");
+    }
+
+    /// A follower racing a writer that rotates as `victauri run` does: every line arrives once or
+    /// its loss is said. The head and the bytes came from two opens, so a rotation between them read
+    /// the new file at an offset meant for the old one.
+    #[test]
+    fn a_follower_racing_rotations_loses_no_line_silently() {
+        use std::io::Write as _;
+        const TOTAL: u64 = 150_000;
+        const ROTATE_AT: u64 = 80_000;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        let write_line = |file: &mut std::fs::File, i: u64| {
+            let line = format!(
+                "{{\"t\":{i},\"s\":\"out\",\"l\":\"{i} {}\"}}\n",
+                "x".repeat(60)
+            );
+            file.write_all(line.as_bytes()).unwrap();
+            line.len() as u64
+        };
+        let mut first = std::fs::File::create(&path).unwrap();
+        let mut written = write_line(&mut first, 0);
+        let head = capture_head(&path).unwrap();
+        let writer = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let mut file = first;
+                let mut rotations = 0u32;
+                for i in 1..TOTAL {
+                    written += write_line(&mut file, i);
+                    if written >= ROTATE_AT {
+                        drop(file);
+                        std::fs::rename(&path, path.with_extension("jsonl.1")).unwrap();
+                        file = std::fs::File::create(&path).unwrap();
+                        written = 0;
+                        rotations += 1;
+                    }
+                    if i % 200 == 0 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                }
+                rotations
+            })
+        };
+        let mut cursor = CaptureCursor { offset: 0, head };
+        let mut expected = 0u64;
+        let (mut silent, mut reported, mut duplicates) = (0u64, 0u64, 0u64);
+        let give_up = std::time::Instant::now() + Duration::from_secs(60);
+        while expected < TOTAL && std::time::Instant::now() < give_up {
+            let (lines, lost) = read_followed_noting_loss(&path, &mut cursor).unwrap();
+            for (at, line) in lines.iter().enumerate() {
+                let i = line["t"].as_u64().unwrap();
+                if i < expected {
+                    duplicates += 1;
+                    continue;
+                }
+                if i > expected {
+                    if lost && at == 0 {
+                        reported += i - expected;
+                    } else {
+                        silent += i - expected;
+                    }
+                }
+                expected = i + 1;
+            }
+        }
+        let rotations = writer.join().unwrap();
+        assert!(rotations > 100, "{rotations} rotations");
+        assert_eq!(
+            (silent, duplicates),
+            (0, 0),
+            "silently lost, duplicated; reported lost {reported}, over {rotations} rotations"
+        );
+        assert_eq!(expected, TOTAL, "reported lost {reported}");
+    }
 
     fn record(n: u64) -> String {
         format!("{{\"t\":{n},\"s\":\"out\",\"l\":\"line {n}\"}}\n")
