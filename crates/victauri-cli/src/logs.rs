@@ -485,11 +485,10 @@ fn final_moments<'a>(lines: &'a [Value], since_ts_ms: u64, opts: &LogsOptions) -
 }
 
 fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
-    let Ok((lines, _)) = read_capture(path, None) else {
+    let Ok((lines, _, unknown)) = read_capture_and_end(path, crate::run::dead_launcher) else {
         return;
     };
     let picked = final_moments(&lines, since_ts_ms, opts);
-    let unknown = unknown_exit(path, &lines);
     if picked.is_empty() && unknown.is_none() {
         return;
     }
@@ -504,11 +503,10 @@ fn show_final_moments(opts: &LogsOptions, path: &Path, since_ts_ms: u64) {
 /// killed outright). A record in the shape of the launcher's own, so a monitor reading stdout sees
 /// it too; `unknown` tells it from one the launcher wrote. It is not written to the capture. `lines`
 /// are the capture's newest records, where an exit record would be.
-fn unknown_exit(path: &Path, lines: &[Value]) -> Option<Value> {
+fn unknown_exit(pid: u32, lines: &[Value]) -> Option<Value> {
     if lines.iter().any(|l| l["s"] == "exit") {
         return None;
     }
-    let pid = crate::run::dead_launcher(path)?;
     let at = lines
         .last()
         .and_then(|l| l["t"].as_u64())
@@ -523,6 +521,18 @@ fn unknown_exit(path: &Path, lines: &[Value]) -> Option<Value> {
         "tail": [],
         "unknown": true,
     }))
+}
+
+/// A capture's newest records, where they end, and [`unknown_exit`]'s record if it has one.
+fn read_capture_and_end(
+    path: &Path,
+    dead_launcher: impl Fn(&Path) -> Option<u32>,
+) -> Result<(Vec<Value>, u64, Option<Value>)> {
+    // Dead first, then read: what it wrote before it was gone is then in the read.
+    let gone = dead_launcher(path);
+    let (lines, offset) = read_capture(path, None)?;
+    let unknown = gone.and_then(|pid| unknown_exit(pid, &lines));
+    Ok((lines, offset, unknown))
 }
 
 /// Where this app's raw output is captured (when run under `victauri run`), from a `logs`
@@ -775,7 +785,7 @@ async fn follow_capture(
         clean(&path.display().to_string())
     );
     let head = capture_head(&path).unwrap_or_default();
-    let (lines, offset) = read_capture(&path, None)?;
+    let (lines, offset, unknown) = read_capture_and_end(&path, crate::run::dead_launcher)?;
     let mut cursor = CaptureCursor { offset, head };
     let recent: Vec<&Value> = if let Some(ts) = since_ts_ms {
         lines
@@ -794,7 +804,7 @@ async fn follow_capture(
         saw_exit |= l["s"] == "exit";
     }
     // Nothing more will come from a launcher that is gone, so there is nothing to follow.
-    if let Some(unknown) = unknown_exit(&path, &lines) {
+    if let Some(unknown) = unknown {
         emit(&render_console(&unknown), opts.json, &unknown);
         return Ok(());
     }
@@ -815,7 +825,7 @@ async fn follow_capture(
             // that exited normally has written its exit record by the time it is gone.
             if launcher_checked.elapsed() >= LAUNCHER_CHECK_EVERY {
                 launcher_checked = std::time::Instant::now();
-                if crate::run::dead_launcher(&path).is_some() {
+                if let Some(pid) = crate::run::dead_launcher(&path) {
                     lines = read_followed(&path, &mut cursor)?;
                     let seen_exit = lines.iter().any(|l| l["s"] == "exit");
                     for l in &lines {
@@ -824,7 +834,7 @@ async fn follow_capture(
                         }
                     }
                     if !seen_exit
-                        && let Some(unknown) = unknown_exit(&path, &read_capture(&path, None)?.0)
+                        && let Some(unknown) = unknown_exit(pid, &read_capture(&path, None)?.0)
                     {
                         emit(&render_console(&unknown), opts.json, &unknown);
                     }
@@ -1027,6 +1037,25 @@ fn infer_level(text: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A launcher writes its exit record and is gone: read before asking, that moment reported a
+    /// kill and lost the real exit. Whatever it wrote before it was seen dead is in the read.
+    #[test]
+    fn a_launcher_ending_between_the_read_and_the_check_is_not_reported_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.jsonl");
+        std::fs::write(&path, "{\"t\":1,\"s\":\"out\",\"l\":\"line\"}\n").unwrap();
+        let (lines, _, unknown) = read_capture_and_end(&path, |path| {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+            file.write_all(b"{\"t\":2,\"s\":\"exit\",\"l\":\"exited with code 3\",\"tail\":[]}\n")
+                .unwrap();
+            Some(4242)
+        })
+        .unwrap();
+        assert!(unknown.is_none(), "{unknown:?}");
+        assert_eq!(lines.last().unwrap()["s"], "exit");
+    }
 
     /// A follower racing a writer that rotates as `victauri run` does: every line arrives once or
     /// its loss is said. The head and the bytes came from two opens, so a rotation between them read
