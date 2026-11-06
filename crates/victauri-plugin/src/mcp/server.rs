@@ -528,32 +528,55 @@ pub(super) fn bind_failure_message(
 }
 
 async fn try_bind(preferred: u16) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
-    let mut last_error = match tokio::net::TcpListener::bind(format!("127.0.0.1:{preferred}")).await
-    {
-        Ok(listener) => return Ok((listener, preferred)),
-        Err(e) => e,
-    };
+    try_bind_in(preferred, PORT_FALLBACK_RANGE).await
+}
 
-    for offset in 1..=PORT_FALLBACK_RANGE {
-        // Saturating/checked add: a `preferred` near u16::MAX (e.g. 65530) would
-        // otherwise overflow `preferred + offset` (panic in debug, wrap in release).
-        let Some(port) = preferred.checked_add(offset) else {
-            break;
-        };
-        match tokio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
-            Ok(listener) => return Ok((listener, port)),
-            Err(e) => last_error = e,
+/// Bind `preferred`, else the next `fallback_range` ports, else a port the OS assigns.
+///
+/// The last step exists because a whole fixed range can be unavailable with nothing
+/// listening on it: Windows reserves dynamic blocks for Hyper-V/WinNAT (100 ports at a
+/// time, different on every boot), and binding inside one fails with `WSAEACCES` (10013).
+/// Clients find the server through the discovery directory, never by a fixed port, so an
+/// OS-assigned port is as reachable as 7373. The returned port is always the one actually
+/// bound (`local_addr`), never the one asked for.
+async fn try_bind_in(
+    preferred: u16,
+    fallback_range: u16,
+) -> anyhow::Result<(tokio::net::TcpListener, u16)> {
+    let mut last_error = None;
+    // Checked add: a `preferred` near u16::MAX (e.g. 65530) would otherwise overflow
+    // `preferred + offset` (panic in debug, wrap in release).
+    let candidates = (0..=fallback_range).map_while(|offset| preferred.checked_add(offset));
+    for port in candidates {
+        match bind_loopback(port).await {
+            Ok(bound) => return Ok(bound),
+            Err(e) => last_error = Some(e),
         }
     }
 
-    anyhow::bail!(
-        "{}",
-        bind_failure_message(
-            preferred,
-            preferred.saturating_add(PORT_FALLBACK_RANGE),
-            Some(&last_error)
-        )
-    )
+    let range_failure = bind_failure_message(
+        preferred,
+        preferred.saturating_add(fallback_range),
+        last_error.as_ref(),
+    );
+    match bind_loopback(0).await {
+        Ok(bound) => {
+            tracing::warn!(
+                "Victauri: {range_failure}; listening on OS-assigned port {} instead \
+                 (clients find it through the discovery directory)",
+                bound.1
+            );
+            Ok(bound)
+        }
+        Err(e) => anyhow::bail!("{range_failure}; an OS-assigned port also failed: {e}"),
+    }
+}
+
+/// Bind `127.0.0.1:port` and report the port actually bound (`port` 0 = OS-assigned).
+async fn bind_loopback(port: u16) -> std::io::Result<(tokio::net::TcpListener, u16)> {
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let actual = listener.local_addr()?.port();
+    Ok((listener, actual))
 }
 
 fn discovery_dir() -> std::path::PathBuf {
@@ -1710,11 +1733,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn try_bind_preferred_port_available() {
+    async fn try_bind_reports_the_port_actually_bound() {
+        // Port 0 asks the OS for one: the reported port must be that real port, never 0,
+        // because it is what the discovery file tells clients to connect to.
         let (listener, port) = try_bind(0).await.unwrap();
         let addr = listener.local_addr().unwrap();
-        assert_eq!(port, 0);
-        assert_ne!(addr.port(), 0); // OS assigned a real port
+        assert_ne!(port, 0);
+        assert_eq!(port, addr.port());
+    }
+
+    #[tokio::test]
+    async fn try_bind_uses_the_preferred_port_when_free() {
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let free = probe.local_addr().unwrap().port();
+        drop(probe);
+        let (listener, port) = try_bind_in(free, 0).await.unwrap();
+        assert_eq!(port, free);
+        assert_eq!(listener.local_addr().unwrap().port(), free);
+    }
+
+    #[tokio::test]
+    async fn try_bind_falls_back_to_an_os_port_when_the_whole_range_is_unavailable() {
+        // A range of one port, held by another listener: the case of a Windows excluded
+        // port range (Hyper-V/WinNAT) covering all of 7373-7383, where every bind fails.
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let blocked = blocker.local_addr().unwrap().port();
+
+        let (listener, port) = try_bind_in(blocked, 0).await.unwrap();
+        assert_ne!(port, blocked);
+        assert_ne!(port, 0);
+        assert_eq!(listener.local_addr().unwrap().port(), port);
+        // And the server is really reachable there.
+        let connected = tokio::net::TcpStream::connect(("127.0.0.1", port)).await;
+        assert!(connected.is_ok(), "{connected:?}");
+    }
+
+    #[tokio::test]
+    async fn try_bind_near_u16_max_does_not_overflow() {
+        // 65535 + 1..=10 overflows: the range stops at u16::MAX and the OS port still binds.
+        let (_listener, port) = try_bind(u16::MAX).await.unwrap();
+        assert_ne!(port, 0);
     }
 
     #[tokio::test]

@@ -388,7 +388,7 @@ Victauri runs **inside** the Tauri process — same thread pool, same memory spa
 | **Setup** | One line in Cargo.toml | Separate process + config |
 | **Release build** | `init()` is a no-op (zero runtime cost) | Must be disabled manually |
 
-**Port selection:** Victauri tries port 7373 first, then falls back through 7374-7383 if taken. The actual port is written to a temp directory for automatic client discovery.
+**Port selection:** Victauri tries port 7373 first, then falls back through 7374-7383 if taken, and if that whole range is unavailable (on Windows, Hyper-V/WSL reserve dynamic port blocks that can cover it) it listens on a port the OS assigns. The actual port is written to a temp directory for automatic client discovery. `VICTAURI_PORT` (or `VictauriBuilder::port`) changes the preferred port.
 
 ---
 

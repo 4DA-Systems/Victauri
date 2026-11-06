@@ -19,7 +19,8 @@
 //!     .unwrap();
 //! ```
 //!
-//! In debug builds this starts an MCP server on port 7373. In release builds
+//! In debug builds this starts an MCP server on 127.0.0.1, port 7373 (else 7374-7383, else a port
+//! the OS assigns; clients find it through the discovery directory). In release builds
 //! the plugin is a no-op with zero overhead.
 //!
 //! # Configuration
@@ -525,7 +526,10 @@ impl VictauriBuilder {
         Self::default()
     }
 
-    /// Set the TCP port for the MCP server (default: 7373, env: `VICTAURI_PORT`).
+    /// Set the preferred TCP port for the MCP server (default: 7373, env: `VICTAURI_PORT`).
+    ///
+    /// If it cannot be bound the server tries the next 10 ports, then a port the OS assigns;
+    /// the port actually bound is written to the discovery directory.
     #[must_use]
     pub fn port(mut self, port: u16) -> Self {
         self.port = Some(port);
