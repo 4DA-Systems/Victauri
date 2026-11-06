@@ -119,7 +119,7 @@ Apps using virtualized lists (react-window, tanstack-virtual) only render visibl
 
 ### Plugin Port Conflicts
 
-`tauri-plugin-localhost` also binds a localhost HTTP server. Victauri's port fallback (7373 → 7374 → ... → 7383) and automatic port file discovery handle this. No action needed.
+`tauri-plugin-localhost` also binds a localhost HTTP server. Victauri's port fallback (7373 → 7374 → ... → 7383 → an OS-assigned port) and automatic port file discovery handle this. No action needed.
 
 ### Custom Invoke Handlers
 

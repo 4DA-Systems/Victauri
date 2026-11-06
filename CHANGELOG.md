@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **victauri-plugin**: the server no longer fails to start when every port in 7373-7383 is
+  unavailable. On Windows, Hyper-V/WinNAT reserve dynamic port blocks (100 at a time, different
+  on every boot) that can cover the whole range, so every bind failed with `os error 10013` and the
+  app had no Victauri at all. It now falls back to a port the OS assigns on 127.0.0.1 and records it
+  in the discovery directory as before, so the CLI, bridge, `victauri-test` and the watchdog find
+  it unchanged. The port recorded is always the one actually bound.
+
 ## [0.10.3] - 2026-11-02
 
 From a nine-lens adversarial audit. **Assertions that reported success without checking now tell the
