@@ -1,5 +1,16 @@
 # Migration Guide
 
+## v0.10.3 → v0.10.4
+
+A patch release with no public API change: consumers on `"0.10"` pick it up with `cargo update`.
+
+**The port can now be one the OS assigns.** When every port in 7373-7383 is unavailable (on Windows,
+Hyper-V/WinNAT can reserve that whole range), the plugin binds a port the OS picks on 127.0.0.1
+instead of failing to start. The CLI, the bridge, `victauri-test` and the watchdog already read the
+bound port from the discovery directory (`<root>/<pid>/port`, see
+[Getting started](docs/src/getting-started.md)), so they need no change. Anything of your own that
+hard-codes `7373` (a script, a proxy rule, a test harness) should read that file instead.
+
 ## v0.10.2 → v0.10.3
 
 A patch release with no public API removal: consumers on `"0.10"` pick it up with `cargo update`.

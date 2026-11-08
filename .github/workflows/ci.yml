@@ -751,7 +751,8 @@ jobs:
   semver:
     name: Semver Checks
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 35, not 25: the plugin check below builds the plugin's rustdoc twice (current and baseline).
+    timeout-minutes: 35
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -785,12 +786,23 @@ jobs:
       # what to run for a major bump (`--release-type minor`, to list what actually broke).
       # A failure is surfaced as a warning annotation below, never swallowed silently;
       # RELEASING.md makes the local run the pre-release gate.
+      #
+      # victauri-plugin is excluded here and checked by the next step. `--workspace` builds each
+      # crate in a placeholder project that ignores Cargo.lock, where the plugin's Tauri range
+      # resolves a Tauri 3 pre-release that does not build, so this step failed on the plugin
+      # (only warning) and the plugin went unchecked from Tauri 3.0.0-alpha.5 (2026-10-14) on.
       - name: Check semver (informational)
         id: semver
         continue-on-error: true
-        run: cargo semver-checks check-release --workspace
+        run: cargo semver-checks check-release --workspace --exclude victauri-plugin
+      # The plugin's rustdoc JSON on both sides, each from its own Cargo.lock (Tauri 2), against
+      # the newest vX.Y.Z tag merged into HEAD (fetch-depth: 0 above fetches the tags).
+      - name: Check semver, victauri-plugin from the lockfile (informational)
+        id: semver_plugin
+        continue-on-error: true
+        run: bash scripts/semver-check-plugin.sh
       - name: Surface a semver-checks failure
-        if: steps.semver.outcome == 'failure'
+        if: steps.semver.outcome == 'failure' || steps.semver_plugin.outcome == 'failure'
         run: echo "::warning title=Semver Checks::cargo semver-checks failed (API break, or a toolchain/tool mismatch) — read the log above"
 
   e2e:

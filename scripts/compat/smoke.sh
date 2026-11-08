@@ -52,8 +52,9 @@ check "eval_js arithmetic"      eval_js     '{"code":"return 6*7"}'             
 check "eval_js document.title"  eval_js     '{"code":"return document.title || \"untitled\""}'       '"result"'
 check "eval_js DOM access"      eval_js     '{"code":"return document.querySelectorAll(\"*\").length"}' '"result":[1-9]'
 
-# Accessible DOM snapshot with ref handles.
-check "dom_snapshot has refs"   dom_snapshot '{}'                                                     '\[e[0-9]+\]|"ref"'
+# Accessible DOM snapshot with ref handles. Since 0.10.3 a ref is page-tagged (`[v4abe0]`, tag
+# `v4ab` + `e` + counter; MIGRATION.md "Refs"); the plain `[e12]` form still matches.
+check "dom_snapshot has refs"   dom_snapshot '{}'                                                     '\[[a-z0-9]*e[0-9]+\]|"ref"'
 
 # Element finding (every app has at least one element).
 check "find_elements body"     find_elements '{"css":"body"}'                                        '"result"'
