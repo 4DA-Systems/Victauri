@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-11-08
+
+A patch release: no public API is added or removed (`cargo semver-checks`, every library crate).
+Consumers on `"0.10"` pick it up with `cargo update`.
+
 ### Fixed
 
 - **victauri-plugin**: the server no longer fails to start when every port in 7373-7383 is
@@ -15,6 +20,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   app had no Victauri at all. It now falls back to a port the OS assigns on 127.0.0.1 and records it
   in the discovery directory as before, so the CLI, bridge, `victauri-test` and the watchdog find
   it unchanged. The port recorded is always the one actually bound.
+
+### Changed: release and CI
+
+- The CI semver check now covers `victauri-plugin`. `cargo semver-checks --workspace` builds each
+  crate against a fresh dependency resolution, where the plugin's Tauri range picks a Tauri 3
+  pre-release that does not build. The step failed on the plugin with only a warning, so from Tauri
+  3.0.0-alpha.5 (2026-10-14) on, the plugin was never checked. The new
+  `scripts/semver-check-plugin.sh` compares the plugin's rustdoc built from each side's own
+  `Cargo.lock`, against the last release tag.
+- The weekly compatibility retest reads 0.10.3's page-tagged snapshot refs (`[v4abe0]`). Its smoke
+  battery still looked for the old `[e12]` form, so all three apps failed that one check from 0.10.3 on.
 
 ## [0.10.3] - 2026-11-02
 
