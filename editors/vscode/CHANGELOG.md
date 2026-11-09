@@ -2,6 +2,13 @@
 
 All notable changes to the Victauri VS Code extension will be documented in this file.
 
+## 0.10.4
+
+Version-synced with the Victauri 0.10.4 release; works with plugins 0.9.x and 0.10.x. No extension
+code change. The plugin can now listen on a port the OS assigns when 7373-7383 is unavailable. The
+extension already finds it, because it reads the port from the discovery directory. The `victauri.port`
+setting (default 7373) matters only for a manual connect.
+
 ## 0.10.3
 
 Version-synced with the Victauri 0.10.3 release; works with plugins 0.9.x and 0.10.x.
